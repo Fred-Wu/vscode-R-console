@@ -1,0 +1,245 @@
+import { ANSI } from "../ansi";
+import { ConsoleSyntax } from "../consoleSyntax";
+import { InputState } from "../inputState";
+import {
+  buildCollapsedRenderPlan,
+  buildWindowedRenderPlan,
+  getContinuationPromptLength,
+  getRenderedRowCount,
+  shouldRenderCollapsed,
+} from "../inputViewport";
+import { Renderer } from "../renderer";
+import { TerminalState } from "../terminalState";
+
+type Dimensions = {
+  columns: number;
+  rows: number;
+};
+
+type RenderInputOptions = {
+  syntax: ConsoleSyntax;
+  renderer: Renderer;
+  inputState: InputState;
+  dimensions: Dimensions;
+  historyBrowsing: boolean;
+  historyCollapsed: boolean;
+};
+
+type ReplayOptions = {
+  write: (text: string) => void;
+  terminalState: TerminalState;
+  dimensions: Dimensions;
+  rerenderInput: () => void;
+  restoreInput: boolean;
+};
+
+export function configureMainPrompt(renderer: Renderer): void {
+  const promptText = "R> ";
+  renderer.setPrompt(promptText, ANSI.brightGreen);
+  renderer.setContinuationPrompt(" ".repeat(promptText.length), ANSI.reset);
+}
+
+export function clearInputRender(
+  write: (text: string) => void,
+  renderer: Renderer
+): void {
+  const lines = renderer.renderedLineCount;
+  if (lines <= 0) {
+    return;
+  }
+
+  write("\r");
+  if (renderer.cursorRowFromTop > 0) {
+    write(`\x1b[${renderer.cursorRowFromTop}A`);
+  }
+  for (let index = 0; index < lines; index += 1) {
+    write("\x1b[2K");
+    if (index < lines - 1) {
+      write("\x1b[1B\r");
+    }
+  }
+  if (lines > 1) {
+    write(`\x1b[${lines - 1}A\r`);
+  } else {
+    write("\r");
+  }
+
+  renderer.renderedLineCount = 1;
+  renderer.cursorRowFromTop = 0;
+}
+
+export function replayVisibleScreen({
+  write,
+  terminalState,
+  dimensions,
+  rerenderInput,
+  restoreInput,
+}: ReplayOptions): void {
+  const viewport = terminalState.getStyledViewport(dimensions.rows);
+  const lastVisibleRow = Math.max(
+    viewport.cursorRow,
+    viewport.lines.reduceRight((found, line, index) => {
+      return found >= 0 || line.length > 0 ? Math.max(found, index) : -1;
+    }, -1)
+  );
+  const linesToReplay = viewport.lines.slice(0, Math.max(0, lastVisibleRow + 1));
+  const targetRow = Math.max(1, Math.min(dimensions.rows, viewport.cursorRow + 1));
+  const targetCol = Math.max(1, Math.min(dimensions.columns, viewport.cursorCol + 1));
+
+  write("\x1b[2J\x1b[H\x1b[?7l");
+  for (let index = 0; index < linesToReplay.length; index += 1) {
+    const line = linesToReplay[index] ?? "";
+    write(`\x1b[${index + 1};1H`);
+    if (line.length > 0) {
+      write(line);
+    }
+  }
+  write("\x1b[?7h");
+  write(`\x1b[${targetRow};${targetCol}H`);
+
+  if (restoreInput) {
+    rerenderInput();
+  }
+}
+
+export function renderInput({
+  syntax,
+  renderer,
+  inputState,
+  dimensions,
+  historyBrowsing,
+  historyCollapsed,
+}: RenderInputOptions): void {
+  syntax.setSource(inputState.lines);
+
+  const lines = inputState.lines;
+  const totalLines = lines.length;
+  const maxRows = Math.max(1, dimensions.rows - 1);
+  const continuationPromptLen = getContinuationPromptLength(
+    renderer.promptText,
+    renderer.promptLen,
+    renderer.continuationPromptText
+  );
+  const totalRows = getRenderedRowCount(
+    lines,
+    dimensions.columns,
+    renderer.promptLen,
+    continuationPromptLen
+  );
+
+  if (
+    totalRows > maxRows &&
+    shouldRenderCollapsed(
+      historyBrowsing,
+      historyCollapsed,
+      inputState.isAtEnd,
+      totalLines,
+      maxRows
+    )
+  ) {
+    renderCollapsed({ renderer, inputState, dimensions });
+  } else if (totalRows > maxRows) {
+    renderWindowed({ renderer, inputState, dimensions });
+  } else {
+    renderer.renderWithCursor(
+      lines,
+      inputState.cursorRow,
+      inputState.cursorCol,
+      dimensions.columns,
+      lines.map((_, index) => index)
+    );
+  }
+}
+
+export function formatTerminalOutput(text: string): string {
+  if (process.platform !== "win32") {
+    return text;
+  }
+  return text.replace(/\r?\n/g, "\r\n");
+}
+
+export function getPromptRenderDelay(
+  pendingInitialPromptGap: boolean,
+  lastOutputAt: number
+): number {
+  const baseDelay =
+    process.platform !== "win32" ? 0 : pendingInitialPromptGap ? 48 : 16;
+  return getOutputQuietDelay(baseDelay, lastOutputAt);
+}
+
+export function getReplyPromptRenderDelay(lastOutputAt: number): number {
+  const baseDelay = process.platform !== "win32" ? 0 : 80;
+  return getOutputQuietDelay(baseDelay, lastOutputAt);
+}
+
+function renderWindowed({
+  renderer,
+  inputState,
+  dimensions,
+}: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">): void {
+  const continuationPromptLen = getContinuationPromptLength(
+    renderer.promptText,
+    renderer.promptLen,
+    renderer.continuationPromptText
+  );
+  const plan = buildWindowedRenderPlan(
+    inputState.lines,
+    inputState.cursorRow,
+    inputState.cursorCol,
+    Math.max(1, dimensions.rows - 1),
+    dimensions.columns,
+    renderer.promptLen,
+    continuationPromptLen
+  );
+
+  renderer.renderWithCursor(
+    plan.lines,
+    plan.cursorRow,
+    plan.cursorCol,
+    dimensions.columns,
+    plan.sourceLineMap
+  );
+}
+
+function renderCollapsed({
+  renderer,
+  inputState,
+  dimensions,
+}: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">): void {
+  const continuationPromptLen = getContinuationPromptLength(
+    renderer.promptText,
+    renderer.promptLen,
+    renderer.continuationPromptText
+  );
+  const plan = buildCollapsedRenderPlan(
+    inputState.lines,
+    Math.max(1, dimensions.rows - 1),
+    dimensions.columns,
+    renderer.promptLen,
+    continuationPromptLen
+  );
+
+  if (!plan) {
+    renderWindowed({ renderer, inputState, dimensions });
+    return;
+  }
+
+  const lines = [...plan.multiline, plan.inputLine];
+  renderer.renderWithCursor(
+    lines,
+    lines.length - 1,
+    plan.inputLine.length,
+    dimensions.columns,
+    plan.sourceLineMap
+  );
+}
+
+function getOutputQuietDelay(baseDelay: number, lastOutputAt: number): number {
+  if (process.platform !== "win32") {
+    return baseDelay;
+  }
+
+  const quietWindowMs = 24;
+  const elapsed = Date.now() - lastOutputAt;
+  return elapsed >= quietWindowMs ? baseDelay : Math.max(baseDelay, quietWindowMs - elapsed);
+}

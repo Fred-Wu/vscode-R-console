@@ -1,0 +1,12 @@
+[package]
+name = "R_CONSOLE_HOST"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "R_CONSOLE_HOST"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"

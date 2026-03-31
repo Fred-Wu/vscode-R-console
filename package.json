@@ -1,0 +1,101 @@
+{
+  "name": "vscode-r-console",
+  "displayName": "R Console",
+  "description": "A light weight R console for VS Code",
+  "version": "0.1.0",
+  "publisher": "RConsole",
+  "license": "SEE LICENSE IN LICENSE",
+  "icon": "images/Rlogo.png",
+  "galleryBanner": {
+    "color": "#2C6DB2",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Fred-Wu/vscode-R-console.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Fred-Wu/vscode-R-console/issues"
+  },
+  "homepage": "https://github.com/Fred-Wu/vscode-R-console#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "r",
+    "rstats",
+    "console",
+    "terminal",
+    "statistics",
+    "data-science"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.untrustedWorkspaces.description%"
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.virtualWorkspaces.description%"
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "r-console.createTerminal",
+        "title": "Create R Console",
+        "category": "R"
+      },
+      {
+        "command": "r-console.createTerminalSide",
+        "title": "Create R Console in Side Editor",
+        "category": "R"
+      }
+    ],
+    "configuration": {
+      "title": "R Console",
+      "properties": {
+        "r.console.autoMatch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically insert matching brackets and quotes."
+        },
+        "r.console.tabSize": {
+          "type": "number",
+          "default": 2,
+          "description": "Number of spaces for indentation."
+        }
+      }
+    }
+  },
+  "extensionDependencies": [
+    "REditorSupport.r"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",
+    "build:sidecar": "cargo build --manifest-path sidecar/pty-host/Cargo.toml --release --bin R_CONSOLE_HOST",
+    "stage:sidecar": "node scripts/stage-sidecar.js",
+    "check-types": "tsc --noEmit -p ./",
+    "compile": "npm run check-types && node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package:extension": "npm run check-types && node esbuild.js --production",
+    "package:vsix": "node scripts/package-vsix.js",
+    "package": "npm run vscode:prepublish && npm run package:vsix"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.7.1",
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.27.4",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@xterm/headless": "^6.0.0",
+    "vscode-languageclient": "^9.0.1"
+  }
+}

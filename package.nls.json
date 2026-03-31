@@ -1,0 +1,4 @@
+{
+  "capabilities.untrustedWorkspaces.description": "R Console launches local R executables and reads local filesystem paths, so it requires a trusted workspace.",
+  "capabilities.virtualWorkspaces.description": "R Console requires local filesystem access and a local R installation, so it is unavailable in virtual workspaces."
+}

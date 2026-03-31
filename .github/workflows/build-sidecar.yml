@@ -1,0 +1,67 @@
+name: Build Console Runtime
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    paths:
+      - "sidecar/pty-host/**"
+      - "package.json"
+      - "scripts/stage-sidecar.js"
+      - ".github/workflows/build-sidecar.yml"
+  pull_request:
+    paths:
+      - "sidecar/pty-host/**"
+      - "package.json"
+      - "scripts/stage-sidecar.js"
+      - ".github/workflows/build-sidecar.yml"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: windows
+          - os: ubuntu-latest
+            artifact_name: linux
+          - os: macos-15-intel
+            artifact_name: darwin-x64
+          - os: macos-15
+            artifact_name: darwin-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build sidecar
+        run: npm run build:sidecar
+
+      - name: Stage sidecar
+        run: node scripts/stage-sidecar.js
+
+      - name: Verify staged runtime
+        run: |
+          node -e "const fs=require('fs'); const p='bundled/bin'; console.log('Staged directory:', p); console.log(fs.readdirSync(p, {withFileTypes:true}).map(d => d.name).join('\n'));"
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.artifact_name }}
+          path: bundled/bin/
