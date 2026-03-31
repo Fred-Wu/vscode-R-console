@@ -65,8 +65,6 @@ type GetRUserFn = unsafe extern "C" fn() -> *const c_char;
 #[cfg(windows)]
 type Rboolean = c_int;
 #[cfg(windows)]
-const R_FALSE: Rboolean = 0;
-#[cfg(windows)]
 const R_TRUE: Rboolean = 1;
 #[cfg(windows)]
 type DefParamsExFn = unsafe extern "C" fn(*mut Rstart, c_int);
@@ -145,9 +143,106 @@ fn c_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
+    let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+    #[cfg(windows)]
+    {
+        return match std::str::from_utf8(bytes) {
+            Ok(value) => value.to_string(),
+            Err(_) => decode_windows_native(bytes).into_owned(),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+#[cfg(windows)]
+fn normalize_console_output(bytes: &[u8]) -> Vec<u8> {
+    let processed = if bytes
+        .windows(3)
+        .any(|window| (window[0] == 0x02 || window[0] == 0x03) && window[1] == 0xFF && window[2] == 0xFE)
+    {
+        std::borrow::Cow::Owned(strip_r_format_escapes(bytes))
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    };
+
+    match std::str::from_utf8(&processed) {
+        Ok(value) => value.as_bytes().to_vec(),
+        Err(_) => decode_windows_native(&processed).into_owned().into_bytes(),
+    }
+}
+
+#[cfg(windows)]
+fn strip_r_format_escapes(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if index + 2 < input.len()
+            && (input[index] == 0x02 || input[index] == 0x03)
+            && input[index + 1] == 0xFF
+            && input[index + 2] == 0xFE
+        {
+            index += 3;
+            continue;
+        }
+        output.push(input[index]);
+        index += 1;
+    }
+    output
+}
+
+#[cfg(windows)]
+fn decode_windows_native(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    if bytes.is_empty() {
+        return std::borrow::Cow::Borrowed("");
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetACP() -> u32;
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi_byte: *const u8,
+            multi_byte_len: i32,
+            wide_char: *mut u16,
+            wide_char_len: i32,
+        ) -> i32;
+    }
+
+    let code_page = unsafe { GetACP() };
+    let wide_len = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if wide_len <= 0 {
+        return String::from_utf8_lossy(bytes);
+    }
+
+    let mut wide = vec![0_u16; wide_len as usize];
+    let converted = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            wide_len,
+        )
+    };
+    if converted <= 0 {
+        return String::from_utf8_lossy(bytes);
+    }
+
+    std::borrow::Cow::Owned(String::from_utf16_lossy(&wide[..converted as usize]))
 }
 
 fn build_r_argv(args: Vec<String>) -> Result<Vec<CString>, Box<dyn Error>> {

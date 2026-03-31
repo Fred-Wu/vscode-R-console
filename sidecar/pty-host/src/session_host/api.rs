@@ -23,7 +23,7 @@ use super::callbacks::{
 };
 use super::Sexp;
 #[cfg(windows)]
-use super::{GetRUserFn, Rstart, UImode, R_FALSE, R_TRUE};
+use super::{GetRUserFn, Rstart, UImode, R_TRUE};
 
 #[cfg(windows)]
 pub(crate) struct WindowsApi {
@@ -35,6 +35,7 @@ pub(crate) struct WindowsApi {
     pub(crate) ga_initapp: Option<super::GAInitAppFn>,
     pub(crate) get_r_user: Option<GetRUserFn>,
     pub(crate) user_break: Option<*mut c_int>,
+    pub(crate) character_mode: Option<*mut c_int>,
 }
 
 #[cfg(unix)]
@@ -142,7 +143,9 @@ fn preload_windows_support_libraries(
         .ok_or("failed to resolve R DLL directory")?;
     let mut graphapp = None;
 
-    for dll_name in ["Rblas.dll", "Riconv.dll", "Rlapack.dll", "Rgraphapp.dll"] {
+    // Preloading Rlapack.dll can hang on some Windows/UCRT installs during embedded startup.
+    // Keep the DLL search path configured via PATH/R_HOME and let R load it on demand instead.
+    for dll_name in ["Rblas.dll", "Riconv.dll", "Rgraphapp.dll"] {
         let dll_path = library_dir.join(dll_name);
         if !dll_path.exists() {
             continue;
@@ -202,6 +205,7 @@ fn load_r_api() -> Result<RApi, Box<dyn Error>> {
         }),
         get_r_user: unsafe { try_load_fn::<GetRUserFn>(library, b"getRUser\0") },
         user_break: unsafe { try_load_var::<c_int>(library, b"UserBreak\0") },
+        character_mode: unsafe { try_load_var::<c_int>(library, b"CharacterMode\0") },
     };
 
     #[cfg(unix)]
@@ -457,7 +461,10 @@ pub(crate) fn initialize_runtime(
 
     unsafe {
         (*params_ptr).r_interactive = R_TRUE;
-        (*params_ptr).character_mode = UImode::LinkDLL;
+        // Match the Windows embedded-R pattern used by ARF/Ark:
+        // let R_SetParams configure the console as RGui first, then switch
+        // the global CharacterMode back to LinkDLL before setup_Rmainloop().
+        (*params_ptr).character_mode = UImode::RGui;
         (*params_ptr).write_console = None;
         (*params_ptr).write_console_ex = Some(host_write_console_ex);
         (*params_ptr).read_console = Some(host_read_console);
@@ -465,7 +472,8 @@ pub(crate) fn initialize_runtime(
         (*params_ptr).yes_no_cancel = Some(host_yes_no_cancel);
         (*params_ptr).callback = Some(host_callback);
         (*params_ptr).busy = Some(host_busy);
-        (*params_ptr).emit_embedded_utf8 = R_FALSE;
+        // VS Code consumes UTF-8 over the sidecar protocol; preserve localized output correctly.
+        (*params_ptr).emit_embedded_utf8 = R_TRUE;
         (*params_ptr).cleanup = Some(host_cleanup);
         (*params_ptr).clearerr_console = Some(host_clearerr_console);
         (*params_ptr).flush_console = Some(host_flush_console);
@@ -487,6 +495,9 @@ pub(crate) fn initialize_runtime(
         unsafe { ga_initapp(0, ptr::null_mut()) };
     }
     unsafe { (api().windows.readconsolecfg)() };
+    if let Some(character_mode) = api().windows.character_mode {
+        unsafe { *character_mode = UImode::LinkDLL as c_int };
+    }
     unsafe { (api().setup_rmainloop)() };
     Ok(())
 }

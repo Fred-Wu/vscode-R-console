@@ -26,6 +26,8 @@ type Dimensions = {
   rows: number;
 };
 
+const SESSION_ATTACH_TIMEOUT_MS = 4000;
+
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
 export type Submission = {
@@ -53,6 +55,7 @@ export type RuntimeHost = {
   lastWriteEndedWithNewline: boolean;
   hasReceivedOutput: boolean;
   sessionAttached: boolean;
+  sessionAttachBypassed: boolean;
   sessionHostConnected: boolean;
   attachWaitTimer: NodeJS.Timeout | undefined;
   pendingSubmissionEcho: unknown;
@@ -113,6 +116,7 @@ export function startRuntime(host: RuntimeHost): void {
   host.terminalState.reset();
   host.terminalState.resize(host.dimensions.columns, host.dimensions.rows);
   host.backendChildPid = undefined;
+  host.sessionAttachBypassed = false;
   host.sessionHostConnected = false;
 
   if (!host.runtimeBackend) {
@@ -198,6 +202,7 @@ export function startRuntime(host: RuntimeHost): void {
 function waitForRuntimeAttach(host: RuntimeHost): void {
   if (!host.sessionWatcher) {
     host.sessionAttached = true;
+    host.sessionAttachBypassed = false;
     return;
   }
   host.sessionWatcher.refresh();
@@ -208,17 +213,50 @@ function waitForRuntimeAttach(host: RuntimeHost): void {
   if (host.attachWaitTimer) {
     clearInterval(host.attachWaitTimer);
   }
+  const attachStartedAt = Date.now();
   host.attachWaitTimer = setInterval(() => {
     host.sessionWatcher?.refresh();
-    if (!host.sessionWatcher?.isAttached()) {
+    if (host.sessionWatcher?.isAttached()) {
+      onRuntimeAttached(host);
       return;
     }
-    onRuntimeAttached(host);
+    if (
+      !host.sessionAttachBypassed &&
+      Date.now() - attachStartedAt >= SESSION_ATTACH_TIMEOUT_MS
+    ) {
+      releasePromptGateWithoutSessionAttach(host);
+      return;
+    }
   }, 100);
 }
 
+function releasePromptGateWithoutSessionAttach(host: RuntimeHost): void {
+  if (host.sessionAttached || host.sessionAttachBypassed) {
+    return;
+  }
+
+  host.sessionAttachBypassed = true;
+  host.sessionAttached = true;
+  host.writeEmitter.fire(
+    `${ANSI.yellow}vscode-R session watcher did not attach; session-backed features are unavailable.${ANSI.reset}\r\n`
+  );
+  host.recordOutputActivity();
+
+  if (host.mode === "starting" && host.promptReady) {
+    host.mode = "ready";
+  }
+
+  if (host.mode === "ready" && host.promptReady) {
+    host.pendingPromptToken = true;
+    host.schedulePrompt();
+    if (host.activeSubmission === null && host.promptKind === "main") {
+      host.startNextSubmission();
+    }
+  }
+}
+
 function onRuntimeAttached(host: RuntimeHost): void {
-  if (host.sessionAttached) {
+  if (host.sessionAttached && !host.sessionAttachBypassed) {
     return;
   }
   if (host.attachWaitTimer) {
@@ -226,6 +264,7 @@ function onRuntimeAttached(host: RuntimeHost): void {
     host.attachWaitTimer = undefined;
   }
   host.sessionAttached = true;
+  host.sessionAttachBypassed = false;
   if (!host.isTrueTerminalBackendConfigured()) {
     host.promptReady = true;
     host.pendingPromptToken = true;
@@ -552,6 +591,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.promptVisible = false;
   host.replyPromptText = "";
   host.sessionAttached = false;
+  host.sessionAttachBypassed = false;
 
   host.submissionQueue = [];
   host.activeSubmission = null;

@@ -94,6 +94,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private sessionWatcher: SessionWatcher | undefined;
   private sessionAttached = false;
+  private sessionAttachBypassed = false;
   private attachWaitTimer: NodeJS.Timeout | undefined;
 
   private lang: RTermLang;
@@ -1639,6 +1640,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     this.sessionAttached = false;
+    this.sessionAttachBypassed = false;
     this.lang.clearPendingLibraries();
     this.lang.stopConsoleLsp();
     setNativeParseCallback(null);

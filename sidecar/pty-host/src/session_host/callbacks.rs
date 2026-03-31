@@ -302,6 +302,11 @@ pub(crate) unsafe extern "C" fn host_write_console_ex(
         return;
     }
     let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), length as usize) };
+    #[cfg(windows)]
+    let normalized = super::normalize_console_output(bytes);
+    #[cfg(windows)]
+    emit_output(&normalized);
+    #[cfg(not(windows))]
     emit_output(bytes);
 }
 
