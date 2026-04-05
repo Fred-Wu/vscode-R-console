@@ -1,21 +1,37 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const {
+  getDefaultPackageTarget,
+  getPackageTargetInfo,
+  getTargetBinaryPath,
+} = require("./sidecar-targets");
 
-function sidecarExeName() {
-  return process.platform === "win32" ? "R_CONSOLE_HOST.exe" : "R_CONSOLE_HOST";
+function parseArgs(argv) {
+  const args = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith("--")) {
+      throw new Error(`Unexpected argument: ${token}`);
+    }
+
+    const name = token.slice(2);
+    const value = argv[index + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error(`Missing value for --${name}`);
+    }
+
+    args[name] = value;
+    index += 1;
+  }
+
+  return args;
 }
 
-function resolveSource(root, exeName) {
-  const release = path.join(root, "sidecar", "pty-host", "target", "release", exeName);
-  const debug = path.join(root, "sidecar", "pty-host", "target", "debug", exeName);
-
-  if (fs.existsSync(release)) {
-    return release;
-  }
-  if (fs.existsSync(debug)) {
-    return debug;
-  }
-  return undefined;
+function resolveSource(root, target) {
+  const sourcePath = getTargetBinaryPath(root, target);
+  return fs.existsSync(sourcePath) ? sourcePath : undefined;
 }
 
 function stageBinary(src, dst) {
@@ -27,20 +43,44 @@ function stageBinary(src, dst) {
   }
 }
 
+function sha256(filePath) {
+  const hash = crypto.createHash("sha256");
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest("hex");
+}
+
+function verifyStagedBinary(src, dst) {
+  if (!fs.existsSync(dst)) {
+    throw new Error(`Staged sidecar missing at ${dst}`);
+  }
+
+  const sourceHash = sha256(src);
+  const stagedHash = sha256(dst);
+  if (sourceHash !== stagedHash) {
+    throw new Error(
+      `Staged sidecar does not match source binary.\nsource: ${src}\ndestination: ${dst}`
+    );
+  }
+}
+
 function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const target = args.target ?? getDefaultPackageTarget();
+  const sidecarName = getPackageTargetInfo(target).executable;
   const root = path.resolve(__dirname, "..");
   const dstDir = path.join(root, "bundled", "bin");
 
-  const sidecarName = sidecarExeName();
-  const sidecarSrc = resolveSource(root, sidecarName);
+  const sidecarSrc = resolveSource(root, target);
   if (!sidecarSrc) {
-    throw new Error(`Sidecar binary not found in target directories for ${sidecarName}`);
+    throw new Error(`Sidecar binary not found in target directories for ${target}`);
   }
 
   fs.rmSync(dstDir, { recursive: true, force: true });
   const sidecarDst = path.join(dstDir, sidecarName);
   stageBinary(sidecarSrc, sidecarDst);
-  process.stdout.write(`Staged sidecar: ${sidecarDst}\n`);
+  verifyStagedBinary(sidecarSrc, sidecarDst);
+
+  process.stdout.write(`Staged sidecar for ${target}: ${sidecarDst}\n`);
 }
 
 main();

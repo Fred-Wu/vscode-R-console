@@ -13,10 +13,8 @@ import { HistoryManager } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
-import { TerminalState } from "./terminalState";
 import {
   getContinuationPromptLength,
-  getRenderedRowCount,
 } from "./inputViewport";
 import {
   type RTerminalOptions,
@@ -34,13 +32,17 @@ import {
   configureMainPrompt,
   getPromptRenderDelay as getViewPromptRenderDelay,
   getReplyPromptRenderDelay as getViewReplyPromptRenderDelay,
-  replayVisibleScreen as replayViewScreen,
   renderInput as renderViewInput,
 } from "./rTerminal/view";
 import {
+  beginVisibleRuntimeSubmission,
   createRuntimeBackend,
+  enqueueRuntimeSubmission,
+  finishRuntimeSubmission,
   interruptRuntime,
+  type PendingSubmissionEcho,
   type RuntimeHost,
+  startNextRuntimeSubmission,
   type Submission,
   type TerminalMode,
   sendRuntimeReply,
@@ -48,6 +50,8 @@ import {
 } from "./rTerminal/runtime";
 
 export { resolveRTerminalOptions } from "./options";
+
+const VSCODE_R_TERMINAL_NAME = "R Interactive";
 
 class TrackingWriteEmitter extends vscode.EventEmitter<string> {
   constructor(private readonly onFireCallback: (data: string) => void) {
@@ -78,9 +82,6 @@ export class RTerminal implements vscode.Pseudoterminal {
   private rProcess: ChildProcess | null = null;
   private backendChildPid: number | undefined;
   private dimensions: { columns: number; rows: number } = { columns: 80, rows: 24 };
-  private terminalState = new TerminalState(80, 24);
-  private suspendTerminalStateTracking = false;
-  private pendingScreenReplay = false;
 
   private syntax: ConsoleSyntax;
   private renderer: Renderer;
@@ -94,8 +95,6 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private sessionWatcher: SessionWatcher | undefined;
   private sessionAttached = false;
-  private sessionAttachBypassed = false;
-  private attachWaitTimer: NodeJS.Timeout | undefined;
 
   private lang: RTermLang;
 
@@ -122,16 +121,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
-  private pendingSubmissionEcho:
-    | {
-        code: string;
-        rowCount: number;
-        lineCount: number;
-        plainLines: string[];
-        styledLines?: Promise<string[]>;
-        restyleStarted: boolean;
-      }
-    | undefined;
+  private pendingSubmissionEcho: PendingSubmissionEcho | undefined;
 
   private inBracketPaste = false;
   private pasteBuffer = "";
@@ -171,15 +161,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
-    return new TrackingWriteEmitter((data) => {
-      if (this.suspendTerminalStateTracking || !data) {
-        return;
-      }
-      try {
-        this.terminalState.write(data);
-      } catch {
-      }
-    });
+    return new TrackingWriteEmitter(() => {});
   }
 
   private loadSettings(): void {
@@ -239,7 +221,6 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     if (initialDimensions) {
       this.dimensions = initialDimensions;
-      this.terminalState.resize(initialDimensions.columns, initialDimensions.rows);
     }
 
     if (this.options.bracketedPaste) {
@@ -251,19 +232,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const displayPid = this.getDisplayPid();
-    if (displayPid !== undefined) {
-      this.nameEmitter.fire(`R Console (PID: ${displayPid})`);
-    }
-    if (this.pendingScreenReplay) {
-      this.pendingScreenReplay = false;
-      this.replayVisibleScreen();
-      if (!this.promptVisible && this.mode === "ready" && this.promptReady) {
-        this.pendingPromptToken = true;
-        this.schedulePrompt();
-      }
-      return;
-    }
+    this.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
     this.pendingPromptToken = true;
     this.schedulePrompt();
   }
@@ -277,7 +246,6 @@ export class RTerminal implements vscode.Pseudoterminal {
   setDimensions(dimensions: vscode.TerminalDimensions): void {
     const previous = this.dimensions;
     this.dimensions = dimensions;
-    this.terminalState.resize(dimensions.columns, dimensions.rows);
     const changed =
       dimensions.columns !== previous.columns || dimensions.rows !== previous.rows;
 
@@ -285,7 +253,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (this.isSessionProtocolActive()) {
+    if (process.platform !== "win32" && this.isSessionProtocolActive()) {
       this.runtimeBackend?.sendSessionCommand(this.rProcess, {
         type: "set-width",
         columns: dimensions.columns,
@@ -295,8 +263,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (!changed) {
       return;
     }
-
-    this.updatePendingSubmissionMetrics();
 
     if (this.promptVisible && this.inputState.text.length > 0) {
       this.clearInputRender();
@@ -308,26 +274,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (!this.promptVisible && this.mode === "ready" && this.promptReady && this.pendingPromptToken) {
       this.schedulePrompt();
     }
-  }
-
-  private updatePendingSubmissionMetrics(): void {
-    if (!this.pendingSubmissionEcho) {
-      return;
-    }
-
-    this.configureRendererPrompt();
-    const continuationPromptLen = getContinuationPromptLength(
-      this.renderer.promptText,
-      this.renderer.promptLen,
-      this.renderer.continuationPromptText
-    );
-
-    this.pendingSubmissionEcho.rowCount = getRenderedRowCount(
-      this.pendingSubmissionEcho.plainLines,
-      this.dimensions.columns,
-      this.renderer.promptLen,
-      continuationPromptLen
-    );
   }
 
   handleInput(data: string): void {
@@ -384,9 +330,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
       .replace(/^\n+/, "");
+    const trimmed = normalized.replace(/\n+$/, "");
+    if (!trimmed) {
+      return;
+    }
 
-    const stripped = this.stripRComments(normalized);
-    const trimmed = stripped.replace(/\n+$/, "");
     const isComplete = await this.inputState.isExpressionCompleteAsync(trimmed);
     if (!isComplete) {
       this.historyBrowsing = false;
@@ -398,7 +346,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const sanitized = this.stripRComments(trimmed).trimEnd();
+    const sanitized = trimmed.trimEnd();
     if (!sanitized) {
       return;
     }
@@ -774,14 +722,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const cursorAtEnd = this.inputState.text.length === 0 || this.inputState.isAtEnd;
-    const stripped = this.stripRComments(normalized);
-    const trimmed = stripped.replace(/\n+$/, "");
+    const trimmed = normalized.replace(/\n+$/, "");
     const fullText = this.inputState.text + trimmed;
 
     const isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
 
     if ((endsWithNewline || containsNewline) && cursorAtEnd && isComplete) {
-      const submission = this.stripRComments(fullText).trimEnd();
+      const submission = fullText.trimEnd();
       if (submission) {
         this.inputState.reset();
         this.historyBrowsing = false;
@@ -908,7 +855,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const visibleSubmission = stripBracketedPasteMarkers(fullText).trimEnd();
-    const sanitized = this.stripRComments(visibleSubmission).trimEnd();
+    const sanitized = visibleSubmission;
     this.inputState.reset();
     this.historyBrowsing = false;
     this.historyCollapsed = true;
@@ -1007,178 +954,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     startRuntime(this.runtimeHost());
   }
 
-  private onSubmissionStart(task: Submission): void {
-    this.activeSubmission = task;
-    this.startSubmission(task);
-  }
-
-  private startSubmission(task: Submission): void {
-    this.mode = "executing";
-    if (task.alreadyVisible) {
-      this.triggerPendingSubmissionRestyle();
-    } else {
-      this.writeSubmissionEcho(task);
-    }
-    this.runtimeBackend?.sendSessionCommand(this.rProcess, {
-      type: "submit",
-      code: task.code,
-    });
-  }
-
-  private writeSubmissionEcho(task: Submission): void {
-    if ((this.mode !== "ready" && this.mode !== "executing") || !this.promptReady) {
-      return;
-    }
-
-    this.historyBrowsing = false;
-    this.historyCollapsed = true;
-
-    this.configureRendererPrompt();
-
-    if (this.promptVisible || this.inputState.text.length > 0) {
-      this.clearInputRender();
-      this.promptVisible = false;
-    } else {
-      if (this.pendingInitialPromptGap) {
-        if (this.hasReceivedOutput) {
-          this.writeEmitter.fire("\n");
-        }
-        this.lastWriteEndedWithNewline = true;
-        this.pendingInitialPromptGap = false;
-      } else if (!this.lastWriteEndedWithNewline) {
-        this.writeEmitter.fire("\n");
-        this.lastWriteEndedWithNewline = true;
-      }
-    }
-
-    this.clearPromptRenderTimer();
-    this.pendingPromptToken = false;
-    const plainLines = task.code.split("\n");
-    const immediateLines = this.syntax.snapshotNow(plainLines);
-    const rowCount = this.writeSubmissionLines(plainLines, immediateLines);
-    this.pendingSubmissionEcho = task.styledLines
-      ? {
-          code: task.code,
-          rowCount,
-          lineCount: plainLines.length,
-          plainLines,
-          styledLines: task.styledLines,
-          restyleStarted: false,
-        }
-      : undefined;
-    this.promptVisible = false;
-    this.triggerPendingSubmissionRestyle();
-  }
-
-  private writeSubmissionLines(plainLines: string[], styledLines: string[]): number {
-    const continuationPad =
-      this.renderer.promptText === ">>> " ? this.renderer.promptLen : 2;
-    const continuationPromptLen = getContinuationPromptLength(
-      this.renderer.promptText,
-      this.renderer.promptLen,
-      this.renderer.continuationPromptText
-    );
-
-    styledLines.forEach((line, index) => {
-      if (index > 0) {
-        this.writeEmitter.fire("\r\n");
-      }
-      const prompt =
-        index === 0
-          ? `${ANSI.reset}${this.renderer.promptColor}${this.renderer.promptText}${ANSI.reset}`
-          : (this.renderer.continuationPromptText === null
-              ? " ".repeat(continuationPad)
-              : `${ANSI.reset}${this.renderer.continuationPromptColor}${this.renderer.continuationPromptText}${ANSI.reset}`);
-      this.writeEmitter.fire(prompt + line);
-    });
-
-    this.writeEmitter.fire("\r\n");
-    this.lastWriteEndedWithNewline = true;
-    this.renderer.renderedLineCount = 1;
-    this.renderer.cursorRowFromTop = 0;
-
-    return getRenderedRowCount(
-      plainLines,
-      this.dimensions.columns,
-      this.renderer.promptLen,
-      continuationPromptLen
-    );
-  }
-
-  private triggerPendingSubmissionRestyle(): void {
-    const pending = this.pendingSubmissionEcho;
-    if (!pending || !pending.styledLines || pending.restyleStarted) {
-      return;
-    }
-
-    pending.restyleStarted = true;
-    void this.restyleSubmissionEcho(pending.code);
-  }
-
-  private async restyleSubmissionEcho(expectedCode: string): Promise<void> {
-    const pending = this.pendingSubmissionEcho;
-    if (!pending || !pending.styledLines || pending.code !== expectedCode) {
-      return;
-    }
-
-    const styledLines = await pending.styledLines;
-    const latest = this.pendingSubmissionEcho;
-    if (
-      !styledLines ||
-      !latest ||
-      latest.code !== expectedCode ||
-      latest.lineCount !== pending.lineCount
-    ) {
-      return;
-    }
-
-    const restoreReplyPrompt = this.promptVisible && this.mode === "reply";
-    const restoreMainPrompt =
-      this.promptVisible &&
-      this.mode === "ready" &&
-      this.promptReady &&
-      this.isSessionReadyForPrompt();
-
-    if (this.promptVisible) {
-      this.clearInputRender();
-      this.promptVisible = false;
-    }
-
-    this.writeEmitter.fire("\r");
-    if (latest.rowCount > 0) {
-      this.writeEmitter.fire(`\x1b[${latest.rowCount}A`);
-    }
-
-    for (let row = 0; row < latest.rowCount; row += 1) {
-      this.writeEmitter.fire("\x1b[2K");
-      if (row < latest.rowCount - 1) {
-        this.writeEmitter.fire("\x1b[1B\r");
-      }
-    }
-
-    if (latest.rowCount > 1) {
-      this.writeEmitter.fire(`\x1b[${latest.rowCount - 1}A\r`);
-    } else {
-      this.writeEmitter.fire("\r");
-    }
-
-    this.writeSubmissionLines(latest.plainLines, styledLines);
-    this.pendingSubmissionEcho = undefined;
-
-    if (restoreReplyPrompt) {
-      this.showReplyPrompt();
-      return;
-    }
-
-    if (restoreMainPrompt) {
-      this.showPrompt();
-    }
-  }
-
   finishActiveSubmission(): void {
-    this.activeSubmission = null;
-    this.mode = "ready";
-    void this.lang.refreshCompletionContextDocument(this.inputState.text);
+    finishRuntimeSubmission(this.runtimeHost());
   }
 
   private async enqueueRSubmission(
@@ -1186,106 +963,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     skipSplit: boolean = false,
     alreadyVisible: boolean = false
   ): Promise<void> {
-    const blocks = skipSplit
-      ? [this.normalizeSubmissionBlock(code)]
-      : await this.splitSubmissionBlocks(code);
-
-    if (blocks.length === 0) {
-      if (alreadyVisible && this.activeSubmission === null) {
-        this.mode = "ready";
-        this.pendingPromptToken = true;
-        this.schedulePrompt();
-      }
-      return;
-    }
-
-    for (const block of blocks) {
-      this.lang.trackPendingLibraries(block);
-      this.submissionQueue.push({
-        code: block,
-        alreadyVisible,
-        styledLines: alreadyVisible ? undefined : this.syntax.prepareSnapshot(block),
-      });
-    }
-
-    void this.lang.refreshCompletionContextDocument(this.inputState.text);
-    this.startNextSubmission();
-  }
-
-  private normalizeSubmissionBlock(code: string): string {
-    return this.stripRComments(code).replace(/\n+$/, "").trimEnd();
-  }
-
-  private async splitSubmissionBlocks(code: string): Promise<string[]> {
-    const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const lines = normalized.split("\n");
-    const blocks: string[] = [];
-    let currentBlock = "";
-
-    for (const line of lines) {
-      currentBlock = currentBlock.length > 0 ? `${currentBlock}\n${line}` : line;
-      const normalizedBlock = this.normalizeSubmissionBlock(currentBlock);
-
-      if (!normalizedBlock.trim()) {
-        continue;
-      }
-
-      const isComplete = await this.inputState.isExpressionCompleteAsync(normalizedBlock);
-      if (!isComplete) {
-        continue;
-      }
-
-      blocks.push(normalizedBlock);
-      currentBlock = "";
-    }
-
-    const trailingBlock = this.normalizeSubmissionBlock(currentBlock);
-    if (trailingBlock.trim()) {
-      blocks.push(trailingBlock);
-    }
-
-    return blocks;
+    await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, alreadyVisible);
   }
 
   private startNextSubmission(): void {
-    if (this.mode !== "ready" && !(this.mode === "executing" && this.activeSubmission === null)) {
-      return;
-    }
-    if (this.activeSubmission) {
-      return;
-    }
-    const task = this.submissionQueue.shift();
-    if (!task) {
-      return;
-    }
-    this.onSubmissionStart(task);
-  }
-
-  private beginVisibleSubmission(visibleCode: string): void {
-    const plainLines = visibleCode.split("\n");
-    this.configureRendererPrompt();
-
-    if (this.promptVisible || this.inputState.text.length > 0) {
-      this.clearInputRender();
-      this.promptVisible = false;
-    }
-
-    this.clearPromptRenderTimer();
-    this.pendingPromptToken = false;
-    const immediateLines = this.syntax.highlightLines(plainLines);
-    const rowCount = this.writeSubmissionLines(plainLines, immediateLines);
-    this.pendingSubmissionEcho = {
-      code: visibleCode,
-      rowCount,
-      lineCount: plainLines.length,
-      plainLines,
-      styledLines: this.syntax.prepareSnapshot(plainLines),
-      restyleStarted: false,
-    };
-    this.triggerPendingSubmissionRestyle();
-
-    this.inputState.reset();
-    this.mode = "executing";
+    startNextRuntimeSubmission(this.runtimeHost());
   }
 
   private sendReadlineReply(text: string): void {
@@ -1446,25 +1128,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.promptVisible = true;
   }
 
-  private replayVisibleScreen(): void {
-    this.suspendTerminalStateTracking = true;
-    try {
-      replayViewScreen({
-        write: (text) => {
-          this.writeEmitter.fire(text);
-        },
-        terminalState: this.terminalState,
-        dimensions: this.dimensions,
-        rerenderInput: () => {
-          this.renderInput();
-        },
-        restoreInput: this.promptVisible || this.inputState.text.length > 0,
-      });
-    } finally {
-      this.suspendTerminalStateTracking = false;
-    }
-  }
-
   private clearInputRender(): void {
     clearViewInputRender(
       (text) => {
@@ -1485,12 +1148,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     });
   }
 
+  private beginVisibleSubmission(visibleCode: string): void {
+    beginVisibleRuntimeSubmission(this.runtimeHost(), visibleCode);
+  }
+
   private refreshSyntax(): void {
     this.syntax.setSource(this.inputState.lines);
   }
 
   sendCode(code: string): void {
-    const sanitized = this.stripRComments(stripBracketedPasteMarkers(code)).trimEnd();
+    const sanitized = stripBracketedPasteMarkers(code).trimEnd();
     if (!sanitized) {
       return;
     }
@@ -1503,19 +1170,6 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.rHistory.push(sanitized);
     void this.enqueueRSubmission(sanitized, false);
-  }
-
-  private stripRComments(code: string): string {
-    const lines = code.split(/\r?\n/);
-    const kept: string[] = [];
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("#")) {
-        continue;
-      }
-      kept.push(line);
-    }
-    return kept.join("\n");
   }
 
   private saveHistory(): void {
@@ -1634,13 +1288,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
 
-    if (this.attachWaitTimer) {
-      clearInterval(this.attachWaitTimer);
-      this.attachWaitTimer = undefined;
-    }
-
     this.sessionAttached = false;
-    this.sessionAttachBypassed = false;
     this.lang.clearPendingLibraries();
     this.lang.stopConsoleLsp();
     setNativeParseCallback(null);
@@ -1673,7 +1321,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.replyPromptText = "";
   }
 
-  prepareForReattach(): void {
+  reattachToNewTerminal(): void {
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
     this.writeEmitter.dispose();
@@ -1682,7 +1330,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.writeEmitter = this.createWriteEmitter();
     this.closeEmitter = new vscode.EventEmitter<number>();
     this.nameEmitter = new vscode.EventEmitter<string>();
-    this.pendingScreenReplay = true;
   }
 
   isRunning(): boolean {
@@ -1711,6 +1358,5 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
-    this.terminalState.dispose();
   }
 }

@@ -101,18 +101,18 @@ function isBackendCapability(value: string): value is BackendCapability {
   );
 }
 
-function parseU32(payload: Buffer, offset: number): number {
-  if (offset + 4 > payload.length) {
-    throw new Error("truncated u32");
-  }
-  return payload.readUInt32LE(offset);
-}
-
 function parseI32(payload: Buffer, offset: number): number {
   if (offset + 4 > payload.length) {
     throw new Error("truncated i32");
   }
   return payload.readInt32LE(offset);
+}
+
+function parseU32(payload: Buffer, offset: number): number {
+  if (offset + 4 > payload.length) {
+    throw new Error("truncated u32");
+  }
+  return payload.readUInt32LE(offset);
 }
 
 function parseString(

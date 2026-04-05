@@ -49,6 +49,7 @@ export class SessionWatcher {
   private workspaceWatcher: fs.FSWatcher | undefined;
   private sessionDirWatcher: fs.FSWatcher | undefined;
   private startedAt = Date.now();
+  private onAttachCallback: (() => void) | undefined;
   private onChangeCallback: ((data: WorkspaceData | undefined) => void) | undefined;
   private expectedPid: number | undefined;
   private expectedPidAutoPinned = false;
@@ -160,6 +161,16 @@ export class SessionWatcher {
     this.updateWorkspace();
   }
 
+  /**
+   * Register a callback invoked immediately when a new R session attaches
+   * (i.e. when request.log is processed with command="attach" and a new
+   * session directory is established). Fires before workspace data is loaded,
+   * so the prompt gate can open without waiting for the 100ms poll timer.
+   */
+  onAttach(callback: () => void): void {
+    this.onAttachCallback = callback;
+  }
+
   onChange(callback: (data: WorkspaceData | undefined) => void): void {
     this.onChangeCallback = callback;
   }
@@ -217,6 +228,9 @@ export class SessionWatcher {
       }
       this.sessionDir = nextSessionDir;
       this.workspaceData = undefined;
+      // isAttached() is now true — notify immediately so the prompt gate can
+      // open without waiting for the next 100ms poll tick.
+      this.onAttachCallback?.();
       this.startWorkspaceWatcher();
     } catch {
       // Ignore malformed request files

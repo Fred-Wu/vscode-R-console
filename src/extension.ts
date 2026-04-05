@@ -1,8 +1,16 @@
 import * as vscode from "vscode";
-import { RTerminal, resolveRTerminalOptions } from "./Terminal/rTerminal";
+import {
+  RTerminal,
+  resolveRTerminalOptions,
+} from "./Terminal/rTerminal";
+import {
+  discoverRBinaryPath,
+  getPlatformRPathConfigEntry,
+} from "./Terminal/options";
 
 const terminalToRTerminal: Map<vscode.Terminal, RTerminal> = new Map();
 const rTerminalToContext: Map<RTerminal, { inSideEditor: boolean }> = new Map();
+const VSCODE_R_TERMINAL_NAME = "R Interactive";
 
 function isVirtualWorkspace(): boolean {
   const folders = vscode.workspace.workspaceFolders;
@@ -33,6 +41,8 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  void ensureConfiguredRPath();
 }
 
 async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<void> {
@@ -60,7 +70,7 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
 
   const ctx = rTerminalToContext.get(rTerminal);
   if (ctx && rTerminal.isRunning()) {
-    recreateTerminal(rTerminal, ctx.inSideEditor);
+    reattachRunningTerminal(rTerminal, ctx.inSideEditor);
   } else {
     rTerminalToContext.delete(rTerminal);
     rTerminal.forceClose();
@@ -93,8 +103,24 @@ function createRTerminal(context: vscode.ExtensionContext, inSideEditor: boolean
   attachTerminal(rTerminal, inSideEditor);
 }
 
-function recreateTerminal(rTerminal: RTerminal, inSideEditor: boolean): void {
-  rTerminal.prepareForReattach();
+async function ensureConfiguredRPath(): Promise<void> {
+  const config = vscode.workspace.getConfiguration("r");
+  const configEntry = getPlatformRPathConfigEntry();
+  const configured = (config.get<string>(configEntry) || "").trim();
+  if (configured.length > 0) {
+    return;
+  }
+
+  const discovered = discoverRBinaryPath();
+  if (!discovered) {
+    return;
+  }
+
+  await config.update(configEntry, discovered, vscode.ConfigurationTarget.Global);
+}
+
+function reattachRunningTerminal(rTerminal: RTerminal, inSideEditor: boolean): void {
+  rTerminal.reattachToNewTerminal();
   attachTerminal(rTerminal, inSideEditor, true);
 }
 
@@ -103,11 +129,8 @@ function attachTerminal(
   inSideEditor: boolean,
   isReattach: boolean = false
 ): void {
-  const pid = rTerminal.getPid();
-  const terminalName = pid ? `R Console (PID: ${pid})` : "R Console";
-  
   const terminalOptions: vscode.ExtensionTerminalOptions = {
-    name: terminalName,
+    name: VSCODE_R_TERMINAL_NAME,
     pty: rTerminal,
     iconPath: new vscode.ThemeIcon("terminal")
   };

@@ -167,6 +167,12 @@ export class RTermLang {
     this.pendingLibraryPackages.clear();
   }
 
+  resetSessionContext(): void {
+    this.cachedLibraryContent = "";
+    this.cachedSearchPackages = [];
+    this.pendingLibraryPackages.clear();
+  }
+
   async requestSemanticTokens(
     content: string
   ): Promise<DocumentSemanticTokensResult | undefined> {
@@ -328,7 +334,6 @@ export class RTermLang {
 
     return `${this.cachedLibraryContent}${extraLines.join("\n")}\n`;
   }
-
   private arraysEqual(a: string[], b: string[]): boolean {
     if (a.length !== b.length) {
       return false;

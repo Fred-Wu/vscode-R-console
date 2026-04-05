@@ -9,7 +9,6 @@ import {
   shouldRenderCollapsed,
 } from "../inputViewport";
 import { Renderer } from "../renderer";
-import { TerminalState } from "../terminalState";
 
 type Dimensions = {
   columns: number;
@@ -23,14 +22,6 @@ type RenderInputOptions = {
   dimensions: Dimensions;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
-};
-
-type ReplayOptions = {
-  write: (text: string) => void;
-  terminalState: TerminalState;
-  dimensions: Dimensions;
-  rerenderInput: () => void;
-  restoreInput: boolean;
 };
 
 export function configureMainPrompt(renderer: Renderer): void {
@@ -66,40 +57,6 @@ export function clearInputRender(
 
   renderer.renderedLineCount = 1;
   renderer.cursorRowFromTop = 0;
-}
-
-export function replayVisibleScreen({
-  write,
-  terminalState,
-  dimensions,
-  rerenderInput,
-  restoreInput,
-}: ReplayOptions): void {
-  const viewport = terminalState.getStyledViewport(dimensions.rows);
-  const lastVisibleRow = Math.max(
-    viewport.cursorRow,
-    viewport.lines.reduceRight((found, line, index) => {
-      return found >= 0 || line.length > 0 ? Math.max(found, index) : -1;
-    }, -1)
-  );
-  const linesToReplay = viewport.lines.slice(0, Math.max(0, lastVisibleRow + 1));
-  const targetRow = Math.max(1, Math.min(dimensions.rows, viewport.cursorRow + 1));
-  const targetCol = Math.max(1, Math.min(dimensions.columns, viewport.cursorCol + 1));
-
-  write("\x1b[2J\x1b[H\x1b[?7l");
-  for (let index = 0; index < linesToReplay.length; index += 1) {
-    const line = linesToReplay[index] ?? "";
-    write(`\x1b[${index + 1};1H`);
-    if (line.length > 0) {
-      write(line);
-    }
-  }
-  write("\x1b[?7h");
-  write(`\x1b[${targetRow};${targetCol}H`);
-
-  if (restoreInput) {
-    rerenderInput();
-  }
 }
 
 export function renderInput({

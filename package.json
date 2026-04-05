@@ -32,7 +32,13 @@
     "statistics",
     "data-science"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished",
+    "onLanguage:r",
+    "onLanguage:rmd",
+    "onCommand:r-console.createTerminal",
+    "onCommand:r-console.createTerminalSide"
+  ],
   "main": "./dist/extension.js",
   "capabilities": {
     "untrustedWorkspaces": {
@@ -78,7 +84,7 @@
   ],
   "scripts": {
     "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",
-    "build:sidecar": "cargo build --manifest-path sidecar/pty-host/Cargo.toml --release --bin R_CONSOLE_HOST",
+    "build:sidecar": "node scripts/build-sidecar.js",
     "stage:sidecar": "node scripts/stage-sidecar.js",
     "check-types": "tsc --noEmit -p ./",
     "compile": "npm run check-types && node esbuild.js",
@@ -88,9 +94,9 @@
     "package": "npm run vscode:prepublish && npm run package:vsix"
   },
   "devDependencies": {
-    "@vscode/vsce": "^3.7.1",
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.7.1",
     "esbuild": "^0.27.4",
     "typescript": "^5.3.0"
   },

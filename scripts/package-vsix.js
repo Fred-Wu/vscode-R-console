@@ -1,6 +1,10 @@
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const {
+  getDefaultPackageTarget,
+  getPackageTargetInfo,
+} = require("./sidecar-targets");
 
 function parseArgs(argv) {
   const args = {};
@@ -24,50 +28,11 @@ function parseArgs(argv) {
   return args;
 }
 
-function getDefaultTarget() {
-  if (process.platform === "win32") {
-    if (process.arch === "x64") {
-      return { target: "win32-x64" };
-    }
-    if (process.arch === "arm64") {
-      return { target: "win32-arm64" };
-    }
+function resolveBundledSidecarSource(root, sidecarName) {
+  const bundledSidecar = path.join(root, "bundled", "bin", sidecarName);
+  if (fs.existsSync(bundledSidecar)) {
+    return bundledSidecar;
   }
-
-  if (process.platform === "darwin") {
-    if (process.arch === "x64") {
-      return { target: "darwin-x64" };
-    }
-    if (process.arch === "arm64") {
-      return { target: "darwin-arm64" };
-    }
-  }
-
-  if (process.platform === "linux" && process.arch === "x64") {
-    return { target: "linux-x64" };
-  }
-
-  throw new Error(
-    `Unsupported host platform for packaging: ${process.platform}-${process.arch}`
-  );
-}
-
-function getSidecarName(target) {
-  return target.startsWith("win32") ? "R_CONSOLE_HOST.exe" : "R_CONSOLE_HOST";
-}
-
-function resolveSidecarSource(root, sidecarName) {
-  const candidates = [
-    path.join(root, "sidecar", "pty-host", "target", "release", sidecarName),
-    path.join(root, "bundled", "bin", sidecarName),
-  ];
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
   return undefined;
 }
 
@@ -116,18 +81,7 @@ function getDefaultOutputPath(root, target) {
 }
 
 function runVsce(stageDir, target, outputPath) {
-  const vsceEntrypoint = path.join(
-    __dirname,
-    "..",
-    "node_modules",
-    "@vscode",
-    "vsce",
-    "vsce"
-  );
-  if (!fs.existsSync(vsceEntrypoint)) {
-    throw new Error(`vsce entrypoint not found at ${vsceEntrypoint}. Run npm install first.`);
-  }
-
+  const vsceEntrypoint = require.resolve("@vscode/vsce/vsce");
   const result = spawnSync(
     process.execPath,
     [
@@ -157,24 +111,25 @@ function runVsce(stageDir, target, outputPath) {
 function main() {
   const root = path.resolve(__dirname, "..");
   const args = parseArgs(process.argv.slice(2));
-  const defaults = getDefaultTarget();
-  const target = args.target ?? defaults.target;
+  const target = args.target ?? getDefaultPackageTarget();
+  const targetInfo = getPackageTargetInfo(target);
 
   const bundlePath = path.join(root, "dist", "extension.js");
   if (!fs.existsSync(bundlePath)) {
     throw new Error(`Extension bundle not found at ${bundlePath}. Run npm run package:extension first.`);
   }
 
-  const sidecarName = getSidecarName(target);
-  const sidecarSource = resolveSidecarSource(root, sidecarName);
+  const sidecarName = targetInfo.executable;
+  const sidecarSource = resolveBundledSidecarSource(root, sidecarName);
   if (!sidecarSource) {
     throw new Error(
-      `Sidecar executable not found for ${target}. Run npm run build:sidecar first.`
+      `Bundled sidecar not found for ${target}. Run node scripts/stage-sidecar.js --target ${target} first.`
     );
   }
 
   const outputPath = path.resolve(root, args.output ?? getDefaultOutputPath(root, target));
   const stageDir = path.join(root, ".vsix-stage");
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 
   createStage(root, stageDir, sidecarSource, sidecarName);
 

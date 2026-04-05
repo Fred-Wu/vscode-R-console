@@ -143,7 +143,9 @@ export class SyntaxTheme {
       key: themeKey,
       rules: loaded.rules,
       semanticRules: loaded.semanticRules,
-      defaultTextAnsi: loaded.defaultForeground ? ansiFromHex(loaded.defaultForeground) : FALLBACK_TEXT_ANSI,
+      defaultTextAnsi: loaded.defaultForeground
+        ? ansiFromHex(loaded.defaultForeground)
+        : FALLBACK_TEXT_ANSI,
     };
     return this.current;
   }

@@ -144,7 +144,9 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     }
 
     if (sourceKey === this.sourceKey && this.exactSemanticKey === sourceKey) {
-      return Promise.resolve(lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? [])));
+      return Promise.resolve(
+        lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? []))
+      );
     }
 
     return this.buildSnapshot(lines, sourceKey);
@@ -171,7 +173,10 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     return lines.map((line, index) => this.applyStyles(line, styles[index] ?? []));
   }
 
-  private async applyCurrentSemantic(sourceKey: string, requestVersion: number): Promise<void> {
+  private async applyCurrentSemantic(
+    sourceKey: string,
+    requestVersion: number
+  ): Promise<void> {
     const semanticTokens = await this.getSemanticTokens(sourceKey);
     if (
       !semanticTokens ||
@@ -188,7 +193,9 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     this.onDidChange();
   }
 
-  private async getSemanticTokens(sourceKey: string): Promise<DocumentSemanticTokensResult | undefined> {
+  private async getSemanticTokens(
+    sourceKey: string
+  ): Promise<DocumentSemanticTokensResult | undefined> {
     const cached = this.semanticCache.get(sourceKey);
     if (cached) {
       return cached;
@@ -236,7 +243,10 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     return lines.map((line) => lexLine(line, defaultAnsi, palette));
   }
 
-  private applySemanticStyles(styles: string[][], semanticTokens: DocumentSemanticTokensResult): void {
+  private applySemanticStyles(
+    styles: string[][],
+    semanticTokens: DocumentSemanticTokensResult
+  ): void {
     let line = 0;
     let char = 0;
 
@@ -339,17 +349,6 @@ function lexLine(
       break;
     }
 
-    if ((char === "r" || char === "R") && index + 1 < line.length) {
-      const rawStringEnd = findRawStringEnd(line, index);
-      if (rawStringEnd !== null) {
-        for (let cursor = index; cursor < rawStringEnd; cursor += 1) {
-          styles[cursor] = palette.string;
-        }
-        index = Math.max(index + 1, rawStringEnd);
-        continue;
-      }
-    }
-
     if (char === "\"" || char === "'" || char === "`") {
       const quote = char;
       let end = index + 1;
@@ -437,7 +436,14 @@ function preserveUnchangedStyles(
   for (let offset = 0; offset < suffixLineCount; offset += 1) {
     const previousIndex = previousLines.length - suffixLineCount + offset;
     const nextIndex = nextLines.length - suffixLineCount + offset;
-    copyWholeLineStyle(previousLines, previousStyles, nextLines, nextStyles, previousIndex, nextIndex);
+    copyWholeLineStyle(
+      previousLines,
+      previousStyles,
+      nextLines,
+      nextStyles,
+      previousIndex,
+      nextIndex
+    );
   }
 }
 
@@ -452,7 +458,12 @@ function copyWholeLineStyle(
   const previousStyle = previousStyles[previousIndex];
   const previousLine = previousLines[previousIndex];
   const nextLine = nextLines[nextIndex];
-  if (!previousStyle || previousLine === undefined || nextLine === undefined || previousLine.length !== nextLine.length) {
+  if (
+    !previousStyle ||
+    previousLine === undefined ||
+    nextLine === undefined ||
+    previousLine.length !== nextLine.length
+  ) {
     return;
   }
   nextStyles[nextIndex] = previousStyle.slice();
@@ -498,57 +509,6 @@ function isNumberStart(line: string, index: number): boolean {
 
 function isOperatorChar(char: string): boolean {
   return /[+\-*/^<>=!$@~:%&|]/.test(char);
-}
-
-function findRawStringEnd(line: string, start: number): number | null {
-  const quote = line[start + 1];
-  if (quote !== "\"" && quote !== "'") {
-    return null;
-  }
-
-  let index = start + 2;
-  let delimiter = "";
-  if (index < line.length) {
-    const marker = line[index];
-    if (marker === "(" || marker === "[" || marker === "{") {
-      delimiter = marker;
-      index += 1;
-    } else if (marker === "-") {
-      while (index < line.length && line[index] === "-") {
-        delimiter += "-";
-        index += 1;
-      }
-    }
-  }
-
-  const closeDelimiter =
-    delimiter === "("
-      ? ")"
-      : delimiter === "["
-        ? "]"
-        : delimiter === "{"
-          ? "}"
-          : delimiter;
-
-  while (index < line.length) {
-    if (!delimiter) {
-      if (line[index] === quote) {
-        return index + 1;
-      }
-      index += 1;
-      continue;
-    }
-
-    if (line.startsWith(closeDelimiter, index)) {
-      const closingSequence = `${closeDelimiter}${quote}`;
-      if (line.startsWith(closingSequence, index)) {
-        return index + closingSequence.length;
-      }
-    }
-    index += 1;
-  }
-
-  return line.length;
 }
 
 function sharedPrefixLineCount(previousLines: string[], nextLines: string[]): number {

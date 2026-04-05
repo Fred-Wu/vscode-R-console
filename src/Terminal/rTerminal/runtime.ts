@@ -1,32 +1,39 @@
 import * as vscode from "vscode";
 import type { ChildProcess } from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 import { setNativeParseCallback } from "../../Language/parser";
 import { type BackendControlEvent } from "../../Runtime/backendProtocol";
 import {
-  getRustSidecarCandidates,
+  getBundledRustSidecarPath,
   resolveRustSidecarPath,
   RuntimeBackend,
   RustSidecarRuntimeBackend,
 } from "../../Runtime/runtimeBackend";
 import type { SessionWatcher, WorkspaceData } from "../../Runtime/sessionWatcher";
 import { ANSI, stripBracketedPasteMarkers } from "../ansi";
+import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
 import {
-  configureEmbeddedRRuntimeEnv,
+  getContinuationPromptLength,
+  getRenderedRowCount,
+} from "../inputViewport";
+import {
   type RTerminalOptions,
-  resolveRHome,
 } from "../options";
 import { Renderer } from "../renderer";
-import { TerminalState } from "../terminalState";
 import { RTermLang } from "./lang";
-import { formatTerminalOutput as formatViewOutput } from "./view";
+import {
+  configureMainPrompt,
+  formatTerminalOutput as formatViewOutput,
+} from "./view";
+
+const VSCODE_R_TERMINAL_NAME = "R Interactive";
 
 type Dimensions = {
   columns: number;
   rows: number;
 };
-
-const SESSION_ATTACH_TIMEOUT_MS = 4000;
 
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
@@ -36,6 +43,15 @@ export type Submission = {
   styledLines?: Promise<string[]>;
 };
 
+export type PendingSubmissionEcho = {
+  code: string;
+  rowCount: number;
+  lineCount: number;
+  plainLines: string[];
+  styledLines?: Promise<string[]>;
+  restyleStarted: boolean;
+};
+
 export type RuntimeHost = {
   options: RTerminalOptions;
   extensionPath: string;
@@ -43,8 +59,6 @@ export type RuntimeHost = {
   rProcess: ChildProcess | null;
   backendChildPid: number | undefined;
   dimensions: Dimensions;
-  terminalState: TerminalState;
-  pendingScreenReplay: boolean;
   mode: TerminalMode;
   promptReady: boolean;
   promptKind: "main" | "cont";
@@ -55,14 +69,15 @@ export type RuntimeHost = {
   lastWriteEndedWithNewline: boolean;
   hasReceivedOutput: boolean;
   sessionAttached: boolean;
-  sessionAttachBypassed: boolean;
   sessionHostConnected: boolean;
-  attachWaitTimer: NodeJS.Timeout | undefined;
-  pendingSubmissionEcho: unknown;
   activeSubmission: Submission | null;
   submissionQueue: Submission[];
+  pendingSubmissionEcho: PendingSubmissionEcho | undefined;
+  historyBrowsing: boolean;
+  historyCollapsed: boolean;
   sessionWatcher: SessionWatcher | undefined;
   inputState: InputState;
+  syntax: ConsoleSyntax;
   renderer: Renderer;
   lang: RTermLang;
   writeEmitter: vscode.EventEmitter<string>;
@@ -95,11 +110,15 @@ export function createRuntimeBackend(
   return undefined;
 }
 
+function getBundledConsoleProfilePath(extensionPath: string): string {
+  return path.join(extensionPath, "bundled", "r", "console-profile.R");
+}
+
 export function startRuntime(host: RuntimeHost): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.lang.stopConsoleLsp();
-  host.pendingScreenReplay = false;
+  host.lang.resetSessionContext();
   host.pendingPromptToken = true;
   host.mode = "starting";
   host.promptReady = false;
@@ -113,20 +132,13 @@ export function startRuntime(host: RuntimeHost): void {
   host.lang.clearPendingLibraries();
   host.submissionQueue = [];
   host.activeSubmission = null;
-  host.terminalState.reset();
-  host.terminalState.resize(host.dimensions.columns, host.dimensions.rows);
   host.backendChildPid = undefined;
-  host.sessionAttachBypassed = false;
+  host.sessionAttached = false;
   host.sessionHostConnected = false;
 
   if (!host.runtimeBackend) {
-    const candidates = host.extensionPath ? getRustSidecarCandidates(host.extensionPath) : [];
-    const details =
-      candidates.length > 0
-        ? `\r\nTried sidecar paths:\r\n${candidates
-            .map((candidate) => `- ${candidate}`)
-            .join("\r\n")}`
-        : "";
+    const expectedPath = host.extensionPath ? getBundledRustSidecarPath(host.extensionPath) : "";
+    const details = expectedPath ? `\r\nExpected bundled sidecar:\r\n- ${expectedPath}` : "";
     host.writeEmitter.fire(
       `${ANSI.red}Failed to start R: sidecar backend not found.${ANSI.reset}${details}\r\n`
     );
@@ -135,20 +147,21 @@ export function startRuntime(host: RuntimeHost): void {
   }
 
   try {
-    const args = [...host.options.rArgs];
+    const args = [host.options.consolePath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
     if (host.extensionPath) {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
       runtimeEnv.VSC_R_COLS = String(Math.max(20, host.dimensions.columns || 80));
       runtimeEnv.VSC_R_ROWS = String(Math.max(5, host.dimensions.rows || 24));
+      const consoleProfilePath = getBundledConsoleProfilePath(host.extensionPath);
+      if (!fs.existsSync(consoleProfilePath)) {
+        throw new Error(`Console bootstrap script not found at ${consoleProfilePath}`);
+      }
+      runtimeEnv.R_PROFILE_USER = consoleProfilePath;
     }
-    const rHome = resolveRHome(host.options.rPath);
-    if (rHome) {
-      configureEmbeddedRRuntimeEnv(runtimeEnv, rHome);
+    if (host.options.cwd) {
+      runtimeEnv.VSC_R_SESSION_CWD = host.options.cwd;
     }
-    const originalProfileUser =
-      runtimeEnv.R_PROFILE_USER ?? process.env.R_PROFILE_USER ?? "";
-    runtimeEnv.R_PROFILE_USER_ORIG = originalProfileUser;
 
     host.rProcess = host.runtimeBackend.start(args, {
       cwd: host.options.cwd,
@@ -181,10 +194,7 @@ export function startRuntime(host: RuntimeHost): void {
       },
     });
 
-    const displayPid = host.getDisplayPid();
-    if (displayPid !== undefined) {
-      host.nameEmitter.fire(`R Console (PID: ${displayPid})`);
-    }
+    host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
     if (!host.options.sessionWatcherEnabled) {
       host.sessionAttached = true;
     }
@@ -199,81 +209,31 @@ export function startRuntime(host: RuntimeHost): void {
   }
 }
 
-function waitForRuntimeAttach(host: RuntimeHost): void {
+function beginRuntimeAttach(host: RuntimeHost): void {
   if (!host.sessionWatcher) {
     host.sessionAttached = true;
-    host.sessionAttachBypassed = false;
     return;
   }
+
+  host.sessionWatcher.onAttach(() => onRuntimeAttached(host));
+  host.sessionWatcher.start();
   host.sessionWatcher.refresh();
   if (host.sessionWatcher.isAttached()) {
     onRuntimeAttached(host);
-    return;
-  }
-  if (host.attachWaitTimer) {
-    clearInterval(host.attachWaitTimer);
-  }
-  const attachStartedAt = Date.now();
-  host.attachWaitTimer = setInterval(() => {
-    host.sessionWatcher?.refresh();
-    if (host.sessionWatcher?.isAttached()) {
-      onRuntimeAttached(host);
-      return;
-    }
-    if (
-      !host.sessionAttachBypassed &&
-      Date.now() - attachStartedAt >= SESSION_ATTACH_TIMEOUT_MS
-    ) {
-      releasePromptGateWithoutSessionAttach(host);
-      return;
-    }
-  }, 100);
-}
-
-function releasePromptGateWithoutSessionAttach(host: RuntimeHost): void {
-  if (host.sessionAttached || host.sessionAttachBypassed) {
-    return;
-  }
-
-  host.sessionAttachBypassed = true;
-  host.sessionAttached = true;
-  host.writeEmitter.fire(
-    `${ANSI.yellow}vscode-R session watcher did not attach; session-backed features are unavailable.${ANSI.reset}\r\n`
-  );
-  host.recordOutputActivity();
-
-  if (host.mode === "starting" && host.promptReady) {
-    host.mode = "ready";
-  }
-
-  if (host.mode === "ready" && host.promptReady) {
-    host.pendingPromptToken = true;
-    host.schedulePrompt();
-    if (host.activeSubmission === null && host.promptKind === "main") {
-      host.startNextSubmission();
-    }
   }
 }
 
 function onRuntimeAttached(host: RuntimeHost): void {
-  if (host.sessionAttached && !host.sessionAttachBypassed) {
+  if (host.sessionAttached) {
     return;
   }
-  if (host.attachWaitTimer) {
-    clearInterval(host.attachWaitTimer);
-    host.attachWaitTimer = undefined;
-  }
   host.sessionAttached = true;
-  host.sessionAttachBypassed = false;
   if (!host.isTrueTerminalBackendConfigured()) {
     host.promptReady = true;
     host.pendingPromptToken = true;
   }
   host.onSessionDataChanged(host.sessionWatcher?.getWorkspaceData());
-  const displayPid = host.getDisplayPid();
-  if (displayPid !== undefined) {
-    host.nameEmitter.fire(`R Console (PID: ${displayPid})`);
-  }
+  host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
   if (host.mode === "starting") {
     if (!host.isTrueTerminalBackendConfigured() || host.promptReady) {
       host.mode = "ready";
@@ -309,15 +269,13 @@ export function handleRuntimeControl(
     case "child-spawned":
       if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
         host.backendChildPid = event.pid;
-        host.nameEmitter.fire(`R Console (PID: ${event.pid})`);
+        host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
         if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
           host.sessionWatcher.setExpectedPid(event.pid);
-          host.sessionWatcher.start();
-          waitForRuntimeAttach(host);
+          beginRuntimeAttach(host);
         }
       } else if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
-        host.sessionWatcher.start();
-        waitForRuntimeAttach(host);
+        beginRuntimeAttach(host);
       }
       return;
     case "prompt":
@@ -403,8 +361,8 @@ export function handleBackendInputRequest(
   host: RuntimeHost,
   prompt: string
 ): void {
-  host.pendingSubmissionEcho = undefined;
   const { prelude, inlinePrompt } = splitReplyPrompt(prompt);
+  host.pendingSubmissionEcho = undefined;
   host.replyPromptText = inlinePrompt;
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
@@ -449,6 +407,7 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
     return;
   }
 
+  host.pendingSubmissionEcho = undefined;
   const shouldRestoreReplyPrompt = host.mode === "reply";
   const shouldRestoreReadyPrompt =
     host.mode === "ready" &&
@@ -456,7 +415,6 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
     (host.pendingPromptToken || host.promptVisible || host.inputState.text.length > 0);
   const formatted = formatViewOutput(text);
   host.recordOutputActivity();
-  host.pendingSubmissionEcho = undefined;
   if (host.promptVisible || host.inputState.text.length > 0) {
     host.clearInputRender();
     host.promptVisible = false;
@@ -480,13 +438,13 @@ export function handleRuntimeError(host: RuntimeHost, error: string): void {
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
   const rawFormatted = stripBracketedPasteMarkers(error.replace(/\r?\n/g, "\r\n"));
+  host.pendingSubmissionEcho = undefined;
   const shouldRestoreReplyPrompt = host.mode === "reply";
   const shouldRestoreReadyPrompt =
     host.mode === "ready" &&
     host.promptReady &&
     (host.pendingPromptToken || host.promptVisible || host.inputState.text.length > 0);
   host.recordOutputActivity();
-  host.pendingSubmissionEcho = undefined;
   if (host.promptVisible || host.inputState.text.length > 0) {
     host.clearInputRender();
     host.promptVisible = false;
@@ -518,6 +476,289 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
     type: "reply-input",
     text,
   });
+}
+
+export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
+  host.mode = "executing";
+  if (task.alreadyVisible) {
+    triggerPendingSubmissionRestyle(host);
+  } else {
+    writeRuntimeSubmissionEcho(host, task);
+  }
+  host.clearPromptRenderTimer();
+  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code: task.code,
+  });
+}
+
+export function finishRuntimeSubmission(host: RuntimeHost): void {
+  host.activeSubmission = null;
+  host.mode = "ready";
+  void host.lang.refreshCompletionContextDocument(host.inputState.text);
+}
+
+export function startNextRuntimeSubmission(host: RuntimeHost): void {
+  if (host.mode !== "ready" && !(host.mode === "executing" && host.activeSubmission === null)) {
+    return;
+  }
+  if (host.activeSubmission) {
+    return;
+  }
+  const task = host.submissionQueue.shift();
+  if (!task) {
+    return;
+  }
+  host.activeSubmission = task;
+  startRuntimeSubmission(host, task);
+}
+
+export async function enqueueRuntimeSubmission(
+  host: RuntimeHost,
+  code: string,
+  skipSplit: boolean = false,
+  alreadyVisible: boolean = false
+): Promise<void> {
+  const blocks = skipSplit
+    ? [normalizeSubmissionBlock(code)]
+    : await splitSubmissionBlocks(host, code);
+
+  if (blocks.length === 0) {
+    if (alreadyVisible && host.activeSubmission === null) {
+      host.mode = "ready";
+      host.pendingPromptToken = true;
+      host.schedulePrompt();
+    }
+    return;
+  }
+
+  for (const block of blocks) {
+    host.lang.trackPendingLibraries(block);
+    host.submissionQueue.push({
+      code: block,
+      alreadyVisible,
+      styledLines: alreadyVisible ? undefined : host.syntax.prepareSnapshot(block),
+    });
+  }
+
+  void host.lang.refreshCompletionContextDocument(host.inputState.text);
+  startNextRuntimeSubmission(host);
+}
+
+export function beginVisibleRuntimeSubmission(
+  host: RuntimeHost,
+  visibleCode: string
+): void {
+  if (host.promptVisible) {
+    const plainLines = visibleCode.split("\n");
+    host.pendingSubmissionEcho = {
+      code: visibleCode,
+      rowCount: host.renderer.renderedLineCount,
+      lineCount: plainLines.length,
+      plainLines,
+      styledLines: host.syntax.prepareSnapshot(plainLines),
+      restyleStarted: false,
+    };
+    host.writeEmitter.fire("\r\n");
+    host.lastWriteEndedWithNewline = true;
+    host.renderer.renderedLineCount = 1;
+    host.renderer.cursorRowFromTop = 0;
+    host.promptVisible = false;
+  }
+  host.inputState.reset();
+  host.mode = "executing";
+}
+
+function normalizeSubmissionBlock(code: string): string {
+  return code.replace(/\n+$/, "").trimEnd();
+}
+
+async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<string[]> {
+  const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+  const blocks: string[] = [];
+  let currentBlock = "";
+
+  for (const line of lines) {
+    currentBlock = currentBlock.length > 0 ? `${currentBlock}\n${line}` : line;
+    const normalizedBlock = normalizeSubmissionBlock(currentBlock);
+
+    if (!normalizedBlock.trim()) {
+      continue;
+    }
+
+    const isComplete = await host.inputState.isExpressionCompleteAsync(normalizedBlock);
+    if (!isComplete) {
+      continue;
+    }
+
+    blocks.push(normalizedBlock);
+    currentBlock = "";
+  }
+
+  const trailingBlock = normalizeSubmissionBlock(currentBlock);
+  if (trailingBlock.trim()) {
+    blocks.push(trailingBlock);
+  }
+
+  return blocks;
+}
+
+function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
+  if ((host.mode !== "ready" && host.mode !== "executing") || !host.promptReady) {
+    return;
+  }
+
+  host.historyBrowsing = false;
+  host.historyCollapsed = true;
+
+  configureMainPrompt(host.renderer);
+
+  if (host.promptVisible || host.inputState.text.length > 0) {
+    host.clearInputRender();
+    host.promptVisible = false;
+  } else {
+    if (host.pendingInitialPromptGap) {
+      if (host.hasReceivedOutput) {
+        host.writeEmitter.fire("\n");
+      }
+      host.lastWriteEndedWithNewline = true;
+      host.pendingInitialPromptGap = false;
+    } else if (!host.lastWriteEndedWithNewline) {
+      host.writeEmitter.fire("\n");
+      host.lastWriteEndedWithNewline = true;
+    }
+  }
+
+  host.pendingPromptToken = false;
+  const plainLines = task.code.split("\n");
+  const immediateLines = host.syntax.snapshotNow(plainLines);
+  const rowCount = writeRuntimeSubmissionLines(host, plainLines, immediateLines);
+  host.pendingSubmissionEcho = task.styledLines
+    ? {
+        code: task.code,
+        rowCount,
+        lineCount: plainLines.length,
+        plainLines,
+        styledLines: task.styledLines,
+        restyleStarted: false,
+      }
+    : undefined;
+  host.promptVisible = false;
+
+  triggerPendingSubmissionRestyle(host);
+}
+
+function writeRuntimeSubmissionLines(
+  host: RuntimeHost,
+  plainLines: string[],
+  styledLines: string[]
+): number {
+  const continuationPad =
+    host.renderer.promptText === ">>> " ? host.renderer.promptLen : 2;
+  const continuationPromptLen = getContinuationPromptLength(
+    host.renderer.promptText,
+    host.renderer.promptLen,
+    host.renderer.continuationPromptText
+  );
+
+  styledLines.forEach((line, index) => {
+    if (index > 0) {
+      host.writeEmitter.fire("\r\n");
+    }
+    const prompt =
+      index === 0
+        ? `${ANSI.reset}${host.renderer.promptColor}${host.renderer.promptText}${ANSI.reset}`
+        : (host.renderer.continuationPromptText === null
+            ? " ".repeat(continuationPad)
+            : `${ANSI.reset}${host.renderer.continuationPromptColor}${host.renderer.continuationPromptText}${ANSI.reset}`);
+    host.writeEmitter.fire(prompt + line);
+  });
+
+  host.writeEmitter.fire("\r\n");
+  host.lastWriteEndedWithNewline = true;
+  host.renderer.renderedLineCount = 1;
+  host.renderer.cursorRowFromTop = 0;
+
+  return getRenderedRowCount(
+    plainLines,
+    host.dimensions.columns,
+    host.renderer.promptLen,
+    continuationPromptLen
+  );
+}
+
+function triggerPendingSubmissionRestyle(host: RuntimeHost): void {
+  const pending = host.pendingSubmissionEcho;
+  if (!pending || !pending.styledLines || pending.restyleStarted) {
+    return;
+  }
+
+  pending.restyleStarted = true;
+  void restyleRuntimeSubmissionEcho(host, pending.code);
+}
+
+async function restyleRuntimeSubmissionEcho(
+  host: RuntimeHost,
+  expectedCode: string
+): Promise<void> {
+  const pending = host.pendingSubmissionEcho;
+  if (!pending || !pending.styledLines || pending.code !== expectedCode) {
+    return;
+  }
+
+  const styledLines = await pending.styledLines;
+  const latest = host.pendingSubmissionEcho;
+  if (
+    !styledLines ||
+    !latest ||
+    latest.code !== expectedCode ||
+    latest.lineCount !== pending.lineCount
+  ) {
+    return;
+  }
+
+  const restoreReplyPrompt = host.promptVisible && host.mode === "reply";
+  const restoreMainPrompt =
+    host.promptVisible &&
+    host.mode === "ready" &&
+    host.promptReady &&
+    host.isSessionReadyForPrompt();
+
+  if (host.promptVisible) {
+    host.clearInputRender();
+    host.promptVisible = false;
+  }
+
+  host.writeEmitter.fire("\r");
+  if (latest.rowCount > 0) {
+    host.writeEmitter.fire(`\x1b[${latest.rowCount}A`);
+  }
+
+  for (let row = 0; row < latest.rowCount; row += 1) {
+    host.writeEmitter.fire("\x1b[2K");
+    if (row < latest.rowCount - 1) {
+      host.writeEmitter.fire("\x1b[1B\r");
+    }
+  }
+
+  if (latest.rowCount > 1) {
+    host.writeEmitter.fire(`\x1b[${latest.rowCount - 1}A\r`);
+  } else {
+    host.writeEmitter.fire("\r");
+  }
+
+  writeRuntimeSubmissionLines(host, latest.plainLines, styledLines);
+  host.pendingSubmissionEcho = undefined;
+
+  if (restoreReplyPrompt) {
+    host.scheduleReplyPrompt();
+    return;
+  }
+
+  if (restoreMainPrompt) {
+    host.schedulePrompt();
+  }
 }
 
 export function interruptRuntime(host: RuntimeHost): void {
@@ -574,11 +815,6 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearReplyPromptRenderTimer();
   setNativeParseCallback(null);
 
-  if (host.attachWaitTimer) {
-    clearInterval(host.attachWaitTimer);
-    host.attachWaitTimer = undefined;
-  }
-
   host.lang.cleanupCompletionDocument();
   host.lang.clearPendingLibraries();
   host.lang.stopConsoleLsp();
@@ -591,10 +827,10 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.promptVisible = false;
   host.replyPromptText = "";
   host.sessionAttached = false;
-  host.sessionAttachBypassed = false;
 
   host.submissionQueue = [];
   host.activeSubmission = null;
+  host.pendingSubmissionEcho = undefined;
 
   host.writeEmitter.fire(
     `\r\n${ANSI.yellow}R exited with code ${code}${ANSI.reset}\r\n`

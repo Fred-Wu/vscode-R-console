@@ -274,22 +274,12 @@ function getRustSidecarExecutableName(): string {
   return process.platform === "win32" ? "R_CONSOLE_HOST.exe" : "R_CONSOLE_HOST";
 }
 
-export function getRustSidecarCandidates(extensionPath: string): string[] {
+export function getBundledRustSidecarPath(extensionPath: string): string {
   const exeName = getRustSidecarExecutableName();
-  return [
-    path.join(extensionPath, "sidecar", "pty-host", "target", "release", exeName),
-    path.join(extensionPath, "sidecar", "pty-host", "target", "debug", exeName),
-    path.join(extensionPath, "bundled", "bin", exeName),
-  ];
+  return path.join(extensionPath, "bundled", "bin", exeName);
 }
 
 export function resolveRustSidecarPath(extensionPath: string): string | undefined {
-  const candidates = getRustSidecarCandidates(extensionPath);
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return undefined;
+  const bundledPath = getBundledRustSidecarPath(extensionPath);
+  return fs.existsSync(bundledPath) ? bundledPath : undefined;
 }

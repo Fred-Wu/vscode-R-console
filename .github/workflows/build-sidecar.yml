@@ -7,13 +7,17 @@ on:
     paths:
       - "sidecar/pty-host/**"
       - "package.json"
+      - "scripts/build-sidecar.js"
       - "scripts/stage-sidecar.js"
+      - "scripts/sidecar-targets.js"
       - ".github/workflows/build-sidecar.yml"
   pull_request:
     paths:
       - "sidecar/pty-host/**"
       - "package.json"
+      - "scripts/build-sidecar.js"
       - "scripts/stage-sidecar.js"
+      - "scripts/sidecar-targets.js"
       - ".github/workflows/build-sidecar.yml"
 
 env:
@@ -29,13 +33,23 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: windows
+            target: win32-x64
+            rust_target: x86_64-pc-windows-msvc
           - os: ubuntu-latest
-            artifact_name: linux
+            target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
           - os: macos-15-intel
-            artifact_name: darwin-x64
+            target: darwin-x64
+            rust_target: x86_64-apple-darwin
           - os: macos-15
-            artifact_name: darwin-arm64
+            target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+          - os: windows-11-arm
+            target: win32-arm64
+            rust_target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
 
@@ -45,16 +59,19 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.rust_target }}
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
       - name: Build sidecar
-        run: npm run build:sidecar
+        run: node scripts/build-sidecar.js --target ${{ matrix.target }}
 
       - name: Stage sidecar
-        run: node scripts/stage-sidecar.js
+        run: node scripts/stage-sidecar.js --target ${{ matrix.target }}
 
       - name: Verify staged runtime
         run: |
@@ -63,5 +80,5 @@ jobs:
       - name: Upload runtime artifact
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-${{ matrix.artifact_name }}
+          name: runtime-${{ matrix.target }}
           path: bundled/bin/

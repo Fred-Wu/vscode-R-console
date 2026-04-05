@@ -39,46 +39,6 @@ export type DocumentSemanticTokensResult = {
   data: number[];
 };
 
-const DEFAULT_SEMANTIC_TOKENS_LEGEND = {
-  tokenTypes: [
-    "namespace",
-    "type",
-    "class",
-    "enum",
-    "interface",
-    "struct",
-    "typeParameter",
-    "parameter",
-    "variable",
-    "property",
-    "enumMember",
-    "event",
-    "function",
-    "method",
-    "macro",
-    "keyword",
-    "modifier",
-    "comment",
-    "string",
-    "number",
-    "regexp",
-    "operator",
-    "decorator",
-  ],
-  tokenModifiers: [
-    "declaration",
-    "definition",
-    "readonly",
-    "static",
-    "deprecated",
-    "abstract",
-    "async",
-    "modification",
-    "documentation",
-    "defaultLibrary",
-  ],
-} as const;
-
 class ConsoleLanguageClient extends LanguageClient {
   private suppressShutdownCloseMessage = false;
 
@@ -307,7 +267,10 @@ export class ConsoleLspClient implements CompletionProvider {
     this.syncDocument(client, doc);
 
     const provider = client.initializeResult?.capabilities.semanticTokensProvider;
-    const legend = provider?.legend ?? DEFAULT_SEMANTIC_TOKENS_LEGEND;
+    const legend = provider?.legend;
+    if (!legend) {
+      return undefined;
+    }
 
     try {
       const result = await client.sendRequest(SemanticTokensRequest.type, {
