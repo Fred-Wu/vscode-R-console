@@ -29,6 +29,7 @@ mod unix_host {
         "top-level-submit",
         "nested-input",
         "parse-status",
+        "set-width",
     ];
 
     const PARSE_STATUS_NULL: c_int = 0;
@@ -55,11 +56,17 @@ mod unix_host {
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut libc::fd_set);
     type Sexp = *mut c_void;
     type MkStringFn = unsafe extern "C" fn(*const c_char) -> Sexp;
+    type InstallFn = unsafe extern "C" fn(*const c_char) -> Sexp;
+    type FindVarInFrameFn = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
+    type ScalarIntegerFn = unsafe extern "C" fn(c_int) -> Sexp;
     type ProtectFn = unsafe extern "C" fn(Sexp) -> Sexp;
     type UnprotectFn = unsafe extern "C" fn(c_int);
     type ParseVectorFn = unsafe extern "C" fn(Sexp, c_int, *mut c_int, Sexp) -> Sexp;
     type TopLevelExecFn =
         unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int;
+    type TagFn = unsafe extern "C" fn(Sexp) -> Sexp;
+    type CdrFn = unsafe extern "C" fn(Sexp) -> Sexp;
+    type SetcarFn = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
 
     struct RApi {
         _library: Library,
@@ -83,10 +90,17 @@ mod unix_host {
         r_run_handlers: RunHandlersFn,
         r_input_handlers: *mut *mut c_void,
         rf_mk_string: MkStringFn,
+        rf_install: InstallFn,
+        rf_find_var_in_frame: FindVarInFrameFn,
+        rf_scalar_integer: ScalarIntegerFn,
         rf_protect: ProtectFn,
         rf_unprotect: UnprotectFn,
         r_parse_vector: ParseVectorFn,
         r_toplevel_exec: TopLevelExecFn,
+        tag: TagFn,
+        cdr: CdrFn,
+        setcar: SetcarFn,
+        r_base_env_ptr: *mut Sexp,
         r_nil_value_ptr: *mut Sexp,
     }
 
@@ -102,6 +116,8 @@ mod unix_host {
         active_submission_lines: VecDeque<Vec<u8>>,
         pending_fragment: Option<Vec<u8>>,
         pending_fragment_from_nested: bool,
+        pending_width: Option<u16>,
+        current_width: Option<u16>,
         busy: bool,
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
@@ -134,10 +150,17 @@ mod unix_host {
     #[derive(Clone, Copy)]
     struct ParseApi {
         rf_mk_string: MkStringFn,
+        rf_install: InstallFn,
+        rf_find_var_in_frame: FindVarInFrameFn,
+        rf_scalar_integer: ScalarIntegerFn,
         rf_protect: ProtectFn,
         rf_unprotect: UnprotectFn,
         r_parse_vector: ParseVectorFn,
         r_toplevel_exec: TopLevelExecFn,
+        tag: TagFn,
+        cdr: CdrFn,
+        setcar: SetcarFn,
+        r_base_env: usize,
         r_nil_value: usize,
     }
 
@@ -153,6 +176,12 @@ mod unix_host {
         api: ParseApi,
         code: CString,
         status: c_int,
+    }
+
+    struct ApplyWidthContext {
+        api: ParseApi,
+        width: c_int,
+        success: bool,
     }
 
     struct PumpEventsContext {
@@ -191,6 +220,15 @@ mod unix_host {
             .set(api.event_loop_api())
             .map_err(|_| "event loop api already initialized")?;
 
+        if let Some(width) = initial_console_width_from_env() {
+            if let Err(error) = apply_console_width(width) {
+                emit_host_error(&format!("failed to apply initial console width {width}: {error}"));
+            } else if let Some(runtime) = host_runtime() {
+                let mut state = runtime.state.lock().expect("host state lock poisoned");
+                state.current_width = Some(width);
+            }
+        }
+
         output.emit_child_spawned(std::process::id())?;
         output.emit_host_connected()?;
 
@@ -228,9 +266,7 @@ mod unix_host {
             IncomingCommand::ReplyInput(text) => queue_reply(text),
             IncomingCommand::ParseStatus { request_id, code } => queue_parse_status(request_id, code),
             IncomingCommand::Interrupt => request_interrupt(),
-            IncomingCommand::SetWidth { columns } => {
-                let _ = columns;
-            }
+            IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
         }
     }
@@ -268,14 +304,31 @@ mod unix_host {
         }
     }
 
+    fn queue_set_width(columns: u16) {
+        let width = normalize_console_width(columns);
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            if state.current_width == Some(width) || state.pending_width == Some(width) {
+                return;
+            }
+            state.pending_width = Some(width);
+            runtime.cv.notify_all();
+        }
+    }
+
     fn request_interrupt() {
+        let mut should_signal = false;
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            should_signal = state.busy;
             runtime.cv.notify_all();
         }
 
         set_r_interrupts_pending(true);
+        if should_signal {
+            signal_r_interrupt();
+        }
     }
 
     fn request_shutdown() {
@@ -326,6 +379,22 @@ mod unix_host {
         unsafe {
             function();
         }
+    }
+
+    fn signal_r_interrupt() {
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGINT);
+        }
+    }
+
+    fn normalize_console_width(columns: u16) -> u16 {
+        columns.max(20)
+    }
+
+    fn initial_console_width_from_env() -> Option<u16> {
+        let raw = std::env::var("VSC_R_COLS").ok()?;
+        let parsed = raw.parse::<u16>().ok()?;
+        Some(normalize_console_width(parsed))
     }
 
     fn pump_r_events_once() {
@@ -415,6 +484,20 @@ mod unix_host {
                 drop(state);
                 let status = parse_status(code);
                 let _ = runtime.output.emit_parse_status_result(request_id, status);
+                state = runtime.state.lock().expect("host state lock poisoned");
+                continue;
+            }
+
+            if let Some(width) = state.pending_width.take() {
+                drop(state);
+                if let Err(error) = apply_console_width(width) {
+                    emit_host_error(&format!("failed to apply console width {width}: {error}"));
+                } else {
+                    let mut next_state = runtime.state.lock().expect("host state lock poisoned");
+                    next_state.current_width = Some(width);
+                    state = next_state;
+                    continue;
+                }
                 state = runtime.state.lock().expect("host state lock poisoned");
                 continue;
             }
@@ -510,14 +593,20 @@ mod unix_host {
 
     unsafe extern "C" fn busy_callback(value: c_int) {
         if let Some(runtime) = host_runtime() {
+            let mut should_signal = false;
             {
                 let mut state = runtime.state.lock().expect("host state lock poisoned");
                 state.busy = value != 0;
-                if value == 0 {
+                if value != 0 {
+                    should_signal = state.interrupt_requested;
+                } else {
                     state.suppress_idle_event_pump = state.interrupt_requested;
                     state.interrupt_requested = false;
                     set_r_interrupts_pending(false);
                 }
+            }
+            if should_signal {
+                signal_r_interrupt();
             }
             let _ = runtime.output.emit_busy(value != 0);
         }
@@ -692,6 +781,30 @@ mod unix_host {
         context.status
     }
 
+    fn apply_console_width(width: u16) -> Result<(), Box<dyn Error>> {
+        let Some(api) = parse_api() else {
+            return Err("parse api not initialized".into());
+        };
+
+        let mut context = ApplyWidthContext {
+            api,
+            width: width as c_int,
+            success: false,
+        };
+
+        let executed = unsafe {
+            (context.api.r_toplevel_exec)(
+                execute_apply_console_width,
+                &mut context as *mut ApplyWidthContext as *mut c_void,
+            )
+        };
+        if executed == 0 || !context.success {
+            return Err("R rejected width update".into());
+        }
+
+        Ok(())
+    }
+
     unsafe extern "C" fn execute_parse_status(data: *mut c_void) {
         if data.is_null() {
             return;
@@ -718,6 +831,30 @@ mod unix_host {
             R_PARSE_ERROR | R_PARSE_EOF => PARSE_STATUS_ERROR,
             _ => PARSE_STATUS_ERROR,
         };
+    }
+
+    unsafe extern "C" fn execute_apply_console_width(data: *mut c_void) {
+        if data.is_null() {
+            return;
+        }
+
+        let context = &mut *(data as *mut ApplyWidthContext);
+        let api = context.api;
+        let options_symbol = (api.rf_install)(b".Options\0".as_ptr() as *const c_char);
+        let width_symbol = (api.rf_install)(b"width\0".as_ptr() as *const c_char);
+        let base_env = *(api.r_base_env as *mut Sexp);
+        let mut node = (api.rf_find_var_in_frame)(base_env, options_symbol);
+
+        while node != api.r_nil_value as Sexp {
+            if (api.tag)(node) == width_symbol {
+                let value = (api.rf_protect)((api.rf_scalar_integer)(context.width));
+                let _ = (api.setcar)(node, value);
+                (api.rf_unprotect)(1);
+                context.success = true;
+                return;
+            }
+            node = (api.cdr)(node);
+        }
     }
 
     fn resolve_r_library_path(r_executable: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -786,10 +923,17 @@ mod unix_host {
                 r_run_handlers: load_function(&library, b"R_runHandlers\0")?,
                 r_input_handlers: load_global(&library, b"R_InputHandlers\0")?,
                 rf_mk_string: load_function(&library, b"Rf_mkString\0")?,
+                rf_install: load_function(&library, b"Rf_install\0")?,
+                rf_find_var_in_frame: load_function(&library, b"Rf_findVarInFrame\0")?,
+                rf_scalar_integer: load_function(&library, b"Rf_ScalarInteger\0")?,
                 rf_protect: load_function(&library, b"Rf_protect\0")?,
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
                 r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                tag: load_function(&library, b"TAG\0")?,
+                cdr: load_function(&library, b"CDR\0")?,
+                setcar: load_function(&library, b"SETCAR\0")?,
+                r_base_env_ptr: load_global(&library, b"R_BaseEnv\0")?,
                 r_nil_value_ptr: load_global(&library, b"R_NilValue\0")?,
                 _library: library,
             })
@@ -804,7 +948,7 @@ mod unix_host {
                 *value = 1;
             }
             if let Some(value) = self.r_signal_handlers {
-                *value = 0;
+                *value = 1;
             }
 
             let mut argv_storage = build_r_args(r_executable, r_args)?;
@@ -852,10 +996,17 @@ mod unix_host {
             let r_nil_value = unsafe { *self.r_nil_value_ptr as usize };
             ParseApi {
                 rf_mk_string: self.rf_mk_string,
+                rf_install: self.rf_install,
+                rf_find_var_in_frame: self.rf_find_var_in_frame,
+                rf_scalar_integer: self.rf_scalar_integer,
                 rf_protect: self.rf_protect,
                 rf_unprotect: self.rf_unprotect,
                 r_parse_vector: self.r_parse_vector,
                 r_toplevel_exec: self.r_toplevel_exec,
+                tag: self.tag,
+                cdr: self.cdr,
+                setcar: self.setcar,
+                r_base_env: self.r_base_env_ptr as usize,
                 r_nil_value,
             }
         }

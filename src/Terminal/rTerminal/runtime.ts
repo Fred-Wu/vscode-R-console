@@ -28,12 +28,7 @@ import {
   formatTerminalOutput as formatViewOutput,
 } from "./view";
 
-const VSCODE_R_TERMINAL_NAME = "R Interactive";
-const INTERRUPT_RETRY_DELAY_MS = 120;
-const INTERRUPT_RETRY_MAX_ATTEMPTS = 6;
-
-const interruptRetryTimers = new WeakMap<RuntimeHost, NodeJS.Timeout>();
-const interruptRetryAttempts = new WeakMap<RuntimeHost, number>();
+const VSCODE_R_TERMINAL_NAME = "R Console";
 
 type Dimensions = {
   columns: number;
@@ -103,6 +98,20 @@ export type RuntimeHost = {
   getDisplayPid(): number | undefined;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
 };
+
+export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">): string {
+  const pid = host.getDisplayPid();
+  if (typeof pid === "number" && Number.isFinite(pid) && pid > 0) {
+    return `${VSCODE_R_TERMINAL_NAME} (${pid})`;
+  }
+  return VSCODE_R_TERMINAL_NAME;
+}
+
+export function updateRuntimeTerminalName(
+  host: Pick<RuntimeHost, "getDisplayPid" | "nameEmitter">
+): void {
+  host.nameEmitter.fire(getRuntimeTerminalName(host));
+}
 
 export function createRuntimeBackend(
   extensionPath: string
@@ -198,7 +207,7 @@ export function startRuntime(host: RuntimeHost): void {
       },
     });
 
-    host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
+    updateRuntimeTerminalName(host);
     if (!host.options.sessionWatcherEnabled) {
       host.sessionAttached = true;
     }
@@ -233,7 +242,7 @@ function onRuntimeAttached(host: RuntimeHost): void {
   }
   host.sessionAttached = true;
   host.onSessionDataChanged(host.sessionWatcher?.getWorkspaceData());
-  host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
+  updateRuntimeTerminalName(host);
   if (host.mode === "starting" && host.promptReady) {
     host.mode = "ready";
   }
@@ -267,7 +276,7 @@ export function handleRuntimeControl(
     case "child-spawned":
       if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
         host.backendChildPid = event.pid;
-        host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
+        updateRuntimeTerminalName(host);
         if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
           host.sessionWatcher.setExpectedPid(event.pid);
           beginRuntimeAttach(host);
@@ -282,8 +291,6 @@ export function handleRuntimeControl(
     case "busy":
       if (event.value && host.mode !== "reply") {
         host.mode = "executing";
-      } else if (!event.value) {
-        clearInterruptRetry(host);
       }
       return;
     case "input-request":
@@ -326,7 +333,6 @@ export function handleBackendPrompt(
   host: RuntimeHost,
   kind: "main" | "cont"
 ): void {
-  clearInterruptRetry(host);
   host.promptReady = true;
   host.promptKind = kind;
   host.replyPromptText = "";
@@ -782,9 +788,7 @@ export function interruptRuntime(host: RuntimeHost): void {
 
   if (host.isSessionProtocolActive() && host.mode === "executing") {
     host.writeEmitter.fire("^C\r\n");
-    if (sendInterrupt()) {
-      scheduleInterruptRetry(host);
-    }
+    sendInterrupt();
     host.inputState.reset();
     host.promptVisible = false;
     host.pendingPromptToken = false;
@@ -814,52 +818,12 @@ export function interruptRuntime(host: RuntimeHost): void {
     return;
   }
 
-  scheduleInterruptRetry(host);
   host.writeEmitter.fire("^C\r\n");
   host.inputState.reset();
   host.promptVisible = false;
 }
 
-function clearInterruptRetry(host: RuntimeHost): void {
-  const timer = interruptRetryTimers.get(host);
-  if (timer) {
-    clearTimeout(timer);
-    interruptRetryTimers.delete(host);
-  }
-  interruptRetryAttempts.delete(host);
-}
-
-function scheduleInterruptRetry(host: RuntimeHost): void {
-  clearInterruptRetry(host);
-
-  const sendRetry = () => {
-    const attempts = interruptRetryAttempts.get(host) ?? 0;
-    if (
-      attempts >= INTERRUPT_RETRY_MAX_ATTEMPTS ||
-      !host.rProcess ||
-      host.rProcess.killed ||
-      host.mode !== "executing" ||
-      !host.isSessionProtocolActive()
-    ) {
-      clearInterruptRetry(host);
-      return;
-    }
-
-    interruptRetryAttempts.set(host, attempts + 1);
-    host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-      type: "interrupt",
-    });
-
-    const timer = setTimeout(sendRetry, INTERRUPT_RETRY_DELAY_MS);
-    interruptRetryTimers.set(host, timer);
-  };
-
-  const timer = setTimeout(sendRetry, INTERRUPT_RETRY_DELAY_MS);
-  interruptRetryTimers.set(host, timer);
-}
-
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
-  clearInterruptRetry(host);
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();

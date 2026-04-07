@@ -10,7 +10,7 @@ import {
 
 const terminalToRTerminal: Map<vscode.Terminal, RTerminal> = new Map();
 const rTerminalToContext: Map<RTerminal, { inSideEditor: boolean }> = new Map();
-const VSCODE_R_TERMINAL_NAME = "R Interactive";
+const VSCODE_R_TERMINAL_NAME = "R Console";
 
 function isVirtualWorkspace(): boolean {
   const folders = vscode.workspace.workspaceFolders;

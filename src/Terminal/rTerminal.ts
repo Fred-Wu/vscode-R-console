@@ -39,6 +39,7 @@ import {
   createRuntimeBackend,
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
+  getRuntimeTerminalName,
   interruptRuntime,
   type PendingSubmissionEcho,
   type RuntimeHost,
@@ -50,8 +51,6 @@ import {
 } from "./rTerminal/runtime";
 
 export { resolveRTerminalOptions } from "./options";
-
-const VSCODE_R_TERMINAL_NAME = "R Interactive";
 
 class TrackingWriteEmitter extends vscode.EventEmitter<string> {
   constructor(private readonly onFireCallback: (data: string) => void) {
@@ -228,7 +227,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    this.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
+    this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
     this.pendingPromptToken = true;
     this.schedulePrompt();
   }
