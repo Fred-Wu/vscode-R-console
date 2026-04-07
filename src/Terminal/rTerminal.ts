@@ -3,7 +3,7 @@ import { spawnSync, ChildProcess } from "child_process";
 import * as path from "path";
 import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
-import { setNativeParseCallback } from "../Language/parser";
+import { setNativeParseCallback, stripCommentLines } from "../Language/parser";
 import {
   ANSI,
   stripBracketedPasteMarkers,
@@ -199,10 +199,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     return createRuntimeBackend(this.extensionPath);
   }
 
-  isTrueTerminalBackendConfigured(): boolean {
-    return Boolean(this.runtimeBackend);
-  }
-
   private isSessionProtocolActive(): boolean {
     return Boolean(
       this.rProcess &&
@@ -278,10 +274,11 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   handleInput(data: string): void {
     if (this.mode === "executing" && this.isSessionProtocolActive()) {
-      if (data === "\x03") {
+      const hasCtrlC =
+        data.includes("\x03") ||
+        this.keyProcessor.parseInputChunk(data).some((action) => action.type === "ctrl_c");
+      if (hasCtrlC) {
         this.interruptR();
-      } else if (this.rProcess && this.runtimeBackend) {
-        this.runtimeBackend.write(this.rProcess, data);
       }
       return;
     }
@@ -326,10 +323,12 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleProgrammaticSubmission(data: string): Promise<void> {
-    const normalized = stripBracketedPasteMarkers(data)
+    const normalized = stripCommentLines(
+      stripBracketedPasteMarkers(data)
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
-      .replace(/^\n+/, "");
+      .replace(/^\n+/, "")
+    );
     const trimmed = normalized.replace(/\n+$/, "");
     if (!trimmed) {
       return;
@@ -357,8 +356,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.escPendingClear = false;
     this.rHistory.resetIndex();
 
-    this.rHistory.push(sanitized);
-    await this.enqueueRSubmission(sanitized, false);
+    const blocks = await this.enqueueRSubmission(sanitized, false);
+    this.recordSubmissionHistory(blocks);
   }
 
   private applyKeyAction(action: KeyAction): void {
@@ -734,8 +733,8 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.historyBrowsing = false;
         this.historyCollapsed = true;
         this.rHistory.resetIndex();
-        this.rHistory.push(submission);
-        void this.enqueueRSubmission(submission, !/[\r\n]/.test(submission));
+        const blocks = await this.enqueueRSubmission(submission, !/[\r\n]/.test(submission));
+        this.recordSubmissionHistory(blocks);
       }
       return;
     }
@@ -856,6 +855,9 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const visibleSubmission = stripBracketedPasteMarkers(fullText).trimEnd();
     const sanitized = visibleSubmission;
+    const recalledHistorySubmission = this.historyBrowsing;
+    const shouldEchoHistoryBlocks =
+      recalledHistorySubmission && /[\r\n]/.test(sanitized);
     this.inputState.reset();
     this.historyBrowsing = false;
     this.historyCollapsed = true;
@@ -869,14 +871,22 @@ export class RTerminal implements vscode.Pseudoterminal {
     const maybeQuit = sanitized.trim();
     if (maybeQuit === "q()" || maybeQuit === "quit()") {
       this.rHistory.push(sanitized);
-      this.beginVisibleSubmission(visibleSubmission);
-      void this.enqueueRSubmission("q(save='no')", true, true);
+      if (!shouldEchoHistoryBlocks) {
+        this.beginVisibleSubmission(visibleSubmission);
+      }
+      void this.enqueueRSubmission("q(save='no')", true, !shouldEchoHistoryBlocks);
       return;
     }
 
-    this.rHistory.push(sanitized);
-    this.beginVisibleSubmission(visibleSubmission);
-    void this.enqueueRSubmission(sanitized, !/[\r\n]/.test(sanitized), true);
+    if (!shouldEchoHistoryBlocks) {
+      this.beginVisibleSubmission(visibleSubmission);
+    }
+    const blocks = await this.enqueueRSubmission(
+      sanitized,
+      !/[\r\n]/.test(sanitized),
+      !shouldEchoHistoryBlocks
+    );
+    this.recordSubmissionHistory(blocks);
   }
 
   private navigateHistory(direction: number): void {
@@ -962,8 +972,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     code: string,
     skipSplit: boolean = false,
     alreadyVisible: boolean = false
-  ): Promise<void> {
-    await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, alreadyVisible);
+  ): Promise<string[]> {
+    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, alreadyVisible);
+  }
+
+  private recordSubmissionHistory(blocks: string[]): void {
+    for (const block of blocks) {
+      if (block.trim()) {
+        this.rHistory.push(block);
+      }
+    }
   }
 
   private startNextSubmission(): void {
@@ -1096,12 +1114,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.pendingInitialPromptGap) {
       if (this.hasReceivedOutput) {
         // Keep a single visual separator between startup banner and first prompt.
-        this.writeEmitter.fire("\n");
+        this.writeEmitter.fire("\r\n");
       }
       this.lastWriteEndedWithNewline = true;
       this.pendingInitialPromptGap = false;
     } else if (!this.lastWriteEndedWithNewline) {
-      this.writeEmitter.fire("\n");
+      this.writeEmitter.fire("\r\n");
       this.lastWriteEndedWithNewline = true;
     }
 
@@ -1120,7 +1138,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.renderer.clearContinuationPrompt();
 
     if (!this.lastWriteEndedWithNewline && !this.pendingInitialPromptGap) {
-      this.writeEmitter.fire("\n");
+      this.writeEmitter.fire("\r\n");
       this.lastWriteEndedWithNewline = true;
     }
 
@@ -1157,7 +1175,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   sendCode(code: string): void {
-    const sanitized = stripBracketedPasteMarkers(code).trimEnd();
+    const sanitized = stripCommentLines(stripBracketedPasteMarkers(code)).trimEnd();
     if (!sanitized) {
       return;
     }
@@ -1168,8 +1186,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.escPendingClear = false;
     this.rHistory.resetIndex();
 
-    this.rHistory.push(sanitized);
-    void this.enqueueRSubmission(sanitized, false);
+    void this.enqueueRSubmission(sanitized, false).then((blocks) => {
+      this.recordSubmissionHistory(blocks);
+    });
   }
 
   private saveHistory(): void {

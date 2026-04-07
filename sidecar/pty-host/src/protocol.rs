@@ -19,20 +19,8 @@ const FRAME_SUBMIT: u16 = 12;
 const FRAME_REPLY_INPUT: u16 = 13;
 const FRAME_INTERRUPT: u16 = 14;
 const FRAME_SET_WIDTH: u16 = 15;
-const FRAME_INPUT_BYTES: u16 = 16;
 const FRAME_SHUTDOWN: u16 = 17;
 const FRAME_HOST_ERROR: u16 = 19;
-
-const CAPABILITIES: &[&str] = &[
-    "control-channel",
-    "raw-write",
-    "shutdown",
-    "session-control",
-    "top-level-submit",
-    "nested-input",
-    "parse-status",
-    "set-width",
-];
 
 #[derive(Debug)]
 pub(crate) enum IncomingCommand {
@@ -40,38 +28,43 @@ pub(crate) enum IncomingCommand {
     ReplyInput(String),
     ParseStatus { request_id: u32, code: String },
     Interrupt,
-    SetWidth(u16),
-    InputBytes(Vec<u8>),
+    SetWidth { columns: u16 },
     Shutdown,
 }
 
 pub(crate) struct OutputSink {
     stdout: Arc<Mutex<io::Stdout>>,
+    host_name: Arc<String>,
+    capabilities: Arc<Vec<String>>,
 }
 
 impl OutputSink {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new_with_capabilities(host_name: &str, capabilities: &[&str]) -> Self {
         Self {
             stdout: Arc::new(Mutex::new(io::stdout())),
+            host_name: Arc::new(host_name.to_string()),
+            capabilities: Arc::new(capabilities.iter().map(|value| (*value).to_string()).collect()),
         }
     }
 
     pub(crate) fn clone_handle(&self) -> Self {
         Self {
             stdout: Arc::clone(&self.stdout),
+            host_name: Arc::clone(&self.host_name),
+            capabilities: Arc::clone(&self.capabilities),
         }
     }
 
     pub(crate) fn emit_backend_ready(&self) -> io::Result<()> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        encode_string_list("pty-r-host", CAPABILITIES, &mut payload);
+        encode_string_list(self.host_name.as_str(), self.capabilities.as_ref(), &mut payload);
         self.emit_frame(FRAME_BACKEND_READY, 0, &payload)
     }
 
     pub(crate) fn emit_host_connected(&self) -> io::Result<()> {
         let mut payload = Vec::new();
-        encode_string_list("pty-r-host", CAPABILITIES, &mut payload);
+        encode_string_list(self.host_name.as_str(), self.capabilities.as_ref(), &mut payload);
         self.emit_frame(FRAME_HOST_CONNECTED, 0, &payload)
     }
 
@@ -187,9 +180,10 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
                 ));
             }
             let width = u32::from_le_bytes(payload.try_into().expect("set-width payload"));
-            IncomingCommand::SetWidth(width.clamp(1, u16::MAX as u32) as u16)
+            IncomingCommand::SetWidth {
+                columns: width.clamp(1, u16::MAX as u32) as u16,
+            }
         }
-        FRAME_INPUT_BYTES => IncomingCommand::InputBytes(payload),
         FRAME_SHUTDOWN => IncomingCommand::Shutdown,
         _ => {
             return Err(io::Error::new(
@@ -202,11 +196,11 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
     Ok(Some(command))
 }
 
-fn encode_string_list(label: &str, capabilities: &[&str], payload: &mut Vec<u8>) {
+fn encode_string_list<T: AsRef<str>>(label: &str, capabilities: &[T], payload: &mut Vec<u8>) {
     encode_string(label, payload);
     payload.extend_from_slice(&(capabilities.len() as u32).to_le_bytes());
     for capability in capabilities {
-        encode_string(capability, payload);
+        encode_string(capability.as_ref(), payload);
     }
 }
 

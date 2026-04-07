@@ -1,712 +1,921 @@
-use crate::protocol::{read_next_command, IncomingCommand, OutputSink, PromptKind};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-use std::collections::VecDeque;
+#[cfg(not(unix))]
 use std::error::Error;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-const MARKER_PREFIX: &[u8] = b"\x1b]633;vsc-r-console;";
-const MARKER_SUFFIX: u8 = 0x07;
-const MARKER_PROMPT_MAIN: &[u8] = b"\x1b]633;vsc-r-console;prompt;main\x07";
-const MARKER_PROMPT_CONT: &[u8] = b"\x1b]633;vsc-r-console;prompt;cont\x07";
-const MARKER_INPUT_END: &[u8] = b"\x1b]633;vsc-r-console;input-end\x07";
-const MARKER_INPUT_PREFIX: &[u8] = b"\x1b]633;vsc-r-console;input;";
-const PARSE_STATUS_NULL: i32 = 0;
-const PARSE_STATUS_OK: i32 = 1;
-const PARSE_STATUS_INCOMPLETE: i32 = 2;
-const PARSE_STATUS_ERROR: i32 = 3;
-const PARSE_STATUS_SCRIPT: &str = r#"stdin_conn <- file("stdin", open = "rb"); stdout_conn <- stdout(); parse_status <- function(code) { if (!nzchar(trimws(code))) { return(0L) }; tryCatch({ parse(text = code, keep.source = FALSE); 1L }, error = function(err) { text <- conditionMessage(err); if (grepl("unexpected end of input", text, fixed = TRUE) || grepl("unexpected end of line", text, fixed = TRUE) || grepl("unexpected EOF", text, fixed = TRUE)) 2L else 3L }) }; repeat { header <- readLines(stdin_conn, n = 1L, warn = FALSE); if (length(header) == 0L) break; size <- suppressWarnings(as.integer(header)); if (!is.finite(size) || size < 0L) { cat(3L, '\n', sep = ''); flush(stdout_conn); next }; payload <- if (size == 0L) raw(0) else readBin(stdin_conn, what = 'raw', n = size); if (length(payload) < size) break; readBin(stdin_conn, what = 'raw', n = 1L); code <- if (length(payload) == 0L) '' else rawToChar(payload); cat(parse_status(code), '\n', sep = ''); flush(stdout_conn) }"#;
-
-#[derive(Clone)]
-struct ParseProgram {
-    executable: String,
-    use_rscript: bool,
+#[cfg(not(unix))]
+pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    Err("Embedded R host is not implemented for this platform yet".into())
 }
 
-struct ParseWorker {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
+#[cfg(unix)]
+mod unix_host {
+    use crate::protocol::{read_next_command, IncomingCommand, OutputSink, PromptKind};
+    use libloading::os::unix::{Library, Symbol};
+    use std::collections::VecDeque;
+    use std::error::Error;
+    use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::Duration;
 
-pub(crate) fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
-    if args.is_empty() {
-        return Err("missing R console executable path".into());
+    const CONT_PROMPT: &str = "+ ";
+    const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    const SUPPORTED_CAPABILITIES: &[&str] = &[
+        "control-channel",
+        "shutdown",
+        "session-control",
+        "top-level-submit",
+        "nested-input",
+        "parse-status",
+    ];
+
+    const PARSE_STATUS_NULL: c_int = 0;
+    const PARSE_STATUS_OK: c_int = 1;
+    const PARSE_STATUS_INCOMPLETE: c_int = 2;
+    const PARSE_STATUS_ERROR: c_int = 3;
+
+    const R_PARSE_OK: c_int = 1;
+    const R_PARSE_INCOMPLETE: c_int = 2;
+    const R_PARSE_ERROR: c_int = 3;
+    const R_PARSE_EOF: c_int = 4;
+
+    type RfInitializeR = unsafe extern "C" fn(c_int, *mut *mut c_char) -> c_int;
+    type SetupRMainloop = unsafe extern "C" fn();
+    type RunRMainloop = unsafe extern "C" fn();
+    type ReadConsoleFn = unsafe extern "C" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
+    type WriteConsoleFn = unsafe extern "C" fn(*const c_char, c_int);
+    type WriteConsoleExFn = unsafe extern "C" fn(*const c_char, c_int, c_int);
+    type ShowMessageFn = unsafe extern "C" fn(*const c_char);
+    type BusyFn = unsafe extern "C" fn(c_int);
+    type SuicideFn = unsafe extern "C" fn(*const c_char);
+    type CheckUserInterruptFn = unsafe extern "C" fn();
+    type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut libc::fd_set;
+    type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut libc::fd_set);
+    type Sexp = *mut c_void;
+    type MkStringFn = unsafe extern "C" fn(*const c_char) -> Sexp;
+    type ProtectFn = unsafe extern "C" fn(Sexp) -> Sexp;
+    type UnprotectFn = unsafe extern "C" fn(c_int);
+    type ParseVectorFn = unsafe extern "C" fn(Sexp, c_int, *mut c_int, Sexp) -> Sexp;
+    type TopLevelExecFn =
+        unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int;
+
+    struct RApi {
+        _library: Library,
+        rf_initialize_r: RfInitializeR,
+        setup_rmainloop: SetupRMainloop,
+        run_rmainloop: RunRMainloop,
+        ptr_r_write_console: Option<*mut Option<WriteConsoleFn>>,
+        ptr_r_write_console_ex: *mut Option<WriteConsoleExFn>,
+        ptr_r_read_console: *mut Option<ReadConsoleFn>,
+        ptr_r_show_message: Option<*mut Option<ShowMessageFn>>,
+        ptr_r_busy: Option<*mut Option<BusyFn>>,
+        ptr_r_suicide: Option<*mut Option<SuicideFn>>,
+        r_outputfile: Option<*mut *mut c_void>,
+        r_consolefile: Option<*mut *mut c_void>,
+        r_interactive: Option<*mut c_int>,
+        r_signal_handlers: Option<*mut c_int>,
+        r_running_as_main_program: Option<*mut c_int>,
+        r_interrupts_pending: Option<*mut c_int>,
+        r_check_user_interrupt: Option<CheckUserInterruptFn>,
+        r_check_activity: CheckActivityFn,
+        r_run_handlers: RunHandlersFn,
+        r_input_handlers: *mut *mut c_void,
+        rf_mk_string: MkStringFn,
+        rf_protect: ProtectFn,
+        rf_unprotect: UnprotectFn,
+        r_parse_vector: ParseVectorFn,
+        r_toplevel_exec: TopLevelExecFn,
+        r_nil_value_ptr: *mut Sexp,
     }
 
-    let cols = std::env::var("VSC_R_COLS")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|value| *value >= 20)
-        .unwrap_or(80);
-    let rows = std::env::var("VSC_R_ROWS")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|value| *value >= 5)
-        .unwrap_or(24);
-
-    let output = OutputSink::new();
-    output.emit_backend_ready()?;
-
-    let pty_system = NativePtySystem::default();
-    let pair = pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-
-    let mut command = CommandBuilder::new(&args[0]);
-    for arg in args.iter().skip(1) {
-        command.arg(arg);
-    }
-    if let Ok(current_dir) = std::env::current_dir() {
-        command.cwd(current_dir);
+    struct HostRuntime {
+        output: OutputSink,
+        state: Mutex<SharedState>,
+        cv: Condvar,
     }
 
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
-    let parser_program = resolve_parser_program(&args[0]);
-    let mut parse_worker = ParseWorker::spawn(&parser_program).ok();
+    #[derive(Default)]
+    struct SharedState {
+        pending_commands: VecDeque<PendingCommand>,
+        active_submission_lines: VecDeque<Vec<u8>>,
+        pending_fragment: Option<Vec<u8>>,
+        pending_fragment_from_nested: bool,
+        busy: bool,
+        interrupt_requested: bool,
+        suppress_idle_event_pump: bool,
+        shutdown_requested: bool,
+    }
 
-    let child_pid = child
-        .process_id()
-        .ok_or("spawned R process did not report a pid")?;
-    output.emit_child_spawned(child_pid as u32)?;
-    output.emit_host_connected()?;
+    enum PendingCommand {
+        Submit(VecDeque<Vec<u8>>),
+        Reply(Vec<u8>),
+        ParseStatus { request_id: u32, code: String },
+    }
 
-    let mut reader = pair.master.try_clone_reader()?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+    enum WaitKind {
+        TopLevel(PromptKind),
+        Nested(String),
+    }
 
-    let suppressor = Arc::new(Mutex::new(EchoSuppressor::default()));
-    let output_thread = {
-        let thread_output = output.clone_handle();
-        let thread_suppressor = Arc::clone(&suppressor);
-        let thread_writer = Arc::clone(&writer);
+    struct PendingLine {
+        bytes: Vec<u8>,
+        signal_input_end: bool,
+    }
+
+    static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
+    static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
+    static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
+    static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
+    static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
+    static READ_CONSOLE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Clone, Copy)]
+    struct ParseApi {
+        rf_mk_string: MkStringFn,
+        rf_protect: ProtectFn,
+        rf_unprotect: UnprotectFn,
+        r_parse_vector: ParseVectorFn,
+        r_toplevel_exec: TopLevelExecFn,
+        r_nil_value: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EventLoopApi {
+        r_check_activity: CheckActivityFn,
+        r_run_handlers: RunHandlersFn,
+        r_toplevel_exec: TopLevelExecFn,
+        r_input_handlers: usize,
+    }
+
+    struct ParseStatusContext {
+        api: ParseApi,
+        code: CString,
+        status: c_int,
+    }
+
+    struct PumpEventsContext {
+        api: EventLoopApi,
+    }
+
+    pub(crate) fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+        if args.is_empty() {
+            return Err("missing R executable path".into());
+        }
+
+        let r_executable = PathBuf::from(&args[0]);
+        let r_args = &args[1..];
+        let library_path = resolve_r_library_path(&r_executable)?;
+        let api = unsafe { RApi::load(&library_path)? };
+
+        let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
+        output.emit_backend_ready()?;
+
+        HOST_RUNTIME
+            .set(HostRuntime {
+                output: output.clone_handle(),
+                state: Mutex::new(SharedState::default()),
+                cv: Condvar::new(),
+            })
+            .map_err(|_| "host runtime already initialized")?;
+        start_command_reader();
+
+        unsafe {
+            api.initialize(&r_executable, r_args)?;
+        }
+        PARSE_API
+            .set(api.parse_api())
+            .map_err(|_| "parse api already initialized")?;
+        EVENT_LOOP_API
+            .set(api.event_loop_api())
+            .map_err(|_| "event loop api already initialized")?;
+
+        output.emit_child_spawned(std::process::id())?;
+        output.emit_host_connected()?;
+
+        unsafe {
+            (api.run_rmainloop)();
+        }
+
+        Ok(())
+    }
+
+    fn start_command_reader() {
         std::thread::spawn(move || {
-            let mut processor = StreamProcessor::new(thread_output, thread_suppressor, thread_writer);
-            let mut buffer = [0_u8; 8192];
+            let stdin = io::stdin();
+            let mut locked = stdin.lock();
             loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = processor.finish();
+                match read_next_command(&mut locked) {
+                    Ok(Some(command)) => handle_command(command),
+                    Ok(None) => {
+                        request_shutdown();
                         break;
-                    }
-                    Ok(count) => {
-                        if processor.push(&buffer[..count]).is_err() {
-                            break;
-                        }
                     }
                     Err(error) => {
-                        let _ = processor.output.emit_host_error(&format!("pty read failed: {error}"));
-                        let _ = processor.finish();
+                        emit_host_error(&format!("backend command read failed: {error}"));
+                        request_shutdown();
                         break;
                     }
                 }
             }
-        })
-    };
+        });
+    }
 
-    let (command_tx, command_rx) = mpsc::channel::<Result<IncomingCommand, String>>();
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut locked = stdin.lock();
-        loop {
-            match read_next_command(&mut locked) {
-                Ok(Some(command)) => {
-                    if command_tx.send(Ok(command)).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    let _ = command_tx.send(Ok(IncomingCommand::Shutdown));
-                    break;
-                }
-                Err(error) => {
-                    let _ = command_tx.send(Err(error.to_string()));
-                    break;
-                }
+    fn handle_command(command: IncomingCommand) {
+        match command {
+            IncomingCommand::Submit(code) => queue_submit(code),
+            IncomingCommand::ReplyInput(text) => queue_reply(text),
+            IncomingCommand::ParseStatus { request_id, code } => queue_parse_status(request_id, code),
+            IncomingCommand::Interrupt => request_interrupt(),
+            IncomingCommand::SetWidth { columns } => {
+                let _ = columns;
             }
-        }
-    });
-
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                drop(writer);
-                drop(pair.master);
-                let _ = output_thread.join();
-                let exit_code = status.exit_code();
-                std::process::exit(exit_code as i32);
-            }
-            None => {}
-        }
-
-        match command_rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(Ok(command)) => match command {
-                IncomingCommand::Submit(code) => {
-                    output.emit_busy(true)?;
-                    if let Ok(mut state) = suppressor.lock() {
-                        state.expect_submission_prompt();
-                        state.push_logical_echo(&(normalize_logical_newlines(&code) + "\n"));
-                    }
-                    write_terminal_submission(&writer, &code)?;
-                }
-                IncomingCommand::ReplyInput(text) => {
-                    if let Ok(mut state) = suppressor.lock() {
-                        state.push_logical_echo(&(normalize_logical_newlines(&text) + "\n"));
-                    }
-                    write_terminal_submission(&writer, &text)?;
-                }
-                IncomingCommand::ParseStatus { request_id, code } => {
-                    let status = query_parse_status(&parser_program, &mut parse_worker, &code);
-                    output.emit_parse_status_result(request_id, status)?;
-                }
-                IncomingCommand::Interrupt => {
-                    if let Ok(mut writer) = writer.lock() {
-                        writer.write_all(&[0x03])?;
-                        writer.flush()?;
-                    }
-                }
-                IncomingCommand::SetWidth(columns) => {
-                    pair.master.resize(PtySize {
-                        rows,
-                        cols: columns.max(1),
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })?;
-                }
-                IncomingCommand::InputBytes(bytes) => {
-                    if let Ok(mut writer) = writer.lock() {
-                        writer.write_all(&bytes)?;
-                        writer.flush()?;
-                    }
-                }
-                IncomingCommand::Shutdown => {
-                    break;
-                }
-            },
-            Ok(Err(message)) => {
-                output.emit_host_error(&message)?;
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                break;
-            }
+            IncomingCommand::Shutdown => request_shutdown(),
         }
     }
 
-    let _ = child.kill();
-
-    drop(writer);
-    drop(pair.master);
-    let _ = output_thread.join();
-
-    match child.wait() {
-        Ok(status) => std::process::exit(status.exit_code() as i32),
-        Err(error) => Err(format!("failed waiting for child exit: {error}").into()),
+    fn queue_submit(code: String) {
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.suppress_idle_event_pump = false;
+            state
+                .pending_commands
+                .push_back(PendingCommand::Submit(split_submission_lines(&code)));
+            runtime.cv.notify_all();
+        }
     }
-}
 
-fn write_terminal_submission(
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
-    text: &str,
-) -> io::Result<()> {
-    let line_break = if cfg!(windows) { "\r" } else { "\n" };
-    let normalized = normalize_logical_newlines(text).replace('\n', line_break);
-    let mut writer = writer
-        .lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "pty writer lock poisoned"))?;
-    writer.write_all(normalized.as_bytes())?;
-    writer.write_all(line_break.as_bytes())?;
-    writer.flush()
-}
+    fn queue_reply(text: String) {
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.suppress_idle_event_pump = false;
+            state
+                .pending_commands
+                .push_back(PendingCommand::Reply(normalize_reply_text(&text).into_bytes()));
+            runtime.cv.notify_all();
+        }
+    }
 
-fn normalize_logical_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
+    fn queue_parse_status(request_id: u32, code: String) {
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.suppress_idle_event_pump = false;
+            state
+                .pending_commands
+                .push_back(PendingCommand::ParseStatus { request_id, code });
+            runtime.cv.notify_all();
+        }
+    }
 
-fn resolve_parser_program(console_path: &str) -> ParseProgram {
-    let executable = std::env::var("VSC_R_EXECUTABLE")
-        .ok()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| console_path.to_string());
+    fn request_interrupt() {
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.interrupt_requested = true;
+            runtime.cv.notify_all();
+        }
 
-    if let Some(rscript) = resolve_rscript_path(&executable).or_else(|| resolve_rscript_path(console_path)) {
-        return ParseProgram {
-            executable: rscript,
-            use_rscript: true,
+        set_r_interrupts_pending(true);
+    }
+
+    fn request_shutdown() {
+        let mut should_interrupt = false;
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.shutdown_requested = true;
+            should_interrupt = state.busy;
+            runtime.cv.notify_all();
+        }
+
+        if should_interrupt {
+            set_r_interrupts_pending(true);
+        }
+    }
+
+    fn host_runtime() -> Option<&'static HostRuntime> {
+        HOST_RUNTIME.get()
+    }
+
+    fn event_loop_api() -> Option<EventLoopApi> {
+        EVENT_LOOP_API.get().copied()
+    }
+
+    fn emit_host_error(message: &str) {
+        if let Some(runtime) = host_runtime() {
+            let _ = runtime.output.emit_host_error(message);
+        }
+    }
+
+    fn set_r_interrupts_pending(pending: bool) {
+        let ptr = R_INTERRUPTS_PENDING_PTR.load(Ordering::Relaxed) as *mut c_int;
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            *ptr = if pending { 1 } else { 0 };
+        }
+    }
+
+    fn trigger_r_user_interrupt() {
+        let function = R_CHECK_USER_INTERRUPT.load(Ordering::Relaxed);
+        if function == 0 {
+            return;
+        }
+
+        let function: CheckUserInterruptFn = unsafe { std::mem::transmute(function) };
+        unsafe {
+            function();
+        }
+    }
+
+    fn pump_r_events_once() {
+        let Some(api) = event_loop_api() else {
+            return;
         };
-    }
 
-    ParseProgram {
-        executable,
-        use_rscript: false,
-    }
-}
+        set_r_interrupts_pending(false);
 
-fn resolve_rscript_path(executable_path: &str) -> Option<String> {
-    let executable = Path::new(executable_path);
-    let name = executable.file_name()?.to_str()?;
-    if name.eq_ignore_ascii_case("Rscript.exe") || name == "Rscript" {
-        return Some(executable_path.to_string());
-    }
-
-    let rscript_name = if cfg!(windows) { "Rscript.exe" } else { "Rscript" };
-    let mut candidates = Vec::new();
-    candidates.push(executable.with_file_name(rscript_name));
-    if let Some(parent) = executable.parent().and_then(|value| value.parent()) {
-        candidates.push(parent.join(rscript_name));
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-impl ParseWorker {
-    fn spawn(parser_program: &ParseProgram) -> io::Result<Self> {
-        let mut command = Command::new(&parser_program.executable);
-        command.arg("--vanilla");
-        if !parser_program.use_rscript {
-            command.arg("--slave");
-        }
-        command
-            .arg("-e")
-            .arg(PARSE_STATUS_SCRIPT)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        command.env("LC_ALL", "C");
-        command.env("LANGUAGE", "en");
-        command.env_remove("R_PROFILE_USER");
-        command.env_remove("R_PROFILE_USER_OLD");
-        command.env_remove("VSCODE_INIT_R");
-        command.env_remove("VSCODE_WATCHER_DIR");
-
-        let mut child = command.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "parse worker stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "parse worker stdout unavailable"))?;
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
-    }
-
-    fn query(&mut self, code: &str) -> io::Result<i32> {
-        let payload = code.as_bytes();
-        write!(self.stdin, "{}\n", payload.len())?;
-        self.stdin.write_all(payload)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "parse worker closed stdout",
-            ));
-        }
-
-        let status = line.trim().parse::<i32>().unwrap_or(PARSE_STATUS_ERROR);
-        Ok(match status {
-            PARSE_STATUS_NULL
-            | PARSE_STATUS_OK
-            | PARSE_STATUS_INCOMPLETE
-            | PARSE_STATUS_ERROR => status,
-            _ => PARSE_STATUS_ERROR,
-        })
-    }
-}
-
-impl Drop for ParseWorker {
-    fn drop(&mut self) {
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn query_parse_status(
-    parser_program: &ParseProgram,
-    parse_worker: &mut Option<ParseWorker>,
-    code: &str,
-) -> i32 {
-    if code.trim().is_empty() {
-        return PARSE_STATUS_NULL;
-    }
-
-    if let Some(worker) = parse_worker.as_mut() {
-        if let Ok(status) = worker.query(code) {
-            return status;
+        let mut context = PumpEventsContext { api };
+        unsafe {
+            (api.r_toplevel_exec)(
+                execute_pump_events,
+                &mut context as *mut PumpEventsContext as *mut c_void,
+            );
         }
     }
 
-    *parse_worker = ParseWorker::spawn(parser_program).ok();
-    if let Some(worker) = parse_worker.as_mut() {
-        if let Ok(status) = worker.query(code) {
-            return status;
+    unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
+        if data.is_null() {
+            return;
         }
-    }
 
-    PARSE_STATUS_ERROR
-}
-
-#[derive(Default)]
-struct EchoSuppressor {
-    pending_echoes: VecDeque<Vec<u8>>,
-    suppress_submission_prompts: bool,
-}
-
-impl EchoSuppressor {
-    fn expect_submission_prompt(&mut self) {
-        self.suppress_submission_prompts = true;
-    }
-
-    fn finish_submission_prompt(&mut self) {
-        self.suppress_submission_prompts = false;
-    }
-
-    fn should_suppress_submission_prompts(&self) -> bool {
-        self.suppress_submission_prompts
-    }
-
-    fn push_logical_echo(&mut self, text: &str) {
-        self.pending_echoes.push_back(text.as_bytes().to_vec());
-    }
-
-    fn strip_expected_echoes(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut cursor = 0_usize;
-        while cursor < bytes.len() {
-            let Some(expected) = self.pending_echoes.front_mut() else {
-                break;
-            };
-            let (consumed_output, consumed_expected, mismatched) =
-                consume_echo_prefix(&bytes[cursor..], expected);
-            if consumed_output == 0 && consumed_expected == 0 {
-                break;
+        let context = &mut *(data as *mut PumpEventsContext);
+        let api = context.api;
+        unsafe {
+            let handlers = *(api.r_input_handlers as *mut *mut c_void);
+            if handlers.is_null() {
+                return;
             }
-            cursor += consumed_output;
-            if consumed_expected > 0 {
-                expected.drain(0..consumed_expected);
+
+            let mask = (api.r_check_activity)(0, 1);
+
+            #[cfg(target_os = "macos")]
+            if !mask.is_null() {
+                (api.r_run_handlers)(handlers, mask);
             }
-            if expected.is_empty() {
-                self.pending_echoes.pop_front();
-            }
-            if mismatched || cursor >= bytes.len() {
-                break;
-            }
+
+            #[cfg(not(target_os = "macos"))]
+            (api.r_run_handlers)(handlers, mask);
         }
-        bytes[cursor..].to_vec()
     }
-}
 
-fn consume_echo_prefix(output: &[u8], expected: &[u8]) -> (usize, usize, bool) {
-    let mut output_index = 0_usize;
-    let mut expected_index = 0_usize;
-    let mut mismatched = false;
+    unsafe extern "C" fn read_console_callback(
+        prompt: *const c_char,
+        buffer: *mut c_uchar,
+        buflen: c_int,
+        add_history: c_int,
+    ) -> c_int {
+        READ_CONSOLE_INTERRUPTED.store(false, Ordering::Relaxed);
 
-    while output_index < output.len() && expected_index < expected.len() {
-        if let Some(sequence_len) = parse_escape_sequence_len(&output[output_index..]) {
-            output_index += sequence_len;
-            continue;
+        let ret = read_console_callback_inner(prompt, buffer, buflen, add_history);
+
+        if READ_CONSOLE_INTERRUPTED.swap(false, Ordering::Relaxed) {
+            set_r_interrupts_pending(true);
+            trigger_r_user_interrupt();
         }
 
-        let output_byte = output[output_index];
-        let expected_byte = expected[expected_index];
+        ret
+    }
 
-        if expected_byte == b'\n' {
-            if output_byte == b'\r' {
-                if output_index + 1 < output.len() && output[output_index + 1] == b'\n' {
-                    output_index += 2;
-                    expected_index += 1;
+    unsafe extern "C" fn read_console_callback_inner(
+        prompt: *const c_char,
+        buffer: *mut c_uchar,
+        buflen: c_int,
+        add_history: c_int,
+    ) -> c_int {
+        let Some(runtime) = host_runtime() else {
+            return 0;
+        };
+
+        let prompt_text = c_string_to_string(prompt);
+        let wait_kind = if add_history != 0 {
+            WaitKind::TopLevel(prompt_kind_from_prompt(&prompt_text))
+        } else {
+            WaitKind::Nested(prompt_text)
+        };
+        let mut wait_event_emitted = false;
+        let mut state = runtime.state.lock().expect("host state lock poisoned");
+
+        loop {
+            if matches!(wait_kind, WaitKind::TopLevel(_)) {
+                set_r_interrupts_pending(false);
+            }
+
+            if let Some((request_id, code)) = take_next_parse_request(&mut state) {
+                drop(state);
+                let status = parse_status(code);
+                let _ = runtime.output.emit_parse_status_result(request_id, status);
+                state = runtime.state.lock().expect("host state lock poisoned");
+                continue;
+            }
+
+            if let Some(fragment) = state.pending_fragment.take() {
+                let signal_input_end = state.pending_fragment_from_nested;
+                state.pending_fragment_from_nested = false;
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    fragment,
+                    &mut state,
+                    signal_input_end,
+                    &runtime.output,
+                );
+            }
+
+            if let Some(line) = take_next_line(&wait_kind, &mut state) {
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    line.bytes,
+                    &mut state,
+                    line.signal_input_end,
+                    &runtime.output,
+                );
+            }
+
+            if state.shutdown_requested {
+                if matches!(wait_kind, WaitKind::Nested(_)) {
+                    let _ = runtime.output.emit_input_end();
+                    let _ = runtime.output.emit_output_flush();
+                }
+                return 0;
+            }
+
+            if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
+                state.interrupt_requested = false;
+                let _ = runtime.output.emit_input_end();
+                let _ = runtime.output.emit_output_flush();
+                READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
+                return 0;
+            }
+
+            if !wait_event_emitted {
+                match &wait_kind {
+                    WaitKind::TopLevel(kind) => {
+                        let _ = runtime.output.emit_prompt(*kind);
+                        let _ = runtime.output.emit_output_flush();
+                    }
+                    WaitKind::Nested(prompt) => {
+                        let _ = runtime.output.emit_input_request(prompt);
+                        let _ = runtime.output.emit_output_flush();
+                    }
+                }
+                wait_event_emitted = true;
+            }
+
+            let (next_state, timeout) = runtime
+                .cv
+                .wait_timeout(state, EVENT_POLL_INTERVAL)
+                .expect("host state lock poisoned");
+            state = next_state;
+            if timeout.timed_out() {
+                if matches!(wait_kind, WaitKind::TopLevel(_)) && state.suppress_idle_event_pump {
                     continue;
                 }
-                output_index += 1;
-                continue;
+                drop(state);
+                pump_r_events_once();
+                state = runtime.state.lock().expect("host state lock poisoned");
             }
-            if output_byte == b'\n' {
-                output_index += 1;
-                expected_index += 1;
-                continue;
+        }
+    }
+
+    unsafe extern "C" fn write_console_ex_callback(text: *const c_char, _bufline: c_int, otype: c_int) {
+        if let Some(runtime) = host_runtime() {
+            let rendered = c_string_to_string(text);
+            if rendered.is_empty() {
+                return;
             }
-            mismatched = true;
-            break;
-        }
-
-        if output_byte == expected_byte {
-            output_index += 1;
-            expected_index += 1;
-            continue;
-        }
-
-        mismatched = true;
-        break;
-    }
-
-    if expected_index == 0 {
-        return (0, 0, false);
-    }
-
-    (output_index, expected_index, mismatched)
-}
-
-fn parse_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
-    if bytes.first().copied() != Some(0x1b) || bytes.len() < 2 {
-        return None;
-    }
-
-    match bytes[1] {
-        b'[' => {
-            for index in 2..bytes.len() {
-                let byte = bytes[index];
-                if (0x40..=0x7e).contains(&byte) {
-                    return Some(index + 1);
-                }
-            }
-            None
-        }
-        b']' => {
-            let mut index = 2_usize;
-            while index < bytes.len() {
-                match bytes[index] {
-                    0x07 => return Some(index + 1),
-                    0x1b if index + 1 < bytes.len() && bytes[index + 1] == b'\\' => {
-                        return Some(index + 2);
-                    }
-                    _ => {
-                        index += 1;
-                    }
-                }
-            }
-            None
-        }
-        _ => Some(2),
-    }
-}
-
-struct StreamProcessor {
-    output: OutputSink,
-    suppressor: Arc<Mutex<EchoSuppressor>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    input_buffer: Vec<u8>,
-    pending_plain: Vec<u8>,
-}
-
-impl StreamProcessor {
-    fn new(
-        output: OutputSink,
-        suppressor: Arc<Mutex<EchoSuppressor>>,
-        writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    ) -> Self {
-        Self {
-            output,
-            suppressor,
-            writer,
-            input_buffer: Vec::new(),
-            pending_plain: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> io::Result<()> {
-        self.input_buffer.extend_from_slice(chunk);
-
-        loop {
-            let marker_start = find_subslice(&self.input_buffer, MARKER_PREFIX);
-            let Some(marker_start) = marker_start else {
-                if !self.input_buffer.is_empty() {
-                    let plain = std::mem::take(&mut self.input_buffer);
-                    self.push_plain(&plain)?;
-                }
-                break;
-            };
-
-            if marker_start > 0 {
-                let plain = self.input_buffer.drain(0..marker_start).collect::<Vec<u8>>();
-                self.push_plain(&plain)?;
-            }
-
-            let Some(marker_end_start) = self.input_buffer.iter().position(|byte| *byte == MARKER_SUFFIX) else {
-                break;
-            };
-            let marker_end = marker_end_start + 1;
-
-            let marker = self.input_buffer[0..marker_end].to_vec();
-            self.input_buffer.drain(0..marker_end);
-            self.flush_pending_plain(false)?;
-            self.handle_marker(&marker)?;
-        }
-
-        self.flush_pending_plain(false)
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        if !self.input_buffer.is_empty() {
-            let remaining = std::mem::take(&mut self.input_buffer);
-            self.push_plain(&remaining)?;
-        }
-        self.flush_pending_plain(true)
-    }
-
-    fn handle_marker(&mut self, marker: &[u8]) -> io::Result<()> {
-        if marker == MARKER_PROMPT_MAIN {
-            if let Ok(mut state) = self.suppressor.lock() {
-                state.finish_submission_prompt();
-            }
-            self.output.emit_busy(false)?;
-            self.output.emit_prompt(PromptKind::Main)?;
-            return Ok(());
-        }
-
-        if marker == MARKER_PROMPT_CONT {
-            let suppress_prompt = if let Ok(state) = self.suppressor.lock() {
-                state.should_suppress_submission_prompts()
+            if otype == 0 {
+                let _ = runtime.output.emit_output(rendered.as_bytes());
             } else {
-                false
-            };
-            if !suppress_prompt {
-                self.output.emit_prompt(PromptKind::Cont)?;
+                let _ = runtime.output.emit_host_error(&rendered);
             }
-            return Ok(());
+            let _ = runtime.output.emit_output_flush();
         }
-
-        if marker == MARKER_INPUT_END {
-            self.output.emit_input_end()?;
-            self.output.emit_busy(true)?;
-            return Ok(());
-        }
-
-        if let Some(payload) = marker.strip_prefix(MARKER_INPUT_PREFIX) {
-            let payload = payload.strip_suffix(&[MARKER_SUFFIX]).unwrap_or(payload);
-            let prompt = decode_marker_payload(payload);
-            self.output.emit_busy(false)?;
-            self.output.emit_input_request(&prompt)?;
-            return Ok(());
-        }
-
-        let mut passthrough = Vec::with_capacity(marker.len());
-        passthrough.extend_from_slice(marker);
-        self.push_plain(&passthrough)
     }
 
-    fn push_plain(&mut self, plain: &[u8]) -> io::Result<()> {
-        let plain = self.strip_terminal_queries(plain)?;
-        let stripped = if let Ok(mut state) = self.suppressor.lock() {
-            state.strip_expected_echoes(&plain)
+    unsafe extern "C" fn show_message_callback(text: *const c_char) {
+        emit_host_error(&c_string_to_string(text));
+    }
+
+    unsafe extern "C" fn busy_callback(value: c_int) {
+        if let Some(runtime) = host_runtime() {
+            {
+                let mut state = runtime.state.lock().expect("host state lock poisoned");
+                state.busy = value != 0;
+                if value == 0 {
+                    state.suppress_idle_event_pump = state.interrupt_requested;
+                    state.interrupt_requested = false;
+                    set_r_interrupts_pending(false);
+                }
+            }
+            let _ = runtime.output.emit_busy(value != 0);
+        }
+    }
+
+    unsafe extern "C" fn suicide_callback(text: *const c_char) {
+        emit_host_error(&c_string_to_string(text));
+        std::process::exit(1);
+    }
+
+    fn take_next_line(wait_kind: &WaitKind, state: &mut SharedState) -> Option<PendingLine> {
+        if let Some(line) = state.active_submission_lines.pop_front() {
+            return Some(PendingLine {
+                bytes: line,
+                signal_input_end: false,
+            });
+        }
+
+        match wait_kind {
+            WaitKind::TopLevel(_) => {
+                let index = state
+                    .pending_commands
+                    .iter()
+                    .position(|command| matches!(command, PendingCommand::Submit(_)))?;
+                match state.pending_commands.remove(index) {
+                    Some(PendingCommand::Submit(lines)) => {
+                        state.active_submission_lines = lines;
+                        state.active_submission_lines.pop_front().map(|line| PendingLine {
+                            bytes: line,
+                            signal_input_end: false,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            WaitKind::Nested(_) => {
+                let index = state
+                    .pending_commands
+                    .iter()
+                    .position(|command| matches!(command, PendingCommand::Reply(_)))?;
+                match state.pending_commands.remove(index) {
+                    Some(PendingCommand::Reply(bytes)) => Some(PendingLine {
+                        bytes,
+                        signal_input_end: true,
+                    }),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn take_next_parse_request(state: &mut SharedState) -> Option<(u32, String)> {
+        let index = state.pending_commands.iter().position(|command| {
+            matches!(command, PendingCommand::ParseStatus { .. })
+        })?;
+        match state.pending_commands.remove(index) {
+            Some(PendingCommand::ParseStatus { request_id, code }) => Some((request_id, code)),
+            _ => None,
+        }
+    }
+
+    fn write_read_buffer(
+        buffer: *mut c_uchar,
+        buflen: c_int,
+        bytes: Vec<u8>,
+        state: &mut SharedState,
+        signal_input_end: bool,
+        output: &OutputSink,
+    ) -> c_int {
+        if buffer.is_null() || buflen <= 1 {
+            return 0;
+        }
+
+        let buffer_len = buflen as usize;
+        let target = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_len) };
+
+        if bytes.len() < buffer_len.saturating_sub(1) {
+            target[..bytes.len()].copy_from_slice(&bytes);
+            target[bytes.len()] = b'\n';
+            target[bytes.len() + 1] = 0;
+            if signal_input_end {
+                let _ = output.emit_input_end();
+                let _ = output.emit_output_flush();
+            }
+            1
         } else {
-            plain
+            let used = buffer_len - 1;
+            target[..used].copy_from_slice(&bytes[..used]);
+            target[used] = 0;
+            state.pending_fragment = Some(bytes[used..].to_vec());
+            state.pending_fragment_from_nested = signal_input_end;
+            1
+        }
+    }
+
+    fn prompt_kind_from_prompt(prompt: &str) -> PromptKind {
+        let trimmed = prompt.trim_end_matches(['\r', '\n']);
+        if trimmed == CONT_PROMPT.trim_end() || trimmed.starts_with('+') {
+            PromptKind::Cont
+        } else {
+            PromptKind::Main
+        }
+    }
+
+    fn split_submission_lines(code: &str) -> VecDeque<Vec<u8>> {
+        let normalized = normalize_newlines(code);
+        let mut lines = VecDeque::new();
+        for line in normalized.split('\n') {
+            lines.push_back(line.as_bytes().to_vec());
+        }
+        if lines.is_empty() {
+            lines.push_back(Vec::new());
+        }
+        lines
+    }
+
+    fn normalize_reply_text(text: &str) -> String {
+        normalize_newlines(text)
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn normalize_newlines(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    fn c_string_to_string(text: *const c_char) -> String {
+        if text.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn parse_api() -> Option<ParseApi> {
+        PARSE_API.get().copied()
+    }
+
+    fn parse_status(code: String) -> c_int {
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            return PARSE_STATUS_NULL;
+        }
+
+        let Some(api) = parse_api() else {
+            return PARSE_STATUS_ERROR;
         };
-        if !stripped.is_empty() {
-            self.pending_plain.extend_from_slice(&stripped);
+
+        let Ok(code) = CString::new(code) else {
+            return PARSE_STATUS_ERROR;
+        };
+
+        let mut context = ParseStatusContext {
+            api,
+            code,
+            status: PARSE_STATUS_ERROR,
+        };
+
+        let executed = unsafe {
+            (context.api.r_toplevel_exec)(
+                execute_parse_status,
+                &mut context as *mut ParseStatusContext as *mut c_void,
+            )
+        };
+        if executed == 0 {
+            return PARSE_STATUS_ERROR;
         }
-        self.flush_pending_plain(false)
+
+        context.status
     }
 
-    fn strip_terminal_queries(&self, plain: &[u8]) -> io::Result<Vec<u8>> {
-        let mut filtered = Vec::with_capacity(plain.len());
-        let mut index = 0_usize;
-        while index < plain.len() {
-            if plain[index..].starts_with(b"\x1b[6n") {
-                if let Ok(mut writer) = self.writer.lock() {
-                    writer.write_all(b"\x1b[1;1R")?;
-                    writer.flush()?;
-                }
-                index += 4;
-                continue;
-            }
-            filtered.push(plain[index]);
-            index += 1;
+    unsafe extern "C" fn execute_parse_status(data: *mut c_void) {
+        if data.is_null() {
+            return;
         }
-        Ok(filtered)
+
+        let context = &mut *(data as *mut ParseStatusContext);
+        let mut parse_status = R_PARSE_OK;
+        let text = (context.api.rf_protect)((context.api.rf_mk_string)(context.code.as_ptr()));
+        let expressions =
+            (context.api.rf_protect)(
+                (context.api.r_parse_vector)(
+                    text,
+                    -1,
+                    &mut parse_status,
+                    context.api.r_nil_value as Sexp,
+                ),
+            );
+        let _ = expressions;
+        (context.api.rf_unprotect)(2);
+
+        context.status = match parse_status {
+            R_PARSE_OK => PARSE_STATUS_OK,
+            R_PARSE_INCOMPLETE => PARSE_STATUS_INCOMPLETE,
+            R_PARSE_ERROR | R_PARSE_EOF => PARSE_STATUS_ERROR,
+            _ => PARSE_STATUS_ERROR,
+        };
     }
 
-    fn flush_pending_plain(&mut self, flush_all: bool) -> io::Result<()> {
-        loop {
-            if self.pending_plain.is_empty() {
-                return Ok(());
-            }
+    fn resolve_r_library_path(r_executable: &Path) -> Result<PathBuf, Box<dyn Error>> {
+        let r_home = resolve_r_home(r_executable)?;
+        let library_name = if cfg!(target_os = "macos") {
+            "libR.dylib"
+        } else {
+            "libR.so"
+        };
+        let library_path = r_home.join("lib").join(library_name);
+        if !library_path.is_file() {
+            return Err(format!(
+                "R shared library not found at {}",
+                library_path.display()
+            )
+            .into());
+        }
+        Ok(library_path)
+    }
 
-            match std::str::from_utf8(&self.pending_plain) {
-                Ok(_) => {
-                    self.output.emit_output(&self.pending_plain)?;
-                    self.output.emit_output_flush()?;
-                    self.pending_plain.clear();
-                    return Ok(());
-                }
-                Err(error) => {
-                    let valid_up_to = error.valid_up_to();
-                    if valid_up_to > 0 {
-                        let valid = self.pending_plain.drain(0..valid_up_to).collect::<Vec<u8>>();
-                        self.output.emit_output(&valid)?;
-                        self.output.emit_output_flush()?;
-                        continue;
-                    }
-
-                    if error.error_len().is_none() && !flush_all {
-                        return Ok(());
-                    }
-
-                    let invalid_len = error.error_len().unwrap_or(self.pending_plain.len()).max(1);
-                    let invalid = self.pending_plain.drain(0..invalid_len).collect::<Vec<u8>>();
-                    let lossy = String::from_utf8_lossy(&invalid).into_owned();
-                    self.output.emit_output(lossy.as_bytes())?;
-                    self.output.emit_output_flush()?;
-                }
+    fn resolve_r_home(r_executable: &Path) -> Result<PathBuf, Box<dyn Error>> {
+        if let Some(configured) = std::env::var_os("R_HOME") {
+            let configured = PathBuf::from(configured);
+            if configured.is_dir() {
+                return Ok(configured);
             }
         }
+
+        let normalized = r_executable
+            .canonicalize()
+            .unwrap_or_else(|_| r_executable.to_path_buf());
+        let Some(bin_dir) = normalized.parent() else {
+            return Err("R executable has no parent directory".into());
+        };
+        let Some(r_home) = bin_dir.parent() else {
+            return Err("failed to derive R_HOME from executable path".into());
+        };
+        Ok(r_home.to_path_buf())
+    }
+
+    impl RApi {
+        unsafe fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
+            let library = Library::open(Some(path), libc::RTLD_NOW | libc::RTLD_GLOBAL)?;
+
+            Ok(Self {
+                rf_initialize_r: load_function(&library, b"Rf_initialize_R\0")?,
+                setup_rmainloop: load_function(&library, b"setup_Rmainloop\0")?,
+                run_rmainloop: load_function(&library, b"run_Rmainloop\0")?,
+                ptr_r_write_console: load_optional_global(&library, b"ptr_R_WriteConsole\0"),
+                ptr_r_write_console_ex: load_global(&library, b"ptr_R_WriteConsoleEx\0")?,
+                ptr_r_read_console: load_global(&library, b"ptr_R_ReadConsole\0")?,
+                ptr_r_show_message: load_optional_global(&library, b"ptr_R_ShowMessage\0"),
+                ptr_r_busy: load_optional_global(&library, b"ptr_R_Busy\0"),
+                ptr_r_suicide: load_optional_global(&library, b"ptr_R_Suicide\0"),
+                r_outputfile: load_optional_global(&library, b"R_Outputfile\0"),
+                r_consolefile: load_optional_global(&library, b"R_Consolefile\0"),
+                r_interactive: load_optional_global(&library, b"R_Interactive\0"),
+                r_signal_handlers: load_optional_global(&library, b"R_SignalHandlers\0"),
+                r_running_as_main_program: load_optional_global(
+                    &library,
+                    b"R_running_as_main_program\0",
+                ),
+                r_interrupts_pending: load_optional_global(&library, b"R_interrupts_pending\0"),
+                r_check_user_interrupt: load_optional_function(&library, b"R_CheckUserInterrupt\0"),
+                r_check_activity: load_function(&library, b"R_checkActivity\0")?,
+                r_run_handlers: load_function(&library, b"R_runHandlers\0")?,
+                r_input_handlers: load_global(&library, b"R_InputHandlers\0")?,
+                rf_mk_string: load_function(&library, b"Rf_mkString\0")?,
+                rf_protect: load_function(&library, b"Rf_protect\0")?,
+                rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
+                r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
+                r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                r_nil_value_ptr: load_global(&library, b"R_NilValue\0")?,
+                _library: library,
+            })
+        }
+
+        unsafe fn initialize(
+            &self,
+            r_executable: &Path,
+            r_args: &[String],
+        ) -> Result<(), Box<dyn Error>> {
+            if let Some(value) = self.r_running_as_main_program {
+                *value = 1;
+            }
+            if let Some(value) = self.r_signal_handlers {
+                *value = 0;
+            }
+
+            let mut argv_storage = build_r_args(r_executable, r_args)?;
+            let mut argv = argv_storage
+                .iter_mut()
+                .map(|value| value.as_ptr() as *mut c_char)
+                .collect::<Vec<_>>();
+
+            (self.rf_initialize_r)(argv.len() as c_int, argv.as_mut_ptr());
+
+            if let Some(value) = self.r_interactive {
+                *value = 1;
+            }
+            if let Some(value) = self.r_interrupts_pending {
+                R_INTERRUPTS_PENDING_PTR.store(value as usize, Ordering::Relaxed);
+            }
+            if let Some(function) = self.r_check_user_interrupt {
+                R_CHECK_USER_INTERRUPT.store(function as usize, Ordering::Relaxed);
+            }
+            if let Some(value) = self.r_outputfile {
+                *value = std::ptr::null_mut();
+            }
+            if let Some(value) = self.r_consolefile {
+                *value = std::ptr::null_mut();
+            }
+            if let Some(value) = self.ptr_r_write_console {
+                *value = None;
+            }
+            *self.ptr_r_write_console_ex = Some(write_console_ex_callback);
+            *self.ptr_r_read_console = Some(read_console_callback);
+            if let Some(value) = self.ptr_r_show_message {
+                *value = Some(show_message_callback);
+            }
+            if let Some(value) = self.ptr_r_busy {
+                *value = Some(busy_callback);
+            }
+            if let Some(value) = self.ptr_r_suicide {
+                *value = Some(suicide_callback);
+            }
+            (self.setup_rmainloop)();
+            Ok(())
+        }
+
+        fn parse_api(&self) -> ParseApi {
+            let r_nil_value = unsafe { *self.r_nil_value_ptr as usize };
+            ParseApi {
+                rf_mk_string: self.rf_mk_string,
+                rf_protect: self.rf_protect,
+                rf_unprotect: self.rf_unprotect,
+                r_parse_vector: self.r_parse_vector,
+                r_toplevel_exec: self.r_toplevel_exec,
+                r_nil_value,
+            }
+        }
+
+        fn event_loop_api(&self) -> EventLoopApi {
+            EventLoopApi {
+                r_check_activity: self.r_check_activity,
+                r_run_handlers: self.r_run_handlers,
+                r_toplevel_exec: self.r_toplevel_exec,
+                r_input_handlers: self.r_input_handlers as usize,
+            }
+        }
+    }
+
+    unsafe fn load_function<T: Copy>(
+        library: &Library,
+        symbol: &[u8],
+    ) -> Result<T, Box<dyn Error>> {
+        let handle: Symbol<T> = library.get(symbol)?;
+        Ok(*handle)
+    }
+
+    unsafe fn load_optional_function<T: Copy>(library: &Library, symbol: &[u8]) -> Option<T> {
+        match library.get::<T>(symbol) {
+            Ok(handle) => Some(*handle),
+            Err(_) => None,
+        }
+    }
+
+    unsafe fn load_global<T>(library: &Library, symbol: &[u8]) -> Result<*mut T, Box<dyn Error>> {
+        let handle: Symbol<*mut T> = library.get(symbol)?;
+        Ok(*handle)
+    }
+
+    unsafe fn load_optional_global<T>(library: &Library, symbol: &[u8]) -> Option<*mut T> {
+        match library.get::<*mut T>(symbol) {
+            Ok(handle) => Some(*handle),
+            Err(_) => None,
+        }
+    }
+
+    fn build_r_args(r_executable: &Path, r_args: &[String]) -> Result<Vec<CString>, Box<dyn Error>> {
+        let mut argv = Vec::with_capacity(r_args.len() + 2);
+        let program_name = r_executable
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("R");
+        argv.push(CString::new(program_name)?);
+
+        if !r_args.iter().any(|arg| arg == "--interactive") {
+            argv.push(CString::new("--interactive")?);
+        }
+
+        for arg in r_args {
+            argv.push(CString::new(arg.as_str())?);
+        }
+
+        Ok(argv)
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|window| window == needle)
-}
-
-fn decode_marker_payload(payload: &[u8]) -> String {
-    let mut output = Vec::with_capacity(payload.len());
-    let mut index = 0_usize;
-
-    while index < payload.len() {
-        match payload[index] {
-            b'\\' if index + 1 < payload.len() && payload[index + 1] == b'\\' => {
-                output.push(b'\\');
-                index += 2;
-            }
-            b'\\' if index + 3 < payload.len() && payload[index + 1] == b'x' => {
-                let hex = &payload[index + 2..index + 4];
-                if let Ok(text) = std::str::from_utf8(hex) {
-                    if let Ok(value) = u8::from_str_radix(text, 16) {
-                        output.push(value);
-                        index += 4;
-                        continue;
-                    }
-                }
-                output.push(payload[index]);
-                index += 1;
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8_lossy(&output).into_owned()
-}
+#[cfg(unix)]
+pub(crate) use unix_host::run;

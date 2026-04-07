@@ -4,7 +4,6 @@ import * as path from "path";
 import {
   type BackendCapability,
   type BackendControlEvent,
-  encodeInputBytesFrame,
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
   encodeReplyInputFrame,
@@ -45,16 +44,25 @@ type BackendProcessState = {
   capabilities: Set<BackendCapability>;
   hostConnected: boolean;
   nextRequestId: number;
-  pendingParseRequests: Map<number, (status: number) => void>;
+  pendingParseRequests: Map<
+    number,
+    {
+      resolve: (status: number) => void;
+      reject: (error: Error) => void;
+      timeout: NodeJS.Timeout;
+    }
+  >;
 };
+
+const PARSE_STATUS_TIMEOUT_MS = 150;
 
 export interface RuntimeBackend {
   start(args: string[], options: RuntimeBackendStartOptions): ChildProcess;
   attach(process: ChildProcess, handlers: RuntimeBackendHandlers): void;
+  hasCapability(process: ChildProcess | null, capability: BackendCapability): boolean;
   canUseSessionCommands(process: ChildProcess | null): boolean;
   sendSessionCommand(process: ChildProcess | null, command: RuntimeSessionCommand): boolean;
   requestParseStatus(process: ChildProcess | null, code: string): Promise<number> | undefined;
-  write(process: ChildProcess, payload: string): boolean;
   close(process: ChildProcess): void;
 }
 
@@ -73,7 +81,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       capabilities: new Set<BackendCapability>(),
       hostConnected: false,
       nextRequestId: 0,
-      pendingParseRequests: new Map<number, (status: number) => void>(),
+      pendingParseRequests: new Map(),
     });
     return child;
   }
@@ -142,6 +150,17 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     );
   }
 
+  hasCapability(process: ChildProcess | null, capability: BackendCapability): boolean {
+    if (!process) {
+      return false;
+    }
+    const state = this.processStates.get(process);
+    if (!state || !state.hostConnected) {
+      return false;
+    }
+    return state.capabilities.has(capability);
+  }
+
   sendSessionCommand(process: ChildProcess | null, command: RuntimeSessionCommand): boolean {
     if (!process) {
       return false;
@@ -153,12 +172,21 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
     switch (command.type) {
       case "submit":
+        if (!state.capabilities.has("top-level-submit")) {
+          return false;
+        }
         return this.writeFrame(process, encodeSubmitFrame(command.code));
       case "interrupt":
         return this.writeFrame(process, encodeInterruptFrame());
       case "reply-input":
+        if (!state.capabilities.has("nested-input")) {
+          return false;
+        }
         return this.writeFrame(process, encodeReplyInputFrame(command.text));
       case "set-width":
+        if (!state.capabilities.has("set-width")) {
+          return false;
+        }
         return this.writeFrame(process, encodeSetWidthFrame(command.columns));
       default:
         return false;
@@ -174,21 +202,50 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return undefined;
     }
 
-    return new Promise<number>((resolve) => {
+    return new Promise<number>((resolve, reject) => {
+      let settled = false;
       const requestId = ++state.nextRequestId;
-      state.pendingParseRequests.set(requestId, resolve);
+      const timeout = setTimeout(() => {
+        const pending = state.pendingParseRequests.get(requestId);
+        if (!pending) {
+          return;
+        }
+        state.pendingParseRequests.delete(requestId);
+        settled = true;
+        pending.reject(new Error("native parse-status request timed out"));
+      }, PARSE_STATUS_TIMEOUT_MS);
+      state.pendingParseRequests.set(requestId, {
+        resolve: (status) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timeout);
+          resolve(status);
+        },
+        reject: (error) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timeout);
+          reject(error);
+        },
+        timeout,
+      });
       const sent = this.writeFrame(process, encodeParseStatusRequestFrame(requestId, code));
       if (sent) {
         return;
       }
+      const pending = state.pendingParseRequests.get(requestId);
+      if (!pending) {
+        return;
+      }
       state.pendingParseRequests.delete(requestId);
+      clearTimeout(pending.timeout);
+      settled = true;
       resolve(1);
     });
-  }
-
-  write(process: ChildProcess, payload: string): boolean {
-    const normalizedPayload = payload.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    return this.writeFrame(process, encodeInputBytesFrame(Buffer.from(normalizedPayload, "utf8")));
   }
 
   close(process: ChildProcess): void {
@@ -228,7 +285,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       capabilities: new Set<BackendCapability>(),
       hostConnected: false,
       nextRequestId: 0,
-      pendingParseRequests: new Map<number, (status: number) => void>(),
+      pendingParseRequests: new Map(),
     };
     this.processStates.set(process, created);
     return created;
@@ -249,12 +306,13 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         }
         return;
       case "parse-status-result": {
-        const resolve = state.pendingParseRequests.get(event.requestId);
-        if (!resolve) {
+        const pending = state.pendingParseRequests.get(event.requestId);
+        if (!pending) {
           return;
         }
         state.pendingParseRequests.delete(event.requestId);
-        resolve(event.status);
+        clearTimeout(pending.timeout);
+        pending.resolve(event.status);
         return;
       }
       default:
@@ -263,8 +321,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   }
 
   private resolvePendingParseRequests(state: BackendProcessState, status: number): void {
-    for (const resolve of state.pendingParseRequests.values()) {
-      resolve(status);
+    for (const pending of state.pendingParseRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve(status);
     }
     state.pendingParseRequests.clear();
   }

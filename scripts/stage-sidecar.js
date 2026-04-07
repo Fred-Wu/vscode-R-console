@@ -43,6 +43,20 @@ function stageBinary(src, dst) {
   }
 }
 
+function copyDirectory(src, dst) {
+  const entries = fs.readdirSync(src, { withFileTypes: true });
+  fs.mkdirSync(dst, { recursive: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const dstPath = path.join(dst, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectory(srcPath, dstPath);
+      continue;
+    }
+    fs.copyFileSync(srcPath, dstPath);
+  }
+}
+
 function sha256(filePath) {
   const hash = crypto.createHash("sha256");
   hash.update(fs.readFileSync(filePath));
@@ -68,19 +82,26 @@ function main() {
   const target = args.target ?? getDefaultPackageTarget();
   const sidecarName = getPackageTargetInfo(target).executable;
   const root = path.resolve(__dirname, "..");
-  const dstDir = path.join(root, "bundled", "bin");
+  const bundledDir = path.join(root, "bundled");
+  const dstDir = path.join(bundledDir, "bin");
+  const resourcesDir = path.join(root, "resources");
+  const runtimeProfileSrc = path.join(resourcesDir, "r", "console-profile.R");
 
   const sidecarSrc = resolveSource(root, target);
   if (!sidecarSrc) {
     throw new Error(`Sidecar binary not found in target directories for ${target}`);
   }
+  if (!fs.existsSync(runtimeProfileSrc)) {
+    throw new Error(`Runtime bootstrap script not found at ${runtimeProfileSrc}`);
+  }
 
-  fs.rmSync(dstDir, { recursive: true, force: true });
+  fs.rmSync(bundledDir, { recursive: true, force: true });
   const sidecarDst = path.join(dstDir, sidecarName);
   stageBinary(sidecarSrc, sidecarDst);
+  copyDirectory(path.join(resourcesDir, "r"), path.join(bundledDir, "r"));
   verifyStagedBinary(sidecarSrc, sidecarDst);
 
-  process.stdout.write(`Staged sidecar for ${target}: ${sidecarDst}\n`);
+  process.stdout.write(`Staged runtime bundle for ${target}: ${bundledDir}\n`);
 }
 
 main();

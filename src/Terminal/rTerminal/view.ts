@@ -109,10 +109,7 @@ export function renderInput({
 }
 
 export function formatTerminalOutput(text: string): string {
-  if (process.platform !== "win32") {
-    return text;
-  }
-  return text.replace(/\r?\n/g, "\r\n");
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
 }
 
 export function getPromptRenderDelay(

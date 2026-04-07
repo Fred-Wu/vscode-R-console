@@ -8,4 +8,5 @@ name = "R_CONSOLE_HOST"
 path = "src/main.rs"
 
 [dependencies]
-portable-pty = "0.9"
+libc = "0.2"
+libloading = "0.8"

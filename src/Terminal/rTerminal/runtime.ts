@@ -29,6 +29,11 @@ import {
 } from "./view";
 
 const VSCODE_R_TERMINAL_NAME = "R Interactive";
+const INTERRUPT_RETRY_DELAY_MS = 120;
+const INTERRUPT_RETRY_MAX_ATTEMPTS = 6;
+
+const interruptRetryTimers = new WeakMap<RuntimeHost, NodeJS.Timeout>();
+const interruptRetryAttempts = new WeakMap<RuntimeHost, number>();
 
 type Dimensions = {
   columns: number;
@@ -93,7 +98,6 @@ export type RuntimeHost = {
   recordOutputActivity(): void;
   isSessionProtocolActive(): boolean;
   isSessionReadyForPrompt(): boolean;
-  isTrueTerminalBackendConfigured(): boolean;
   startNextSubmission(): void;
   finishActiveSubmission(): void;
   getDisplayPid(): number | undefined;
@@ -147,7 +151,7 @@ export function startRuntime(host: RuntimeHost): void {
   }
 
   try {
-    const args = [host.options.consolePath, ...host.options.rArgs];
+    const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
     if (host.extensionPath) {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
@@ -228,16 +232,10 @@ function onRuntimeAttached(host: RuntimeHost): void {
     return;
   }
   host.sessionAttached = true;
-  if (!host.isTrueTerminalBackendConfigured()) {
-    host.promptReady = true;
-    host.pendingPromptToken = true;
-  }
   host.onSessionDataChanged(host.sessionWatcher?.getWorkspaceData());
   host.nameEmitter.fire(VSCODE_R_TERMINAL_NAME);
-  if (host.mode === "starting") {
-    if (!host.isTrueTerminalBackendConfigured() || host.promptReady) {
-      host.mode = "ready";
-    }
+  if (host.mode === "starting" && host.promptReady) {
+    host.mode = "ready";
   }
   if (host.mode === "ready" && host.promptReady) {
     host.pendingPromptToken = true;
@@ -282,8 +280,10 @@ export function handleRuntimeControl(
       handleBackendPrompt(host, event.kind);
       return;
     case "busy":
-      if (host.isTrueTerminalBackendConfigured() && event.value && host.mode !== "reply") {
+      if (event.value && host.mode !== "reply") {
         host.mode = "executing";
+      } else if (!event.value) {
+        clearInterruptRetry(host);
       }
       return;
     case "input-request":
@@ -326,6 +326,7 @@ export function handleBackendPrompt(
   host: RuntimeHost,
   kind: "main" | "cont"
 ): void {
+  clearInterruptRetry(host);
   host.promptReady = true;
   host.promptKind = kind;
   host.replyPromptText = "";
@@ -518,7 +519,7 @@ export async function enqueueRuntimeSubmission(
   code: string,
   skipSplit: boolean = false,
   alreadyVisible: boolean = false
-): Promise<void> {
+) : Promise<string[]> {
   const blocks = skipSplit
     ? [normalizeSubmissionBlock(code)]
     : await splitSubmissionBlocks(host, code);
@@ -529,7 +530,7 @@ export async function enqueueRuntimeSubmission(
       host.pendingPromptToken = true;
       host.schedulePrompt();
     }
-    return;
+    return [];
   }
 
   for (const block of blocks) {
@@ -543,6 +544,7 @@ export async function enqueueRuntimeSubmission(
 
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
   startNextRuntimeSubmission(host);
+  return blocks;
 }
 
 export function beginVisibleRuntimeSubmission(
@@ -559,6 +561,13 @@ export function beginVisibleRuntimeSubmission(
       styledLines: host.syntax.prepareSnapshot(plainLines),
       restyleStarted: false,
     };
+    const rowsBelowCursor = Math.max(
+      0,
+      host.renderer.renderedLineCount - 1 - host.renderer.cursorRowFromTop
+    );
+    if (rowsBelowCursor > 0) {
+      host.writeEmitter.fire(`\x1b[${rowsBelowCursor}B`);
+    }
     host.writeEmitter.fire("\r\n");
     host.lastWriteEndedWithNewline = true;
     host.renderer.renderedLineCount = 1;
@@ -597,7 +606,7 @@ async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<s
   }
 
   const trailingBlock = normalizeSubmissionBlock(currentBlock);
-  if (trailingBlock.trim()) {
+  if (trailingBlock.trim() && (await host.inputState.isExpressionCompleteAsync(trailingBlock))) {
     blocks.push(trailingBlock);
   }
 
@@ -620,12 +629,12 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
   } else {
     if (host.pendingInitialPromptGap) {
       if (host.hasReceivedOutput) {
-        host.writeEmitter.fire("\n");
+        host.writeEmitter.fire("\r\n");
       }
       host.lastWriteEndedWithNewline = true;
       host.pendingInitialPromptGap = false;
     } else if (!host.lastWriteEndedWithNewline) {
-      host.writeEmitter.fire("\n");
+      host.writeEmitter.fire("\r\n");
       host.lastWriteEndedWithNewline = true;
     }
   }
@@ -766,11 +775,16 @@ export function interruptRuntime(host: RuntimeHost): void {
     return;
   }
 
-  if (host.isSessionProtocolActive() && host.mode === "executing") {
-    host.writeEmitter.fire("^C\r\n");
+  const sendInterrupt = (): boolean =>
     host.runtimeBackend?.sendSessionCommand(host.rProcess, {
       type: "interrupt",
-    });
+    }) ?? false;
+
+  if (host.isSessionProtocolActive() && host.mode === "executing") {
+    host.writeEmitter.fire("^C\r\n");
+    if (sendInterrupt()) {
+      scheduleInterruptRetry(host);
+    }
     host.inputState.reset();
     host.promptVisible = false;
     host.pendingPromptToken = false;
@@ -785,9 +799,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.promptVisible = false;
     host.replyPromptText = "";
     host.mode = "executing";
-    host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-      type: "interrupt",
-    });
+    sendInterrupt();
     return;
   }
 
@@ -798,18 +810,56 @@ export function interruptRuntime(host: RuntimeHost): void {
     return;
   }
 
+  if (!sendInterrupt()) {
+    return;
+  }
+
+  scheduleInterruptRetry(host);
   host.writeEmitter.fire("^C\r\n");
-  host.runtimeBackend?.write(host.rProcess, "\x03");
-
   host.inputState.reset();
-  host.activeSubmission = null;
+  host.promptVisible = false;
+}
 
-  host.mode = "ready";
-  host.pendingPromptToken = true;
-  host.schedulePrompt();
+function clearInterruptRetry(host: RuntimeHost): void {
+  const timer = interruptRetryTimers.get(host);
+  if (timer) {
+    clearTimeout(timer);
+    interruptRetryTimers.delete(host);
+  }
+  interruptRetryAttempts.delete(host);
+}
+
+function scheduleInterruptRetry(host: RuntimeHost): void {
+  clearInterruptRetry(host);
+
+  const sendRetry = () => {
+    const attempts = interruptRetryAttempts.get(host) ?? 0;
+    if (
+      attempts >= INTERRUPT_RETRY_MAX_ATTEMPTS ||
+      !host.rProcess ||
+      host.rProcess.killed ||
+      host.mode !== "executing" ||
+      !host.isSessionProtocolActive()
+    ) {
+      clearInterruptRetry(host);
+      return;
+    }
+
+    interruptRetryAttempts.set(host, attempts + 1);
+    host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+      type: "interrupt",
+    });
+
+    const timer = setTimeout(sendRetry, INTERRUPT_RETRY_DELAY_MS);
+    interruptRetryTimers.set(host, timer);
+  };
+
+  const timer = setTimeout(sendRetry, INTERRUPT_RETRY_DELAY_MS);
+  interruptRetryTimers.set(host, timer);
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
+  clearInterruptRetry(host);
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
@@ -839,7 +889,12 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
 }
 
 function updateNativeParseCallback(host: RuntimeHost): void {
-  if (!host.runtimeBackend || !host.rProcess || !host.sessionHostConnected) {
+  if (
+    !host.runtimeBackend ||
+    !host.rProcess ||
+    !host.sessionHostConnected ||
+    !host.runtimeBackend.hasCapability(host.rProcess, "parse-status")
+  ) {
     setNativeParseCallback(null);
     return;
   }

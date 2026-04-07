@@ -16,14 +16,12 @@ const FrameKind = {
   ReplyInput: 13,
   Interrupt: 14,
   SetWidth: 15,
-  InputBytes: 16,
   Shutdown: 17,
   HostError: 19,
 } as const;
 
 export type BackendCapability =
   | "control-channel"
-  | "raw-write"
   | "shutdown"
   | "session-control"
   | "top-level-submit"
@@ -91,7 +89,6 @@ type StringListPayload = {
 function isBackendCapability(value: string): value is BackendCapability {
   return (
     value === "control-channel" ||
-    value === "raw-write" ||
     value === "shutdown" ||
     value === "session-control" ||
     value === "top-level-submit" ||
@@ -319,10 +316,6 @@ export function encodeParseStatusRequestFrame(
   code: string
 ): Buffer {
   return createFrame(FrameKind.ParseStatusRequest, requestId, Buffer.from(code, "utf8"));
-}
-
-export function encodeInputBytesFrame(payload: Buffer): Buffer {
-  return createFrame(FrameKind.InputBytes, 0, payload);
 }
 
 export function encodeShutdownFrame(): Buffer {

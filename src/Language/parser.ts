@@ -8,7 +8,7 @@ export function setNativeParseCallback(
 
 type LocalParseClassification = "complete" | "incomplete" | "unknown";
 
-function stripCommentLines(code: string): string {
+export function stripCommentLines(code: string): string {
   const lines = code.split(/\r?\n/);
   const kept: string[] = [];
   for (const line of lines) {
