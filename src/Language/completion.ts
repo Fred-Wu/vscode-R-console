@@ -260,10 +260,6 @@ export async function collectCompletionEntries(
     context.kind === "bracket"
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
-  const argumentItems =
-    context.kind === "argument"
-      ? await getArgumentCompletions(context, doc, position, completionProvider)
-      : [];
   
   const columnItems = getDataColumnCompletions(context, sessionData);
 
@@ -276,7 +272,6 @@ export async function collectCompletionEntries(
   }
 
   if (context.kind === "argument") {
-    const argFiltered = filterCompletionEntries(argumentItems, context.prefix);
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
@@ -285,7 +280,6 @@ export async function collectCompletionEntries(
          if (context.prefix.length === 0) {
         return dedupeCompletionEntries([
           ...columnFiltered,
-          ...argFiltered,
           ...lspFiltered,
           ...sessionFiltered,
         ]);
@@ -294,15 +288,14 @@ export async function collectCompletionEntries(
           ...columnFiltered,
           ...lspFiltered,
           ...sessionFiltered,
-          ...argFiltered,
         ]);
       }
     }
     
     if (context.prefix.length === 0) {
-      return dedupeCompletionEntries([...argFiltered, ...lspFiltered, ...sessionFiltered]);
+      return dedupeCompletionEntries([...lspFiltered, ...sessionFiltered]);
     } else {
-      return dedupeCompletionEntries([...lspFiltered, ...sessionFiltered, ...argFiltered]);
+      return dedupeCompletionEntries([...lspFiltered, ...sessionFiltered]);
     }
   }
 
@@ -319,13 +312,13 @@ export async function collectCompletionEntries(
   
   if (context.dataObjectName && defaultColumnFiltered.length > 0) {
     return dedupeCompletionEntries(filterCompletionEntries(
-      [...columnItems, ...lspItems, ...argumentItems, ...sessionItems],
+      [...columnItems, ...lspItems, ...sessionItems],
       context.prefix
     ));
   }
 
   return dedupeCompletionEntries(filterCompletionEntries(
-    [...lspItems, ...argumentItems, ...sessionItems],
+    [...lspItems, ...sessionItems],
     context.prefix
   ));
 }
@@ -499,70 +492,6 @@ async function getLanguageServerCompletions(
   } catch {
     return [];
   }
-}
-
-async function getArgumentCompletions(
-  context: CompletionContext,
-  doc: vscode.TextDocument,
-  position: vscode.Position,
-  completionProvider?: CompletionProvider
-): Promise<CompletionEntry[]> {
-  if (!context.functionName || !completionProvider) {
-    return [];
-  }
-  try {
-    const sig = await completionProvider.provideSignatureHelp(
-      doc,
-      position,
-      getSignatureTriggerCharacter(doc, position)
-    );
-    const sigInfo = sig?.signatures?.[0];
-    if (!sigInfo || !sigInfo.parameters) {
-      return [];
-    }
-    const entries: CompletionEntry[] = [];
-    for (const param of sigInfo.parameters) {
-      let labelText: string;
-      if (typeof param.label === "string") {
-        labelText = param.label;
-      } else {
-        const [start, end] = param.label;
-        labelText = doc.getText(new vscode.Range(doc.positionAt(start), doc.positionAt(end)));
-      }
-      const clean = labelText
-        .replace(/[,=:].*$/, "")
-        .replace(/^\s*\.{3}\s*/, "")
-        .trim();
-      if (!clean) {
-        continue;
-      }
-      entries.push({
-        label: clean,
-        insertText: `${clean} = `,
-        kind: vscode.CompletionItemKind.Property,
-        detail: `argument of ${context.functionName}`,
-        source: "lsp",
-        replaceStart: context.replaceStart,
-      });
-    }
-    return entries;
-  } catch {
-    return [];
-  }
-}
-
-function getSignatureTriggerCharacter(
-  doc: vscode.TextDocument,
-  position: vscode.Position
-): string | undefined {
-  const offset = doc.offsetAt(position);
-  if (offset <= 0) {
-    return undefined;
-  }
-  const previous = doc.getText(
-    new vscode.Range(doc.positionAt(offset - 1), position)
-  );
-  return previous === "(" || previous === "," ? previous : undefined;
 }
 
 function getCompletionLabel(item: vscode.CompletionItem): string {

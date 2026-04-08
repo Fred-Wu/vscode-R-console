@@ -35,59 +35,149 @@ type LoadedTheme = {
   key: string;
   rules: TokenRule[];
   semanticRules: Map<string, SemanticTokenRule>;
-  defaultTextAnsi: string;
+  semanticScopeRules: Map<string, readonly (readonly string[])[]>;
+  bracketPairAnsi: string[];
 };
 
-const FALLBACK_TEXT_ANSI = "\x1b[37m";
+const BUILTIN_SEMANTIC_SCOPE_RULES = new Map<string, readonly (readonly string[])[]>([
+  ["comment", [["comment"]]],
+  ["string", [["string"]]],
+  ["keyword", [["keyword.control"]]],
+  ["number", [["constant.numeric"]]],
+  ["regexp", [["constant.regexp"]]],
+  ["operator", [["keyword.operator"]]],
+  ["namespace", [["entity.name.namespace"]]],
+  ["type", [["entity.name.type"], ["support.type"]]],
+  ["struct", [["entity.name.type.struct"]]],
+  ["class", [["entity.name.type.class"], ["support.class"]]],
+  ["interface", [["entity.name.type.interface"]]],
+  ["enum", [["entity.name.type.enum"]]],
+  ["typeParameter", [["entity.name.type.parameter"]]],
+  ["function", [["entity.name.function"], ["support.function"]]],
+  ["method", [["entity.name.function.member"], ["support.function"]]],
+  ["member", [["entity.name.function.member"], ["support.function"]]],
+  ["macro", [["entity.name.function.preprocessor"]]],
+  ["variable", [["variable.other.readwrite"], ["entity.name.variable"]]],
+  ["parameter", [["variable.parameter"]]],
+  ["property", [["variable.other.property"]]],
+  ["enumMember", [["variable.other.enummember"]]],
+  ["event", [["variable.other.event"]]],
+  ["decorator", [["entity.name.decorator"], ["entity.name.function"]]],
+  ["variable.readonly", [["variable.other.constant"]]],
+  ["property.readonly", [["variable.other.constant.property"]]],
+  ["type.defaultLibrary", [["support.type"]]],
+  ["class.defaultLibrary", [["support.class"]]],
+  ["interface.defaultLibrary", [["support.class"]]],
+  ["variable.defaultLibrary", [["support.variable"], ["support.other.variable"]]],
+  ["variable.defaultLibrary.readonly", [["support.constant"]]],
+  ["property.defaultLibrary", [["support.variable.property"]]],
+  ["property.defaultLibrary.readonly", [["support.constant.property"]]],
+  ["function.defaultLibrary", [["support.function"]]],
+  ["method.defaultLibrary", [["support.function"]]],
+  ["member.defaultLibrary", [["support.function"]]],
+]);
+
+const DEFAULT_BRACKET_COLORS = {
+  dark: ["#FFD700", "#DA70D6", "#179FFF"],
+  light: ["#0431FA", "#319331", "#7B3814"],
+  highContrastDark: ["#FFD700", "#DA70D6", "#87CEFA"],
+  highContrastLight: ["#0431FA", "#319331", "#7B3814"],
+} as const;
 
 const extensionNlsCache = new Map<string, Record<string, string>>();
 
 export class SyntaxTheme {
   private current: LoadedTheme | undefined;
   private scopeCache = new Map<string, string>();
+  private strictScopeCache = new Map<string, string>();
   private semanticCache = new Map<string, string>();
 
   invalidate(): void {
     this.current = undefined;
     this.scopeCache.clear();
+    this.strictScopeCache.clear();
     this.semanticCache.clear();
   }
 
-  getDefaultAnsi(): string {
-    return this.ensureLoaded().defaultTextAnsi;
+  resolveBracketPairAnsi(depth: number): string {
+    const theme = this.ensureLoaded();
+    const enabled = vscode.workspace
+      .getConfiguration("editor")
+      .get<boolean>("bracketPairColorization.enabled", true);
+    if (!enabled || theme.bracketPairAnsi.length === 0) {
+      return "";
+    }
+    return theme.bracketPairAnsi[depth % theme.bracketPairAnsi.length] ?? "";
   }
 
   resolveScopesToAnsi(scopes: readonly string[]): string {
+    const innermost = scopes[scopes.length - 1] ?? "";
+    if (isStructuralScope(innermost)) {
+      const semanticScopes = scopes.filter((scope) => !isStructuralScope(scope));
+      if (semanticScopes.length === 0) {
+        return "";
+      }
+      return this.resolveScopesToAnsiInternal(semanticScopes, true);
+    }
+    return this.resolveScopesToAnsiInternal(scopes, true);
+  }
+
+  private resolveScopedRuleToAnsi(scopes: readonly string[]): string {
+    return this.resolveScopesToAnsiInternal(scopes, false);
+  }
+
+  private resolveScopesToAnsiInternal(
+    scopes: readonly string[],
+    allowDefaultRule: boolean
+  ): string {
     const key = scopes.join("|");
-    const cached = this.scopeCache.get(key);
+    const cache = allowDefaultRule ? this.scopeCache : this.strictScopeCache;
+    const cached = cache.get(key);
     if (cached !== undefined) {
       return cached;
     }
 
     const { rules } = this.ensureLoaded();
     let foreground: string | undefined;
+    let foregroundScore = Number.NEGATIVE_INFINITY;
+    let foregroundIndex = -1;
     let bold = false;
     let italic = false;
     let underline = false;
+    let fontStyleScore = Number.NEGATIVE_INFINITY;
+    let fontStyleIndex = -1;
 
-    for (const rule of rules) {
-      const selectors = normalizeScopes(rule.scope);
-      if (
-        selectors.length > 0 &&
-        !selectors.some((selector) => scopes.some((scope) => scopeMatches(selector, scope)))
-      ) {
+    for (const [ruleIndex, rule] of rules.entries()) {
+      if (!allowDefaultRule && rule.scope === undefined) {
+        continue;
+      }
+
+      const score = scoreRule(rule.scope, scopes);
+      if (score === undefined) {
         continue;
       }
 
       if (typeof rule.settings.foreground === "string") {
-        foreground = normalizeHex(rule.settings.foreground) ?? foreground;
+        const normalized = normalizeHex(rule.settings.foreground);
+        if (
+          normalized &&
+          (score > foregroundScore || (score === foregroundScore && ruleIndex > foregroundIndex))
+        ) {
+          foreground = normalized;
+          foregroundScore = score;
+          foregroundIndex = ruleIndex;
+        }
       }
 
       if (rule.settings.fontStyle !== undefined) {
-        const fontStyle = parseFontStyle(rule.settings.fontStyle);
-        bold = fontStyle.bold;
-        italic = fontStyle.italic;
-        underline = fontStyle.underline;
+        if (score > fontStyleScore || (score === fontStyleScore && ruleIndex > fontStyleIndex)) {
+          const fontStyle = parseFontStyle(rule.settings.fontStyle);
+          bold = fontStyle.bold;
+          italic = fontStyle.italic;
+          underline = fontStyle.underline;
+          fontStyleScore = score;
+          fontStyleIndex = ruleIndex;
+        }
       }
     }
 
@@ -98,7 +188,7 @@ export class SyntaxTheme {
       underline ? ANSI.underline : "",
     ].join("");
 
-    this.scopeCache.set(key, ansi);
+    cache.set(key, ansi);
     return ansi;
   }
 
@@ -111,20 +201,28 @@ export class SyntaxTheme {
 
     const theme = this.ensureLoaded();
     const semanticRule = selectSemanticRule(theme.semanticRules, tokenType, modifiers);
-    if (!semanticRule) {
-      this.semanticCache.set(key, "");
-      return "";
+    if (semanticRule) {
+      const foreground = normalizeHex(semanticRule.foreground);
+      const fontStyle = parseFontStyle(semanticRule.fontStyle ?? "");
+      const ansi = [
+        foreground ? ansiFromHex(foreground) : "",
+        fontStyle.bold ? ANSI.bold : "",
+        fontStyle.italic ? ANSI.italic : "",
+        fontStyle.underline ? ANSI.underline : "",
+      ].join("");
+
+      if (ansi) {
+        this.semanticCache.set(key, ansi);
+        return ansi;
+      }
     }
 
-    const foreground = normalizeHex(semanticRule.foreground);
-    const fontStyle = parseFontStyle(semanticRule.fontStyle ?? "");
-    const ansi = [
-      foreground ? ansiFromHex(foreground) : "",
-      fontStyle.bold ? ANSI.bold : "",
-      fontStyle.italic ? ANSI.italic : "",
-      fontStyle.underline ? ANSI.underline : "",
-    ].join("");
-
+    const ansi = resolveSemanticScopeAnsi(
+      theme.semanticScopeRules,
+      tokenType,
+      modifiers,
+      (scopes) => this.resolveScopedRuleToAnsi(scopes)
+    );
     this.semanticCache.set(key, ansi);
     return ansi;
   }
@@ -138,14 +236,14 @@ export class SyntaxTheme {
 
     const loaded = loadTheme(themeKey);
     this.scopeCache.clear();
+    this.strictScopeCache.clear();
     this.semanticCache.clear();
     this.current = {
       key: themeKey,
       rules: loaded.rules,
       semanticRules: loaded.semanticRules,
-      defaultTextAnsi: loaded.defaultForeground
-        ? ansiFromHex(loaded.defaultForeground)
-        : FALLBACK_TEXT_ANSI,
+      semanticScopeRules: loadSemanticScopeRules("r"),
+      bracketPairAnsi: loaded.bracketColors.map((color) => ansiFromHex(color)),
     };
     return this.current;
   }
@@ -154,28 +252,117 @@ export class SyntaxTheme {
 function loadTheme(themeName: string): {
   rules: TokenRule[];
   semanticRules: Map<string, SemanticTokenRule>;
-  defaultForeground?: string;
+  bracketColors: string[];
 } {
   const themePath = resolveThemePath(themeName);
   const theme = themePath
     ? readTheme(themePath)
-    : { rules: [], semanticRules: new Map<string, SemanticTokenRule>(), defaultForeground: undefined };
-  const normalizedDefault = normalizeHex(theme.defaultForeground);
-  const hasDefaultRule = theme.rules.some(
-    (rule) =>
-      rule.scope === undefined &&
-      typeof rule.settings.foreground === "string" &&
-      normalizeHex(rule.settings.foreground) !== undefined
-  );
+    : {
+        rules: [],
+        semanticRules: new Map<string, SemanticTokenRule>(),
+        colors: {},
+      };
 
   return {
-    rules:
-      normalizedDefault && !hasDefaultRule
-        ? [{ settings: { foreground: normalizedDefault } }, ...theme.rules]
-        : theme.rules,
+    rules: theme.rules,
     semanticRules: theme.semanticRules,
-    defaultForeground: normalizedDefault,
+    bracketColors: buildBracketColors(theme.colors),
   };
+}
+
+function buildBracketColors(themeColors: Record<string, string>): string[] {
+  return [0, 1, 2, 3, 4, 5]
+    .map((index) => {
+      const configured = normalizeHex(themeColors[`editorBracketHighlight.foreground${index + 1}`]);
+      if (configured) {
+        return configured;
+      }
+      return defaultBracketColor(index);
+    })
+    .filter((color): color is string => color !== undefined);
+}
+
+function defaultBracketColor(index: number): string | undefined {
+  const defaults = getDefaultBracketPalette();
+  return defaults[index];
+}
+
+function getDefaultBracketPalette(): readonly string[] {
+  switch (vscode.window.activeColorTheme.kind) {
+    case vscode.ColorThemeKind.Light:
+      return DEFAULT_BRACKET_COLORS.light;
+    case vscode.ColorThemeKind.HighContrast:
+      return DEFAULT_BRACKET_COLORS.highContrastDark;
+    case vscode.ColorThemeKind.HighContrastLight:
+      return DEFAULT_BRACKET_COLORS.highContrastLight;
+    case vscode.ColorThemeKind.Dark:
+    default:
+      return DEFAULT_BRACKET_COLORS.dark;
+  }
+}
+
+function loadSemanticScopeRules(languageId: string): Map<string, readonly (readonly string[])[]> {
+  const rules = new Map(BUILTIN_SEMANTIC_SCOPE_RULES);
+
+  for (const extension of vscode.extensions.all) {
+    const contributions = extension.packageJSON?.contributes?.semanticTokenScopes;
+    if (!Array.isArray(contributions)) {
+      continue;
+    }
+
+    for (const contribution of contributions as Array<{
+      language?: string;
+      scopes?: Record<string, string | string[]>;
+    }>) {
+      if (contribution.language !== languageId || !contribution.scopes) {
+        continue;
+      }
+
+      for (const [selector, scopes] of Object.entries(contribution.scopes)) {
+        const normalizedScopes = normalizeSemanticScopes(scopes);
+        if (normalizedScopes.length > 0) {
+          rules.set(selector, normalizedScopes);
+        }
+      }
+    }
+  }
+
+  return rules;
+}
+
+function normalizeSemanticScopes(scopes: string | string[]): readonly (readonly string[])[] {
+  const values = Array.isArray(scopes) ? scopes : [scopes];
+  return values
+    .map((value) =>
+      value
+        .split(/\s+/)
+        .map((segment) => segment.trim())
+        .filter((segment) => segment.length > 0)
+    )
+    .filter((scopeChain) => scopeChain.length > 0);
+}
+
+function resolveSemanticScopeAnsi(
+  semanticScopeRules: Map<string, readonly (readonly string[])[]>,
+  tokenType: string,
+  modifiers: readonly string[],
+  resolveScopes: (scopes: readonly string[]) => string
+): string {
+  for (const selector of buildSemanticSelectorOrder(tokenType, [...modifiers].sort())) {
+    const scopeChains = semanticScopeRules.get(selector);
+    if (!scopeChains) {
+      continue;
+    }
+
+    for (const scopes of scopeChains) {
+      const ansi = resolveScopes(scopes);
+      if (ansi) {
+        return ansi;
+      }
+    }
+  }
+
+  return "";
 }
 
 function resolveThemePath(themeName: string): string | undefined {
@@ -308,22 +495,22 @@ function readTheme(
 ): {
   rules: TokenRule[];
   semanticRules: Map<string, SemanticTokenRule>;
-  defaultForeground?: string;
+  colors: Record<string, string>;
 } {
   const normalizedPath = path.normalize(themePath);
   if (seen.has(normalizedPath)) {
-    return { rules: [], semanticRules: new Map<string, SemanticTokenRule>() };
+    return { rules: [], semanticRules: new Map<string, SemanticTokenRule>(), colors: {} };
   }
   seen.add(normalizedPath);
 
   const document = readThemeDocument(normalizedPath);
   if (!document) {
-    return { rules: [], semanticRules: new Map<string, SemanticTokenRule>() };
+    return { rules: [], semanticRules: new Map<string, SemanticTokenRule>(), colors: {} };
   }
 
   const rules: TokenRule[] = [];
   const semanticRules = new Map<string, SemanticTokenRule>();
-  let defaultForeground: string | undefined;
+  let colors: Record<string, string> = {};
 
   if (typeof document.include === "string" && document.include.trim().length > 0) {
     const included = readTheme(path.resolve(path.dirname(normalizedPath), document.include), seen);
@@ -331,7 +518,7 @@ function readTheme(
     for (const [key, value] of included.semanticRules) {
       semanticRules.set(key, value);
     }
-    defaultForeground = included.defaultForeground;
+    colors = { ...included.colors };
   }
 
   if (Array.isArray(document.settings)) {
@@ -349,7 +536,6 @@ function readTheme(
     for (const [key, value] of includedColors.semanticRules) {
       semanticRules.set(key, value);
     }
-    defaultForeground = includedColors.defaultForeground ?? defaultForeground;
   }
 
   if (document.semanticTokenColors) {
@@ -358,21 +544,14 @@ function readTheme(
     }
   }
 
-  const scopedDefault = rules.reduce<string | undefined>((current, rule) => {
-    if (rule.scope !== undefined) {
-      return current;
-    }
-    return normalizeHex(rule.settings.foreground) ?? current;
-  }, defaultForeground);
-
-  const colorDefault =
-    normalizeHex(document.colors?.["editor.foreground"]) ??
-    normalizeHex(document.colors?.["terminal.foreground"]);
+  if (document.colors) {
+    colors = { ...colors, ...document.colors };
+  }
 
   return {
     rules,
     semanticRules,
-    defaultForeground: colorDefault ?? scopedDefault,
+    colors,
   };
 }
 
@@ -409,11 +588,10 @@ function selectSemanticRule(
 
 function buildSemanticSelectorOrder(tokenType: string, modifiers: string[]): string[] {
   const selectors = new Set<string>();
-  selectors.add(tokenType);
-
   for (let size = modifiers.length; size >= 1; size -= 1) {
     appendModifierCombinations(selectors, tokenType, modifiers, size, 0, []);
   }
+  selectors.add(tokenType);
 
   return [...selectors];
 }
@@ -459,8 +637,71 @@ function normalizeScopes(scope?: string | string[]): string[] {
     .filter((value) => value.length > 0);
 }
 
-function scopeMatches(selector: string, scope: string): boolean {
-  return scope === selector || scope.startsWith(`${selector}.`) || selector.startsWith(`${scope}.`);
+function scoreRule(scope: string | string[] | undefined, scopes: readonly string[]): number | undefined {
+  const selectors = normalizeScopes(scope);
+  if (selectors.length === 0) {
+    return 0;
+  }
+
+  let bestScore: number | undefined;
+  for (const selector of selectors) {
+    const score = scoreSelector(selector, scopes);
+    if (score === undefined || (bestScore !== undefined && score <= bestScore)) {
+      continue;
+    }
+    bestScore = score;
+  }
+
+  return bestScore;
+}
+
+function scoreSelector(selector: string, scopes: readonly string[]): number | undefined {
+  const segments = selector.split(/\s+/).filter((value) => value.length > 0);
+  if (segments.length === 0) {
+    return undefined;
+  }
+
+  let scopeIndex = scopes.length - 1;
+  let score = 0;
+
+  for (let segmentIndex = segments.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
+    const segment = segments[segmentIndex];
+    const matchedIndex = findMatchingScopeIndex(scopes, scopeIndex, segment);
+    if (matchedIndex < 0) {
+      return undefined;
+    }
+
+    score += selectorSpecificity(segment) * 100 + (scopes.length - matchedIndex);
+    scopeIndex = matchedIndex - 1;
+  }
+
+  return score * 10 + segments.length;
+}
+
+function findMatchingScopeIndex(
+  scopes: readonly string[],
+  startIndex: number,
+  selector: string
+): number {
+  for (let index = startIndex; index >= 0; index -= 1) {
+    if (scopeMatchesSelector(scopes[index], selector)) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function scopeMatchesSelector(scope: string, selector: string): boolean {
+  return scope === selector || scope.startsWith(`${selector}.`);
+}
+
+function selectorSpecificity(selector: string): number {
+  return selector.split(".").length;
+}
+
+function isStructuralScope(scope: string): boolean {
+  return scope.startsWith("meta.") || scope.startsWith("source.");
 }
 
 function parseFontStyle(fontStyle: string): { bold: boolean; italic: boolean; underline: boolean } {
@@ -484,11 +725,18 @@ function normalizeHex(color: string | undefined): string | undefined {
 
   const digits = match[1];
   if (digits.length === 3 || digits.length === 4) {
+    if (digits.length === 4 && digits[3] === "0") {
+      return undefined;
+    }
     return `#${digits
       .slice(0, 3)
       .split("")
       .map((digit) => digit + digit)
       .join("")}`;
+  }
+
+  if (digits.length === 8 && digits.slice(6, 8) === "00") {
+    return undefined;
   }
 
   return `#${digits.slice(0, 6)}`;

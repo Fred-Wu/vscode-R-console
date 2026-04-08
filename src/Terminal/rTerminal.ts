@@ -136,6 +136,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
     this.lang = new RTermLang({
+      extensionPath: this.extensionPath,
       rPath: this.options.rPath,
       requestMemberCompletions: async (expression, operator) =>
         await this.sessionWatcher?.requestMemberCompletions(expression, operator),
@@ -922,6 +923,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleAutocomplete(): Promise<void> {
+    this.sessionWatcher?.refresh();
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
@@ -1307,7 +1309,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearReplyPromptRenderTimer();
 
     this.sessionAttached = false;
-    this.lang.clearPendingLibraries();
+    this.lang.clearSessionState();
     this.lang.stopConsoleLsp();
     setNativeParseCallback(null);
 

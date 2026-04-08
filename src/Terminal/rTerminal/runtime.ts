@@ -123,15 +123,15 @@ export function createRuntimeBackend(
   return undefined;
 }
 
-function getBundledConsoleProfilePath(extensionPath: string): string {
-  return path.join(extensionPath, "bundled", "r", "console-profile.R");
+function getConsoleProfilePath(extensionPath: string): string {
+  return path.join(extensionPath, "resources", "r", "console-profile.R");
 }
 
 export function startRuntime(host: RuntimeHost): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.lang.stopConsoleLsp();
-  host.lang.resetSessionContext();
+  host.lang.clearSessionState();
   host.pendingPromptToken = true;
   host.mode = "starting";
   host.promptReady = false;
@@ -142,7 +142,6 @@ export function startRuntime(host: RuntimeHost): void {
   host.lastWriteEndedWithNewline = true;
   host.hasReceivedOutput = false;
   host.inputState.reset();
-  host.lang.clearPendingLibraries();
   host.submissionQueue = [];
   host.activeSubmission = null;
   host.backendChildPid = undefined;
@@ -166,7 +165,7 @@ export function startRuntime(host: RuntimeHost): void {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
       runtimeEnv.VSC_R_COLS = String(Math.max(20, host.dimensions.columns || 80));
       runtimeEnv.VSC_R_ROWS = String(Math.max(5, host.dimensions.rows || 24));
-      const consoleProfilePath = getBundledConsoleProfilePath(host.extensionPath);
+      const consoleProfilePath = getConsoleProfilePath(host.extensionPath);
       if (!fs.existsSync(consoleProfilePath)) {
         throw new Error(`Console bootstrap script not found at ${consoleProfilePath}`);
       }
@@ -540,7 +539,6 @@ export async function enqueueRuntimeSubmission(
   }
 
   for (const block of blocks) {
-    host.lang.trackPendingLibraries(block);
     host.submissionQueue.push({
       code: block,
       alreadyVisible,
@@ -772,6 +770,7 @@ async function restyleRuntimeSubmissionEcho(
   }
 
   if (restoreMainPrompt) {
+    host.pendingPromptToken = true;
     host.schedulePrompt();
   }
 }
@@ -830,7 +829,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   setNativeParseCallback(null);
 
   host.lang.cleanupCompletionDocument();
-  host.lang.clearPendingLibraries();
+  host.lang.clearSessionState();
   host.lang.stopConsoleLsp();
 
   host.rProcess = null;

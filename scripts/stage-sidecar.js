@@ -43,20 +43,6 @@ function stageBinary(src, dst) {
   }
 }
 
-function copyDirectory(src, dst) {
-  const entries = fs.readdirSync(src, { withFileTypes: true });
-  fs.mkdirSync(dst, { recursive: true });
-  for (const entry of entries) {
-    const srcPath = path.join(src, entry.name);
-    const dstPath = path.join(dst, entry.name);
-    if (entry.isDirectory()) {
-      copyDirectory(srcPath, dstPath);
-      continue;
-    }
-    fs.copyFileSync(srcPath, dstPath);
-  }
-}
-
 function sha256(filePath) {
   const hash = crypto.createHash("sha256");
   hash.update(fs.readFileSync(filePath));
@@ -98,7 +84,6 @@ function main() {
   fs.rmSync(bundledDir, { recursive: true, force: true });
   const sidecarDst = path.join(dstDir, sidecarName);
   stageBinary(sidecarSrc, sidecarDst);
-  copyDirectory(path.join(resourcesDir, "r"), path.join(bundledDir, "r"));
   verifyStagedBinary(sidecarSrc, sidecarDst);
 
   process.stdout.write(`Staged runtime bundle for ${target}: ${bundledDir}\n`);

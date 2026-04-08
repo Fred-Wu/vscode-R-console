@@ -24,11 +24,17 @@ import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
 
 type ConsoleLspClientOptions = {
   consoleId: string;
+  extensionPath: string;
   rPath: string;
   requestMemberCompletions?: (
     expression: string,
     operator: "$" | "@"
   ) => Promise<SessionMemberCompletionItem[] | undefined>;
+};
+
+export type ConsoleLspSessionState = {
+  attachedPackages: string[];
+  loadedNamespaces: string[];
 };
 
 export type DocumentSemanticTokensResult = {
@@ -57,6 +63,14 @@ class ConsoleLanguageClient extends LanguageClient {
     // Console-LSP failures are surfaced in the output channel, not as global popups.
     super.error(message, data, false);
   }
+
+  async sendRawRequest(method: string, params: unknown): Promise<unknown> {
+    const connection = (this as unknown as { activeConnection?: () => { sendRequest: (m: string, p: unknown) => Promise<unknown> } | undefined }).activeConnection?.();
+    if (!connection) {
+      throw new Error("Console language client connection is not active.");
+    }
+    return await connection.sendRequest(method, params);
+  }
 }
 
 export class ConsoleLspClient implements CompletionProvider {
@@ -70,6 +84,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private spawnedServer: ChildProcess | undefined;
   private pendingSocketServer: net.Server | undefined;
   private syncedDocuments = new Map<string, { document: vscode.TextDocument; version: number }>();
+  private sessionState: ConsoleLspSessionState | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.outputChannel = vscode.window.createOutputChannel(
@@ -175,6 +190,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return undefined;
     }
     this.syncDocument(client, doc);
+    await this.applySessionState(client);
     const context: vscode.CompletionContext = triggerCharacter
       ? {
           triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
@@ -200,6 +216,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return;
     }
     this.syncDocument(client, doc);
+    await this.applySessionState(client);
   }
 
   closeDocument(doc: vscode.TextDocument): void {
@@ -234,6 +251,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return undefined;
     }
     this.syncDocument(client, doc);
+    await this.applySessionState(client);
     const context: vscode.SignatureHelpContext = triggerCharacter
       ? {
           triggerKind: vscode.SignatureHelpTriggerKind.TriggerCharacter,
@@ -262,23 +280,47 @@ export class ConsoleLspClient implements CompletionProvider {
   ): Promise<DocumentSemanticTokensResult | undefined> {
     const client = await this.ensureClient();
     if (!client) {
+      console.log("[r-console][semantic] no LSP client available", {
+        uri: doc.uri.toString(),
+        version: doc.version,
+      });
       return undefined;
     }
     this.syncDocument(client, doc);
+    await this.applySessionState(client);
 
     const provider = client.initializeResult?.capabilities.semanticTokensProvider;
     const legend = provider?.legend;
     if (!legend) {
+      console.log("[r-console][semantic] semantic token legend missing", {
+        uri: doc.uri.toString(),
+        version: doc.version,
+      });
       return undefined;
     }
 
     try {
-      const result = await client.sendRequest(SemanticTokensRequest.type, {
-        textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(doc),
+      console.log("[r-console][semantic] sending LSP semanticTokens/full", {
+        uri: doc.uri.toString(),
+        version: doc.version,
       });
+      const result = (await client.sendRawRequest(SemanticTokensRequest.type.method, {
+        textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(doc),
+      })) as { data?: ArrayLike<number> } | undefined;
       if (!result?.data) {
+        console.log("[r-console][semantic] LSP returned no semantic token data", {
+          uri: doc.uri.toString(),
+          version: doc.version,
+          result,
+        });
         return undefined;
       }
+      console.log("[r-console][semantic] LSP semantic token response", {
+        uri: doc.uri.toString(),
+        version: doc.version,
+        tokenCount: Array.from(result.data).length / 5,
+        firstTokens: Array.from(result.data).slice(0, 20),
+      });
       return {
         legend: {
           tokenTypes: [...legend.tokenTypes],
@@ -286,7 +328,12 @@ export class ConsoleLspClient implements CompletionProvider {
         },
         data: Array.from(result.data),
       };
-    } catch {
+    } catch (error) {
+      console.log("[r-console][semantic] LSP semantic token request failed", {
+        uri: doc.uri.toString(),
+        version: doc.version,
+        error: String(error),
+      });
       return undefined;
     }
   }
@@ -302,6 +349,28 @@ export class ConsoleLspClient implements CompletionProvider {
       return await this.options.requestMemberCompletions(expression, operator);
     } catch {
       return undefined;
+    }
+  }
+
+  async syncSessionState(state: ConsoleLspSessionState): Promise<void> {
+    this.sessionState = state;
+    const client = await this.ensureClient();
+    if (!client) {
+      return;
+    }
+
+    await this.applySessionState(client);
+  }
+
+  private async applySessionState(client: ConsoleLanguageClient): Promise<void> {
+    if (!this.sessionState) {
+      return;
+    }
+
+    try {
+      await client.sendRequest("rConsole/syncSessionState", this.sessionState);
+    } catch (error) {
+      this.outputChannel.appendLine(`Failed to sync console session state: ${String(error)}`);
     }
   }
 
@@ -510,16 +579,13 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private resolveLanguageServerScriptPath(): string {
-    const extension = vscode.extensions.getExtension("REditorSupport.r");
-    const extensionPath = extension?.extensionPath;
-    if (!extensionPath) {
-      throw new Error("Cannot locate extension REditorSupport.r.");
+    const scriptPath = path.join(this.options.extensionPath, "resources", "r", "console-language-server.R");
+    if (fs.existsSync(scriptPath)) {
+      return scriptPath;
     }
-    const scriptPath = path.join(extensionPath, "R", "languageServer.R");
-    if (!fs.existsSync(scriptPath)) {
-      throw new Error(`Cannot locate language server script at ${scriptPath}`);
-    }
-    return scriptPath;
+    throw new Error(
+      `Cannot locate console language server script at ${scriptPath}`
+    );
   }
 
   private closePendingSocketServer(): void {

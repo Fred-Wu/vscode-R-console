@@ -7,6 +7,7 @@ import {
 } from "../../Language/completion";
 import {
   ConsoleLspClient,
+  type ConsoleLspSessionState,
   type DocumentSemanticTokensResult,
 } from "../../Language/consoleLspClient";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
@@ -25,6 +26,7 @@ export type InputSnapshot = {
 };
 
 type LangOptions = {
+  extensionPath: string;
   rPath: string;
   requestMemberCompletions: (
     expression: string,
@@ -45,12 +47,9 @@ export class RTermLang {
   private readonly completionDocumentId = `${process.pid}-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}`;
-  private readonly semanticRequestBaseId = `${this.completionDocumentId}-semantic`;
   private semanticRequestCounter = 0;
   private consoleLsp: ConsoleLspClient | undefined;
-  private cachedLibraryContent = "";
-  private cachedSearchPackages: string[] = [];
-  private pendingLibraryPackages = new Set<string>();
+  private sessionState: ConsoleLspSessionState | undefined;
 
   constructor(private readonly options: LangOptions) {}
 
@@ -79,10 +78,6 @@ export class RTermLang {
 
     this.completionInProgress = true;
     try {
-      const useLibraryLines =
-        context.kind === "default" ||
-        context.kind === "argument" ||
-        context.kind === "package";
       await this.ensureConsoleLspStarted();
 
       const latestInput = getCurrentInput();
@@ -94,11 +89,7 @@ export class RTermLang {
       }
 
       const sessionData = getWorkspaceData();
-      const libraryPrefix = useLibraryLines ? this.getEffectiveLibraryContent() : "";
-      const content = libraryPrefix + latestInput.text;
-      const libraryLineCount = libraryPrefix ? libraryPrefix.split("\n").length - 1 : 0;
-
-      const doc = this.getOrUpdateCompletionDocument(content);
+      const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
         return;
       }
@@ -106,10 +97,7 @@ export class RTermLang {
         await this.consoleLsp.prepareDocument(doc);
       }
 
-      const position = new vscode.Position(
-        latestInput.cursorRow + libraryLineCount,
-        context.snapshotCursor
-      );
+      const position = new vscode.Position(latestInput.cursorRow, context.snapshotCursor);
 
       const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
       const entries = await collectCompletionEntries(
@@ -151,6 +139,11 @@ export class RTermLang {
   }
 
   cleanupCompletionDocument(): void {
+    if (this.consoleLsp) {
+      if (this.completionDocument) {
+        this.consoleLsp.closeDocument(this.completionDocument as unknown as vscode.TextDocument);
+      }
+    }
     this.completionDocument = undefined;
   }
 
@@ -163,35 +156,38 @@ export class RTermLang {
     void lsp.dispose();
   }
 
-  clearPendingLibraries(): void {
-    this.pendingLibraryPackages.clear();
-  }
-
-  resetSessionContext(): void {
-    this.cachedLibraryContent = "";
-    this.cachedSearchPackages = [];
-    this.pendingLibraryPackages.clear();
+  clearSessionState(): void {
+    this.sessionState = undefined;
   }
 
   async requestSemanticTokens(
     content: string
   ): Promise<DocumentSemanticTokensResult | undefined> {
     await this.ensureConsoleLspStarted();
-    if (!this.consoleLsp) {
+    const lsp = this.consoleLsp;
+    if (!lsp) {
+      console.log("[r-console][semantic] no console LSP client");
       return undefined;
     }
 
-    const requestId = `${this.semanticRequestBaseId}-${++this.semanticRequestCounter}`;
-    const requestDocument = new VirtualRDocument(
-      requestId,
-      content,
-      "semantic.R"
-    ) as unknown as vscode.TextDocument;
+    const doc = this.createSemanticSnapshotDocument(content);
+    if (!doc) {
+      console.log("[r-console][semantic] failed to create semantic document", {
+        contentLength: content.length,
+      });
+      return undefined;
+    }
 
+    console.log("[r-console][semantic] request", {
+      uri: doc.uri.toString(),
+      version: doc.version,
+      contentLength: content.length,
+      preview: content.slice(0, 120),
+    });
     try {
-      return await this.consoleLsp.provideDocumentSemanticTokens(requestDocument);
+      return await lsp.provideDocumentSemanticTokens(doc);
     } finally {
-      this.consoleLsp.closeDocument(requestDocument);
+      lsp.closeDocument(doc);
     }
   }
 
@@ -201,74 +197,31 @@ export class RTermLang {
       return;
     }
 
-    const content = this.getEffectiveLibraryContent() + inputText;
-    const doc = this.getOrUpdateCompletionDocument(content);
+    const doc = this.getOrUpdateCompletionDocument(inputText);
     if (!doc) {
       return;
     }
     await this.consoleLsp.prepareDocument(doc);
   }
 
-  trackPendingLibraries(code: string): void {
-    // Track package attach/detach intents from executed console code.
-    const attachPattern =
-      /\b(?:library|require)\s*\(\s*(?:package\s*=\s*)?(?:(["'])([A-Za-z][A-Za-z0-9._]*)\1|([A-Za-z][A-Za-z0-9._]*))/g;
-    let match: RegExpExecArray | null;
-    while ((match = attachPattern.exec(code)) !== null) {
-      const pkg = (match[2] || match[3] || "").trim();
-      if (!pkg) {
-        continue;
-      }
-      this.pendingLibraryPackages.add(pkg);
-    }
-
-    const detachPattern =
-      /\bdetach\s*\(\s*(?:(["'])package:([A-Za-z][A-Za-z0-9._]*)\1|package\s*=\s*(["'])([A-Za-z][A-Za-z0-9._]*)\3)\s*[,\)]/g;
-    while ((match = detachPattern.exec(code)) !== null) {
-      const pkg = (match[2] || match[4] || "").trim();
-      if (!pkg) {
-        continue;
-      }
-      this.pendingLibraryPackages.delete(pkg);
-    }
-  }
-
   updateSessionData(data: WorkspaceData | undefined): boolean {
-    const currentSearch = data?.search ?? [];
-    if (this.arraysEqual(currentSearch, this.cachedSearchPackages)) {
+    if (!data) {
       return false;
     }
 
-    const basePackages = new Set([
-      "base",
-      "methods",
-      "datasets",
-      "utils",
-      "grDevices",
-      "graphics",
-      "stats",
-    ]);
-    const libraryLines = currentSearch
-      .filter((value) => value.startsWith("package:"))
-      .map((value) => value.slice(8))
-      .filter((pkg) => !basePackages.has(pkg))
-      .map((pkg) => `library(${pkg})`);
-
-    this.cachedSearchPackages = [...currentSearch];
-    this.cachedLibraryContent = libraryLines.length > 0 ? `${libraryLines.join("\n")}\n` : "";
-    if (this.pendingLibraryPackages.size > 0) {
-      const attached = new Set(
-        currentSearch
-          .filter((value) => value.startsWith("package:"))
-          .map((value) => value.slice(8))
-      );
-      for (const pkg of this.pendingLibraryPackages) {
-        if (attached.has(pkg)) {
-          this.pendingLibraryPackages.delete(pkg);
-        }
-      }
+    const nextState = this.toSessionState(data);
+    if (
+      this.sessionState &&
+      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages) &&
+      this.arraysEqual(nextState.loadedNamespaces, this.sessionState.loadedNamespaces)
+    ) {
+      return false;
     }
 
+    this.sessionState = nextState;
+    if (this.consoleLsp) {
+      void this.consoleLsp.syncSessionState(nextState);
+    }
     return true;
   }
 
@@ -292,10 +245,26 @@ export class RTermLang {
     }
   }
 
+  private createSemanticSnapshotDocument(content: string): vscode.TextDocument | undefined {
+    try {
+      this.semanticRequestCounter += 1;
+      const requestId = `${this.completionDocumentId}-semantic-${this.semanticRequestCounter}`;
+      const document = new VirtualRDocument(
+        requestId,
+        content,
+        `semantic-${this.semanticRequestCounter}.R`
+      );
+      return document as unknown as vscode.TextDocument;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async ensureConsoleLspStarted(): Promise<void> {
     if (this.consoleLsp) {
       try {
         await this.consoleLsp.start();
+        await this.syncConsoleSessionState();
       } catch {
       }
       return;
@@ -303,6 +272,7 @@ export class RTermLang {
 
     this.consoleLsp = new ConsoleLspClient({
       consoleId: this.completionDocumentId,
+      extensionPath: this.options.extensionPath,
       rPath: this.options.rPath,
       requestMemberCompletions: async (expression, operator) =>
         await this.options.requestMemberCompletions(expression, operator),
@@ -310,30 +280,27 @@ export class RTermLang {
 
     try {
       await this.consoleLsp.start();
+      await this.syncConsoleSessionState();
     } catch {
     }
   }
 
-  private getEffectiveLibraryContent(): string {
-    const pendingPackages = [...this.pendingLibraryPackages];
-    if (pendingPackages.length === 0) {
-      return this.cachedLibraryContent;
+  private async syncConsoleSessionState(): Promise<void> {
+    if (!this.consoleLsp || !this.sessionState) {
+      return;
     }
-
-    const searchPackages = new Set(
-      this.cachedSearchPackages
-        .filter((value) => value.startsWith("package:"))
-        .map((value) => value.slice(8))
-    );
-    const extraLines = pendingPackages
-      .filter((pkg) => !searchPackages.has(pkg))
-      .map((pkg) => `library(${pkg})`);
-    if (extraLines.length === 0) {
-      return this.cachedLibraryContent;
-    }
-
-    return `${this.cachedLibraryContent}${extraLines.join("\n")}\n`;
+    await this.consoleLsp.syncSessionState(this.sessionState);
   }
+
+  private toSessionState(data: WorkspaceData): ConsoleLspSessionState {
+    return {
+      attachedPackages: data.search
+        .filter((value) => value.startsWith("package:"))
+        .map((value) => value.slice(8)),
+      loadedNamespaces: [...data.loaded_namespaces],
+    };
+  }
+
   private arraysEqual(a: string[], b: string[]): boolean {
     if (a.length !== b.length) {
       return false;

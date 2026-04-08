@@ -1,3 +1,8 @@
+import * as fs from "fs";
+import * as path from "path";
+import * as vscode from "vscode";
+import { OnigScanner, OnigString, loadWASM } from "vscode-oniguruma";
+import { INITIAL, Registry, parseRawGrammar, type IGrammar, type StateStack } from "vscode-textmate";
 import { ANSI } from "./ansi";
 import type { DocumentSemanticTokensResult } from "../Language/consoleLspClient";
 import type { RendererLineHighlighter } from "./renderer";
@@ -5,50 +10,41 @@ import { SyntaxTheme } from "./syntaxTheme";
 
 type SemanticProvider = (content: string) => Promise<DocumentSemanticTokensResult | undefined>;
 
-const LIVE_SCOPES = {
-  comment: ["comment.line.number-sign.r", "comment"],
-  function: ["entity.name.function.r", "entity.name.function", "support.function"],
-  identifier: ["variable.other.r", "variable.other", "variable"],
-  number: ["constant.numeric.float.decimal.r", "constant.numeric"],
-  operator: ["keyword.operator.assignment.r", "keyword.operator.other.r", "keyword.operator"],
-  string: ["string.quoted.double.r", "string"],
-} as const;
+const R_SCOPE_NAME = "source.r";
+const R_SYNTAX_EXTENSION_ID = "REditorSupport.r-syntax";
 
-const SEMANTIC_SCOPES: Record<string, string[]> = {
-  namespace: ["support.namespace.r", "entity.name.namespace", "support.type", "entity.name.type"],
-  type: ["support.type", "entity.name.type", "support.class", "entity.name.class"],
-  class: ["support.class", "entity.name.class", "support.type", "entity.name.type"],
-  enum: ["support.type", "entity.name.type", "constant.language"],
-  interface: ["support.type", "entity.name.type", "support.class", "entity.name.class"],
-  struct: ["support.type", "entity.name.type", "support.class", "entity.name.class"],
-  typeParameter: ["entity.name.type", "support.type"],
-  parameter: ["variable.parameter.r", "variable.parameter", "variable.other", "variable"],
-  variable: ["variable.other.r", "variable.other", "variable"],
-  property: ["variable.other.property", "variable.other", "variable"],
-  function: ["entity.name.function.r", "entity.name.function", "support.function"],
-  method: ["entity.name.function.r", "entity.name.function", "support.function"],
-  keyword: ["keyword.control.r", "keyword.control", "keyword"],
-  comment: ["comment.line.number-sign.r", "comment"],
-  string: ["string.quoted.double.r", "string"],
-  number: ["constant.numeric.float.decimal.r", "constant.numeric"],
-  regexp: ["string.regexp", "string"],
-  operator: ["keyword.operator.assignment.r", "keyword.operator.other.r", "keyword.operator"],
+type GrammarContribution = {
+  language?: string;
+  scopeName?: string;
+  path?: string;
 };
+
+const OPEN_TO_CLOSE: Record<string, string> = {
+  "(": ")",
+  "[": "]",
+  "{": "}",
+};
+
+const CLOSING_BRACKETS = new Set([")", "]", "}"]);
 
 export class ConsoleSyntax implements RendererLineHighlighter {
   private readonly theme = new SyntaxTheme();
-  private readonly semanticCache = new Map<string, DocumentSemanticTokensResult>();
-  private readonly pendingSemantics = new Map<string, Promise<DocumentSemanticTokensResult | undefined>>();
+  private grammar: IGrammar | undefined;
+  private grammarPromise: Promise<IGrammar | undefined> | undefined;
   private sourceLines: string[] = [];
   private sourceKey = "";
   private styles: string[][] = [];
-  private exactSemanticKey = "";
-  private requestVersion = 0;
+  private sourceVersion = 0;
+  private appliedSemanticVersion = 0;
+  private wantedSemanticVersion = 0;
+  private semanticRequestInFlight = false;
 
   constructor(
     private readonly onDidChange: () => void,
     private readonly requestSemantics?: SemanticProvider
-  ) {}
+  ) {
+    void this.ensureGrammar();
+  }
 
   setSource(lines: string[]): void {
     const nextLines = [...lines];
@@ -57,60 +53,59 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       return;
     }
 
-    const previousLines = this.sourceLines;
-    const previousStyles = this.styles;
     this.sourceLines = nextLines;
     this.sourceKey = nextKey;
-    this.exactSemanticKey = "";
     this.styles = this.buildLiveStyles(nextLines);
-    preserveUnchangedStyles(previousLines, previousStyles, nextLines, this.styles);
+    this.appliedSemanticVersion = 0;
+    void this.ensureGrammar();
 
+    const sourceVersion = ++this.sourceVersion;
     if (!nextKey.trim() || !this.requestSemantics) {
-      this.requestVersion += 1;
+      this.wantedSemanticVersion = 0;
       return;
     }
 
-    const requestVersion = ++this.requestVersion;
-    void this.applyCurrentSemantic(nextKey, requestVersion);
+    this.wantedSemanticVersion = sourceVersion;
+    void this.runLatestSemanticRequest();
   }
 
   invalidateTheme(): void {
     this.theme.invalidate();
     this.styles = this.buildLiveStyles(this.sourceLines);
-    this.exactSemanticKey = "";
+    this.appliedSemanticVersion = 0;
+    const sourceVersion = ++this.sourceVersion;
 
     if (!this.sourceKey.trim() || !this.requestSemantics) {
+      this.wantedSemanticVersion = 0;
       this.onDidChange();
       return;
     }
 
-    const requestVersion = ++this.requestVersion;
-    void this.applyCurrentSemantic(this.sourceKey, requestVersion);
+    this.wantedSemanticVersion = sourceVersion;
+    void this.runLatestSemanticRequest();
   }
 
   dispose(): void {
     this.theme.invalidate();
-    this.semanticCache.clear();
-    this.pendingSemantics.clear();
     this.sourceLines = [];
     this.sourceKey = "";
     this.styles = [];
-    this.exactSemanticKey = "";
-    this.requestVersion += 1;
+    this.appliedSemanticVersion = 0;
+    this.sourceVersion += 1;
+    this.wantedSemanticVersion = 0;
+    this.semanticRequestInFlight = false;
   }
 
   highlightLines(lines: string[], sourceLineMap?: Array<number | undefined>): string[] {
-    const defaultAnsi = this.theme.getDefaultAnsi();
-
     return lines.map((displayLine, index) => {
       const sourceLineIndex = sourceLineMap ? sourceLineMap[index] : index;
       if (sourceLineIndex === undefined) {
-        return this.applyStyles(displayLine, new Array(displayLine.length).fill(defaultAnsi));
+        return this.applyStyles(displayLine, new Array(displayLine.length).fill(""));
       }
 
       const sourceLine = this.sourceLines[sourceLineIndex];
       const sourceStyles = this.styles[sourceLineIndex];
-      const fallbackStyles = new Array(displayLine.length).fill(defaultAnsi);
+      const fallbackStyles = new Array(displayLine.length).fill("");
       if (sourceLine === undefined || !sourceStyles || sourceStyles.length === 0) {
         return this.applyStyles(displayLine, fallbackStyles);
       }
@@ -127,7 +122,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         const prefixLength = displayLine.length - 3;
         return this.applyStyles(
           displayLine,
-          sourceStyles.slice(0, prefixLength).concat([defaultAnsi, defaultAnsi, defaultAnsi])
+          sourceStyles.slice(0, prefixLength).concat(["", "", ""])
         );
       }
 
@@ -143,7 +138,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       return Promise.resolve(lines);
     }
 
-    if (sourceKey === this.sourceKey && this.exactSemanticKey === sourceKey) {
+    if (sourceKey === this.sourceKey && this.appliedSemanticVersion === this.sourceVersion) {
       return Promise.resolve(
         lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? []))
       );
@@ -156,7 +151,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     const lines = Array.isArray(input) ? [...input] : input.split("\n");
     const sourceKey = lines.join("\n");
 
-    if (sourceKey === this.sourceKey && this.exactSemanticKey === sourceKey) {
+    if (sourceKey === this.sourceKey && this.appliedSemanticVersion === this.sourceVersion) {
       return lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? []));
     }
 
@@ -165,82 +160,132 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   }
 
   private async buildSnapshot(lines: string[], sourceKey: string): Promise<string[]> {
+    await this.ensureGrammar();
     const styles = this.buildLiveStyles(lines);
-    const semanticTokens = await this.getSemanticTokens(sourceKey);
+    const semanticTokens = this.requestSemantics
+      ? await this.requestSemantics(sourceKey)
+      : undefined;
     if (semanticTokens) {
       this.applySemanticStyles(styles, semanticTokens);
     }
     return lines.map((line, index) => this.applyStyles(line, styles[index] ?? []));
   }
 
-  private async applyCurrentSemantic(
-    sourceKey: string,
-    requestVersion: number
-  ): Promise<void> {
-    const semanticTokens = await this.getSemanticTokens(sourceKey);
-    if (
-      !semanticTokens ||
-      requestVersion !== this.requestVersion ||
-      sourceKey !== this.sourceKey
-    ) {
+  private async runLatestSemanticRequest(): Promise<void> {
+    if (this.semanticRequestInFlight || !this.requestSemantics) {
       return;
     }
 
-    const styles = this.buildLiveStyles(this.sourceLines);
-    this.applySemanticStyles(styles, semanticTokens);
-    this.styles = styles;
-    this.exactSemanticKey = sourceKey;
-    this.onDidChange();
-  }
-
-  private async getSemanticTokens(
-    sourceKey: string
-  ): Promise<DocumentSemanticTokensResult | undefined> {
-    const cached = this.semanticCache.get(sourceKey);
-    if (cached) {
-      return cached;
-    }
-
-    if (!this.requestSemantics) {
-      return undefined;
-    }
-
-    const pending = this.pendingSemantics.get(sourceKey);
-    if (pending) {
-      return pending;
-    }
-
-    const request = this.requestSemantics(sourceKey)
-      .then((result) => {
-        if (result) {
-          this.semanticCache.set(sourceKey, result);
-          trimSemanticCache(this.semanticCache);
+    this.semanticRequestInFlight = true;
+    try {
+      while (
+        this.wantedSemanticVersion > 0 &&
+        this.wantedSemanticVersion > this.appliedSemanticVersion
+      ) {
+        await this.ensureGrammar();
+        const requestedVersion = this.wantedSemanticVersion;
+        const requestedContent = this.sourceKey;
+        const semanticTokens = await this.requestSemantics(requestedContent);
+        if (!semanticTokens || requestedVersion !== this.sourceVersion) {
+          console.log("[r-console][semantic] applyCurrentSemantic skipped", {
+            hasTokens: Boolean(semanticTokens),
+            sourceVersion: requestedVersion,
+            currentSourceVersion: this.sourceVersion,
+            contentPreview: requestedContent.slice(0, 120),
+          });
+          continue;
         }
-        return result;
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        if (this.pendingSemantics.get(sourceKey) === request) {
-          this.pendingSemantics.delete(sourceKey);
-        }
-      });
 
-    this.pendingSemantics.set(sourceKey, request);
-    return request;
+        const styles = this.buildLiveStyles(this.sourceLines);
+        this.applySemanticStyles(styles, semanticTokens);
+        this.styles = styles;
+        this.appliedSemanticVersion = requestedVersion;
+        console.log("[r-console][semantic] applyCurrentSemantic applied", {
+          sourceVersion: requestedVersion,
+          contentPreview: requestedContent.slice(0, 120),
+          tokenCount: semanticTokens.data.length / 5,
+        });
+        this.onDidChange();
+      }
+    } finally {
+      this.semanticRequestInFlight = false;
+      if (this.wantedSemanticVersion > 0 && this.wantedSemanticVersion > this.appliedSemanticVersion) {
+        void this.runLatestSemanticRequest();
+      }
+    }
   }
 
   private buildLiveStyles(lines: string[]): string[][] {
-    const defaultAnsi = this.theme.getDefaultAnsi();
-    const palette = {
-      comment: this.theme.resolveScopesToAnsi(LIVE_SCOPES.comment) || defaultAnsi,
-      function: this.theme.resolveScopesToAnsi(LIVE_SCOPES.function) || defaultAnsi,
-      identifier: this.theme.resolveScopesToAnsi(LIVE_SCOPES.identifier) || defaultAnsi,
-      number: this.theme.resolveScopesToAnsi(LIVE_SCOPES.number) || defaultAnsi,
-      operator: this.theme.resolveScopesToAnsi(LIVE_SCOPES.operator) || defaultAnsi,
-      string: this.theme.resolveScopesToAnsi(LIVE_SCOPES.string) || defaultAnsi,
-    };
+    if (!this.grammar) {
+      return lines.map((line) => new Array(line.length).fill(""));
+    }
 
-    return lines.map((line) => lexLine(line, defaultAnsi, palette));
+    let state: StateStack | null = INITIAL;
+    const bracketStack: Array<{ close: string; depth: number }> = [];
+    return lines.map((line) => {
+      const row = new Array(line.length).fill("");
+      const result = this.grammar?.tokenizeLine(line, state);
+      state = result?.ruleStack ?? INITIAL;
+
+      for (const token of result?.tokens ?? []) {
+        const ansi = this.theme.resolveScopesToAnsi(token.scopes);
+        if (!ansi) {
+          continue;
+        }
+        const start = Math.max(0, token.startIndex);
+        const end = Math.min(row.length, token.endIndex);
+        for (let cursor = start; cursor < end; cursor += 1) {
+          row[cursor] = ansi;
+        }
+      }
+
+      this.applyBracketPairStyles(line, row, result?.tokens ?? [], bracketStack);
+
+      return row;
+    });
+  }
+
+  private ensureGrammar(): Promise<IGrammar | undefined> {
+    if (this.grammar) {
+      return Promise.resolve(this.grammar);
+    }
+
+    if (this.grammarPromise) {
+      return this.grammarPromise;
+    }
+
+    const request = loadRGrammar()
+      .then((grammar) => {
+        this.grammar = grammar;
+        return grammar;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.grammarPromise === request) {
+          this.grammarPromise = undefined;
+        }
+      });
+
+    this.grammarPromise = request;
+
+    void request.then((grammar) => {
+      if (!grammar || this.sourceLines.length === 0) {
+        return;
+      }
+
+      this.appliedSemanticVersion = 0;
+      if (!this.sourceKey.trim() || !this.requestSemantics) {
+        this.styles = this.buildLiveStyles(this.sourceLines);
+        this.onDidChange();
+        return;
+      }
+
+      const sourceVersion = ++this.sourceVersion;
+      this.wantedSemanticVersion = sourceVersion;
+      void this.runLatestSemanticRequest();
+    });
+
+    return request;
   }
 
   private applySemanticStyles(
@@ -269,9 +314,17 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         continue;
       }
 
-      const ansi =
-        this.theme.resolveSemanticTokenToAnsi(tokenType, tokenModifiers) ||
-        this.theme.resolveScopesToAnsi(SEMANTIC_SCOPES[tokenType] ?? []);
+      const ansi = this.theme.resolveSemanticTokenToAnsi(tokenType, tokenModifiers);
+      if (tokenType === "function" || tokenType === "method") {
+        console.log("[r-console][semantic] applying function-like token", {
+          line,
+          char,
+          length,
+          tokenType,
+          tokenModifiers,
+          ansi,
+        });
+      }
       if (!ansi) {
         continue;
       }
@@ -280,6 +333,49 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       const end = Math.min(row.length, char + length);
       for (let cursor = Math.max(0, char); cursor < end; cursor += 1) {
         row[cursor] = ansi;
+      }
+    }
+  }
+
+  private applyBracketPairStyles(
+    line: string,
+    row: string[],
+    tokens: readonly { startIndex: number; endIndex: number; scopes: string[] }[],
+    stack: Array<{ close: string; depth: number }>
+  ): void {
+    for (const token of tokens) {
+      if (hasNonCodeScope(token.scopes)) {
+        continue;
+      }
+
+      const start = Math.max(0, token.startIndex);
+      const end = Math.min(line.length, token.endIndex);
+      for (let cursor = start; cursor < end; cursor += 1) {
+        const char = line[cursor];
+        const close = OPEN_TO_CLOSE[char];
+        if (close) {
+          const ansi = this.theme.resolveBracketPairAnsi(stack.length);
+          if (ansi) {
+            row[cursor] = ansi;
+          }
+          stack.push({ close, depth: stack.length });
+          continue;
+        }
+
+        if (!CLOSING_BRACKETS.has(char)) {
+          continue;
+        }
+
+        const current = stack[stack.length - 1];
+        const depth =
+          current && current.close === char ? current.depth : Math.max(stack.length - 1, 0);
+        const ansi = this.theme.resolveBracketPairAnsi(depth);
+        if (ansi) {
+          row[cursor] = ansi;
+        }
+        if (current && current.close === char) {
+          stack.pop();
+        }
       }
     }
   }
@@ -324,220 +420,90 @@ function decodeTokenModifiers(bits: number, legend: readonly string[]): string[]
   return modifiers;
 }
 
-function lexLine(
-  line: string,
-  defaultAnsi: string,
-  palette: {
-    comment: string;
-    function: string;
-    identifier: string;
-    number: string;
-    operator: string;
-    string: string;
-  }
-): string[] {
-  const styles = new Array(line.length).fill(defaultAnsi);
-  let index = 0;
-
-  while (index < line.length) {
-    const char = line[index];
-
-    if (char === "#") {
-      for (let cursor = index; cursor < line.length; cursor += 1) {
-        styles[cursor] = palette.comment;
-      }
-      break;
-    }
-
-    if (char === "\"" || char === "'" || char === "`") {
-      const quote = char;
-      let end = index + 1;
-      let escaped = false;
-      while (end < line.length) {
-        const next = line[end];
-        if (!escaped && next === quote) {
-          end += 1;
-          break;
-        }
-        if (next === "\\" && !escaped) {
-          escaped = true;
-        } else {
-          escaped = false;
-        }
-        end += 1;
-      }
-      for (let cursor = index; cursor < Math.min(end, line.length); cursor += 1) {
-        styles[cursor] = palette.string;
-      }
-      index = Math.max(index + 1, end);
-      continue;
-    }
-
-    if (isIdentifierStart(char, index === 0 ? undefined : line[index - 1])) {
-      let end = index + 1;
-      while (end < line.length && isIdentifierContinue(line[end])) {
-        end += 1;
-      }
-      const style = isCallHead(line, end) ? palette.function : palette.identifier;
-      for (let cursor = index; cursor < end; cursor += 1) {
-        styles[cursor] = style;
-      }
-      index = end;
-      continue;
-    }
-
-    if (isNumberStart(line, index)) {
-      let end = index + 1;
-      while (end < line.length && /[0-9A-Fa-fxXbBeE.+-]/.test(line[end])) {
-        end += 1;
-      }
-      for (let cursor = index; cursor < end; cursor += 1) {
-        styles[cursor] = palette.number;
-      }
-      index = end;
-      continue;
-    }
-
-    if (isOperatorChar(char)) {
-      let end = index + 1;
-      while (end < line.length && isOperatorChar(line[end])) {
-        end += 1;
-      }
-      for (let cursor = index; cursor < end; cursor += 1) {
-        styles[cursor] = palette.operator;
-      }
-      index = end;
-      continue;
-    }
-
-    index += 1;
-  }
-
-  return styles;
+function hasNonCodeScope(scopes: readonly string[]): boolean {
+  return scopes.some((scope) => scope.startsWith("string") || scope.startsWith("comment"));
 }
 
-function preserveUnchangedStyles(
-  previousLines: string[],
-  previousStyles: string[][],
-  nextLines: string[],
-  nextStyles: string[][]
-): void {
-  if (previousLines.length === 0 || previousStyles.length === 0) {
-    return;
+async function loadRGrammar(): Promise<IGrammar | undefined> {
+  const grammarPath = resolveRGrammarPath();
+  if (!grammarPath) {
+    return undefined;
   }
 
-  const prefixLineCount = sharedPrefixLineCount(previousLines, nextLines);
-  const suffixLineCount = sharedSuffixLineCount(previousLines, nextLines, prefixLineCount);
+  const onigWasmPath = path.resolve(
+    __dirname,
+    "..",
+    "node_modules",
+    "vscode-oniguruma",
+    "release",
+    "onig.wasm"
+  );
+  const wasm = await fs.promises.readFile(onigWasmPath);
+  const onigLib = loadWASM(wasm).then(() => ({
+    createOnigScanner(patterns: string[]): OnigScanner {
+      return new OnigScanner(patterns);
+    },
+    createOnigString(content: string): OnigString {
+      return new OnigString(content);
+    },
+  }));
 
-  for (let lineIndex = 0; lineIndex < prefixLineCount; lineIndex += 1) {
-    copyWholeLineStyle(previousLines, previousStyles, nextLines, nextStyles, lineIndex, lineIndex);
+  const registry = new Registry({
+    onigLib,
+    loadGrammar: async (scopeName) => {
+      if (scopeName !== R_SCOPE_NAME) {
+        return null;
+      }
+
+      const rawGrammar = await fs.promises.readFile(grammarPath, "utf8");
+      return parseRawGrammar(rawGrammar, grammarPath);
+    },
+  });
+
+  return (await registry.loadGrammar(R_SCOPE_NAME)) ?? undefined;
+}
+
+function resolveRGrammarPath(): string | undefined {
+  const preferred = vscode.extensions.getExtension(R_SYNTAX_EXTENSION_ID);
+  const preferredPath = preferred
+    ? findGrammarPath(preferred.extensionPath, preferred.packageJSON?.contributes?.grammars)
+    : undefined;
+  if (preferredPath) {
+    return preferredPath;
   }
 
-  for (let offset = 0; offset < suffixLineCount; offset += 1) {
-    const previousIndex = previousLines.length - suffixLineCount + offset;
-    const nextIndex = nextLines.length - suffixLineCount + offset;
-    copyWholeLineStyle(
-      previousLines,
-      previousStyles,
-      nextLines,
-      nextStyles,
-      previousIndex,
-      nextIndex
+  for (const extension of vscode.extensions.all) {
+    const grammarPath = findGrammarPath(
+      extension.extensionPath,
+      extension.packageJSON?.contributes?.grammars
     );
-  }
-}
-
-function copyWholeLineStyle(
-  previousLines: string[],
-  previousStyles: string[][],
-  nextLines: string[],
-  nextStyles: string[][],
-  previousIndex: number,
-  nextIndex: number
-): void {
-  const previousStyle = previousStyles[previousIndex];
-  const previousLine = previousLines[previousIndex];
-  const nextLine = nextLines[nextIndex];
-  if (
-    !previousStyle ||
-    previousLine === undefined ||
-    nextLine === undefined ||
-    previousLine.length !== nextLine.length
-  ) {
-    return;
-  }
-  nextStyles[nextIndex] = previousStyle.slice();
-}
-
-function trimSemanticCache(cache: Map<string, DocumentSemanticTokensResult>): void {
-  while (cache.size > 20) {
-    const oldest = cache.keys().next().value;
-    if (oldest === undefined) {
-      break;
-    }
-    cache.delete(oldest);
-  }
-}
-
-function isIdentifierStart(char: string, previousChar?: string): boolean {
-  if (/[A-Za-z_]/.test(char)) {
-    return true;
-  }
-  return char === "." && (previousChar === undefined || !/[A-Za-z0-9._]/.test(previousChar));
-}
-
-function isIdentifierContinue(char: string): boolean {
-  return /[A-Za-z0-9._]/.test(char);
-}
-
-function isCallHead(line: string, end: number): boolean {
-  let index = end;
-  while (index < line.length && /\s/.test(line[index])) {
-    index += 1;
-  }
-  return line[index] === "(";
-}
-
-function isNumberStart(line: string, index: number): boolean {
-  const char = line[index];
-  if (!/[0-9]/.test(char)) {
-    return false;
-  }
-  const previous = index > 0 ? line[index - 1] : "";
-  return previous.length === 0 || !/[A-Za-z0-9._]/.test(previous);
-}
-
-function isOperatorChar(char: string): boolean {
-  return /[+\-*/^<>=!$@~:%&|]/.test(char);
-}
-
-function sharedPrefixLineCount(previousLines: string[], nextLines: string[]): number {
-  const sharedLength = Math.min(previousLines.length, nextLines.length);
-  for (let index = 0; index < sharedLength; index += 1) {
-    if (previousLines[index] !== nextLines[index]) {
-      return index;
+    if (grammarPath) {
+      return grammarPath;
     }
   }
-  return sharedLength;
+
+  return undefined;
 }
 
-function sharedSuffixLineCount(
-  previousLines: string[],
-  nextLines: string[],
-  prefixLineCount: number
-): number {
-  const previousRemaining = previousLines.length - prefixLineCount;
-  const nextRemaining = nextLines.length - prefixLineCount;
-  const sharedLength = Math.min(previousRemaining, nextRemaining);
-  let count = 0;
-  while (count < sharedLength) {
+function findGrammarPath(
+  extensionPath: string,
+  grammars: GrammarContribution[] | undefined
+): string | undefined {
+  if (!Array.isArray(grammars)) {
+    return undefined;
+  }
+
+  for (const grammar of grammars) {
     if (
-      previousLines[previousLines.length - 1 - count] !==
-      nextLines[nextLines.length - 1 - count]
+      grammar.language !== "r" ||
+      grammar.scopeName !== R_SCOPE_NAME ||
+      typeof grammar.path !== "string"
     ) {
-      break;
+      continue;
     }
-    count += 1;
+
+    return path.join(extensionPath, grammar.path);
   }
-  return count;
+
+  return undefined;
 }

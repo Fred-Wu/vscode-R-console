@@ -102,6 +102,8 @@
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0",
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^9.0.1",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
   }
 }

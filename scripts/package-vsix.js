@@ -28,12 +28,10 @@ function parseArgs(argv) {
   return args;
 }
 
-function resolveBundledRuntimeSource(root, sidecarName) {
-  const bundledDir = path.join(root, "bundled");
-  const bundledSidecar = path.join(bundledDir, "bin", sidecarName);
-  const bundledProfile = path.join(bundledDir, "r", "console-profile.R");
-  if (fs.existsSync(bundledSidecar) && fs.existsSync(bundledProfile)) {
-    return bundledDir;
+function resolveBundledSidecarSource(root, sidecarName) {
+  const bundledSidecar = path.join(root, "bundled", "bin", sidecarName);
+  if (fs.existsSync(bundledSidecar)) {
+    return bundledSidecar;
   }
   return undefined;
 }
@@ -56,7 +54,7 @@ function copyDirectory(src, dst) {
   }
 }
 
-function createStage(root, stageDir, bundledSource, sidecarName) {
+function createStage(root, stageDir, bundledSidecar, sidecarName) {
   fs.rmSync(stageDir, { recursive: true, force: true });
 
   copyFile(path.join(root, "package.json"), path.join(stageDir, "package.json"));
@@ -66,7 +64,8 @@ function createStage(root, stageDir, bundledSource, sidecarName) {
   copyFile(path.join(root, "LICENSE"), path.join(stageDir, "LICENSE"));
   copyFile(path.join(root, "images", "Rlogo.png"), path.join(stageDir, "images", "Rlogo.png"));
   copyFile(path.join(root, "dist", "extension.js"), path.join(stageDir, "dist", "extension.js"));
-  copyDirectory(bundledSource, path.join(stageDir, "bundled"));
+  copyDirectory(path.join(root, "resources", "r"), path.join(stageDir, "resources", "r"));
+  copyFile(bundledSidecar, path.join(stageDir, "bundled", "bin", sidecarName));
 
   const stagedSidecar = path.join(stageDir, "bundled", "bin", sidecarName);
   if (!sidecarName.endsWith(".exe")) {
@@ -79,7 +78,8 @@ function createStage(root, stageDir, bundledSource, sidecarName) {
   packageJson.files = [
     "dist/**",
     "images/**",
-    "bundled/**",
+    "bundled/bin/**",
+    "resources/r/**",
     "package.nls.json",
     "README.md",
     "CHANGELOG.md",
@@ -135,18 +135,22 @@ function main() {
   }
 
   const sidecarName = targetInfo.executable;
-  const bundledSource = resolveBundledRuntimeSource(root, sidecarName);
-  if (!bundledSource) {
+  const bundledSidecar = resolveBundledSidecarSource(root, sidecarName);
+  if (!bundledSidecar) {
     throw new Error(
       `Bundled sidecar not found for ${target}. Run node scripts/stage-sidecar.js --target ${target} first.`
     );
+  }
+  const resourcesProfile = path.join(root, "resources", "r", "console-profile.R");
+  if (!fs.existsSync(resourcesProfile)) {
+    throw new Error(`Runtime bootstrap script not found at ${resourcesProfile}`);
   }
 
   const outputPath = path.resolve(root, args.output ?? getDefaultOutputPath(root, target));
   const stageDir = path.join(root, ".vsix-stage");
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 
-  createStage(root, stageDir, bundledSource, sidecarName);
+  createStage(root, stageDir, bundledSidecar, sidecarName);
 
   try {
     runVsce(stageDir, target, outputPath);
