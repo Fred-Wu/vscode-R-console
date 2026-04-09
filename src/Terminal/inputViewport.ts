@@ -3,12 +3,15 @@ type WindowedRenderPlan = {
   cursorRow: number;
   cursorCol: number;
   sourceLineMap: Array<number | undefined>;
+  promptKinds: Array<"main" | "cont">;
 };
 
 type CollapsedRenderPlan = {
   multiline: string[];
   inputLine: string;
+  inputLineCursorCol: number;
   sourceLineMap: Array<number | undefined>;
+  promptKinds: Array<"main" | "cont">;
 };
 
 export type InputRenderMetrics = {
@@ -50,11 +53,9 @@ function getRenderedRowCountForLine(
 }
 
 export function getContinuationPromptLength(
-  promptText: string,
-  promptLen: number,
   continuationPromptText: string | null
 ): number {
-  const continuationPad = promptText === ">>> " ? promptLen : 2;
+  const continuationPad = 2;
   return continuationPromptText
     ? continuationPromptText.length
     : continuationPad;
@@ -175,16 +176,95 @@ export function shouldRenderCollapsed(
   return isAtEnd && totalLines > maxRows;
 }
 
-function clipViewportLine(line: string, columns: number, promptLen: number): string {
+function getPromptKindForDisplayLine(
+  sourceLineIndex: number | undefined
+): "main" | "cont" {
+  return sourceLineIndex === 0 ? "main" : "cont";
+}
+
+function clipViewportLine(
+  line: string,
+  columns: number,
+  promptLen: number,
+  focusCol?: number
+): { text: string; cursorCol: number } {
   const safeColumns = Math.max(20, columns || 80);
   const maxLen = Math.max(1, safeColumns - Math.max(0, promptLen));
+  const clampedFocusCol =
+    focusCol === undefined
+      ? undefined
+      : Math.max(0, Math.min(focusCol, line.length));
+
   if (line.length <= maxLen) {
-    return line;
+    return {
+      text: line,
+      cursorCol: clampedFocusCol ?? line.length,
+    };
   }
   if (maxLen <= 3) {
-    return ".".repeat(maxLen);
+    return {
+      text: ".".repeat(maxLen),
+      cursorCol: clampedFocusCol === undefined ? maxLen : Math.min(maxLen, clampedFocusCol),
+    };
   }
-  return `${line.slice(0, maxLen - 3)}...`;
+
+  if (clampedFocusCol === undefined) {
+    return {
+      text: `${line.slice(0, maxLen - 3)}...`,
+      cursorCol: maxLen,
+    };
+  }
+
+  const ellipsis = "...";
+  const singleSidedBudget = maxLen - ellipsis.length;
+
+  if (clampedFocusCol <= singleSidedBudget) {
+    return {
+      text: `${line.slice(0, singleSidedBudget)}${ellipsis}`,
+      cursorCol: clampedFocusCol,
+    };
+  }
+
+  const tailStart = Math.max(0, line.length - singleSidedBudget);
+  if (clampedFocusCol >= tailStart) {
+    return {
+      text: `${ellipsis}${line.slice(tailStart)}`,
+      cursorCol: ellipsis.length + (clampedFocusCol - tailStart),
+    };
+  }
+
+  const middleBudget = Math.max(1, maxLen - ellipsis.length * 2);
+  const desiredStart = clampedFocusCol - Math.floor(middleBudget / 2);
+  const start = Math.max(0, Math.min(desiredStart, line.length - middleBudget));
+  const end = start + middleBudget;
+  return {
+    text: `${ellipsis}${line.slice(start, end)}${ellipsis}`,
+    cursorCol: ellipsis.length + (clampedFocusCol - start),
+  };
+}
+
+function getPromptLengthForDisplayLine(
+  promptKind: "main" | "cont",
+  promptLen: number,
+  continuationPromptLen: number
+): number {
+  return promptKind === "main" ? promptLen : continuationPromptLen;
+}
+
+function clipDisplayLine(
+  line: string,
+  columns: number,
+  promptKind: "main" | "cont",
+  promptLen: number,
+  continuationPromptLen: number,
+  focusCol?: number
+): { text: string; cursorCol: number } {
+  return clipViewportLine(
+    line,
+    columns,
+    getPromptLengthForDisplayLine(promptKind, promptLen, continuationPromptLen),
+    focusCol
+  );
 }
 
 export function buildWindowedRenderPlan(
@@ -197,12 +277,21 @@ export function buildWindowedRenderPlan(
   continuationPromptLen: number
 ): WindowedRenderPlan {
   if (visibleRowBudget === 1) {
-    const onlyLine = clipViewportLine(allLines[cursorRow] ?? "", columns, promptLen);
+    const promptKinds: Array<"main" | "cont"> = [cursorRow === 0 ? "main" : "cont"];
+    const onlyLine = clipDisplayLine(
+      allLines[cursorRow] ?? "",
+      columns,
+      promptKinds[0],
+      promptLen,
+      continuationPromptLen,
+      cursorCol
+    );
     return {
-      lines: [onlyLine],
+      lines: [onlyLine.text],
       cursorRow: 0,
-      cursorCol: Math.min(cursorCol, onlyLine.length),
+      cursorCol: onlyLine.cursorCol,
       sourceLineMap: [cursorRow],
+      promptKinds,
     };
   }
 
@@ -238,16 +327,27 @@ export function buildWindowedRenderPlan(
     sourceLineMap[sourceLineMap.length - 1] = endLine - 1;
   }
 
-  const clippedLines = windowedLines.map((line, idx) =>
-    clipViewportLine(line, columns, idx === 0 ? promptLen : continuationPromptLen)
+  const promptKinds = sourceLineMap.map((sourceLineIndex) =>
+    getPromptKindForDisplayLine(sourceLineIndex)
   );
-  const cursorLine = clippedLines[adjustedCursorRow] ?? "";
+  const clippedLines = windowedLines.map((line, idx) =>
+    clipDisplayLine(
+      line,
+      columns,
+      promptKinds[idx]!,
+      promptLen,
+      continuationPromptLen,
+      idx === adjustedCursorRow ? cursorCol : undefined
+    )
+  );
+  const cursorLine = clippedLines[adjustedCursorRow];
 
   return {
-    lines: clippedLines,
+    lines: clippedLines.map((line) => line.text),
     cursorRow: adjustedCursorRow,
-    cursorCol: Math.min(cursorCol, cursorLine.length),
+    cursorCol: cursorLine?.cursorCol ?? 0,
     sourceLineMap,
+    promptKinds,
   };
 }
 
@@ -261,11 +361,24 @@ export function buildCollapsedRenderPlan(
   const totalLines = allLines.length;
 
   if (visibleRowBudget === 1) {
-    const onlyLine = clipViewportLine(allLines[allLines.length - 1] ?? "", columns, promptLen);
+    const sourceLineIndex = allLines.length - 1;
+    const promptKinds: Array<"main" | "cont"> = [
+      sourceLineIndex === 0 ? "main" : "cont"
+    ];
+    const onlyLine = clipDisplayLine(
+      allLines[sourceLineIndex] ?? "",
+      columns,
+      promptKinds[0],
+      promptLen,
+      continuationPromptLen,
+      (allLines[sourceLineIndex] ?? "").length
+    );
     return {
       multiline: [],
-      inputLine: onlyLine,
-      sourceLineMap: [allLines.length - 1],
+      inputLine: onlyLine.text,
+      inputLineCursorCol: onlyLine.cursorCol,
+      sourceLineMap: [sourceLineIndex],
+      promptKinds,
     };
   }
 
@@ -299,15 +412,27 @@ export function buildCollapsedRenderPlan(
     undefined,
     ...bottomLines.map((_, index) => totalLines - bottomCount + index),
   ];
+  const promptKinds = sourceLineMap.map((sourceLineIndex) =>
+    getPromptKindForDisplayLine(sourceLineIndex)
+  );
 
   const visibleLines = [...topLines, ellipsis, ...bottomLines];
   const clippedVisibleLines = visibleLines.map((line, idx) =>
-    clipViewportLine(line, columns, idx === 0 ? promptLen : continuationPromptLen)
+    clipDisplayLine(
+      line,
+      columns,
+      promptKinds[idx]!,
+      promptLen,
+      continuationPromptLen,
+      idx === visibleLines.length - 1 ? line.length : undefined
+    )
   );
 
   return {
-    multiline: clippedVisibleLines.slice(0, -1),
-    inputLine: clippedVisibleLines[clippedVisibleLines.length - 1] ?? "",
+    multiline: clippedVisibleLines.slice(0, -1).map((line) => line.text),
+    inputLine: clippedVisibleLines[clippedVisibleLines.length - 1]?.text ?? "",
+    inputLineCursorCol: clippedVisibleLines[clippedVisibleLines.length - 1]?.cursorCol ?? 0,
     sourceLineMap,
+    promptKinds,
   };
 }

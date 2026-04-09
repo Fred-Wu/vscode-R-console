@@ -1,5 +1,4 @@
 import {
-  classifyExpressionLocal as parserClassifyExpressionLocal,
   isExpressionCompleteAsync as parserIsExpressionCompleteAsync,
 } from "../Language/parser";
 import {
@@ -245,10 +244,6 @@ export class InputState {
 
   async isExpressionCompleteAsync(code: string = this._text): Promise<boolean> {
     return parserIsExpressionCompleteAsync(code);
-  }
-
-  static checkExpressionComplete(text: string): boolean {
-    return parserClassifyExpressionLocal(text) === "complete";
   }
 
   private moveByRenderedRows(

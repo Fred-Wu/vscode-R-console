@@ -73,8 +73,6 @@ export function renderInput({
   const totalLines = lines.length;
   const maxRows = Math.max(1, dimensions.rows - 1);
   const continuationPromptLen = getContinuationPromptLength(
-    renderer.promptText,
-    renderer.promptLen,
     renderer.continuationPromptText
   );
   const totalRows = getRenderedRowCount(
@@ -103,7 +101,8 @@ export function renderInput({
       inputState.cursorRow,
       inputState.cursorCol,
       dimensions.columns,
-      lines.map((_, index) => index)
+      lines.map((_, index) => index),
+      lines.map((_, index) => index === 0 ? "main" : "cont")
     );
   }
 }
@@ -132,8 +131,6 @@ function renderWindowed({
   dimensions,
 }: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">): void {
   const continuationPromptLen = getContinuationPromptLength(
-    renderer.promptText,
-    renderer.promptLen,
     renderer.continuationPromptText
   );
   const plan = buildWindowedRenderPlan(
@@ -151,7 +148,8 @@ function renderWindowed({
     plan.cursorRow,
     plan.cursorCol,
     dimensions.columns,
-    plan.sourceLineMap
+    plan.sourceLineMap,
+    plan.promptKinds
   );
 }
 
@@ -161,8 +159,6 @@ function renderCollapsed({
   dimensions,
 }: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">): void {
   const continuationPromptLen = getContinuationPromptLength(
-    renderer.promptText,
-    renderer.promptLen,
     renderer.continuationPromptText
   );
   const plan = buildCollapsedRenderPlan(
@@ -182,9 +178,10 @@ function renderCollapsed({
   renderer.renderWithCursor(
     lines,
     lines.length - 1,
-    plan.inputLine.length,
+    plan.inputLineCursorCol,
     dimensions.columns,
-    plan.sourceLineMap
+    plan.sourceLineMap,
+    plan.promptKinds
   );
 }
 

@@ -582,7 +582,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private expandForEdit(): void {
     if (this.historyBrowsing && this.historyCollapsed) {
-      this.renderer.clearInputRender();
+      this.clearInputRender();
       this.historyCollapsed = false;
     }
   }
@@ -1080,8 +1080,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       columns: this.dimensions.columns,
       promptLen: this.renderer.promptLen,
       continuationPromptLen: getContinuationPromptLength(
-        this.renderer.promptText,
-        this.renderer.promptLen,
         this.renderer.continuationPromptText
       ),
     };

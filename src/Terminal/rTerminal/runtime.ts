@@ -689,11 +689,8 @@ function writeRuntimeSubmissionLines(
   plainLines: string[],
   styledLines: string[]
 ): number {
-  const continuationPad =
-    host.renderer.promptText === ">>> " ? host.renderer.promptLen : 2;
+  const continuationPad = 2;
   const continuationPromptLen = getContinuationPromptLength(
-    host.renderer.promptText,
-    host.renderer.promptLen,
     host.renderer.continuationPromptText
   );
 

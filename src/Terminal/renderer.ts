@@ -4,6 +4,8 @@ export interface RendererLineHighlighter {
   highlightLines(lines: string[], sourceLineMap?: Array<number | undefined>): string[];
 }
 
+type RenderPromptKind = "main" | "cont";
+
 export class Renderer {
   renderedLineCount = 1;
   /** The row (0-indexed from render start) where cursor is positioned after render */
@@ -42,10 +44,6 @@ export class Renderer {
     this.continuationPromptColor = ANSI.reset;
   }
 
-  setLineHighlighter(lineHighlighter: RendererLineHighlighter | undefined): void {
-    this.lineHighlighter = lineHighlighter;
-  }
-
   /**
    * Render with 2D cursor position (row, col).
    * This is the new preferred method for multi-line editing.
@@ -55,21 +53,22 @@ export class Renderer {
     cursorRow: number,
     cursorCol: number,
     columns: number,
-    sourceLineMap?: Array<number | undefined>
+    sourceLineMap: Array<number | undefined>,
+    promptKinds: RenderPromptKind[]
   ): void {
     const highlighted = this.lineHighlighter
       ? this.lineHighlighter.highlightLines(lines, sourceLineMap)
       : lines;
     const safeColumns = Math.max(1, columns);
-    const continuationPad =
-      this.promptText === ">>> " ? this.promptLen : 2;
+    const continuationPad = 2;
     const continuationLen = this.continuationPromptText
       ? this.continuationPromptText.length
       : continuationPad;
+    const getPromptKind = (index: number): RenderPromptKind => promptKinds[index]!;
 
     const lineRows = lines.map((_, idx) => {
       const pLen =
-        idx === 0
+        getPromptKind(idx) === "main"
           ? this.promptLen
           : continuationLen;
       const visibleLen =
@@ -102,8 +101,9 @@ export class Renderer {
 
     highlighted.forEach((line, idx) => {
       if (idx > 0) this.write("\r\n");
+      const promptKind = getPromptKind(idx);
       const prompt =
-        idx === 0
+        promptKind === "main"
           ? `${ANSI.reset}${this.promptColor}${this.promptText}${ANSI.reset}`
           : (this.continuationPromptText === null
               ? " ".repeat(continuationPad)
@@ -117,7 +117,7 @@ export class Renderer {
     // Sum up wrapped rows for lines before cursor line
     const prefixRows = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
     const pLen =
-      cursorRow === 0
+      getPromptKind(cursorRow) === "main"
         ? this.promptLen
         : continuationLen;
     const cursorOffset = pLen + cursorCol;
@@ -133,33 +133,5 @@ export class Renderer {
 
     // Track where the cursor actually is (for clearInputRender)
     this.cursorRowFromTop = terminalRow;
-  }
-
-  /**
-   * Clear the current rendered input area without re-rendering.
-   * Useful before changing state that would alter the number of rendered lines.
-   */
-  clearInputRender(): void {
-    // Move to start of render area
-    this.write("\r");
-    if (this.cursorRowFromTop > 0) {
-      this.write(`\x1b[${this.cursorRowFromTop}A`);
-    }
-    // Clear all rendered lines
-    for (let i = 0; i < this.renderedLineCount; i++) {
-      this.write("\x1b[2K"); // Clear entire line
-      if (i < this.renderedLineCount - 1) {
-        this.write("\x1b[1B\r"); // Move down and return to column 0
-      }
-    }
-    // Move back to the top of render area
-    if (this.renderedLineCount > 1) {
-      this.write(`\x1b[${this.renderedLineCount - 1}A\r`);
-    } else {
-      this.write("\r");
-    }
-    // Reset state
-    this.renderedLineCount = 1;
-    this.cursorRowFromTop = 0;
   }
 }
