@@ -1,5 +1,7 @@
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::{fs::File, os::fd::FromRawFd};
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
@@ -33,7 +35,7 @@ pub(crate) enum IncomingCommand {
 }
 
 pub(crate) struct OutputSink {
-    stdout: Arc<Mutex<io::Stdout>>,
+    stdout: Arc<Mutex<Box<dyn Write + Send>>>,
     host_name: Arc<String>,
     capabilities: Arc<Vec<String>>,
 }
@@ -41,7 +43,7 @@ pub(crate) struct OutputSink {
 impl OutputSink {
     pub(crate) fn new_with_capabilities(host_name: &str, capabilities: &[&str]) -> Self {
         Self {
-            stdout: Arc::new(Mutex::new(io::stdout())),
+            stdout: Arc::new(Mutex::new(create_protocol_writer())),
             host_name: Arc::new(host_name.to_string()),
             capabilities: Arc::new(capabilities.iter().map(|value| (*value).to_string()).collect()),
         }
@@ -125,6 +127,37 @@ impl OutputSink {
         }
         stdout.flush()
     }
+}
+
+#[cfg(unix)]
+fn create_protocol_writer() -> Box<dyn Write + Send> {
+    unsafe {
+        let protocol_fd = libc::dup(libc::STDOUT_FILENO);
+        if protocol_fd >= 0 {
+            let current_flags = libc::fcntl(protocol_fd, libc::F_GETFD);
+            if current_flags >= 0 {
+                let _ = libc::fcntl(protocol_fd, libc::F_SETFD, current_flags | libc::FD_CLOEXEC);
+            }
+
+            let stdin_flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFD);
+            if stdin_flags >= 0 {
+                let _ = libc::fcntl(libc::STDIN_FILENO, libc::F_SETFD, stdin_flags | libc::FD_CLOEXEC);
+            }
+
+            if libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) >= 0 {
+                return Box::new(File::from_raw_fd(protocol_fd));
+            }
+
+            let _ = libc::close(protocol_fd);
+        }
+    }
+
+    Box::new(io::stdout())
+}
+
+#[cfg(not(unix))]
+fn create_protocol_writer() -> Box<dyn Write + Send> {
+    Box::new(io::stdout())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

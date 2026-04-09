@@ -288,8 +288,15 @@ export function handleRuntimeControl(
       handleBackendPrompt(host, event.kind);
       return;
     case "busy":
-      if (event.value && host.mode !== "reply") {
-        host.mode = "executing";
+      if (event.value) {
+        if (host.mode !== "reply" && (host.activeSubmission !== null || host.mode === "starting")) {
+          host.mode = "executing";
+        }
+        return;
+      }
+
+      if (host.mode === "executing") {
+        restoreReadyStateAfterExecution(host);
       }
       return;
     case "input-request":
@@ -326,6 +333,21 @@ export function handleRuntimeControl(
       }
       return;
   }
+}
+
+function restoreReadyStateAfterExecution(host: RuntimeHost): void {
+  if (host.activeSubmission) {
+    host.finishActiveSubmission();
+  } else {
+    host.mode = "ready";
+  }
+
+  if (!host.promptReady || host.promptVisible || !host.isSessionReadyForPrompt()) {
+    return;
+  }
+
+  host.pendingPromptToken = true;
+  host.schedulePrompt();
 }
 
 export function handleBackendPrompt(
