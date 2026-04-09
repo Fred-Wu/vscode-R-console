@@ -37,6 +37,7 @@ type LoadedTheme = {
   semanticRules: Map<string, SemanticTokenRule>;
   semanticScopeRules: Map<string, readonly (readonly string[])[]>;
   bracketPairAnsi: string[];
+  defaultForegroundAnsi: string;
 };
 
 const BUILTIN_SEMANTIC_SCOPE_RULES = new Map<string, readonly (readonly string[])[]>([
@@ -88,13 +89,11 @@ const extensionNlsCache = new Map<string, Record<string, string>>();
 
 export class SyntaxTheme {
   private current: LoadedTheme | undefined;
-  private scopeCache = new Map<string, string>();
   private strictScopeCache = new Map<string, string>();
   private semanticCache = new Map<string, string>();
 
   invalidate(): void {
     this.current = undefined;
-    this.scopeCache.clear();
     this.strictScopeCache.clear();
     this.semanticCache.clear();
   }
@@ -110,29 +109,17 @@ export class SyntaxTheme {
     return theme.bracketPairAnsi[depth % theme.bracketPairAnsi.length] ?? "";
   }
 
-  resolveScopesToAnsi(scopes: readonly string[]): string {
-    const innermost = scopes[scopes.length - 1] ?? "";
-    if (isStructuralScope(innermost)) {
-      const semanticScopes = scopes.filter((scope) => !isStructuralScope(scope));
-      if (semanticScopes.length === 0) {
-        return "";
-      }
-      return this.resolveScopesToAnsiInternal(semanticScopes, true);
-    }
-    return this.resolveScopesToAnsiInternal(scopes, true);
+  resolveDefaultForegroundAnsi(): string {
+    return this.ensureLoaded().defaultForegroundAnsi;
   }
 
   private resolveScopedRuleToAnsi(scopes: readonly string[]): string {
-    return this.resolveScopesToAnsiInternal(scopes, false);
+    return this.resolveScopesToAnsiInternal(scopes);
   }
 
-  private resolveScopesToAnsiInternal(
-    scopes: readonly string[],
-    allowDefaultRule: boolean
-  ): string {
+  private resolveScopesToAnsiInternal(scopes: readonly string[]): string {
     const key = scopes.join("|");
-    const cache = allowDefaultRule ? this.scopeCache : this.strictScopeCache;
-    const cached = cache.get(key);
+    const cached = this.strictScopeCache.get(key);
     if (cached !== undefined) {
       return cached;
     }
@@ -148,7 +135,7 @@ export class SyntaxTheme {
     let fontStyleIndex = -1;
 
     for (const [ruleIndex, rule] of rules.entries()) {
-      if (!allowDefaultRule && rule.scope === undefined) {
+      if (rule.scope === undefined) {
         continue;
       }
 
@@ -188,7 +175,7 @@ export class SyntaxTheme {
       underline ? ANSI.underline : "",
     ].join("");
 
-    cache.set(key, ansi);
+    this.strictScopeCache.set(key, ansi);
     return ansi;
   }
 
@@ -235,7 +222,6 @@ export class SyntaxTheme {
     }
 
     const loaded = loadTheme(themeKey);
-    this.scopeCache.clear();
     this.strictScopeCache.clear();
     this.semanticCache.clear();
     this.current = {
@@ -244,6 +230,7 @@ export class SyntaxTheme {
       semanticRules: loaded.semanticRules,
       semanticScopeRules: loadSemanticScopeRules("r"),
       bracketPairAnsi: loaded.bracketColors.map((color) => ansiFromHex(color)),
+      defaultForegroundAnsi: resolveDefaultForegroundAnsi(loaded.rules, loaded.colors),
     };
     return this.current;
   }
@@ -253,6 +240,7 @@ function loadTheme(themeName: string): {
   rules: TokenRule[];
   semanticRules: Map<string, SemanticTokenRule>;
   bracketColors: string[];
+  colors: Record<string, string>;
 } {
   const themePath = resolveThemePath(themeName);
   const theme = themePath
@@ -267,6 +255,7 @@ function loadTheme(themeName: string): {
     rules: theme.rules,
     semanticRules: theme.semanticRules,
     bracketColors: buildBracketColors(theme.colors),
+    colors: theme.colors,
   };
 }
 
@@ -280,6 +269,26 @@ function buildBracketColors(themeColors: Record<string, string>): string[] {
       return defaultBracketColor(index);
     })
     .filter((color): color is string => color !== undefined);
+}
+
+function resolveDefaultForegroundAnsi(
+  rules: readonly TokenRule[],
+  colors: Record<string, string>
+): string {
+  let foreground = normalizeHex(colors["editor.foreground"]);
+
+  for (const rule of rules) {
+    if (rule.scope !== undefined) {
+      continue;
+    }
+
+    const normalized = normalizeHex(rule.settings.foreground);
+    if (normalized) {
+      foreground = normalized;
+    }
+  }
+
+  return foreground ? ansiFromHex(foreground) : "";
 }
 
 function defaultBracketColor(index: number): string | undefined {
@@ -698,10 +707,6 @@ function scopeMatchesSelector(scope: string, selector: string): boolean {
 
 function selectorSpecificity(selector: string): number {
   return selector.split(".").length;
-}
-
-function isStructuralScope(scope: string): boolean {
-  return scope.startsWith("meta.") || scope.startsWith("source.");
 }
 
 function parseFontStyle(fontStyle: string): { bold: boolean; italic: boolean; underline: boolean } {

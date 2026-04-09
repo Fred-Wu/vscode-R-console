@@ -62,6 +62,20 @@ interface Token {
   position: number;
 }
 
+export type HighlightTokenKind =
+  | "comment"
+  | "string"
+  | "number"
+  | "identifier"
+  | "keyword"
+  | "operator";
+
+export interface HighlightToken {
+  kind: HighlightTokenKind;
+  value: string;
+  position: number;
+}
+
 const KEYWORDS: Record<string, TokenType> = {
   function: TokenType.Function,
   if: TokenType.If,
@@ -264,6 +278,39 @@ function tokenize(code: string): Token[] {
 
   tokens.push({ type: TokenType.EOF, value: "", position: pos });
   return tokens;
+}
+
+export function tokenizeForHighlighting(code: string): HighlightToken[] {
+  return tokenize(code)
+    .map<HighlightToken | undefined>((token) => {
+      switch (token.type) {
+        case TokenType.Comment:
+          return { kind: "comment", value: token.value, position: token.position };
+        case TokenType.String:
+        case TokenType.RawString:
+          return { kind: "string", value: token.value, position: token.position };
+        case TokenType.Number:
+          return { kind: "number", value: token.value, position: token.position };
+        case TokenType.Identifier:
+          return { kind: "identifier", value: token.value, position: token.position };
+        case TokenType.Function:
+        case TokenType.If:
+        case TokenType.Else:
+        case TokenType.For:
+        case TokenType.While:
+        case TokenType.Repeat:
+        case TokenType.In:
+        case TokenType.Next:
+        case TokenType.Break:
+        case TokenType.Return:
+          return { kind: "keyword", value: token.value, position: token.position };
+        case TokenType.Operator:
+          return { kind: "operator", value: token.value, position: token.position };
+        default:
+          return undefined;
+      }
+    })
+    .filter((token): token is HighlightToken => token !== undefined);
 }
 
 function isDigit(ch: string): boolean {

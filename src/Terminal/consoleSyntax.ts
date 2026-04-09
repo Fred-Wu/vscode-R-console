@@ -1,36 +1,13 @@
-import * as fs from "fs";
-import * as path from "path";
-import * as vscode from "vscode";
-import { OnigScanner, OnigString, loadWASM } from "vscode-oniguruma";
-import { INITIAL, Registry, parseRawGrammar, type IGrammar, type StateStack } from "vscode-textmate";
 import { ANSI } from "./ansi";
 import type { DocumentSemanticTokensResult } from "../Language/consoleLspClient";
+import { tokenizeForHighlighting, type HighlightTokenKind } from "../Language/parser";
 import type { RendererLineHighlighter } from "./renderer";
 import { SyntaxTheme } from "./syntaxTheme";
 
 type SemanticProvider = (content: string) => Promise<DocumentSemanticTokensResult | undefined>;
 
-const R_SCOPE_NAME = "source.r";
-const R_SYNTAX_EXTENSION_ID = "REditorSupport.r-syntax";
-
-type GrammarContribution = {
-  language?: string;
-  scopeName?: string;
-  path?: string;
-};
-
-const OPEN_TO_CLOSE: Record<string, string> = {
-  "(": ")",
-  "[": "]",
-  "{": "}",
-};
-
-const CLOSING_BRACKETS = new Set([")", "]", "}"]);
-
 export class ConsoleSyntax implements RendererLineHighlighter {
   private readonly theme = new SyntaxTheme();
-  private grammar: IGrammar | undefined;
-  private grammarPromise: Promise<IGrammar | undefined> | undefined;
   private sourceLines: string[] = [];
   private sourceKey = "";
   private styles: string[][] = [];
@@ -42,9 +19,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   constructor(
     private readonly onDidChange: () => void,
     private readonly requestSemantics?: SemanticProvider
-  ) {
-    void this.ensureGrammar();
-  }
+  ) {}
 
   setSource(lines: string[]): void {
     const nextLines = [...lines];
@@ -53,11 +28,12 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       return;
     }
 
+    const previousLines = this.sourceLines;
+    const previousStyles = this.styles;
     this.sourceLines = nextLines;
     this.sourceKey = nextKey;
-    this.styles = this.buildLiveStyles(nextLines);
+    this.styles = this.buildPendingStyles(previousLines, previousStyles, nextLines);
     this.appliedSemanticVersion = 0;
-    void this.ensureGrammar();
 
     const sourceVersion = ++this.sourceVersion;
     if (!nextKey.trim() || !this.requestSemantics) {
@@ -71,7 +47,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
 
   invalidateTheme(): void {
     this.theme.invalidate();
-    this.styles = this.buildLiveStyles(this.sourceLines);
+    this.styles = this.buildBaseStyles(this.sourceLines);
     this.appliedSemanticVersion = 0;
     const sourceVersion = ++this.sourceVersion;
 
@@ -100,12 +76,12 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     return lines.map((displayLine, index) => {
       const sourceLineIndex = sourceLineMap ? sourceLineMap[index] : index;
       if (sourceLineIndex === undefined) {
-        return this.applyStyles(displayLine, new Array(displayLine.length).fill(""));
+        return this.applyStyles(displayLine, this.buildDefaultStyles(displayLine));
       }
 
       const sourceLine = this.sourceLines[sourceLineIndex];
       const sourceStyles = this.styles[sourceLineIndex];
-      const fallbackStyles = new Array(displayLine.length).fill("");
+      const fallbackStyles = this.buildDefaultStyles(displayLine);
       if (sourceLine === undefined || !sourceStyles || sourceStyles.length === 0) {
         return this.applyStyles(displayLine, fallbackStyles);
       }
@@ -122,7 +98,9 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         const prefixLength = displayLine.length - 3;
         return this.applyStyles(
           displayLine,
-          sourceStyles.slice(0, prefixLength).concat(["", "", ""])
+          sourceStyles
+            .slice(0, prefixLength)
+            .concat(this.buildDefaultStyles("..."))
         );
       }
 
@@ -155,13 +133,12 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       return lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? []));
     }
 
-    const styles = this.buildLiveStyles(lines);
+    const styles = this.buildBaseStyles(lines);
     return lines.map((line, index) => this.applyStyles(line, styles[index] ?? []));
   }
 
   private async buildSnapshot(lines: string[], sourceKey: string): Promise<string[]> {
-    await this.ensureGrammar();
-    const styles = this.buildLiveStyles(lines);
+    const styles = this.buildBaseStyles(lines);
     const semanticTokens = this.requestSemantics
       ? await this.requestSemantics(sourceKey)
       : undefined;
@@ -182,29 +159,17 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         this.wantedSemanticVersion > 0 &&
         this.wantedSemanticVersion > this.appliedSemanticVersion
       ) {
-        await this.ensureGrammar();
         const requestedVersion = this.wantedSemanticVersion;
         const requestedContent = this.sourceKey;
         const semanticTokens = await this.requestSemantics(requestedContent);
         if (!semanticTokens || requestedVersion !== this.sourceVersion) {
-          console.log("[r-console][semantic] applyCurrentSemantic skipped", {
-            hasTokens: Boolean(semanticTokens),
-            sourceVersion: requestedVersion,
-            currentSourceVersion: this.sourceVersion,
-            contentPreview: requestedContent.slice(0, 120),
-          });
           continue;
         }
 
-        const styles = this.buildLiveStyles(this.sourceLines);
+        const styles = this.buildBaseStyles(this.sourceLines);
         this.applySemanticStyles(styles, semanticTokens);
         this.styles = styles;
         this.appliedSemanticVersion = requestedVersion;
-        console.log("[r-console][semantic] applyCurrentSemantic applied", {
-          sourceVersion: requestedVersion,
-          contentPreview: requestedContent.slice(0, 120),
-          tokenCount: semanticTokens.data.length / 5,
-        });
         this.onDidChange();
       }
     } finally {
@@ -215,77 +180,123 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     }
   }
 
-  private buildLiveStyles(lines: string[]): string[][] {
-    if (!this.grammar) {
-      return lines.map((line) => new Array(line.length).fill(""));
-    }
-
-    let state: StateStack | null = INITIAL;
-    const bracketStack: Array<{ close: string; depth: number }> = [];
-    return lines.map((line) => {
-      const row = new Array(line.length).fill("");
-      const result = this.grammar?.tokenizeLine(line, state);
-      state = result?.ruleStack ?? INITIAL;
-
-      for (const token of result?.tokens ?? []) {
-        const ansi = this.theme.resolveScopesToAnsi(token.scopes);
-        if (!ansi) {
-          continue;
-        }
-        const start = Math.max(0, token.startIndex);
-        const end = Math.min(row.length, token.endIndex);
-        for (let cursor = start; cursor < end; cursor += 1) {
-          row[cursor] = ansi;
-        }
-      }
-
-      this.applyBracketPairStyles(line, row, result?.tokens ?? [], bracketStack);
-
-      return row;
-    });
+  private buildBaseStyles(lines: string[]): string[][] {
+    const styles = lines.map((line) => this.buildDefaultStyles(line));
+    this.applyLiveTokenStyles(lines, styles);
+    this.applyBracketPairStyles(lines, styles);
+    return styles;
   }
 
-  private ensureGrammar(): Promise<IGrammar | undefined> {
-    if (this.grammar) {
-      return Promise.resolve(this.grammar);
-    }
+  private buildDefaultStyles(line: string): string[] {
+    return new Array(line.length).fill(this.theme.resolveDefaultForegroundAnsi());
+  }
 
-    if (this.grammarPromise) {
-      return this.grammarPromise;
-    }
+  private buildPendingStyles(
+    previousLines: readonly string[],
+    previousStyles: readonly string[][],
+    nextLines: readonly string[]
+  ): string[][] {
+    const styles = this.buildBaseStyles([...nextLines]);
 
-    const request = loadRGrammar()
-      .then((grammar) => {
-        this.grammar = grammar;
-        return grammar;
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        if (this.grammarPromise === request) {
-          this.grammarPromise = undefined;
-        }
-      });
-
-    this.grammarPromise = request;
-
-    void request.then((grammar) => {
-      if (!grammar || this.sourceLines.length === 0) {
-        return;
+    for (let index = 0; index < nextLines.length; index += 1) {
+      const line = nextLines[index] ?? "";
+      const previousLine = previousLines[index];
+      const previousRow = previousStyles[index];
+      if (previousLine === undefined || previousRow === undefined) {
+        continue;
       }
 
-      this.appliedSemanticVersion = 0;
-      if (!this.sourceKey.trim() || !this.requestSemantics) {
-        this.styles = this.buildLiveStyles(this.sourceLines);
-        this.onDidChange();
-        return;
+      if (previousLine === line && previousRow.length === line.length) {
+        styles[index] = [...previousRow];
+        continue;
       }
 
-      const sourceVersion = ++this.sourceVersion;
-      this.wantedSemanticVersion = sourceVersion;
-      void this.runLatestSemanticRequest();
-    });
+      styles[index] = this.remapLineStyles(
+        previousLine,
+        previousRow,
+        line,
+        styles[index] ?? []
+      );
+    }
 
-    return request;
+    this.applyBracketPairStyles(nextLines, styles);
+    return styles;
+  }
+
+  private remapLineStyles(
+    previousLine: string,
+    previousRow: string[],
+    nextLine: string,
+    baseRow: string[]
+  ): string[] {
+    const row = baseRow.length === nextLine.length ? [...baseRow] : this.buildDefaultStyles(nextLine);
+    const prefixLength = commonPrefixLength(previousLine, nextLine);
+    const suffixLength = commonSuffixLength(previousLine, nextLine, prefixLength);
+
+    for (let index = 0; index < prefixLength; index += 1) {
+      row[index] = previousRow[index] ?? row[index];
+    }
+
+    for (let index = 0; index < suffixLength; index += 1) {
+      const previousIndex = previousLine.length - suffixLength + index;
+      const nextIndex = nextLine.length - suffixLength + index;
+      row[nextIndex] = previousRow[previousIndex] ?? row[nextIndex];
+    }
+
+    this.extendEditedTokenStyle(previousLine, previousRow, nextLine, row, prefixLength, suffixLength);
+
+    return row;
+  }
+
+  private extendEditedTokenStyle(
+    previousLine: string,
+    previousRow: string[],
+    nextLine: string,
+    row: string[],
+    prefixLength: number,
+    suffixLength: number
+  ): void {
+    const nextChangedEnd = nextLine.length - suffixLength;
+    const previousChangedEnd = previousLine.length - suffixLength;
+    if (nextChangedEnd <= prefixLength) {
+      return;
+    }
+
+    const inserted = nextLine.slice(prefixLength, nextChangedEnd);
+    if (!isWordLikeSegment(inserted)) {
+      return;
+    }
+
+    const leftChar = prefixLength > 0 ? nextLine[prefixLength - 1] : "";
+    const rightChar = nextChangedEnd < nextLine.length ? nextLine[nextChangedEnd] : "";
+    const leftStyle = prefixLength > 0 && isWordLikeChar(leftChar) ? row[prefixLength - 1] ?? "" : "";
+    const rightStyle =
+      nextChangedEnd < nextLine.length && isWordLikeChar(rightChar)
+        ? row[nextChangedEnd] ?? ""
+        : "";
+
+    const previousLeftStyle =
+      prefixLength > 0 && isWordLikeChar(previousLine[prefixLength - 1] ?? "")
+        ? previousRow[prefixLength - 1] ?? ""
+        : "";
+    const previousRightStyle =
+      previousChangedEnd < previousLine.length && isWordLikeChar(previousLine[previousChangedEnd] ?? "")
+        ? previousRow[previousChangedEnd] ?? ""
+        : "";
+
+    const candidate = firstNonEmptyStyle([
+      leftStyle,
+      rightStyle,
+      previousLeftStyle,
+      previousRightStyle,
+    ]);
+    if (!candidate) {
+      return;
+    }
+
+    for (let index = prefixLength; index < nextChangedEnd; index += 1) {
+      row[index] = candidate;
+    }
   }
 
   private applySemanticStyles(
@@ -315,16 +326,6 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       }
 
       const ansi = this.theme.resolveSemanticTokenToAnsi(tokenType, tokenModifiers);
-      if (tokenType === "function" || tokenType === "method") {
-        console.log("[r-console][semantic] applying function-like token", {
-          line,
-          char,
-          length,
-          tokenType,
-          tokenModifiers,
-          ansi,
-        });
-      }
       if (!ansi) {
         continue;
       }
@@ -335,30 +336,91 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         row[cursor] = ansi;
       }
     }
+
+    this.applyBracketPairStyles(this.sourceLines, styles);
   }
 
-  private applyBracketPairStyles(
-    line: string,
-    row: string[],
-    tokens: readonly { startIndex: number; endIndex: number; scopes: string[] }[],
-    stack: Array<{ close: string; depth: number }>
-  ): void {
-    for (const token of tokens) {
-      if (hasNonCodeScope(token.scopes)) {
+  private applyLiveTokenStyles(lines: readonly string[], styles: string[][]): void {
+    if (lines.length === 0) {
+      return;
+    }
+
+    const source = lines.join("\n");
+    const lineStarts = buildLineStarts(lines);
+    let lineIndex = 0;
+
+    for (const token of tokenizeForHighlighting(source)) {
+      const ansi = this.resolveLiveTokenAnsi(token.kind);
+      if (!ansi) {
         continue;
       }
 
-      const start = Math.max(0, token.startIndex);
-      const end = Math.min(line.length, token.endIndex);
-      for (let cursor = start; cursor < end; cursor += 1) {
+      while (
+        lineIndex + 1 < lineStarts.length &&
+        token.position >= lineStarts[lineIndex + 1]
+      ) {
+        lineIndex += 1;
+      }
+
+      this.applyTokenStyle(styles, lineStarts, lineIndex, token.position, token.value, ansi);
+    }
+  }
+
+  private applyBracketPairStyles(lines: readonly string[], styles: string[][]): void {
+    const stack: string[] = [];
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let inBacktick = false;
+
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const line = lines[lineIndex] ?? "";
+      const row = styles[lineIndex];
+      if (!row) {
+        continue;
+      }
+
+      let escaped = false;
+      for (let cursor = 0; cursor < line.length; cursor += 1) {
         const char = line[cursor];
+
+        if (!inSingleQuote && !inDoubleQuote && !inBacktick && char === "#") {
+          break;
+        }
+
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+
+        if ((inSingleQuote || inDoubleQuote) && char === "\\") {
+          escaped = true;
+          continue;
+        }
+
+        if (!inDoubleQuote && !inBacktick && char === "'") {
+          inSingleQuote = !inSingleQuote;
+          continue;
+        }
+        if (!inSingleQuote && !inBacktick && char === "\"") {
+          inDoubleQuote = !inDoubleQuote;
+          continue;
+        }
+        if (!inSingleQuote && !inDoubleQuote && char === "`") {
+          inBacktick = !inBacktick;
+          continue;
+        }
+
+        if (inSingleQuote || inDoubleQuote || inBacktick) {
+          continue;
+        }
+
         const close = OPEN_TO_CLOSE[char];
         if (close) {
           const ansi = this.theme.resolveBracketPairAnsi(stack.length);
           if (ansi) {
             row[cursor] = ansi;
           }
-          stack.push({ close, depth: stack.length });
+          stack.push(close);
           continue;
         }
 
@@ -367,13 +429,12 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         }
 
         const current = stack[stack.length - 1];
-        const depth =
-          current && current.close === char ? current.depth : Math.max(stack.length - 1, 0);
+        const depth = current === char ? Math.max(stack.length - 1, 0) : Math.max(stack.length - 1, 0);
         const ansi = this.theme.resolveBracketPairAnsi(depth);
         if (ansi) {
           row[cursor] = ansi;
         }
-        if (current && current.close === char) {
+        if (current === char) {
           stack.pop();
         }
       }
@@ -408,6 +469,54 @@ export class ConsoleSyntax implements RendererLineHighlighter {
 
     return result;
   }
+
+  private resolveLiveTokenAnsi(kind: HighlightTokenKind): string {
+    switch (kind) {
+      case "comment":
+        return this.theme.resolveSemanticTokenToAnsi("comment", []);
+      case "string":
+        return this.theme.resolveSemanticTokenToAnsi("string", []);
+      case "number":
+        return this.theme.resolveSemanticTokenToAnsi("number", []);
+      case "keyword":
+        return this.theme.resolveSemanticTokenToAnsi("keyword", []);
+      case "operator":
+        return this.theme.resolveSemanticTokenToAnsi("operator", []);
+      case "identifier":
+        return (
+          this.theme.resolveSemanticTokenToAnsi("variable", []) ||
+          this.theme.resolveSemanticTokenToAnsi("function", []) ||
+          this.theme.resolveDefaultForegroundAnsi()
+        );
+    }
+  }
+
+  private applyTokenStyle(
+    styles: string[][],
+    lineStarts: readonly number[],
+    startLineIndex: number,
+    position: number,
+    value: string,
+    ansi: string
+  ): void {
+    const segments = value.split("\n");
+    let lineIndex = startLineIndex;
+    let column = position - (lineStarts[lineIndex] ?? 0);
+
+    for (const segment of segments) {
+      const row = styles[lineIndex];
+      if (row) {
+        const start = Math.max(0, column);
+        const end = Math.min(row.length, column + segment.length);
+        for (let cursor = start; cursor < end; cursor += 1) {
+          row[cursor] = ansi;
+        }
+      }
+
+      lineIndex += 1;
+      column = 0;
+    }
+  }
 }
 
 function decodeTokenModifiers(bits: number, legend: readonly string[]): string[] {
@@ -420,90 +529,62 @@ function decodeTokenModifiers(bits: number, legend: readonly string[]): string[]
   return modifiers;
 }
 
-function hasNonCodeScope(scopes: readonly string[]): boolean {
-  return scopes.some((scope) => scope.startsWith("string") || scope.startsWith("comment"));
+const OPEN_TO_CLOSE: Record<string, string> = {
+  "(": ")",
+  "[": "]",
+  "{": "}",
+};
+
+const CLOSING_BRACKETS = new Set([")", "]", "}"]);
+
+function commonPrefixLength(left: string, right: string): number {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left[index] === right[index]) {
+    index += 1;
+  }
+  return index;
 }
 
-async function loadRGrammar(): Promise<IGrammar | undefined> {
-  const grammarPath = resolveRGrammarPath();
-  if (!grammarPath) {
-    return undefined;
+function commonSuffixLength(left: string, right: string, prefixLength: number): number {
+  const leftRemaining = left.length - prefixLength;
+  const rightRemaining = right.length - prefixLength;
+  const limit = Math.min(leftRemaining, rightRemaining);
+  let count = 0;
+  while (
+    count < limit &&
+    left[left.length - 1 - count] === right[right.length - 1 - count]
+  ) {
+    count += 1;
   }
-
-  const onigWasmPath = path.resolve(
-    __dirname,
-    "..",
-    "node_modules",
-    "vscode-oniguruma",
-    "release",
-    "onig.wasm"
-  );
-  const wasm = await fs.promises.readFile(onigWasmPath);
-  const onigLib = loadWASM(wasm).then(() => ({
-    createOnigScanner(patterns: string[]): OnigScanner {
-      return new OnigScanner(patterns);
-    },
-    createOnigString(content: string): OnigString {
-      return new OnigString(content);
-    },
-  }));
-
-  const registry = new Registry({
-    onigLib,
-    loadGrammar: async (scopeName) => {
-      if (scopeName !== R_SCOPE_NAME) {
-        return null;
-      }
-
-      const rawGrammar = await fs.promises.readFile(grammarPath, "utf8");
-      return parseRawGrammar(rawGrammar, grammarPath);
-    },
-  });
-
-  return (await registry.loadGrammar(R_SCOPE_NAME)) ?? undefined;
+  return count;
 }
 
-function resolveRGrammarPath(): string | undefined {
-  const preferred = vscode.extensions.getExtension(R_SYNTAX_EXTENSION_ID);
-  const preferredPath = preferred
-    ? findGrammarPath(preferred.extensionPath, preferred.packageJSON?.contributes?.grammars)
-    : undefined;
-  if (preferredPath) {
-    return preferredPath;
-  }
+function isWordLikeChar(char: string): boolean {
+  return /[A-Za-z0-9._]/.test(char);
+}
 
-  for (const extension of vscode.extensions.all) {
-    const grammarPath = findGrammarPath(
-      extension.extensionPath,
-      extension.packageJSON?.contributes?.grammars
-    );
-    if (grammarPath) {
-      return grammarPath;
+function isWordLikeSegment(value: string): boolean {
+  return value.length > 0 && /^[A-Za-z0-9._]+$/.test(value);
+}
+
+function firstNonEmptyStyle(values: readonly string[]): string {
+  for (const value of values) {
+    if (value) {
+      return value;
     }
   }
-
-  return undefined;
+  return "";
 }
 
-function findGrammarPath(
-  extensionPath: string,
-  grammars: GrammarContribution[] | undefined
-): string | undefined {
-  if (!Array.isArray(grammars)) {
-    return undefined;
+function buildLineStarts(lines: readonly string[]): number[] {
+  const starts: number[] = [];
+  let offset = 0;
+
+  for (const line of lines) {
+    starts.push(offset);
+    offset += line.length + 1;
   }
 
-  for (const grammar of grammars) {
-    if (
-      grammar.language !== "r" ||
-      grammar.scopeName !== R_SCOPE_NAME ||
-      typeof grammar.path !== "string"
-    ) {
-      continue;
-    }
-
-    return path.join(extensionPath, grammar.path);
-  }
-
-  return undefined;
+  return starts;
 }
