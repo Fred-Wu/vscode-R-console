@@ -552,13 +552,6 @@ function sanitizeRArgs(): string[] {
     args.push(arg);
   }
 
-  const defaultArgs = ["--no-save", "--no-restore"];
-  for (const defaultArg of defaultArgs) {
-    if (!args.includes(defaultArg)) {
-      args.push(defaultArg);
-    }
-  }
-
   return args;
 }
 

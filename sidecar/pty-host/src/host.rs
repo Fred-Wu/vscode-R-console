@@ -51,6 +51,7 @@ mod unix_host {
     type ShowMessageFn = unsafe extern "C" fn(*const c_char);
     type BusyFn = unsafe extern "C" fn(c_int);
     type SuicideFn = unsafe extern "C" fn(*const c_char);
+    type EventCallbackFn = unsafe extern "C" fn();
     type CheckUserInterruptFn = unsafe extern "C" fn();
     type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut libc::fd_set;
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut libc::fd_set);
@@ -79,6 +80,8 @@ mod unix_host {
         ptr_r_show_message: Option<*mut Option<ShowMessageFn>>,
         ptr_r_busy: Option<*mut Option<BusyFn>>,
         ptr_r_suicide: Option<*mut Option<SuicideFn>>,
+        ptr_r_process_events: Option<*mut Option<EventCallbackFn>>,
+        r_polled_events: Option<*mut Option<EventCallbackFn>>,
         r_outputfile: Option<*mut *mut c_void>,
         r_consolefile: Option<*mut *mut c_void>,
         r_interactive: Option<*mut c_int>,
@@ -413,29 +416,46 @@ mod unix_host {
         }
     }
 
+    unsafe fn run_input_handlers(api: EventLoopApi) {
+        let handlers = *(api.r_input_handlers as *mut *mut c_void);
+        if handlers.is_null() {
+            return;
+        }
+
+        let mask = (api.r_check_activity)(0, 1);
+
+        #[cfg(target_os = "macos")]
+        if !mask.is_null() {
+            (api.r_run_handlers)(handlers, mask);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        (api.r_run_handlers)(handlers, mask);
+    }
+
     unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
         if data.is_null() {
             return;
         }
 
         let context = &mut *(data as *mut PumpEventsContext);
-        let api = context.api;
-        unsafe {
-            let handlers = *(api.r_input_handlers as *mut *mut c_void);
-            if handlers.is_null() {
-                return;
-            }
+        run_input_handlers(context.api);
+    }
 
-            let mask = (api.r_check_activity)(0, 1);
+    unsafe extern "C" fn process_events_callback() {
+        let Some(api) = event_loop_api() else {
+            return;
+        };
 
-            #[cfg(target_os = "macos")]
-            if !mask.is_null() {
-                (api.r_run_handlers)(handlers, mask);
-            }
+        run_input_handlers(api);
+    }
 
-            #[cfg(not(target_os = "macos"))]
-            (api.r_run_handlers)(handlers, mask);
-        }
+    unsafe extern "C" fn polled_events_callback() {
+        let Some(api) = event_loop_api() else {
+            return;
+        };
+
+        run_input_handlers(api);
     }
 
     unsafe extern "C" fn read_console_callback(
@@ -909,6 +929,8 @@ mod unix_host {
                 ptr_r_show_message: load_optional_global(&library, b"ptr_R_ShowMessage\0"),
                 ptr_r_busy: load_optional_global(&library, b"ptr_R_Busy\0"),
                 ptr_r_suicide: load_optional_global(&library, b"ptr_R_Suicide\0"),
+                ptr_r_process_events: load_optional_global(&library, b"ptr_R_ProcessEvents\0"),
+                r_polled_events: load_optional_global(&library, b"R_PolledEvents\0"),
                 r_outputfile: load_optional_global(&library, b"R_Outputfile\0"),
                 r_consolefile: load_optional_global(&library, b"R_Consolefile\0"),
                 r_interactive: load_optional_global(&library, b"R_Interactive\0"),
@@ -987,6 +1009,12 @@ mod unix_host {
             }
             if let Some(value) = self.ptr_r_suicide {
                 *value = Some(suicide_callback);
+            }
+            if let Some(value) = self.ptr_r_process_events {
+                *value = Some(process_events_callback);
+            }
+            if let Some(value) = self.r_polled_events {
+                *value = Some(polled_events_callback);
             }
             (self.setup_rmainloop)();
             Ok(())

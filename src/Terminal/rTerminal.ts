@@ -868,16 +868,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const maybeQuit = sanitized.trim();
-    if (maybeQuit === "q()" || maybeQuit === "quit()") {
-      this.rHistory.push(sanitized);
-      if (!shouldEchoHistoryBlocks) {
-        this.beginVisibleSubmission(visibleSubmission);
-      }
-      void this.enqueueRSubmission("q(save='no')", true, !shouldEchoHistoryBlocks);
-      return;
-    }
-
     if (!shouldEchoHistoryBlocks) {
       this.beginVisibleSubmission(visibleSubmission);
     }
