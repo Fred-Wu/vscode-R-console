@@ -3,7 +3,10 @@ import type { ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { setNativeParseCallback } from "../../Language/parser";
-import { type BackendControlEvent } from "../../Runtime/backendProtocol";
+import {
+  type BackendControlEvent,
+  type BackendDialogRequest,
+} from "../../Runtime/backendProtocol";
 import {
   getBundledRustSidecarPath,
   resolveRustSidecarPath,
@@ -310,6 +313,9 @@ export function handleRuntimeControl(
         host.inputState.reset();
       }
       return;
+    case "dialog-request":
+      void handleBackendDialogRequest(host, event.dialog);
+      return;
     case "output-flush":
       if (host.mode === "reply" && !host.promptVisible) {
         host.scheduleReplyPrompt();
@@ -428,6 +434,229 @@ export function splitReplyPrompt(
     prelude: normalized.slice(0, lastNewline + 1).replace(/\n/g, "\r\n"),
     inlinePrompt: normalized.slice(lastNewline + 1),
   };
+}
+
+async function handleBackendDialogRequest(
+  host: RuntimeHost,
+  dialog: BackendDialogRequest
+): Promise<void> {
+  switch (dialog.kind) {
+    case "choose-file":
+      await handleChooseFileDialog(host, dialog.newFile);
+      return;
+    case "edit-expression":
+      await handleEditExpressionDialog(host, dialog.path);
+      return;
+    case "edit-files":
+      await handleEditFilesDialog(host, dialog.paths);
+      return;
+  }
+}
+
+async function handleChooseFileDialog(
+  host: RuntimeHost,
+  newFile: boolean
+): Promise<void> {
+  let selectedPath: string | undefined;
+  const defaultUri =
+    host.options.cwd && path.isAbsolute(host.options.cwd)
+      ? vscode.Uri.file(host.options.cwd)
+      : undefined;
+
+  try {
+    if (newFile) {
+      const uri = await vscode.window.showSaveDialog({ defaultUri });
+      selectedPath = uri?.fsPath;
+    } else {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectFolders: false,
+        canSelectMany: false,
+        defaultUri,
+      });
+      selectedPath = uris?.[0]?.fsPath;
+    }
+  } catch (error) {
+    void vscode.window.showErrorMessage(`R Console file chooser failed: ${String(error)}`);
+  }
+
+  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "dialog-result",
+    result: {
+      kind: "choose-file",
+      path: selectedPath,
+    },
+  });
+}
+
+async function handleEditExpressionDialog(
+  host: RuntimeHost,
+  filePath: string
+): Promise<void> {
+  const completed = await runEditorSession(host, [filePath], true);
+
+  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "dialog-result",
+    result: {
+      kind: "edit-expression",
+      completed,
+    },
+  });
+}
+
+async function handleEditFilesDialog(
+  host: RuntimeHost,
+  filePaths: string[]
+): Promise<void> {
+  const completed = await runEditorSession(host, filePaths, false);
+
+  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "dialog-result",
+    result: {
+      kind: "edit-files",
+      completed,
+    },
+  });
+}
+
+async function runEditorSession(
+  host: RuntimeHost,
+  filePaths: readonly string[],
+  normalizeTrailingNewline: boolean
+): Promise<boolean> {
+  try {
+    const targetUris: vscode.Uri[] = [];
+    const tabs: vscode.Tab[] = [];
+    for (const filePath of filePaths) {
+      const targetUri = await resolveEditorFileUri(host, filePath);
+      targetUris.push(targetUri);
+      const targetTab = await openEditorTab(targetUri);
+      if (!tabs.includes(targetTab)) {
+        tabs.push(targetTab);
+      }
+    }
+    await waitForClosedTabs(tabs);
+    if (normalizeTrailingNewline && targetUris.length > 0) {
+      await ensureTrailingNewline(targetUris[0]);
+    }
+    return true;
+  } catch (error) {
+    void vscode.window.showErrorMessage(`R Console editor session failed: ${String(error)}`);
+    return false;
+  }
+}
+
+async function resolveEditorFileUri(
+  host: RuntimeHost,
+  filePath: string
+): Promise<vscode.Uri> {
+  const resolvedPath =
+    path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(host.options.cwd ?? process.cwd(), filePath);
+  if (!fs.existsSync(resolvedPath)) {
+    await fs.promises.mkdir(path.dirname(resolvedPath), { recursive: true });
+    await fs.promises.writeFile(resolvedPath, "");
+  }
+  const canonicalPath = await fs.promises.realpath(resolvedPath).catch(() => resolvedPath);
+  return vscode.Uri.file(canonicalPath);
+}
+
+async function openEditorTab(targetUri: vscode.Uri): Promise<vscode.Tab> {
+  const existingTabs = getTextTabs(targetUri);
+  const document = await vscode.workspace.openTextDocument(targetUri);
+  await vscode.window.showTextDocument(document, { preview: false });
+
+  const activeTab = getActiveTextTab(targetUri);
+  if (activeTab) {
+    return activeTab;
+  }
+
+  const openedTab = getTextTabs(targetUri).find((tab) => !existingTabs.includes(tab));
+  if (openedTab) {
+    return openedTab;
+  }
+
+  throw new Error(`failed to track editor tab for ${targetUri.fsPath}`);
+}
+
+function waitForClosedTabs(tabs: readonly vscode.Tab[]): Promise<void> {
+  if (tabs.length === 0 || tabs.every((tab) => !isTabOpen(tab))) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const remaining = new Set(tabs);
+    const finishIfDone = (): void => {
+      for (const tab of [...remaining]) {
+        if (!isTabOpen(tab)) {
+          remaining.delete(tab);
+        }
+      }
+      if (remaining.size === 0) {
+        subscription.dispose();
+        resolve();
+      }
+    };
+
+    const subscription = vscode.window.tabGroups.onDidChangeTabs((event) => {
+      for (const tab of event.closed) {
+        remaining.delete(tab);
+      }
+      finishIfDone();
+    });
+
+    finishIfDone();
+  });
+}
+
+function getTextTabs(targetUri: vscode.Uri): vscode.Tab[] {
+  const targetKey = targetUri.toString();
+  const matches: vscode.Tab[] = [];
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === targetKey) {
+        matches.push(tab);
+      }
+    }
+  }
+  return matches;
+}
+
+function getActiveTextTab(targetUri: vscode.Uri): vscode.Tab | undefined {
+  const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  if (
+    activeTab?.input instanceof vscode.TabInputText &&
+    activeTab.input.uri.toString() === targetUri.toString()
+  ) {
+    return activeTab;
+  }
+  return undefined;
+}
+
+function isTabOpen(targetTab: vscode.Tab): boolean {
+  return vscode.window.tabGroups.all.some((group) => group.tabs.includes(targetTab));
+}
+
+async function ensureTrailingNewline(targetUri: vscode.Uri): Promise<void> {
+  let content: Buffer;
+  try {
+    content = await fs.promises.readFile(targetUri.fsPath);
+  } catch {
+    return;
+  }
+
+  if (content.length === 0) {
+    return;
+  }
+
+  const lastByte = content[content.length - 1];
+  if (lastByte === 0x0a || lastByte === 0x0d) {
+    return;
+  }
+
+  const newline = content.toString("utf8").includes("\r\n") ? "\r\n" : "\n";
+  await fs.promises.appendFile(targetUri.fsPath, newline);
 }
 
 export function renderRuntimeOutput(host: RuntimeHost, text: string): void {

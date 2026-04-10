@@ -280,10 +280,6 @@ export class ConsoleLspClient implements CompletionProvider {
   ): Promise<DocumentSemanticTokensResult | undefined> {
     const client = await this.ensureClient();
     if (!client) {
-      console.log("[r-console][semantic] no LSP client available", {
-        uri: doc.uri.toString(),
-        version: doc.version,
-      });
       return undefined;
     }
     this.syncDocument(client, doc);
@@ -292,35 +288,16 @@ export class ConsoleLspClient implements CompletionProvider {
     const provider = client.initializeResult?.capabilities.semanticTokensProvider;
     const legend = provider?.legend;
     if (!legend) {
-      console.log("[r-console][semantic] semantic token legend missing", {
-        uri: doc.uri.toString(),
-        version: doc.version,
-      });
       return undefined;
     }
 
     try {
-      console.log("[r-console][semantic] sending LSP semanticTokens/full", {
-        uri: doc.uri.toString(),
-        version: doc.version,
-      });
       const result = (await client.sendRawRequest(SemanticTokensRequest.type.method, {
         textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(doc),
       })) as { data?: ArrayLike<number> } | undefined;
       if (!result?.data) {
-        console.log("[r-console][semantic] LSP returned no semantic token data", {
-          uri: doc.uri.toString(),
-          version: doc.version,
-          result,
-        });
         return undefined;
       }
-      console.log("[r-console][semantic] LSP semantic token response", {
-        uri: doc.uri.toString(),
-        version: doc.version,
-        tokenCount: Array.from(result.data).length / 5,
-        firstTokens: Array.from(result.data).slice(0, 20),
-      });
       return {
         legend: {
           tokenTypes: [...legend.tokenTypes],
@@ -329,11 +306,6 @@ export class ConsoleLspClient implements CompletionProvider {
         data: Array.from(result.data),
       };
     } catch (error) {
-      console.log("[r-console][semantic] LSP semantic token request failed", {
-        uri: doc.uri.toString(),
-        version: doc.version,
-        error: String(error),
-      });
       return undefined;
     }
   }

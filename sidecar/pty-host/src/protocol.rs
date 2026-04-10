@@ -21,13 +21,30 @@ const FRAME_SUBMIT: u16 = 12;
 const FRAME_REPLY_INPUT: u16 = 13;
 const FRAME_INTERRUPT: u16 = 14;
 const FRAME_SET_WIDTH: u16 = 15;
+const FRAME_DIALOG_REQUEST: u16 = 16;
 const FRAME_SHUTDOWN: u16 = 17;
+const FRAME_DIALOG_RESULT: u16 = 18;
 const FRAME_HOST_ERROR: u16 = 19;
+
+#[derive(Debug)]
+pub(crate) enum DialogRequest {
+    ChooseFile { new_file: bool },
+    EditExpression { path: String },
+    EditFiles { paths: Vec<String> },
+}
+
+#[derive(Debug)]
+pub(crate) enum DialogResult {
+    ChooseFile { path: Option<String> },
+    EditExpression { completed: bool },
+    EditFiles { completed: bool },
+}
 
 #[derive(Debug)]
 pub(crate) enum IncomingCommand {
     Submit(String),
     ReplyInput(String),
+    DialogResult(DialogResult),
     ParseStatus { request_id: u32, code: String },
     Interrupt,
     SetWidth { columns: u16 },
@@ -92,6 +109,24 @@ impl OutputSink {
 
     pub(crate) fn emit_input_end(&self) -> io::Result<()> {
         self.emit_frame(FRAME_INPUT_END, 0, &[])
+    }
+
+    pub(crate) fn emit_dialog_request(&self, request: &DialogRequest) -> io::Result<()> {
+        let mut payload = Vec::new();
+        match request {
+            DialogRequest::ChooseFile { new_file } => {
+                payload.push(if *new_file { 1 } else { 0 });
+            }
+            DialogRequest::EditExpression { path } => {
+                payload.push(2);
+                encode_string(path, &mut payload);
+            }
+            DialogRequest::EditFiles { paths } => {
+                payload.push(3);
+                encode_string_array(paths, &mut payload);
+            }
+        }
+        self.emit_frame(FRAME_DIALOG_REQUEST, 0, &payload)
     }
 
     pub(crate) fn emit_output(&self, payload: &[u8]) -> io::Result<()> {
@@ -198,6 +233,7 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
         FRAME_REPLY_INPUT => {
             IncomingCommand::ReplyInput(String::from_utf8_lossy(&payload).into_owned())
         }
+        FRAME_DIALOG_RESULT => IncomingCommand::DialogResult(decode_dialog_result(&payload)?),
         FRAME_PARSE_STATUS_REQUEST => {
             IncomingCommand::ParseStatus {
                 request_id,
@@ -237,7 +273,91 @@ fn encode_string_list<T: AsRef<str>>(label: &str, capabilities: &[T], payload: &
     }
 }
 
+fn encode_string_array<T: AsRef<str>>(values: &[T], payload: &mut Vec<u8>) {
+    payload.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for value in values {
+        encode_string(value.as_ref(), payload);
+    }
+}
+
 fn encode_string(value: &str, payload: &mut Vec<u8>) {
     payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
     payload.extend_from_slice(value.as_bytes());
+}
+
+fn decode_dialog_result(payload: &[u8]) -> io::Result<DialogResult> {
+    let Some(kind) = payload.first().copied() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing dialog-result kind",
+        ));
+    };
+
+    match kind {
+        0 => {
+            if payload.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated choose-file dialog result",
+                ));
+            }
+            if payload[1] == 0 {
+                Ok(DialogResult::ChooseFile { path: None })
+            } else {
+                let (path, offset) = decode_string(payload, 2)?;
+                if offset != payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trailing bytes in choose-file dialog result",
+                    ));
+                }
+                Ok(DialogResult::ChooseFile { path: Some(path) })
+            }
+        }
+        1 => {
+            if payload.len() != 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid edit-expression dialog result payload",
+                ));
+            }
+            Ok(DialogResult::EditExpression {
+                completed: payload[1] != 0,
+            })
+        }
+        2 => {
+            if payload.len() != 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid edit-files dialog result payload",
+                ));
+            }
+            Ok(DialogResult::EditFiles {
+                completed: payload[1] != 0,
+            })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown dialog-result kind {kind}"),
+        )),
+    }
+}
+
+fn decode_string(payload: &[u8], offset: usize) -> io::Result<(String, usize)> {
+    let Some(length_slice) = payload.get(offset..offset + 4) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated string length",
+        ));
+    };
+    let length = u32::from_le_bytes(length_slice.try_into().expect("string length slice")) as usize;
+    let start = offset + 4;
+    let end = start + length;
+    let Some(value_slice) = payload.get(start..end) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated string payload",
+        ));
+    };
+    Ok((String::from_utf8_lossy(value_slice).into_owned(), end))
 }

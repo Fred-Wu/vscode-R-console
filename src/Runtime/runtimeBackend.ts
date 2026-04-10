@@ -4,6 +4,8 @@ import * as path from "path";
 import {
   type BackendCapability,
   type BackendControlEvent,
+  type BackendDialogResult,
+  encodeDialogResultFrame,
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
   encodeReplyInputFrame,
@@ -38,6 +40,10 @@ type RuntimeSessionCommand =
   | {
       type: "set-width";
       columns: number;
+    }
+  | {
+      type: "dialog-result";
+      result: BackendDialogResult;
     };
 
 type BackendProcessState = {
@@ -188,6 +194,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           return false;
         }
         return this.writeFrame(process, encodeSetWidthFrame(command.columns));
+      case "dialog-result":
+        return this.writeFrame(process, encodeDialogResultFrame(command.result));
       default:
         return false;
     }

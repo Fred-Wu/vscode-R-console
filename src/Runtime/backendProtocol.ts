@@ -16,7 +16,9 @@ const FrameKind = {
   ReplyInput: 13,
   Interrupt: 14,
   SetWidth: 15,
+  DialogRequest: 16,
   Shutdown: 17,
+  DialogResult: 18,
   HostError: 19,
 } as const;
 
@@ -28,6 +30,34 @@ export type BackendCapability =
   | "nested-input"
   | "parse-status"
   | "set-width";
+
+export type BackendDialogRequest =
+  | {
+      kind: "choose-file";
+      newFile: boolean;
+    }
+  | {
+      kind: "edit-expression";
+      path: string;
+    }
+  | {
+      kind: "edit-files";
+      paths: string[];
+    };
+
+export type BackendDialogResult =
+  | {
+      kind: "choose-file";
+      path?: string;
+    }
+  | {
+      kind: "edit-expression";
+      completed: boolean;
+    }
+  | {
+      kind: "edit-files";
+      completed: boolean;
+    };
 
 export type BackendControlEvent =
   | {
@@ -59,6 +89,10 @@ export type BackendControlEvent =
     }
   | {
       type: "input-end";
+    }
+  | {
+      type: "dialog-request";
+      dialog: BackendDialogRequest;
     }
   | {
       type: "output-flush";
@@ -148,6 +182,46 @@ function parseStringListPayload(payload: Buffer): StringListPayload {
   };
 }
 
+function parseStringArray(
+  payload: Buffer,
+  offset: number = 0
+): { values: string[]; offset: number } {
+  const count = parseU32(payload, offset);
+  offset += 4;
+  const values: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const result = parseString(payload, offset);
+    values.push(result.value);
+    offset = result.offset;
+  }
+  return { values, offset };
+}
+
+function parseDialogRequest(payload: Buffer): BackendDialogRequest {
+  if (payload.length === 0) {
+    throw new Error("missing dialog-request kind");
+  }
+
+  switch (payload[0]) {
+    case 0:
+      return { kind: "choose-file", newFile: false };
+    case 1:
+      return { kind: "choose-file", newFile: true };
+    case 2:
+      return {
+        kind: "edit-expression",
+        path: parseString(payload, 1).value,
+      };
+    case 3:
+      return {
+        kind: "edit-files",
+        paths: parseStringArray(payload, 1).values,
+      };
+    default:
+      throw new Error(`unknown dialog-request kind ${payload[0]}`);
+  }
+}
+
 function parseControlFrame(
   kind: number,
   requestId: number,
@@ -206,6 +280,11 @@ function parseControlFrame(
       };
     case FrameKind.InputEnd:
       return { type: "input-end" };
+    case FrameKind.DialogRequest:
+      return {
+        type: "dialog-request",
+        dialog: parseDialogRequest(payload),
+      };
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.ParseStatusResult:
@@ -309,6 +388,35 @@ export function encodeSetWidthFrame(columns: number): Buffer {
   const payload = Buffer.allocUnsafe(4);
   payload.writeUInt32LE(Math.max(1, Math.floor(columns)), 0);
   return createFrame(FrameKind.SetWidth, 0, payload);
+}
+
+export function encodeDialogResultFrame(result: BackendDialogResult): Buffer {
+  switch (result.kind) {
+    case "choose-file": {
+      if (!result.path) {
+        return createFrame(FrameKind.DialogResult, 0, Buffer.from([0, 0]));
+      }
+      const pathPayload = Buffer.from(result.path, "utf8");
+      const payload = Buffer.allocUnsafe(2 + 4 + pathPayload.length);
+      payload[0] = 0;
+      payload[1] = 1;
+      payload.writeUInt32LE(pathPayload.length, 2);
+      pathPayload.copy(payload, 6);
+      return createFrame(FrameKind.DialogResult, 0, payload);
+    }
+    case "edit-expression":
+      return createFrame(
+        FrameKind.DialogResult,
+        0,
+        Buffer.from([1, result.completed ? 1 : 0])
+      );
+    case "edit-files":
+      return createFrame(
+        FrameKind.DialogResult,
+        0,
+        Buffer.from([2, result.completed ? 1 : 0])
+      );
+  }
 }
 
 export function encodeParseStatusRequestFrame(

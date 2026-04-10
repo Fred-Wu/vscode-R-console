@@ -8,7 +8,9 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 mod unix_host {
-    use crate::protocol::{read_next_command, IncomingCommand, OutputSink, PromptKind};
+    use crate::protocol::{
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, PromptKind,
+    };
     use libloading::os::unix::{Library, Symbol};
     use std::collections::VecDeque;
     use std::error::Error;
@@ -51,7 +53,12 @@ mod unix_host {
     type ShowMessageFn = unsafe extern "C" fn(*const c_char);
     type BusyFn = unsafe extern "C" fn(c_int);
     type SuicideFn = unsafe extern "C" fn(*const c_char);
+    type ChooseFileFn = unsafe extern "C" fn(c_int, *mut c_char, c_int) -> c_int;
+    type EditFileFn = unsafe extern "C" fn(*const c_char) -> c_int;
+    type EditFilesFn =
+        unsafe extern "C" fn(c_int, *const *const c_char, *const *const c_char, *const c_char) -> c_int;
     type EventCallbackFn = unsafe extern "C" fn();
+    type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
     type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut libc::fd_set;
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut libc::fd_set);
@@ -74,12 +81,16 @@ mod unix_host {
         rf_initialize_r: RfInitializeR,
         setup_rmainloop: SetupRMainloop,
         run_rmainloop: RunRMainloop,
+        r_expand_file_name: ExpandFileNameFn,
         ptr_r_write_console: Option<*mut Option<WriteConsoleFn>>,
         ptr_r_write_console_ex: *mut Option<WriteConsoleExFn>,
         ptr_r_read_console: *mut Option<ReadConsoleFn>,
         ptr_r_show_message: Option<*mut Option<ShowMessageFn>>,
         ptr_r_busy: Option<*mut Option<BusyFn>>,
         ptr_r_suicide: Option<*mut Option<SuicideFn>>,
+        ptr_r_choose_file: Option<*mut Option<ChooseFileFn>>,
+        ptr_r_edit_file: Option<*mut Option<EditFileFn>>,
+        ptr_r_edit_files: Option<*mut Option<EditFilesFn>>,
         ptr_r_process_events: Option<*mut Option<EventCallbackFn>>,
         r_polled_events: Option<*mut Option<EventCallbackFn>>,
         r_outputfile: Option<*mut *mut c_void>,
@@ -119,6 +130,7 @@ mod unix_host {
         active_submission_lines: VecDeque<Vec<u8>>,
         pending_fragment: Option<Vec<u8>>,
         pending_fragment_from_nested: bool,
+        pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
         current_width: Option<u16>,
         busy: bool,
@@ -149,6 +161,7 @@ mod unix_host {
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
     static READ_CONSOLE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+    static R_EXPAND_FILE_NAME: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone, Copy)]
     struct ParseApi {
@@ -267,6 +280,7 @@ mod unix_host {
         match command {
             IncomingCommand::Submit(code) => queue_submit(code),
             IncomingCommand::ReplyInput(text) => queue_reply(text),
+            IncomingCommand::DialogResult(result) => queue_dialog_result(result),
             IncomingCommand::ParseStatus { request_id, code } => queue_parse_status(request_id, code),
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
@@ -292,6 +306,15 @@ mod unix_host {
             state
                 .pending_commands
                 .push_back(PendingCommand::Reply(normalize_reply_text(&text).into_bytes()));
+            runtime.cv.notify_all();
+        }
+    }
+
+    fn queue_dialog_result(result: DialogResult) {
+        if let Some(runtime) = host_runtime() {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.suppress_idle_event_pump = false;
+            state.pending_dialog_result = Some(result);
             runtime.cv.notify_all();
         }
     }
@@ -362,6 +385,24 @@ mod unix_host {
         }
     }
 
+    fn expand_r_file_name(path: &str) -> String {
+        let function = R_EXPAND_FILE_NAME.load(Ordering::Relaxed);
+        if function == 0 {
+            return path.to_string();
+        }
+        let Ok(c_path) = CString::new(path) else {
+            return path.to_string();
+        };
+        let function: ExpandFileNameFn = unsafe { std::mem::transmute(function) };
+        let expanded = unsafe { function(c_path.as_ptr()) };
+        if expanded.is_null() {
+            return path.to_string();
+        }
+        unsafe { CStr::from_ptr(expanded) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn set_r_interrupts_pending(pending: bool) {
         let ptr = R_INTERRUPTS_PENDING_PTR.load(Ordering::Relaxed) as *mut c_int;
         if ptr.is_null() {
@@ -398,6 +439,72 @@ mod unix_host {
         let raw = std::env::var("VSC_R_COLS").ok()?;
         let parsed = raw.parse::<u16>().ok()?;
         Some(normalize_console_width(parsed))
+    }
+
+    fn request_choose_file(new_file: bool) -> Option<String> {
+        match request_dialog(DialogRequest::ChooseFile { new_file })? {
+            DialogResult::ChooseFile { path } => path,
+            DialogResult::EditExpression { .. } | DialogResult::EditFiles { .. } => {
+                emit_host_error("unexpected edit dialog result while waiting for choose-file");
+                None
+            }
+        }
+    }
+
+    fn request_edit_file(path: &str) -> bool {
+        match request_dialog(DialogRequest::EditExpression {
+            path: path.to_string(),
+        }) {
+            Some(DialogResult::EditExpression { completed }) => completed,
+            Some(DialogResult::ChooseFile { .. }) | Some(DialogResult::EditFiles { .. }) => {
+                emit_host_error(
+                    "unexpected dialog result while waiting for edit() expression session",
+                );
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn request_edit_files(paths: &[String]) -> bool {
+        match request_dialog(DialogRequest::EditFiles {
+            paths: paths.to_vec(),
+        }) {
+            Some(DialogResult::EditFiles { completed }) => completed,
+            Some(DialogResult::ChooseFile { .. }) | Some(DialogResult::EditExpression { .. }) => {
+                emit_host_error("unexpected dialog result while waiting for file.edit()");
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn request_dialog(request: DialogRequest) -> Option<DialogResult> {
+        let runtime = host_runtime()?;
+        {
+            let mut state = runtime.state.lock().expect("host state lock poisoned");
+            state.pending_dialog_result = None;
+        }
+        if runtime.output.emit_dialog_request(&request).is_err() {
+            return None;
+        }
+
+        let mut state = runtime.state.lock().expect("host state lock poisoned");
+        loop {
+            if let Some(result) = state.pending_dialog_result.take() {
+                return Some(result);
+            }
+
+            if state.shutdown_requested || state.interrupt_requested {
+                return None;
+            }
+
+            let (next_state, _) = runtime
+                .cv
+                .wait_timeout(state, EVENT_POLL_INTERVAL)
+                .expect("host state lock poisoned");
+            state = next_state;
+        }
     }
 
     fn pump_r_events_once() {
@@ -637,6 +744,69 @@ mod unix_host {
         std::process::exit(1);
     }
 
+    unsafe extern "C" fn choose_file_callback(new_file: c_int, buffer: *mut c_char, len: c_int) -> c_int {
+        let Some(path) = request_choose_file(new_file != 0) else {
+            if !buffer.is_null() && len > 0 {
+                *buffer = 0;
+            }
+            return 0;
+        };
+
+        write_path_buffer(buffer, len, &path)
+    }
+
+    unsafe extern "C" fn edit_file_callback(path: *const c_char) -> c_int {
+        let file_path = c_string_to_string(path);
+        if file_path.is_empty() {
+            return 1;
+        }
+
+        let expanded_path = expand_r_file_name(&file_path);
+
+        if request_edit_file(&expanded_path) {
+            0
+        } else {
+            1
+        }
+    }
+
+    unsafe extern "C" fn edit_files_callback(
+        count: c_int,
+        paths: *const *const c_char,
+        _titles: *const *const c_char,
+        _editor: *const c_char,
+    ) -> c_int {
+        let expanded_paths = c_string_array_to_vec(paths, count)
+            .into_iter()
+            .map(|value| expand_r_file_name(&value))
+            .collect::<Vec<_>>();
+        if expanded_paths.is_empty() {
+            return 1;
+        }
+
+        if request_edit_files(&expanded_paths) {
+            0
+        } else {
+            1
+        }
+    }
+
+    fn write_path_buffer(buffer: *mut c_char, len: c_int, path: &str) -> c_int {
+        let bytes = path.as_bytes();
+        if buffer.is_null() || len <= 0 {
+            return bytes.len() as c_int;
+        }
+
+        let capacity = len as usize;
+        let used = bytes.len().min(capacity.saturating_sub(1));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer as *mut u8, used);
+            *(buffer.add(used)) = 0;
+        }
+
+        bytes.len() as c_int
+    }
+
     fn take_next_line(wait_kind: &WaitKind, state: &mut SharedState) -> Option<PendingLine> {
         if let Some(line) = state.active_submission_lines.pop_front() {
             return Some(PendingLine {
@@ -762,6 +932,23 @@ mod unix_host {
         unsafe { CStr::from_ptr(text) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    fn c_string_array_to_vec(values: *const *const c_char, count: c_int) -> Vec<String> {
+        if values.is_null() || count <= 0 {
+            return Vec::new();
+        }
+
+        let entries = unsafe { std::slice::from_raw_parts(values, count as usize) };
+        entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.is_null() {
+                    return None;
+                }
+                Some(c_string_to_string(*entry))
+            })
+            .collect()
     }
 
     fn parse_api() -> Option<ParseApi> {
@@ -923,12 +1110,16 @@ mod unix_host {
                 rf_initialize_r: load_function(&library, b"Rf_initialize_R\0")?,
                 setup_rmainloop: load_function(&library, b"setup_Rmainloop\0")?,
                 run_rmainloop: load_function(&library, b"run_Rmainloop\0")?,
+                r_expand_file_name: load_function(&library, b"R_ExpandFileName\0")?,
                 ptr_r_write_console: load_optional_global(&library, b"ptr_R_WriteConsole\0"),
                 ptr_r_write_console_ex: load_global(&library, b"ptr_R_WriteConsoleEx\0")?,
                 ptr_r_read_console: load_global(&library, b"ptr_R_ReadConsole\0")?,
                 ptr_r_show_message: load_optional_global(&library, b"ptr_R_ShowMessage\0"),
                 ptr_r_busy: load_optional_global(&library, b"ptr_R_Busy\0"),
                 ptr_r_suicide: load_optional_global(&library, b"ptr_R_Suicide\0"),
+                ptr_r_choose_file: load_optional_global(&library, b"ptr_R_ChooseFile\0"),
+                ptr_r_edit_file: load_optional_global(&library, b"ptr_R_EditFile\0"),
+                ptr_r_edit_files: load_optional_global(&library, b"ptr_R_EditFiles\0"),
                 ptr_r_process_events: load_optional_global(&library, b"ptr_R_ProcessEvents\0"),
                 r_polled_events: load_optional_global(&library, b"R_PolledEvents\0"),
                 r_outputfile: load_optional_global(&library, b"R_Outputfile\0"),
@@ -990,6 +1181,7 @@ mod unix_host {
             if let Some(function) = self.r_check_user_interrupt {
                 R_CHECK_USER_INTERRUPT.store(function as usize, Ordering::Relaxed);
             }
+            R_EXPAND_FILE_NAME.store(self.r_expand_file_name as usize, Ordering::Relaxed);
             if let Some(value) = self.r_outputfile {
                 *value = std::ptr::null_mut();
             }
@@ -1009,6 +1201,15 @@ mod unix_host {
             }
             if let Some(value) = self.ptr_r_suicide {
                 *value = Some(suicide_callback);
+            }
+            if let Some(value) = self.ptr_r_choose_file {
+                *value = Some(choose_file_callback);
+            }
+            if let Some(value) = self.ptr_r_edit_file {
+                *value = Some(edit_file_callback);
+            }
+            if let Some(value) = self.ptr_r_edit_files {
+                *value = Some(edit_files_callback);
             }
             if let Some(value) = self.ptr_r_process_events {
                 *value = Some(process_events_callback);

@@ -166,24 +166,14 @@ export class RTermLang {
     await this.ensureConsoleLspStarted();
     const lsp = this.consoleLsp;
     if (!lsp) {
-      console.log("[r-console][semantic] no console LSP client");
       return undefined;
     }
 
     const doc = this.createSemanticSnapshotDocument(content);
     if (!doc) {
-      console.log("[r-console][semantic] failed to create semantic document", {
-        contentLength: content.length,
-      });
       return undefined;
     }
 
-    console.log("[r-console][semantic] request", {
-      uri: doc.uri.toString(),
-      version: doc.version,
-      contentLength: content.length,
-      preview: content.slice(0, 120),
-    });
     try {
       return await lsp.provideDocumentSemanticTokens(doc);
     } finally {
