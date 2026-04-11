@@ -1330,10 +1330,12 @@ mod windows_host {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
     use std::time::Duration;
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP};
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const EMBEDDED_UTF8_PREFIX: &[u8] = &[0x02, 0xff, 0xfe];
+    const EMBEDDED_UTF8_SUFFIX: &[u8] = &[0x03, 0xff, 0xfe];
 
     const SUPPORTED_CAPABILITIES: &[&str] = &[
         "control-channel",
@@ -1484,6 +1486,7 @@ mod windows_host {
         r_interactive: Option<*mut c_int>,
         r_signal_handlers: Option<*mut c_int>,
         r_running_as_main_program: Option<*mut c_int>,
+        locale_cp: Option<*mut c_int>,
         r_interrupts_pending: Option<*mut c_int>,
         r_check_user_interrupt: Option<CheckUserInterruptFn>,
         r_cstack_limit: Option<*mut usize>,
@@ -1550,6 +1553,7 @@ mod windows_host {
     static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
     static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
     static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
+    static R_LOCALE_CP_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
     static READ_CONSOLE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -1698,9 +1702,11 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
-            state.pending_commands.push_back(PendingCommand::Reply(
-                normalize_reply_text(&text).into_bytes(),
-            ));
+            state
+                .pending_commands
+                .push_back(PendingCommand::Reply(encode_windows_console_text(
+                    &normalize_reply_text(&text),
+                )));
             runtime.cv.notify_all();
         }
     }
@@ -1780,7 +1786,7 @@ mod windows_host {
         if function == 0 {
             return path.to_string();
         }
-        let Ok(c_path) = CString::new(path) else {
+        let Ok(c_path) = CString::new(encode_windows_console_text(path)) else {
             return path.to_string();
         };
         let function: ExpandFileNameFn = unsafe { std::mem::transmute(function) };
@@ -1788,9 +1794,7 @@ mod windows_host {
         if expanded.is_null() {
             return path.to_string();
         }
-        unsafe { CStr::from_ptr(expanded) }
-            .to_string_lossy()
-            .into_owned()
+        c_string_to_string(expanded)
     }
 
     fn set_r_interrupts_pending(pending: bool) {
@@ -2178,7 +2182,7 @@ mod windows_host {
     }
 
     fn write_path_buffer(buffer: *mut c_char, len: c_int, path: &str) -> c_int {
-        let bytes = path.as_bytes();
+        let bytes = encode_windows_console_text(path);
         if buffer.is_null() || len <= 0 {
             return bytes.len() as c_int;
         }
@@ -2295,7 +2299,7 @@ mod windows_host {
         let normalized = normalize_newlines(code);
         let mut lines = VecDeque::new();
         for line in normalized.split('\n') {
-            lines.push_back(line.as_bytes().to_vec());
+            lines.push_back(encode_windows_console_text(line));
         }
         if lines.is_empty() {
             lines.push_back(Vec::new());
@@ -2319,9 +2323,8 @@ mod windows_host {
         if text.is_null() {
             return String::new();
         }
-        unsafe { CStr::from_ptr(text) }
-            .to_string_lossy()
-            .into_owned()
+        let bytes = unsafe { CStr::from_ptr(text) }.to_bytes();
+        decode_windows_console_text(bytes)
     }
 
     fn c_string_array_to_vec(values: *const *const c_char, count: c_int) -> Vec<String> {
@@ -2355,7 +2358,7 @@ mod windows_host {
             return PARSE_STATUS_ERROR;
         };
 
-        let Ok(code) = CString::new(code) else {
+        let Ok(code) = CString::new(encode_windows_console_text(&code)) else {
             return PARSE_STATUS_ERROR;
         };
 
@@ -2556,14 +2559,15 @@ mod windows_host {
         Err("failed to derive R_HOME from executable path".into())
     }
 
-    fn decode_windows_ansi(bytes: &[u8]) -> String {
+    fn decode_windows_code_page(bytes: &[u8]) -> String {
         if bytes.is_empty() {
             return String::new();
         }
 
         unsafe {
+            let code_page = current_windows_code_page();
             let wide_len = MultiByteToWideChar(
-                CP_ACP,
+                code_page,
                 0,
                 bytes.as_ptr(),
                 bytes.len() as c_int,
@@ -2576,7 +2580,7 @@ mod windows_host {
 
             let mut wide = vec![0_u16; wide_len as usize];
             let written = MultiByteToWideChar(
-                CP_ACP,
+                code_page,
                 0,
                 bytes.as_ptr(),
                 bytes.len() as c_int,
@@ -2591,6 +2595,99 @@ mod windows_host {
         }
     }
 
+    fn current_windows_code_page() -> u32 {
+        let ptr = R_LOCALE_CP_PTR.load(Ordering::Relaxed) as *const c_int;
+        if !ptr.is_null() {
+            let code_page = unsafe { *ptr };
+            if code_page > 0 {
+                return code_page as u32;
+            }
+        }
+        CP_ACP as u32
+    }
+
+    fn decode_windows_console_text(bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return String::new();
+        }
+
+        let mut rendered = String::new();
+        let mut remaining = bytes;
+
+        while let Some(prefix_start) = find_subslice(remaining, EMBEDDED_UTF8_PREFIX) {
+            let text_start = prefix_start + EMBEDDED_UTF8_PREFIX.len();
+            let Some(suffix_offset) = find_subslice(&remaining[text_start..], EMBEDDED_UTF8_SUFFIX)
+            else {
+                break;
+            };
+            let text_end = text_start + suffix_offset;
+
+            if prefix_start > 0 {
+                rendered.push_str(&decode_windows_code_page(&remaining[..prefix_start]));
+            }
+
+            rendered.push_str(&String::from_utf8_lossy(&remaining[text_start..text_end]));
+            remaining = &remaining[text_end + EMBEDDED_UTF8_SUFFIX.len()..];
+        }
+
+        if !remaining.is_empty() {
+            rendered.push_str(&decode_windows_code_page(remaining));
+        }
+
+        rendered
+    }
+
+    fn encode_windows_console_text(text: &str) -> Vec<u8> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let code_page = current_windows_code_page();
+            let encoded_len = WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                wide.len() as c_int,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            if encoded_len <= 0 {
+                return text.as_bytes().to_vec();
+            }
+
+            let mut encoded = vec![0_u8; encoded_len as usize];
+            let written = WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                wide.len() as c_int,
+                encoded.as_mut_ptr(),
+                encoded_len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            if written <= 0 {
+                return text.as_bytes().to_vec();
+            }
+
+            encoded.truncate(written as usize);
+            encoded
+        }
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return None;
+        }
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     fn get_r_user_home(get_r_user: Option<GetRUserFn>) -> String {
         if let Some(function) = get_r_user {
             let result = unsafe { function() };
@@ -2599,7 +2696,7 @@ mod windows_host {
                 if let Ok(path) = std::str::from_utf8(bytes) {
                     return path.to_string();
                 }
-                return decode_windows_ansi(bytes);
+                return decode_windows_code_page(bytes);
             }
         }
 
@@ -2688,6 +2785,7 @@ mod windows_host {
                     &library,
                     b"R_running_as_main_program\0",
                 ),
+                locale_cp: load_optional_global(&library, b"localeCP\0"),
                 r_interrupts_pending: load_optional_global(&library, b"UserBreak\0")
                     .or_else(|| load_optional_global(&library, b"R_interrupts_pending\0")),
                 r_check_user_interrupt: load_optional_function(&library, b"R_CheckUserInterrupt\0"),
@@ -2732,6 +2830,9 @@ mod windows_host {
             if let Some(value) = self.r_interactive {
                 *value = 1;
             }
+            if let Some(value) = self.locale_cp {
+                R_LOCALE_CP_PTR.store(value as usize, Ordering::Relaxed);
+            }
             if let Some(value) = self.r_interrupts_pending {
                 R_INTERRUPTS_PENDING_PTR.store(value as usize, Ordering::Relaxed);
                 *value = 0;
@@ -2746,8 +2847,10 @@ mod windows_host {
 
             let r_home = resolve_r_home(r_executable)?;
             let user_home = get_r_user_home(self.get_r_user);
-            let r_home_storage = CString::new(r_home.to_string_lossy().as_ref())?;
-            let user_home_storage = CString::new(user_home)?;
+            let r_home_storage = CString::new(encode_windows_console_text(
+                r_home.to_string_lossy().as_ref(),
+            ))?;
+            let user_home_storage = CString::new(encode_windows_console_text(&user_home))?;
             let mut r_start = Box::<RStart>::new(std::mem::zeroed());
 
             if let Some(def_params_ex) = self.r_def_params_ex {
@@ -2759,12 +2862,12 @@ mod windows_host {
             }
 
             if let Some(cmdlineoptions) = self.cmdlineoptions {
-                let program_name = CString::new(
+                let program_name = CString::new(encode_windows_console_text(
                     r_executable
                         .file_name()
                         .and_then(|value| value.to_str())
                         .unwrap_or("R"),
-                )?;
+                ))?;
                 let mut empty_args = vec![program_name.as_ptr() as *mut c_char];
                 cmdlineoptions(empty_args.len() as c_int, empty_args.as_mut_ptr());
             }
@@ -2898,17 +3001,37 @@ mod windows_host {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("R");
-        argv.push(CString::new(program_name)?);
+        argv.push(CString::new(encode_windows_console_text(program_name))?);
 
         if !r_args.iter().any(|arg| arg == "--interactive") {
-            argv.push(CString::new("--interactive")?);
+            argv.push(CString::new(encode_windows_console_text("--interactive"))?);
         }
 
         for arg in r_args {
-            argv.push(CString::new(arg.as_str())?);
+            argv.push(CString::new(encode_windows_console_text(arg.as_str()))?);
         }
 
         Ok(argv)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::decode_windows_console_text;
+
+        #[test]
+        fn decodes_embedded_utf8_console_segments() {
+            let bytes = b"[1] \"\x02\xff\xfehi\x03\xff\xfe\"";
+            assert_eq!(decode_windows_console_text(bytes), "[1] \"hi\"");
+        }
+
+        #[test]
+        fn decodes_plain_ascii_console_text() {
+            let bytes = b"Packages in library C:/Program Files/R/library:";
+            assert_eq!(
+                decode_windows_console_text(bytes),
+                "Packages in library C:/Program Files/R/library:"
+            );
+        }
     }
 }
 
