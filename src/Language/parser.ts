@@ -66,6 +66,7 @@ export type HighlightTokenKind =
   | "comment"
   | "string"
   | "number"
+  | "function"
   | "identifier"
   | "keyword"
   | "operator";
@@ -281,8 +282,10 @@ function tokenize(code: string): Token[] {
 }
 
 export function tokenizeForHighlighting(code: string): HighlightToken[] {
-  return tokenize(code)
-    .map<HighlightToken | undefined>((token) => {
+  const tokens = tokenize(code);
+
+  return tokens
+    .map<HighlightToken | undefined>((token, index) => {
       switch (token.type) {
         case TokenType.Comment:
           return { kind: "comment", value: token.value, position: token.position };
@@ -292,7 +295,11 @@ export function tokenizeForHighlighting(code: string): HighlightToken[] {
         case TokenType.Number:
           return { kind: "number", value: token.value, position: token.position };
         case TokenType.Identifier:
-          return { kind: "identifier", value: token.value, position: token.position };
+          return {
+            kind: getIdentifierHighlightKind(tokens, index),
+            value: token.value,
+            position: token.position,
+          };
         case TokenType.Function:
         case TokenType.If:
         case TokenType.Else:
@@ -311,6 +318,35 @@ export function tokenizeForHighlighting(code: string): HighlightToken[] {
       }
     })
     .filter((token): token is HighlightToken => token !== undefined);
+}
+
+function getIdentifierHighlightKind(
+  tokens: readonly Token[],
+  index: number
+): Extract<HighlightTokenKind, "function" | "identifier"> {
+  const nextToken = findNextMeaningfulToken(tokens, index);
+  return nextToken?.type === TokenType.LeftParen ? "function" : "identifier";
+}
+
+function findNextMeaningfulToken(
+  tokens: readonly Token[],
+  index: number
+): Token | undefined {
+  for (let cursor = index + 1; cursor < tokens.length; cursor += 1) {
+    const token = tokens[cursor];
+    if (!token) {
+      continue;
+    }
+    if (
+      token.type === TokenType.Comment ||
+      token.type === TokenType.Newline ||
+      token.type === TokenType.EOF
+    ) {
+      continue;
+    }
+    return token;
+  }
+  return undefined;
 }
 
 function isDigit(ch: string): boolean {

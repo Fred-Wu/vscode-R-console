@@ -478,6 +478,13 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         return this.theme.resolveSemanticTokenToAnsi("string", []);
       case "number":
         return this.theme.resolveSemanticTokenToAnsi("number", []);
+      case "function":
+        return (
+          this.theme.resolveSemanticTokenToAnsi("function", []) ||
+          this.theme.resolveSemanticTokenToAnsi("method", []) ||
+          this.theme.resolveSemanticTokenToAnsi("variable", []) ||
+          this.theme.resolveDefaultForegroundAnsi()
+        );
       case "keyword":
         return this.theme.resolveSemanticTokenToAnsi("keyword", []);
       case "operator":
@@ -485,7 +492,6 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       case "identifier":
         return (
           this.theme.resolveSemanticTokenToAnsi("variable", []) ||
-          this.theme.resolveSemanticTokenToAnsi("function", []) ||
           this.theme.resolveDefaultForegroundAnsi()
         );
     }
