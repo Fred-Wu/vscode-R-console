@@ -2,6 +2,16 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::{fs::File, os::fd::FromRawFd};
+#[cfg(windows)]
+use std::{fs::File, os::windows::io::FromRawHandle};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE},
+    System::{
+        Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE},
+        Threading::GetCurrentProcess,
+    },
+};
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
@@ -62,7 +72,12 @@ impl OutputSink {
         Self {
             stdout: Arc::new(Mutex::new(create_protocol_writer())),
             host_name: Arc::new(host_name.to_string()),
-            capabilities: Arc::new(capabilities.iter().map(|value| (*value).to_string()).collect()),
+            capabilities: Arc::new(
+                capabilities
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            ),
         }
     }
 
@@ -77,13 +92,21 @@ impl OutputSink {
     pub(crate) fn emit_backend_ready(&self) -> io::Result<()> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        encode_string_list(self.host_name.as_str(), self.capabilities.as_ref(), &mut payload);
+        encode_string_list(
+            self.host_name.as_str(),
+            self.capabilities.as_ref(),
+            &mut payload,
+        );
         self.emit_frame(FRAME_BACKEND_READY, 0, &payload)
     }
 
     pub(crate) fn emit_host_connected(&self) -> io::Result<()> {
         let mut payload = Vec::new();
-        encode_string_list(self.host_name.as_str(), self.capabilities.as_ref(), &mut payload);
+        encode_string_list(
+            self.host_name.as_str(),
+            self.capabilities.as_ref(),
+            &mut payload,
+        );
         self.emit_frame(FRAME_HOST_CONNECTED, 0, &payload)
     }
 
@@ -176,7 +199,11 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
 
             let stdin_flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFD);
             if stdin_flags >= 0 {
-                let _ = libc::fcntl(libc::STDIN_FILENO, libc::F_SETFD, stdin_flags | libc::FD_CLOEXEC);
+                let _ = libc::fcntl(
+                    libc::STDIN_FILENO,
+                    libc::F_SETFD,
+                    stdin_flags | libc::FD_CLOEXEC,
+                );
             }
 
             if libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) >= 0 {
@@ -192,6 +219,32 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
 
 #[cfg(not(unix))]
 fn create_protocol_writer() -> Box<dyn Write + Send> {
+    #[cfg(windows)]
+    unsafe {
+        let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !stdout_handle.is_null() && stdout_handle != (-1isize) as HANDLE {
+            let mut protocol_handle: HANDLE = std::ptr::null_mut();
+            let process = GetCurrentProcess();
+            if DuplicateHandle(
+                process,
+                stdout_handle,
+                process,
+                &mut protocol_handle,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ) != 0
+            {
+                if !stderr_handle.is_null() && stderr_handle != (-1isize) as HANDLE {
+                    let _ = SetStdHandle(STD_OUTPUT_HANDLE, stderr_handle);
+                    let _ = libc::dup2(2, 1);
+                }
+                return Box::new(File::from_raw_handle(protocol_handle as _));
+            }
+        }
+    }
+
     Box::new(io::stdout())
 }
 
@@ -234,12 +287,10 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
             IncomingCommand::ReplyInput(String::from_utf8_lossy(&payload).into_owned())
         }
         FRAME_DIALOG_RESULT => IncomingCommand::DialogResult(decode_dialog_result(&payload)?),
-        FRAME_PARSE_STATUS_REQUEST => {
-            IncomingCommand::ParseStatus {
-                request_id,
-                code: String::from_utf8_lossy(&payload).into_owned(),
-            }
-        }
+        FRAME_PARSE_STATUS_REQUEST => IncomingCommand::ParseStatus {
+            request_id,
+            code: String::from_utf8_lossy(&payload).into_owned(),
+        },
         FRAME_INTERRUPT => IncomingCommand::Interrupt,
         FRAME_SET_WIDTH => {
             if payload.len() != 4 {
