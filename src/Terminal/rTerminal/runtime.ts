@@ -19,7 +19,6 @@ import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
 import {
   getContinuationPromptLength,
-  getRenderedRowCount,
 } from "../inputViewport";
 import {
   type RTerminalOptions,
@@ -43,16 +42,6 @@ export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "close
 export type Submission = {
   code: string;
   alreadyVisible?: boolean;
-  styledLines?: Promise<string[]>;
-};
-
-export type PendingSubmissionEcho = {
-  code: string;
-  rowCount: number;
-  lineCount: number;
-  plainLines: string[];
-  styledLines?: Promise<string[]>;
-  restyleStarted: boolean;
 };
 
 export type RuntimeHost = {
@@ -75,7 +64,6 @@ export type RuntimeHost = {
   sessionHostConnected: boolean;
   activeSubmission: Submission | null;
   submissionQueue: Submission[];
-  pendingSubmissionEcho: PendingSubmissionEcho | undefined;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
   sessionWatcher: SessionWatcher | undefined;
@@ -396,7 +384,6 @@ export function handleBackendInputRequest(
   prompt: string
 ): void {
   const { prelude, inlinePrompt } = splitReplyPrompt(prompt);
-  host.pendingSubmissionEcho = undefined;
   host.replyPromptText = inlinePrompt;
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
@@ -664,7 +651,6 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
     return;
   }
 
-  host.pendingSubmissionEcho = undefined;
   const shouldRestoreReplyPrompt = host.mode === "reply";
   const shouldRestoreReadyPrompt =
     host.mode === "ready" &&
@@ -695,7 +681,6 @@ export function handleRuntimeError(host: RuntimeHost, error: string): void {
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
   const rawFormatted = stripBracketedPasteMarkers(error.replace(/\r?\n/g, "\r\n"));
-  host.pendingSubmissionEcho = undefined;
   const shouldRestoreReplyPrompt = host.mode === "reply";
   const shouldRestoreReadyPrompt =
     host.mode === "ready" &&
@@ -706,7 +691,8 @@ export function handleRuntimeError(host: RuntimeHost, error: string): void {
     host.clearInputRender();
     host.promptVisible = false;
   }
-  host.writeEmitter.fire(`${ANSI.red}${rawFormatted}${ANSI.reset}`);
+  const errText = `${ANSI.red}${rawFormatted}${ANSI.reset}`;
+  host.writeEmitter.fire(errText);
   host.lastWriteEndedWithNewline =
     rawFormatted.endsWith("\n") || rawFormatted.endsWith("\r\n");
   if (shouldRestoreReplyPrompt) {
@@ -737,9 +723,7 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
 
 export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
   host.mode = "executing";
-  if (task.alreadyVisible) {
-    triggerPendingSubmissionRestyle(host);
-  } else {
+  if (!task.alreadyVisible) {
     writeRuntimeSubmissionEcho(host, task);
   }
   host.clearPromptRenderTimer();
@@ -793,7 +777,6 @@ export async function enqueueRuntimeSubmission(
     host.submissionQueue.push({
       code: block,
       alreadyVisible,
-      styledLines: alreadyVisible ? undefined : host.syntax.prepareSnapshot(block),
     });
   }
 
@@ -807,15 +790,6 @@ export function beginVisibleRuntimeSubmission(
   visibleCode: string
 ): void {
   if (host.promptVisible) {
-    const plainLines = visibleCode.split("\n");
-    host.pendingSubmissionEcho = {
-      code: visibleCode,
-      rowCount: host.renderer.renderedLineCount,
-      lineCount: plainLines.length,
-      plainLines,
-      styledLines: host.syntax.prepareSnapshot(plainLines),
-      restyleStarted: false,
-    };
     const rowsBelowCursor = Math.max(
       0,
       host.renderer.renderedLineCount - 1 - host.renderer.cursorRowFromTop
@@ -897,27 +871,15 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
   host.pendingPromptToken = false;
   const plainLines = task.code.split("\n");
   const immediateLines = host.syntax.snapshotNow(plainLines);
-  const rowCount = writeRuntimeSubmissionLines(host, plainLines, immediateLines);
-  host.pendingSubmissionEcho = task.styledLines
-    ? {
-        code: task.code,
-        rowCount,
-        lineCount: plainLines.length,
-        plainLines,
-        styledLines: task.styledLines,
-        restyleStarted: false,
-      }
-    : undefined;
+  writeRuntimeSubmissionLines(host, plainLines, immediateLines);
   host.promptVisible = false;
-
-  triggerPendingSubmissionRestyle(host);
 }
 
 function writeRuntimeSubmissionLines(
   host: RuntimeHost,
   plainLines: string[],
   styledLines: string[]
-): number {
+): void {
   const continuationPad = 2;
   const continuationPromptLen = getContinuationPromptLength(
     host.renderer.continuationPromptText
@@ -940,89 +902,7 @@ function writeRuntimeSubmissionLines(
   host.lastWriteEndedWithNewline = true;
   host.renderer.renderedLineCount = 1;
   host.renderer.cursorRowFromTop = 0;
-
-  return getRenderedRowCount(
-    plainLines,
-    host.dimensions.columns,
-    host.renderer.promptLen,
-    continuationPromptLen
-  );
 }
-
-function triggerPendingSubmissionRestyle(host: RuntimeHost): void {
-  const pending = host.pendingSubmissionEcho;
-  if (!pending || !pending.styledLines || pending.restyleStarted) {
-    return;
-  }
-
-  pending.restyleStarted = true;
-  void restyleRuntimeSubmissionEcho(host, pending.code);
-}
-
-async function restyleRuntimeSubmissionEcho(
-  host: RuntimeHost,
-  expectedCode: string
-): Promise<void> {
-  const pending = host.pendingSubmissionEcho;
-  if (!pending || !pending.styledLines || pending.code !== expectedCode) {
-    return;
-  }
-
-  const styledLines = await pending.styledLines;
-  const latest = host.pendingSubmissionEcho;
-  if (
-    !styledLines ||
-    !latest ||
-    latest.code !== expectedCode ||
-    latest.lineCount !== pending.lineCount
-  ) {
-    return;
-  }
-
-  const restoreReplyPrompt = host.promptVisible && host.mode === "reply";
-  const restoreMainPrompt =
-    host.promptVisible &&
-    host.mode === "ready" &&
-    host.promptReady &&
-    host.isSessionReadyForPrompt();
-
-  if (host.promptVisible) {
-    host.clearInputRender();
-    host.promptVisible = false;
-  }
-
-  host.writeEmitter.fire("\r");
-  if (latest.rowCount > 0) {
-    host.writeEmitter.fire(`\x1b[${latest.rowCount}A`);
-  }
-
-  for (let row = 0; row < latest.rowCount; row += 1) {
-    host.writeEmitter.fire("\x1b[2K");
-    if (row < latest.rowCount - 1) {
-      host.writeEmitter.fire("\x1b[1B\r");
-    }
-  }
-
-  if (latest.rowCount > 1) {
-    host.writeEmitter.fire(`\x1b[${latest.rowCount - 1}A\r`);
-  } else {
-    host.writeEmitter.fire("\r");
-  }
-
-  writeRuntimeSubmissionLines(host, latest.plainLines, styledLines);
-  host.pendingSubmissionEcho = undefined;
-
-  if (restoreReplyPrompt) {
-    host.scheduleReplyPrompt();
-    return;
-  }
-
-  if (restoreMainPrompt) {
-    host.pendingPromptToken = true;
-    host.schedulePrompt();
-  }
-}
-
 export function interruptRuntime(host: RuntimeHost): void {
   if (!host.rProcess || host.rProcess.killed) {
     return;
@@ -1091,7 +971,6 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
 
   host.submissionQueue = [];
   host.activeSubmission = null;
-  host.pendingSubmissionEcho = undefined;
 
   host.writeEmitter.fire(
     `\r\n${ANSI.yellow}R exited with code ${code}${ANSI.reset}\r\n`

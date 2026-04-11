@@ -28,7 +28,18 @@
       "Read(//c/Users/Fred Wu/.vscode-R//**)",
       "Bash(curl -s https://raw.githubusercontent.com/randy3k/rchitect/master/rchitect/setup.py)",
       "Bash(curl -s https://raw.githubusercontent.com/randy3k/rchitect/master/rchitect/callbacks.py)",
-      "Bash(curl -s https://raw.githubusercontent.com/randy3k/rchitect/master/rchitect/interface.py)"
+      "Bash(curl -s https://raw.githubusercontent.com/randy3k/rchitect/master/rchitect/interface.py)",
+      "Bash(npx tsc:*)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(node_modules/.bin/tsc --version)",
+      "Bash(node ./node_modules/.bin/tsc --noEmit)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(pip show:*)",
+      "Bash(pip3 show:*)",
+      "Bash(/opt/homebrew/Caskroom/miniforge/base/envs/ds-macos/bin/pip show:*)",
+      "Bash(cargo check:*)",
+      "Bash(rustup target:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }

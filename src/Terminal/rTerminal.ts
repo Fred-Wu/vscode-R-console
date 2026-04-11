@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync, ChildProcess } from "child_process";
 import * as path from "path";
 import * as os from "os";
@@ -15,6 +16,7 @@ import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
 import {
   getContinuationPromptLength,
+  getRenderedRowCount,
 } from "./inputViewport";
 import {
   type RTerminalOptions,
@@ -41,7 +43,6 @@ import {
   finishRuntimeSubmission,
   getRuntimeTerminalName,
   interruptRuntime,
-  type PendingSubmissionEcho,
   type RuntimeHost,
   startNextRuntimeSubmission,
   type Submission,
@@ -62,6 +63,36 @@ class TrackingWriteEmitter extends vscode.EventEmitter<string> {
     super.fire(data);
   }
 }
+
+type ReplayTerminal = HeadlessTerminal & {
+  _core: {
+    _writeBuffer: {
+      writeSync(data: string): void;
+    };
+  };
+};
+
+type SerializedReplayRow = {
+  plainText: string;
+  styledText: string;
+  wrapped: boolean;
+};
+
+type SerializedCellStyle = {
+  fgMode: "default" | "palette" | "rgb";
+  fg: number;
+  bgMode: "default" | "palette" | "rgb";
+  bg: number;
+  bold: boolean;
+  italic: boolean;
+  dim: boolean;
+  underline: boolean;
+  blink: boolean;
+  inverse: boolean;
+  invisible: boolean;
+  strikethrough: boolean;
+  overline: boolean;
+};
 
 export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
@@ -107,6 +138,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   private pendingPromptToken = false;
   private lastWriteEndedWithNewline = true;
   private hasReceivedOutput = false;
+  private terminalState: ReplayTerminal;
+  private suppressTerminalStateCapture = false;
+  private static readonly TERMINAL_SCROLLBACK = 5000;
   private pendingInitialPromptGap = false;
   private promptRenderTimer: NodeJS.Timeout | null = null;
   private replyPromptRenderTimer: NodeJS.Timeout | null = null;
@@ -120,7 +154,6 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
-  private pendingSubmissionEcho: PendingSubmissionEcho | undefined;
 
   private inBracketPaste = false;
   private pasteBuffer = "";
@@ -130,6 +163,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private lastSearchTerm = "";
 
   constructor(private options: RTerminalOptions, private extensionPath: string = "") {
+    this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = this.resolveRuntimeBackend();
     this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
@@ -161,7 +195,30 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
-    return new TrackingWriteEmitter(() => {});
+    return new TrackingWriteEmitter((data) => this.captureTerminalWrite(data));
+  }
+
+  private createReplayTerminal(): ReplayTerminal {
+    return new HeadlessTerminal({
+      cols: Math.max(20, this.dimensions.columns || 80),
+      rows: Math.max(5, this.dimensions.rows || 24),
+      scrollback: RTerminal.TERMINAL_SCROLLBACK,
+      allowProposedApi: true,
+    }) as ReplayTerminal;
+  }
+
+  private captureTerminalWrite(data: string): void {
+    if (this.suppressTerminalStateCapture || data.length === 0) {
+      return;
+    }
+    this.terminalState._core._writeBuffer.writeSync(data);
+  }
+
+  private syncReplayTerminalSize(): void {
+    this.terminalState.resize(
+      Math.max(20, this.dimensions.columns || 80),
+      Math.max(5, this.dimensions.rows || 24)
+    );
   }
 
   private loadSettings(): void {
@@ -217,6 +274,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     if (initialDimensions) {
       this.dimensions = initialDimensions;
+      this.syncReplayTerminalSize();
     }
 
     if (this.options.bracketedPaste) {
@@ -228,9 +286,23 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
-    this.pendingPromptToken = true;
-    this.schedulePrompt();
+    this.restoreTerminalState();
+    // Defer the name update: VSCode drops nameEmitter events fired
+    // synchronously during open() because the terminal UI hasn't attached yet.
+    setTimeout(() => {
+      this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
+    }, 0);
+
+    if (this.mode === "reply") {
+      if (!this.promptVisible) {
+        this.scheduleReplyPrompt();
+      }
+      return;
+    }
+
+    if (!this.promptVisible && this.mode === "ready" && this.promptReady && this.pendingPromptToken) {
+      this.schedulePrompt();
+    }
   }
 
   close(): void {
@@ -244,6 +316,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.dimensions = dimensions;
     const changed =
       dimensions.columns !== previous.columns || dimensions.rows !== previous.rows;
+
+    if (changed) {
+      this.syncReplayTerminalSize();
+    }
 
     if (!this.rProcess) {
       return;
@@ -493,6 +569,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       case "ctrl_l":
+        this.terminalState.clear();
         this.writeEmitter.fire("\x1b[2J\x1b[H");
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
@@ -858,6 +935,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     const recalledHistorySubmission = this.historyBrowsing;
     const shouldEchoHistoryBlocks =
       recalledHistorySubmission && /[\r\n]/.test(sanitized);
+    const canReuseVisibleSubmission =
+      !shouldEchoHistoryBlocks && this.isCurrentInputFullyVisible();
+    if (!canReuseVisibleSubmission && this.promptVisible) {
+      // Clear the live input viewport before any async submission work starts.
+      // Otherwise semantic-token callbacks can rerender against the reset input
+      // state and leave stale viewport content behind.
+      this.clearInputRender();
+      this.promptVisible = false;
+      this.lastWriteEndedWithNewline = true;
+    }
     this.inputState.reset();
     this.historyBrowsing = false;
     this.historyCollapsed = true;
@@ -868,13 +955,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (!shouldEchoHistoryBlocks) {
+    if (canReuseVisibleSubmission) {
       this.beginVisibleSubmission(visibleSubmission);
     }
     const blocks = await this.enqueueRSubmission(
       sanitized,
       !/[\r\n]/.test(sanitized),
-      !shouldEchoHistoryBlocks
+      canReuseVisibleSubmission
     );
     this.recordSubmissionHistory(blocks);
   }
@@ -1087,6 +1174,259 @@ export class RTerminal implements vscode.Pseudoterminal {
     configureMainPrompt(this.renderer);
   }
 
+  private restoreTerminalState(): void {
+    const replay = this.buildTerminalReplay();
+    if (replay.lines.length === 0) {
+      return;
+    }
+
+    this.suppressTerminalStateCapture = true;
+    try {
+      replay.lines.forEach((line, index) => {
+        this.writeEmitter.fire(line);
+        if (index < replay.lines.length - 1) {
+          this.writeEmitter.fire("\r\n");
+        }
+      });
+
+      const deltaUp = replay.finalRow - replay.cursorRow;
+      if (deltaUp > 0) {
+        this.writeEmitter.fire(`\x1b[${deltaUp}A`);
+      }
+      this.writeEmitter.fire(`\r\x1b[${replay.cursorCol + 1}G`);
+    } finally {
+      this.suppressTerminalStateCapture = false;
+    }
+  }
+
+  private buildTerminalReplay(): {
+    lines: string[];
+    finalRow: number;
+    cursorRow: number;
+    cursorCol: number;
+  } {
+    const buffer = this.terminalState.buffer.active;
+    const rawRows = Array.from({ length: buffer.length }, (_, index) =>
+      this.serializeReplayRow(buffer.getLine(index))
+    );
+    const cursorAbsoluteRow = buffer.baseY + buffer.cursorY;
+    const firstContentRow = rawRows.findIndex((row) => row.plainText.trimEnd().length > 0);
+    let lastContentRow = -1;
+    for (let index = rawRows.length - 1; index >= 0; index -= 1) {
+      if (rawRows[index]?.plainText.trimEnd().length) {
+        lastContentRow = index;
+        break;
+      }
+    }
+    const rowStart = firstContentRow === -1 ? cursorAbsoluteRow : Math.min(firstContentRow, cursorAbsoluteRow);
+    const rowEnd = Math.max(lastContentRow, cursorAbsoluteRow);
+
+    if (rowEnd < rowStart) {
+      return { lines: [], finalRow: 0, cursorRow: 0, cursorCol: 0 };
+    }
+
+    const rows = rawRows.slice(rowStart, rowEnd + 1);
+    const adjustedCursorRow = cursorAbsoluteRow - rowStart;
+    const lines: Array<{ plainText: string; styledText: string }> = [];
+    const rowOffsets: Array<{ lineIndex: number; offset: number }> = [];
+
+    rows.forEach((row, index) => {
+      if (index === 0 || !row.wrapped || lines.length === 0) {
+        lines.push({
+          plainText: row.plainText,
+          styledText: row.styledText,
+        });
+        rowOffsets[index] = { lineIndex: lines.length - 1, offset: 0 };
+        return;
+      }
+
+      const offset = lines[lines.length - 1]?.plainText.length ?? 0;
+      lines[lines.length - 1] = {
+        plainText: `${lines[lines.length - 1]?.plainText ?? ""}${row.plainText}`,
+        styledText: `${lines[lines.length - 1]?.styledText ?? ""}${row.styledText}`,
+      };
+      rowOffsets[index] = { lineIndex: lines.length - 1, offset };
+    });
+
+    const cursorOffset = rowOffsets[adjustedCursorRow] ?? {
+      lineIndex: Math.max(0, lines.length - 1),
+      offset: 0,
+    };
+    const absoluteCursorCol = cursorOffset.offset + buffer.cursorX;
+    const safeColumns = Math.max(1, this.dimensions.columns || 80);
+    const wrapRows = lines.map((line) => Math.max(1, Math.ceil(line.plainText.length / safeColumns)));
+    const finalRow = wrapRows.reduce((sum, count) => sum + count, 0) - 1;
+    const cursorRow =
+      wrapRows.slice(0, cursorOffset.lineIndex).reduce((sum, count) => sum + count, 0) +
+      Math.floor(absoluteCursorCol / safeColumns);
+
+    return {
+      lines: lines.map((line) => line.styledText),
+      finalRow,
+      cursorRow,
+      cursorCol: absoluteCursorCol % safeColumns,
+    };
+  }
+
+  private serializeReplayRow(line: IBufferLine | undefined): SerializedReplayRow {
+    if (!line) {
+      return {
+        plainText: "",
+        styledText: "",
+        wrapped: false,
+      };
+    }
+
+    let plainText = "";
+    let styledText = "";
+    let activeStyleKey = this.serializeCellStyleKey(this.getDefaultSerializedCellStyle());
+    const defaultStyleKey = activeStyleKey;
+
+    for (let index = 0; index < line.length; index += 1) {
+      const cell = line.getCell(index);
+      if (!cell) {
+        continue;
+      }
+
+      const width = cell.getWidth();
+      if (width === 0) {
+        continue;
+      }
+
+      const chars = cell.getChars();
+      const text = chars.length > 0 ? chars : " ";
+      plainText += text;
+
+      const style = this.serializeCellStyle(cell);
+      const styleKey = this.serializeCellStyleKey(style);
+      if (styleKey !== activeStyleKey) {
+        styledText += this.buildAnsiForSerializedCellStyle(style);
+        activeStyleKey = styleKey;
+      }
+      styledText += text;
+    }
+
+    if (activeStyleKey !== defaultStyleKey) {
+      styledText += ANSI.reset;
+    }
+
+    return {
+      plainText,
+      styledText,
+      wrapped: line.isWrapped,
+    };
+  }
+
+  private serializeCellStyle(cell: IBufferCell): SerializedCellStyle {
+    return {
+      fgMode: cell.isFgRGB() ? "rgb" : cell.isFgPalette() ? "palette" : "default",
+      fg: cell.getFgColor(),
+      bgMode: cell.isBgRGB() ? "rgb" : cell.isBgPalette() ? "palette" : "default",
+      bg: cell.getBgColor(),
+      bold: cell.isBold() !== 0,
+      italic: cell.isItalic() !== 0,
+      dim: cell.isDim() !== 0,
+      underline: cell.isUnderline() !== 0,
+      blink: cell.isBlink() !== 0,
+      inverse: cell.isInverse() !== 0,
+      invisible: cell.isInvisible() !== 0,
+      strikethrough: cell.isStrikethrough() !== 0,
+      overline: cell.isOverline() !== 0,
+    };
+  }
+
+  private getDefaultSerializedCellStyle(): SerializedCellStyle {
+    return {
+      fgMode: "default",
+      fg: -1,
+      bgMode: "default",
+      bg: -1,
+      bold: false,
+      italic: false,
+      dim: false,
+      underline: false,
+      blink: false,
+      inverse: false,
+      invisible: false,
+      strikethrough: false,
+      overline: false,
+    };
+  }
+
+  private serializeCellStyleKey(style: SerializedCellStyle): string {
+    return [
+      style.fgMode,
+      style.fg,
+      style.bgMode,
+      style.bg,
+      Number(style.bold),
+      Number(style.italic),
+      Number(style.dim),
+      Number(style.underline),
+      Number(style.blink),
+      Number(style.inverse),
+      Number(style.invisible),
+      Number(style.strikethrough),
+      Number(style.overline),
+    ].join("|");
+  }
+
+  private buildAnsiForSerializedCellStyle(style: SerializedCellStyle): string {
+    const codes = ["0"];
+
+    if (style.bold) {
+      codes.push("1");
+    }
+    if (style.dim) {
+      codes.push("2");
+    }
+    if (style.italic) {
+      codes.push("3");
+    }
+    if (style.underline) {
+      codes.push("4");
+    }
+    if (style.blink) {
+      codes.push("5");
+    }
+    if (style.inverse) {
+      codes.push("7");
+    }
+    if (style.invisible) {
+      codes.push("8");
+    }
+    if (style.strikethrough) {
+      codes.push("9");
+    }
+    if (style.overline) {
+      codes.push("53");
+    }
+
+    this.appendColorCodes(codes, style.fgMode, style.fg, false);
+    this.appendColorCodes(codes, style.bgMode, style.bg, true);
+
+    return `\x1b[${codes.join(";")}m`;
+  }
+
+  private appendColorCodes(
+    codes: string[],
+    mode: SerializedCellStyle["fgMode"],
+    color: number,
+    background: boolean
+  ): void {
+    const prefix = background ? "48" : "38";
+    if (mode === "palette") {
+      codes.push(prefix, "5", String(Math.max(0, color)));
+      return;
+    }
+    if (mode === "rgb") {
+      const red = (color >> 16) & 0xff;
+      const green = (color >> 8) & 0xff;
+      const blue = color & 0xff;
+      codes.push(prefix, "2", String(red), String(green), String(blue));
+    }
+  }
+
   private showPrompt(): void {
     this.clearPromptRenderTimer();
     if (
@@ -1153,6 +1493,19 @@ export class RTerminal implements vscode.Pseudoterminal {
       historyBrowsing: this.historyBrowsing,
       historyCollapsed: this.historyCollapsed,
     });
+  }
+
+  private isCurrentInputFullyVisible(): boolean {
+    const continuationPromptLen = getContinuationPromptLength(
+      this.renderer.continuationPromptText
+    );
+    const totalRows = getRenderedRowCount(
+      this.inputState.lines,
+      this.dimensions.columns,
+      this.renderer.promptLen,
+      continuationPromptLen
+    );
+    return totalRows <= Math.max(1, this.dimensions.rows - 1);
   }
 
   private beginVisibleSubmission(visibleCode: string): void {
@@ -1291,7 +1644,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
     this.lang.cleanupCompletionDocument();
-    this.pendingSubmissionEcho = undefined;
     this.clearPendingInputFlushTimer();
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
@@ -1327,6 +1679,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.sessionHostConnected = false;
     this.mode = "closed";
     this.replyPromptText = "";
+    this.terminalState.dispose();
   }
 
   reattachToNewTerminal(): void {

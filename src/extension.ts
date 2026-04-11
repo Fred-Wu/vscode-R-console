@@ -56,6 +56,17 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
     return;
   }
 
+  // Reattach the terminal immediately so it remains visible while the user
+  // answers the confirmation dialog. Without this, the tab closes before the
+  // dialog appears because VSCode gives no before-close hook for terminals.
+  const ctx = rTerminalToContext.get(rTerminal);
+  if (ctx) {
+    reattachRunningTerminal(rTerminal, ctx.inSideEditor);
+    // Yield one UI turn so VS Code can attach and reveal the replacement tab
+    // before the modal warning steals focus.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
   const result = await vscode.window.showWarningMessage(
     "Are you sure you want to close the R console?",
     { modal: true },
@@ -65,13 +76,24 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   if (result === "Close") {
     rTerminalToContext.delete(rTerminal);
     rTerminal.forceClose();
+    // Dispose the reattached vscode.Terminal to remove the tab. This fires
+    // onDidCloseTerminal again, but rTerminal is no longer in the map so the
+    // handler returns immediately without recursing.
+    if (ctx) {
+      for (const [terminal, rt] of terminalToRTerminal) {
+        if (rt === rTerminal) {
+          terminalToRTerminal.delete(terminal);
+          terminal.dispose();
+          break;
+        }
+      }
+    }
     return;
   }
 
-  const ctx = rTerminalToContext.get(rTerminal);
-  if (ctx && rTerminal.isRunning()) {
-    reattachRunningTerminal(rTerminal, ctx.inSideEditor);
-  } else {
+  // User cancelled — terminal is already reattached and visible, nothing to do.
+  // If ctx was missing we couldn't reattach, so fall back to force-close.
+  if (!ctx) {
     rTerminalToContext.delete(rTerminal);
     rTerminal.forceClose();
   }
@@ -121,13 +143,14 @@ async function ensureConfiguredRPath(): Promise<void> {
 
 function reattachRunningTerminal(rTerminal: RTerminal, inSideEditor: boolean): void {
   rTerminal.reattachToNewTerminal();
-  attachTerminal(rTerminal, inSideEditor, true);
+  attachTerminal(rTerminal, inSideEditor, true, true);
 }
 
 function attachTerminal(
   rTerminal: RTerminal,
   inSideEditor: boolean,
-  isReattach: boolean = false
+  isReattach: boolean = false,
+  preserveFocusOverride?: boolean
 ): void {
   const terminalOptions: vscode.ExtensionTerminalOptions = {
     name: VSCODE_R_TERMINAL_NAME,
@@ -144,7 +167,9 @@ function attachTerminal(
   terminalToRTerminal.set(terminal, rTerminal);
 
   const alwaysUseActive = vscode.workspace.getConfiguration("r").get<boolean>("alwaysUseActiveTerminal");
-  terminal.show(alwaysUseActive === false);
+  const preserveFocus =
+    preserveFocusOverride ?? alwaysUseActive === false;
+  terminal.show(preserveFocus);
 }
 
 export function deactivate() {

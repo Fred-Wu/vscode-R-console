@@ -76,6 +76,26 @@ export class Renderer {
       return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
+    const previousRows = this.renderedLineCount;
+
+    if (totalRows > previousRows) {
+      // Grow the editable viewport by creating blank rows below the current
+      // render area before redrawing. Without this, multi-line edits at the
+      // bottom of the terminal scroll implicitly, and the scrolled-off rows can
+      // no longer be cleared on the next redraw.
+      this.write("\r");
+      const rowsBelowCursor = Math.max(0, previousRows - 1 - this.cursorRowFromTop);
+      if (rowsBelowCursor > 0) {
+        this.write(`\x1b[${rowsBelowCursor}B`);
+      }
+      const growth = totalRows - previousRows;
+      for (let row = 0; row < growth; row += 1) {
+        this.write("\r\n");
+      }
+      this.renderedLineCount = totalRows;
+      this.cursorRowFromTop = this.renderedLineCount - 1;
+    }
+    const areaRows = this.renderedLineCount;
 
     // Move to start of render area
     // The cursor is currently at row `cursorRowFromTop` within the render area
@@ -86,15 +106,15 @@ export class Renderer {
     }
     // Clear only the previously rendered lines, not beyond
     // Use \x1b[K (clear line) for each line instead of \x1b[J (clear to end of screen)
-    for (let i = 0; i < this.renderedLineCount; i++) {
+    for (let i = 0; i < areaRows; i++) {
       this.write("\x1b[2K"); // Clear entire line
-      if (i < this.renderedLineCount - 1) {
+      if (i < areaRows - 1) {
         this.write("\x1b[1B\r"); // Move down and return to column 0
       }
     }
     // Move back to the top of render area
-    if (this.renderedLineCount > 1) {
-      this.write(`\x1b[${this.renderedLineCount - 1}A\r`);
+    if (areaRows > 1) {
+      this.write(`\x1b[${areaRows - 1}A\r`);
     } else {
       this.write("\r");
     }
@@ -110,8 +130,6 @@ export class Renderer {
               : `${ANSI.reset}${this.continuationPromptColor}${this.continuationPromptText}${ANSI.reset}`);
       this.write(prompt + line);
     });
-
-    this.renderedLineCount = totalRows;
 
     // Calculate cursor position in terminal
     // Sum up wrapped rows for lines before cursor line
