@@ -363,10 +363,13 @@ function restoreReadyStateAfterExecution(host: RuntimeHost): void {
   }
 
   if (host.activeSubmission) {
-    host.finishActiveSubmission();
-  } else {
-    host.mode = "ready";
+    // Top-level submissions are complete when R returns the next prompt, not
+    // when Windows emits an intermediate busy(false) transition during redraws.
+    host.awaitingExecutionStart = false;
+    return;
   }
+
+  host.mode = "ready";
 
   if (!host.promptReady || host.promptVisible || !host.isSessionReadyForPrompt()) {
     return;
@@ -782,10 +785,19 @@ function writeRuntimeText(
     host.promptReady &&
     host.activeSubmission === null &&
     (host.pendingPromptToken || host.promptVisible || host.inputState.text.length > 0);
+  const shouldRearmReadyPrompt =
+    !host.submissionPending &&
+    host.mode === "ready" &&
+    host.promptReady &&
+    host.activeSubmission === null &&
+    (host.promptVisible || host.inputState.text.length > 0);
   host.recordOutputActivity();
   if (host.promptVisible || host.inputState.text.length > 0) {
     host.clearInputRender();
     host.promptVisible = false;
+    if (shouldRearmReadyPrompt) {
+      host.pendingPromptToken = true;
+    }
   }
 
   if (isSimpleCarriageReturnRewrite(text)) {
@@ -795,9 +807,6 @@ function writeRuntimeText(
   }
 
   host.lastWriteEndedWithNewline = endedWithLineFeed;
-  if (!endedWithLineFeed && host.mode !== "reply") {
-    host.pendingPromptToken = false;
-  }
   host.renderer.renderedLineCount = 1;
   host.renderer.cursorRowFromTop = 0;
 
