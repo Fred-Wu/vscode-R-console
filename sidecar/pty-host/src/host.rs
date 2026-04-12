@@ -9,7 +9,8 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
+        OutputStream, PromptKind,
     };
     use libloading::os::unix::{Library, Symbol};
     use std::collections::VecDeque;
@@ -718,9 +719,13 @@ mod unix_host {
                 return;
             }
             if otype == 0 {
-                let _ = runtime.output.emit_output(rendered.as_bytes());
+                let _ = runtime
+                    .output
+                    .emit_output(OutputStream::Stdout, rendered.as_bytes());
             } else {
-                let _ = runtime.output.emit_host_error(&rendered);
+                let _ = runtime
+                    .output
+                    .emit_output(OutputStream::Stderr, rendered.as_bytes());
             }
             let _ = runtime.output.emit_output_flush();
         }
@@ -1316,7 +1321,8 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
+        OutputStream, PromptKind,
     };
     use libloading::os::windows::{
         Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -2083,9 +2089,13 @@ mod windows_host {
                 return;
             }
             if otype == 0 {
-                let _ = runtime.output.emit_output(rendered.as_bytes());
+                let _ = runtime
+                    .output
+                    .emit_output(OutputStream::Stdout, rendered.as_bytes());
             } else {
-                let _ = runtime.output.emit_host_error(&rendered);
+                let _ = runtime
+                    .output
+                    .emit_output(OutputStream::Stderr, rendered.as_bytes());
             }
             let _ = runtime.output.emit_output_flush();
         }

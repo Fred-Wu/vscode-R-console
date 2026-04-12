@@ -109,7 +109,10 @@ export type BackendControlEvent =
 
 type BackendFrameParseResult = {
   events: BackendControlEvent[];
-  output: Buffer[];
+  output: Array<{
+    stream: "stdout" | "stderr";
+    data: Buffer;
+  }>;
   carry: Buffer;
   error?: string;
 };
@@ -303,6 +306,30 @@ function parseControlFrame(
   }
 }
 
+function parseOutputPayload(payload: Buffer): {
+  stream: "stdout" | "stderr";
+  data: Buffer;
+} {
+  if (payload.length === 0) {
+    return {
+      stream: "stdout",
+      data: Buffer.alloc(0),
+    };
+  }
+
+  if (payload[0] === 0 || payload[0] === 1) {
+    return {
+      stream: payload[0] === 1 ? "stderr" : "stdout",
+      data: Buffer.from(payload.subarray(1)),
+    };
+  }
+
+  return {
+    stream: "stdout",
+    data: Buffer.from(payload),
+  };
+}
+
 function createFrame(kind: number, requestId: number, payload: Buffer): Buffer {
   const frame = Buffer.allocUnsafe(FRAME_HEADER_LEN + payload.length);
   frame.writeUInt32LE(payload.length, 0);
@@ -320,7 +347,10 @@ export function parseBackendFrames(
   const combined =
     carry.length === 0 ? chunk : Buffer.concat([carry, chunk], carry.length + chunk.length);
   const events: BackendControlEvent[] = [];
-  const output: Buffer[] = [];
+  const output: Array<{
+    stream: "stdout" | "stderr";
+    data: Buffer;
+  }> = [];
   let cursor = 0;
 
   while (cursor + FRAME_HEADER_LEN <= combined.length) {
@@ -336,7 +366,7 @@ export function parseBackendFrames(
 
     try {
       if (kind === FrameKind.Output) {
-        output.push(Buffer.from(payload));
+        output.push(parseOutputPayload(payload));
       } else {
         const event = parseControlFrame(kind, requestId, payload);
         if (event) {

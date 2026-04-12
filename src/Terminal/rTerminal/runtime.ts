@@ -32,6 +32,14 @@ import {
 
 const VSCODE_R_TERMINAL_NAME = "R Console";
 
+type PendingRuntimeRewrite = {
+  bareCarriageReturn: boolean;
+  clearFrame: {
+    text: string;
+    endedWithLineFeed: boolean;
+  } | null;
+};
+
 type Dimensions = {
   columns: number;
   rows: number;
@@ -43,6 +51,8 @@ export type Submission = {
   code: string;
   alreadyVisible?: boolean;
 };
+
+const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
 
 export type RuntimeHost = {
   options: RTerminalOptions;
@@ -58,6 +68,8 @@ export type RuntimeHost = {
   replyPromptText: string;
   pendingPromptToken: boolean;
   pendingInitialPromptGap: boolean;
+  submissionPending: boolean;
+  awaitingExecutionStart: boolean;
   lastWriteEndedWithNewline: boolean;
   hasReceivedOutput: boolean;
   sessionAttached: boolean;
@@ -121,6 +133,7 @@ function getConsoleProfilePath(extensionPath: string): string {
 }
 
 export function startRuntime(host: RuntimeHost): void {
+  pendingRuntimeRewrites.delete(host);
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.lang.stopConsoleLsp();
@@ -132,6 +145,8 @@ export function startRuntime(host: RuntimeHost): void {
   host.promptVisible = false;
   host.replyPromptText = "";
   host.pendingInitialPromptGap = true;
+  host.submissionPending = false;
+  host.awaitingExecutionStart = false;
   host.lastWriteEndedWithNewline = true;
   host.hasReceivedOutput = false;
   host.inputState.reset();
@@ -248,6 +263,9 @@ function onRuntimeAttached(host: RuntimeHost): void {
 }
 
 export function handleRuntimeOutput(host: RuntimeHost, output: string): void {
+  if (host.awaitingExecutionStart && host.activeSubmission) {
+    host.awaitingExecutionStart = false;
+  }
   host.hasReceivedOutput = true;
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
@@ -258,6 +276,10 @@ export function handleRuntimeControl(
   host: RuntimeHost,
   event: BackendControlEvent
 ): void {
+  if (event.type !== "output-flush") {
+    flushPendingRuntimeRewrite(host);
+  }
+
   switch (event.type) {
     case "backend-ready":
       return;
@@ -282,6 +304,9 @@ export function handleRuntimeControl(
       return;
     case "busy":
       if (event.value) {
+        if (host.awaitingExecutionStart && host.activeSubmission) {
+          host.awaitingExecutionStart = false;
+        }
         if (host.mode !== "reply" && (host.activeSubmission !== null || host.mode === "starting")) {
           host.mode = "executing";
         }
@@ -310,6 +335,7 @@ export function handleRuntimeControl(
       if (host.mode === "reply" && !host.promptVisible) {
         host.scheduleReplyPrompt();
       } else if (
+        !host.submissionPending &&
         host.mode === "ready" &&
         host.promptReady &&
         host.pendingPromptToken &&
@@ -332,6 +358,10 @@ export function handleRuntimeControl(
 }
 
 function restoreReadyStateAfterExecution(host: RuntimeHost): void {
+  if (host.submissionPending) {
+    return;
+  }
+
   if (host.activeSubmission) {
     host.finishActiveSubmission();
   } else {
@@ -350,6 +380,14 @@ export function handleBackendPrompt(
   host: RuntimeHost,
   kind: "main" | "cont"
 ): void {
+  if (host.awaitingExecutionStart && host.activeSubmission) {
+    host.promptReady = true;
+    host.promptKind = kind;
+    host.replyPromptText = "";
+    host.pendingPromptToken = false;
+    return;
+  }
+
   host.promptReady = true;
   host.promptKind = kind;
   host.replyPromptText = "";
@@ -372,6 +410,14 @@ export function handleBackendPrompt(
     }
   } else {
     host.mode = "ready";
+  }
+
+  if (host.submissionPending) {
+    host.pendingPromptToken = false;
+    if (kind === "main" && host.mode === "ready" && host.activeSubmission === null) {
+      host.startNextSubmission();
+    }
+    return;
   }
 
   host.pendingPromptToken = true;
@@ -653,20 +699,105 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
     return;
   }
 
+  const formatted = formatViewOutput(text);
+  renderRuntimeText(host, formatted, didOutputEndWithLineFeed(formatted));
+}
+
+export function handleRuntimeError(host: RuntimeHost, error: string): void {
+  host.hasReceivedOutput = true;
+  host.clearPromptRenderTimer();
+  host.clearReplyPromptRenderTimer();
+  const formatted = formatViewOutput(stripBracketedPasteMarkers(error));
+  renderRuntimeText(
+    host,
+    `${ANSI.red}${formatted}${ANSI.reset}`,
+    didOutputEndWithLineFeed(formatted)
+  );
+}
+
+function renderRuntimeText(
+  host: RuntimeHost,
+  text: string,
+  endedWithLineFeed: boolean
+): void {
+  if (!text) {
+    return;
+  }
+
+  const pending = getPendingRuntimeRewrite(host);
+  if (pending.clearFrame) {
+    if (shouldReplacePendingClearFrame(text)) {
+      pending.clearFrame = null;
+    } else {
+      const pendingClearFrame = pending.clearFrame;
+      pending.clearFrame = null;
+      writeRuntimeText(
+        host,
+        pendingClearFrame.text,
+        pendingClearFrame.endedWithLineFeed
+      );
+    }
+  }
+
+  if (pending.bareCarriageReturn) {
+    pending.bareCarriageReturn = false;
+    if (text === "\r") {
+      pending.bareCarriageReturn = true;
+      return;
+    }
+    if (shouldPrefixPendingCarriageReturn(text)) {
+      text = `\r${text}`;
+      endedWithLineFeed = didOutputEndWithLineFeed(text);
+    } else if (!text.startsWith("\r")) {
+      writeRuntimeText(host, "\r", false);
+    }
+  }
+
+  if (text === "\r") {
+    pending.bareCarriageReturn = true;
+    return;
+  }
+
+  if (shouldDeferClearFrame(text)) {
+    pending.clearFrame = {
+      text,
+      endedWithLineFeed,
+    };
+    return;
+  }
+
+  writeRuntimeText(host, text, endedWithLineFeed);
+}
+
+function writeRuntimeText(
+  host: RuntimeHost,
+  text: string,
+  endedWithLineFeed: boolean
+): void {
   const shouldRestoreReplyPrompt = host.mode === "reply";
   const shouldRestoreReadyPrompt =
+    endedWithLineFeed &&
+    !host.submissionPending &&
     host.mode === "ready" &&
     host.promptReady &&
+    host.activeSubmission === null &&
     (host.pendingPromptToken || host.promptVisible || host.inputState.text.length > 0);
-  const formatted = formatViewOutput(text);
   host.recordOutputActivity();
   if (host.promptVisible || host.inputState.text.length > 0) {
     host.clearInputRender();
     host.promptVisible = false;
   }
 
-  host.writeEmitter.fire(formatted);
-  host.lastWriteEndedWithNewline = /(\n|\r)$/.test(formatted);
+  if (isSimpleCarriageReturnRewrite(text)) {
+    host.writeEmitter.fire(rewriteSimpleCarriageReturnOutput(text));
+  } else {
+    host.writeEmitter.fire(text);
+  }
+
+  host.lastWriteEndedWithNewline = endedWithLineFeed;
+  if (!endedWithLineFeed && host.mode !== "reply") {
+    host.pendingPromptToken = false;
+  }
   host.renderer.renderedLineCount = 1;
   host.renderer.cursorRowFromTop = 0;
 
@@ -678,30 +809,57 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
   }
 }
 
-export function handleRuntimeError(host: RuntimeHost, error: string): void {
-  host.hasReceivedOutput = true;
-  host.clearPromptRenderTimer();
-  host.clearReplyPromptRenderTimer();
-  const rawFormatted = stripBracketedPasteMarkers(error.replace(/\r?\n/g, "\r\n"));
-  const shouldRestoreReplyPrompt = host.mode === "reply";
-  const shouldRestoreReadyPrompt =
-    host.mode === "ready" &&
-    host.promptReady &&
-    (host.pendingPromptToken || host.promptVisible || host.inputState.text.length > 0);
-  host.recordOutputActivity();
-  if (host.promptVisible || host.inputState.text.length > 0) {
-    host.clearInputRender();
-    host.promptVisible = false;
+function shouldPrefixPendingCarriageReturn(text: string): boolean {
+  return !text.startsWith("\r") && !text.includes("\n");
+}
+
+function shouldDeferClearFrame(text: string): boolean {
+  return /^\r\s*\| +$/.test(text);
+}
+
+function shouldReplacePendingClearFrame(text: string): boolean {
+  return text.startsWith("\r") && !text.includes("\n");
+}
+
+function isSimpleCarriageReturnRewrite(text: string): boolean {
+  return text.startsWith("\r") && !text.includes("\n") && !text.includes("\b") && !/\x1b\[/.test(text);
+}
+
+function rewriteSimpleCarriageReturnOutput(text: string): string {
+  return `\x1b[2K\x1b[1G${text.slice(1)}`;
+}
+
+function didOutputEndWithLineFeed(text: string): boolean {
+  return text.endsWith("\r\n");
+}
+
+function getPendingRuntimeRewrite(host: RuntimeHost): PendingRuntimeRewrite {
+  let pending = pendingRuntimeRewrites.get(host);
+  if (!pending) {
+    pending = {
+      bareCarriageReturn: false,
+      clearFrame: null,
+    };
+    pendingRuntimeRewrites.set(host, pending);
   }
-  const errText = `${ANSI.red}${rawFormatted}${ANSI.reset}`;
-  host.writeEmitter.fire(errText);
-  host.lastWriteEndedWithNewline =
-    rawFormatted.endsWith("\n") || rawFormatted.endsWith("\r\n");
-  if (shouldRestoreReplyPrompt) {
-    host.scheduleReplyPrompt();
-  } else if (shouldRestoreReadyPrompt) {
-    host.pendingPromptToken = true;
-    host.schedulePrompt();
+  return pending;
+}
+
+function flushPendingRuntimeRewrite(host: RuntimeHost): void {
+  const pending = pendingRuntimeRewrites.get(host);
+  if (!pending) {
+    return;
+  }
+
+  if (pending.clearFrame) {
+    const clearFrame = pending.clearFrame;
+    pending.clearFrame = null;
+    writeRuntimeText(host, clearFrame.text, clearFrame.endedWithLineFeed);
+  }
+
+  if (pending.bareCarriageReturn) {
+    pending.bareCarriageReturn = false;
+    writeRuntimeText(host, "\r", false);
   }
 }
 
@@ -716,6 +874,7 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
   }
   host.inputState.reset();
   host.mode = host.activeSubmission ? "executing" : "ready";
+  host.awaitingExecutionStart = false;
   host.replyPromptText = "";
   host.runtimeBackend?.sendSessionCommand(host.rProcess, {
     type: "reply-input",
@@ -724,6 +883,9 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
 }
 
 export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
+  host.submissionPending = false;
+  host.pendingPromptToken = false;
+  host.awaitingExecutionStart = true;
   host.mode = "executing";
   if (!task.alreadyVisible) {
     writeRuntimeSubmissionEcho(host, task);
@@ -737,6 +899,7 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
 
 export function finishRuntimeSubmission(host: RuntimeHost): void {
   host.activeSubmission = null;
+  host.awaitingExecutionStart = false;
   host.mode = "ready";
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
 }
@@ -767,6 +930,8 @@ export async function enqueueRuntimeSubmission(
     : await splitSubmissionBlocks(host, code);
 
   if (blocks.length === 0) {
+    host.submissionPending = false;
+    host.awaitingExecutionStart = false;
     if (alreadyVisible && host.activeSubmission === null) {
       host.mode = "ready";
       host.pendingPromptToken = true;
@@ -791,6 +956,10 @@ export function beginVisibleRuntimeSubmission(
   host: RuntimeHost,
   visibleCode: string
 ): void {
+  host.clearPromptRenderTimer();
+  host.pendingPromptToken = false;
+  host.submissionPending = true;
+  host.awaitingExecutionStart = false;
   if (host.promptVisible) {
     const rowsBelowCursor = Math.max(
       0,
@@ -956,6 +1125,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
+  flushPendingRuntimeRewrite(host);
   setNativeParseCallback(null);
 
   host.lang.cleanupCompletionDocument();
@@ -970,6 +1140,8 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.promptVisible = false;
   host.replyPromptText = "";
   host.sessionAttached = false;
+  host.awaitingExecutionStart = false;
+  host.submissionPending = false;
 
   host.submissionQueue = [];
   host.activeSubmission = null;

@@ -107,8 +107,15 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       }
 
       for (const outputChunk of parsed.output) {
-        if (outputChunk.length > 0) {
-          handlers.onStdout?.(outputChunk.toString("utf8"));
+        if (outputChunk.data.length === 0) {
+          continue;
+        }
+
+        const text = outputChunk.data.toString("utf8");
+        if (outputChunk.stream === "stderr") {
+          handlers.onStderr?.(text);
+        } else {
+          handlers.onStdout?.(text);
         }
       }
 

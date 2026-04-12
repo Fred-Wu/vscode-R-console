@@ -108,7 +108,27 @@ export function renderInput({
 }
 
 export function formatTerminalOutput(text: string): string {
-  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
+  let formatted = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\r") {
+      if (text[index + 1] === "\n") {
+        formatted += "\r\n";
+        index += 1;
+      } else {
+        formatted += "\r";
+      }
+      continue;
+    }
+
+    if (char === "\n") {
+      formatted += "\r\n";
+      continue;
+    }
+
+    formatted += char;
+  }
+  return formatted;
 }
 
 export function getPromptRenderDelay(

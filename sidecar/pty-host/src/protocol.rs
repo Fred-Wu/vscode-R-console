@@ -61,6 +61,12 @@ pub(crate) enum IncomingCommand {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
 pub(crate) struct OutputSink {
     stdout: Arc<Mutex<Box<dyn Write + Send>>>,
     host_name: Arc<String>,
@@ -152,8 +158,14 @@ impl OutputSink {
         self.emit_frame(FRAME_DIALOG_REQUEST, 0, &payload)
     }
 
-    pub(crate) fn emit_output(&self, payload: &[u8]) -> io::Result<()> {
-        self.emit_frame(FRAME_OUTPUT, 0, payload)
+    pub(crate) fn emit_output(&self, stream: OutputStream, payload: &[u8]) -> io::Result<()> {
+        let mut framed = Vec::with_capacity(payload.len() + 1);
+        framed.push(match stream {
+            OutputStream::Stdout => 0,
+            OutputStream::Stderr => 1,
+        });
+        framed.extend_from_slice(payload);
+        self.emit_frame(FRAME_OUTPUT, 0, &framed)
     }
 
     pub(crate) fn emit_output_flush(&self) -> io::Result<()> {
