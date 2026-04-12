@@ -14,15 +14,13 @@ R Console is a VS Code extension that runs R inside a custom pseudoterminal. It 
 
 4. Rust sidecar
 - `sidecar/pty-host/` builds one binary:
-- `R_CONSOLE_HOST` is the embedded host. It does not spawn a second internal session-host process.
-- It loads the R shared library dynamically, wires console callbacks, and emits prompt, busy, input-request, dialog, and parse-status events back to the extension over the backend protocol.
-- On Unix it uses the `ptr_R_*` callback globals and the native event-pump APIs.
-- On Windows it uses `Rstart` / `R_SetParams`, support-DLL preloading, `getRUser`, `GA_initapp`, `GA_peekevent`, and `R_ProcessEvents` while preserving the same extension-facing protocol.
+- `R_CONSOLE_HOST` is the embedded host. It does not spawn a second internal session-host process. It loads the R shared library dynamically, wires console callbacks, and emits prompt, busy, input-request, dialog, and parse-status events back to the extension over the backend protocol.
+
 
 ### Dependency Model
 
-- `vscode-R` is a hard dependency. R Console uses the same configured R binary and the same session bootstrap model as the Unix implementation.
-- `languageserver` is optional but required for console semantic tokens, completion, and signature help.
+- `vscode-R` is a hard dependency. R Console uses the same configured R binary.
+- R's `languageserver` package is optional but required for console semantic tokens, completion, and signature help.
 - The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
 
 ## Features
@@ -32,10 +30,9 @@ R Console is a VS Code extension that runs R inside a custom pseudoterminal. It 
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
 - Parser-backed completeness checks before submission.
-- Immediate local syntax highlighting plus semantic-token styling through `languageserver`.
-- Immediate function-call highlighting for obvious call sites such as `plot(...)`, without waiting for semantic-token round trips.
-- Console-scoped completion and signature help through `languageserver`.
+- Console-scoped completion and signature help through R's `languageserver` package.
 - Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
+- Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
 - Screen, scrollback, cursor, and ANSI style restoration when the terminal UI is recreated after a cancelled close or a reattach.
 - Close confirmation that immediately reattaches the running console before showing the modal prompt, which keeps the console visible despite the VS Code terminal API lacking a before-close hook.
 - Embedded console backend for macOS, Linux, and Windows.
@@ -45,9 +42,33 @@ R Console is a VS Code extension that runs R inside a custom pseudoterminal. It 
 - VS Code 1.85.0 or later.
 - Node.js 24.x for the extension build and packaging scripts.
 - R 4.5.x installed and configured through vscode-R settings. The current runtime rejects other R major/minor versions.
-- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension depends on vscode-R session bootstrap and configuration; there is no standalone startup path.
+- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension declares `REditorSupport.r` in `extensionDependencies` and depends on vscode-R session bootstrap/configuration; there is no standalone startup path.
 - The R package `languageserver` if you want completion, signature help, and semantic highlighting.
 - Rust/Cargo only if you are building the sidecar binaries from source.
+
+## Using R Console
+
+Launch `R Console` from the Command Palette with:
+
+- `R: Create R Console`
+- `R: Create R Console in Side Editor`
+
+The minimum vscode-R setup for those commands to work is:
+
+1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
+2. Set the platform-specific vscode-R `r.rpath.*` setting to the R binary path used by `R Console`:
+   - Windows: `r.rpath.windows` -> path to `R.exe`
+   - macOS: `r.rpath.mac` -> path to `R`
+   - Linux: `r.rpath.linux` -> path to `R`
+   
+   `r.rterm.*` is not required to create `R Console`
+3. Set `r.alwaysUseActiveTerminal` to be `true` to make vscode-R commands to target `R Console`
+4. Keep `r.rterm.option` compatible with embedded startup. `R Console` strips some wrapper-only flags, but startup still requires the vscode-R bootstrap path and will reject options such as `--vanilla` and `--no-init-file`.
+
+Useful optional settings:
+
+- `r.sessionWatcher = true` keeps the vscode-R watcher bridge enabled for workspace/global-environment updates and member completion.
+- `r.bracketedPaste = true` enables bracketed paste mode in the console.
 
 ## Build
 
@@ -82,15 +103,17 @@ R Console reads several settings from vscode-R:
 
 | Setting | Purpose |
 | --- | --- |
-| `r.rterm.windows` | R executable path on Windows |
-| `r.rterm.mac` | R executable path on macOS |
-| `r.rterm.linux` | R executable path on Linux |
+| `r.rpath.windows` | R executable path on Windows for R Console startup |
+| `r.rpath.mac` | R executable path on macOS for R Console startup |
+| `r.rpath.linux` | R executable path on Linux for R Console startup |
 | `r.rterm.option` | Extra arguments passed to R |
 | `r.sessionWatcher` | Enables the vscode-R session watcher bridge |
 | `r.bracketedPaste` | Enables bracketed paste mode |
 | `r.lsp.args` | Extra arguments passed when starting `languageserver` |
 | `r.lsp.use_stdio` | Uses stdio instead of a loopback socket for the console LSP client when supported |
 | `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused |
+
+`R Console` does not launch from `r.rterm.windows`, `r.rterm.mac`, or `r.rterm.linux`.
 
 R Console also contributes its own settings:
 
@@ -106,18 +129,13 @@ R Console also contributes its own settings:
 - `src/Runtime/` contains the backend control protocol, bundled Rust binary resolution, and the session watcher integration.
 - `sidecar/pty-host/` contains the Rust embedded host and protocol framing code.
 
-## Credits
+## Acknowledgements
 
-R Console is built on the broader VS Code, Rust, and R tooling ecosystems, and on the work of several open-source projects that shaped the extension. In particular, the following projects informed the current design and implementation:
+R Console is built on the broader VS Code, Rust, and R ecosystems, and on the work of open-source projects that informed the extension. In particular, we would like to highlight the following projects:
 
-- [vscode-R](https://github.com/REditorSupport/vscode-R) provides the settings surface this extension reads, the session bootstrap scripts (`R/session/profile.R` and `R/session/init.R`) that the console integrates with, and the watcher/request model that informed `SessionWatcher`.
-- [arf](https://github.com/eitsupi/arf) is the closest reference for the current Rust-side console host implementation. The `sidecar/pty-host/src/host.rs` code follows the same Rust `libloading` approach to loading `libR`, platform-specific callback wiring, Windows support-DLL preloading (`Rblas.dll`, `Riconv.dll`, `Rlapack.dll`, `Rgraphapp.dll`), `R_SetParams` / `getRUser` / `GA_initapp` setup on Windows, and Unix callback/event integration.
-- [rchitect](https://github.com/randy3k/rchitect) informed the embedded-R callback model behind the current Rust host: the `Rstart` / `ptr_R_*` callback surface, `R_ToplevelExec`-guarded parse/eval flow, and the Unix event-pump pattern around `R_PolledEvents`, `R_checkActivity`, and `R_runHandlers`.
-- Multiline editing, console history storage, and several input heuristics were shaped by prior terminal-first R console patterns, but the implementation here is self-contained within this extension.
-- [`@xterm/headless`](https://www.npmjs.com/package/@xterm/headless) maintains the off-screen terminal buffer that lets the extension replay a styled screen when the UI is reattached.
-- [`vscode-languageclient`](https://www.npmjs.com/package/vscode-languageclient) powers the console-scoped LSP client used with the R `languageserver` package.
-- [`libloading`](https://crates.io/crates/libloading) makes it possible for `R_CONSOLE_HOST` to dynamically load the R shared library and bind the embedded-console callbacks.
-- Built on the [VS Code Extension API](https://code.visualstudio.com/api).
+- [vscode-R](https://github.com/REditorSupport/vscode-R) - R Console depends on vscode-R for configuration, session bootstrap, session watching, and the surrounding VS Code R workflow.
+- [arf](https://github.com/eitsupi/arf) - The current embedded-R host design was heavily informed by arf's Rust-based approach to loading and embedding R, platform-specific console initialization, callback wiring, and backend architecture.
+- [radian](https://github.com/randy3k/radian) - The terminal-first interaction model and several console UX ideas, including multiline editing, history search/navigation, bracketed paste, and prompt-centric workflows, were inspired by radian.
 
 ## Development Note
 
