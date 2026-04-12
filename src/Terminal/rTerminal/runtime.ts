@@ -87,6 +87,7 @@ export type RuntimeHost = {
   startNextSubmission(): void;
   finishActiveSubmission(): void;
   getDisplayPid(): number | undefined;
+  notifyDisplayPidChanged(): void;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
 };
 
@@ -99,9 +100,10 @@ export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">)
 }
 
 export function updateRuntimeTerminalName(
-  host: Pick<RuntimeHost, "getDisplayPid" | "nameEmitter">
+  host: Pick<RuntimeHost, "getDisplayPid" | "nameEmitter" | "notifyDisplayPidChanged">
 ): void {
   host.nameEmitter.fire(getRuntimeTerminalName(host));
+  host.notifyDisplayPidChanged();
 }
 
 export function createRuntimeBackend(

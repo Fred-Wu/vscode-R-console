@@ -98,6 +98,8 @@ export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
+  private pidEmitter = new vscode.EventEmitter<number | undefined>();
+  private lastKnownPid: number | undefined;
 
   get onDidWrite(): vscode.Event<string> {
     return this.writeEmitter.event;
@@ -107,6 +109,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
   get onDidChangeName(): vscode.Event<string> {
     return this.nameEmitter.event;
+  }
+  get onDidChangePid(): vscode.Event<number | undefined> {
+    return this.pidEmitter.event;
   }
 
   private rProcess: ChildProcess | null = null;
@@ -291,6 +296,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     // synchronously during open() because the terminal UI hasn't attached yet.
     setTimeout(() => {
       this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
+      this.notifyDisplayPidChanged();
     }, 0);
 
     if (this.mode === "reply") {
@@ -1679,6 +1685,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.sessionHostConnected = false;
     this.mode = "closed";
     this.replyPromptText = "";
+    this.notifyDisplayPidChanged();
     this.terminalState.dispose();
   }
 
@@ -1714,10 +1721,20 @@ export class RTerminal implements vscode.Pseudoterminal {
     return this.rProcess?.pid;
   }
 
+  notifyDisplayPidChanged(): void {
+    const nextPid = this.getDisplayPid();
+    if (nextPid === this.lastKnownPid) {
+      return;
+    }
+    this.lastKnownPid = nextPid;
+    this.pidEmitter.fire(nextPid);
+  }
+
   dispose(): void {
     this.forceClose();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
+    this.pidEmitter.dispose();
   }
 }

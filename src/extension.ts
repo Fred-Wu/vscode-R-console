@@ -8,8 +8,21 @@ import {
   getPlatformRPathConfigEntry,
 } from "./Terminal/options";
 
-const terminalToRTerminal: Map<vscode.Terminal, RTerminal> = new Map();
-const rTerminalToContext: Map<RTerminal, { inSideEditor: boolean }> = new Map();
+type TerminalContext =
+  | { kind: "panel" }
+  | { kind: "editor"; viewColumn: vscode.ViewColumn };
+
+type ConsoleRecord = {
+  rTerminal: RTerminal;
+  location: TerminalContext;
+  pid?: number;
+  pidSubscription: vscode.Disposable;
+};
+
+const terminalToRecord: Map<vscode.Terminal, ConsoleRecord> = new Map();
+const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
+const pidToRecord: Map<number, ConsoleRecord> = new Map();
+const editorCloseInProgress: Set<number> = new Set();
 const VSCODE_R_TERMINAL_NAME = "R Console";
 
 function isVirtualWorkspace(): boolean {
@@ -18,8 +31,8 @@ function isVirtualWorkspace(): boolean {
 }
 
 function refreshTerminalAppearance(): void {
-  for (const rTerminal of terminalToRTerminal.values()) {
-    rTerminal.refreshAppearance();
+  for (const record of new Set(rTerminalToRecord.values())) {
+    record.rTerminal.refreshAppearance();
   }
 }
 
@@ -31,7 +44,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("r-console.createTerminalSide", () => {
       createRTerminal(context, true);
     }),
+    vscode.window.onDidOpenTerminal(handleTerminalOpen),
+    vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
     vscode.window.onDidCloseTerminal(handleTerminalClose),
+    vscode.window.tabGroups.onDidChangeTabs(handleTerminalTabChange),
     vscode.window.onDidChangeActiveColorTheme(() => {
       refreshTerminalAppearance();
     }),
@@ -42,64 +58,27 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  syncTerminalRecordsFromWindow();
   void ensureConfiguredRPath();
 }
 
 async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<void> {
-  const rTerminal = terminalToRTerminal.get(closedTerminal);
-  if (!rTerminal) return;
+  const record = resolveRecordFromTerminal(closedTerminal);
+  if (!record) return;
 
-  terminalToRTerminal.delete(closedTerminal);
+  terminalToRecord.delete(closedTerminal);
 
-  if (!rTerminal.isRunning()) {
-    rTerminalToContext.delete(rTerminal);
+  if (record.location.kind === "editor") {
     return;
   }
 
-  // Reattach the terminal immediately so it remains visible while the user
-  // answers the confirmation dialog. Without this, the tab closes before the
-  // dialog appears because VSCode gives no before-close hook for terminals.
-  const ctx = rTerminalToContext.get(rTerminal);
-  if (ctx) {
-    reattachRunningTerminal(rTerminal, ctx.inSideEditor);
-    // Yield one UI turn so VS Code can attach and reveal the replacement tab
-    // before the modal warning steals focus.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-
-  const result = await vscode.window.showWarningMessage(
-    "Are you sure you want to close the R console?",
-    { modal: true },
-    "Close"
-  );
-
-  if (result === "Close") {
-    rTerminalToContext.delete(rTerminal);
-    rTerminal.forceClose();
-    // Dispose the reattached vscode.Terminal to remove the tab. This fires
-    // onDidCloseTerminal again, but rTerminal is no longer in the map so the
-    // handler returns immediately without recursing.
-    if (ctx) {
-      for (const [terminal, rt] of terminalToRTerminal) {
-        if (rt === rTerminal) {
-          terminalToRTerminal.delete(terminal);
-          terminal.dispose();
-          break;
-        }
-      }
-    }
-    return;
-  }
-
-  // User cancelled — terminal is already reattached and visible, nothing to do.
-  // If ctx was missing we couldn't reattach, so fall back to force-close.
-  if (!ctx) {
-    rTerminalToContext.delete(rTerminal);
-    rTerminal.forceClose();
-  }
+  await handleRunningConsoleClose(record);
 }
 
-function createRTerminal(context: vscode.ExtensionContext, inSideEditor: boolean = false): void {
+function createRTerminal(
+  context: vscode.ExtensionContext,
+  inSideEditor: boolean = false
+): void {
   if (!vscode.workspace.isTrusted) {
     void vscode.window.showErrorMessage(
       "R Console requires a trusted workspace because it launches local R executables."
@@ -120,9 +99,14 @@ function createRTerminal(context: vscode.ExtensionContext, inSideEditor: boolean
   }
 
   const rTerminal = new RTerminal(options, context.extensionPath);
-  rTerminalToContext.set(rTerminal, { inSideEditor });
-  
-  attachTerminal(rTerminal, inSideEditor);
+  const record = createConsoleRecord(
+    rTerminal,
+    inSideEditor
+      ? { kind: "editor", viewColumn: vscode.ViewColumn.Beside }
+      : { kind: "panel" }
+  );
+
+  attachTerminal(record);
 }
 
 async function ensureConfiguredRPath(): Promise<void> {
@@ -141,41 +125,334 @@ async function ensureConfiguredRPath(): Promise<void> {
   await config.update(configEntry, discovered, vscode.ConfigurationTarget.Global);
 }
 
-function reattachRunningTerminal(rTerminal: RTerminal, inSideEditor: boolean): void {
-  rTerminal.reattachToNewTerminal();
-  attachTerminal(rTerminal, inSideEditor, true, true);
+function createConsoleRecord(
+  rTerminal: RTerminal,
+  location: TerminalContext
+): ConsoleRecord {
+  const record: ConsoleRecord = {
+    rTerminal,
+    location,
+    pidSubscription: new vscode.Disposable(() => {}),
+  };
+
+  record.pidSubscription = rTerminal.onDidChangePid((pid) => {
+    updateConsoleRecordPid(record, pid);
+  });
+
+  rTerminalToRecord.set(rTerminal, record);
+  updateConsoleRecordPid(record, rTerminal.getPid());
+  return record;
+}
+
+function updateConsoleRecordPid(
+  record: ConsoleRecord,
+  pid: number | undefined
+): void {
+  if (record.pid === pid) {
+    return;
+  }
+
+  if (typeof record.pid === "number") {
+    pidToRecord.delete(record.pid);
+  }
+
+  record.pid = pid;
+
+  if (typeof pid === "number" && Number.isFinite(pid) && pid > 0) {
+    pidToRecord.set(pid, record);
+    syncTerminalRecordForPid(pid);
+    syncConsoleRecordLocationFromTabs(record);
+  }
+}
+
+function disposeConsoleRecord(record: ConsoleRecord): void {
+  if (typeof record.pid === "number") {
+    pidToRecord.delete(record.pid);
+  }
+  record.pid = undefined;
+  record.pidSubscription.dispose();
+  rTerminalToRecord.delete(record.rTerminal);
+
+  for (const [terminal, mappedRecord] of terminalToRecord) {
+    if (mappedRecord === record) {
+      terminalToRecord.delete(terminal);
+    }
+  }
+}
+
+function reattachRunningTerminal(record: ConsoleRecord): vscode.Terminal {
+  record.rTerminal.reattachToNewTerminal();
+  return attachTerminal(record, true);
+}
+
+async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
+  if (!record.rTerminal.isRunning()) {
+    disposeConsoleRecord(record);
+    return;
+  }
+
+  const reattachedTerminal = reattachRunningTerminal(record);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const result = await vscode.window.showWarningMessage(
+    "Are you sure you want to close the R console?",
+    { modal: true },
+    "Close"
+  );
+
+  if (result === "Close") {
+    disposeConsoleRecord(record);
+    record.rTerminal.forceClose();
+    terminalToRecord.delete(reattachedTerminal);
+    reattachedTerminal.dispose();
+  }
 }
 
 function attachTerminal(
-  rTerminal: RTerminal,
-  inSideEditor: boolean,
-  isReattach: boolean = false,
+  record: ConsoleRecord,
   preserveFocusOverride?: boolean
-): void {
+): vscode.Terminal {
   const terminalOptions: vscode.ExtensionTerminalOptions = {
     name: VSCODE_R_TERMINAL_NAME,
-    pty: rTerminal,
+    pty: record.rTerminal,
     iconPath: new vscode.ThemeIcon("terminal")
   };
 
-  if (inSideEditor) {
-    const viewColumn = isReattach ? vscode.ViewColumn.Active : vscode.ViewColumn.Beside;
-    (terminalOptions as any).location = { viewColumn };
+  if (record.location.kind === "editor") {
+    terminalOptions.location = { viewColumn: record.location.viewColumn };
   }
 
   const terminal = vscode.window.createTerminal(terminalOptions);
-  terminalToRTerminal.set(terminal, rTerminal);
+  terminalToRecord.set(terminal, record);
 
   const alwaysUseActive = vscode.workspace.getConfiguration("r").get<boolean>("alwaysUseActiveTerminal");
   const preserveFocus =
     preserveFocusOverride ?? alwaysUseActive === false;
   terminal.show(preserveFocus);
+  return terminal;
+}
+
+function handleTerminalOpen(terminal: vscode.Terminal): void {
+  syncTerminalRecord(terminal);
+}
+
+function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {
+  if (!terminal) {
+    return;
+  }
+  syncTerminalRecord(terminal);
+}
+
+function resolveRecordFromTerminal(
+  terminal: vscode.Terminal
+): ConsoleRecord | undefined {
+  const directRecord = terminalToRecord.get(terminal);
+  if (directRecord) {
+    return directRecord;
+  }
+
+  const rTerminal = resolveRTerminalFromCreationOptions(terminal);
+  if (rTerminal) {
+    const record = rTerminalToRecord.get(rTerminal);
+    if (record) {
+      terminalToRecord.set(terminal, record);
+      return record;
+    }
+  }
+
+  const pid = parseConsolePidFromTerminal(terminal);
+  if (typeof pid !== "number") {
+    return undefined;
+  }
+
+  const record = pidToRecord.get(pid);
+  if (record) {
+    terminalToRecord.set(terminal, record);
+  }
+  return record;
+}
+
+function syncTerminalRecordsFromWindow(): void {
+  for (const terminal of vscode.window.terminals) {
+    syncTerminalRecord(terminal);
+  }
+}
+
+function syncTerminalRecord(terminal: vscode.Terminal): void {
+  if (terminalToRecord.has(terminal)) {
+    return;
+  }
+
+  const record = resolveRecordFromTerminal(terminal);
+  if (record) {
+    terminalToRecord.set(terminal, record);
+  }
+}
+
+function syncTerminalRecordForPid(pid: number): void {
+  const record = pidToRecord.get(pid);
+  if (!record) {
+    return;
+  }
+
+  for (const terminal of vscode.window.terminals) {
+    if (terminalToRecord.has(terminal)) {
+      continue;
+    }
+    if (parseConsolePidFromTerminal(terminal) !== pid) {
+      continue;
+    }
+    terminalToRecord.set(terminal, record);
+  }
+}
+
+function resolveRTerminalFromCreationOptions(
+  terminal: vscode.Terminal
+): RTerminal | undefined {
+  const options = terminal.creationOptions;
+  if (!("pty" in options) || !(options.pty instanceof RTerminal)) {
+    return undefined;
+  }
+  return options.pty;
+}
+
+function parseConsolePidFromTerminal(
+  terminal: vscode.Terminal
+): number | undefined {
+  for (const name of getTerminalCandidateNames(terminal)) {
+    const pid = parseConsolePidFromLabel(name);
+    if (typeof pid === "number") {
+      return pid;
+    }
+  }
+  return undefined;
+}
+
+function getTerminalCandidateNames(terminal: vscode.Terminal): string[] {
+  const names = new Set<string>();
+  if (terminal.name.length > 0) {
+    names.add(terminal.name);
+  }
+  const options = terminal.creationOptions;
+  if ("name" in options && typeof options.name === "string" && options.name.length > 0) {
+    names.add(options.name);
+  }
+  return [...names];
+}
+
+function parseConsolePidFromLabel(label: string): number | undefined {
+  const match = label.match(/^R Console \((\d+)\)$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const pid = Number.parseInt(match[1], 10);
+  return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+}
+
+function handleTerminalTabChange(event: vscode.TabChangeEvent): void {
+  syncTerminalRecordsFromWindow();
+
+  for (const tab of [...event.opened, ...event.changed]) {
+    if (!(tab.input instanceof vscode.TabInputTerminal)) {
+      continue;
+    }
+
+    const pid = parseConsolePidFromLabel(tab.label);
+    if (typeof pid !== "number") {
+      continue;
+    }
+
+    const record = pidToRecord.get(pid);
+    if (!record) {
+      continue;
+    }
+
+    record.location = {
+      kind: "editor",
+      viewColumn: tab.group.viewColumn,
+    };
+  }
+
+  for (const tab of event.closed) {
+    if (!(tab.input instanceof vscode.TabInputTerminal)) {
+      continue;
+    }
+
+    const pid = parseConsolePidFromLabel(tab.label);
+    if (typeof pid !== "number") {
+      continue;
+    }
+
+    void handleEditorTerminalTabClosed(pid);
+  }
+}
+
+async function handleEditorTerminalTabClosed(pid: number): Promise<void> {
+  if (editorCloseInProgress.has(pid)) {
+    return;
+  }
+
+  const record = pidToRecord.get(pid);
+  if (!record || record.location.kind !== "editor") {
+    return;
+  }
+
+  editorCloseInProgress.add(pid);
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    syncTerminalRecordsFromWindow();
+
+    if (findEditorTabByPid(pid)) {
+      syncConsoleRecordLocationFromTabs(record);
+      return;
+    }
+
+    await handleRunningConsoleClose(record);
+  } finally {
+    editorCloseInProgress.delete(pid);
+  }
+}
+
+function syncConsoleRecordLocationFromTabs(record: ConsoleRecord): void {
+  if (typeof record.pid !== "number") {
+    return;
+  }
+
+  const tab = findEditorTabByPid(record.pid);
+  if (!tab) {
+    return;
+  }
+
+  record.location = {
+    kind: "editor",
+    viewColumn: tab.group.viewColumn,
+  };
+}
+
+function findEditorTabByPid(pid: number): vscode.Tab | undefined {
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      if (!(tab.input instanceof vscode.TabInputTerminal)) {
+        continue;
+      }
+      if (parseConsolePidFromLabel(tab.label) !== pid) {
+        continue;
+      }
+      return tab;
+    }
+  }
+
+  return undefined;
 }
 
 export function deactivate() {
-  for (const rTerminal of terminalToRTerminal.values()) {
-    rTerminal.forceClose();
+  for (const record of new Set(rTerminalToRecord.values())) {
+    record.pidSubscription.dispose();
+    record.rTerminal.forceClose();
   }
-  terminalToRTerminal.clear();
-  rTerminalToContext.clear();
+  terminalToRecord.clear();
+  rTerminalToRecord.clear();
+  pidToRecord.clear();
 }
