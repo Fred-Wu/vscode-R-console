@@ -579,6 +579,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.renderer.cursorRowFromTop = 0;
         this.promptVisible = false;
         this.renderInput();
+        this.promptVisible = true;
         return;
       case "escape":
         if (this.historyBrowsing) {
