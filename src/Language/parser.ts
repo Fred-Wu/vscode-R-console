@@ -103,8 +103,8 @@ const MULTI_CHAR_OPS = [
   ">=",
   "%%",
   "|>",
-  "::",
   ":::",
+  "::",
 ];
 
 const SINGLE_CHAR_OPS = new Set([
