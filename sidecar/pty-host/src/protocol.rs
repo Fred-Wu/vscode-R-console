@@ -12,8 +12,7 @@ use windows_sys::Win32::{
     },
     System::{
         Console::{
-            GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-            STD_OUTPUT_HANDLE,
+            GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
         },
         Threading::GetCurrentProcess,
     },
@@ -239,17 +238,8 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
 fn create_protocol_writer() -> Box<dyn Write + Send> {
     #[cfg(windows)]
     unsafe {
-        let stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
         let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
         let stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
-
-        // The backend stdin carries framed control messages from VS Code, not
-        // user input. Keep child processes like `R CMD INSTALL` from inheriting
-        // that pipe or they can stall waiting on the control channel during
-        // Windows source-package installs.
-        if !stdin_handle.is_null() && stdin_handle != (-1isize) as HANDLE {
-            let _ = SetHandleInformation(stdin_handle, HANDLE_FLAG_INHERIT, 0);
-        }
 
         if !stdout_handle.is_null() && stdout_handle != (-1isize) as HANDLE {
             let mut protocol_handle: HANDLE = std::ptr::null_mut();
@@ -264,6 +254,10 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
                 DUPLICATE_SAME_ACCESS,
             ) != 0
             {
+                // `DuplicateHandle(..., bInheritHandle = FALSE, ...)` only
+                // affects the duplicate. Child processes can still inherit the
+                // original stdout pipe unless we clear that handle too.
+                let _ = SetHandleInformation(stdout_handle, HANDLE_FLAG_INHERIT, 0);
                 let _ = SetHandleInformation(protocol_handle, HANDLE_FLAG_INHERIT, 0);
                 if !stderr_handle.is_null() && stderr_handle != (-1isize) as HANDLE {
                     let _ = SetStdHandle(STD_OUTPUT_HANDLE, stderr_handle);

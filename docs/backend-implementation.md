@@ -158,7 +158,8 @@ The TypeScript/Rust boundary is defined in [`src/Runtime/backendProtocol.ts`](..
 
 ### 5.1 Transport
 
-- Rust host stdin receives commands from the extension
+- Unix: Rust host stdin receives commands from the extension
+- Windows: the extension writes commands to a dedicated named pipe passed in `VSC_R_BACKEND_COMMAND_PIPE`
 - Rust host stdout carries framed output and control events
 - Rust host stderr is reserved for diagnostic/error text
 
@@ -597,7 +598,7 @@ Although initialization differs per platform, most host-control logic is shared 
 
 The same high-level state machine exists on both platforms:
 
-- command reader thread reads backend frames from stdin
+- command reader thread reads backend frames from stdin on Unix or the backend named pipe on Windows
 - commands are queued in shared state
 - `ReadConsole` waits for top-level submits or nested replies
 - parse-status requests are handled while waiting

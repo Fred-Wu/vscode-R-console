@@ -1,5 +1,6 @@
 import { ChildProcess, spawn, SpawnOptions } from "child_process";
 import * as fs from "fs";
+import * as net from "net";
 import * as path from "path";
 import {
   type BackendCapability,
@@ -49,6 +50,9 @@ type RuntimeSessionCommand =
 type BackendProcessState = {
   capabilities: Set<BackendCapability>;
   hostConnected: boolean;
+  commandServer?: net.Server;
+  commandSocket?: net.Socket;
+  pendingCommandFrames: Buffer[];
   nextRequestId: number;
   pendingParseRequests: Map<
     number,
@@ -78,18 +82,62 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   constructor(private readonly sidecarPath: string) {}
 
   start(args: string[], options: RuntimeBackendStartOptions): ChildProcess {
-    const child = spawn(this.sidecarPath, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.processStates.set(child, {
+    const state: BackendProcessState = {
       capabilities: new Set<BackendCapability>(),
       hostConnected: false,
+      pendingCommandFrames: [],
       nextRequestId: 0,
       pendingParseRequests: new Map(),
-    });
-    return child;
+    };
+    const spawnOptions: SpawnOptions = {
+      cwd: options.cwd,
+      env: { ...options.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    };
+
+    if (process.platform === "win32") {
+      const commandPipePath = createBackendCommandPipePath();
+      const server = net.createServer((socket) => {
+        state.commandSocket = socket;
+        socket.on("error", () => {
+          if (state.commandSocket === socket) {
+            state.commandSocket = undefined;
+          }
+        });
+        socket.on("close", () => {
+          if (state.commandSocket === socket) {
+            state.commandSocket = undefined;
+          }
+        });
+        for (const frame of state.pendingCommandFrames) {
+          socket.write(frame);
+        }
+        state.pendingCommandFrames = [];
+      });
+      server.on("error", () => {
+        state.commandSocket?.destroy();
+        state.commandSocket = undefined;
+      });
+      server.listen(commandPipePath);
+      state.commandServer = server;
+      spawnOptions.env = {
+        ...spawnOptions.env,
+        VSC_R_BACKEND_COMMAND_PIPE: commandPipePath,
+      };
+      spawnOptions.stdio = ["ignore", "pipe", "pipe"];
+    }
+
+    try {
+      const child = spawn(this.sidecarPath, args, spawnOptions);
+      this.processStates.set(child, state);
+      return child;
+    } catch (error) {
+      state.commandSocket?.destroy();
+      state.commandSocket = undefined;
+      state.commandServer?.close();
+      state.commandServer = undefined;
+      throw error;
+    }
   }
 
   attach(process: ChildProcess, handlers: RuntimeBackendHandlers): void {
@@ -131,6 +179,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     });
 
     process.on("exit", (code) => {
+      state.commandSocket?.destroy();
+      state.commandSocket = undefined;
+      state.commandServer?.close();
+      state.commandServer = undefined;
       if (stdoutCarry.length > 0) {
         handlers.onStderr?.(
           `[r-console] truncated backend frame stream (${stdoutCarry.length} buffered bytes left)\n`
@@ -142,6 +194,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     });
 
     process.on("error", (error) => {
+      state.commandSocket?.destroy();
+      state.commandSocket = undefined;
+      state.commandServer?.close();
+      state.commandServer = undefined;
       this.resolvePendingParseRequests(state, 1);
       handlers.onError?.(error instanceof Error ? error : new Error(String(error)));
     });
@@ -264,17 +320,34 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   }
 
   close(process: ChildProcess): void {
+    if (!this.writeFrame(process, encodeShutdownFrame(), true)) {
+      return;
+    }
     if (!process.stdin || process.killed || process.stdin.destroyed || process.stdin.writableEnded) {
       return;
     }
     try {
-      process.stdin.write(encodeShutdownFrame());
       process.stdin.end();
     } catch {
     }
   }
 
-  private writeFrame(process: ChildProcess, frame: Buffer): boolean {
+  private writeFrame(process: ChildProcess, frame: Buffer, closing: boolean = false): boolean {
+    const state = this.processStates.get(process);
+    if (state?.commandSocket && !state.commandSocket.destroyed) {
+      try {
+        state.commandSocket.write(frame);
+        if (closing) {
+          state.commandSocket.end();
+        }
+        return true;
+      } catch {
+      }
+    }
+    if (state?.commandServer && globalThis.process.platform === "win32") {
+      state.pendingCommandFrames.push(Buffer.from(frame));
+      return true;
+    }
     if (
       !process.stdin ||
       process.killed ||
@@ -299,6 +372,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     const created: BackendProcessState = {
       capabilities: new Set<BackendCapability>(),
       hostConnected: false,
+      pendingCommandFrames: [],
       nextRequestId: 0,
       pendingParseRequests: new Map(),
     };
@@ -342,6 +416,11 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     }
     state.pendingParseRequests.clear();
   }
+}
+
+function createBackendCommandPipePath(): string {
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `\\\\.\\pipe\\r-console-backend-${token}`;
 }
 
 function getRustSidecarExecutableName(): string {

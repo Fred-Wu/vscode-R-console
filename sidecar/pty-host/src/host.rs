@@ -1331,6 +1331,7 @@ mod windows_host {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
+    use std::fs::OpenOptions;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1660,10 +1661,16 @@ mod windows_host {
 
     fn start_command_reader() {
         std::thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut locked = stdin.lock();
+            let mut reader = match open_command_reader() {
+                Ok(reader) => reader,
+                Err(error) => {
+                    emit_host_error(&format!("backend command channel open failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
             loop {
-                match read_next_command(&mut locked) {
+                match read_next_command(&mut reader) {
                     Ok(Some(command)) => handle_command(command),
                     Ok(None) => {
                         request_shutdown();
@@ -1677,6 +1684,16 @@ mod windows_host {
                 }
             }
         });
+    }
+
+    fn open_command_reader() -> io::Result<Box<dyn io::Read + Send>> {
+        match std::env::var("VSC_R_BACKEND_COMMAND_PIPE") {
+            Ok(path) if !path.trim().is_empty() => {
+                let file = OpenOptions::new().read(true).write(true).open(path)?;
+                Ok(Box::new(file))
+            }
+            _ => Ok(Box::new(io::stdin())),
+        }
     }
 
     fn handle_command(command: IncomingCommand) {

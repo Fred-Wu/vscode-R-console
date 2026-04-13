@@ -325,6 +325,46 @@ function parseNullSeparatedEnv(text: string): NodeJS.ProcessEnv {
   return result;
 }
 
+function normalizeEnvDirectory(value: string | undefined): string | undefined {
+  const trimmed = (value ?? "")
+    .trim()
+    .replace(/^"(.*)"$/, "$1")
+    .replace(/^'(.*)'$/, "$1");
+  if (!trimmed) {
+    return undefined;
+  }
+  return path.resolve(trimmed);
+}
+
+function sanitizeWindowsRToolchainEnv(env: NodeJS.ProcessEnv): void {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  // Let modern Windows R discover its own toolchain unless the caller has
+  // provided valid overrides. Stale inherited variables like `RTOOLS45_HOME`
+  // can point the embedded session at an uninstalled toolchain even when PATH
+  // already resolves the correct `make` / `gcc`.
+  for (const key of Object.keys(env)) {
+    if (!/^RTOOLS\d+_HOME$/i.test(key)) {
+      continue;
+    }
+    const directory = normalizeEnvDirectory(env[key]);
+    if (!directory || fs.existsSync(directory)) {
+      continue;
+    }
+    delete env[key];
+  }
+
+  for (const key of ["R_TOOLS_SOFT", "LOCAL_SOFT", "R_CUSTOM_TOOLS_SOFT"]) {
+    const directory = normalizeEnvDirectory(env[key]);
+    if (!directory || fs.existsSync(directory)) {
+      continue;
+    }
+    delete env[key];
+  }
+}
+
 function sourceRLauncherLibraryEnv(
   env: NodeJS.ProcessEnv,
   rHome: string,
@@ -557,6 +597,7 @@ function buildRuntimeEnv(
     TERM_PROGRAM: "vscode",
     R_PROFILE_USER_OLD: process.env.R_PROFILE_USER ?? "",
   };
+  sanitizeWindowsRToolchainEnv(env);
 
   if (rHome) {
     configureRRuntimeEnv(env, rHome, startup);
