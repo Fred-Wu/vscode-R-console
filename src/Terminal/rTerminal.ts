@@ -4,7 +4,7 @@ import { spawnSync, ChildProcess } from "child_process";
 import * as path from "path";
 import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
-import { setNativeParseCallback, stripCommentLines } from "../Language/parser";
+import { setNativeParseCallback } from "../Language/parser";
 import {
   ANSI,
   stripBracketedPasteMarkers,
@@ -151,6 +151,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private mode: TerminalMode = "starting";
   private pendingInputFlushTimer: NodeJS.Timeout | null = null;
+  private pendingProgrammaticInput = "";
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
   private suppressNextEnterAfterPasteEnd = false;
@@ -356,6 +357,10 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   handleInput(data: string): void {
+    if (this.shouldHandleAsProgrammaticSubmission(data)) {
+      this.bufferProgrammaticSubmission(data);
+      return;
+    }
     if (this.mode === "executing" && this.isSessionProtocolActive()) {
       const hasCtrlC =
         data.includes("\x03") ||
@@ -363,13 +368,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (hasCtrlC) {
         this.interruptR();
       }
-      return;
-    }
-    if (this.shouldHandleAsProgrammaticSubmission(data)) {
-      this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
-        async () => this.handleProgrammaticSubmission(data),
-        async () => this.handleProgrammaticSubmission(data)
-      );
       return;
     }
     const actions = this.keyProcessor.parseInputChunk(data);
@@ -385,62 +383,84 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private shouldHandleAsProgrammaticSubmission(data: string): boolean {
-    if (this.mode !== "ready" || !this.promptReady) {
+    if (this.inBracketPaste || data.includes("\x1b") || data.includes("\x03")) {
       return false;
     }
-    if (this.inBracketPaste) {
+    if (this.pendingProgrammaticInput.length > 0 || this.pendingInputFlushTimer) {
+      return data.length > 0;
+    }
+    if (this.mode !== "ready" || !this.promptReady) {
       return false;
     }
     if (this.inputState.text.length !== 0 || !this.inputState.isAtEnd) {
       return false;
     }
-    const unwrapped = stripBracketedPasteMarkers(data);
-    if (unwrapped.length <= 1) {
+    const normalized = data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (!normalized.includes("\n")) {
       return false;
     }
-    // Accept bracketed-paste wrappers, but reject any remaining escape/control streams.
-    if (unwrapped.includes("\x1b")) {
+    if (normalized.trim().length === 0) {
       return false;
     }
-    return unwrapped.includes("\n") || unwrapped.includes("\r");
+    return true;
+  }
+
+  private bufferProgrammaticSubmission(data: string): void {
+    this.pendingProgrammaticInput += data;
+    this.clearPendingInputFlushTimer();
+    this.pendingInputFlushTimer = setTimeout(() => {
+      this.pendingInputFlushTimer = null;
+      const buffered = this.pendingProgrammaticInput;
+      this.pendingProgrammaticInput = "";
+      if (!buffered) {
+        return;
+      }
+      this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
+        async () => this.handleProgrammaticSubmission(buffered),
+        async () => this.handleProgrammaticSubmission(buffered)
+      );
+    }, this.getProgrammaticSubmissionFlushDelay());
+  }
+
+  private getProgrammaticSubmissionFlushDelay(): number {
+    const configuredDelay = vscode.workspace.getConfiguration("r").get<number>("rtermSendDelay", 8) ?? 8;
+    const sendDelay = Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : 8;
+    return Math.max(40, sendDelay * 4);
   }
 
   private async handleProgrammaticSubmission(data: string): Promise<void> {
-    const normalized = stripCommentLines(
-      stripBracketedPasteMarkers(data)
+    const normalized = stripBracketedPasteMarkers(data)
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
-      .replace(/^\n+/, "")
-    );
+    ;
     const trimmed = normalized.replace(/\n+$/, "");
-    if (!trimmed) {
+    const submission = trimmed.trimEnd();
+    if (!submission) {
       return;
     }
 
-    const isComplete = await this.inputState.isExpressionCompleteAsync(trimmed);
-    if (!isComplete) {
-      this.historyBrowsing = false;
-      this.historyCollapsed = true;
-      this.escPendingClear = false;
-      this.rHistory.resetIndex();
-      this.inputState.insertText(trimmed);
-      this.renderInput();
-      return;
-    }
-
-    const sanitized = trimmed.trimEnd();
-    if (!sanitized) {
-      return;
-    }
-
-    this.inputState.reset();
     this.historyBrowsing = false;
     this.historyCollapsed = true;
     this.escPendingClear = false;
     this.rHistory.resetIndex();
 
-    const blocks = await this.enqueueRSubmission(sanitized, false);
-    this.recordSubmissionHistory(blocks);
+    const blocks = await this.enqueueRSubmission(submission, false);
+    if (blocks.length > 0) {
+      this.recordSubmissionHistory(blocks);
+      return;
+    }
+
+    const isComplete = await this.inputState.isExpressionCompleteAsync(submission);
+    if (
+      !isComplete &&
+      this.mode === "ready" &&
+      this.promptReady &&
+      this.inputState.text.length === 0 &&
+      this.inputState.isAtEnd
+    ) {
+      this.inputState.insertText(trimmed);
+      this.renderInput();
+    }
   }
 
   private applyKeyAction(action: KeyAction): void {
@@ -1494,23 +1514,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.syntax.setSource(this.inputState.lines);
   }
 
-  sendCode(code: string): void {
-    const sanitized = stripCommentLines(stripBracketedPasteMarkers(code)).trimEnd();
-    if (!sanitized) {
-      return;
-    }
-
-    this.inputState.reset();
-    this.historyBrowsing = false;
-    this.historyCollapsed = true;
-    this.escPendingClear = false;
-    this.rHistory.resetIndex();
-
-    void this.enqueueRSubmission(sanitized, false).then((blocks) => {
-      this.recordSubmissionHistory(blocks);
-    });
-  }
-
   private saveHistory(): void {
     this.rHistory.save();
   }
@@ -1623,6 +1626,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.syntax.dispose();
     this.lang.cleanupCompletionDocument();
     this.clearPendingInputFlushTimer();
+    this.pendingProgrammaticInput = "";
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
 

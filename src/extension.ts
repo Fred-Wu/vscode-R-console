@@ -39,10 +39,10 @@ function refreshTerminalAppearance(): void {
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("r-console.createTerminal", () => {
-      createRTerminal(context);
+      void createRTerminal(context);
     }),
     vscode.commands.registerCommand("r-console.createTerminalSide", () => {
-      createRTerminal(context, true);
+      void createRTerminal(context, true);
     }),
     vscode.window.onDidOpenTerminal(handleTerminalOpen),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
@@ -54,6 +54,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("r.console")) {
         refreshTerminalAppearance();
+      }
+      const bracketedPasteScope = getBracketedPasteConfigScope();
+      if (event.affectsConfiguration("r.bracketedPaste", bracketedPasteScope)) {
+        warnIfBracketedPasteDisabled();
       }
     })
   );
@@ -75,10 +79,10 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   await handleRunningConsoleClose(record);
 }
 
-function createRTerminal(
+async function createRTerminal(
   context: vscode.ExtensionContext,
   inSideEditor: boolean = false
-): void {
+): Promise<void> {
   if (!vscode.workspace.isTrusted) {
     void vscode.window.showErrorMessage(
       "R Console requires a trusted workspace because it launches local R executables."
@@ -92,6 +96,8 @@ function createRTerminal(
     );
     return;
   }
+
+  warnIfBracketedPasteDisabled(true);
 
   const options = resolveRTerminalOptions();
   if (!options) {
@@ -123,6 +129,37 @@ async function ensureConfiguredRPath(): Promise<void> {
   }
 
   await config.update(configEntry, discovered, vscode.ConfigurationTarget.Global);
+}
+
+function warnIfBracketedPasteDisabled(force: boolean = false): void {
+  if (!force && rTerminalToRecord.size === 0) {
+    return;
+  }
+
+  const enabled = vscode.workspace
+    .getConfiguration("r", getBracketedPasteConfigScope())
+    .get<boolean>("bracketedPaste", false);
+  if (enabled) {
+    return;
+  }
+
+  void vscode.window.showWarningMessage(
+    "Set r.bracketedPaste to true for correct editor-send behavior in R Console.",
+    "Open Settings"
+  ).then((selection) => {
+    if (selection === "Open Settings") {
+      void vscode.commands.executeCommand("workbench.action.openSettings", "r.bracketedPaste");
+    }
+  });
+}
+
+function getBracketedPasteConfigScope(): vscode.ConfigurationScope | undefined {
+  const activeDocumentUri = vscode.window.activeTextEditor?.document.uri;
+  if (activeDocumentUri && activeDocumentUri.scheme === "file") {
+    return activeDocumentUri;
+  }
+
+  return vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === "file")?.uri;
 }
 
 function createConsoleRecord(
