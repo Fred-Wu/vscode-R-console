@@ -16,3 +16,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Console",
   "Win32_System_Threading",
 ] }
+
+[build-dependencies]
+winresource = "0.1"
