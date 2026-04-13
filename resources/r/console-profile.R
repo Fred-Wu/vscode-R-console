@@ -143,3 +143,88 @@ local({
 
     options(pager = console_pager)
 })
+
+# Lock prompt and GUI-selection options while the console is active.
+local({
+    base_env <- baseenv()
+    current_options <- get("options", envir = base_env, inherits = FALSE)
+    current_env <- environment(current_options)
+
+    if (!is.null(current_env) &&
+        isTRUE(get0("r_console_locked_options_wrapper", envir = current_env, inherits = FALSE))) {
+        lock_env <- current_env
+    } else {
+        lock_env <- new.env(parent = baseenv())
+        lock_env$r_console_locked_options_wrapper <- TRUE
+        lock_env$base_options <- current_options
+        lock_env$base_warning <- get("warning", envir = base_env, inherits = FALSE)
+        lock_env$locked_message <- paste(
+            "R Console locks options(prompt=...),",
+            "options(continue=...), and options(menu.graphics=...)",
+            "while the console is active."
+        )
+
+        lock_env$locked_options <- evalq(function(...) {
+            dots <- list(...)
+            blocked <- character()
+
+            if (length(dots) == 1L && is.list(dots[[1L]]) && !is.object(dots[[1L]])) {
+                opts <- dots[[1L]]
+                if (!is.null(names(opts))) {
+                    blocked <- intersect(names(opts), c("prompt", "continue", "menu.graphics"))
+                    if ("prompt" %in% blocked) {
+                        opts[["prompt"]] <- prompt_main
+                    }
+                    if ("continue" %in% blocked) {
+                        opts[["continue"]] <- prompt_cont
+                    }
+                    if ("menu.graphics" %in% blocked) {
+                        opts[["menu.graphics"]] <- menu_graphics
+                    }
+                }
+
+                result <- do.call(base_options, list(opts))
+                if (length(blocked)) {
+                    base_warning(locked_message, call. = FALSE, immediate. = TRUE)
+                    return(invisible(result))
+                }
+                return(result)
+            }
+
+            if (!is.null(names(dots))) {
+                blocked <- intersect(names(dots), c("prompt", "continue", "menu.graphics"))
+                if ("prompt" %in% blocked) {
+                    dots[["prompt"]] <- prompt_main
+                }
+                if ("continue" %in% blocked) {
+                    dots[["continue"]] <- prompt_cont
+                }
+                if ("menu.graphics" %in% blocked) {
+                    dots[["menu.graphics"]] <- menu_graphics
+                }
+            }
+
+            result <- do.call(base_options, dots)
+            if (length(blocked)) {
+                base_warning(locked_message, call. = FALSE, immediate. = TRUE)
+                return(invisible(result))
+            }
+            result
+        }, envir = lock_env)
+
+        if (bindingIsLocked("options", base_env)) {
+            unlockBinding("options", base_env)
+        }
+        assign("options", lock_env$locked_options, envir = base_env)
+        lockBinding("options", base_env)
+    }
+
+    lock_env$prompt_main <- "> "
+    lock_env$prompt_cont <- "+ "
+    lock_env$menu_graphics <- FALSE
+    lock_env$base_options(
+        prompt = lock_env$prompt_main,
+        continue = lock_env$prompt_cont,
+        menu.graphics = lock_env$menu_graphics
+    )
+})
