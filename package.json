@@ -1,10 +1,10 @@
 {
   "name": "vscode-r-console",
   "displayName": "R Console",
-  "description": "A light weight R console for VS Code",
+  "description": "A lightweight R console for VS Code",
   "version": "0.1.0",
   "publisher": "RConsole",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "icon": "images/Rlogo.png",
   "galleryBanner": {
     "color": "#2C6DB2",
@@ -35,9 +35,17 @@
   "activationEvents": [
     "onStartupFinished",
     "onLanguage:r",
-    "onLanguage:rmd",
-    "onCommand:r-console.createTerminal",
-    "onCommand:r-console.createTerminalSide"
+    "onLanguage:rmd"
+  ],
+  "files": [
+    "dist/**",
+    "images/**",
+    "bundled/bin/**",
+    "resources/r/**",
+    "package.nls.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "main": "./dist/extension.js",
   "capabilities": {

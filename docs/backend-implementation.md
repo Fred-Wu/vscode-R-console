@@ -85,15 +85,22 @@ This is implemented in [`src/extension.ts`](../src/extension.ts).
 
 The relevant entrypoint is [`src/Terminal/options.ts`](../src/Terminal/options.ts).
 
-### 4.1 R path and version
+### 4.1 R path selection
 
-The extension reads the R executable path from `vscode-R` settings:
+The extension prefers the R executable path from `vscode-R` settings:
 
-- `r.rterm.windows`
-- `r.rterm.mac`
-- `r.rterm.linux`
+- `r.rpath.windows`
+- `r.rpath.mac`
+- `r.rpath.linux`
 
-It currently requires R `4.5.x`.
+If `r.rpath.*` is unset, the extension falls back to ambient `R_HOME` by
+resolving `R_HOME/bin/R` (or `R.exe` on Windows). If `R_HOME` is also unset,
+it finally falls back to `R` on `PATH`.
+
+Once an executable is selected, the extension derives `R_HOME` from that
+executable path and passes the derived value into the sidecar environment so
+the embedded host loads the matching shared-library tree from the same
+installation.
 
 ### 4.2 Hard dependency on `vscode-R`
 
@@ -131,6 +138,9 @@ Important environment values:
   workspace cwd when available
 
 The extension also sets the normal R environment such as `R_HOME`, `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR`, `PATH`, and platform-specific loader paths.
+
+`R_HOME` is forced from the selected executable instead of inheriting an
+unrelated outer-process `R_HOME`.
 
 ### 4.4 `console-profile.R`
 
@@ -640,7 +650,8 @@ This is the minimum useful Windows validation list.
 - confirm the installed extension contains one correct sidecar:
   `bundled/bin/R_CONSOLE_HOST.exe`
 - confirm `REditorSupport.r` is installed
-- confirm R `4.5.x` is configured in `vscode-R`
+- confirm the startup resolution source points to the intended R install:
+  `r.rpath.*`, else ambient `R_HOME`, else `PATH`
 
 ### 15.2 Startup
 
@@ -709,14 +720,14 @@ When Windows testing fails, check these in order:
 2. the console LSP output channel
 3. whether `R_CONSOLE_HOST.exe` exists in the installed extension
 4. whether `vscode-R` is installed and its `R/session/init.R` exists
-5. whether the configured R is really `4.5.x`
+5. whether the resolved runtime source really points at the intended R install
 6. whether `R.dll` and support DLLs exist in the expected `bin/x64`, `bin/arm64`, or `bin` directory
 
 Typical failure classes:
 
 - missing sidecar package for the current target
 - missing `vscode-R`
-- unsupported R version
+- wrong runtime selection from `r.rpath.*`, ambient `R_HOME`, or `PATH`
 - bad Windows R layout resolution
 - missing support DLL preload
 - no `languageserver`
@@ -725,7 +736,6 @@ Typical failure classes:
 ## 17. Current Assumptions And Limits
 
 - The console depends on `vscode-R`; there is no standalone mode.
-- The console currently requires R `4.5.x`.
 - Windows support is for modern 64-bit layouts only.
 - The Windows LSP path uses a socket transport, not stdio.
 - Close interception is still constrained by the VS Code custom-terminal API.

@@ -15,16 +15,6 @@ export type RTerminalOptions = {
 };
 
 const SESSION_WATCHER_DIR = path.join(os.homedir(), ".vscode-R");
-const REQUIRED_R_MAJOR = 4;
-const REQUIRED_R_MINOR = 5;
-const REQUIRED_R_SERIES = `${REQUIRED_R_MAJOR}.${REQUIRED_R_MINOR}`;
-
-type ParsedRVersion = {
-  major: number;
-  minor: number;
-  patch?: number;
-  text: string;
-};
 
 type RStartupOptions = {
   rArch: string;
@@ -117,8 +107,48 @@ function resolveConfiguredExecutablePath(
   return resolved;
 }
 
+function resolveExecutableFromRHome(
+  rHomeValue: string | undefined,
+  showErrors: boolean = true
+): string | undefined {
+  const trimmed = (rHomeValue ?? "")
+    .trim()
+    .replace(/^"(.*)"$/, "$1")
+    .replace(/^'(.*)'$/, "$1");
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const rHome = path.resolve(trimmed);
+  if (!fs.existsSync(rHome)) {
+    if (showErrors) {
+      void vscode.window.showErrorMessage(
+        `Cannot find R_HOME at ${rHome}. Check your environment configuration.`
+      );
+    }
+    return undefined;
+  }
+
+  const candidate =
+    process.platform === "win32" ? path.join(rHome, "bin", "R.exe") : path.join(rHome, "bin", "R");
+  if (!fs.existsSync(candidate)) {
+    if (showErrors) {
+      void vscode.window.showErrorMessage(
+        `Cannot find R under R_HOME at ${candidate}. Check your environment configuration.`
+      );
+    }
+    return undefined;
+  }
+
+  return candidate;
+}
+
 export function discoverRBinaryPath(): string | undefined {
-  return resolveConfiguredExecutablePath(getPlatformRPathConfigEntry(), false) ?? findROnPath();
+  return (
+    resolveConfiguredExecutablePath(getPlatformRPathConfigEntry(), false) ??
+    resolveExecutableFromRHome(process.env.R_HOME, false) ??
+    findROnPath()
+  );
 }
 
 function findROnPath(): string | undefined {
@@ -412,7 +442,10 @@ function configureRRuntimeEnv(
   rHome: string,
   startup: RStartupOptions
 ): void {
-  env.R_HOME = env.R_HOME || rHome;
+  // Keep the embedded host anchored to the same installation as `r.rpath.*`.
+  // An ambient `R_HOME` from the outer environment must not redirect the
+  // sidecar to a different shared-library tree.
+  env.R_HOME = rHome;
   env.R_SHARE_DIR = env.R_SHARE_DIR || path.join(rHome, "share");
   env.R_INCLUDE_DIR = env.R_INCLUDE_DIR || path.join(rHome, "include");
   env.R_DOC_DIR = env.R_DOC_DIR || path.join(rHome, "doc");
@@ -433,79 +466,17 @@ function configureRRuntimeEnv(
   prependToPath(env, pathEntries);
 }
 
-function parseRVersionText(text: string): ParsedRVersion | undefined {
-  const match = text.match(/R version\s+(\d+)\.(\d+)(?:\.(\d+))?/i);
-  if (!match) {
-    return undefined;
-  }
-  const major = Number.parseInt(match[1], 10);
-  const minor = Number.parseInt(match[2], 10);
-  const patch = match[3] ? Number.parseInt(match[3], 10) : undefined;
-  if (!Number.isFinite(major) || !Number.isFinite(minor)) {
-    return undefined;
-  }
-  return {
-    major,
-    minor,
-    patch,
-    text: patch === undefined ? `${major}.${minor}` : `${major}.${minor}.${patch}`,
-  };
-}
-
-function detectRVersion(rPath: string): ParsedRVersion | undefined {
-  try {
-    const result = spawnSync(rPath, ["--version"], {
-      encoding: "utf8",
-      windowsHide: true,
-    });
-    const output = `${typeof result.stdout === "string" ? result.stdout : ""}\n${
-      typeof result.stderr === "string" ? result.stderr : ""
-    }`;
-    const parsed = parseRVersionText(output);
-    if (parsed) {
-      return parsed;
-    }
-  } catch {
-  }
-
-  const rHome = resolveRHome(rPath);
-  if (!rHome) {
-    return undefined;
-  }
-
-  const match = path.basename(rHome).match(/^R-(\d+)\.(\d+)(?:\.(\d+))?$/i);
-  if (!match) {
-    return undefined;
-  }
-
-  const major = Number.parseInt(match[1], 10);
-  const minor = Number.parseInt(match[2], 10);
-  const patch = match[3] ? Number.parseInt(match[3], 10) : undefined;
-  if (!Number.isFinite(major) || !Number.isFinite(minor)) {
-    return undefined;
-  }
-
-  return {
-    major,
-    minor,
-    patch,
-    text: patch === undefined ? `${major}.${minor}` : `${major}.${minor}.${patch}`,
-  };
-}
-
-function isSupportedRVersion(version: ParsedRVersion | undefined): boolean {
-  return Boolean(
-    version &&
-      version.major === REQUIRED_R_MAJOR &&
-      version.minor === REQUIRED_R_MINOR
-  );
-}
-
 function resolveRBinaryPath(): string | undefined {
   const rPathConfigEntry = getPlatformConfigEntry("rpath");
-  const configured = resolveConfiguredExecutablePath(rPathConfigEntry);
-  if (configured) {
-    return configured;
+  const config = getRConfig();
+  const configured = (config.get<string>(rPathConfigEntry) || "").trim();
+  if (configured.length > 0) {
+    return resolveConfiguredExecutablePath(rPathConfigEntry);
+  }
+
+  const fromRHome = resolveExecutableFromRHome(process.env.R_HOME);
+  if (fromRHome) {
+    return fromRHome;
   }
 
   const discovered = findROnPath();
@@ -514,7 +485,7 @@ function resolveRBinaryPath(): string | undefined {
   }
 
   void vscode.window.showErrorMessage(
-    `Cannot find R. Please install R or configure r.${rPathConfigEntry}.`
+    `Cannot find R. Configure r.${rPathConfigEntry}, set R_HOME, or install R on PATH.`
   );
   return undefined;
 }
@@ -605,15 +576,6 @@ export function resolveRTerminalOptions(): RTerminalOptions | undefined {
 
   const rPath = resolveRBinaryPath();
   if (!rPath) {
-    return undefined;
-  }
-
-  const detectedVersion = detectRVersion(rPath);
-  if (!isSupportedRVersion(detectedVersion)) {
-    const detectedText = detectedVersion?.text ?? "unknown version";
-    void vscode.window.showErrorMessage(
-      `R Console requires R ${REQUIRED_R_SERIES}.x. Detected ${detectedText} at ${rPath}.`
-    );
     return undefined;
   }
 

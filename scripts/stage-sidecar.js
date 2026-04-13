@@ -63,6 +63,16 @@ function verifyStagedBinary(src, dst) {
   }
 }
 
+function verifyBundledLayout(dstDir, sidecarName) {
+  const entries = fs.readdirSync(dstDir, { withFileTypes: true });
+  const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+  if (files.length !== 1 || files[0] !== sidecarName) {
+    throw new Error(
+      `Bundled runtime layout is invalid.\nexpected: ${sidecarName}\nfound: ${files.join(", ")}`
+    );
+  }
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const target = args.target ?? getDefaultPackageTarget();
@@ -85,6 +95,7 @@ function main() {
   const sidecarDst = path.join(dstDir, sidecarName);
   stageBinary(sidecarSrc, sidecarDst);
   verifyStagedBinary(sidecarSrc, sidecarDst);
+  verifyBundledLayout(dstDir, sidecarName);
 
   process.stdout.write(`Staged runtime bundle for ${target}: ${bundledDir}\n`);
 }

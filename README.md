@@ -41,7 +41,7 @@ R Console is a VS Code extension that runs R inside a custom pseudoterminal. It 
 
 - VS Code 1.85.0 or later.
 - Node.js 24.x for the extension build and packaging scripts.
-- R 4.5.x installed and configured through vscode-R settings. The current runtime rejects other R major/minor versions.
+- A local R installation. `R Console` resolves it in this order: vscode-R `r.rpath.*`, ambient `R_HOME`, then `PATH`.
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension declares `REditorSupport.r` in `extensionDependencies` and depends on vscode-R session bootstrap/configuration; there is no standalone startup path.
 - The R package `languageserver` if you want completion, signature help, and semantic highlighting.
 - Rust/Cargo only if you are building the sidecar binaries from source.
@@ -56,12 +56,14 @@ Launch `R Console` from the Command Palette with:
 The minimum vscode-R setup for those commands to work is:
 
 1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
-2. Set the platform-specific vscode-R `r.rpath.*` setting to the R binary path used by `R Console`:
+2. Prefer setting the platform-specific vscode-R `r.rpath.*` entry to the R binary path used by `R Console`:
    - Windows: `r.rpath.windows` -> path to `R.exe`
    - macOS: `r.rpath.mac` -> path to `R`
    - Linux: `r.rpath.linux` -> path to `R`
    
-   `r.rterm.*` is not required to create `R Console`
+   `r.rterm.*` is not required to create `R Console`.
+   If `r.rpath.*` is unset, `R Console` falls back to ambient `R_HOME`, then `PATH`.
+   After selecting an executable, `R Console` derives `R_HOME` from that executable path and loads the matching shared library from that same installation.
 3. Set `r.alwaysUseActiveTerminal` to be `true` to make vscode-R commands to target `R Console`
 4. Keep `r.rterm.option` compatible with embedded startup. `R Console` strips some wrapper-only flags, but startup still requires the vscode-R bootstrap path and will reject options such as `--vanilla` and `--no-init-file`.
 
@@ -85,6 +87,8 @@ npm run stage:sidecar
 
 `stage:sidecar` copies the current platform's `R_CONSOLE_HOST` into `bundled/bin/`.
 
+`dist/`, `bundled/`, and `sidecar/pty-host/target/` are generated build outputs and are intentionally not committed.
+
 ### Packaging
 
 ```bash
@@ -94,6 +98,8 @@ npm run package
 This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.1.0-win32-x64.vsix`.
 
 `vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
+
+Each target-specific VSIX contains exactly one platform-matching `R_CONSOLE_HOST` binary in `bundled/bin/`.
 
 The GitHub release workflow packages six target-specific builds: `win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`.
 
@@ -114,6 +120,7 @@ R Console reads several settings from vscode-R:
 | `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused |
 
 `R Console` does not launch from `r.rterm.windows`, `r.rterm.mac`, or `r.rterm.linux`.
+If `r.rpath.*` is set, an ambient `R_HOME` does not override it. If `r.rpath.*` is unset, ambient `R_HOME` is used before `PATH`.
 
 R Console also contributes its own settings:
 
