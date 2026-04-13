@@ -14,6 +14,12 @@ type CollapsedRenderPlan = {
   promptKinds: Array<"main" | "cont">;
 };
 
+export type DisplayRenderPlan = {
+  lines: string[];
+  sourceLineMap: Array<number | undefined>;
+  promptKinds: Array<"main" | "cont">;
+};
+
 export type InputRenderMetrics = {
   columns: number;
   promptLen: number;
@@ -434,5 +440,60 @@ export function buildCollapsedRenderPlan(
     inputLineCursorCol: clippedVisibleLines[clippedVisibleLines.length - 1]?.cursorCol ?? 0,
     sourceLineMap,
     promptKinds,
+  };
+}
+
+export function buildSubmissionRenderPlan(
+  allLines: string[],
+  visibleRowBudget: number,
+  columns: number,
+  promptLen: number,
+  continuationPromptLen: number
+): DisplayRenderPlan {
+  const safeLines = allLines.length > 0 ? allLines : [""];
+  const safeBudget = Math.max(1, visibleRowBudget);
+  const totalRows = getRenderedRowCount(
+    safeLines,
+    columns,
+    promptLen,
+    continuationPromptLen
+  );
+
+  if (totalRows <= safeBudget) {
+    return {
+      lines: [...safeLines],
+      sourceLineMap: safeLines.map((_, index) => index),
+      promptKinds: safeLines.map((_, index) => (index === 0 ? "main" : "cont")),
+    };
+  }
+
+  const collapsed = buildCollapsedRenderPlan(
+    safeLines,
+    safeBudget,
+    columns,
+    promptLen,
+    continuationPromptLen
+  );
+  if (collapsed) {
+    return {
+      lines: [...collapsed.multiline, collapsed.inputLine],
+      sourceLineMap: collapsed.sourceLineMap,
+      promptKinds: collapsed.promptKinds,
+    };
+  }
+
+  const windowed = buildWindowedRenderPlan(
+    safeLines,
+    0,
+    (safeLines[0] ?? "").length,
+    safeBudget,
+    columns,
+    promptLen,
+    continuationPromptLen
+  );
+  return {
+    lines: windowed.lines,
+    sourceLineMap: windowed.sourceLineMap,
+    promptKinds: windowed.promptKinds,
   };
 }

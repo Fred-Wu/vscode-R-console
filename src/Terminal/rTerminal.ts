@@ -16,7 +16,6 @@ import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
 import {
   getContinuationPromptLength,
-  getRenderedRowCount,
 } from "./inputViewport";
 import {
   type RTerminalOptions,
@@ -37,7 +36,6 @@ import {
   renderInput as renderViewInput,
 } from "./rTerminal/view";
 import {
-  beginVisibleRuntimeSubmission,
   createRuntimeBackend,
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
@@ -936,14 +934,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const visibleSubmission = stripBracketedPasteMarkers(fullText).trimEnd();
-    const sanitized = visibleSubmission;
-    const recalledHistorySubmission = this.historyBrowsing;
-    const shouldEchoHistoryBlocks =
-      recalledHistorySubmission && /[\r\n]/.test(sanitized);
-    const canReuseVisibleSubmission =
-      !shouldEchoHistoryBlocks && this.isCurrentInputFullyVisible();
-    if (!canReuseVisibleSubmission && this.promptVisible) {
+    const sanitized = stripBracketedPasteMarkers(fullText).trimEnd();
+    if (this.promptVisible) {
       // Clear the live input viewport before any async submission work starts.
       // Otherwise semantic-token callbacks can rerender against the reset input
       // state and leave stale viewport content behind.
@@ -961,13 +953,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (canReuseVisibleSubmission) {
-      this.beginVisibleSubmission(visibleSubmission);
-    }
     const blocks = await this.enqueueRSubmission(
       sanitized,
-      !/[\r\n]/.test(sanitized),
-      canReuseVisibleSubmission
+      !/[\r\n]/.test(sanitized)
     );
     this.recordSubmissionHistory(blocks);
   }
@@ -1054,10 +1042,9 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private async enqueueRSubmission(
     code: string,
-    skipSplit: boolean = false,
-    alreadyVisible: boolean = false
+    skipSplit: boolean = false
   ): Promise<string[]> {
-    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, alreadyVisible);
+    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit);
   }
 
   private recordSubmissionHistory(blocks: string[]): void {
@@ -1499,23 +1486,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       historyBrowsing: this.historyBrowsing,
       historyCollapsed: this.historyCollapsed,
     });
-  }
-
-  private isCurrentInputFullyVisible(): boolean {
-    const continuationPromptLen = getContinuationPromptLength(
-      this.renderer.continuationPromptText
-    );
-    const totalRows = getRenderedRowCount(
-      this.inputState.lines,
-      this.dimensions.columns,
-      this.renderer.promptLen,
-      continuationPromptLen
-    );
-    return totalRows <= Math.max(1, this.dimensions.rows - 1);
-  }
-
-  private beginVisibleSubmission(visibleCode: string): void {
-    beginVisibleRuntimeSubmission(this.runtimeHost(), visibleCode);
   }
 
   private refreshSyntax(): void {

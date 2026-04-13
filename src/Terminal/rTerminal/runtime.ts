@@ -18,6 +18,7 @@ import { ANSI, stripBracketedPasteMarkers } from "../ansi";
 import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
 import {
+  buildSubmissionRenderPlan,
   getContinuationPromptLength,
 } from "../inputViewport";
 import {
@@ -49,7 +50,6 @@ export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "close
 
 export type Submission = {
   code: string;
-  alreadyVisible?: boolean;
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
@@ -896,9 +896,7 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
   host.pendingPromptToken = false;
   host.awaitingExecutionStart = true;
   host.mode = "executing";
-  if (!task.alreadyVisible) {
-    writeRuntimeSubmissionEcho(host, task);
-  }
+  writeRuntimeSubmissionEcho(host, task);
   host.clearPromptRenderTimer();
   host.runtimeBackend?.sendSessionCommand(host.rProcess, {
     type: "submit",
@@ -931,8 +929,7 @@ export function startNextRuntimeSubmission(host: RuntimeHost): void {
 export async function enqueueRuntimeSubmission(
   host: RuntimeHost,
   code: string,
-  skipSplit: boolean = false,
-  alreadyVisible: boolean = false
+  skipSplit: boolean = false
 ) : Promise<string[]> {
   const blocks = skipSplit
     ? [normalizeSubmissionBlock(code)]
@@ -941,50 +938,18 @@ export async function enqueueRuntimeSubmission(
   if (blocks.length === 0) {
     host.submissionPending = false;
     host.awaitingExecutionStart = false;
-    if (alreadyVisible && host.activeSubmission === null) {
-      host.mode = "ready";
-      host.pendingPromptToken = true;
-      host.schedulePrompt();
-    }
     return [];
   }
 
   for (const block of blocks) {
     host.submissionQueue.push({
       code: block,
-      alreadyVisible,
     });
   }
 
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
   startNextRuntimeSubmission(host);
   return blocks;
-}
-
-export function beginVisibleRuntimeSubmission(
-  host: RuntimeHost,
-  visibleCode: string
-): void {
-  host.clearPromptRenderTimer();
-  host.pendingPromptToken = false;
-  host.submissionPending = true;
-  host.awaitingExecutionStart = false;
-  if (host.promptVisible) {
-    const rowsBelowCursor = Math.max(
-      0,
-      host.renderer.renderedLineCount - 1 - host.renderer.cursorRowFromTop
-    );
-    if (rowsBelowCursor > 0) {
-      host.writeEmitter.fire(`\x1b[${rowsBelowCursor}B`);
-    }
-    host.writeEmitter.fire("\r\n");
-    host.lastWriteEndedWithNewline = true;
-    host.renderer.renderedLineCount = 1;
-    host.renderer.cursorRowFromTop = 0;
-    host.promptVisible = false;
-  }
-  host.inputState.reset();
-  host.mode = "executing";
 }
 
 function normalizeSubmissionBlock(code: string): string {
@@ -1050,27 +1015,33 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
 
   host.pendingPromptToken = false;
   const plainLines = task.code.split("\n");
-  const immediateLines = host.syntax.snapshotNow(plainLines);
-  writeRuntimeSubmissionLines(host, plainLines, immediateLines);
+  host.syntax.setSource(plainLines);
+  const plan = buildSubmissionRenderPlan(
+    plainLines,
+    Math.max(1, host.dimensions.rows - 1),
+    host.dimensions.columns,
+    host.renderer.promptLen,
+    getContinuationPromptLength(host.renderer.continuationPromptText)
+  );
+  const styledLines = host.syntax.highlightLines(plan.lines, plan.sourceLineMap);
+  writeRuntimeSubmissionLines(host, styledLines, plan.promptKinds);
   host.promptVisible = false;
 }
 
 function writeRuntimeSubmissionLines(
   host: RuntimeHost,
-  plainLines: string[],
-  styledLines: string[]
+  styledLines: string[],
+  promptKinds: Array<"main" | "cont">
 ): void {
   const continuationPad = 2;
-  const continuationPromptLen = getContinuationPromptLength(
-    host.renderer.continuationPromptText
-  );
 
   styledLines.forEach((line, index) => {
     if (index > 0) {
       host.writeEmitter.fire("\r\n");
     }
+    const promptKind = promptKinds[index] ?? (index === 0 ? "main" : "cont");
     const prompt =
-      index === 0
+      promptKind === "main"
         ? `${ANSI.reset}${host.renderer.promptColor}${host.renderer.promptText}${ANSI.reset}`
         : (host.renderer.continuationPromptText === null
             ? " ".repeat(continuationPad)
