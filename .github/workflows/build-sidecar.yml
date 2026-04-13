@@ -75,7 +75,7 @@ jobs:
 
       - name: Verify staged runtime
         run: |
-          node -e "const fs=require('fs'); const path=require('path'); const expected=process.platform==='win32'?'R_CONSOLE_HOST.exe':'R_CONSOLE_HOST'; const dir='bundled/bin'; const files=fs.readdirSync(dir,{withFileTypes:true}).filter(e=>e.isFile()).map(e=>e.name).sort(); if(files.length!==1||files[0]!==expected){throw new Error(`Expected exactly one staged runtime (${expected}) in ${dir}; found: ${files.join(', ')}`)} console.log(path.join(dir, files[0]));"
+          node -e "const fs=require('fs'); const path=require('path'); const expected=process.platform==='win32'?'R_CONSOLE_HOST.exe':'R_CONSOLE_HOST'; const dir='bundled/bin'; const files=fs.readdirSync(dir,{withFileTypes:true}).filter(e=>e.isFile()).map(e=>e.name).sort(); if(files.length!==1||files[0]!==expected){throw new Error('Expected exactly one staged runtime (' + expected + ') in ' + dir + '; found: ' + files.join(', '));} console.log(path.join(dir, files[0]));"
 
       - name: Upload runtime artifact
         uses: actions/upload-artifact@v4

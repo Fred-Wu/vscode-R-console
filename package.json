@@ -102,10 +102,10 @@
     "package": "npm run vscode:prepublish && npm run package:vsix"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/node": "^24.12.2",
+    "@types/vscode": "1.85.0",
     "@vscode/vsce": "^3.7.1",
-    "esbuild": "^0.27.4",
+    "esbuild": "^0.27.7",
     "typescript": "^5.3.0"
   },
   "dependencies": {
