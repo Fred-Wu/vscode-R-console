@@ -26,9 +26,20 @@ local({
 
 # Run vscode initializer
 local({
+    report_bootstrap_failure <- function(message_text) {
+        message("R Console: vscode-R session bootstrap failed: ", message_text)
+        message("R Console: continuing without vscode-R session bootstrap.")
+    }
+
     init_file <- Sys.getenv("VSCODE_INIT_R")
     if (nzchar(init_file)) {
-        source(init_file, chdir = TRUE, local = TRUE)
+        tryCatch(
+            source(init_file, chdir = TRUE, local = TRUE),
+            error = function(err) {
+                report_bootstrap_failure(conditionMessage(err))
+                invisible(NULL)
+            }
+        )
     }
 })
 
