@@ -164,8 +164,8 @@ export class SessionWatcher {
   /**
    * Register a callback invoked immediately when a new R session attaches
    * (i.e. when request.log is processed with command="attach" and a new
-   * session directory is established). Fires before workspace data is loaded,
-   * so the prompt gate can open without waiting for the 100ms poll timer.
+   * session directory is established). Fires before workspace data is loaded
+   * so session-scoped state can update without waiting for the 100ms poll timer.
    */
   onAttach(callback: () => void): void {
     this.onAttachCallback = callback;
@@ -228,8 +228,8 @@ export class SessionWatcher {
       }
       this.sessionDir = nextSessionDir;
       this.workspaceData = undefined;
-      // isAttached() is now true — notify immediately so the prompt gate can
-      // open without waiting for the next 100ms poll tick.
+      // isAttached() is now true — notify immediately so PID/state updates do
+      // not wait for the next 100ms poll tick.
       this.onAttachCallback?.();
       this.startWorkspaceWatcher();
     } catch {

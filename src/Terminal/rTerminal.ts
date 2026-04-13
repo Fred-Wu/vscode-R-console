@@ -269,7 +269,10 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private isSessionReadyForPrompt(): boolean {
-    return !this.options.sessionWatcherEnabled || this.sessionAttached;
+    // The console prompt must not depend on vscode-R's session watcher.
+    // Missing watcher bootstrap packages should degrade watcher-driven
+    // features only, not block the embedded R session from becoming interactive.
+    return true;
   }
 
   open(initialDimensions: vscode.TerminalDimensions | undefined): void {

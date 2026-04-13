@@ -253,7 +253,7 @@ function onRuntimeAttached(host: RuntimeHost): void {
   if (host.mode === "starting" && host.promptReady) {
     host.mode = "ready";
   }
-  if (host.mode === "ready" && host.promptReady) {
+  if (host.mode === "ready" && host.promptReady && !host.promptVisible) {
     host.pendingPromptToken = true;
     host.schedulePrompt();
     if (host.activeSubmission === null && host.promptKind === "main") {
@@ -400,9 +400,7 @@ export function handleBackendPrompt(
   }
 
   if (host.mode === "starting") {
-    if (host.isSessionReadyForPrompt()) {
-      host.mode = "ready";
-    }
+    host.mode = "ready";
   } else if (host.activeSubmission) {
     if (kind === "main") {
       host.finishActiveSubmission();

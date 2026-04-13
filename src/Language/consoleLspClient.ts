@@ -45,6 +45,24 @@ export type DocumentSemanticTokensResult = {
   data: number[];
 };
 
+class SilentOutputChannel implements vscode.OutputChannel {
+  constructor(public readonly name: string) {}
+
+  append(_value: string): void {}
+
+  appendLine(_value: string): void {}
+
+  replace(_value: string): void {}
+
+  clear(): void {}
+
+  show(_columnOrPreserveFocus?: vscode.ViewColumn | boolean, _preserveFocus?: boolean): void {}
+
+  hide(): void {}
+
+  dispose(): void {}
+}
+
 class ConsoleLanguageClient extends LanguageClient {
   private suppressShutdownCloseMessage = false;
 
@@ -87,9 +105,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private sessionState: ConsoleLspSessionState | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
-    this.outputChannel = vscode.window.createOutputChannel(
-      `R Console LSP (${this.options.consoleId.slice(0, 8)})`
-    );
+    this.outputChannel = new SilentOutputChannel("R Console");
     this.workingDirectory = path.join(os.tmpdir(), "r-console", "lsp", this.options.consoleId);
     fs.mkdirSync(this.workingDirectory, { recursive: true });
   }
@@ -342,7 +358,7 @@ export class ConsoleLspClient implements CompletionProvider {
     try {
       await client.sendRequest("rConsole/syncSessionState", this.sessionState);
     } catch (error) {
-      this.outputChannel.appendLine(`Failed to sync console session state: ${String(error)}`);
+      this.logError(`Failed to sync console session state: ${String(error)}`);
     }
   }
 
@@ -353,7 +369,7 @@ export class ConsoleLspClient implements CompletionProvider {
     try {
       await this.start();
     } catch (error) {
-      this.outputChannel.appendLine(`Failed to start console language server: ${String(error)}`);
+      this.logError(`Failed to start console language server: ${String(error)}`);
       return undefined;
     }
     return this.client;
@@ -385,7 +401,7 @@ export class ConsoleLspClient implements CompletionProvider {
 
     const client = new ConsoleLanguageClient(
       `r-console-${this.options.consoleId}`,
-      "R Console Language Server",
+      "R Console",
       useStdio
         ? {
             command: this.options.rPath,
@@ -459,19 +475,22 @@ export class ConsoleLspClient implements CompletionProvider {
           shell: false,
         });
         this.spawnedServer = child;
-        this.outputChannel.appendLine(`R Console Language Server (${child.pid ?? "unknown"}) started`);
+        this.logInfo(`R Console Language Server (${child.pid ?? "unknown"}) started`);
         child.stderr?.on("data", (data: Buffer | string) => {
           this.outputChannel.appendLine(data.toString());
         });
         child.on("error", (error) => {
-          this.outputChannel.appendLine(`R Console Language Server process error: ${error.message}`);
+          this.logError(`R Console Language Server process error: ${error.message}`);
         });
         child.on("exit", (code, signal) => {
-          this.outputChannel.appendLine(
-            `R Console Language Server (${child.pid ?? "unknown"}) exited ${
-              signal ? `from signal ${signal}` : `with exit code ${code ?? "null"}`
-            }`
-          );
+          const exitText = `R Console Language Server (${child.pid ?? "unknown"}) exited ${
+            signal ? `from signal ${signal}` : `with exit code ${code ?? "null"}`
+          }`;
+          if (signal || (code ?? 0) !== 0) {
+            this.logError(exitText);
+          } else {
+            this.logInfo(exitText);
+          }
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -606,5 +625,13 @@ export class ConsoleLspClient implements CompletionProvider {
       }, 1000);
     } catch {
     }
+  }
+
+  private logInfo(message: string): void {
+    void message;
+  }
+
+  private logError(message: string): void {
+    void message;
   }
 }
