@@ -6,9 +6,15 @@ use std::{fs::File, os::fd::FromRawFd};
 use std::{fs::File, os::windows::io::FromRawHandle};
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE},
+    Foundation::{
+        DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE,
+        HANDLE_FLAG_INHERIT,
+    },
     System::{
-        Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE},
+        Console::{
+            GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE,
+        },
         Threading::GetCurrentProcess,
     },
 };
@@ -233,8 +239,18 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
 fn create_protocol_writer() -> Box<dyn Write + Send> {
     #[cfg(windows)]
     unsafe {
+        let stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
         let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
         let stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
+
+        // The backend stdin carries framed control messages from VS Code, not
+        // user input. Keep child processes like `R CMD INSTALL` from inheriting
+        // that pipe or they can stall waiting on the control channel during
+        // Windows source-package installs.
+        if !stdin_handle.is_null() && stdin_handle != (-1isize) as HANDLE {
+            let _ = SetHandleInformation(stdin_handle, HANDLE_FLAG_INHERIT, 0);
+        }
+
         if !stdout_handle.is_null() && stdout_handle != (-1isize) as HANDLE {
             let mut protocol_handle: HANDLE = std::ptr::null_mut();
             let process = GetCurrentProcess();
@@ -248,6 +264,7 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
                 DUPLICATE_SAME_ACCESS,
             ) != 0
             {
+                let _ = SetHandleInformation(protocol_handle, HANDLE_FLAG_INHERIT, 0);
                 if !stderr_handle.is_null() && stderr_handle != (-1isize) as HANDLE {
                     let _ = SetStdHandle(STD_OUTPUT_HANDLE, stderr_handle);
                     let _ = libc::dup2(2, 1);
