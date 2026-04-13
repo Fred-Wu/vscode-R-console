@@ -77,17 +77,24 @@ export class Renderer {
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
     const previousRows = this.renderedLineCount;
+    const clearRenderedArea = (rowCount: number): void => {
+      for (let i = 0; i < rowCount; i++) {
+        this.write("\x1b[2K");
+        if (i < rowCount - 1) {
+          this.write("\x1b[1B\r");
+        }
+      }
+    };
 
     if (totalRows > previousRows) {
-      // Grow the editable viewport by creating blank rows below the current
-      // render area before redrawing. Without this, multi-line edits at the
-      // bottom of the terminal scroll implicitly, and the scrolled-off rows can
-      // no longer be cleared on the next redraw.
+      // Blank the current prompt area before growing it. Otherwise, if the
+      // render expands at the bottom of the viewport, the transient history/edit
+      // rows can be pushed into scrollback before submit clears them.
       this.write("\r");
-      const rowsBelowCursor = Math.max(0, previousRows - 1 - this.cursorRowFromTop);
-      if (rowsBelowCursor > 0) {
-        this.write(`\x1b[${rowsBelowCursor}B`);
+      if (this.cursorRowFromTop > 0) {
+        this.write(`\x1b[${this.cursorRowFromTop}A`);
       }
+      clearRenderedArea(previousRows);
       const growth = totalRows - previousRows;
       for (let row = 0; row < growth; row += 1) {
         this.write("\r\n");
@@ -106,12 +113,7 @@ export class Renderer {
     }
     // Clear only the previously rendered lines, not beyond
     // Use \x1b[K (clear line) for each line instead of \x1b[J (clear to end of screen)
-    for (let i = 0; i < areaRows; i++) {
-      this.write("\x1b[2K"); // Clear entire line
-      if (i < areaRows - 1) {
-        this.write("\x1b[1B\r"); // Move down and return to column 0
-      }
-    }
+    clearRenderedArea(areaRows);
     // Move back to the top of render area
     if (areaRows > 1) {
       this.write(`\x1b[${areaRows - 1}A\r`);

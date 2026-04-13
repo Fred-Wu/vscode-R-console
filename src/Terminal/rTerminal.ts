@@ -696,9 +696,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     if (dir === "left" || dir === "right") {
-      if (this.historyBrowsing && this.historyCollapsed) {
-        this.historyCollapsed = false;
-      }
+      this.expandForEdit();
       if (dir === "left") {
         this.inputState.cursorLeft();
       } else {
