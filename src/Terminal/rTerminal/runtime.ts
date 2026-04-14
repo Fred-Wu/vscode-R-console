@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { setNativeParseCallback } from "../../Language/parser";
+import { setNativeParseCallback, stripCommentLines } from "../../Language/parser";
 import {
   type BackendControlEvent,
   type BackendDialogRequest,
@@ -951,7 +951,7 @@ export async function enqueueRuntimeSubmission(
 }
 
 function normalizeSubmissionBlock(code: string): string {
-  return code.replace(/\n+$/, "").trimEnd();
+  return stripCommentLines(code.replace(/\n+$/, "")).trimEnd();
 }
 
 async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<string[]> {

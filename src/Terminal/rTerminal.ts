@@ -4,7 +4,7 @@ import { spawnSync, ChildProcess } from "child_process";
 import * as path from "path";
 import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
-import { setNativeParseCallback, stripCommentLines } from "../Language/parser";
+import { setNativeParseCallback } from "../Language/parser";
 import {
   ANSI,
   stripBracketedPasteMarkers,
@@ -429,11 +429,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleProgrammaticSubmission(data: string): Promise<void> {
-    const normalized = stripCommentLines(
-      stripBracketedPasteMarkers(data)
-        .replace(/\r\n/g, "\n")
-        .replace(/\r/g, "\n")
-    );
+    const normalized = stripBracketedPasteMarkers(data)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
     const trimmed = normalized.replace(/\n+$/, "");
     const submission = trimmed.trimEnd();
     if (!submission) {
