@@ -417,6 +417,7 @@ export class ConsoleLspClient implements CompletionProvider {
     client.setSuppressShutdownCloseMessage(this.suppressShutdownCloseMessage);
     this.client = client;
     await client.start();
+    await this.disableConsoleDiagnostics(client);
   }
 
   private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<StreamInfo> {
@@ -624,6 +625,22 @@ export class ConsoleLspClient implements CompletionProvider {
         }
       }, 1000);
     } catch {
+    }
+  }
+
+  private async disableConsoleDiagnostics(client: ConsoleLanguageClient): Promise<void> {
+    try {
+      await client.sendNotification("workspace/didChangeConfiguration", {
+        settings: {
+          r: {
+            lsp: {
+              diagnostics: false,
+            },
+          },
+        },
+      });
+    } catch (error) {
+      this.logError(`Failed to disable console diagnostics: ${String(error)}`);
     }
   }
 

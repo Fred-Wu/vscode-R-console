@@ -32,6 +32,7 @@ port <- if (nzchar(port)) as.integer(port) else NULL
 tools::Rd2txt_options(underline_titles = FALSE)
 tools::Rd2txt_options(itemBullet = "* ")
 languageserver:::lsp_settings$update_from_options()
+languageserver:::lsp_settings$set("diagnostics", FALSE)
 if (isTRUE(debug)) {
     languageserver:::lsp_settings$set("debug", TRUE)
     languageserver:::lsp_settings$set("log_file", NULL)
@@ -81,6 +82,25 @@ semantic_tokens_full_sync <- function(self, id, params) {
     self$deliver(reply)
 }
 
+console_text_document_did_close <- function(self, params) {
+    textDocument <- params$textDocument
+    uri <- languageserver:::uri_escape_unicode(textDocument$uri)
+    path <- languageserver:::path_from_uri(uri)
+
+    if (length(path) == 0 || !nzchar(path)) {
+        if (self$workspace$documents$has(uri)) {
+            doc <- self$workspace$documents$get(uri)
+            doc$did_close()
+            self$workspace$documents$remove(uri)
+            self$workspace$update_loaded_packages()
+        }
+        self$pending_replies$remove(uri)
+        return(invisible(NULL))
+    }
+
+    languageserver:::text_document_did_close(self, params)
+}
+
 server <- languageserver:::LanguageServer$new("localhost", port)
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
@@ -97,5 +117,6 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     self$deliver(languageserver:::Response$new(id, result = TRUE))
 }
 server$request_handlers[["textDocument/semanticTokens/full"]] <- semantic_tokens_full_sync
+server$notification_handlers[["textDocument/didClose"]] <- console_text_document_did_close
 
 server$run()
