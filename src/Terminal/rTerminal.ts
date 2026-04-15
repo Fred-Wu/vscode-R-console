@@ -29,10 +29,12 @@ import {
   RTermLang,
 } from "./rTerminal/lang";
 import {
+  buildInputRenderPlan,
   clearInputRender as clearViewInputRender,
   configureMainPrompt,
   getPromptRenderDelay as getViewPromptRenderDelay,
   getReplyPromptRenderDelay as getViewReplyPromptRenderDelay,
+  type InputRenderPlan,
   renderInput as renderViewInput,
 } from "./rTerminal/view";
 import {
@@ -141,6 +143,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private pendingPromptToken = false;
   private lastWriteEndedWithNewline = true;
   private hasReceivedOutput = false;
+  private promptBlockStartRow = 0;
   private terminalState: ReplayTerminal;
   private suppressTerminalStateCapture = false;
   private static readonly TERMINAL_SCROLLBACK = 5000;
@@ -344,14 +347,19 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   setDimensions(dimensions: vscode.TerminalDimensions): void {
     const previous = this.dimensions;
-    this.dimensions = dimensions;
-    const widthChanged = dimensions.columns !== previous.columns;
+    const hadVisiblePrompt = this.promptVisible;
+    const previousPromptRows = hadVisiblePrompt ? this.renderer.renderedLineCount : 0;
+    const previousPromptStartRow = hadVisiblePrompt ? this.promptBlockStartRow : 0;
     const changed =
       dimensions.columns !== previous.columns || dimensions.rows !== previous.rows;
 
-    if (changed) {
-      this.syncReplayTerminalSize();
+    if (!changed) {
+      return;
     }
+
+    this.dimensions = dimensions;
+
+    this.syncReplayTerminalSize();
 
     if (!this.rProcess) {
       return;
@@ -364,16 +372,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       });
     }
 
-    if (!changed) {
-      return;
-    }
-
-    if (process.platform === "win32" && widthChanged && this.promptVisible) {
-      this.redrawVisibleTerminalAfterResize();
-    } else if (this.promptVisible && this.inputState.text.length > 0) {
-      this.clearInputRender();
+    if (hadVisiblePrompt) {
       this.promptVisible = false;
-      this.renderInput();
+      this.replaceVisiblePromptBlock(
+        previousPromptStartRow,
+        previousPromptRows,
+        this.buildCurrentInputRenderPlan()
+      );
       this.promptVisible = true;
     }
 
@@ -745,13 +750,18 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       case "ctrl_l":
-        this.terminalState.clear();
+        if (this.promptVisible) {
+          this.clearInputRender();
+          this.promptVisible = false;
+        }
         this.writeEmitter.fire("\x1b[2J\x1b[H");
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
-        this.promptVisible = false;
-        this.renderInput();
-        this.promptVisible = true;
+        if (this.promptReady) {
+          this.promptBlockStartRow = 0;
+          this.renderInputFresh(this.buildCurrentInputRenderPlan());
+          this.promptVisible = true;
+        }
         return;
       case "escape":
         if (this.historyBrowsing) {
@@ -1682,6 +1692,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.lastWriteEndedWithNewline = true;
     }
 
+    this.promptBlockStartRow = this.getVisibleOutputCursorRow();
     this.renderInput();
     this.promptVisible = true;
     this.pendingPromptToken = false;
@@ -1701,6 +1712,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.lastWriteEndedWithNewline = true;
     }
 
+    this.promptBlockStartRow = this.getVisibleOutputCursorRow();
     this.renderInput();
     this.promptVisible = true;
   }
@@ -1729,28 +1741,62 @@ export class RTerminal implements vscode.Pseudoterminal {
     });
   }
 
-  private redrawVisibleTerminalAfterResize(): void {
-    const shouldRestorePrompt = this.promptVisible;
+  private buildCurrentInputRenderPlan(): InputRenderPlan {
+    this.syntax.setSource(this.inputState.lines);
+    return buildInputRenderPlan({
+      renderer: this.renderer,
+      inputState: this.inputState,
+      dimensions: this.dimensions,
+      historyBrowsing: this.historyBrowsing,
+      historyCollapsed: this.historyCollapsed,
+    });
+  }
+
+  private getVisibleOutputCursorRow(): number {
+    return Math.max(
+      0,
+      Math.min(this.terminalState.buffer.active.cursorY, this.dimensions.rows - 1)
+    );
+  }
+
+  private renderInputFresh(plan: InputRenderPlan): void {
+    this.withTerminalStateCaptureSuppressed(() => {
+      this.renderer.renderFreshWithCursor(
+        plan.lines,
+        plan.cursorRow,
+        plan.cursorCol,
+        this.dimensions.columns,
+        plan.sourceLineMap,
+        plan.promptKinds
+      );
+    });
+  }
+
+  private replaceVisiblePromptBlock(
+    startRow: number,
+    previousPromptRows: number,
+    plan: InputRenderPlan
+  ): void {
+    const promptStartRow = Math.max(0, Math.min(startRow, this.dimensions.rows - 1));
+    const rowsToClear = Math.max(previousPromptRows, plan.renderedRowCount);
+    const clearableRows = Math.max(1, this.dimensions.rows - promptStartRow);
+    const rowCount = Math.min(rowsToClear, clearableRows);
 
     this.withTerminalStateCaptureSuppressed(() => {
-      this.writeEmitter.fire("\x1b[2J\x1b[H");
+      for (let index = 0; index < rowCount; index += 1) {
+        this.writeEmitter.fire(`\x1b[${promptStartRow + index + 1};1H`);
+        this.writeEmitter.fire("\x1b[2K");
+      }
+      this.writeEmitter.fire(`\x1b[${promptStartRow + 1};1H`);
+      this.renderer.renderFreshWithCursor(
+        plan.lines,
+        plan.cursorRow,
+        plan.cursorCol,
+        this.dimensions.columns,
+        plan.sourceLineMap,
+        plan.promptKinds
+      );
     });
-
-    this.renderer.renderedLineCount = 1;
-    this.renderer.cursorRowFromTop = 0;
-    this.promptVisible = false;
-
-    this.restoreVisibleTerminalState();
-
-    if (!shouldRestorePrompt) {
-      return;
-    }
-
-    if (this.mode === "reply") {
-      this.showReplyPrompt();
-    } else if (this.mode === "ready" && this.promptReady) {
-      this.showPrompt();
-    }
   }
 
   private refreshSyntax(): void {

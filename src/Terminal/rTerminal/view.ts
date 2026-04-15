@@ -24,6 +24,15 @@ type RenderInputOptions = {
   historyCollapsed: boolean;
 };
 
+export type InputRenderPlan = {
+  lines: string[];
+  cursorRow: number;
+  cursorCol: number;
+  sourceLineMap: Array<number | undefined>;
+  promptKinds: Array<"main" | "cont">;
+  renderedRowCount: number;
+};
+
 export function configureMainPrompt(renderer: Renderer): void {
   const promptText = "R> ";
   renderer.setPrompt(promptText, ANSI.brightGreen);
@@ -69,6 +78,31 @@ export function renderInput({
 }: RenderInputOptions): void {
   syntax.setSource(inputState.lines);
 
+  const plan = buildInputRenderPlan({
+    renderer,
+    inputState,
+    dimensions,
+    historyBrowsing,
+    historyCollapsed,
+  });
+
+  renderer.renderWithCursor(
+    plan.lines,
+    plan.cursorRow,
+    plan.cursorCol,
+    dimensions.columns,
+    plan.sourceLineMap,
+    plan.promptKinds
+  );
+}
+
+export function buildInputRenderPlan({
+  renderer,
+  inputState,
+  dimensions,
+  historyBrowsing,
+  historyCollapsed,
+}: Omit<RenderInputOptions, "syntax">): InputRenderPlan {
   const lines = inputState.lines;
   const totalLines = lines.length;
   const maxRows = Math.max(1, dimensions.rows - 1);
@@ -82,6 +116,9 @@ export function renderInput({
     continuationPromptLen
   );
 
+  let plan:
+    | Pick<InputRenderPlan, "lines" | "cursorRow" | "cursorCol" | "sourceLineMap" | "promptKinds">;
+
   if (
     totalRows > maxRows &&
     shouldRenderCollapsed(
@@ -92,19 +129,30 @@ export function renderInput({
       maxRows
     )
   ) {
-    renderCollapsed({ renderer, inputState, dimensions });
+    plan = buildCollapsedInputRenderPlan({ renderer, inputState, dimensions });
   } else if (totalRows > maxRows) {
-    renderWindowed({ renderer, inputState, dimensions });
+    plan = buildWindowedInputRenderPlan({ renderer, inputState, dimensions });
   } else {
-    renderer.renderWithCursor(
+    plan = {
       lines,
-      inputState.cursorRow,
-      inputState.cursorCol,
-      dimensions.columns,
-      lines.map((_, index) => index),
-      lines.map((_, index) => index === 0 ? "main" : "cont")
-    );
+      cursorRow: inputState.cursorRow,
+      cursorCol: inputState.cursorCol,
+      sourceLineMap: lines.map((_, index) => index),
+      promptKinds: lines.map((_, index) => index === 0 ? "main" : "cont"),
+    };
   }
+
+  const renderedRowCount = getRenderedRowCount(
+    plan.lines,
+    dimensions.columns,
+    renderer.promptLen,
+    continuationPromptLen
+  );
+
+  return {
+    ...plan,
+    renderedRowCount,
+  };
 }
 
 export function formatTerminalOutput(text: string): string {
@@ -145,11 +193,12 @@ export function getReplyPromptRenderDelay(lastOutputAt: number): number {
   return getOutputQuietDelay(baseDelay, lastOutputAt);
 }
 
-function renderWindowed({
+function buildWindowedInputRenderPlan({
   renderer,
   inputState,
   dimensions,
-}: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">): void {
+}: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">):
+  Pick<InputRenderPlan, "lines" | "cursorRow" | "cursorCol" | "sourceLineMap" | "promptKinds"> {
   const continuationPromptLen = getContinuationPromptLength(
     renderer.continuationPromptText
   );
@@ -163,21 +212,15 @@ function renderWindowed({
     continuationPromptLen
   );
 
-  renderer.renderWithCursor(
-    plan.lines,
-    plan.cursorRow,
-    plan.cursorCol,
-    dimensions.columns,
-    plan.sourceLineMap,
-    plan.promptKinds
-  );
+  return plan;
 }
 
-function renderCollapsed({
+function buildCollapsedInputRenderPlan({
   renderer,
   inputState,
   dimensions,
-}: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">): void {
+}: Omit<RenderInputOptions, "syntax" | "historyBrowsing" | "historyCollapsed">):
+  Pick<InputRenderPlan, "lines" | "cursorRow" | "cursorCol" | "sourceLineMap" | "promptKinds"> {
   const continuationPromptLen = getContinuationPromptLength(
     renderer.continuationPromptText
   );
@@ -190,19 +233,17 @@ function renderCollapsed({
   );
 
   if (!plan) {
-    renderWindowed({ renderer, inputState, dimensions });
-    return;
+    return buildWindowedInputRenderPlan({ renderer, inputState, dimensions });
   }
 
   const lines = [...plan.multiline, plan.inputLine];
-  renderer.renderWithCursor(
+  return {
     lines,
-    lines.length - 1,
-    plan.inputLineCursorCol,
-    dimensions.columns,
-    plan.sourceLineMap,
-    plan.promptKinds
-  );
+    cursorRow: lines.length - 1,
+    cursorCol: plan.inputLineCursorCol,
+    sourceLineMap: plan.sourceLineMap,
+    promptKinds: plan.promptKinds,
+  };
 }
 
 function getOutputQuietDelay(baseDelay: number, lastOutputAt: number): number {

@@ -154,4 +154,68 @@ export class Renderer {
     // Track where the cursor actually is (for clearInputRender)
     this.cursorRowFromTop = terminalRow;
   }
+
+  renderFreshWithCursor(
+    lines: string[],
+    cursorRow: number,
+    cursorCol: number,
+    columns: number,
+    sourceLineMap: Array<number | undefined>,
+    promptKinds: RenderPromptKind[]
+  ): void {
+    const highlighted = this.lineHighlighter
+      ? this.lineHighlighter.highlightLines(lines, sourceLineMap)
+      : lines;
+    const safeColumns = Math.max(1, columns);
+    const continuationPad = 2;
+    const continuationLen = this.continuationPromptText
+      ? this.continuationPromptText.length
+      : continuationPad;
+    const getPromptKind = (index: number): RenderPromptKind => promptKinds[index]!;
+
+    const lineRows = lines.map((_, idx) => {
+      const pLen =
+        getPromptKind(idx) === "main"
+          ? this.promptLen
+          : continuationLen;
+      const visibleLen =
+        pLen + highlighted[idx].replace(/\x1b\[[0-9;]*m/g, "").length;
+      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+    });
+    const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
+
+    this.write("\r");
+    highlighted.forEach((line, idx) => {
+      if (idx > 0) {
+        this.write("\r\n");
+      }
+      const promptKind = getPromptKind(idx);
+      const prompt =
+        promptKind === "main"
+          ? `${ANSI.reset}${this.promptColor}${this.promptText}${ANSI.reset}`
+          : (this.continuationPromptText === null
+              ? " ".repeat(continuationPad)
+              : `${ANSI.reset}${this.continuationPromptColor}${this.continuationPromptText}${ANSI.reset}`);
+      this.write(prompt + line);
+    });
+
+    const prefixRows = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
+    const pLen =
+      getPromptKind(cursorRow) === "main"
+        ? this.promptLen
+        : continuationLen;
+    const cursorOffset = pLen + cursorCol;
+    const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
+    const terminalRow = prefixRows + rowWithinLine;
+    const col = (cursorOffset % safeColumns) + 1;
+
+    const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
+    if (deltaUp > 0) {
+      this.write(`\x1b[${deltaUp}A`);
+    }
+    this.write(`\r\x1b[${col}G`);
+
+    this.renderedLineCount = totalRows;
+    this.cursorRowFromTop = terminalRow;
+  }
 }
