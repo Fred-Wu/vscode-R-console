@@ -218,6 +218,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.terminalState._core._writeBuffer.writeSync(data);
   }
 
+  private withTerminalStateCaptureSuppressed<T>(action: () => T): T {
+    const previous = this.suppressTerminalStateCapture;
+    this.suppressTerminalStateCapture = true;
+    try {
+      return action();
+    } finally {
+      this.suppressTerminalStateCapture = previous;
+    }
+  }
+
   private syncReplayTerminalSize(): void {
     this.terminalState.resize(
       Math.max(20, this.dimensions.columns || 80),
@@ -293,6 +303,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
+    const hadPromptVisible = this.promptVisible;
     this.restoreTerminalState();
     // Defer the name update: VSCode drops nameEmitter events fired
     // synchronously during open() because the terminal UI hasn't attached yet.
@@ -300,6 +311,18 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
       this.notifyDisplayPidChanged();
     }, 0);
+
+    if (hadPromptVisible) {
+      this.promptVisible = false;
+      if (this.mode === "reply") {
+        this.showReplyPrompt();
+        return;
+      }
+      if (this.mode === "ready" && this.promptReady) {
+        this.showPrompt();
+        return;
+      }
+    }
 
     if (this.mode === "reply") {
       if (!this.promptVisible) {
@@ -322,6 +345,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   setDimensions(dimensions: vscode.TerminalDimensions): void {
     const previous = this.dimensions;
     this.dimensions = dimensions;
+    const widthChanged = dimensions.columns !== previous.columns;
     const changed =
       dimensions.columns !== previous.columns || dimensions.rows !== previous.rows;
 
@@ -344,7 +368,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (this.promptVisible && this.inputState.text.length > 0) {
+    if (process.platform === "win32" && widthChanged && this.promptVisible) {
+      this.redrawVisibleTerminalAfterResize();
+    } else if (this.promptVisible && this.inputState.text.length > 0) {
       this.clearInputRender();
       this.promptVisible = false;
       this.renderInput();
@@ -1318,8 +1344,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    this.suppressTerminalStateCapture = true;
-    try {
+    this.withTerminalStateCaptureSuppressed(() => {
       replay.lines.forEach((line, index) => {
         this.writeEmitter.fire(line);
         if (index < replay.lines.length - 1) {
@@ -1332,9 +1357,22 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.writeEmitter.fire(`\x1b[${deltaUp}A`);
       }
       this.writeEmitter.fire(`\r\x1b[${replay.cursorCol + 1}G`);
-    } finally {
-      this.suppressTerminalStateCapture = false;
+    });
+  }
+
+  private restoreVisibleTerminalState(): void {
+    const replay = this.buildVisibleTerminalReplay();
+    if (replay.lines.length === 0) {
+      return;
     }
+
+    this.withTerminalStateCaptureSuppressed(() => {
+      replay.lines.forEach((line, index) => {
+        this.writeEmitter.fire(`\x1b[${index + 1};1H`);
+        this.writeEmitter.fire(line);
+      });
+      this.writeEmitter.fire(`\x1b[${replay.cursorRow + 1};${replay.cursorCol + 1}H`);
+    });
   }
 
   private buildTerminalReplay(): {
@@ -1406,7 +1444,43 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
   }
 
-  private serializeReplayRow(line: IBufferLine | undefined): SerializedReplayRow {
+  private buildVisibleTerminalReplay(): {
+    lines: string[];
+    finalRow: number;
+    cursorRow: number;
+    cursorCol: number;
+  } {
+    const buffer = this.terminalState.buffer.active;
+    const viewportStart = buffer.viewportY;
+    const visibleRows = Array.from({ length: this.dimensions.rows }, (_, index) =>
+      this.serializeReplayRow(buffer.getLine(viewportStart + index), true)
+    );
+
+    let lastContentRow = -1;
+    for (let index = visibleRows.length - 1; index >= 0; index -= 1) {
+      if (visibleRows[index]?.plainText.trimEnd().length) {
+        lastContentRow = index;
+        break;
+      }
+    }
+
+    const finalRow = Math.max(lastContentRow, buffer.cursorY);
+    if (finalRow < 0) {
+      return { lines: [], finalRow: 0, cursorRow: 0, cursorCol: 0 };
+    }
+
+    return {
+      lines: visibleRows.slice(0, finalRow + 1).map((row) => row.styledText),
+      finalRow,
+      cursorRow: Math.min(buffer.cursorY, finalRow),
+      cursorCol: buffer.cursorX,
+    };
+  }
+
+  private serializeReplayRow(
+    line: IBufferLine | undefined,
+    trimTrailingWhitespace = false
+  ): SerializedReplayRow {
     if (!line) {
       return {
         plainText: "",
@@ -1419,8 +1493,26 @@ export class RTerminal implements vscode.Pseudoterminal {
     let styledText = "";
     let activeStyleKey = this.serializeCellStyleKey(this.getDefaultSerializedCellStyle());
     const defaultStyleKey = activeStyleKey;
+    let lastCellIndex = line.length - 1;
 
-    for (let index = 0; index < line.length; index += 1) {
+    if (trimTrailingWhitespace) {
+      while (lastCellIndex >= 0) {
+        const cell = line.getCell(lastCellIndex);
+        if (!cell || cell.getWidth() === 0) {
+          lastCellIndex -= 1;
+          continue;
+        }
+
+        const chars = cell.getChars();
+        const text = chars.length > 0 ? chars : " ";
+        if (text !== " ") {
+          break;
+        }
+        lastCellIndex -= 1;
+      }
+    }
+
+    for (let index = 0; index <= lastCellIndex; index += 1) {
       const cell = line.getCell(index);
       if (!cell) {
         continue;
@@ -1614,23 +1706,51 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private clearInputRender(): void {
-    clearViewInputRender(
-      (text) => {
-        this.writeEmitter.fire(text);
-      },
-      this.renderer
-    );
+    this.withTerminalStateCaptureSuppressed(() => {
+      clearViewInputRender(
+        (text) => {
+          this.writeEmitter.fire(text);
+        },
+        this.renderer
+      );
+    });
   }
 
   private renderInput(): void {
-    renderViewInput({
-      syntax: this.syntax,
-      renderer: this.renderer,
-      inputState: this.inputState,
-      dimensions: this.dimensions,
-      historyBrowsing: this.historyBrowsing,
-      historyCollapsed: this.historyCollapsed,
+    this.withTerminalStateCaptureSuppressed(() => {
+      renderViewInput({
+        syntax: this.syntax,
+        renderer: this.renderer,
+        inputState: this.inputState,
+        dimensions: this.dimensions,
+        historyBrowsing: this.historyBrowsing,
+        historyCollapsed: this.historyCollapsed,
+      });
     });
+  }
+
+  private redrawVisibleTerminalAfterResize(): void {
+    const shouldRestorePrompt = this.promptVisible;
+
+    this.withTerminalStateCaptureSuppressed(() => {
+      this.writeEmitter.fire("\x1b[2J\x1b[H");
+    });
+
+    this.renderer.renderedLineCount = 1;
+    this.renderer.cursorRowFromTop = 0;
+    this.promptVisible = false;
+
+    this.restoreVisibleTerminalState();
+
+    if (!shouldRestorePrompt) {
+      return;
+    }
+
+    if (this.mode === "reply") {
+      this.showReplyPrompt();
+    } else if (this.mode === "ready" && this.promptReady) {
+      this.showPrompt();
+    }
   }
 
   private refreshSyntax(): void {
