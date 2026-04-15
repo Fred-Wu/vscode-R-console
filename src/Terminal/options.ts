@@ -175,7 +175,7 @@ function guessRHomeFromExecutable(rPath: string): string | undefined {
   return normalized.slice(0, markerIndex);
 }
 
-export function resolveRHome(rPath: string): string | undefined {
+function resolveRHome(rPath: string): string | undefined {
   try {
     const result = spawnSync(rPath, ["RHOME"], {
       encoding: "utf8",

@@ -537,15 +537,6 @@ interface ParserState {
   dblBracketDepth: number;
 }
 
-export function classifyExpressionLocal(code: string): LocalParseClassification {
-  const sanitized = stripCommentLines(code);
-  const trimmed = sanitized.trim();
-  if (!trimmed) {
-    return "complete";
-  }
-  return classifyExpressionHeuristic(sanitized);
-}
-
 export async function isExpressionCompleteAsync(code: string): Promise<boolean> {
   const result = await getExpressionCompletenessAsync(code);
   return result.isComplete;
