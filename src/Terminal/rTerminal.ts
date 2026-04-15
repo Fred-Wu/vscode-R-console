@@ -144,6 +144,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private lastWriteEndedWithNewline = true;
   private hasReceivedOutput = false;
   private promptBlockStartRow = 0;
+  private replayStartAbsoluteRow = 0;
   private terminalState: ReplayTerminal;
   private suppressTerminalStateCapture = false;
   private static readonly TERMINAL_SCROLLBACK = 5000;
@@ -349,13 +350,15 @@ export class RTerminal implements vscode.Pseudoterminal {
   setDimensions(dimensions: vscode.TerminalDimensions): void {
     const previous = this.dimensions;
     const hadVisiblePrompt = this.promptVisible;
-    const previousPromptRows = hadVisiblePrompt ? this.renderer.renderedLineCount : 0;
-    const previousPromptStartRow = hadVisiblePrompt ? this.promptBlockStartRow : 0;
     const changed =
       dimensions.columns !== previous.columns || dimensions.rows !== previous.rows;
 
     if (!changed) {
       return;
+    }
+
+    if (hadVisiblePrompt) {
+      this.promptVisible = false;
     }
 
     this.dimensions = dimensions;
@@ -373,15 +376,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       });
     }
 
-    if (hadVisiblePrompt) {
-      this.promptVisible = false;
-      this.replaceVisiblePromptBlock(
-        previousPromptStartRow,
-        previousPromptRows,
-        this.buildCurrentInputRenderPlan()
-      );
-      this.promptVisible = true;
-    }
+    this.repaintAfterResize(hadVisiblePrompt);
 
     if (!this.promptVisible && this.mode === "ready" && this.promptReady && this.pendingPromptToken) {
       this.schedulePrompt();
@@ -755,7 +750,11 @@ export class RTerminal implements vscode.Pseudoterminal {
           this.clearInputRender();
           this.promptVisible = false;
         }
-        this.writeEmitter.fire("\x1b[2J\x1b[H");
+        this.replayStartAbsoluteRow =
+          this.terminalState.buffer.active.baseY + this.terminalState.buffer.active.cursorY;
+        this.withTerminalStateCaptureSuppressed(() => {
+          this.writeEmitter.fire("\x1b[H\x1b[2J\x1b[3J");
+        });
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
         if (this.promptReady) {
@@ -1397,15 +1396,23 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.serializeReplayRow(buffer.getLine(index))
     );
     const cursorAbsoluteRow = buffer.baseY + buffer.cursorY;
-    const firstContentRow = rawRows.findIndex((row) => row.plainText.trimEnd().length > 0);
+    const baselineRow = Math.max(0, Math.min(this.replayStartAbsoluteRow, rawRows.length));
+    const firstContentOffset = rawRows
+      .slice(baselineRow)
+      .findIndex((row) => row.plainText.trimEnd().length > 0);
+    const firstContentRow =
+      firstContentOffset === -1 ? -1 : baselineRow + firstContentOffset;
     let lastContentRow = -1;
-    for (let index = rawRows.length - 1; index >= 0; index -= 1) {
+    for (let index = rawRows.length - 1; index >= baselineRow; index -= 1) {
       if (rawRows[index]?.plainText.trimEnd().length) {
         lastContentRow = index;
         break;
       }
     }
-    const rowStart = firstContentRow === -1 ? cursorAbsoluteRow : Math.min(firstContentRow, cursorAbsoluteRow);
+    const rowStart = Math.max(
+      baselineRow,
+      firstContentRow === -1 ? cursorAbsoluteRow : Math.min(firstContentRow, cursorAbsoluteRow)
+    );
     const rowEnd = Math.max(lastContentRow, cursorAbsoluteRow);
 
     if (rowEnd < rowStart) {
@@ -1455,7 +1462,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
   }
 
-  private buildVisibleTerminalReplay(): {
+  private buildVisibleTerminalReplay(maxRows?: number): {
     lines: string[];
     finalRow: number;
     cursorRow: number;
@@ -1480,10 +1487,21 @@ export class RTerminal implements vscode.Pseudoterminal {
       return { lines: [], finalRow: 0, cursorRow: 0, cursorCol: 0 };
     }
 
+    const replayLines = visibleRows.slice(0, finalRow + 1).map((row) => row.styledText);
+    const boundedRows =
+      maxRows === undefined
+        ? replayLines.length
+        : Math.max(0, Math.min(maxRows, replayLines.length));
+    const firstVisibleRow = Math.max(0, replayLines.length - boundedRows);
+    const lines = replayLines.slice(firstVisibleRow);
+
     return {
-      lines: visibleRows.slice(0, finalRow + 1).map((row) => row.styledText),
-      finalRow,
-      cursorRow: Math.min(buffer.cursorY, finalRow),
+      lines,
+      finalRow: Math.max(0, lines.length - 1),
+      cursorRow:
+        lines.length > 0
+          ? Math.max(0, Math.min(buffer.cursorY - firstVisibleRow, lines.length - 1))
+          : 0,
       cursorCol: buffer.cursorX,
     };
   }
@@ -1773,30 +1791,44 @@ export class RTerminal implements vscode.Pseudoterminal {
     });
   }
 
-  private replaceVisiblePromptBlock(
-    startRow: number,
-    previousPromptRows: number,
-    plan: InputRenderPlan
-  ): void {
-    const promptStartRow = Math.max(0, Math.min(startRow, this.dimensions.rows - 1));
-    const rowsToClear = Math.max(previousPromptRows, plan.renderedRowCount);
-    const clearableRows = Math.max(1, this.dimensions.rows - promptStartRow);
-    const rowCount = Math.min(rowsToClear, clearableRows);
-
+  private repaintAfterResize(restorePrompt: boolean): void {
     this.withTerminalStateCaptureSuppressed(() => {
-      for (let index = 0; index < rowCount; index += 1) {
-        this.writeEmitter.fire(`\x1b[${promptStartRow + index + 1};1H`);
-        this.writeEmitter.fire("\x1b[2K");
+      // Home first, then erase viewport AND scrollback. The \x1b[3J is critical:
+      // \x1b[2J alone scrolls visible content into scrollback in xterm.js, causing
+      // ghost prompt copies to accumulate and re-enter the viewport on reflow.
+      this.writeEmitter.fire("\x1b[H\x1b[2J\x1b[3J");
+
+      // Use the full-buffer replay which joins wrapped rows back into logical
+      // lines. xterm will re-wrap them naturally at the new column width.
+      // buildVisibleTerminalReplay() returns raw rows already wrapped at the
+      // old width, which would cause double-wrapping artifacts.
+      const replay = this.buildTerminalReplay();
+      replay.lines.forEach((line, index) => {
+        if (index > 0) {
+          this.writeEmitter.fire("\r\n");
+        }
+        this.writeEmitter.fire(line);
+      });
+      if (replay.lines.length > 0) {
+        // Advance to the next line, ready for the prompt (or cursor rest).
+        this.writeEmitter.fire("\r\n");
       }
-      this.writeEmitter.fire(`\x1b[${promptStartRow + 1};1H`);
-      this.renderer.renderFreshWithCursor(
-        plan.lines,
-        plan.cursorRow,
-        plan.cursorCol,
-        this.dimensions.columns,
-        plan.sourceLineMap,
-        plan.promptKinds
-      );
+
+      if (restorePrompt) {
+        const plan = this.buildCurrentInputRenderPlan();
+        this.renderer.renderedLineCount = 1;
+        this.renderer.cursorRowFromTop = 0;
+        this.renderer.renderFreshWithCursor(
+          plan.lines,
+          plan.cursorRow,
+          plan.cursorCol,
+          this.dimensions.columns,
+          plan.sourceLineMap,
+          plan.promptKinds
+        );
+        this.promptBlockStartRow = this.getVisibleOutputCursorRow();
+        this.promptVisible = true;
+      }
     });
   }
 
