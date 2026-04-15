@@ -2,6 +2,7 @@ import * as fs from "fs";
 
 export class HistoryManager {
   private historyBuffer: string[] = [];
+  private sessionEntries: string[] = [];
   private historyIndex = 0;
   private searchNoDuplicates = false;
   private maxHistorySize = 10000;
@@ -16,6 +17,7 @@ export class HistoryManager {
     try {
       if (!fs.existsSync(this.historyFile)) {
         this.historyBuffer = [];
+        this.sessionEntries = [];
         this.historyIndex = 0;
         return;
       }
@@ -23,9 +25,11 @@ export class HistoryManager {
       const content = fs.readFileSync(this.historyFile, "utf-8");
       const entries = this.parseConsoleHistoryFormat(content);
       this.historyBuffer = entries;
+      this.sessionEntries = [];
       this.historyIndex = this.historyBuffer.length;
     } catch {
       this.historyBuffer = [];
+      this.sessionEntries = [];
       this.historyIndex = 0;
     }
   }
@@ -91,8 +95,16 @@ export class HistoryManager {
 
   push(entry: string): void {
     this.historyBuffer.push(entry);
+    this.sessionEntries.push(entry);
     this.historyIndex = this.historyBuffer.length;
     this.appendToFile(entry);
+  }
+
+  getRecentSessionEntries(limit: number = 200): string[] {
+    if (limit <= 0) {
+      return [];
+    }
+    return this.sessionEntries.slice(-limit);
   }
 
   resetIndex(): void {

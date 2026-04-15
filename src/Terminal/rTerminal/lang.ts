@@ -28,6 +28,7 @@ export type InputSnapshot = {
 type LangOptions = {
   extensionPath: string;
   rPath: string;
+  getRecentSessionEntries?: () => string[];
   requestMemberCompletions: (
     expression: string,
     operator: "$" | "@"
@@ -106,6 +107,7 @@ export class RTermLang {
         position,
         sessionData,
         linesBefore,
+        this.options.getRecentSessionEntries?.() ?? [],
         this.consoleLsp
       );
 

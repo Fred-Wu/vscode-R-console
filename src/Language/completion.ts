@@ -18,7 +18,7 @@ type CompletionEntry = {
   insertText: string;
   kind?: vscode.CompletionItemKind;
   detail?: string;
-  source: "lsp" | "session";
+  source: "lsp" | "session" | "buffer";
   replaceStart?: number;
 };
 
@@ -27,7 +27,7 @@ export type CompletionPickItem = vscode.QuickPickItem & {
   replaceStart: number;
   snapshotInput: string;
   snapshotCursor: number;
-  source: "lsp" | "session";
+  source: "lsp" | "session" | "buffer";
 };
 
 export interface CompletionProvider {
@@ -70,6 +70,28 @@ type WorkspaceData = {
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
+const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
+const R_RESERVED_WORDS = new Set([
+  "if",
+  "else",
+  "repeat",
+  "while",
+  "function",
+  "for",
+  "in",
+  "next",
+  "break",
+  "TRUE",
+  "FALSE",
+  "NULL",
+  "Inf",
+  "NaN",
+  "NA",
+  "NA_integer_",
+  "NA_real_",
+  "NA_complex_",
+  "NA_character_",
+]);
 const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
   `(${MEMBER_CHAIN_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_CHAIN_SEGMENT})*)\\s*$`
 );
@@ -249,6 +271,7 @@ export async function collectCompletionEntries(
   position: vscode.Position,
   sessionData: WorkspaceData | undefined,
   multilineBuffer: string[],
+  recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider
 ): Promise<CompletionEntry[]> {
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -260,42 +283,66 @@ export async function collectCompletionEntries(
     context.kind === "bracket"
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
-  
+  const bufferItems = getConsoleBufferCompletions(
+    context,
+    doc.getText(),
+    recentConsoleEntries
+  );
   const columnItems = getDataColumnCompletions(context, sessionData);
+  const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
+    ...lspItems,
+    ...sessionItems,
+    ...columnItems,
+  ]);
 
   if (context.kind === "bracket") {
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
+    const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (columnFiltered.length > 0) {
       return dedupeCompletionEntries(columnFiltered);
     }
-    return dedupeCompletionEntries(filterCompletionEntries(sessionItems, context.prefix));
+    return dedupeCompletionEntries([
+      ...filterCompletionEntries(sessionItems, context.prefix),
+      ...bufferFiltered,
+    ]);
   }
 
   if (context.kind === "argument") {
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
-    
+    const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
+
     if (context.dataObjectName && columnFiltered.length > 0) {
-         if (context.prefix.length === 0) {
+      if (context.prefix.length === 0) {
         return dedupeCompletionEntries([
           ...columnFiltered,
           ...lspFiltered,
           ...sessionFiltered,
+          ...bufferFiltered,
         ]);
       } else {
         return dedupeCompletionEntries([
           ...columnFiltered,
           ...lspFiltered,
           ...sessionFiltered,
+          ...bufferFiltered,
         ]);
       }
     }
-    
+
     if (context.prefix.length === 0) {
-      return dedupeCompletionEntries([...lspFiltered, ...sessionFiltered]);
+      return dedupeCompletionEntries([
+        ...lspFiltered,
+        ...sessionFiltered,
+        ...bufferFiltered,
+      ]);
     } else {
-      return dedupeCompletionEntries([...lspFiltered, ...sessionFiltered]);
+      return dedupeCompletionEntries([
+        ...lspFiltered,
+        ...sessionFiltered,
+        ...bufferFiltered,
+      ]);
     }
   }
 
@@ -312,13 +359,13 @@ export async function collectCompletionEntries(
   
   if (context.dataObjectName && defaultColumnFiltered.length > 0) {
     return dedupeCompletionEntries(filterCompletionEntries(
-      [...columnItems, ...lspItems, ...sessionItems],
+      [...columnItems, ...lspItems, ...sessionItems, ...fallbackBufferItems],
       context.prefix
     ));
   }
 
   return dedupeCompletionEntries(filterCompletionEntries(
-    [...lspItems, ...sessionItems],
+    [...lspItems, ...sessionItems, ...fallbackBufferItems],
     context.prefix
   ));
 }
@@ -415,6 +462,56 @@ function getDataColumnCompletions(
   }));
 }
 
+function getConsoleBufferCompletions(
+  context: CompletionContext,
+  currentInputText: string,
+  recentConsoleEntries: string[]
+): CompletionEntry[] {
+  if (
+    context.prefix.length === 0 ||
+    (context.kind !== "default" &&
+      context.kind !== "argument" &&
+      context.kind !== "bracket")
+  ) {
+    return [];
+  }
+
+  const result: CompletionEntry[] = [];
+  const seen = new Set<string>();
+  const sources = [currentInputText, ...[...recentConsoleEntries].reverse()];
+
+  for (const sourceText of sources) {
+    const matches = sourceText.match(CONSOLE_IDENTIFIER_PATTERN);
+    if (!matches) {
+      continue;
+    }
+
+    for (const label of matches) {
+      if (
+        label === context.prefix ||
+        R_RESERVED_WORDS.has(label) ||
+        seen.has(label)
+      ) {
+        continue;
+      }
+
+      seen.add(label);
+      result.push({
+        label,
+        insertText: label,
+        kind: vscode.CompletionItemKind.Text,
+        source: "buffer",
+      });
+
+      if (result.length >= 200) {
+        return result;
+      }
+    }
+  }
+
+  return result;
+}
+
 async function getRuntimeMemberCompletions(
   context: CompletionContext,
   completionProvider?: CompletionProvider
@@ -477,9 +574,18 @@ async function getLanguageServerCompletions(
 
     const items = Array.isArray(result) ? result : result?.items || [];
     
-    const filteredItems = (context.kind === "argument" || context.kind === "package")
-      ? items.filter(item => item.kind !== vscode.CompletionItemKind.Snippet)
-      : items;
+    const filteredItems = items.filter((item) => {
+      if (item.kind === vscode.CompletionItemKind.Text) {
+        return false;
+      }
+      if (
+        (context.kind === "argument" || context.kind === "package") &&
+        item.kind === vscode.CompletionItemKind.Snippet
+      ) {
+        return false;
+      }
+      return true;
+    });
     
     return filteredItems.map((item) => ({
       label: stripSnippetSyntax(getCompletionLabel(item)),
@@ -560,6 +666,25 @@ function filterCompletionEntries(
   return result;
 }
 
+function filterShadowedBufferEntries(
+  bufferEntries: CompletionEntry[],
+  preferredEntries: CompletionEntry[]
+): CompletionEntry[] {
+  if (bufferEntries.length === 0 || preferredEntries.length === 0) {
+    return bufferEntries;
+  }
+
+  const preferredLabels = new Set(
+    preferredEntries
+      .filter((entry) => entry.source !== "buffer")
+      .map((entry) => entry.label.toLowerCase())
+  );
+
+  return bufferEntries.filter(
+    (entry) => !preferredLabels.has(entry.label.toLowerCase())
+  );
+}
+
 function dedupeCompletionEntries(entries: CompletionEntry[]): CompletionEntry[] {
   const seen = new Set<string>();
   const result: CompletionEntry[] = [];
@@ -575,6 +700,9 @@ function dedupeCompletionEntries(entries: CompletionEntry[]): CompletionEntry[] 
 }
 
 function getCompletionDescription(entry: CompletionEntry): string {
+  if (entry.source === "buffer") {
+    return "";
+  }
   const kindName = getCompletionKindName(entry.kind);
   return kindName || "";
 }
@@ -646,6 +774,8 @@ function getCompletionIcon(kind?: vscode.CompletionItemKind): string {
       return "$(symbol-operator)";
     case vscode.CompletionItemKind.Snippet:
       return "$(symbol-snippet)";
+    case vscode.CompletionItemKind.Text:
+      return "$(symbol-text)";
     default:
       return "$(symbol-misc)";
   }
