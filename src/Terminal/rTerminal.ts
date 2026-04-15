@@ -333,7 +333,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (process.platform !== "win32" && this.isSessionProtocolActive()) {
+    if (this.isSessionProtocolActive()) {
       this.runtimeBackend?.sendSessionCommand(this.rProcess, {
         type: "set-width",
         columns: dimensions.columns,
