@@ -1337,7 +1337,11 @@ mod windows_host {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
     use std::time::Duration;
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP};
+    use windows_sys::Win32::{
+        Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP},
+        System::LibraryLoader::{GetModuleHandleA, GetProcAddress},
+        UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE},
+    };
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1385,13 +1389,18 @@ mod windows_host {
     type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
     type ProcessEventsFn = unsafe extern "C" fn();
+    type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut c_void;
+    type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
     type Sexp = *mut c_void;
     type MkStringFn = unsafe extern "C" fn(*const c_char) -> Sexp;
     type InstallFn = unsafe extern "C" fn(*const c_char) -> Sexp;
     type FindVarInFrameFn = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
     type ScalarIntegerFn = unsafe extern "C" fn(c_int) -> Sexp;
+    type ScalarLogicalFn = unsafe extern "C" fn(c_int) -> Sexp;
+    type ScalarRealFn = unsafe extern "C" fn(f64) -> Sexp;
     type ProtectFn = unsafe extern "C" fn(Sexp) -> Sexp;
     type UnprotectFn = unsafe extern "C" fn(c_int);
+    type LaterExecCallbacksFn = unsafe extern "C" fn(Sexp, Sexp, Sexp) -> Sexp;
     type ParseVectorFn = unsafe extern "C" fn(Sexp, c_int, *mut c_int, Sexp) -> Sexp;
     type TopLevelExecFn =
         unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int;
@@ -1490,6 +1499,11 @@ mod windows_host {
         ga_initapp: Option<GAInitAppFn>,
         ga_peekevent: Option<GAPeekEventFn>,
         r_process_events: Option<ProcessEventsFn>,
+        ptr_r_process_events: Option<*mut Option<EventCallbackFn>>,
+        r_polled_events: Option<*mut Option<EventCallbackFn>>,
+        r_check_activity: Option<CheckActivityFn>,
+        r_run_handlers: Option<RunHandlersFn>,
+        r_input_handlers: Option<*mut *mut c_void>,
         r_interactive: Option<*mut c_int>,
         r_signal_handlers: Option<*mut c_int>,
         r_running_as_main_program: Option<*mut c_int>,
@@ -1505,6 +1519,8 @@ mod windows_host {
         rf_install: InstallFn,
         rf_find_var_in_frame: FindVarInFrameFn,
         rf_scalar_integer: ScalarIntegerFn,
+        rf_scalar_logical: ScalarLogicalFn,
+        rf_scalar_real: ScalarRealFn,
         rf_protect: ProtectFn,
         rf_unprotect: UnprotectFn,
         r_parse_vector: ParseVectorFn,
@@ -1564,6 +1580,7 @@ mod windows_host {
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
     static READ_CONSOLE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+    static PROCESS_EVENTS_CALLBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
     static R_EXPAND_FILE_NAME: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone, Copy)]
@@ -1586,8 +1603,15 @@ mod windows_host {
     #[derive(Clone, Copy)]
     struct EventLoopApi {
         r_process_events: Option<ProcessEventsFn>,
-        r_toplevel_exec: TopLevelExecFn,
         ga_peekevent: Option<GAPeekEventFn>,
+        r_check_activity: Option<CheckActivityFn>,
+        r_run_handlers: Option<RunHandlersFn>,
+        r_input_handlers: Option<usize>,
+        rf_scalar_integer: ScalarIntegerFn,
+        rf_scalar_logical: ScalarLogicalFn,
+        rf_scalar_real: ScalarRealFn,
+        rf_protect: ProtectFn,
+        rf_unprotect: UnprotectFn,
     }
 
     struct ParseStatusContext {
@@ -1600,10 +1624,6 @@ mod windows_host {
         api: ParseApi,
         width: c_int,
         success: bool,
-    }
-
-    struct PumpEventsContext {
-        api: EventLoopApi,
     }
 
     pub(crate) fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
@@ -1923,33 +1943,81 @@ mod windows_host {
             return;
         };
 
-        let mut context = PumpEventsContext { api };
         unsafe {
-            (api.r_toplevel_exec)(
-                execute_pump_events,
-                &mut context as *mut PumpEventsContext as *mut c_void,
-            );
+            run_process_events(api);
         }
     }
 
-    unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
-        if data.is_null() {
+    unsafe fn run_input_handlers(api: EventLoopApi) {
+        let Some(check_activity) = api.r_check_activity else {
+            return;
+        };
+        let Some(run_handlers) = api.r_run_handlers else {
+            return;
+        };
+        let Some(input_handlers) = api.r_input_handlers else {
+            return;
+        };
+
+        let handlers = *(input_handlers as *mut *mut c_void);
+        if handlers.is_null() {
             return;
         }
 
-        let context = &mut *(data as *mut PumpEventsContext);
-        if let Some(peek_event) = context.api.ga_peekevent {
-            while peek_event() != 0 {}
-        }
-        if let Some(process_events) = context.api.r_process_events {
+        let mask = check_activity(0, 1);
+        run_handlers(handlers, mask);
+    }
+
+    unsafe fn run_process_events(api: EventLoopApi) {
+        // Keep the prompt-idle pump nonblocking. `GA_peekevent()` is still
+        // handled by R's native callback path below, but calling it here can
+        // stall the wait loop before the session webserver is serviced.
+        pump_windows_messages();
+        run_input_handlers(api);
+        run_later_exec_callbacks(api);
+        if let Some(process_events) = api.r_process_events {
             process_events();
+        }
+    }
+
+    unsafe fn run_later_exec_callbacks(api: EventLoopApi) {
+        let module = GetModuleHandleA(c"later.dll".as_ptr() as *const u8);
+        if module.is_null() {
+            return;
+        }
+
+        let Some(address) = GetProcAddress(module, c"_later_execCallbacks".as_ptr() as *const u8)
+        else {
+            return;
+        };
+
+        let exec_callbacks: LaterExecCallbacksFn = std::mem::transmute(address);
+        let timeout = (api.rf_protect)((api.rf_scalar_real)(0.0));
+        let run_all = (api.rf_protect)((api.rf_scalar_logical)(0));
+        let loop_id = (api.rf_protect)((api.rf_scalar_integer)(0));
+        let _ = exec_callbacks(timeout, run_all, loop_id);
+        (api.rf_unprotect)(3);
+    }
+
+    unsafe fn pump_windows_messages() {
+        let mut message: MSG = std::mem::zeroed();
+        while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
     }
 
     unsafe extern "C" fn process_events_callback() {
         if let Some(api) = event_loop_api() {
-            if let Some(peek_event) = api.ga_peekevent {
-                while peek_event() != 0 {}
+            if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
+                if let Some(peek_event) = api.ga_peekevent {
+                    while peek_event() != 0 {}
+                }
+                pump_windows_messages();
+                // Drive the input-handler path that httpuv and other socket-based
+                // integrations rely on, matching the Unix embedded host wiring.
+                run_input_handlers(api);
+                PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
 
@@ -1957,6 +2025,16 @@ mod windows_host {
             let state = runtime.state.lock().expect("host state lock poisoned");
             if state.interrupt_requested {
                 set_r_interrupts_pending(true);
+            }
+        }
+    }
+
+    unsafe extern "C" fn polled_events_callback() {
+        if let Some(api) = event_loop_api() {
+            if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
+                pump_windows_messages();
+                run_input_handlers(api);
+                PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
     }
@@ -2806,6 +2884,11 @@ mod windows_host {
                 ga_initapp,
                 ga_peekevent,
                 r_process_events: load_optional_function(&library, b"R_ProcessEvents\0"),
+                ptr_r_process_events: load_optional_global(&library, b"ptr_R_ProcessEvents\0"),
+                r_polled_events: load_optional_global(&library, b"R_PolledEvents\0"),
+                r_check_activity: load_optional_function(&library, b"R_checkActivity\0"),
+                r_run_handlers: load_optional_function(&library, b"R_runHandlers\0"),
+                r_input_handlers: load_optional_global(&library, b"R_InputHandlers\0"),
                 r_interactive: load_optional_global(&library, b"R_Interactive\0"),
                 r_signal_handlers: load_optional_global(&library, b"R_SignalHandlers\0"),
                 r_running_as_main_program: load_optional_global(
@@ -2825,6 +2908,8 @@ mod windows_host {
                 rf_install: load_function(&library, b"Rf_install\0")?,
                 rf_find_var_in_frame: load_function(&library, b"Rf_findVarInFrame\0")?,
                 rf_scalar_integer: load_function(&library, b"Rf_ScalarInteger\0")?,
+                rf_scalar_logical: load_function(&library, b"Rf_ScalarLogical\0")?,
+                rf_scalar_real: load_function(&library, b"Rf_ScalarReal\0")?,
                 rf_protect: load_function(&library, b"Rf_protect\0")?,
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
@@ -2937,6 +3022,12 @@ mod windows_host {
             if let Some(value) = self.ptr_r_edit_files {
                 *value = Some(edit_files_callback);
             }
+            if let Some(value) = self.ptr_r_process_events {
+                *value = Some(process_events_callback);
+            }
+            if let Some(value) = self.r_polled_events {
+                *value = Some(polled_events_callback);
+            }
 
             if let Some(ga_initapp) = self.ga_initapp {
                 ga_initapp(0, std::ptr::null_mut());
@@ -2979,8 +3070,15 @@ mod windows_host {
         fn event_loop_api(&self) -> EventLoopApi {
             EventLoopApi {
                 r_process_events: self.r_process_events,
-                r_toplevel_exec: self.r_toplevel_exec,
                 ga_peekevent: self.ga_peekevent,
+                r_check_activity: self.r_check_activity,
+                r_run_handlers: self.r_run_handlers,
+                r_input_handlers: self.r_input_handlers.map(|value| value as usize),
+                rf_scalar_integer: self.rf_scalar_integer,
+                rf_scalar_logical: self.rf_scalar_logical,
+                rf_scalar_real: self.rf_scalar_real,
+                rf_protect: self.rf_protect,
+                rf_unprotect: self.rf_unprotect,
             }
         }
     }

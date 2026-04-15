@@ -357,8 +357,15 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   handleInput(data: string): void {
+    if (this.consumeBufferedProgrammaticInput(data)) {
+      return;
+    }
+    if (this.shouldBufferProgrammaticInput(data)) {
+      this.bufferProgrammaticInput(data);
+      return;
+    }
     if (this.shouldHandleAsProgrammaticSubmission(data)) {
-      this.bufferProgrammaticSubmission(data);
+      this.queueProgrammaticSubmission(data);
       return;
     }
     if (this.mode === "executing" && this.isSessionProtocolActive()) {
@@ -382,30 +389,86 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
   }
 
+  private consumeBufferedProgrammaticInput(data: string): boolean {
+    if (this.pendingProgrammaticInput.length === 0 && !this.pendingInputFlushTimer) {
+      return false;
+    }
+
+    // VS Code may deliver sendText(text, true) to custom terminals as a text
+    // chunk followed by Enter in a separate handleInput call on Windows.
+    const combined = `${this.pendingProgrammaticInput}${data}`;
+    if (this.shouldHandleAsProgrammaticSubmission(combined)) {
+      this.pendingProgrammaticInput = "";
+      this.clearPendingInputFlushTimer();
+      this.queueProgrammaticSubmission(combined);
+      return true;
+    }
+
+    if (this.shouldBufferProgrammaticInput(data)) {
+      this.bufferProgrammaticInput(data);
+      return true;
+    }
+
+    const buffered = this.pendingProgrammaticInput;
+    this.pendingProgrammaticInput = "";
+    this.clearPendingInputFlushTimer();
+    this.flushBufferedProgrammaticInput(buffered);
+    return false;
+  }
+
   private shouldHandleAsProgrammaticSubmission(data: string): boolean {
-    if (this.inBracketPaste || data.includes("\x1b") || data.includes("\x03")) {
+    if (!this.canAcceptProgrammaticSubmission()) {
       return false;
     }
-    if (this.pendingProgrammaticInput.length > 0 || this.pendingInputFlushTimer) {
-      return data.length > 0;
-    }
-    if (this.mode !== "ready" || !this.promptReady) {
+
+    const normalized = this.normalizeProgrammaticInput(data);
+    return (
+      normalized.includes("\n") &&
+      normalized.trim().length > 0 &&
+      !normalized.includes("\x1b") &&
+      !normalized.includes("\x03")
+    );
+  }
+
+  private shouldBufferProgrammaticInput(data: string): boolean {
+    if (!this.canAcceptProgrammaticSubmission()) {
       return false;
     }
-    if (this.inputState.text.length !== 0 || !this.inputState.isAtEnd) {
+
+    const normalized = this.normalizeProgrammaticInput(data);
+    return normalized.length > 1 && this.isPlainTextInputChunk(normalized);
+  }
+
+  private canAcceptProgrammaticSubmission(): boolean {
+    return (
+      !this.inBracketPaste &&
+      this.mode !== "closed" &&
+      this.mode !== "reply" &&
+      this.inputState.text.length === 0 &&
+      this.inputState.isAtEnd
+    );
+  }
+
+  private normalizeProgrammaticInput(data: string): string {
+    return data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  private isPlainTextInputChunk(data: string): boolean {
+    if (!data || data.includes("\n") || data.includes("\x1b") || data.includes("\x03")) {
       return false;
     }
-    const normalized = data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    if (!normalized.includes("\n")) {
-      return false;
+
+    for (const ch of data) {
+      const code = ch.charCodeAt(0);
+      if (code < 32 || code === 127) {
+        return false;
+      }
     }
-    if (normalized.trim().length === 0) {
-      return false;
-    }
+
     return true;
   }
 
-  private bufferProgrammaticSubmission(data: string): void {
+  private bufferProgrammaticInput(data: string): void {
     this.pendingProgrammaticInput += data;
     this.clearPendingInputFlushTimer();
     this.pendingInputFlushTimer = setTimeout(() => {
@@ -415,10 +478,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (!buffered) {
         return;
       }
-      this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
-        async () => this.handleProgrammaticSubmission(buffered),
-        async () => this.handleProgrammaticSubmission(buffered)
-      );
+      this.flushBufferedProgrammaticInput(buffered);
     }, this.getProgrammaticSubmissionFlushDelay());
   }
 
@@ -426,6 +486,68 @@ export class RTerminal implements vscode.Pseudoterminal {
     const configuredDelay = vscode.workspace.getConfiguration("r").get<number>("rtermSendDelay", 8) ?? 8;
     const sendDelay = Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : 8;
     return Math.max(40, sendDelay * 4);
+  }
+
+  private flushBufferedProgrammaticInput(data: string): void {
+    if (!data) {
+      return;
+    }
+
+    if (this.mode !== "ready" || !this.promptReady) {
+      this.pendingProgrammaticInput = data;
+      this.clearPendingInputFlushTimer();
+      this.pendingInputFlushTimer = setTimeout(() => {
+        this.pendingInputFlushTimer = null;
+        const buffered = this.pendingProgrammaticInput;
+        this.pendingProgrammaticInput = "";
+        if (!buffered) {
+          return;
+        }
+        this.flushBufferedProgrammaticInput(buffered);
+      }, this.getProgrammaticSubmissionFlushDelay());
+      return;
+    }
+
+    this.applyKeyAction({ type: "text", text: data });
+  }
+
+  private shouldSuppressEnterAfterPasteEnd(content: string): boolean {
+    const normalized = stripBracketedPasteMarkers(content)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+    return normalized.includes("\n");
+  }
+
+  private queueProgrammaticSubmission(data: string): void {
+    this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
+      async () => this.handleQueuedProgrammaticSubmission(data),
+      async () => this.handleQueuedProgrammaticSubmission(data)
+    );
+  }
+
+  private async handleQueuedProgrammaticSubmission(data: string): Promise<void> {
+    if (this.mode === "closed") {
+      return;
+    }
+
+    if (!this.canRunProgrammaticSubmission()) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, this.getProgrammaticSubmissionFlushDelay());
+      });
+      await this.handleQueuedProgrammaticSubmission(data);
+      return;
+    }
+
+    await this.handleProgrammaticSubmission(data);
+  }
+
+  private canRunProgrammaticSubmission(): boolean {
+    return (
+      this.mode === "ready" &&
+      this.promptReady &&
+      this.inputState.text.length === 0 &&
+      this.inputState.isAtEnd
+    );
   }
 
   private async handleProgrammaticSubmission(data: string): Promise<void> {
@@ -494,7 +616,9 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       case "paste-end":
         this.inBracketPaste = false;
-        this.suppressNextEnterAfterPasteEnd = true;
+        this.suppressNextEnterAfterPasteEnd = this.shouldSuppressEnterAfterPasteEnd(
+          this.pasteBuffer
+        );
         void this.handlePasteEnd();
         return;
       case "text":
