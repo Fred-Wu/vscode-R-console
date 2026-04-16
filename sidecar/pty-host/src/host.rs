@@ -1347,7 +1347,9 @@ mod windows_host {
     use std::sync::{Condvar, Mutex, OnceLock};
     use std::time::Duration;
     use windows_sys::Win32::{
-        Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP},
+        Globalization::{
+            MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS,
+        },
         System::LibraryLoader::{GetModuleHandleA, GetProcAddress},
         UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE},
     };
@@ -1756,7 +1758,7 @@ mod windows_host {
             state.suppress_idle_event_pump = false;
             state
                 .pending_commands
-                .push_back(PendingCommand::Reply(encode_windows_console_text(
+                .push_back(PendingCommand::Reply(encode_windows_native_text(
                     &normalize_reply_text(&text),
                 )));
             runtime.cv.notify_all();
@@ -1838,7 +1840,7 @@ mod windows_host {
         if function == 0 {
             return path.to_string();
         }
-        let Ok(c_path) = CString::new(encode_windows_console_text(path)) else {
+        let Ok(c_path) = CString::new(encode_windows_native_text(path)) else {
             return path.to_string();
         };
         let function: ExpandFileNameFn = unsafe { std::mem::transmute(function) };
@@ -2180,11 +2182,11 @@ mod windows_host {
 
     unsafe extern "C" fn write_console_ex_callback(
         text: *const c_char,
-        _bufline: c_int,
+        buflen: c_int,
         otype: c_int,
     ) {
         if let Some(runtime) = host_runtime() {
-            let rendered = c_string_to_string(text);
+            let rendered = decode_windows_console_buffer(text, buflen);
             if rendered.is_empty() {
                 return;
             }
@@ -2292,7 +2294,7 @@ mod windows_host {
     }
 
     fn write_path_buffer(buffer: *mut c_char, len: c_int, path: &str) -> c_int {
-        let bytes = encode_windows_console_text(path);
+        let bytes = encode_windows_native_text(path);
         if buffer.is_null() || len <= 0 {
             return bytes.len() as c_int;
         }
@@ -2422,12 +2424,26 @@ mod windows_host {
         let normalized = normalize_newlines(code);
         let mut lines = VecDeque::new();
         for line in normalized.split('\n') {
-            lines.push_back(encode_windows_console_text(line));
+            lines.push_back(encode_windows_r_source_text(line));
         }
         if lines.is_empty() {
             lines.push_back(Vec::new());
         }
         lines
+    }
+
+    fn decode_windows_console_buffer(text: *const c_char, buflen: c_int) -> String {
+        if text.is_null() {
+            return String::new();
+        }
+
+        let bytes = if buflen > 0 {
+            unsafe { std::slice::from_raw_parts(text as *const u8, buflen as usize) }
+        } else {
+            unsafe { CStr::from_ptr(text) }.to_bytes()
+        };
+
+        decode_windows_console_text(bytes)
     }
 
     fn normalize_reply_text(text: &str) -> String {
@@ -2481,7 +2497,7 @@ mod windows_host {
             return PARSE_STATUS_ERROR;
         };
 
-        let Ok(code) = CString::new(encode_windows_console_text(&code)) else {
+        let Ok(code) = CString::new(encode_windows_r_source_text(&code)) else {
             return PARSE_STATUS_ERROR;
         };
 
@@ -2683,12 +2699,15 @@ mod windows_host {
     }
 
     fn decode_windows_code_page(bytes: &[u8]) -> String {
+        decode_windows_code_page_with(bytes, current_windows_code_page())
+    }
+
+    fn decode_windows_code_page_with(bytes: &[u8], code_page: u32) -> String {
         if bytes.is_empty() {
             return String::new();
         }
 
         unsafe {
-            let code_page = current_windows_code_page();
             let wide_len = MultiByteToWideChar(
                 code_page,
                 0,
@@ -2730,8 +2749,19 @@ mod windows_host {
     }
 
     fn decode_windows_console_text(bytes: &[u8]) -> String {
+        decode_windows_console_text_with_code_page(bytes, current_windows_code_page())
+    }
+
+    fn decode_windows_console_text_with_code_page(bytes: &[u8], code_page: u32) -> String {
         if bytes.is_empty() {
             return String::new();
+        }
+
+        if find_subslice(bytes, EMBEDDED_UTF8_PREFIX).is_none() {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return text.to_string();
+            }
+            return decode_windows_code_page_with(bytes, code_page);
         }
 
         let mut rendered = String::new();
@@ -2741,12 +2771,16 @@ mod windows_host {
             let text_start = prefix_start + EMBEDDED_UTF8_PREFIX.len();
             let Some(suffix_offset) = find_subslice(&remaining[text_start..], EMBEDDED_UTF8_SUFFIX)
             else {
-                break;
+                rendered.push_str(&decode_windows_code_page_with(remaining, code_page));
+                return rendered;
             };
             let text_end = text_start + suffix_offset;
 
             if prefix_start > 0 {
-                rendered.push_str(&decode_windows_code_page(&remaining[..prefix_start]));
+                rendered.push_str(&decode_windows_code_page_with(
+                    &remaining[..prefix_start],
+                    code_page,
+                ));
             }
 
             rendered.push_str(&String::from_utf8_lossy(&remaining[text_start..text_end]));
@@ -2754,13 +2788,13 @@ mod windows_host {
         }
 
         if !remaining.is_empty() {
-            rendered.push_str(&decode_windows_code_page(remaining));
+            rendered.push_str(&decode_windows_code_page_with(remaining, code_page));
         }
 
         rendered
     }
 
-    fn encode_windows_console_text(text: &str) -> Vec<u8> {
+    fn encode_windows_native_text(text: &str) -> Vec<u8> {
         if text.is_empty() {
             return Vec::new();
         }
@@ -2802,10 +2836,104 @@ mod windows_host {
         }
     }
 
+    fn encode_windows_r_source_text(text: &str) -> Vec<u8> {
+        encode_windows_r_source_text_with_code_page(text, current_windows_code_page())
+    }
+
+    fn encode_windows_r_source_text_with_code_page(text: &str, code_page: u32) -> Vec<u8> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        if code_page == 65001 {
+            return text.as_bytes().to_vec();
+        }
+
+        let mut encoded = Vec::with_capacity(text.len());
+        for ch in text.chars() {
+            if let Some(bytes) = encode_windows_scalar_with_code_page(ch, code_page) {
+                encoded.extend_from_slice(&bytes);
+            } else if (ch as u32) <= 0xffff {
+                encoded.extend_from_slice(format!("\\u{:04x}", ch as u32).as_bytes());
+            } else {
+                encoded.extend_from_slice(format!("\\U{:08x}", ch as u32).as_bytes());
+            }
+        }
+
+        encoded
+    }
+
+    fn encode_windows_scalar_with_code_page(ch: char, code_page: u32) -> Option<Vec<u8>> {
+        let mut wide = [0_u16; 2];
+        let wide = ch.encode_utf16(&mut wide);
+        let flags = WC_NO_BEST_FIT_CHARS;
+        let mut used_default = 0;
+
+        unsafe {
+            let encoded_len = WideCharToMultiByte(
+                code_page,
+                flags,
+                wide.as_ptr(),
+                wide.len() as c_int,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                &mut used_default,
+            );
+            if encoded_len <= 0 || used_default != 0 {
+                return None;
+            }
+
+            let mut encoded = vec![0_u8; encoded_len as usize];
+            let written = WideCharToMultiByte(
+                code_page,
+                flags,
+                wide.as_ptr(),
+                wide.len() as c_int,
+                encoded.as_mut_ptr(),
+                encoded_len,
+                std::ptr::null(),
+                &mut used_default,
+            );
+            if written <= 0 || used_default != 0 {
+                return None;
+            }
+
+            let wide_len = MultiByteToWideChar(
+                code_page,
+                0,
+                encoded.as_ptr(),
+                written,
+                std::ptr::null_mut(),
+                0,
+            );
+            if wide_len != wide.len() as c_int {
+                return None;
+            }
+
+            let mut round_trip = vec![0_u16; wide_len as usize];
+            let converted = MultiByteToWideChar(
+                code_page,
+                0,
+                encoded.as_ptr(),
+                written,
+                round_trip.as_mut_ptr(),
+                wide_len,
+            );
+            if converted != wide_len || round_trip.as_slice() != wide {
+                return None;
+            }
+
+            encoded.truncate(written as usize);
+            Some(encoded)
+        }
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         if needle.is_empty() || haystack.len() < needle.len() {
             return None;
         }
+
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
@@ -2977,10 +3105,10 @@ mod windows_host {
 
             let r_home = resolve_r_home(r_executable)?;
             let user_home = get_r_user_home(self.get_r_user);
-            let r_home_storage = CString::new(encode_windows_console_text(
+            let r_home_storage = CString::new(encode_windows_native_text(
                 r_home.to_string_lossy().as_ref(),
             ))?;
-            let user_home_storage = CString::new(encode_windows_console_text(&user_home))?;
+            let user_home_storage = CString::new(encode_windows_native_text(&user_home))?;
             let mut r_start = Box::<RStart>::new(std::mem::zeroed());
 
             if let Some(def_params_ex) = self.r_def_params_ex {
@@ -2992,7 +3120,7 @@ mod windows_host {
             }
 
             if let Some(cmdlineoptions) = self.cmdlineoptions {
-                let program_name = CString::new(encode_windows_console_text(
+                let program_name = CString::new(encode_windows_native_text(
                     r_executable
                         .file_name()
                         .and_then(|value| value.to_str())
@@ -3144,14 +3272,14 @@ mod windows_host {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("R");
-        argv.push(CString::new(encode_windows_console_text(program_name))?);
+        argv.push(CString::new(encode_windows_native_text(program_name))?);
 
         if !r_args.iter().any(|arg| arg == "--interactive") {
-            argv.push(CString::new(encode_windows_console_text("--interactive"))?);
+            argv.push(CString::new(encode_windows_native_text("--interactive"))?);
         }
 
         for arg in r_args {
-            argv.push(CString::new(encode_windows_console_text(arg.as_str()))?);
+            argv.push(CString::new(encode_windows_native_text(arg.as_str()))?);
         }
 
         Ok(argv)
@@ -3159,20 +3287,140 @@ mod windows_host {
 
     #[cfg(test)]
     mod tests {
-        use super::decode_windows_console_text;
+        use super::{
+            decode_windows_console_text_with_code_page, encode_windows_r_source_text_with_code_page,
+        };
 
         #[test]
         fn decodes_embedded_utf8_console_segments() {
             let bytes = b"[1] \"\x02\xff\xfehi\x03\xff\xfe\"";
-            assert_eq!(decode_windows_console_text(bytes), "[1] \"hi\"");
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "[1] \"hi\""
+            );
         }
 
         #[test]
         fn decodes_plain_ascii_console_text() {
             let bytes = b"Packages in library C:/Program Files/R/library:";
             assert_eq!(
-                decode_windows_console_text(bytes),
+                decode_windows_console_text_with_code_page(bytes, 1252),
                 "Packages in library C:/Program Files/R/library:"
+            );
+        }
+
+        #[test]
+        #[ignore = "replaced by unicode-safe regression tests below"]
+        fn decodes_plain_utf8_console_text_without_markers() {
+            let bytes = "[1] \"日本語\" \"🙂 emoji\"".as_bytes();
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "[1] \"日本語\" \"🙂 emoji\""
+            );
+        }
+
+        #[test]
+        #[ignore = "replaced by unicode-safe regression tests below"]
+        fn decodes_utf8_latin_text_without_markers() {
+            let bytes = b"caf\xc3\xa9";
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "café"
+            );
+        }
+
+        #[test]
+        #[ignore = "replaced by unicode-safe regression tests below"]
+        fn preserves_legacy_code_page_text_when_not_utf8() {
+            let bytes = b"caf\xe9";
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "café"
+            );
+        }
+
+        #[test]
+        #[ignore = "replaced by unicode-safe regression tests below"]
+        fn preserves_shift_jis_console_text() {
+            let bytes = &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA];
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 932),
+                "日本語"
+            );
+        }
+
+        #[test]
+        fn decodes_utf8_console_text_without_markers_unicode_safe() {
+            let bytes = "[1] \"\u{65e5}\u{672c}\u{8a9e}\" \"\u{1f642} emoji\"".as_bytes();
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "[1] \"\u{65e5}\u{672c}\u{8a9e}\" \"\u{1f642} emoji\""
+            );
+        }
+
+        #[test]
+        fn decodes_utf8_latin_text_without_markers_unicode_safe() {
+            let bytes = b"caf\xc3\xa9";
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "caf\u{e9}"
+            );
+        }
+
+        #[test]
+        fn preserves_legacy_code_page_text_unicode_safe() {
+            let bytes = b"caf\xe9";
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "caf\u{e9}"
+            );
+        }
+
+        #[test]
+        fn preserves_shift_jis_console_text_unicode_safe() {
+            let bytes = &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA];
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 932),
+                "\u{65e5}\u{672c}\u{8a9e}"
+            );
+        }
+
+        #[test]
+        fn decodes_mixed_code_page_and_embedded_utf8_console_text() {
+            let bytes = b"caf\xe9 \x02\xff\xfe\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\x03\xff\xfe";
+            assert_eq!(
+                decode_windows_console_text_with_code_page(bytes, 1252),
+                "caf\u{e9} \u{65e5}\u{672c}\u{8a9e}"
+            );
+        }
+
+        #[test]
+        fn encodes_r_source_text_with_unicode_escapes_when_code_page_cannot_represent_it() {
+            assert_eq!(
+                encode_windows_r_source_text_with_code_page(
+                    "\u{65e5}\u{672c}\u{8a9e} \u{1f642}",
+                    1252,
+                ),
+                b"\\u65e5\\u672c\\u8a9e \\U0001f642"
+            );
+        }
+
+        #[test]
+        fn preserves_r_source_text_bytes_when_code_page_can_represent_it() {
+            assert_eq!(
+                encode_windows_r_source_text_with_code_page("caf\u{e9}", 1252),
+                b"caf\xe9"
+            );
+        }
+
+        #[test]
+        fn preserves_r_source_text_as_utf8_under_utf8_locale() {
+            assert_eq!(
+                encode_windows_r_source_text_with_code_page(
+                    "\u{65e5}\u{672c}\u{8a9e} \u{1f642}",
+                    65001,
+                ),
+                "\u{65e5}\u{672c}\u{8a9e} \u{1f642}".as_bytes()
             );
         }
     }

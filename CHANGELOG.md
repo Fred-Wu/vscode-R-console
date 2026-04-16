@@ -15,6 +15,7 @@ All notable changes to R Console will be documented in this file.
 - Nested prompts such as `browser()` now stay on the nested-input path instead of being misclassified as top-level prompts.
 - Submission preprocessing now strips real full-line R comments without removing quoted `#...` text such as `Rcpp::sourceCpp()` headers.
 - Embedded console startup now advertises ANSI color and dynamic redraw capabilities for packages such as `cli` and `crayon`.
+- Fixed a Windows R console Unicode regression, where some CJK characters and emoji could be evaluated or displayed incorrectly.
 
 ## [0.1.0] - 2026-04-13
 
