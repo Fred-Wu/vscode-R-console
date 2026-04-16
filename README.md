@@ -18,6 +18,8 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 - Close confirmation that immediately reattaches the running console before showing the modal prompt, which keeps the console visible despite the VS Code terminal API lacking a before-close hook.
 - Embedded console backend for macOS, Linux, and Windows.
 
+https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
+
 ## Requirements
 
 - VS Code 1.85.0 or later.
