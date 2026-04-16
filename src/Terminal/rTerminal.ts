@@ -154,8 +154,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   private lastOutputAt = 0;
 
   private mode: TerminalMode = "starting";
+  private submissionPending = false;
+  private awaitingExecutionStart = false;
   private pendingInputFlushTimer: NodeJS.Timeout | null = null;
   private pendingProgrammaticInput = "";
+  private runtimeHostAdapter!: RuntimeHost;
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
   private suppressNextEnterAfterPasteEnd = false;
@@ -201,6 +204,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     this.loadSettings();
+    this.runtimeHostAdapter = this.createRuntimeHost();
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
@@ -247,7 +251,217 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private runtimeHost(): RuntimeHost {
-    return this as unknown as RuntimeHost;
+    return this.runtimeHostAdapter;
+  }
+
+  private createRuntimeHost(): RuntimeHost {
+    const self = this;
+
+    const host: RuntimeHost = {
+      get options() {
+        return self.options;
+      },
+      set options(value) {
+        self.options = value;
+      },
+      get extensionPath() {
+        return self.extensionPath;
+      },
+      set extensionPath(value) {
+        self.extensionPath = value;
+      },
+      get runtimeBackend() {
+        return self.runtimeBackend;
+      },
+      set runtimeBackend(value) {
+        self.runtimeBackend = value;
+      },
+      get rProcess() {
+        return self.rProcess;
+      },
+      set rProcess(value) {
+        self.rProcess = value;
+      },
+      get backendChildPid() {
+        return self.backendChildPid;
+      },
+      set backendChildPid(value) {
+        self.backendChildPid = value;
+      },
+      get dimensions() {
+        return self.dimensions;
+      },
+      set dimensions(value) {
+        self.dimensions = value;
+      },
+      get mode() {
+        return self.mode;
+      },
+      set mode(value) {
+        self.mode = value;
+      },
+      get promptReady() {
+        return self.promptReady;
+      },
+      set promptReady(value) {
+        self.promptReady = value;
+      },
+      get promptKind() {
+        return self.promptKind;
+      },
+      set promptKind(value) {
+        self.promptKind = value;
+      },
+      get promptVisible() {
+        return self.promptVisible;
+      },
+      set promptVisible(value) {
+        self.promptVisible = value;
+      },
+      get replyPromptText() {
+        return self.replyPromptText;
+      },
+      set replyPromptText(value) {
+        self.replyPromptText = value;
+      },
+      get pendingPromptToken() {
+        return self.pendingPromptToken;
+      },
+      set pendingPromptToken(value) {
+        self.pendingPromptToken = value;
+      },
+      get pendingInitialPromptGap() {
+        return self.pendingInitialPromptGap;
+      },
+      set pendingInitialPromptGap(value) {
+        self.pendingInitialPromptGap = value;
+      },
+      get submissionPending() {
+        return self.submissionPending;
+      },
+      set submissionPending(value) {
+        self.submissionPending = value;
+      },
+      get awaitingExecutionStart() {
+        return self.awaitingExecutionStart;
+      },
+      set awaitingExecutionStart(value) {
+        self.awaitingExecutionStart = value;
+      },
+      get lastWriteEndedWithNewline() {
+        return self.lastWriteEndedWithNewline;
+      },
+      set lastWriteEndedWithNewline(value) {
+        self.lastWriteEndedWithNewline = value;
+      },
+      get hasReceivedOutput() {
+        return self.hasReceivedOutput;
+      },
+      set hasReceivedOutput(value) {
+        self.hasReceivedOutput = value;
+      },
+      get sessionAttached() {
+        return self.sessionAttached;
+      },
+      set sessionAttached(value) {
+        self.sessionAttached = value;
+      },
+      get sessionHostConnected() {
+        return self.sessionHostConnected;
+      },
+      set sessionHostConnected(value) {
+        self.sessionHostConnected = value;
+      },
+      get activeSubmission() {
+        return self.activeSubmission;
+      },
+      set activeSubmission(value) {
+        self.activeSubmission = value;
+      },
+      get submissionQueue() {
+        return self.submissionQueue;
+      },
+      set submissionQueue(value) {
+        self.submissionQueue = value;
+      },
+      get historyBrowsing() {
+        return self.historyBrowsing;
+      },
+      set historyBrowsing(value) {
+        self.historyBrowsing = value;
+      },
+      get historyCollapsed() {
+        return self.historyCollapsed;
+      },
+      set historyCollapsed(value) {
+        self.historyCollapsed = value;
+      },
+      get sessionWatcher() {
+        return self.sessionWatcher;
+      },
+      set sessionWatcher(value) {
+        self.sessionWatcher = value;
+      },
+      get inputState() {
+        return self.inputState;
+      },
+      set inputState(value) {
+        self.inputState = value;
+      },
+      get syntax() {
+        return self.syntax;
+      },
+      set syntax(value) {
+        self.syntax = value;
+      },
+      get renderer() {
+        return self.renderer;
+      },
+      set renderer(value) {
+        self.renderer = value;
+      },
+      get lang() {
+        return self.lang;
+      },
+      set lang(value) {
+        self.lang = value;
+      },
+      get writeEmitter() {
+        return self.writeEmitter;
+      },
+      set writeEmitter(value) {
+        self.writeEmitter = value;
+      },
+      get closeEmitter() {
+        return self.closeEmitter;
+      },
+      set closeEmitter(value) {
+        self.closeEmitter = value;
+      },
+      get nameEmitter() {
+        return self.nameEmitter;
+      },
+      set nameEmitter(value) {
+        self.nameEmitter = value;
+      },
+      clearPendingInputFlushTimer: () => self.clearPendingInputFlushTimer(),
+      clearPromptRenderTimer: () => self.clearPromptRenderTimer(),
+      clearReplyPromptRenderTimer: () => self.clearReplyPromptRenderTimer(),
+      schedulePrompt: () => self.schedulePrompt(),
+      scheduleReplyPrompt: () => self.scheduleReplyPrompt(),
+      clearInputRender: () => self.clearInputRender(),
+      renderInput: () => self.renderInput(),
+      recordOutputActivity: () => self.recordOutputActivity(),
+      isSessionProtocolActive: () => self.isSessionProtocolActive(),
+      isSessionReadyForPrompt: () => self.isSessionReadyForPrompt(),
+      startNextSubmission: () => self.startNextSubmission(),
+      finishActiveSubmission: () => self.finishActiveSubmission(),
+      getDisplayPid: () => self.getDisplayPid(),
+      notifyDisplayPidChanged: () => self.notifyDisplayPidChanged(),
+      onSessionDataChanged: (data) => self.onSessionDataChanged(data),
+    };
+
+    return host;
   }
 
   public refreshAppearance(): void {
@@ -750,11 +964,15 @@ export class RTerminal implements vscode.Pseudoterminal {
           this.clearInputRender();
           this.promptVisible = false;
         }
-        this.replayStartAbsoluteRow =
-          this.terminalState.buffer.active.baseY + this.terminalState.buffer.active.cursorY;
         this.withTerminalStateCaptureSuppressed(() => {
           this.writeEmitter.fire("\x1b[H\x1b[2J\x1b[3J");
         });
+        // Ctrl+L is a hard visual reset. Drop the replay buffer too so old
+        // output cannot reappear on resize or terminal reattach.
+        this.terminalState = this.createReplayTerminal();
+        this.replayStartAbsoluteRow = 0;
+        this.lastWriteEndedWithNewline = true;
+        this.pendingInitialPromptGap = false;
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
         if (this.promptReady) {
