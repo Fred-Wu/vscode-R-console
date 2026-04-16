@@ -24,6 +24,7 @@ const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
 const pidToRecord: Map<number, ConsoleRecord> = new Map();
 const editorCloseInProgress: Set<number> = new Set();
 const VSCODE_R_TERMINAL_NAME = "R Console";
+let extensionBaseUri: vscode.Uri | undefined;
 
 function isVirtualWorkspace(): boolean {
   const folders = vscode.workspace.workspaceFolders;
@@ -37,6 +38,7 @@ function refreshTerminalAppearance(): void {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+  extensionBaseUri = context.extensionUri;
   context.subscriptions.push(
     vscode.commands.registerCommand("r-console.createTerminal", () => {
       void createRTerminal(context);
@@ -252,7 +254,9 @@ function attachTerminal(
   const terminalOptions: vscode.ExtensionTerminalOptions = {
     name: VSCODE_R_TERMINAL_NAME,
     pty: record.rTerminal,
-    iconPath: new vscode.ThemeIcon("terminal")
+    iconPath: extensionBaseUri
+      ? vscode.Uri.joinPath(extensionBaseUri, "images", "Rlogo.png")
+      : new vscode.ThemeIcon("terminal")
   };
 
   if (record.location.kind === "editor") {
