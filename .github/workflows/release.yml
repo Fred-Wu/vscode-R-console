@@ -103,9 +103,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           name: R Console ${{ github.ref_name }}
+          body: |
+            Full changelog: https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
           files: |
             release-artifacts/*.vsix
             release-artifacts/SHA256SUMS.txt
           fail_on_unmatched_files: true
-          generate_release_notes: true
           overwrite_files: true
