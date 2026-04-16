@@ -2,7 +2,7 @@
 
 R Console is a VS Code extension that runs R inside a custom pseudoterminal. It combines a TypeScript console frontend, a bundled Rust sidecar that embeds R directly, and a console-scoped language server client. It is designed to work with VS Code, the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) extension, and R's `languageserver`.
 
-Implementation details are documented in [docs/implmentation.md](docs/implmentation.md).
+Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 ## Features
 

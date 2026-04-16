@@ -96,13 +96,14 @@ When the user runs `r-console.createTerminal` or `r-console.createTerminalSide`:
 
 VS Code does not provide a terminal "before close" hook for custom terminals.
 
-Current behavior:
+Current behavior differs slightly between panel terminals and side-editor tabs, but the shutdown model is the same:
 
-1. `onDidCloseTerminal` fires after VS Code closes the tab
-2. if the R console is still running, the extension immediately reattaches the same `RTerminal` instance to a new terminal tab
-3. it then shows the modal confirmation dialog
-4. if the user confirms close, the backend is shut down
-5. if the user cancels, the reattached terminal remains visible
+1. panel terminals are detected from `onDidCloseTerminal`
+2. side-editor terminals are detected from tab-close events and then resolved back to the same console record by pid
+3. if the R console is still running, the extension immediately reattaches the same `RTerminal` instance to a new terminal tab
+4. it then shows the modal confirmation dialog
+5. if the user confirms close, the backend is shut down
+6. if the user cancels, the reattached terminal remains visible
 
 This is implemented in [`src/extension.ts`](../src/extension.ts).
 
@@ -164,31 +165,48 @@ How those settings are used in practice:
 
 ### 4.3 Startup environment
 
-The extension builds the runtime environment before launching the sidecar.
+The runtime launch environment is assembled in two stages:
 
-Important environment values:
+1. [`src/Terminal/options.ts`](../src/Terminal/options.ts) builds the shared base environment while resolving startup options
+2. [`src/Terminal/rTerminal/runtime.ts`](../src/Terminal/rTerminal/runtime.ts) adds launch-only values such as the current terminal size and the active console bootstrap script immediately before spawning the sidecar
+
+Base environment values:
 
 - `VSCODE_INIT_R`
   points to `vscode-R`'s `init.R`
 - `VSCODE_WATCHER_DIR`
   points to the watcher directory used by `vscode-R`
-- `R_PROFILE_USER`
-  is replaced with this extension's own `console-profile.R`
 - `R_PROFILE_USER_OLD`
   preserves the user's previous `R_PROFILE_USER`
 - `VSC_R_EXECUTABLE`
   keeps the original configured R binary path
+- `COLORTERM`
+  is set to `truecolor`
+- `R_CLI_NUM_COLORS`
+  is set to `256`
+- `R_CLI_DYNAMIC`
+  is set to `true`
+
+Launch-time environment values:
+
+- `R_PROFILE_USER`
+  is replaced with this extension's own `console-profile.R`
 - `VSC_R_COLS`
   initial console width
 - `VSC_R_ROWS`
   initial row count
 - `VSC_R_SESSION_CWD`
   workspace cwd when available
+- `VSC_R_EXT`
+  extension install path used to resolve bundled resources
 
 The extension also sets the normal R environment such as `R_HOME`, `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR`, `PATH`, and platform-specific loader paths.
 
 `R_HOME` is forced from the selected executable instead of inheriting an
 unrelated outer-process `R_HOME`.
+
+The ANSI and `cli` / `crayon` capability hints are currently env-based rather
+than R-option-based because the embedded host is not a real tty.
 
 ### 4.4 `console-profile.R`
 
@@ -203,6 +221,9 @@ This is part of the reason the extension depends on `vscode-R`: the console want
 Implementation details inside `console-profile.R`:
 
 - it temporarily restores the user's original `R_PROFILE_USER` from `R_PROFILE_USER_OLD` before sourcing the user's profile
+- profile lookup order is:
+  `R_PROFILE_USER_OLD` if set, otherwise working-directory `.Rprofile`, otherwise `~/.Rprofile`
+- the working directory is normally the selected workspace folder, so workspace `.Rprofile` is usually preferred over the global user profile when no explicit `R_PROFILE_USER` was present
 - after user profile sourcing, it runs vscode-R bootstrap from `VSCODE_INIT_R` inside `tryCatch(...)` so bootstrap failures are reported but do not crash the whole console session
 - it replaces `options(pager=...)` with a console pager implemented in R so pager navigation stays inside the terminal
 - it locks `options(prompt=...)`, `options(continue=...)`, and `options(menu.graphics=...)` while the console is active so the embedded console prompt contract stays stable
@@ -314,6 +335,7 @@ Current submit behavior is intentionally simple:
 
 - when the current input is already fully visible and stable, the visible input can be reused
 - otherwise, the live input render is cleared and the submission is echoed once
+- before block splitting, submission normalization strips only true full-line R comment tokens; quoted `#...` text such as `Rcpp::sourceCpp()` headers is preserved
 - the submission echo uses `ConsoleSyntax.snapshotNow(...)`
 - there is no second async restyle/rewrite pass for submitted code
 
@@ -494,11 +516,12 @@ The watcher integration lives in [`src/Runtime/sessionWatcher.ts`](../src/Runtim
 
 ### 10.1 What it watches
 
-It watches files created by `vscode-R` under `VSCODE_WATCHER_DIR`:
+It watches lock files created by `vscode-R` under `VSCODE_WATCHER_DIR` and
+then reads the corresponding data files:
 
-- `request.log`
-- `workspace.lock`
-- `workspace.json`
+- root `request.lock`, then reads root `request.log`
+- attached-session `workspace.lock`, then reads session `workspace.json`
+- the attached session directory itself until `workspace.lock` appears for the first time
 
 ### 10.2 What it gets from `vscode-R`
 
@@ -706,15 +729,18 @@ Current Windows callback set includes:
 
 ### 12.6 Event pump
 
-Windows idle/event pumping does not use the Unix input-handler APIs.
+Windows idle/event pumping is centered on the Windows / graphapp message loop,
+but it does not stop there.
 
 Current behavior:
 
-- `GA_peekevent()` is called when available
+- the explicit idle pump drains the Windows message queue with `PeekMessageW` / `DispatchMessageW`
+- optional input handlers still run through `R_checkActivity`, `R_runHandlers`, and `R_InputHandlers` when those symbols are available
+- `later` callbacks are executed when `later.dll` is loaded
 - `R_ProcessEvents()` is called when available
-- this is done from both the explicit idle pump and the callback path
+- the callback path (`process_events_callback` / `polled_events_callback`) also pumps Windows messages and available handlers
 
-This is what keeps Windows graphapp/help/GUI event processing moving while the console is waiting for input.
+This is what keeps Windows graphapp/help/GUI event processing moving while the console is waiting for input, while still servicing handler-driven and `later`-driven work.
 
 ### 12.7 Interrupt model
 
@@ -746,6 +772,13 @@ The same high-level state machine exists on both platforms:
 - dialog requests are bridged back to VS Code
 
 This means most frontend behavior is platform-independent even though the embedded-R wiring is platform-specific.
+
+One important shared contract is prompt classification:
+
+- only the locked console prompts `> ` and `+ ` are treated as top-level prompts
+- everything else, including history-enabled prompts such as `Browse[1]>`, is treated as nested input
+
+That shared rule is why `browser()`, pager prompts, and other nested reads now behave consistently on both Unix and Windows.
 
 ## 14. Recent Backend-Adjacent Fixes
 
