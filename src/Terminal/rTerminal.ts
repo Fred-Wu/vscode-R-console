@@ -1323,8 +1323,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     const fullText = this.inputState.text;
     if (!fullText.trim()) {
       this.inputState.reset();
-      this.promptVisible = false;
-      this.writeEmitter.fire("\r\n");
+      if (this.promptVisible) {
+        this.clearInputRender();
+        this.promptVisible = false;
+      }
+      // Write the styled empty-prompt line unsuppressed so it is captured into
+      // terminalState. Without this, only a bare \r\n was recorded there, and
+      // the "R> " characters would disappear from the visible screen after a
+      // resize replay (which rebuilds the viewport solely from terminalState).
+      this.writeEmitter.fire(
+        `${ANSI.reset}${this.renderer.promptColor}${this.renderer.promptText}${ANSI.reset}\r\n`
+      );
       this.lastWriteEndedWithNewline = true;
       this.renderer.renderedLineCount = 1;
       this.renderer.cursorRowFromTop = 0;
@@ -2027,10 +2036,13 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         this.writeEmitter.fire(line);
       });
-      if (replay.lines.length > 0) {
-        // Advance to the next line, ready for the prompt (or cursor rest).
-        this.writeEmitter.fire("\r\n");
-      }
+      // No trailing \r\n here: showPrompt() always fires \r\n before calling
+      // the suppressed renderInput(), so the headless terminal's cursor row is
+      // a blank line that is already the last entry in replay.lines. Writing
+      // on that row (renderFreshWithCursor starts with \r) places the prompt
+      // exactly where it belongs. An extra \r\n would push one row too far,
+      // producing a visible blank line between the last history entry and the
+      // fresh prompt.
 
       if (restorePrompt) {
         const plan = this.buildCurrentInputRenderPlan();
