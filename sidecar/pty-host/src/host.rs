@@ -603,11 +603,7 @@ mod unix_host {
         };
 
         let prompt_text = c_string_to_string(prompt);
-        let wait_kind = if add_history != 0 {
-            WaitKind::TopLevel(prompt_kind_from_prompt(&prompt_text))
-        } else {
-            WaitKind::Nested(prompt_text)
-        };
+        let wait_kind = classify_wait_kind(&prompt_text, add_history);
         let mut wait_event_emitted = false;
         let mut state = runtime.state.lock().expect("host state lock poisoned");
 
@@ -924,6 +920,19 @@ mod unix_host {
         } else {
             PromptKind::Main
         }
+    }
+
+    fn classify_wait_kind(prompt_text: &str, add_history: c_int) -> WaitKind {
+        if add_history != 0 && is_top_level_prompt(prompt_text) {
+            WaitKind::TopLevel(prompt_kind_from_prompt(prompt_text))
+        } else {
+            WaitKind::Nested(prompt_text.to_string())
+        }
+    }
+
+    fn is_top_level_prompt(prompt: &str) -> bool {
+        let trimmed = prompt.trim_end_matches(['\r', '\n']);
+        trimmed == "> " || trimmed == ">" || trimmed == "+ " || trimmed == "+"
     }
 
     fn split_submission_lines(code: &str) -> VecDeque<Vec<u8>> {
@@ -2068,11 +2077,7 @@ mod windows_host {
         };
 
         let prompt_text = c_string_to_string(prompt);
-        let wait_kind = if add_history != 0 {
-            WaitKind::TopLevel(prompt_kind_from_prompt(&prompt_text))
-        } else {
-            WaitKind::Nested(prompt_text)
-        };
+        let wait_kind = classify_wait_kind(&prompt_text, add_history);
         let mut wait_event_emitted = false;
         let mut state = runtime.state.lock().expect("host state lock poisoned");
 
@@ -2398,6 +2403,19 @@ mod windows_host {
         } else {
             PromptKind::Main
         }
+    }
+
+    fn classify_wait_kind(prompt_text: &str, add_history: c_int) -> WaitKind {
+        if add_history != 0 && is_top_level_prompt(prompt_text) {
+            WaitKind::TopLevel(prompt_kind_from_prompt(prompt_text))
+        } else {
+            WaitKind::Nested(prompt_text.to_string())
+        }
+    }
+
+    fn is_top_level_prompt(prompt: &str) -> bool {
+        let trimmed = prompt.trim_end_matches(['\r', '\n']);
+        trimmed == "> " || trimmed == ">" || trimmed == "+ " || trimmed == "+"
     }
 
     fn split_submission_lines(code: &str) -> VecDeque<Vec<u8>> {

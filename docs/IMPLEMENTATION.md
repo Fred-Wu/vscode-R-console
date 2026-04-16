@@ -1,6 +1,6 @@
-# Backend Implementation And Windows Test Handoff
+# Implementation
 
-This document is the current architecture note for `vscode-R-console`.
+This document is the current implementation note for `vscode-R-console`.
 
 It is written for another engineer or Codex instance that needs to understand:
 
@@ -27,6 +27,31 @@ Important correction:
 
 - `R_CONSOLE_HOST` is not a wrapper around a second internal session-host process.
 - The sidecar process is the embedded host.
+
+### 1.1 Integration summary
+
+This extension sits between VS Code, `vscode-R`, and `languageserver` rather than replacing them.
+
+`vscode-R` integration:
+
+- provides the configured `r.rpath.*` executable that R Console prefers at startup
+- provides `R/session/init.R`, which is required for bootstrap
+- provides the watcher/session-server files under `VSCODE_WATCHER_DIR`
+- provides the session state used for search-path updates, workspace/global-environment data, and `$` / `@` member completion
+
+`languageserver` integration:
+
+- runs in a separate R process started by `resources/r/console-language-server.R`
+- receives console-scoped virtual `r-console://` documents from the extension
+- provides completion, signature help, and semantic tokens for the console buffer
+- receives synchronized attached-package and loaded-namespace state from the active session
+- has diagnostics disabled for console buffers, and cleans up virtual documents on close
+
+VS Code integration:
+
+- hosts the extension entrypoint and the custom pseudoterminal lifecycle
+- provides terminal, tab, dialog, workspace-trust, and color-theme events used by the console
+- remains the UI layer, while `vscode-R` and `languageserver` provide R-specific bootstrap and language intelligence
 
 ## 2. Packaging And Installed Binaries
 
@@ -114,6 +139,29 @@ If that file is missing, startup is rejected.
 
 This means the console is intentionally coupled to `vscode-R`'s session bootstrap model.
 
+Implementation details:
+
+- [`src/Terminal/options.ts`](../src/Terminal/options.ts) calls `vscode.extensions.getExtension("REditorSupport.r")` and resolves the installed extension path through the VS Code extension host.
+- startup fails early if the extension is not installed or if `R/session/init.R` is missing from that installation
+- the console does not try to reproduce vscode-R bootstrap logic itself; it delegates bootstrap to that `init.R`
+- this is why there is no real standalone mode even though the terminal UI and the embedded host live in this repo
+
+`vscode-R` settings and behaviors consumed directly by this extension:
+
+- `r.rpath.windows`, `r.rpath.mac`, `r.rpath.linux`
+- `r.rterm.option`
+- `r.sessionWatcher`
+- `r.bracketedPaste`
+- `r.alwaysUseActiveTerminal`
+
+How those settings are used in practice:
+
+- `r.rpath.*` selects the R executable that both the embedded host and the console LSP use
+- `r.rterm.option` is sanitized and forwarded, but wrapper-specific flags are removed and incompatible flags such as `--vanilla` / `--no-init-file` are rejected
+- `r.sessionWatcher` controls whether the console watches vscode-R session files and enables session-aware completion/state sync
+- `r.bracketedPaste` controls editor-send / paste behavior compatibility
+- `r.alwaysUseActiveTerminal` influences whether the created R Console grabs focus immediately
+
 ### 4.3 Startup environment
 
 The extension builds the runtime environment before launching the sidecar.
@@ -151,6 +199,15 @@ unrelated outer-process `R_HOME`.
 3. it replaces the pager so `file.show()` stays inside the console
 
 This is part of the reason the extension depends on `vscode-R`: the console wants the same session bootstrap/watcher behavior as the normal `vscode-R` workflow.
+
+Implementation details inside `console-profile.R`:
+
+- it temporarily restores the user's original `R_PROFILE_USER` from `R_PROFILE_USER_OLD` before sourcing the user's profile
+- after user profile sourcing, it runs vscode-R bootstrap from `VSCODE_INIT_R` inside `tryCatch(...)` so bootstrap failures are reported but do not crash the whole console session
+- it replaces `options(pager=...)` with a console pager implemented in R so pager navigation stays inside the terminal
+- it locks `options(prompt=...)`, `options(continue=...)`, and `options(menu.graphics=...)` while the console is active so the embedded console prompt contract stays stable
+
+That means `vscode-R` is not just a startup prerequisite. Its bootstrap script is part of the live session model that the console expects to run for every session.
 
 ## 5. Runtime Backend Protocol
 
@@ -274,6 +331,17 @@ Current model:
 - wrapped lines are reassembled into logical lines
 - cursor position is restored after replay
 
+The same replay buffer is also used for resize recovery:
+
+- the viewport and scrollback are cleared first
+- the saved logical lines are replayed at the new width so xterm can wrap them again naturally
+- if the live prompt is visible, it is rendered again after the replay pass
+
+Important related behavior:
+
+- `Ctrl+L` resets the replay terminal itself, not just the visible viewport
+- cleared output therefore stays cleared after both resize and reattach
+
 Relevant implementation:
 
 - [`src/Terminal/rTerminal.ts`](../src/Terminal/rTerminal.ts)
@@ -329,6 +397,13 @@ It is a separate R process started with:
 - the configured R binary
 - `resources/r/console-language-server.R`
 
+Implementation details:
+
+- each `RTerminal` owns one [`RTermLang`](../src/Terminal/rTerminal/lang.ts) instance
+- `RTermLang` lazily creates one [`ConsoleLspClient`](../src/Language/consoleLspClient.ts) per console session
+- the client uses a unique console id and a dedicated temp working directory under the system temp folder
+- the console LSP uses the same resolved `rPath` as the embedded runtime, so language features follow the same R installation as the running console
+
 ### 9.2 Transport choice
 
 The LSP transport is:
@@ -337,6 +412,13 @@ The LSP transport is:
 - loopback socket otherwise
 
 Windows uses the socket path, not stdio.
+
+Implementation details:
+
+- the stdio path starts `R` directly through `vscode-languageclient`
+- the socket path first opens a loopback server in the extension host, exports the chosen port through `VSCR_LSP_PORT`, then spawns `R` separately and waits for the language server to connect back
+- Windows always uses the socket path to avoid the stdio/backend interaction problems that the console already has to manage for the embedded host
+- stderr from the spawned LSP process is captured by the client, while normal LSP traffic goes over either stdio or the socket transport
 
 ### 9.3 `console-language-server.R`
 
@@ -347,8 +429,19 @@ Windows uses the socket path, not stdio.
 3. verifies that the `languageserver` package is installed
 4. starts `languageserver`
 5. overrides `textDocument/semanticTokens/full` with a synchronous helper
-6. adds a custom request:
+6. disables diagnostics for console-only buffers
+7. overrides `textDocument/didClose` so `r-console://` documents are removed cleanly even though they have no filesystem path
+8. adds a custom request:
    `rConsole/syncSessionState`
+
+Implementation details:
+
+- the script extends `.libPaths()` from `VSCR_LIB_PATHS` and optionally from `renv::paths$cache()` when `VSCR_USE_RENV_LIB_PATH` is enabled
+- it exits with status code `10` when `languageserver` is missing; the TypeScript client treats that as the "package not installed" signal and warns the user
+- it applies `languageserver` option-derived settings, then forces diagnostics off for console buffers
+- it replaces `textDocument/semanticTokens/full` with a synchronous helper so the console can request semantic tokens deterministically for its virtual documents
+- it special-cases `textDocument/didClose` because the console uses `r-console://...` virtual URIs rather than real workspace files
+- it accepts console session state from the extension and pushes attached packages / loaded namespaces into the server workspace so completion and semantic context reflect the live console session more closely
 
 ### 9.4 Session-state sync
 
@@ -359,6 +452,13 @@ The extension sends session state to the console LSP:
 
 That lets the LSP side know more about the live console session than a plain static text document would.
 
+Implementation details:
+
+- [`RTermLang`](../src/Terminal/rTerminal/lang.ts) converts `SessionWatcher` workspace data into a `ConsoleLspSessionState`
+- only package and namespace changes trigger a new sync; identical state is ignored
+- [`ConsoleLspClient`](../src/Language/consoleLspClient.ts) sends that state through the custom `rConsole/syncSessionState` request after ensuring the client is running
+- the R-side handler updates `startup_packages`, refreshes loaded-package state, and eagerly loads namespace metadata when possible
+
 ### 9.5 Completion sources
 
 Completion is merged from:
@@ -367,6 +467,26 @@ Completion is merged from:
 - `languageserver`
 - session watcher workspace state
 - live member completion requests through the `vscode-R` session server for `$` and `@`
+
+Implementation details:
+
+- the current console input is mirrored into a long-lived virtual completion document
+- completion requests manually send `textDocument/didOpen` / `didChange` notifications before each request so document state is ordered correctly
+- semantic-token requests use short-lived snapshot virtual documents so one semantic request cannot corrupt the completion document state
+- the completion pipeline prefers `languageserver` and session data, but can fall back to recent console/session identifiers when the language server does not return useful symbols
+- `$` and `@` completions can bypass `languageserver` and go through vscode-R's session server when a live object/member lookup is needed
+
+### 9.6 Error handling and lifecycle
+
+The console LSP is intentionally quiet from the VS Code UI point of view.
+
+Current behavior:
+
+- client connection errors are suppressed as global popups
+- shutdown close messages are suppressed when the console is intentionally disposing the client
+- the client explicitly sends `workspace/didChangeConfiguration` with diagnostics disabled
+- on stop/dispose, the client sends `textDocument/didClose` for all still-synced console documents before tearing the process down
+- if a spawned R language-server process exits with code `10`, the console warns that the `languageserver` package is required
 
 ## 10. `vscode-R` Session Watcher Integration
 
@@ -395,6 +515,14 @@ From `workspace.json`:
 - loaded namespaces
 - global environment summary
 
+Implementation details:
+
+- attach/detach/session metadata are read from `request.log`
+- workspace state is reloaded from `workspace.json` when `workspace.lock` changes
+- if the console does not yet know which session PID it belongs to, it auto-pins to the first fresh attach request it sees
+- once pinned, it ignores attach events from other R sessions so multiple active R sessions do not cross-contaminate console state
+- if vscode-R exposes an HTTP session server, the watcher also stores its host/port/token for later member-completion requests
+
 ### 10.3 Why it matters
 
 The watcher is used for:
@@ -403,6 +531,16 @@ The watcher is used for:
 - showing the real attached R pid when available
 - session-aware completion
 - passing package/namespace state to the console LSP
+
+Detailed flow:
+
+1. the console starts the watcher against `~/.vscode-R`
+2. vscode-R writes an attach event to `request.log`
+3. the watcher resolves the session tempdir and switches to that session's `vscode-R` directory
+4. `workspace.lock` changes cause `workspace.json` reloads
+5. workspace data is pushed into the terminal layer
+6. `RTermLang` converts that data into LSP session state
+7. member-completion HTTP requests use the stored session-server host/port/token when available
 
 ## 11. Unix Backend Implementation
 
@@ -640,6 +778,28 @@ Expected behavior after cancelling a close:
 ### 14.3 Immediate function-call coloring
 
 `plot(1:100)` should color `plot` as a function immediately, even if the user submits quickly.
+
+### 14.4 Resize replay and hard clear
+
+Recent terminal fixes changed both resize recovery and clear-screen semantics.
+
+Current expected behavior:
+
+- terminal resize rebuilds the visible console from the headless replay buffer
+- wrapped output is reflowed at the new width instead of replaying already-wrapped old rows
+- empty prompt-only submits keep the visible `R> ` line after resize
+- `Ctrl+L` clears the current viewport and also drops the replay buffer, so old content does not reappear later
+
+### 14.5 Console completion and LSP cleanup
+
+Recent console-language changes also affect what users should expect.
+
+Current expected behavior:
+
+- completion still prefers `languageserver` and session watcher data
+- when those sources are missing, recent console identifiers can still appear as fallback suggestions
+- console diagnostics are disabled
+- closing a console-scoped `r-console://` virtual document should not leave stale LSP workspace state behind
 
 ## 15. Windows Testing Checklist
 

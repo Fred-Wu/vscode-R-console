@@ -9,16 +9,52 @@ export function setNativeParseCallback(
 type LocalParseClassification = "complete" | "incomplete" | "unknown";
 
 export function stripCommentLines(code: string): string {
-  const lines = code.split(/\r?\n/);
-  const kept: string[] = [];
+  const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+  const lineStarts: number[] = [];
+  let offset = 0;
   for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith("#")) {
+    lineStarts.push(offset);
+    offset += line.length + 1;
+  }
+
+  const strippedLines = new Set<number>();
+  for (const token of tokenize(normalized)) {
+    if (token.type !== TokenType.Comment) {
       continue;
     }
-    kept.push(line);
+    const lineIndex = findLineIndex(lineStarts, token.position);
+    if (lineIndex < 0) {
+      continue;
+    }
+    const lineStart = lineStarts[lineIndex];
+    if (normalized.slice(lineStart, token.position).trim().length === 0) {
+      strippedLines.add(lineIndex);
+    }
   }
-  return kept.join("\n");
+
+  return lines.filter((_, index) => !strippedLines.has(index)).join("\n");
+}
+
+function findLineIndex(lineStarts: readonly number[], position: number): number {
+  let low = 0;
+  let high = lineStarts.length - 1;
+
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const start = lineStarts[mid];
+    const nextStart = mid + 1 < lineStarts.length ? lineStarts[mid + 1] : Number.POSITIVE_INFINITY;
+
+    if (position < start) {
+      high = mid - 1;
+    } else if (position >= nextStart) {
+      low = mid + 1;
+    } else {
+      return mid;
+    }
+  }
+
+  return -1;
 }
 
 enum TokenType {

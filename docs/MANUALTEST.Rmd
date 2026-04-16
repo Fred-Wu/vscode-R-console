@@ -1,4 +1,10 @@
-# R Console Manual Stress Test Plan
+---
+title: "R Console Manual Stress Test Plan"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
 
 This checklist is aimed at the parts of `R Console` that are easiest to get
 almost-right but still break in real use:
@@ -12,6 +18,11 @@ almost-right but still break in real use:
 
 These are intentionally tougher than basic smoke tests.
 
+All runnable snippets below are R Markdown chunks so VS Code can send them
+directly to the R Console. For sections that say "type slowly", "paste", or "at
+the prompt", use the chunk as source material and send lines manually instead of
+always sending the whole chunk.
+
 ## Suggested Setup
 
 Use a fresh VS Code window with:
@@ -24,7 +35,7 @@ Use a fresh VS Code window with:
 
 Optional packages used below:
 
-```r
+```{r setup-packages}
 install.packages(c(
   "languageserver",
   "shiny",
@@ -32,6 +43,7 @@ install.packages(c(
   "later",
   "promises",
   "Rcpp",
+  "reticulate",
   "cli",
   "crayon",
   "jsonlite",
@@ -44,16 +56,19 @@ install.packages(c(
 
 Run:
 
-```r
+```{r startup-and-prompt}
 sessionInfo()
 Sys.getenv(c("R_HOME", "R_PROFILE_USER", "VSCODE_INIT_R", "VSC_R_SESSION_CWD"))
-getOption(c("prompt", "continue", "menu.graphics"))
+getOption("prompt")
+getOption("continue") 
+getOption("menu.graphics")
 ```
 
 Expected:
 
 - console starts without hanging
-- prompt is stable and stays `R> ` / continuation prompt
+- the console UI prompt stays `R> ` and the continuation prompt stays stable
+- `getOption("prompt")` is `"> "` and `getOption("continue")` is `"+ "`
 - `menu.graphics` is `FALSE`
 - startup does not fall back to a different R installation unexpectedly
 
@@ -62,13 +77,13 @@ Failure signs:
 - blank console
 - duplicated prompt
 - prompt changes after startup
-- `sessionWatcher`/completion never warms up
+- `sessionWatcher` / completion never warms up
 
 ## 2. Multiline Editing And Parse Completeness
 
 Type this slowly by hand instead of pasting:
 
-```r
+```{r multiline-incomplete}
 if (TRUE) {
   x <- 1
   y <- x + 1
@@ -82,7 +97,7 @@ Expected:
 
 Then finish it:
 
-```r
+```{r multiline-complete}
 }
 y
 ```
@@ -97,20 +112,20 @@ Expected:
 
 Paste this as one expression:
 
-```r
+```{r long-input-one-line}
 very_long_name <- paste(sprintf("chunk_%03d", 1:200), collapse = " + ")
 ```
 
 Now edit in the middle, start, and end using:
 
-- Left/Right
-- Home/End
+- Left / Right
+- Home / End
 - Ctrl+A / Ctrl+E
 - Ctrl+Left / Ctrl+Right or Alt+B / Alt+F
 
 Then build a long multiline object:
 
-```r
+```{r long-input-multiline}
 z <- list(
   a = 1,
   b = 2,
@@ -138,7 +153,7 @@ Expected:
 
 Paste this whole block:
 
-```r
+```{r bracketed-paste}
 paste_test <- function(x = c("a", "b", "c")) {
   data.frame(
     txt = x,
@@ -151,21 +166,21 @@ paste_test()
 
 Then manually type:
 
-```r
+```{r auto-match-manual}
 list(
 ```
 
 Expected:
 
 - auto-match inserts `)` only once
-- paste does not add doubled brackets/quotes
+- paste does not add doubled brackets / quotes
 - Enter after a bracketed paste should not accidentally submit twice
 
 ## 5. History And Reverse Search
 
 Run:
 
-```r
+```{r history-setup}
 alpha_test <- 1
 beta_test <- 2
 gamma_test <- alpha_test + beta_test
@@ -173,14 +188,16 @@ gamma_test <- alpha_test + beta_test
 
 Then test:
 
-- Up/Down history navigation
-- `Ctrl+R`, search for `alpha_test`
-- press `Ctrl+R` again to keep searching backward
+- Up / Down history navigation
+- type `alpha_test`, then press `Ctrl+R` once to recall the previous matching entry
+- after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
 
 Expected:
 
 - multiline history entries are restored intact
+- `Ctrl+R` uses the current line text as the search term and recalls a matching history entry directly into the input buffer
+- there is no separate incremental reverse-search prompt that accepts a second search string
 - reverse search does not corrupt the current buffer
 - recalled command can be edited normally
 
@@ -188,7 +205,7 @@ Expected:
 
 Run:
 
-```r
+```{r readline-test}
 answer <- readline("Type something: ")
 answer
 ```
@@ -201,7 +218,7 @@ Expected:
 
 Run:
 
-```r
+```{r menu-test}
 menu(c("apple", "banana", "cherry"), title = "Pick one")
 ```
 
@@ -212,7 +229,7 @@ Expected:
 
 Run:
 
-```r
+```{r browser-test}
 f <- function() {
   x <- 1
   browser()
@@ -221,15 +238,16 @@ f <- function() {
 f()
 ```
 
-At the `Browse` prompt, try:
+At the `Browse[n]>` prompt, try:
 
-```r
+```{r browser-commands}
 x
 n
 ```
 
 Expected:
 
+- a visible `Browse[n]>` prompt appears
 - browser prompt is usable
 - nested prompt and normal prompt do not overlap
 - leaving `browser()` returns to the main console cleanly
@@ -238,7 +256,7 @@ Expected:
 
 Run:
 
-```r
+```{r pager-test}
 tf <- tempfile(fileext = ".txt")
 writeLines(sprintf("Line %03d", 1:120), tf)
 file.show(tf, title = "Pager Stress")
@@ -261,7 +279,7 @@ Expected:
 
 Run:
 
-```r
+```{r interrupt-repeat}
 repeat {
   Sys.sleep(0.2)
   cat("tick\n")
@@ -278,7 +296,7 @@ Expected:
 
 Then run:
 
-```r
+```{r interrupt-progress}
 for (i in 1:200) {
   cat(sprintf("\rprogress %03d/200", i))
   flush.console()
@@ -303,24 +321,19 @@ different output paths:
 
 Run:
 
-```r
-# Define the total number of iterations
+```{r txtprogressbar-test}
 n <- 100
-
-# style = 3 gives a compact progress bar with percentage
 pb <- txtProgressBar(min = 0, max = n, style = 3)
-
 for (i in 1:n) {
   Sys.sleep(0.01)
   setTxtProgressBar(pb, i)
 }
-
 close(pb)
 ```
 
 Then run:
 
-```r
+```{r cli-progress-test}
 if (requireNamespace("cli", quietly = TRUE)) {
   n <- 100
   cli::cli_progress_bar("Processing data", total = n)
@@ -334,7 +347,7 @@ if (requireNamespace("cli", quietly = TRUE)) {
 
 Then run:
 
-```r
+```{r progress-package-test}
 if (requireNamespace("progress", quietly = TRUE)) {
   pb <- progress::progress_bar$new(
     format = "  downloading [:bar] :percent eta: :eta",
@@ -359,7 +372,7 @@ Optional harder variant:
 Expected:
 
 - progress bars redraw mostly in place instead of printing hundreds of broken lines
-- percentage/bar text remains legible
+- percentage / bar text remains legible
 - ANSI styling from `cli` does not leak into later output or the prompt
 - prompt returns cleanly after completion
 - after an interrupt, the console still accepts the next command normally
@@ -375,7 +388,7 @@ Failure signs:
 
 Run:
 
-```r
+```{r output-flood}
 cat(paste(sprintf("row_%05d %s", 1:5000, strrep("x", 40)), collapse = "\n"), "\n")
 ```
 
@@ -390,20 +403,20 @@ Expected:
 
 Run:
 
-```r
+```{r unicode-width}
 txt <- c(
   "plain ASCII",
-  "accented caf\u00e9",
-  "combining e\u0301",
-  "\u65e5\u672c\u8a9e",
-  "\U0001f642 emoji"
+  "accented café",
+  "combining é",
+  "日本語",
+  "🙂 emoji"
 )
 enc2utf8(txt)
 ```
 
 Run:
 
-```r
+```{r ansi-styling}
 if (requireNamespace("crayon", quietly = TRUE)) {
   cat(crayon::red("red text"), "\n")
   cat(crayon::green$bold("bold green"), "\n")
@@ -417,13 +430,16 @@ Expected:
 
 - text is not mangled
 - cursor placement after wide characters is still sane
+- `red text` is visibly red
+- `bold green` is visibly bold green
+- the `cli` info marker is colored and not plain white
 - ANSI colors do not leak into the prompt
 
 ## 12. Completion, Signatures, And Session Watcher
 
 Run:
 
-```r
+```{r completion-setup}
 df_test <- data.frame(alpha = 1:3, beta = 4:6, gamma = 7:9)
 lm_test <- lm(mpg ~ wt + cyl, data = mtcars)
 ```
@@ -432,12 +448,13 @@ Now test in the console:
 
 - type `df_test$` and request completion
 - type `lm(` and request signature help
-- type `mtcars[` and request completion inside brackets
+- type `df_test[` and request completion inside brackets
 - type `stats::f` and request package completion
 
 Expected:
 
 - `$` completions include `alpha`, `beta`, `gamma`
+- `[` completions on `df_test` include `alpha`, `beta`, `gamma`
 - signature help shows `lm` arguments
 - completion still works after several commands, not just right after startup
 
@@ -449,15 +466,20 @@ Failure signs:
 
 ## 13. Editor-To-Console Integration
 
-Create a file `manual-editor-test.R` with:
+Create a file `manual-editor-test.R`:
 
-```r
-editor_value <- 123
-editor_square <- function(x) x^2
-editor_square(editor_value)
-
-editor_value <- editor_value + 1
-editor_square(editor_value)
+```{r create-editor-test-file}
+writeLines(
+  c(
+    "editor_value <- 123",
+    "editor_square <- function(x) x^2",
+    "editor_square(editor_value)",
+    "",
+    "editor_value <- editor_value + 1",
+    "editor_square(editor_value)"
+  ),
+  "manual-editor-test.R"
+)
 ```
 
 From the editor, test:
@@ -467,11 +489,22 @@ From the editor, test:
 - source entire file
 - repeat with the cursor in the middle of the file
 
+If you test with a literal console command instead of the editor action, use the
+correct filename:
+
+```{r editor-test-manual-source}
+source("manual-editor-test.R")
+editor_value
+editor_square(editor_value)
+```
+
 Expected:
 
 - code is sent to the active R Console, not some other terminal
 - echoed code appears once
 - object state matches the exact lines sent
+- plain `source("manual-editor-test.R")` may print nothing by itself; the state
+  checks above should return `124` and `15376`
 
 Also test with:
 
@@ -483,7 +516,7 @@ Also test with:
 
 Run:
 
-```r
+```{r base-plotting}
 op <- par(no.readonly = TRUE)
 on.exit(par(op), add = TRUE)
 par(mfrow = c(2, 2))
@@ -501,7 +534,7 @@ Expected:
 
 Then run several plots quickly:
 
-```r
+```{r many-plots}
 for (i in 1:10) {
   plot(rnorm(100), rnorm(100), main = paste("plot", i))
 }
@@ -515,7 +548,7 @@ Expected:
 
 If installed:
 
-```r
+```{r plotly-test}
 if (requireNamespace("plotly", quietly = TRUE)) {
   plotly::plot_ly(x = 1:10, y = (1:10)^2, type = "scatter", mode = "lines+markers")
 }
@@ -523,15 +556,16 @@ if (requireNamespace("plotly", quietly = TRUE)) {
 
 Expected:
 
-- htmlwidget output opens in the expected VS Code/browser flow
+- htmlwidget output opens in the expected VS Code / browser flow
 - console remains usable afterward
 
 ## 16. Lightweight HTTP Server
 
 Run:
 
-```r
-if (requireNamespace("httpuv", quietly = TRUE)) {
+```{r httpuv-server}
+if (requireNamespace("httpuv", quietly = TRUE) &&
+    requireNamespace("jsonlite", quietly = TRUE)) {
   server <- httpuv::startServer("127.0.0.1", 8123, list(
     call = function(req) {
       list(
@@ -553,12 +587,13 @@ Open `http://127.0.0.1:8123/test`.
 Expected:
 
 - server responds
-- console stays responsive
-- interrupting or stopping the server returns the prompt cleanly
+- prompt returns immediately after startup
+- console stays responsive while the server is running
+- stopping the server with `server$stop()` leaves a clean prompt
 
 Cleanup:
 
-```r
+```{r httpuv-server-stop}
 if (exists("server")) server$stop()
 ```
 
@@ -566,7 +601,7 @@ if (exists("server")) server$stop()
 
 Run:
 
-```r
+```{r shiny-app}
 if (requireNamespace("shiny", quietly = TRUE)) {
   app <- shiny::shinyApp(
     ui = shiny::fluidPage(
@@ -596,20 +631,47 @@ if (requireNamespace("shiny", quietly = TRUE)) {
 While the app is running:
 
 - change controls in the browser
-- return to VS Code and run another command if supported by the console state
 - stop the app with interrupt
 
 Expected:
 
 - app launches
 - reactive plot updates work
+- `shiny::runApp(...)` blocks the console until interrupted
 - stopping the app does not leave the console half-busy
 
-## 18. Compilation With `Rcpp`
+## 18. Python Via `reticulate`
+
+If installed and configured with a working Python:
+
+```{r reticulate-python}
+if (requireNamespace("reticulate", quietly = TRUE) &&
+    reticulate::py_available(initialize = TRUE)) {
+  reticulate::py_config()
+  reticulate::repl_python()
+}
+```
+
+At the Python prompt, type:
+
+- `1 + 1`
+- `import math`
+- `math.sqrt(9)`
+- `exit`
+
+Expected:
+
+- `reticulate::py_config()` prints the selected Python configuration cleanly
+- `reticulate::repl_python()` opens an interactive Python prompt such as `>>> `
+- Python expressions run at the Python prompt
+- `exit` returns to a clean `R> ` prompt
+- subsequent R commands still work in the same console
+
+## 19. Compilation With `Rcpp`
 
 Run:
 
-```r
+```{r rcpp-basic}
 if (requireNamespace("Rcpp", quietly = TRUE)) {
   Rcpp::sourceCpp(code = '
     #include <Rcpp.h>
@@ -632,7 +694,7 @@ Expected:
 
 Optional harder variant:
 
-```r
+```{r rcpp-crossprod}
 if (requireNamespace("Rcpp", quietly = TRUE)) {
   Rcpp::sourceCpp(code = '
     #include <Rcpp.h>
@@ -661,19 +723,37 @@ if (requireNamespace("Rcpp", quietly = TRUE)) {
 }
 ```
 
-## 19. `source()`, Errors, Warnings, And Tracebacks
+Expected:
+
+- compiler output still leaves the prompt clean
+- compiled code runs in the current session
+- result is:
+
+```text
+     [,1] [,2] [,3]
+[1,]   14   32   50
+[2,]   32   77  122
+[3,]   50  122  194
+```
+
+## 20. `source()`, Errors, Warnings, And Tracebacks
 
 Create a file `manual-source-test.R`:
 
-```r
-message("starting source test")
-warning("source warning")
-stop("source error")
+```{r create-source-test-file}
+writeLines(
+  c(
+    'message("starting source test")',
+    'warning("source warning")',
+    'stop("source error")'
+  ),
+  "manual-source-test.R"
+)
 ```
 
 Run:
 
-```r
+```{r source-error-test}
 source("manual-source-test.R")
 traceback()
 ```
@@ -684,7 +764,7 @@ Expected:
 - traceback is printed correctly
 - prompt returns after the error
 
-## 20. Resize And Reattach
+## 21. Resize And Reattach
 
 While the console contains scrollback and a partially edited multiline command:
 
@@ -696,24 +776,24 @@ While the console contains scrollback and a partially edited multiline command:
 Expected:
 
 - input buffer survives resize
-- prompt/input do not duplicate
+- prompt / input do not duplicate
 - reattached console restores visible state reasonably well
 - cancelling close keeps the running session alive
 
-## 21. Two Concurrent Consoles
+## 22. Two Concurrent Consoles
 
 Open two R Console instances.
 
 In console A:
 
-```r
+```{r console-a}
 whoami <- "A"
 df_a <- data.frame(a_only = 1:3)
 ```
 
 In console B:
 
-```r
+```{r console-b}
 whoami <- "B"
 df_b <- data.frame(b_only = 4:6)
 ```
@@ -726,14 +806,14 @@ Then in each console test:
 
 Expected:
 
-- outputs and completions stay scoped to the correct console/session
-- watcher/LSP state from one console does not bleed into the other
+- outputs and completions stay scoped to the correct console / session
+- watcher / LSP state from one console does not bleed into the other
 
 ## Good Final Smoke Check
 
 After running several of the tests above, the console should still handle:
 
-```r
+```{r final-smoke-check}
 1 + 1
 plot(1:10)
 readline("still alive? ")

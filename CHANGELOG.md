@@ -2,6 +2,20 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.1.1] - 2026-04-16
+
+### Changed
+- Console resize now rebuilds the visible terminal from the headless replay buffer so wrapped output and prompt placement stay stable after width changes.
+- Console completion now falls back to recent console/session identifiers when the language server does not return a useful symbol.
+
+### Fixed
+- `Ctrl+L` now performs a true clear by resetting both the visible console and the replay buffer, so cleared output does not come back after resize or reattach.
+- Empty prompt submissions now preserve the visible `R> ` line during replay-driven resize restores instead of dropping it.
+- Console-scoped LSP documents now close cleanly for `r-console://` URIs, and diagnostics are disabled for console buffers.
+- Nested prompts such as `browser()` now stay on the nested-input path instead of being misclassified as top-level prompts.
+- Submission preprocessing now strips real full-line R comments without removing quoted `#...` text such as `Rcpp::sourceCpp()` headers.
+- Embedded console startup now advertises ANSI color and dynamic redraw capabilities for packages such as `cli` and `crayon`.
+
 ## [0.1.0] - 2026-04-13
 
 ### Added

@@ -2,26 +2,7 @@
 
 R Console is a VS Code extension that runs R inside a custom pseudoterminal. It combines a TypeScript console frontend, a bundled Rust sidecar that embeds R directly, and a console-scoped language server client. It is designed to work with VS Code, the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) extension, and R's `languageserver`.
 
-## Architecture
-
-### Runtime Layers
-
-1. Terminal layer owns the pseudoterminal implementation, input buffer, cursor movement, multiline editing, history, the long-input viewport renderer, prompt handling, and an off-screen `@xterm/headless` buffer used to restore screen and scrollback state on reattach.
-
-2. Language layer owns completion-context analysis, local parse heuristics, immediate token-based styling, virtual documents, and the console-specific LSP bridge.
-
-3. Runtime layer owns the sidecar/session control protocol, bundled binary resolution, dialog bridging, and the vscode-R session watcher bridge.
-
-4. Rust sidecar
-- `sidecar/pty-host/` builds one binary:
-- `R_CONSOLE_HOST` is the embedded host. It does not spawn a second internal session-host process. It loads the R shared library dynamically, wires console callbacks, and emits prompt, busy, input-request, dialog, and parse-status events back to the extension over the backend protocol.
-
-
-### Dependency Model
-
-- `vscode-R` is a hard dependency. R Console uses the same configured R binary.
-- R's `languageserver` package is optional but required for console semantic tokens, completion, and signature help.
-- The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
+Implementation details are documented in [docs/implmentation.md](docs/implmentation.md).
 
 ## Features
 
@@ -95,13 +76,13 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.1.0-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.1.1-win32-x64.vsix`.
 
 `vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 
 Each target-specific VSIX contains exactly one platform-matching `R_CONSOLE_HOST` binary in `bundled/bin/`.
 
-The GitHub release workflow packages six target-specific builds: `win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`.
+Pushing a tag that matches `package.json`'s version, for example `v0.1.1`, runs the GitHub release workflow. It packages six target-specific builds (`win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`), generates `SHA256SUMS.txt`, and creates or updates the GitHub release for that tag. `workflow_dispatch` still acts as a packaging-only dry run.
 
 ## Configuration
 
@@ -128,6 +109,26 @@ R Console also contributes its own settings:
 | --- | --- | --- |
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
+
+## Architecture
+
+### Runtime Layers
+
+1. Terminal layer owns the pseudoterminal implementation, input buffer, cursor movement, multiline editing, history, the long-input viewport renderer, prompt handling, and an off-screen `@xterm/headless` buffer used to restore screen and scrollback state on reattach.
+
+2. Language layer owns completion-context analysis, local parse heuristics, immediate token-based styling, virtual documents, and the console-specific LSP bridge.
+
+3. Runtime layer owns the sidecar/session control protocol, bundled binary resolution, dialog bridging, and the vscode-R session watcher bridge.
+
+4. Rust sidecar
+- `sidecar/pty-host/` builds one binary:
+- `R_CONSOLE_HOST` is the embedded host. It does not spawn a second internal session-host process. It loads the R shared library dynamically, wires console callbacks, and emits prompt, busy, input-request, dialog, and parse-status events back to the extension over the backend protocol.
+
+### Dependency Model
+
+- `vscode-R` is a hard dependency. R Console uses the same configured R binary.
+- R's `languageserver` package is optional but required for console semantic tokens, completion, and signature help.
+- The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
 
 ## Project Layout
 
