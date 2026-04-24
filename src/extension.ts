@@ -19,6 +19,7 @@ type TerminalContext =
 type ConsoleRecord = {
   rTerminal: RTerminal;
   location: TerminalContext;
+  terminal?: vscode.Terminal;
   pid?: number;
   pidSubscription: vscode.Disposable;
 };
@@ -33,12 +34,20 @@ type PersistedReloadState = {
   consoles: PersistedConsoleRecord[];
 };
 
+type RestoredConsoleRecord = {
+  persisted: PersistedConsoleRecord;
+  record: ConsoleRecord;
+  terminal: vscode.Terminal;
+};
+
 const terminalToRecord: Map<vscode.Terminal, ConsoleRecord> = new Map();
 const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
 const pidToRecord: Map<number, ConsoleRecord> = new Map();
 const editorCloseInProgress: Set<number> = new Set();
+const ignoredEditorClosePids: Set<number> = new Set();
+const closeConfirmationInProgress = new WeakSet<ConsoleRecord>();
 const ignoredTerminalCloseEvents = new WeakSet<vscode.Terminal>();
-const VSCODE_R_TERMINAL_NAME = "R Console";
+const R_CONSOLE_PID_LABEL_PATTERN = /^R Console \((\d+)\)$/;
 let extensionBaseUri: vscode.Uri | undefined;
 let persistedSessionFilePath: string | undefined;
 
@@ -87,7 +96,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   await activateVscodeRExtension();
-  void restorePersistedSessions(context);
+  await restorePersistedSessions(context);
   syncTerminalRecordsFromWindow();
   void ensureConfiguredRPath();
 }
@@ -109,20 +118,47 @@ async function restorePersistedSessions(context: vscode.ExtensionContext): Promi
     return;
   }
 
-  for (const entry of persisted) {
-    const options = buildRestoredTerminalOptions(entry.terminal.options);
-    if (!options) {
-      continue;
+  const restored: RestoredConsoleRecord[] = [];
+  const restoringPids = new Set<number>();
+
+  try {
+    for (const entry of persisted) {
+      const options = buildRestoredTerminalOptions(entry.terminal.options);
+      if (!options) {
+        continue;
+      }
+
+      const pid = getPersistedRuntimePid(entry.terminal);
+      if (typeof pid === "number") {
+        restoringPids.add(pid);
+        ignoredEditorClosePids.add(pid);
+      }
+
+      const rTerminal = new RTerminal(options, context.extensionPath, entry.terminal);
+      const record = createConsoleRecord(rTerminal, entry.location);
+      const terminal = attachTerminal(record, true);
+      restored.push({
+        persisted: entry,
+        record,
+        terminal,
+      });
     }
 
-    const disposedStaleTerminal = disposeStalePersistedTerminal(entry.terminal);
-    if (disposedStaleTerminal) {
-      await waitForStalePersistedTerminalDisposed(entry.terminal);
+    if (restored.length === 0) {
+      return;
     }
 
-    const rTerminal = new RTerminal(options, context.extensionPath, entry.terminal);
-    const record = createConsoleRecord(rTerminal, entry.location);
-    attachTerminal(record, true);
+    const disposedStalePids = disposeStalePersistedTerminals(restored);
+    if (disposedStalePids.size > 0) {
+      await waitForStalePersistedTerminalsDisposed(restored);
+    }
+    if (restoringPids.size > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  } finally {
+    for (const pid of restoringPids) {
+      ignoredEditorClosePids.delete(pid);
+    }
   }
 }
 
@@ -140,41 +176,79 @@ function buildRestoredTerminalOptions(
   };
 }
 
-function disposeStalePersistedTerminal(state: PersistedRTerminalState): boolean {
-  const pid = state.runtime.pid;
-  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
-    return false;
+function disposeStalePersistedTerminals(restored: readonly RestoredConsoleRecord[]): Set<number> {
+  const restoredPids = new Set<number>();
+  const replacementTerminals = new Set<vscode.Terminal>();
+  for (const entry of restored) {
+    const pid = getPersistedRuntimePid(entry.persisted.terminal);
+    if (typeof pid === "number") {
+      restoredPids.add(pid);
+    }
+    replacementTerminals.add(entry.terminal);
   }
-  let disposed = false;
+
+  if (restoredPids.size === 0) {
+    return new Set<number>();
+  }
+
+  const disposedPids = new Set<number>();
   for (const terminal of vscode.window.terminals) {
-    if (parseConsolePidFromTerminal(terminal) !== pid) {
+    if (replacementTerminals.has(terminal)) {
+      continue;
+    }
+    const pid = parseConsolePidFromTerminal(terminal);
+    if (typeof pid !== "number" || !restoredPids.has(pid)) {
       continue;
     }
     ignoredTerminalCloseEvents.add(terminal);
+    ignoredEditorClosePids.add(pid);
     terminal.dispose();
-    disposed = true;
+    disposedPids.add(pid);
   }
-  return disposed;
+  return disposedPids;
 }
 
-async function waitForStalePersistedTerminalDisposed(
-  state: PersistedRTerminalState
+async function waitForStalePersistedTerminalsDisposed(
+  restored: readonly RestoredConsoleRecord[]
 ): Promise<void> {
-  const pid = state.runtime.pid;
-  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+  const restoredPids = new Set<number>();
+  const replacementTerminals = new Set<vscode.Terminal>();
+  for (const entry of restored) {
+    const pid = getPersistedRuntimePid(entry.persisted.terminal);
+    if (typeof pid === "number") {
+      restoredPids.add(pid);
+    }
+    replacementTerminals.add(entry.terminal);
+  }
+
+  if (restoredPids.size === 0) {
     return;
   }
 
   const deadline = Date.now() + 1000;
   while (Date.now() < deadline) {
-    const stillVisible = vscode.window.terminals.some(
-      (terminal) => parseConsolePidFromTerminal(terminal) === pid
-    );
+    const stillVisible = vscode.window.terminals.some((terminal) => {
+      if (replacementTerminals.has(terminal)) {
+        return false;
+      }
+      const pid = parseConsolePidFromTerminal(terminal);
+      return typeof pid === "number" && restoredPids.has(pid);
+    });
     if (!stillVisible) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+}
+
+function getPersistedRuntimePid(state: PersistedRTerminalState): number | undefined {
+  const runtimePid = state.runtime.pid;
+  if (isPositiveInteger(runtimePid)) {
+    return runtimePid;
+  }
+
+  const backendChildPid = state.ui.backendChildPid;
+  return isPositiveInteger(backendChildPid) ? backendChildPid : undefined;
 }
 
 async function loadPersistedSessions(currentSessionId: string): Promise<PersistedConsoleRecord[]> {
@@ -357,7 +431,7 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   const record = resolveRecordFromTerminal(closedTerminal);
   if (!record) return;
 
-  terminalToRecord.delete(closedTerminal);
+  detachTerminalFromRecord(record, closedTerminal);
 
   if (record.location.kind === "editor") {
     return;
@@ -484,8 +558,17 @@ function updateConsoleRecordPid(
 
   if (typeof pid === "number" && Number.isFinite(pid) && pid > 0) {
     pidToRecord.set(pid, record);
-    syncTerminalRecordForPid(pid);
     syncConsoleRecordLocationFromTabs(record);
+  }
+}
+
+function detachTerminalFromRecord(
+  record: ConsoleRecord,
+  terminal: vscode.Terminal
+): void {
+  terminalToRecord.delete(terminal);
+  if (record.terminal === terminal) {
+    record.terminal = undefined;
   }
 }
 
@@ -502,6 +585,7 @@ function disposeConsoleRecord(record: ConsoleRecord): void {
       terminalToRecord.delete(terminal);
     }
   }
+  record.terminal = undefined;
 }
 
 function reattachRunningTerminal(record: ConsoleRecord): vscode.Terminal {
@@ -510,25 +594,34 @@ function reattachRunningTerminal(record: ConsoleRecord): vscode.Terminal {
 }
 
 async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
+  if (closeConfirmationInProgress.has(record)) {
+    return;
+  }
+
   if (!record.rTerminal.isRunning()) {
     disposeConsoleRecord(record);
     return;
   }
 
-  const reattachedTerminal = reattachRunningTerminal(record);
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  closeConfirmationInProgress.add(record);
+  try {
+    const reattachedTerminal = reattachRunningTerminal(record);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-  const result = await vscode.window.showWarningMessage(
-    "Are you sure you want to close the R console?",
-    { modal: true },
-    "Close"
-  );
+    const result = await vscode.window.showWarningMessage(
+      "Are you sure you want to close the R console?",
+      { modal: true },
+      "Close"
+    );
 
-  if (result === "Close") {
-    disposeConsoleRecord(record);
-    record.rTerminal.forceClose();
-    terminalToRecord.delete(reattachedTerminal);
-    reattachedTerminal.dispose();
+    if (result === "Close") {
+      disposeConsoleRecord(record);
+      record.rTerminal.forceClose();
+      terminalToRecord.delete(reattachedTerminal);
+      reattachedTerminal.dispose();
+    }
+  } finally {
+    closeConfirmationInProgress.delete(record);
   }
 }
 
@@ -537,7 +630,7 @@ function attachTerminal(
   preserveFocusOverride?: boolean
 ): vscode.Terminal {
   const terminalOptions: vscode.ExtensionTerminalOptions = {
-    name: VSCODE_R_TERMINAL_NAME,
+    name: record.rTerminal.getTerminalName(),
     pty: record.rTerminal,
     iconPath: extensionBaseUri
       ? vscode.Uri.joinPath(extensionBaseUri, "images", "Rlogo.png")
@@ -550,6 +643,10 @@ function attachTerminal(
   }
 
   const terminal = vscode.window.createTerminal(terminalOptions);
+  if (record.terminal) {
+    terminalToRecord.delete(record.terminal);
+  }
+  record.terminal = terminal;
   terminalToRecord.set(terminal, record);
 
   const alwaysUseActive = vscode.workspace.getConfiguration("r").get<boolean>("alwaysUseActiveTerminal");
@@ -587,16 +684,7 @@ function resolveRecordFromTerminal(
     }
   }
 
-  const pid = parseConsolePidFromTerminal(terminal);
-  if (typeof pid !== "number") {
-    return undefined;
-  }
-
-  const record = pidToRecord.get(pid);
-  if (record) {
-    terminalToRecord.set(terminal, record);
-  }
-  return record;
+  return undefined;
 }
 
 function syncTerminalRecordsFromWindow(): void {
@@ -612,23 +700,6 @@ function syncTerminalRecord(terminal: vscode.Terminal): void {
 
   const record = resolveRecordFromTerminal(terminal);
   if (record) {
-    terminalToRecord.set(terminal, record);
-  }
-}
-
-function syncTerminalRecordForPid(pid: number): void {
-  const record = pidToRecord.get(pid);
-  if (!record) {
-    return;
-  }
-
-  for (const terminal of vscode.window.terminals) {
-    if (terminalToRecord.has(terminal)) {
-      continue;
-    }
-    if (parseConsolePidFromTerminal(terminal) !== pid) {
-      continue;
-    }
     terminalToRecord.set(terminal, record);
   }
 }
@@ -668,7 +739,7 @@ function getTerminalCandidateNames(terminal: vscode.Terminal): string[] {
 }
 
 function parseConsolePidFromLabel(label: string): number | undefined {
-  const match = label.match(/^R Console \((\d+)\)$/);
+  const match = label.match(R_CONSOLE_PID_LABEL_PATTERN);
   if (!match) {
     return undefined;
   }
@@ -716,6 +787,10 @@ function handleTerminalTabChange(event: vscode.TabChangeEvent): void {
 }
 
 async function handleEditorTerminalTabClosed(pid: number): Promise<void> {
+  if (ignoredEditorClosePids.has(pid)) {
+    return;
+  }
+
   if (editorCloseInProgress.has(pid)) {
     return;
   }

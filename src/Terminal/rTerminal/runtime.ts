@@ -48,6 +48,10 @@ type Dimensions = {
 
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
+type RuntimeAttachOptions = {
+  ignoreExistingSessionRequest?: boolean;
+};
+
 export type Submission = {
   code: string;
 };
@@ -204,17 +208,20 @@ export function startRuntime(host: RuntimeHost): void {
   }
 }
 
-export function primeRuntimeAttach(host: RuntimeHost): void {
+export function primeRuntimeAttach(
+  host: RuntimeHost,
+  options: RuntimeAttachOptions = {}
+): void {
   if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
     return;
   }
 
-  const runtimePid = host.runtimeBackend?.getPid(host.rProcess);
+  const runtimePid = host.runtimeBackend?.getPid(host.rProcess) ?? host.getDisplayPid();
   if (typeof runtimePid === "number" && Number.isFinite(runtimePid) && runtimePid > 0) {
     host.sessionWatcher.setExpectedPid(runtimePid);
   }
 
-  beginRuntimeAttach(host);
+  beginRuntimeAttach(host, options);
 }
 
 export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boolean = false): void {
@@ -254,14 +261,22 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
   });
 }
 
-function beginRuntimeAttach(host: RuntimeHost): void {
+function beginRuntimeAttach(
+  host: RuntimeHost,
+  options: RuntimeAttachOptions = {}
+): void {
   if (!host.sessionWatcher) {
     host.sessionAttached = true;
     return;
   }
 
   host.sessionWatcher.onAttach(() => onRuntimeAttached(host));
-  host.sessionWatcher.start();
+  host.sessionWatcher.start({
+    ignoreExistingRequest: options.ignoreExistingSessionRequest,
+  });
+  if (options.ignoreExistingSessionRequest) {
+    return;
+  }
   host.sessionWatcher.refresh();
   if (host.sessionWatcher.isAttached()) {
     onRuntimeAttached(host);

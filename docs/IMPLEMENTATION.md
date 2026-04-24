@@ -96,7 +96,8 @@ When the user runs `r-console.createTerminal` or `r-console.createTerminalSide`:
 
 VS Code does not provide a terminal "before close" hook for custom terminals.
 
-Current behavior differs slightly between panel terminals and side-editor tabs, but the shutdown model is the same:
+For user-initiated closes, behavior differs slightly between panel terminals
+and side-editor tabs, but the shutdown model is the same:
 
 1. panel terminals are detected from `onDidCloseTerminal`
 2. side-editor terminals are detected from tab-close events and then resolved back to the same console record by pid
@@ -104,6 +105,18 @@ Current behavior differs slightly between panel terminals and side-editor tabs, 
 4. it then shows the modal confirmation dialog
 5. if the user confirms close, the backend is shut down
 6. if the user cancels, the reattached terminal remains visible
+
+Extension-host restart uses a different path. Running consoles are persisted
+on deactivate, then restored as new `RTerminal` instances that reconnect to the
+existing sidecar sessions. The restored terminal UI is treated as the current
+owner of the console; stale VS Code terminal UI from before the host restart is
+disposed without close confirmation. Terminal ownership is not inferred from a
+PID label alone, because stale and restored terminal tabs can legitimately share
+the same `R Console (<pid>)` label during restore. The vscode-R session watcher
+is restarted in a "fresh attach only" mode, so a restored console does not
+consume the pre-existing global `request.log`. Users reattach vscode-R
+explicitly through the `R: (not attached)` status item or by running
+`.vsc.attach()` in the console.
 
 This is implemented in [`src/extension.ts`](../src/extension.ts).
 

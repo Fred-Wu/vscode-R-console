@@ -25,7 +25,10 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
-import { SessionWatcher, WorkspaceData } from "../Runtime/sessionWatcher";
+import {
+  SessionWatcher,
+  type WorkspaceData,
+} from "../Runtime/sessionWatcher";
 import {
   InputSnapshot,
   RTermLang,
@@ -46,6 +49,7 @@ import {
   getRuntimeTerminalName,
   interruptRuntime,
   attachRuntimeSession,
+  primeRuntimeAttach,
   updateRuntimeTerminalName,
   type RuntimeHost,
   startNextRuntimeSubmission,
@@ -266,6 +270,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (restoreState?.runtime && this.runtimeBackend) {
       this.applyPersistedUiSnapshot(restoreState.ui);
       this.rProcess = this.runtimeBackend.reconnect(restoreState.runtime);
+      primeRuntimeAttach(this.runtimeHost(), {
+        ignoreExistingSessionRequest: true,
+      });
       attachRuntimeSession(this.runtimeHost(), true);
       updateRuntimeTerminalName(this.runtimeHost());
     }
@@ -2333,6 +2340,10 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   getPid(): number | undefined {
     return this.getDisplayPid();
+  }
+
+  getTerminalName(): string {
+    return getRuntimeTerminalName(this.runtimeHost());
   }
 
   exportPersistentState(): PersistedRTerminalState | undefined {

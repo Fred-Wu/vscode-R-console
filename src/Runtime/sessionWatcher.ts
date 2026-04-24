@@ -36,6 +36,10 @@ type SessionServerInfo = {
   token: string;
 };
 
+type SessionWatcherStartOptions = {
+  ignoreExistingRequest?: boolean;
+};
+
 export type SessionMemberCompletionItem = {
   name: string;
   type?: string;
@@ -55,6 +59,7 @@ export class SessionWatcher {
   private expectedPidAutoPinned = false;
   private attachedPid: number | undefined;
   private server: SessionServerInfo | undefined;
+  private ignoreRequestsBefore: number | undefined;
 
   constructor(private watcherDir: string) {}
 
@@ -67,7 +72,7 @@ export class SessionWatcher {
     this.expectedPidAutoPinned = false;
   }
 
-  start(): void {
+  start(options: SessionWatcherStartOptions = {}): void {
     if (this.expectedPidAutoPinned) {
       this.expectedPid = undefined;
       this.expectedPidAutoPinned = false;
@@ -83,6 +88,7 @@ export class SessionWatcher {
     this.sessionDirWatcher?.close();
     this.sessionDirWatcher = undefined;
     this.startedAt = Date.now();
+    this.ignoreRequestsBefore = options.ignoreExistingRequest ? this.startedAt : undefined;
 
     fs.mkdirSync(this.watcherDir, { recursive: true });
     const lockFile = path.join(this.watcherDir, "request.lock");
@@ -181,6 +187,9 @@ export class SessionWatcher {
       return;
     }
     const stats = fs.statSync(requestFile);
+    if (this.ignoreRequestsBefore !== undefined && stats.mtimeMs < this.ignoreRequestsBefore) {
+      return;
+    }
     if (this.expectedPid === undefined && stats.mtimeMs < this.startedAt) {
       return;
     }
