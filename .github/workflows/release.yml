@@ -99,12 +99,47 @@ jobs:
           cd release-artifacts
           sha256sum *.vsix > SHA256SUMS.txt
 
+      - name: Generate release notes
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const pkg = require("./package.json");
+
+          const tag = process.env.GITHUB_REF_NAME || "";
+          const version = tag.startsWith("v") ? tag.slice(1) : pkg.version;
+          const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+          const heading = changelog.match(
+            new RegExp(`^## \\[${escapedVersion}\\][^\\n]*$`, "m")
+          );
+
+          if (!heading || heading.index === undefined) {
+            throw new Error(`CHANGELOG.md does not contain a section for ${version}`);
+          }
+
+          const sectionStart = heading.index;
+          const afterHeading = sectionStart + heading[0].length;
+          const nextSectionOffset = changelog.slice(afterHeading).search(/\n## \[/);
+          const sectionEnd =
+            nextSectionOffset === -1
+              ? changelog.length
+              : afterHeading + nextSectionOffset;
+
+          const releaseNotes = [
+            changelog.slice(sectionStart, sectionEnd).trim(),
+            "",
+            `Full changelog: https://github.com/${process.env.GITHUB_REPOSITORY}/blob/${tag}/CHANGELOG.md`,
+            "",
+          ].join("\n");
+
+          fs.writeFileSync("release-notes.md", releaseNotes);
+          NODE
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
           name: R Console ${{ github.ref_name }}
-          body: |
-            Full changelog: https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
+          body_path: release-notes.md
           files: |
             release-artifacts/*.vsix
             release-artifacts/SHA256SUMS.txt

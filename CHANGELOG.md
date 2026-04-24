@@ -2,6 +2,18 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.0] - 2026-04-24
+
+### Added
+- Running R consoles now survive an extension host restart by reconnecting to the existing R backend session and restoring the console view.
+- Multiple R consoles can be restored after an extension host restart without losing the extra console tabs.
+
+### Fixed
+- Restored consoles no longer auto-attach to vscode-R from an old session request; users can reattach from `R: (not attached)` or by running `.vsc.attach()`.
+- Restoring multiple consoles no longer creates a duplicate terminal or shows an unexpected close confirmation for the last console.
+- Restored console output is replayed without large extra blank spaces.
+- Resizing a restored console in an editor tab is smoother and no longer immediately snaps back during split dragging.
+
 ## [0.1.1] - 2026-04-16
 
 ### Changed
