@@ -236,10 +236,10 @@ The TypeScript/Rust boundary is defined in [`src/Runtime/backendProtocol.ts`](..
 
 ### 5.1 Transport
 
-- Unix: Rust host stdin receives commands from the extension
-- Windows: the extension writes commands to a dedicated named pipe passed in `VSC_R_BACKEND_COMMAND_PIPE`
-- Rust host stdout carries framed output and control events
-- Rust host stderr is reserved for diagnostic/error text
+- Normal extension runs use a session socket: TypeScript passes `VSC_R_BACKEND_SESSION_FILE`, the Rust host binds a localhost command/output socket, writes the selected port and process id to that file, and TypeScript connects to it.
+- That socket is the reload-reconnect boundary. The Rust host keeps the embedded R session alive for a short reconnect grace window if the extension host disconnects.
+- If no session file is configured, the Rust host falls back to stdin commands and framed stdout output.
+- Rust host stderr is reserved for diagnostic/error text.
 
 The protocol frame header is 12 bytes and includes:
 
@@ -266,7 +266,7 @@ Key events:
 
 - `backend-ready`
 - `host-connected`
-- `child-spawned`
+- `session-state`
 - `prompt`
 - `busy`
 - `input-request`

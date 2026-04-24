@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import {
   RTerminal,
+  type PersistedRTerminalState,
+  type PersistedRTerminalOptions,
   resolveRTerminalOptions,
 } from "./Terminal/rTerminal";
 import {
@@ -19,12 +23,24 @@ type ConsoleRecord = {
   pidSubscription: vscode.Disposable;
 };
 
+type PersistedConsoleRecord = {
+  terminal: PersistedRTerminalState;
+  location: TerminalContext;
+};
+
+type PersistedReloadState = {
+  sessionId: string;
+  consoles: PersistedConsoleRecord[];
+};
+
 const terminalToRecord: Map<vscode.Terminal, ConsoleRecord> = new Map();
 const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
 const pidToRecord: Map<number, ConsoleRecord> = new Map();
 const editorCloseInProgress: Set<number> = new Set();
+const ignoredTerminalCloseEvents = new WeakSet<vscode.Terminal>();
 const VSCODE_R_TERMINAL_NAME = "R Console";
 let extensionBaseUri: vscode.Uri | undefined;
+let persistedSessionFilePath: string | undefined;
 
 function isVirtualWorkspace(): boolean {
   const folders = vscode.workspace.workspaceFolders;
@@ -37,8 +53,14 @@ function refreshTerminalAppearance(): void {
   }
 }
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionBaseUri = context.extensionUri;
+  const reloadStorageUri = context.storageUri ?? context.globalStorageUri;
+  persistedSessionFilePath = vscode.Uri.joinPath(
+    reloadStorageUri,
+    "reload-sessions.json"
+  ).fsPath;
+  void fs.promises.mkdir(reloadStorageUri.fsPath, { recursive: true }).catch(() => {});
   context.subscriptions.push(
     vscode.commands.registerCommand("r-console.createTerminal", () => {
       void createRTerminal(context);
@@ -64,11 +86,274 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  await activateVscodeRExtension();
+  void restorePersistedSessions(context);
   syncTerminalRecordsFromWindow();
   void ensureConfiguredRPath();
 }
 
+async function activateVscodeRExtension(): Promise<void> {
+  const extension = vscode.extensions.getExtension("REditorSupport.r");
+  if (!extension || extension.isActive) {
+    return;
+  }
+  try {
+    await extension.activate();
+  } catch {
+  }
+}
+
+async function restorePersistedSessions(context: vscode.ExtensionContext): Promise<void> {
+  const persisted = await loadPersistedSessions(vscode.env.sessionId);
+  if (persisted.length === 0) {
+    return;
+  }
+
+  for (const entry of persisted) {
+    const options = buildRestoredTerminalOptions(entry.terminal.options);
+    if (!options) {
+      continue;
+    }
+
+    const disposedStaleTerminal = disposeStalePersistedTerminal(entry.terminal);
+    if (disposedStaleTerminal) {
+      await waitForStalePersistedTerminalDisposed(entry.terminal);
+    }
+
+    const rTerminal = new RTerminal(options, context.extensionPath, entry.terminal);
+    const record = createConsoleRecord(rTerminal, entry.location);
+    attachTerminal(record, true);
+  }
+}
+
+function buildRestoredTerminalOptions(
+  persistedOptions: PersistedRTerminalOptions
+): ReturnType<typeof resolveRTerminalOptions> {
+  const currentOptions = resolveRTerminalOptions();
+  if (!currentOptions) {
+    return undefined;
+  }
+  return {
+    ...currentOptions,
+    ...persistedOptions,
+    rArgs: [...persistedOptions.rArgs],
+  };
+}
+
+function disposeStalePersistedTerminal(state: PersistedRTerminalState): boolean {
+  const pid = state.runtime.pid;
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  let disposed = false;
+  for (const terminal of vscode.window.terminals) {
+    if (parseConsolePidFromTerminal(terminal) !== pid) {
+      continue;
+    }
+    ignoredTerminalCloseEvents.add(terminal);
+    terminal.dispose();
+    disposed = true;
+  }
+  return disposed;
+}
+
+async function waitForStalePersistedTerminalDisposed(
+  state: PersistedRTerminalState
+): Promise<void> {
+  const pid = state.runtime.pid;
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+    return;
+  }
+
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const stillVisible = vscode.window.terminals.some(
+      (terminal) => parseConsolePidFromTerminal(terminal) === pid
+    );
+    if (!stillVisible) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function loadPersistedSessions(currentSessionId: string): Promise<PersistedConsoleRecord[]> {
+  if (!persistedSessionFilePath) {
+    return [];
+  }
+  try {
+    const raw = await fs.promises.readFile(persistedSessionFilePath, "utf8");
+    await fs.promises.rm(persistedSessionFilePath, { force: true });
+    const parsed = JSON.parse(raw);
+    if (!isPersistedReloadState(parsed)) {
+      return [];
+    }
+    if (parsed.sessionId !== currentSessionId) {
+      return [];
+    }
+    return parsed.consoles;
+  } catch {
+    return [];
+  }
+}
+
+function isPersistedConsoleRecord(value: unknown): value is PersistedConsoleRecord {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+  if (!isPersistedRTerminalState(value.terminal)) {
+    return false;
+  }
+  if (!isPersistedTerminalContext(value.location)) {
+    return false;
+  }
+  return true;
+}
+
+function isPersistedReloadState(value: unknown): value is PersistedReloadState {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+  if (typeof value.sessionId !== "string" || value.sessionId.trim().length === 0) {
+    return false;
+  }
+  if (!Array.isArray(value.consoles)) {
+    return false;
+  }
+  return value.consoles.every(isPersistedConsoleRecord);
+}
+
+function isPersistedRTerminalState(value: unknown): value is PersistedRTerminalState {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+  return (
+    isPersistedRTerminalOptions(value.options) &&
+    isRuntimeSessionReconnectInfo(value.runtime) &&
+    isPersistedUiSnapshot(value.ui)
+  );
+}
+
+function isPersistedRTerminalOptions(value: unknown): value is PersistedRTerminalOptions {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+  if (typeof value.rPath !== "string" || value.rPath.trim().length === 0) {
+    return false;
+  }
+  if (!Array.isArray(value.rArgs) || value.rArgs.some((entry) => typeof entry !== "string")) {
+    return false;
+  }
+  if (typeof value.sessionWatcherEnabled !== "boolean") {
+    return false;
+  }
+  if (typeof value.watcherDir !== "string" || value.watcherDir.trim().length === 0) {
+    return false;
+  }
+  if (typeof value.bracketedPaste !== "boolean") {
+    return false;
+  }
+  if (value.cwd !== undefined && typeof value.cwd !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isRuntimeSessionReconnectInfo(
+  value: unknown
+): value is PersistedRTerminalState["runtime"] {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+  if (typeof value.sessionId !== "string" || value.sessionId.trim().length === 0) {
+    return false;
+  }
+  if (!isPositiveInteger(value.port)) {
+    return false;
+  }
+  if (value.pid !== undefined && !isPositiveInteger(value.pid)) {
+    return false;
+  }
+  return true;
+}
+
+function isPersistedUiSnapshot(value: unknown): value is PersistedRTerminalState["ui"] {
+  if (!isObjectRecord(value) || !isPersistedReplaySnapshot(value.replay)) {
+    return false;
+  }
+  if (!isPositiveInteger(value.replayColumns) || !isPositiveInteger(value.replayRows)) {
+    return false;
+  }
+  if (!["starting", "ready", "executing", "reply", "closed"].includes(String(value.mode))) {
+    return false;
+  }
+  if (!["main", "cont"].includes(String(value.promptKind))) {
+    return false;
+  }
+  if (
+    typeof value.promptReady !== "boolean" ||
+    typeof value.promptVisible !== "boolean" ||
+    typeof value.replyPromptText !== "string" ||
+    typeof value.pendingPromptToken !== "boolean" ||
+    typeof value.pendingInitialPromptGap !== "boolean" ||
+    typeof value.lastWriteEndedWithNewline !== "boolean" ||
+    typeof value.hasReceivedOutput !== "boolean" ||
+    typeof value.inputText !== "string" ||
+    !isNonNegativeInteger(value.inputCursorPosition)
+  ) {
+    return false;
+  }
+  if (value.backendChildPid !== undefined && !isPositiveInteger(value.backendChildPid)) {
+    return false;
+  }
+  return true;
+}
+
+function isPersistedReplaySnapshot(
+  value: unknown
+): value is PersistedRTerminalState["ui"]["replay"] {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+  if (!Array.isArray(value.lines) || value.lines.some((line) => typeof line !== "string")) {
+    return false;
+  }
+  return (
+    isNonNegativeInteger(value.finalRow) &&
+    isNonNegativeInteger(value.cursorRow) &&
+    isNonNegativeInteger(value.cursorCol)
+  );
+}
+
+function isPersistedTerminalContext(value: unknown): value is TerminalContext {
+  if (!isObjectRecord(value) || typeof value.kind !== "string") {
+    return false;
+  }
+  if (value.kind === "panel") {
+    return true;
+  }
+  return value.kind === "editor" && typeof value.viewColumn === "number";
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<void> {
+  if (ignoredTerminalCloseEvents.has(closedTerminal)) {
+    ignoredTerminalCloseEvents.delete(closedTerminal);
+    terminalToRecord.delete(closedTerminal);
+    return;
+  }
+
   const record = resolveRecordFromTerminal(closedTerminal);
   if (!record) return;
 
@@ -256,7 +541,8 @@ function attachTerminal(
     pty: record.rTerminal,
     iconPath: extensionBaseUri
       ? vscode.Uri.joinPath(extensionBaseUri, "images", "Rlogo.png")
-      : new vscode.ThemeIcon("terminal")
+      : new vscode.ThemeIcon("terminal"),
+    isTransient: true,
   };
 
   if (record.location.kind === "editor") {
@@ -489,11 +775,52 @@ function findEditorTabByPid(pid: number): vscode.Tab | undefined {
 }
 
 export function deactivate() {
+  persistRunningSessionsForReload();
   for (const record of new Set(rTerminalToRecord.values())) {
     record.pidSubscription.dispose();
-    record.rTerminal.forceClose();
   }
   terminalToRecord.clear();
   rTerminalToRecord.clear();
   pidToRecord.clear();
+}
+
+function persistRunningSessionsForReload(): void {
+  if (!persistedSessionFilePath) {
+    return;
+  }
+
+  const persisted: PersistedConsoleRecord[] = [];
+  for (const record of new Set(rTerminalToRecord.values())) {
+    if (!record.rTerminal.isRunning()) {
+      continue;
+    }
+    const terminal = record.rTerminal.exportPersistentState();
+    if (!terminal) {
+      continue;
+    }
+    persisted.push({
+      terminal,
+      location: record.location,
+    });
+  }
+
+  if (persisted.length === 0) {
+    try {
+      fs.rmSync(persistedSessionFilePath, { force: true });
+    } catch {
+    }
+    return;
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(persistedSessionFilePath), {
+      recursive: true,
+    });
+    const reloadState: PersistedReloadState = {
+      sessionId: vscode.env.sessionId,
+      consoles: persisted,
+    };
+    fs.writeFileSync(persistedSessionFilePath, JSON.stringify(reloadState), "utf8");
+  } catch {
+  }
 }

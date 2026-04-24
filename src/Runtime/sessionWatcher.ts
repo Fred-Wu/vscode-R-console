@@ -188,6 +188,23 @@ export class SessionWatcher {
       const content = fs.readFileSync(requestFile, "utf-8");
       const request = JSON.parse(content) as SessionRequest;
 
+      if (
+        request.command === "attach" &&
+        isValidSessionPid(request.pid) &&
+        !isSessionPidAlive(request.pid)
+      ) {
+        this.workspaceData = undefined;
+        this.sessionDir = undefined;
+        this.attachedPid = undefined;
+        this.server = undefined;
+        this.workspaceWatcher?.close();
+        this.workspaceWatcher = undefined;
+        this.sessionDirWatcher?.close();
+        this.sessionDirWatcher = undefined;
+        this.onChangeCallback?.(undefined);
+        return;
+      }
+
       // Sidecar mode does not know child R PID up front; auto-pin to the first
       // fresh attach request so updates stay scoped to one session (v1 behavior).
       if (
@@ -198,13 +215,13 @@ export class SessionWatcher {
         this.expectedPid = request.pid;
         this.expectedPidAutoPinned = true;
       }
-      
+
       // PID filtering: only process requests from our expected R session
       if (this.expectedPid !== undefined && request.pid !== this.expectedPid) {
         // This request is from a different R session, ignore it
         return;
       }
-      
+
       if (request.command === "detach") {
         this.workspaceData = undefined;
         this.sessionDir = undefined;
@@ -366,5 +383,19 @@ export class SessionWatcher {
       req.write(body);
       req.end();
     });
+  }
+}
+
+function isValidSessionPid(pid: number | undefined): pid is number {
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 0;
+}
+
+function isSessionPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "EPERM";
   }
 }

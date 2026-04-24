@@ -780,7 +780,36 @@ Expected:
 - reattached console restores visible state reasonably well
 - cancelling close keeps the running session alive
 
-## 22. Two Concurrent Consoles
+## 22. Extension Reload Reattach
+
+With a running console that already has:
+
+- visible scrollback
+- at least one workspace object, for example `x <- 1`
+- a partially edited command at the prompt
+
+Trigger an extension-host style reload:
+
+1. run `Developer: Restart Extension Host`
+2. wait for the window to finish reloading
+3. return to the R Console tab
+4. verify the prompt accepts input again
+5. run:
+
+```{r reload-reattach-test}
+x
+1 + 1
+```
+
+Expected:
+
+- the original R session is still alive
+- the console prompt becomes interactive again without manually starting a new console
+- existing objects like `x` are still present
+- visible scrollback is restored well enough to continue working
+- closing the restored console still shows the usual confirmation flow
+
+## 23. Two Concurrent Consoles
 
 Open two R Console instances.
 

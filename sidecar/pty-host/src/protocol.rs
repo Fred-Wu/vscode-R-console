@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
+use std::thread;
 #[cfg(unix)]
 use std::{fs::File, os::fd::FromRawFd};
 #[cfg(windows)]
@@ -7,13 +9,10 @@ use std::{fs::File, os::windows::io::FromRawHandle};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE,
-        HANDLE_FLAG_INHERIT,
+        DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE, HANDLE_FLAG_INHERIT,
     },
     System::{
-        Console::{
-            GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-        },
+        Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE},
         Threading::GetCurrentProcess,
     },
 };
@@ -23,7 +22,6 @@ pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
 const FRAME_BACKEND_READY: u16 = 1;
 const FRAME_HOST_CONNECTED: u16 = 2;
-const FRAME_CHILD_SPAWNED: u16 = 3;
 const FRAME_PROMPT: u16 = 4;
 const FRAME_BUSY: u16 = 5;
 const FRAME_INPUT_REQUEST: u16 = 6;
@@ -40,6 +38,9 @@ const FRAME_DIALOG_REQUEST: u16 = 16;
 const FRAME_SHUTDOWN: u16 = 17;
 const FRAME_DIALOG_RESULT: u16 = 18;
 const FRAME_HOST_ERROR: u16 = 19;
+const FRAME_SESSION_STATE: u16 = 20;
+const MAX_BUFFERED_FRAMES: usize = 4096;
+const MAX_BUFFERED_BYTES: usize = 1_000_000;
 
 #[derive(Debug)]
 pub(crate) enum DialogRequest {
@@ -73,15 +74,35 @@ pub(crate) enum OutputStream {
 }
 
 pub(crate) struct OutputSink {
-    stdout: Arc<Mutex<Box<dyn Write + Send>>>,
+    output_state: Arc<Mutex<OutputChannelState>>,
     host_name: Arc<String>,
     capabilities: Arc<Vec<String>>,
+}
+
+struct OutputChannelState {
+    writer: Option<Box<dyn Write + Send>>,
+    backlog: VecDeque<Vec<u8>>,
+    backlog_bytes: usize,
+}
+
+pub(crate) enum SessionWaitState {
+    None,
+    TopLevel(PromptKind),
+    Nested(String),
 }
 
 impl OutputSink {
     pub(crate) fn new_with_capabilities(host_name: &str, capabilities: &[&str]) -> Self {
         Self {
-            stdout: Arc::new(Mutex::new(create_protocol_writer())),
+            output_state: Arc::new(Mutex::new(OutputChannelState {
+                writer: if session_transport_enabled() {
+                    None
+                } else {
+                    Some(create_protocol_writer())
+                },
+                backlog: VecDeque::new(),
+                backlog_bytes: 0,
+            })),
             host_name: Arc::new(host_name.to_string()),
             capabilities: Arc::new(
                 capabilities
@@ -94,10 +115,17 @@ impl OutputSink {
 
     pub(crate) fn clone_handle(&self) -> Self {
         Self {
-            stdout: Arc::clone(&self.stdout),
+            output_state: Arc::clone(&self.output_state),
             host_name: Arc::clone(&self.host_name),
             capabilities: Arc::clone(&self.capabilities),
         }
+    }
+
+    pub(crate) fn capture_process_stdout(&self) -> io::Result<()> {
+        if !session_transport_enabled() {
+            return Ok(());
+        }
+        capture_process_stdout_to_sink(self.clone_handle())
     }
 
     pub(crate) fn emit_backend_ready(&self) -> io::Result<()> {
@@ -119,10 +147,6 @@ impl OutputSink {
             &mut payload,
         );
         self.emit_frame(FRAME_HOST_CONNECTED, 0, &payload)
-    }
-
-    pub(crate) fn emit_child_spawned(&self, pid: u32) -> io::Result<()> {
-        self.emit_frame(FRAME_CHILD_SPAWNED, 0, &pid.to_le_bytes())
     }
 
     pub(crate) fn emit_prompt(&self, kind: PromptKind) -> io::Result<()> {
@@ -185,23 +209,115 @@ impl OutputSink {
         self.emit_frame(FRAME_HOST_ERROR, 0, message.as_bytes())
     }
 
-    fn emit_frame(&self, kind: u16, request_id: u32, payload: &[u8]) -> io::Result<()> {
-        let mut header = [0_u8; FRAME_HEADER_LEN];
-        header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        header[4..6].copy_from_slice(&kind.to_le_bytes());
-        header[6..8].copy_from_slice(&0_u16.to_le_bytes());
-        header[8..12].copy_from_slice(&request_id.to_le_bytes());
+    pub(crate) fn emit_session_state(
+        &self,
+        pid: u32,
+        busy: bool,
+        wait: SessionWaitState,
+    ) -> io::Result<()> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&pid.to_le_bytes());
+        payload.push(if busy { 1 } else { 0 });
+        match wait {
+            SessionWaitState::None => payload.push(0),
+            SessionWaitState::TopLevel(PromptKind::Main) => payload.push(1),
+            SessionWaitState::TopLevel(PromptKind::Cont) => payload.push(2),
+            SessionWaitState::Nested(prompt) => {
+                payload.push(3);
+                payload.extend_from_slice(prompt.as_bytes());
+            }
+        }
+        self.emit_frame(FRAME_SESSION_STATE, 0, &payload)
+    }
 
-        let mut stdout = self
-            .stdout
+    pub(crate) fn attach_client<W: Write + Send + 'static>(&self, writer: W) {
+        if let Ok(mut output_state) = self.output_state.lock() {
+            output_state.writer = Some(Box::new(writer));
+        }
+    }
+
+    pub(crate) fn detach_client(&self) {
+        if let Ok(mut output_state) = self.output_state.lock() {
+            output_state.writer = None;
+        }
+    }
+
+    pub(crate) fn flush_backlog(&self) -> io::Result<()> {
+        let mut output_state = self
+            .output_state
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout lock poisoned"))?;
-        stdout.write_all(&header)?;
-        if !payload.is_empty() {
-            stdout.write_all(payload)?;
+        let Some(mut writer) = output_state.writer.take() else {
+            return Ok(());
+        };
+        let mut backlog = std::mem::take(&mut output_state.backlog);
+        output_state.backlog_bytes = 0;
+
+        while let Some(frame) = backlog.pop_front() {
+            if let Err(err) = writer.write_all(&frame) {
+                queue_backlog_frame(&mut output_state, frame);
+                while let Some(remaining) = backlog.pop_front() {
+                    queue_backlog_frame(&mut output_state, remaining);
+                }
+                return Err(err);
+            }
         }
-        stdout.flush()
+        if let Err(err) = writer.flush() {
+            while let Some(remaining) = backlog.pop_front() {
+                queue_backlog_frame(&mut output_state, remaining);
+            }
+            return Err(err);
+        }
+
+        output_state.writer = Some(writer);
+        Ok(())
     }
+
+    fn emit_frame(&self, kind: u16, request_id: u32, payload: &[u8]) -> io::Result<()> {
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&kind.to_le_bytes());
+        frame.extend_from_slice(&0_u16.to_le_bytes());
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(payload);
+
+        let mut output_state = self
+            .output_state
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout lock poisoned"))?;
+        if let Some(writer) = output_state.writer.as_mut() {
+            match writer.write_all(&frame).and_then(|_| writer.flush()) {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    output_state.writer = None;
+                }
+            }
+        }
+
+        queue_backlog_frame(&mut output_state, frame);
+        Ok(())
+    }
+}
+
+fn queue_backlog_frame(output_state: &mut OutputChannelState, frame: Vec<u8>) {
+    output_state.backlog_bytes += frame.len();
+    output_state.backlog.push_back(frame);
+    while output_state.backlog.len() > MAX_BUFFERED_FRAMES
+        || output_state.backlog_bytes > MAX_BUFFERED_BYTES
+    {
+        if let Some(removed) = output_state.backlog.pop_front() {
+            output_state.backlog_bytes = output_state.backlog_bytes.saturating_sub(removed.len());
+        } else {
+            break;
+        }
+    }
+}
+
+fn session_transport_enabled() -> bool {
+    matches!(
+        std::env::var("VSC_R_BACKEND_SESSION_FILE"),
+        Ok(value) if !value.trim().is_empty()
+    )
 }
 
 #[cfg(unix)]
@@ -232,6 +348,50 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
     }
 
     Box::new(io::stdout())
+}
+
+#[cfg(unix)]
+fn capture_process_stdout_to_sink(output: OutputSink) -> io::Result<()> {
+    unsafe {
+        let mut fds = [0; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        let read_flags = libc::fcntl(read_fd, libc::F_GETFD);
+        if read_flags >= 0 {
+            let _ = libc::fcntl(read_fd, libc::F_SETFD, read_flags | libc::FD_CLOEXEC);
+        }
+
+        if libc::dup2(write_fd, libc::STDOUT_FILENO) < 0 {
+            let error = io::Error::last_os_error();
+            let _ = libc::close(read_fd);
+            let _ = libc::close(write_fd);
+            return Err(error);
+        }
+        let _ = libc::close(write_fd);
+
+        thread::spawn(move || {
+            let mut reader = File::from_raw_fd(read_fd);
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let _ = output.emit_output(OutputStream::Stdout, &buffer[..count]);
+                        let _ = output.emit_output_flush();
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -269,6 +429,11 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
     }
 
     Box::new(io::stdout())
+}
+
+#[cfg(not(unix))]
+fn capture_process_stdout_to_sink(_output: OutputSink) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

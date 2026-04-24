@@ -9,21 +9,25 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
-        OutputStream, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        PromptKind, SessionWaitState,
     };
     use libloading::os::unix::{Library, Symbol};
     use std::collections::VecDeque;
     use std::error::Error;
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
+    use std::fs;
     use std::io;
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     const SUPPORTED_CAPABILITIES: &[&str] = &[
         "control-channel",
@@ -142,6 +146,7 @@ mod unix_host {
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
         shutdown_requested: bool,
+        wait_state: Option<StoredWaitState>,
     }
 
     enum PendingCommand {
@@ -151,6 +156,12 @@ mod unix_host {
     }
 
     enum WaitKind {
+        TopLevel(PromptKind),
+        Nested(String),
+    }
+
+    #[derive(Clone)]
+    enum StoredWaitState {
         TopLevel(PromptKind),
         Nested(String),
     }
@@ -220,7 +231,10 @@ mod unix_host {
         let api = unsafe { RApi::load(&library_path)? };
 
         let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
-        output.emit_backend_ready()?;
+        if let Err(error) = output.capture_process_stdout() {
+            let _ =
+                output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
+        }
 
         HOST_RUNTIME
             .set(HostRuntime {
@@ -252,9 +266,6 @@ mod unix_host {
             }
         }
 
-        output.emit_child_spawned(std::process::id())?;
-        output.emit_host_connected()?;
-
         unsafe {
             (api.run_rmainloop)();
         }
@@ -263,7 +274,14 @@ mod unix_host {
     }
 
     fn start_command_reader() {
-        std::thread::spawn(move || {
+        if let Some((session_file, initial_connect_grace, reconnect_grace)) =
+            session_transport_config()
+        {
+            start_session_command_reader(session_file, initial_connect_grace, reconnect_grace);
+            return;
+        }
+
+        thread::spawn(move || {
             let stdin = io::stdin();
             let mut locked = stdin.lock();
             loop {
@@ -281,6 +299,173 @@ mod unix_host {
                 }
             }
         });
+    }
+
+    fn start_session_command_reader(
+        session_file: String,
+        initial_connect_grace: Duration,
+        reconnect_grace: Duration,
+    ) {
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    emit_host_error(&format!("backend session server bind failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = listener.set_nonblocking(true) {
+                emit_host_error(&format!("backend session server setup failed: {error}"));
+                request_shutdown();
+                return;
+            }
+
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    emit_host_error(&format!("backend session server address failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = write_session_bootstrap(&session_file, port, std::process::id()) {
+                emit_host_error(&format!("backend session bootstrap write failed: {error}"));
+                request_shutdown();
+                return;
+            }
+
+            let mut disconnect_deadline = Some(Instant::now() + initial_connect_grace);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session stream setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        let writer = match stream.try_clone() {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                emit_host_error(&format!(
+                                    "backend session stream clone failed: {error}"
+                                ));
+                                request_shutdown();
+                                break;
+                            }
+                        };
+                        if let Err(error) = writer.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session writer setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        if let Some(runtime) = host_runtime() {
+                            runtime.output.attach_client(writer);
+                            emit_attached_client_state(runtime);
+                        }
+
+                        loop {
+                            match read_next_command(&mut stream) {
+                                Ok(Some(command)) => handle_command(command),
+                                Ok(None) => break,
+                                Err(error) => {
+                                    emit_host_error(&format!(
+                                        "backend command read failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(runtime) = host_runtime() {
+                            runtime.output.detach_client();
+                        }
+                        if is_shutdown_requested() {
+                            break;
+                        }
+                        disconnect_deadline = Some(Instant::now() + reconnect_grace);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if is_shutdown_requested() {
+                            break;
+                        }
+                        if let Some(deadline) = disconnect_deadline {
+                            if Instant::now() >= deadline {
+                                request_shutdown();
+                                break;
+                            }
+                        }
+                        thread::sleep(SESSION_ACCEPT_POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        emit_host_error(&format!("backend session accept failed: {error}"));
+                        request_shutdown();
+                        break;
+                    }
+                }
+            }
+            let _ = fs::remove_file(&session_file);
+        });
+    }
+
+    fn session_transport_config() -> Option<(String, Duration, Duration)> {
+        let session_file = std::env::var("VSC_R_BACKEND_SESSION_FILE").ok()?;
+        if session_file.trim().is_empty() {
+            return None;
+        }
+        let initial_connect_grace_ms = std::env::var("VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60_000);
+        let reconnect_grace_ms = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(15_000);
+        Some((
+            session_file,
+            Duration::from_millis(initial_connect_grace_ms),
+            Duration::from_millis(reconnect_grace_ms),
+        ))
+    }
+
+    fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
+        let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
+        fs::write(session_file, payload)
+    }
+
+    fn emit_attached_client_state(runtime: &HostRuntime) {
+        let pid = std::process::id();
+        let _ = runtime.output.flush_backlog();
+        let _ = runtime.output.emit_backend_ready();
+        let _ = runtime.output.emit_host_connected();
+
+        let (busy, wait_state) = {
+            let state = runtime.state.lock().expect("host state lock poisoned");
+            (state.busy, state.wait_state.clone())
+        };
+        let wait = match wait_state {
+            Some(StoredWaitState::TopLevel(kind)) => SessionWaitState::TopLevel(kind),
+            Some(StoredWaitState::Nested(prompt)) => SessionWaitState::Nested(prompt),
+            None => SessionWaitState::None,
+        };
+        let _ = runtime.output.emit_session_state(pid, busy, wait);
+        let _ = runtime.output.emit_output_flush();
+    }
+
+    fn is_shutdown_requested() -> bool {
+        host_runtime()
+            .map(|runtime| {
+                runtime
+                    .state
+                    .lock()
+                    .expect("host state lock poisoned")
+                    .shutdown_requested
+            })
+            .unwrap_or(false)
     }
 
     fn handle_command(command: IncomingCommand) {
@@ -637,6 +822,7 @@ mod unix_host {
             if let Some(fragment) = state.pending_fragment.take() {
                 let signal_input_end = state.pending_fragment_from_nested;
                 state.pending_fragment_from_nested = false;
+                state.wait_state = None;
                 return write_read_buffer(
                     buffer,
                     buflen,
@@ -659,6 +845,7 @@ mod unix_host {
             }
 
             if state.shutdown_requested {
+                state.wait_state = None;
                 if matches!(wait_kind, WaitKind::Nested(_)) {
                     let _ = runtime.output.emit_input_end();
                     let _ = runtime.output.emit_output_flush();
@@ -668,6 +855,7 @@ mod unix_host {
 
             if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
                 state.interrupt_requested = false;
+                state.wait_state = None;
                 let _ = runtime.output.emit_input_end();
                 let _ = runtime.output.emit_output_flush();
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
@@ -677,10 +865,12 @@ mod unix_host {
             if !wait_event_emitted {
                 match &wait_kind {
                     WaitKind::TopLevel(kind) => {
+                        state.wait_state = Some(StoredWaitState::TopLevel(*kind));
                         let _ = runtime.output.emit_prompt(*kind);
                         let _ = runtime.output.emit_output_flush();
                     }
                     WaitKind::Nested(prompt) => {
+                        state.wait_state = Some(StoredWaitState::Nested(prompt.clone()));
                         let _ = runtime.output.emit_input_request(prompt);
                         let _ = runtime.output.emit_output_flush();
                     }
@@ -738,6 +928,7 @@ mod unix_host {
                 let mut state = runtime.state.lock().expect("host state lock poisoned");
                 state.busy = value != 0;
                 if value != 0 {
+                    state.wait_state = None;
                     should_signal = state.interrupt_requested;
                 } else {
                     state.suppress_idle_event_pump = state.interrupt_requested;
@@ -826,6 +1017,7 @@ mod unix_host {
 
     fn take_next_line(wait_kind: &WaitKind, state: &mut SharedState) -> Option<PendingLine> {
         if let Some(line) = state.active_submission_lines.pop_front() {
+            state.wait_state = None;
             return Some(PendingLine {
                 bytes: line,
                 signal_input_end: false,
@@ -841,6 +1033,7 @@ mod unix_host {
                 match state.pending_commands.remove(index) {
                     Some(PendingCommand::Submit(lines)) => {
                         state.active_submission_lines = lines;
+                        state.wait_state = None;
                         state
                             .active_submission_lines
                             .pop_front()
@@ -858,10 +1051,13 @@ mod unix_host {
                     .iter()
                     .position(|command| matches!(command, PendingCommand::Reply(_)))?;
                 match state.pending_commands.remove(index) {
-                    Some(PendingCommand::Reply(bytes)) => Some(PendingLine {
-                        bytes,
-                        signal_input_end: true,
-                    }),
+                    Some(PendingCommand::Reply(bytes)) => {
+                        state.wait_state = None;
+                        Some(PendingLine {
+                            bytes,
+                            signal_input_end: true,
+                        })
+                    }
                     _ => None,
                 }
             }
@@ -1330,8 +1526,8 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
-        OutputStream, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        PromptKind, SessionWaitState,
     };
     use libloading::os::windows::{
         Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -1340,22 +1536,25 @@ mod windows_host {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
-    use std::fs::OpenOptions;
+    use std::fs;
     use std::io;
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use windows_sys::Win32::{
-        Globalization::{
-            MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS,
-        },
+        Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS},
         System::LibraryLoader::{GetModuleHandleA, GetProcAddress},
-        UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE},
+        UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        },
     };
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     const EMBEDDED_UTF8_PREFIX: &[u8] = &[0x02, 0xff, 0xfe];
     const EMBEDDED_UTF8_SUFFIX: &[u8] = &[0x03, 0xff, 0xfe];
 
@@ -1566,6 +1765,7 @@ mod windows_host {
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
         shutdown_requested: bool,
+        wait_state: Option<StoredWaitState>,
     }
 
     enum PendingCommand {
@@ -1575,6 +1775,12 @@ mod windows_host {
     }
 
     enum WaitKind {
+        TopLevel(PromptKind),
+        Nested(String),
+    }
+
+    #[derive(Clone)]
+    enum StoredWaitState {
         TopLevel(PromptKind),
         Nested(String),
     }
@@ -1648,7 +1854,10 @@ mod windows_host {
         let mut api = unsafe { RApi::load(&layout)? };
 
         let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
-        output.emit_backend_ready()?;
+        if let Err(error) = output.capture_process_stdout() {
+            let _ =
+                output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
+        }
 
         HOST_RUNTIME
             .set(HostRuntime {
@@ -1680,9 +1889,6 @@ mod windows_host {
             }
         }
 
-        output.emit_child_spawned(std::process::id())?;
-        output.emit_host_connected()?;
-
         unsafe {
             (api.run_rmainloop)();
         }
@@ -1691,17 +1897,18 @@ mod windows_host {
     }
 
     fn start_command_reader() {
-        std::thread::spawn(move || {
-            let mut reader = match open_command_reader() {
-                Ok(reader) => reader,
-                Err(error) => {
-                    emit_host_error(&format!("backend command channel open failed: {error}"));
-                    request_shutdown();
-                    return;
-                }
-            };
+        if let Some((session_file, initial_connect_grace, reconnect_grace)) =
+            session_transport_config()
+        {
+            start_session_command_reader(session_file, initial_connect_grace, reconnect_grace);
+            return;
+        }
+
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut locked = stdin.lock();
             loop {
-                match read_next_command(&mut reader) {
+                match read_next_command(&mut locked) {
                     Ok(Some(command)) => handle_command(command),
                     Ok(None) => {
                         request_shutdown();
@@ -1717,14 +1924,171 @@ mod windows_host {
         });
     }
 
-    fn open_command_reader() -> io::Result<Box<dyn io::Read + Send>> {
-        match std::env::var("VSC_R_BACKEND_COMMAND_PIPE") {
-            Ok(path) if !path.trim().is_empty() => {
-                let file = OpenOptions::new().read(true).write(true).open(path)?;
-                Ok(Box::new(file))
+    fn start_session_command_reader(
+        session_file: String,
+        initial_connect_grace: Duration,
+        reconnect_grace: Duration,
+    ) {
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    emit_host_error(&format!("backend session server bind failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = listener.set_nonblocking(true) {
+                emit_host_error(&format!("backend session server setup failed: {error}"));
+                request_shutdown();
+                return;
             }
-            _ => Ok(Box::new(io::stdin())),
+
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    emit_host_error(&format!("backend session server address failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = write_session_bootstrap(&session_file, port, std::process::id()) {
+                emit_host_error(&format!("backend session bootstrap write failed: {error}"));
+                request_shutdown();
+                return;
+            }
+
+            let mut disconnect_deadline = Some(Instant::now() + initial_connect_grace);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session stream setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        let writer = match stream.try_clone() {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                emit_host_error(&format!(
+                                    "backend session stream clone failed: {error}"
+                                ));
+                                request_shutdown();
+                                break;
+                            }
+                        };
+                        if let Err(error) = writer.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session writer setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        if let Some(runtime) = host_runtime() {
+                            runtime.output.attach_client(writer);
+                            emit_attached_client_state(runtime);
+                        }
+
+                        loop {
+                            match read_next_command(&mut stream) {
+                                Ok(Some(command)) => handle_command(command),
+                                Ok(None) => break,
+                                Err(error) => {
+                                    emit_host_error(&format!(
+                                        "backend command read failed: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(runtime) = host_runtime() {
+                            runtime.output.detach_client();
+                        }
+                        if is_shutdown_requested() {
+                            break;
+                        }
+                        disconnect_deadline = Some(Instant::now() + reconnect_grace);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if is_shutdown_requested() {
+                            break;
+                        }
+                        if let Some(deadline) = disconnect_deadline {
+                            if Instant::now() >= deadline {
+                                request_shutdown();
+                                break;
+                            }
+                        }
+                        thread::sleep(SESSION_ACCEPT_POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        emit_host_error(&format!("backend session accept failed: {error}"));
+                        request_shutdown();
+                        break;
+                    }
+                }
+            }
+            let _ = fs::remove_file(&session_file);
+        });
+    }
+
+    fn session_transport_config() -> Option<(String, Duration, Duration)> {
+        let session_file = std::env::var("VSC_R_BACKEND_SESSION_FILE").ok()?;
+        if session_file.trim().is_empty() {
+            return None;
         }
+        let initial_connect_grace_ms = std::env::var("VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60_000);
+        let reconnect_grace_ms = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(15_000);
+        Some((
+            session_file,
+            Duration::from_millis(initial_connect_grace_ms),
+            Duration::from_millis(reconnect_grace_ms),
+        ))
+    }
+
+    fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
+        let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
+        fs::write(session_file, payload)
+    }
+
+    fn emit_attached_client_state(runtime: &HostRuntime) {
+        let pid = std::process::id();
+        let _ = runtime.output.flush_backlog();
+        let _ = runtime.output.emit_backend_ready();
+        let _ = runtime.output.emit_host_connected();
+
+        let (busy, wait_state) = {
+            let state = runtime.state.lock().expect("host state lock poisoned");
+            (state.busy, state.wait_state.clone())
+        };
+        let wait = match wait_state {
+            Some(StoredWaitState::TopLevel(kind)) => SessionWaitState::TopLevel(kind),
+            Some(StoredWaitState::Nested(prompt)) => SessionWaitState::Nested(prompt),
+            None => SessionWaitState::None,
+        };
+        let _ = runtime.output.emit_session_state(pid, busy, wait);
+        let _ = runtime.output.emit_output_flush();
+    }
+
+    fn is_shutdown_requested() -> bool {
+        host_runtime()
+            .map(|runtime| {
+                runtime
+                    .state
+                    .lock()
+                    .expect("host state lock poisoned")
+                    .shutdown_requested
+            })
+            .unwrap_or(false)
     }
 
     fn handle_command(command: IncomingCommand) {
@@ -2113,6 +2477,7 @@ mod windows_host {
             if let Some(fragment) = state.pending_fragment.take() {
                 let signal_input_end = state.pending_fragment_from_nested;
                 state.pending_fragment_from_nested = false;
+                state.wait_state = None;
                 return write_read_buffer(
                     buffer,
                     buflen,
@@ -2135,6 +2500,7 @@ mod windows_host {
             }
 
             if state.shutdown_requested {
+                state.wait_state = None;
                 if matches!(wait_kind, WaitKind::Nested(_)) {
                     let _ = runtime.output.emit_input_end();
                     let _ = runtime.output.emit_output_flush();
@@ -2144,6 +2510,7 @@ mod windows_host {
 
             if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
                 state.interrupt_requested = false;
+                state.wait_state = None;
                 let _ = runtime.output.emit_input_end();
                 let _ = runtime.output.emit_output_flush();
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
@@ -2153,10 +2520,12 @@ mod windows_host {
             if !wait_event_emitted {
                 match &wait_kind {
                     WaitKind::TopLevel(kind) => {
+                        state.wait_state = Some(StoredWaitState::TopLevel(*kind));
                         let _ = runtime.output.emit_prompt(*kind);
                         let _ = runtime.output.emit_output_flush();
                     }
                     WaitKind::Nested(prompt) => {
+                        state.wait_state = Some(StoredWaitState::Nested(prompt.clone()));
                         let _ = runtime.output.emit_input_request(prompt);
                         let _ = runtime.output.emit_output_flush();
                     }
@@ -2227,6 +2596,8 @@ mod windows_host {
                     state.suppress_idle_event_pump = state.interrupt_requested;
                     state.interrupt_requested = false;
                     set_r_interrupts_pending(false);
+                } else {
+                    state.wait_state = None;
                 }
                 should_preserve_interrupt = value != 0 && state.interrupt_requested;
             }
@@ -2311,6 +2682,7 @@ mod windows_host {
 
     fn take_next_line(wait_kind: &WaitKind, state: &mut SharedState) -> Option<PendingLine> {
         if let Some(line) = state.active_submission_lines.pop_front() {
+            state.wait_state = None;
             return Some(PendingLine {
                 bytes: line,
                 signal_input_end: false,
@@ -2326,6 +2698,7 @@ mod windows_host {
                 match state.pending_commands.remove(index) {
                     Some(PendingCommand::Submit(lines)) => {
                         state.active_submission_lines = lines;
+                        state.wait_state = None;
                         state
                             .active_submission_lines
                             .pop_front()
@@ -2343,10 +2716,13 @@ mod windows_host {
                     .iter()
                     .position(|command| matches!(command, PendingCommand::Reply(_)))?;
                 match state.pending_commands.remove(index) {
-                    Some(PendingCommand::Reply(bytes)) => Some(PendingLine {
-                        bytes,
-                        signal_input_end: true,
-                    }),
+                    Some(PendingCommand::Reply(bytes)) => {
+                        state.wait_state = None;
+                        Some(PendingLine {
+                            bytes,
+                            signal_input_end: true,
+                        })
+                    }
                     _ => None,
                 }
             }
