@@ -21,7 +21,7 @@ mod unix_host {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -304,7 +304,7 @@ mod unix_host {
     fn start_session_command_reader(
         session_file: String,
         initial_connect_grace: Duration,
-        reconnect_grace: Duration,
+        reconnect_grace: Option<Duration>,
     ) {
         thread::spawn(move || {
             let listener = match TcpListener::bind(("127.0.0.1", 0)) {
@@ -335,8 +335,31 @@ mod unix_host {
                 return;
             }
 
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<usize>();
+            let current_client = Arc::new(AtomicUsize::new(0));
+            let client_connected = Arc::new(AtomicBool::new(false));
+            let mut next_client_id = 0_usize;
             let mut disconnect_deadline = Some(Instant::now() + initial_connect_grace);
             loop {
+                let mut should_break = false;
+                while let Ok(client_id) = disconnect_rx.try_recv() {
+                    if current_client.load(Ordering::SeqCst) != client_id {
+                        continue;
+                    }
+                    if let Some(runtime) = host_runtime() {
+                        runtime.output.detach_client();
+                    }
+                    client_connected.store(false, Ordering::SeqCst);
+                    if is_shutdown_requested() {
+                        should_break = true;
+                        break;
+                    }
+                    disconnect_deadline = reconnect_grace.map(|grace| Instant::now() + grace);
+                }
+                if should_break {
+                    break;
+                }
+
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
                         if let Err(error) = stream.set_nonblocking(false) {
@@ -356,6 +379,11 @@ mod unix_host {
                                 break;
                             }
                         };
+                        next_client_id = next_client_id.wrapping_add(1).max(1);
+                        let client_id = next_client_id;
+                        current_client.store(client_id, Ordering::SeqCst);
+                        client_connected.store(true, Ordering::SeqCst);
+                        disconnect_deadline = None;
                         if let Err(error) = writer.set_nonblocking(false) {
                             emit_host_error(&format!(
                                 "backend session writer setup failed: {error}"
@@ -368,35 +396,48 @@ mod unix_host {
                             emit_attached_client_state(runtime);
                         }
 
-                        loop {
-                            match read_next_command(&mut stream) {
-                                Ok(Some(command)) => handle_command(command),
-                                Ok(None) => break,
-                                Err(error) => {
-                                    emit_host_error(&format!(
-                                        "backend command read failed: {error}"
-                                    ));
-                                    break;
+                        let reader_current_client = Arc::clone(&current_client);
+                        let reader_disconnect_tx = disconnect_tx.clone();
+                        thread::spawn(move || {
+                            loop {
+                                match read_next_command(&mut stream) {
+                                    Ok(Some(command)) => {
+                                        if reader_current_client.load(Ordering::SeqCst)
+                                            != client_id
+                                        {
+                                            break;
+                                        }
+                                        handle_command(command);
+                                        if is_shutdown_requested() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(error) => {
+                                        if reader_current_client.load(Ordering::SeqCst)
+                                            == client_id
+                                        {
+                                            emit_host_error(&format!(
+                                                "backend command read failed: {error}"
+                                            ));
+                                        }
+                                        break;
+                                    }
                                 }
                             }
-                        }
-
-                        if let Some(runtime) = host_runtime() {
-                            runtime.output.detach_client();
-                        }
-                        if is_shutdown_requested() {
-                            break;
-                        }
-                        disconnect_deadline = Some(Instant::now() + reconnect_grace);
+                            let _ = reader_disconnect_tx.send(client_id);
+                        });
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if is_shutdown_requested() {
                             break;
                         }
-                        if let Some(deadline) = disconnect_deadline {
-                            if Instant::now() >= deadline {
-                                request_shutdown();
-                                break;
+                        if !client_connected.load(Ordering::SeqCst) {
+                            if let Some(deadline) = disconnect_deadline {
+                                if Instant::now() >= deadline {
+                                    request_shutdown();
+                                    break;
+                                }
                             }
                         }
                         thread::sleep(SESSION_ACCEPT_POLL_INTERVAL);
@@ -412,7 +453,7 @@ mod unix_host {
         });
     }
 
-    fn session_transport_config() -> Option<(String, Duration, Duration)> {
+    fn session_transport_config() -> Option<(String, Duration, Option<Duration>)> {
         let session_file = std::env::var("VSC_R_BACKEND_SESSION_FILE").ok()?;
         if session_file.trim().is_empty() {
             return None;
@@ -421,14 +462,20 @@ mod unix_host {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(60_000);
-        let reconnect_grace_ms = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
+        let reconnect_grace = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(15_000);
+            .and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(value))
+                }
+            });
         Some((
             session_file,
             Duration::from_millis(initial_connect_grace_ms),
-            Duration::from_millis(reconnect_grace_ms),
+            reconnect_grace,
         ))
     }
 
@@ -1541,7 +1588,7 @@ mod windows_host {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::{
@@ -1927,7 +1974,7 @@ mod windows_host {
     fn start_session_command_reader(
         session_file: String,
         initial_connect_grace: Duration,
-        reconnect_grace: Duration,
+        reconnect_grace: Option<Duration>,
     ) {
         thread::spawn(move || {
             let listener = match TcpListener::bind(("127.0.0.1", 0)) {
@@ -1958,8 +2005,31 @@ mod windows_host {
                 return;
             }
 
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<usize>();
+            let current_client = Arc::new(AtomicUsize::new(0));
+            let client_connected = Arc::new(AtomicBool::new(false));
+            let mut next_client_id = 0_usize;
             let mut disconnect_deadline = Some(Instant::now() + initial_connect_grace);
             loop {
+                let mut should_break = false;
+                while let Ok(client_id) = disconnect_rx.try_recv() {
+                    if current_client.load(Ordering::SeqCst) != client_id {
+                        continue;
+                    }
+                    if let Some(runtime) = host_runtime() {
+                        runtime.output.detach_client();
+                    }
+                    client_connected.store(false, Ordering::SeqCst);
+                    if is_shutdown_requested() {
+                        should_break = true;
+                        break;
+                    }
+                    disconnect_deadline = reconnect_grace.map(|grace| Instant::now() + grace);
+                }
+                if should_break {
+                    break;
+                }
+
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
                         if let Err(error) = stream.set_nonblocking(false) {
@@ -1979,6 +2049,11 @@ mod windows_host {
                                 break;
                             }
                         };
+                        next_client_id = next_client_id.wrapping_add(1).max(1);
+                        let client_id = next_client_id;
+                        current_client.store(client_id, Ordering::SeqCst);
+                        client_connected.store(true, Ordering::SeqCst);
+                        disconnect_deadline = None;
                         if let Err(error) = writer.set_nonblocking(false) {
                             emit_host_error(&format!(
                                 "backend session writer setup failed: {error}"
@@ -1991,35 +2066,48 @@ mod windows_host {
                             emit_attached_client_state(runtime);
                         }
 
-                        loop {
-                            match read_next_command(&mut stream) {
-                                Ok(Some(command)) => handle_command(command),
-                                Ok(None) => break,
-                                Err(error) => {
-                                    emit_host_error(&format!(
-                                        "backend command read failed: {error}"
-                                    ));
-                                    break;
+                        let reader_current_client = Arc::clone(&current_client);
+                        let reader_disconnect_tx = disconnect_tx.clone();
+                        thread::spawn(move || {
+                            loop {
+                                match read_next_command(&mut stream) {
+                                    Ok(Some(command)) => {
+                                        if reader_current_client.load(Ordering::SeqCst)
+                                            != client_id
+                                        {
+                                            break;
+                                        }
+                                        handle_command(command);
+                                        if is_shutdown_requested() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(error) => {
+                                        if reader_current_client.load(Ordering::SeqCst)
+                                            == client_id
+                                        {
+                                            emit_host_error(&format!(
+                                                "backend command read failed: {error}"
+                                            ));
+                                        }
+                                        break;
+                                    }
                                 }
                             }
-                        }
-
-                        if let Some(runtime) = host_runtime() {
-                            runtime.output.detach_client();
-                        }
-                        if is_shutdown_requested() {
-                            break;
-                        }
-                        disconnect_deadline = Some(Instant::now() + reconnect_grace);
+                            let _ = reader_disconnect_tx.send(client_id);
+                        });
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if is_shutdown_requested() {
                             break;
                         }
-                        if let Some(deadline) = disconnect_deadline {
-                            if Instant::now() >= deadline {
-                                request_shutdown();
-                                break;
+                        if !client_connected.load(Ordering::SeqCst) {
+                            if let Some(deadline) = disconnect_deadline {
+                                if Instant::now() >= deadline {
+                                    request_shutdown();
+                                    break;
+                                }
                             }
                         }
                         thread::sleep(SESSION_ACCEPT_POLL_INTERVAL);
@@ -2035,7 +2123,7 @@ mod windows_host {
         });
     }
 
-    fn session_transport_config() -> Option<(String, Duration, Duration)> {
+    fn session_transport_config() -> Option<(String, Duration, Option<Duration>)> {
         let session_file = std::env::var("VSC_R_BACKEND_SESSION_FILE").ok()?;
         if session_file.trim().is_empty() {
             return None;
@@ -2044,14 +2132,20 @@ mod windows_host {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(60_000);
-        let reconnect_grace_ms = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
+        let reconnect_grace = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(15_000);
+            .and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(value))
+                }
+            });
         Some((
             session_file,
             Duration::from_millis(initial_connect_grace_ms),
-            Duration::from_millis(reconnect_grace_ms),
+            reconnect_grace,
         ))
     }
 

@@ -91,7 +91,8 @@ const PARSE_STATUS_TIMEOUT_MS = 150;
 const SESSION_BOOTSTRAP_TIMEOUT_MS = 5000;
 const SESSION_BOOTSTRAP_POLL_MS = 40;
 const INITIAL_CONNECT_GRACE_MS = 60000;
-const RECONNECT_GRACE_MS = 60000;
+const PERSISTENT_RECONNECT_GRACE_MS = 0;
+const RECONNECT_SOCKET_RETRY_MS = 100;
 
 export interface RuntimeBackend {
   start(args: string[], options: RuntimeBackendStartOptions): RuntimeSessionHandle;
@@ -126,12 +127,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         ...options.env,
         VSC_R_BACKEND_SESSION_FILE: sessionFilePath,
         VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS: String(INITIAL_CONNECT_GRACE_MS),
-        VSC_R_BACKEND_RECONNECT_GRACE_MS: String(RECONNECT_GRACE_MS),
+        VSC_R_BACKEND_RECONNECT_GRACE_MS: String(PERSISTENT_RECONNECT_GRACE_MS),
       },
-      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
     };
 
     const child = spawn(this.sidecarPath, args, spawnOptions);
+    child.unref();
     const handle: RuntimeSessionHandle = {
       sessionId,
     };
@@ -365,14 +368,13 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return false;
     }
     if (state.child) {
-      return state.child.exitCode === null && state.child.signalCode === null;
+      return (
+        state.child.exitCode === null &&
+        state.child.signalCode === null &&
+        isRuntimeSessionPidAlive(state.child.pid)
+      );
     }
-    return (
-      Boolean(state.socket && !state.socket.destroyed) ||
-      (typeof state.reconnectInfo.port === "number" &&
-        Number.isFinite(state.reconnectInfo.port) &&
-        state.reconnectInfo.port > 0)
-    );
+    return Boolean(state.socket && !state.socket.destroyed) || state.attachGeneration > 0;
   }
 
   getPid(session: RuntimeSessionHandle | null): number | undefined {
@@ -402,6 +404,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (typeof port !== "number" || !Number.isFinite(port) || port <= 0) {
       return undefined;
     }
+    if (isRuntimeSessionPid(pid) && !isRuntimeSessionPidAlive(pid)) {
+      cleanupRuntimeSessionBootstrapFile(sessionId);
+      return undefined;
+    }
     return {
       sessionId,
       port,
@@ -421,7 +427,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
       state.reconnectInfo = { ...state.reconnectInfo, ...info };
 
-      const socket = await this.connectSocket(info.port);
+      const socket = await this.connectSocketWithRetry(state, info, generation);
       if (state.attachGeneration !== generation || state.explicitClose) {
         socket.destroy();
         return;
@@ -548,6 +554,40 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       socket.once("error", onError);
       socket.once("connect", onConnect);
     });
+  }
+
+  private async connectSocketWithRetry(
+    state: BackendSessionState,
+    info: RuntimeSessionReconnectInfo,
+    generation: number
+  ): Promise<net.Socket> {
+    while (true) {
+      if (state.attachGeneration !== generation || state.explicitClose) {
+        throw new Error("backend reconnect was cancelled");
+      }
+
+      if (state.child && state.child.exitCode !== null) {
+        throw new Error(`R backend exited with code ${state.child.exitCode}`);
+      }
+      if (state.child && state.child.signalCode !== null) {
+        throw new Error(`R backend exited with signal ${state.child.signalCode}`);
+      }
+      if (state.child && !isRuntimeSessionPidAlive(state.child.pid)) {
+        this.cleanupSessionBootstrapFile(state);
+        throw new Error(`R backend process ${state.child.pid} is no longer running`);
+      }
+      if (!state.child && isRuntimeSessionPid(info.pid) && !isRuntimeSessionPidAlive(info.pid)) {
+        cleanupRuntimeSessionBootstrapFile(info.sessionId);
+        throw new Error(`R backend process ${info.pid} is no longer running`);
+      }
+
+      try {
+        return await this.connectSocket(info.port);
+      } catch {
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, RECONNECT_SOCKET_RETRY_MS));
+    }
   }
 
   private writeFrame(state: BackendSessionState, frame: Buffer, closing: boolean = false): boolean {
@@ -704,4 +744,27 @@ export function getBundledRustSidecarPath(extensionPath: string): string {
 export function resolveRustSidecarPath(extensionPath: string): string | undefined {
   const bundledPath = getBundledRustSidecarPath(extensionPath);
   return fs.existsSync(bundledPath) ? bundledPath : undefined;
+}
+
+function isRuntimeSessionPid(pid: number | undefined): pid is number {
+  return typeof pid === "number" && Number.isFinite(pid) && pid > 0;
+}
+
+function isRuntimeSessionPidAlive(pid: number | undefined): boolean {
+  if (!isRuntimeSessionPid(pid)) {
+    return true;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function cleanupRuntimeSessionBootstrapFile(sessionId: string): void {
+  try {
+    fs.rmSync(getSessionBootstrapFilePath(sessionId), { force: true });
+  } catch {
+  }
 }

@@ -148,9 +148,10 @@ async function restorePersistedSessions(context: vscode.ExtensionContext): Promi
       return;
     }
 
+    const replacementRecords = getRestoredRecords(restored);
     const disposedStalePids = disposeStalePersistedTerminals(restored);
     if (disposedStalePids.size > 0) {
-      await waitForStalePersistedTerminalsDisposed(restored);
+      await waitForPersistedTerminalsDisposed(disposedStalePids, replacementRecords);
     }
     if (restoringPids.size > 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -177,27 +178,47 @@ function buildRestoredTerminalOptions(
 }
 
 function disposeStalePersistedTerminals(restored: readonly RestoredConsoleRecord[]): Set<number> {
+  return disposePersistedTerminalsByPid(
+    getRestoredPids(restored),
+    getRestoredRecords(restored)
+  );
+}
+
+function getRestoredPids(restored: readonly RestoredConsoleRecord[]): Set<number> {
   const restoredPids = new Set<number>();
-  const replacementTerminals = new Set<vscode.Terminal>();
   for (const entry of restored) {
     const pid = getPersistedRuntimePid(entry.persisted.terminal);
     if (typeof pid === "number") {
       restoredPids.add(pid);
     }
-    replacementTerminals.add(entry.terminal);
   }
+  return restoredPids;
+}
 
-  if (restoredPids.size === 0) {
+function getRestoredRecords(restored: readonly RestoredConsoleRecord[]): Set<ConsoleRecord> {
+  const records = new Set<ConsoleRecord>();
+  for (const entry of restored) {
+    records.add(entry.record);
+  }
+  return records;
+}
+
+function disposePersistedTerminalsByPid(
+  pids: ReadonlySet<number>,
+  replacementRecords: ReadonlySet<ConsoleRecord>
+): Set<number> {
+  if (pids.size === 0) {
     return new Set<number>();
   }
 
   const disposedPids = new Set<number>();
   for (const terminal of vscode.window.terminals) {
-    if (replacementTerminals.has(terminal)) {
+    const record = resolveRecordFromTerminal(terminal);
+    if (record && replacementRecords.has(record)) {
       continue;
     }
     const pid = parseConsolePidFromTerminal(terminal);
-    if (typeof pid !== "number" || !restoredPids.has(pid)) {
+    if (typeof pid !== "number" || !pids.has(pid)) {
       continue;
     }
     ignoredTerminalCloseEvents.add(terminal);
@@ -208,31 +229,23 @@ function disposeStalePersistedTerminals(restored: readonly RestoredConsoleRecord
   return disposedPids;
 }
 
-async function waitForStalePersistedTerminalsDisposed(
-  restored: readonly RestoredConsoleRecord[]
+async function waitForPersistedTerminalsDisposed(
+  pids: ReadonlySet<number>,
+  replacementRecords: ReadonlySet<ConsoleRecord>
 ): Promise<void> {
-  const restoredPids = new Set<number>();
-  const replacementTerminals = new Set<vscode.Terminal>();
-  for (const entry of restored) {
-    const pid = getPersistedRuntimePid(entry.persisted.terminal);
-    if (typeof pid === "number") {
-      restoredPids.add(pid);
-    }
-    replacementTerminals.add(entry.terminal);
-  }
-
-  if (restoredPids.size === 0) {
+  if (pids.size === 0) {
     return;
   }
 
   const deadline = Date.now() + 1000;
   while (Date.now() < deadline) {
     const stillVisible = vscode.window.terminals.some((terminal) => {
-      if (replacementTerminals.has(terminal)) {
+      const record = resolveRecordFromTerminal(terminal);
+      if (record && replacementRecords.has(record)) {
         return false;
       }
       const pid = parseConsolePidFromTerminal(terminal);
-      return typeof pid === "number" && restoredPids.has(pid);
+      return typeof pid === "number" && pids.has(pid);
     });
     if (!stillVisible) {
       return;

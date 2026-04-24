@@ -1,6 +1,11 @@
 # R Console
 
-R Console is a VS Code extension that runs R inside a custom pseudoterminal. It combines a TypeScript console frontend, a bundled Rust sidecar that embeds R directly, and a console-scoped language server client. It is designed to work with VS Code, the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) extension, and R's `languageserver`.
+R Console is a terminal-focused R console for VS Code. It is not a replacement
+for [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r);
+it is built to work inside the vscode-R workflow. The console provides the
+interactive terminal experience, while vscode-R provides the R startup and
+session integration, and R's `languageserver` provides console completions,
+signature help, and semantic highlighting.
 
 Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
@@ -14,18 +19,30 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 - Console-scoped completion and signature help through R's `languageserver` package.
 - Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
 - Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
+- Console view restoration after extension-host restart, including multiple open consoles.
 - Screen, scrollback, cursor, and ANSI style restoration when the terminal UI is recreated after a cancelled close or a reattach.
 - Close confirmation that immediately reattaches the running console before showing the modal prompt, which keeps the console visible despite the VS Code terminal API lacking a before-close hook.
 - Embedded console backend for macOS, Linux, and Windows.
 
 https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
 
+## Scope
+
+R Console owns the console surface: input editing, prompt handling, history,
+completion inside the console, syntax styling, and the embedded console runtime.
+It deliberately does not try to become the full R workspace UI.
+
+Features such as R session management, plot viewing, data viewing, help viewing,
+workspace browsing, R Markdown workflows, and general R file tooling belong to
+vscode-R and related R extensions. R Console integrates with those tools so an
+interactive console can fit into the same session model.
+
 ## Requirements
 
 - VS Code 1.85.0 or later.
 - Node.js 24.x for the extension build and packaging scripts.
 - A local R installation. `R Console` resolves it in this order: vscode-R `r.rpath.*`, ambient `R_HOME`, then `PATH`.
-- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension declares `REditorSupport.r` in `extensionDependencies` and depends on vscode-R session bootstrap/configuration; there is no standalone startup path.
+- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension declares `REditorSupport.r` in `extensionDependencies` and depends on vscode-R session bootstrap and configuration; there is no standalone startup path.
 - The R package `languageserver` if you want completion, signature help, and semantic highlighting.
 - Rust/Cargo only if you are building the sidecar binaries from source.
 
@@ -43,11 +60,11 @@ The minimum vscode-R setup for those commands to work is:
    - Windows: `r.rpath.windows` -> path to `R.exe`
    - macOS: `r.rpath.mac` -> path to `R`
    - Linux: `r.rpath.linux` -> path to `R`
-   
+
    `r.rterm.*` is not required to create `R Console`.
    If `r.rpath.*` is unset, `R Console` falls back to ambient `R_HOME`, then `PATH`.
    After selecting an executable, `R Console` derives `R_HOME` from that executable path and loads the matching shared library from that same installation.
-3. Set `r.alwaysUseActiveTerminal` to be `true` to make vscode-R commands to target `R Console`
+3. Set `r.alwaysUseActiveTerminal` to `true` if you want vscode-R commands to target `R Console`.
 4. Keep `r.rterm.option` compatible with embedded startup. `R Console` strips some wrapper-only flags, but startup still requires the vscode-R bootstrap path and will reject options such as `--vanilla` and `--no-init-file`.
 
 Useful optional settings:
@@ -114,21 +131,16 @@ R Console also contributes its own settings:
 
 ## Architecture
 
-### Runtime Layers
+R Console is split into a few high-level pieces:
 
-1. Terminal layer owns the pseudoterminal implementation, input buffer, cursor movement, multiline editing, history, the long-input viewport renderer, prompt handling, and an off-screen `@xterm/headless` buffer used to restore screen and scrollback state on reattach.
-
-2. Language layer owns completion-context analysis, local parse heuristics, immediate token-based styling, virtual documents, and the console-specific LSP bridge.
-
-3. Runtime layer owns the sidecar/session control protocol, bundled binary resolution, dialog bridging, and the vscode-R session watcher bridge.
-
-4. Rust sidecar
-- `sidecar/pty-host/` builds one binary:
-- `R_CONSOLE_HOST` is the embedded host. It does not spawn a second internal session-host process. It loads the R shared library dynamically, wires console callbacks, and emits prompt, busy, input-request, dialog, and parse-status events back to the extension over the backend protocol.
+- the terminal UI, which owns editing, prompts, history, and terminal-state restoration
+- the runtime bridge, which starts the bundled backend and keeps the console connected to R
+- the vscode-R bridge, which reads configuration and session state from vscode-R
+- the language bridge, which uses R's `languageserver` for console-aware editor features
 
 ### Dependency Model
 
-- `vscode-R` is a hard dependency. R Console uses the same configured R binary.
+- `vscode-R` is a hard dependency. R Console uses vscode-R configuration, bootstrap, and session watcher data.
 - R's `languageserver` package is optional but required for console semantic tokens, completion, and signature help.
 - The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
 

@@ -17,9 +17,9 @@ The runtime model is:
 
 1. VS Code hosts the extension.
 2. The extension creates a custom pseudoterminal implemented by `RTerminal`.
-3. `RTerminal` starts one bundled Rust binary: `R_CONSOLE_HOST`.
+3. `RTerminal` starts one detached bundled Rust binary: `R_CONSOLE_HOST`.
 4. `R_CONSOLE_HOST` embeds R directly in-process.
-5. The TypeScript side and the Rust side communicate over a framed protocol carried on stdio.
+5. The TypeScript side and the Rust side communicate over a framed protocol. Normal extension runs carry that protocol over a localhost session socket; the stdio transport remains as a fallback when no session file is configured.
 6. `vscode-R` is still required for startup/bootstrap/session-watcher integration.
 7. `languageserver` is started in a separate R process for completion, signatures, and semantic tokens.
 
@@ -107,16 +107,17 @@ and side-editor tabs, but the shutdown model is the same:
 6. if the user cancels, the reattached terminal remains visible
 
 Extension-host restart uses a different path. Running consoles are persisted
-on deactivate, then restored as new `RTerminal` instances that reconnect to the
-existing sidecar sessions. The restored terminal UI is treated as the current
-owner of the console; stale VS Code terminal UI from before the host restart is
-disposed without close confirmation. Terminal ownership is not inferred from a
-PID label alone, because stale and restored terminal tabs can legitimately share
-the same `R Console (<pid>)` label during restore. The vscode-R session watcher
-is restarted in a "fresh attach only" mode, so a restored console does not
-consume the pre-existing global `request.log`. Users reattach vscode-R
-explicitly through the `R: (not attached)` status item or by running
-`.vsc.attach()` in the console.
+on deactivate, while their detached sidecars continue running. On activation,
+the extension restores new `RTerminal` instances that reconnect to those
+sidecar sessions. The restored terminal UI is treated as the current owner of
+the console; stale VS Code terminal UI from before the host restart is disposed
+without close confirmation. Terminal ownership is not inferred from a PID label
+alone, because stale and restored terminal tabs can legitimately share the same
+`R Console (<pid>)` label during restore. The vscode-R session watcher is
+restarted in a "fresh attach only" mode, so a restored console does not consume
+the pre-existing global `request.log`. Users reattach vscode-R explicitly
+through the `R: (not attached)` status item or by running `.vsc.attach()` in the
+console.
 
 This is implemented in [`src/extension.ts`](../src/extension.ts).
 
@@ -249,10 +250,10 @@ The TypeScript/Rust boundary is defined in [`src/Runtime/backendProtocol.ts`](..
 
 ### 5.1 Transport
 
-- Normal extension runs use a session socket: TypeScript passes `VSC_R_BACKEND_SESSION_FILE`, the Rust host binds a localhost command/output socket, writes the selected port and process id to that file, and TypeScript connects to it.
-- That socket is the reload-reconnect boundary. The Rust host keeps the embedded R session alive for a short reconnect grace window if the extension host disconnects.
+- Normal extension runs use a detached sidecar and a session socket: TypeScript passes `VSC_R_BACKEND_SESSION_FILE`, the Rust host binds a localhost command/output socket, writes the selected port and process id to that file, and TypeScript connects to it.
+- That socket is the reload-reconnect boundary. After the first TypeScript client connects, the Rust host keeps the embedded R session alive indefinitely if the extension host disconnects; only explicit shutdown, R exit, sidecar crash, or OS process termination ends the session.
 - If no session file is configured, the Rust host falls back to stdin commands and framed stdout output.
-- Rust host stderr is reserved for diagnostic/error text.
+- Rust host stderr is only for early process diagnostics; session output uses the protocol socket.
 
 The protocol frame header is 12 bytes and includes:
 
@@ -302,14 +303,17 @@ Key commands:
 
 ### 5.5 Why stdout handling matters
 
-The protocol shares stdio with R output, so the sidecar has to keep raw console writes from corrupting protocol frames.
+R and native packages can write directly to process stdout, bypassing the R
+console callbacks. The sidecar has to capture those writes without corrupting
+the framed control/output protocol.
 
 Current behavior:
 
-- Unix duplicates the original stdout fd for protocol output and redirects process stdout to stderr.
-- Windows duplicates the stdout handle for protocol output, then redirects process stdout to stderr as well.
+- In normal session-socket mode, the sidecar captures process stdout and forwards it as protocol output to the active client or to the output backlog while no client is attached.
+- In stdio fallback mode, Unix duplicates the original stdout fd for protocol output and redirects process stdout to stderr.
+- In stdio fallback mode, Windows duplicates the stdout handle for protocol output, then redirects process stdout to stderr as well.
 
-That keeps framed protocol traffic isolated from direct R console writes.
+That keeps framed protocol traffic isolated from direct R/native writes.
 
 ## 6. Terminal Frontend Model
 
