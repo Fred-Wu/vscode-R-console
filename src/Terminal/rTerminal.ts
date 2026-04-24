@@ -195,6 +195,8 @@ export class RTerminal implements vscode.Pseudoterminal {
   private pendingInitialPromptGap = false;
   private promptRenderTimer: NodeJS.Timeout | null = null;
   private replyPromptRenderTimer: NodeJS.Timeout | null = null;
+  private resizeRepaintTimer: NodeJS.Timeout | null = null;
+  private pendingResizeRestorePrompt = false;
   private lastOutputAt = 0;
 
   private mode: TerminalMode = "starting";
@@ -339,9 +341,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    snapshot.lines.forEach((line, index) => {
+    const lines = snapshot.lines.map((line) => this.trimReplayLineRight(line));
+    lines.forEach((line, index) => {
       this.terminalState._core._writeBuffer.writeSync(line);
-      if (index < snapshot.lines.length - 1) {
+      if (index < lines.length - 1) {
         this.terminalState._core._writeBuffer.writeSync("\r\n");
       }
     });
@@ -699,11 +702,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       });
     }
 
-    this.repaintAfterResize(hadVisiblePrompt);
-
-    if (!this.promptVisible && this.mode === "ready" && this.promptReady && this.pendingPromptToken) {
-      this.schedulePrompt();
-    }
+    this.scheduleResizeRepaint(hadVisiblePrompt);
   }
 
   handleInput(data: string): void {
@@ -1654,6 +1653,35 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.replyPromptRenderTimer = null;
   }
 
+  private scheduleResizeRepaint(restorePrompt: boolean): void {
+    this.pendingResizeRestorePrompt = this.pendingResizeRestorePrompt || restorePrompt;
+    this.clearResizeRepaintTimer();
+
+    this.resizeRepaintTimer = setTimeout(() => {
+      this.resizeRepaintTimer = null;
+      const shouldRestorePrompt = this.pendingResizeRestorePrompt;
+      this.pendingResizeRestorePrompt = false;
+
+      if (this.mode === "closed" || !this.rProcess) {
+        return;
+      }
+
+      this.repaintAfterResize(shouldRestorePrompt);
+
+      if (!this.promptVisible && this.mode === "ready" && this.promptReady && this.pendingPromptToken) {
+        this.schedulePrompt();
+      }
+    }, 30);
+  }
+
+  private clearResizeRepaintTimer(): void {
+    if (!this.resizeRepaintTimer) {
+      return;
+    }
+    clearTimeout(this.resizeRepaintTimer);
+    this.resizeRepaintTimer = null;
+  }
+
   private getPromptRenderDelay(): number {
     return getViewPromptRenderDelay(this.pendingInitialPromptGap, this.lastOutputAt);
   }
@@ -1692,7 +1720,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.withTerminalStateCaptureSuppressed(() => {
       replay.lines.forEach((line, index) => {
-        this.writeEmitter.fire(line);
+        this.writeEmitter.fire(this.trimReplayLineRight(line));
         if (index < replay.lines.length - 1) {
           this.writeEmitter.fire("\r\n");
         }
@@ -1728,9 +1756,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     cursorCol: number;
   } {
     const buffer = this.terminalState.buffer.active;
-    const rawRows = Array.from({ length: buffer.length }, (_, index) =>
-      this.serializeReplayRow(buffer.getLine(index))
-    );
+    const rawRows = Array.from({ length: buffer.length }, (_, index) => {
+      const nextLine = buffer.getLine(index + 1);
+      return this.serializeReplayRow(buffer.getLine(index), !nextLine?.isWrapped);
+    });
     const cursorAbsoluteRow = buffer.baseY + buffer.cursorY;
     const baselineRow = Math.max(0, Math.min(this.replayStartAbsoluteRow, rawRows.length));
     const firstContentOffset = rawRows
@@ -1791,7 +1820,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       Math.floor(absoluteCursorCol / safeColumns);
 
     return {
-      lines: lines.map((line) => line.styledText),
+      lines: lines.map((line) => this.trimReplayLineRight(line.styledText)),
       finalRow,
       cursorRow,
       cursorCol: absoluteCursorCol % safeColumns,
@@ -1910,6 +1939,22 @@ export class RTerminal implements vscode.Pseudoterminal {
       styledText,
       wrapped: line.isWrapped,
     };
+  }
+
+  private trimReplayLineRight(line: string): string {
+    let body = line;
+    let suffix = "";
+
+    while (true) {
+      const match = body.match(/(?:\x1b\[[0-9;]*m)+$/);
+      if (!match) {
+        break;
+      }
+      suffix = `${match[0]}${suffix}`;
+      body = body.slice(0, -match[0].length);
+    }
+
+    return `${body.replace(/[ \t]+$/, "")}${suffix}`;
   }
 
   private serializeCellStyle(cell: IBufferCell): SerializedCellStyle {
@@ -2143,7 +2188,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         if (index > 0) {
           this.writeEmitter.fire("\r\n");
         }
-        this.writeEmitter.fire(line);
+        this.writeEmitter.fire(this.trimReplayLineRight(line));
       });
       // No trailing \r\n here: showPrompt() always fires \r\n before calling
       // the suppressed renderInput(), so the headless terminal's cursor row is
@@ -2290,6 +2335,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.pendingProgrammaticInput = "";
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
+    this.clearResizeRepaintTimer();
+    this.pendingResizeRestorePrompt = false;
 
     this.sessionAttached = false;
     this.lang.clearSessionState();
@@ -2326,6 +2373,8 @@ export class RTerminal implements vscode.Pseudoterminal {
   reattachToNewTerminal(): void {
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
+    this.clearResizeRepaintTimer();
+    this.pendingResizeRestorePrompt = false;
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
