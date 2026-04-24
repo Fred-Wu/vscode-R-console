@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
+import { randomUUID } from "crypto";
+import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
@@ -72,6 +74,18 @@ class TrackingWriteEmitter extends vscode.EventEmitter<string> {
   }
 }
 
+function createShutdownDetachMarkerPath(): string {
+  return path.join(
+    os.tmpdir(),
+    "vscode-r-console",
+    `suppress-detach-${randomUUID()}`
+  );
+}
+
+function isPositivePid(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 type ReplayTerminal = HeadlessTerminal & {
   _core: {
     _writeBuffer: {
@@ -113,6 +127,7 @@ type PersistedUiSnapshot = {
   replay: PersistedReplaySnapshot;
   replayColumns: number;
   replayRows: number;
+  shutdownDetachMarkerPath?: string;
   mode: TerminalMode;
   promptReady: boolean;
   promptKind: "main" | "cont";
@@ -125,6 +140,15 @@ type PersistedUiSnapshot = {
   inputText: string;
   inputCursorPosition: number;
   backendChildPid?: number;
+};
+
+type VscodeRSessionRequest = {
+  command?: string;
+  pid?: number;
+};
+
+type ForceCloseOptions = {
+  suppressVscodeSessionDetach?: boolean;
 };
 
 export type PersistedRTerminalOptions = Pick<
@@ -161,6 +185,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private rProcess: RuntimeSessionHandle | null = null;
   private backendChildPid: number | undefined;
   private dimensions: { columns: number; rows: number } = { columns: 80, rows: 24 };
+  private shutdownDetachMarkerPath = createShutdownDetachMarkerPath();
 
   private syntax: ConsoleSyntax;
   private renderer: Renderer;
@@ -236,6 +261,12 @@ export class RTerminal implements vscode.Pseudoterminal {
         columns: Math.max(20, restoreState.ui.replayColumns),
         rows: Math.max(5, restoreState.ui.replayRows),
       };
+    }
+    if (
+      typeof restoreState?.ui.shutdownDetachMarkerPath === "string" &&
+      restoreState.ui.shutdownDetachMarkerPath.length > 0
+    ) {
+      this.shutdownDetachMarkerPath = restoreState.ui.shutdownDetachMarkerPath;
     }
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
@@ -381,6 +412,12 @@ export class RTerminal implements vscode.Pseudoterminal {
       },
       set extensionPath(value) {
         self.extensionPath = value;
+      },
+      get shutdownDetachMarkerPath() {
+        return self.shutdownDetachMarkerPath;
+      },
+      set shutdownDetachMarkerPath(value) {
+        self.shutdownDetachMarkerPath = value;
       },
       get runtimeBackend() {
         return self.runtimeBackend;
@@ -2322,12 +2359,17 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     this.writeEmitter.fire("\r\n");
-    this.forceClose();
+    this.forceClose({
+      suppressVscodeSessionDetach: this.shouldSuppressShutdownDetach(),
+    });
     this.closeEmitter.fire(0);
   }
 
-  forceClose(): void {
+  forceClose(options: ForceCloseOptions = {}): void {
     this.saveHistory();
+    if (options.suppressVscodeSessionDetach) {
+      this.markShutdownDetachSuppressed();
+    }
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
     this.lang.cleanupCompletionDocument();
@@ -2395,6 +2437,52 @@ export class RTerminal implements vscode.Pseudoterminal {
     return getRuntimeTerminalName(this.runtimeHost());
   }
 
+  shouldSuppressShutdownDetach(): boolean {
+    if (!this.options.sessionWatcherEnabled) {
+      return false;
+    }
+
+    const currentPid = this.getDisplayPid();
+    if (!isPositivePid(currentPid)) {
+      return false;
+    }
+
+    const request = this.readCurrentVscodeRSessionRequest();
+    return (
+      request?.command === "attach" &&
+      isPositivePid(request.pid) &&
+      request.pid !== currentPid
+    );
+  }
+
+  private readCurrentVscodeRSessionRequest(): VscodeRSessionRequest | undefined {
+    try {
+      const requestFile = path.join(this.options.watcherDir, "request.log");
+      if (!fs.existsSync(requestFile)) {
+        return undefined;
+      }
+      const parsed = JSON.parse(fs.readFileSync(requestFile, "utf-8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return undefined;
+      }
+      const request = parsed as Record<string, unknown>;
+      return {
+        command: typeof request.command === "string" ? request.command : undefined,
+        pid: isPositivePid(request.pid) ? request.pid : undefined,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private markShutdownDetachSuppressed(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.shutdownDetachMarkerPath), { recursive: true });
+      fs.writeFileSync(this.shutdownDetachMarkerPath, String(Date.now()));
+    } catch {
+    }
+  }
+
   exportPersistentState(): PersistedRTerminalState | undefined {
     if (!this.runtimeBackend || !this.rProcess) {
       return undefined;
@@ -2418,6 +2506,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         replay: this.buildTerminalReplay(),
         replayColumns: this.dimensions.columns,
         replayRows: this.dimensions.rows,
+        shutdownDetachMarkerPath: this.shutdownDetachMarkerPath,
         mode: this.mode,
         promptReady: this.promptReady,
         promptKind: this.promptKind,

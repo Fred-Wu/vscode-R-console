@@ -615,8 +615,9 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
     );
 
     if (result === "Close") {
+      const suppressVscodeSessionDetach = record.rTerminal.shouldSuppressShutdownDetach();
       disposeConsoleRecord(record);
-      record.rTerminal.forceClose();
+      record.rTerminal.forceClose({ suppressVscodeSessionDetach });
       terminalToRecord.delete(reattachedTerminal);
       reattachedTerminal.dispose();
     }

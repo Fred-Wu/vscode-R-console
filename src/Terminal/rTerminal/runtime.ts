@@ -61,6 +61,7 @@ const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>()
 export type RuntimeHost = {
   options: RTerminalOptions;
   extensionPath: string;
+  shutdownDetachMarkerPath: string;
   runtimeBackend: RuntimeBackend | undefined;
   rProcess: RuntimeSessionHandle | null;
   backendChildPid: number | undefined;
@@ -171,12 +172,21 @@ export function startRuntime(host: RuntimeHost): void {
   }
 
   try {
+    if (host.options.sessionWatcherEnabled) {
+      fs.mkdirSync(host.options.watcherDir, { recursive: true });
+    }
     const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
     if (host.extensionPath) {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
       runtimeEnv.VSC_R_COLS = String(Math.max(20, host.dimensions.columns || 80));
       runtimeEnv.VSC_R_ROWS = String(Math.max(5, host.dimensions.rows || 24));
+      runtimeEnv.VSC_R_SUPPRESS_DETACH_FILE = host.shutdownDetachMarkerPath;
+      try {
+        fs.mkdirSync(path.dirname(host.shutdownDetachMarkerPath), { recursive: true });
+        fs.rmSync(host.shutdownDetachMarkerPath, { force: true });
+      } catch {
+      }
       const consoleProfilePath = getConsoleProfilePath(host.extensionPath);
       if (!fs.existsSync(consoleProfilePath)) {
         throw new Error(`Console bootstrap script not found at ${consoleProfilePath}`);

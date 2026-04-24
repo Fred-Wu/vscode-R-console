@@ -11,6 +11,7 @@ All notable changes to R Console will be documented in this file.
 ### Fixed
 - Restored consoles no longer auto-attach to vscode-R from an old session request; users can reattach from `R: (not attached)` or by running `.vsc.attach()`.
 - Restoring multiple consoles no longer creates a duplicate terminal or shows an unexpected close confirmation for the last console.
+- Closing a non-current console no longer drops the `R: workspace` view for the still-attached console. This is for the custom [vscode-R](https://github.com/Fred-Wu/vscode-R) console build. 
 - Restored console output is replayed without large extra blank spaces.
 - Resizing a restored console in an editor tab is smoother and no longer immediately snaps back during split dragging.
 

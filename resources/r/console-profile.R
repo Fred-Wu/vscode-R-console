@@ -43,6 +43,68 @@ local({
     }
 })
 
+# Prevent a non-current embedded console from clearing vscode-R's global
+# workspace view when that console exits. The TypeScript host creates the
+# marker only when another R session owns the current vscode-R attachment.
+local({
+    install_detach_guard <- function() {
+        tools_env <- tryCatch(
+            as.environment("tools:vscode"),
+            error = function(err) NULL
+        )
+        if (!is.environment(tools_env) ||
+            !exists(".vsc", envir = tools_env, inherits = FALSE)) {
+            return(invisible(FALSE))
+        }
+
+        vsc_env <- get(".vsc", envir = tools_env, inherits = FALSE)
+        if (!is.environment(vsc_env) ||
+            !exists("request", envir = vsc_env, inherits = FALSE)) {
+            return(invisible(FALSE))
+        }
+
+        current_request <- get("request", envir = vsc_env, inherits = FALSE)
+        if (isTRUE(attr(current_request, "r_console_detach_guard"))) {
+            return(invisible(TRUE))
+        }
+
+        guarded_request <- local({
+            original_request <- current_request
+            function(command, ...) {
+                marker_file <- Sys.getenv("VSC_R_SUPPRESS_DETACH_FILE", "")
+                if (identical(command, "detach") &&
+                    nzchar(marker_file) &&
+                    file.exists(marker_file)) {
+                    unlink(marker_file, force = TRUE)
+                    return(invisible(NULL))
+                }
+                original_request(command, ...)
+            }
+        })
+        attr(guarded_request, "r_console_detach_guard") <- TRUE
+        tryCatch(
+            {
+                assign("request", guarded_request, envir = vsc_env)
+                invisible(TRUE)
+            },
+            error = function(err) invisible(FALSE)
+        )
+    }
+
+    first_sys <- get0(".First.sys", envir = globalenv(), inherits = FALSE)
+    if (is.function(first_sys)) {
+        guarded_first_sys <- local({
+            original_first_sys <- first_sys
+            function(...) {
+                result <- original_first_sys(...)
+                try(install_detach_guard(), silent = TRUE)
+                result
+            }
+        })
+        assign(".First.sys", guarded_first_sys, envir = globalenv())
+    }
+})
+
 # Keep file.show() inside the console instead of launching the external R pager.
 local({
     normalize_pager_command <- function(command) {
