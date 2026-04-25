@@ -813,7 +813,7 @@ export function handleRuntimeError(host: RuntimeHost, error: string): void {
   const formatted = formatViewOutput(stripBracketedPasteMarkers(error));
   renderRuntimeText(
     host,
-    `${ANSI.red}${formatted}${ANSI.reset}`,
+    colorRuntimeText(formatted, ANSI.red, ANSI.reset),
     didOutputEndWithLineFeed(formatted)
   );
 }
@@ -923,7 +923,7 @@ function shouldPrefixPendingCarriageReturn(text: string): boolean {
 }
 
 function shouldDeferClearFrame(text: string): boolean {
-  return /^\r\s*\| +$/.test(text);
+  return /^\r\s*\| +$/.test(stripSgrCodes(text));
 }
 
 function shouldReplacePendingClearFrame(text: string): boolean {
@@ -931,11 +931,33 @@ function shouldReplacePendingClearFrame(text: string): boolean {
 }
 
 function isSimpleCarriageReturnRewrite(text: string): boolean {
-  return text.startsWith("\r") && !text.includes("\n") && !text.includes("\b") && !/\x1b\[/.test(text);
+  const withoutSgr = stripSgrCodes(text);
+  return (
+    withoutSgr.startsWith("\r") &&
+    !withoutSgr.includes("\n") &&
+    !withoutSgr.includes("\b") &&
+    !/\x1b/.test(withoutSgr)
+  );
 }
 
 function rewriteSimpleCarriageReturnOutput(text: string): string {
   return `\x1b[2K\x1b[1G${text.slice(1)}`;
+}
+
+function colorRuntimeText(text: string, prefix: string, suffix: string): string {
+  if (!text || text === "\r") {
+    return text;
+  }
+
+  if (text.startsWith("\r") && !text.startsWith("\r\n")) {
+    return `\r${prefix}${text.slice(1)}${suffix}`;
+  }
+
+  return `${prefix}${text}${suffix}`;
+}
+
+function stripSgrCodes(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function didOutputEndWithLineFeed(text: string): boolean {

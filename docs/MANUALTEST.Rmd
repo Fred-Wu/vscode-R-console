@@ -227,6 +227,26 @@ Expected:
 - console prompts for a numeric choice
 - no GUI menu is launched
 
+Also run these base-R nested prompt variants:
+
+```{r menu-like-nested-prompts}
+scan(what = character(), nmax = 2, quiet = TRUE)
+utils::askYesNo("Continue?")
+select.list(c("alpha", "beta", "gamma"), graphics = FALSE, title = "Select one")
+```
+
+At the prompts:
+
+- for `scan()`, enter two text values on separate prompt lines
+- for `askYesNo()`, enter `y`, `n`, or `cancel`
+- for `select.list()`, enter a numeric choice or `0`
+
+Expected:
+
+- each prompt remains visible after input and after terminal resize
+- replies are submitted once, without duplicated or skipped prompt lines
+- multiline paste at any of these prompts is replayed one prompt at a time
+
 Run:
 
 ```{r browser-test}
