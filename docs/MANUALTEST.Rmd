@@ -356,7 +356,7 @@ Then run:
 ```{r cli-progress-test}
 if (requireNamespace("cli", quietly = TRUE)) {
   n <- 100
-  cli::cli_progress_bar("Processing data", total = n)
+  cli::cli_progress_bar("Processing data", total = n, clear = FALSE)
   for (i in 1:n) {
     Sys.sleep(0.02)
     cli::cli_progress_update()

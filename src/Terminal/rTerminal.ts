@@ -217,6 +217,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private terminalState: ReplayTerminal;
   private suppressTerminalStateCapture = false;
   private static readonly TERMINAL_SCROLLBACK = 5000;
+  private static readonly RESIZE_REPAINT_SETTLE_MS = 150;
   private pendingInitialPromptGap = false;
   private promptRenderTimer: NodeJS.Timeout | null = null;
   private replyPromptRenderTimer: NodeJS.Timeout | null = null;
@@ -716,19 +717,20 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   setDimensions(dimensions: vscode.TerminalDimensions): void {
     const previous = this.dimensions;
-    const hadVisiblePrompt = this.promptVisible;
-    const changed =
-      dimensions.columns !== previous.columns || dimensions.rows !== previous.rows;
+    const nextDimensions = {
+      columns: dimensions.columns,
+      rows: dimensions.rows,
+    };
+    const columnsChanged = nextDimensions.columns !== previous.columns;
+    const rowsChanged = nextDimensions.rows !== previous.rows;
+    const changed = columnsChanged || rowsChanged;
 
     if (!changed) {
       return;
     }
 
-    if (hadVisiblePrompt) {
-      this.promptVisible = false;
-    }
-
-    this.dimensions = dimensions;
+    const hadVisiblePrompt = this.promptVisible;
+    this.dimensions = nextDimensions;
 
     this.syncReplayTerminalSize();
 
@@ -736,14 +738,30 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (this.isSessionProtocolActive()) {
+    if (columnsChanged && this.isSessionProtocolActive()) {
       this.runtimeBackend?.sendSessionCommand(this.rProcess, {
         type: "set-width",
-        columns: dimensions.columns,
+        columns: nextDimensions.columns,
       });
     }
 
-    this.scheduleResizeRepaint(hadVisiblePrompt);
+    if (columnsChanged) {
+      // xterm already reflows ordinary output when the editor width changes.
+      // Replaying the whole buffer at an idle prompt clears/rebuilds scrollback
+      // and can make editor-group width resizing jump. Only use the expensive
+      // replay path when there is live input that the native reflow cannot
+      // reliably preserve with the renderer's cursor bookkeeping.
+      const hasLiveInput = hadVisiblePrompt && this.inputState.text.length > 0;
+      if (hasLiveInput) {
+        this.promptVisible = false;
+        this.scheduleResizeRepaint(true);
+      }
+      return;
+    }
+
+    if (rowsChanged && hadVisiblePrompt) {
+      this.renderInput();
+    }
   }
 
   handleInput(data: string): void {
@@ -830,8 +848,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const normalized = this.normalizeProgrammaticInput(data);
+    const fullReplyText = this.stripFinalInputNewline(
+      `${this.inputState.text}${normalized}`
+    );
     return (
-      normalized.includes("\n") &&
+      fullReplyText.includes("\n") &&
       !normalized.includes("\x1b") &&
       !normalized.includes("\x03")
     );
@@ -866,6 +887,12 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private normalizeProgrammaticInput(data: string): string {
     return data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  private stripFinalInputNewline(data: string): string {
+    // The final newline is the Enter that submits the current reply; only
+    // earlier newlines represent additional queued prompt replies.
+    return data.endsWith("\n") ? data.slice(0, -1) : data;
   }
 
   private isPlainTextInputChunk(data: string): boolean {
@@ -1029,9 +1056,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private sendNestedReplyInput(text: string): void {
-    const normalized = stripBracketedPasteMarkers(text)
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n");
+    const normalized = this.stripFinalInputNewline(
+      stripBracketedPasteMarkers(text)
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+    );
     const lines = normalized.split("\n");
     const firstLine = lines.shift() ?? "";
     this.pendingConsoleInputLines.push(...lines);
@@ -1865,7 +1894,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (!this.promptVisible && this.mode === "ready" && this.promptReady && this.pendingPromptToken) {
         this.schedulePrompt();
       }
-    }, 30);
+    }, RTerminal.RESIZE_REPAINT_SETTLE_MS);
   }
 
   private clearResizeRepaintTimer(): void {
