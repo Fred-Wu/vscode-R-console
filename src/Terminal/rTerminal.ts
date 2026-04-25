@@ -598,6 +598,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       clearPromptRenderTimer: () => self.clearPromptRenderTimer(),
       clearReplyPromptRenderTimer: () => self.clearReplyPromptRenderTimer(),
       clearPendingConsoleInput: () => self.clearPendingConsoleInput(),
+      captureVisibleInputForReplay: () => self.captureVisibleInputForReplay(),
       sendPendingConsoleInput: (kind) => self.sendPendingConsoleInput(kind),
       schedulePrompt: () => self.schedulePrompt(),
       scheduleReplyPrompt: () => self.scheduleReplyPrompt(),
@@ -1096,6 +1097,29 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     this.renderInput();
     this.promptVisible = true;
+  }
+
+  private captureVisibleInputForReplay(): void {
+    if (!this.promptVisible) {
+      return;
+    }
+
+    const lines = this.inputState.lines;
+    const styledLines = this.syntax.snapshotNow(lines);
+    const continuationPad = "  ";
+
+    styledLines.forEach((line, index) => {
+      if (index > 0) {
+        this.terminalState._core._writeBuffer.writeSync("\r\n");
+      }
+      const prompt =
+        index === 0
+          ? `${ANSI.reset}${this.renderer.promptColor}${this.renderer.promptText}${ANSI.reset}`
+          : this.renderer.continuationPromptText === null
+            ? continuationPad
+            : `${ANSI.reset}${this.renderer.continuationPromptColor}${this.renderer.continuationPromptText}${ANSI.reset}`;
+      this.terminalState._core._writeBuffer.writeSync(`${prompt}${line}`);
+    });
   }
 
   private applyKeyAction(action: KeyAction): void {

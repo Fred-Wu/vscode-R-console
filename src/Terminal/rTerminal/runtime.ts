@@ -96,6 +96,7 @@ export type RuntimeHost = {
   clearPromptRenderTimer(): void;
   clearReplyPromptRenderTimer(): void;
   clearPendingConsoleInput(): void;
+  captureVisibleInputForReplay(): void;
   sendPendingConsoleInput(kind: "top-level" | "nested"): boolean;
   schedulePrompt(): void;
   scheduleReplyPrompt(): void;
@@ -985,6 +986,7 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
   }
 
   if (host.promptVisible) {
+    host.captureVisibleInputForReplay();
     host.writeEmitter.fire("\r\n");
     host.lastWriteEndedWithNewline = true;
     host.renderer.renderedLineCount = 1;
