@@ -229,6 +229,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private awaitingExecutionStart = false;
   private pendingInputFlushTimer: NodeJS.Timeout | null = null;
   private pendingProgrammaticInput = "";
+  private pendingConsoleInputLines: string[] = [];
   private runtimeHostAdapter!: RuntimeHost;
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
@@ -596,6 +597,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       clearPendingInputFlushTimer: () => self.clearPendingInputFlushTimer(),
       clearPromptRenderTimer: () => self.clearPromptRenderTimer(),
       clearReplyPromptRenderTimer: () => self.clearReplyPromptRenderTimer(),
+      clearPendingConsoleInput: () => self.clearPendingConsoleInput(),
+      sendPendingConsoleInput: (kind) => self.sendPendingConsoleInput(kind),
       schedulePrompt: () => self.schedulePrompt(),
       scheduleReplyPrompt: () => self.scheduleReplyPrompt(),
       clearInputRender: () => self.clearInputRender(),
@@ -754,6 +757,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.queueProgrammaticSubmission(data);
       return;
     }
+    if (this.shouldHandleAsNestedProgrammaticReply(data)) {
+      this.handleNestedProgrammaticReply(data);
+      return;
+    }
     if (this.mode === "executing" && this.isSessionProtocolActive()) {
       const hasCtrlC =
         data.includes("\x03") ||
@@ -816,6 +823,19 @@ export class RTerminal implements vscode.Pseudoterminal {
     );
   }
 
+  private shouldHandleAsNestedProgrammaticReply(data: string): boolean {
+    if (!this.canAcceptNestedReplyPaste()) {
+      return false;
+    }
+
+    const normalized = this.normalizeProgrammaticInput(data);
+    return (
+      normalized.includes("\n") &&
+      !normalized.includes("\x1b") &&
+      !normalized.includes("\x03")
+    );
+  }
+
   private shouldBufferProgrammaticInput(data: string): boolean {
     if (!this.canAcceptProgrammaticSubmission()) {
       return false;
@@ -831,6 +851,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.mode !== "closed" &&
       this.mode !== "reply" &&
       this.inputState.text.length === 0 &&
+      this.inputState.isAtEnd
+    );
+  }
+
+  private canAcceptNestedReplyPaste(): boolean {
+    return (
+      !this.inBracketPaste &&
+      this.mode === "reply" &&
       this.inputState.isAtEnd
     );
   }
@@ -968,6 +996,106 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.inputState.insertText(trimmed);
       this.renderInput();
     }
+  }
+
+  private handleNestedProgrammaticReply(data: string): void {
+    const normalized = stripBracketedPasteMarkers(data)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+    if (!normalized.includes("\n")) {
+      return;
+    }
+
+    this.sendNestedReplyInput(`${this.inputState.text}${normalized}`);
+  }
+
+  private handleNestedReplyPaste(content: string): boolean {
+    const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (!normalized.includes("\n")) {
+      this.inputState.insertText(normalized);
+      this.renderInput();
+      return false;
+    }
+
+    if (!this.inputState.isAtEnd) {
+      this.inputState.insertText(normalized);
+      this.renderInput();
+      return false;
+    }
+
+    this.sendNestedReplyInput(`${this.inputState.text}${normalized}`);
+    return true;
+  }
+
+  private sendNestedReplyInput(text: string): void {
+    const normalized = stripBracketedPasteMarkers(text)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+    const lines = normalized.split("\n");
+    const firstLine = lines.shift() ?? "";
+    this.pendingConsoleInputLines.push(...lines);
+
+    this.historyBrowsing = false;
+    this.historyCollapsed = true;
+    this.escPendingClear = false;
+    this.rHistory.resetIndex();
+
+    this.renderNestedInputLine(firstLine);
+    this.sendReadlineReply(firstLine);
+  }
+
+  private clearPendingConsoleInput(): void {
+    this.pendingConsoleInputLines = [];
+  }
+
+  private sendPendingConsoleInput(kind: "top-level" | "nested"): boolean {
+    if (this.mode === "closed") {
+      return false;
+    }
+
+    const line = this.pendingConsoleInputLines.shift();
+    if (line === undefined) {
+      return false;
+    }
+
+    if (kind === "nested") {
+      this.sendQueuedNestedInputLine(line);
+      return true;
+    }
+
+    void this.enqueueRSubmission(line, true).then((blocks) => {
+      this.recordSubmissionHistory(blocks);
+    });
+    return true;
+  }
+
+  private sendQueuedNestedInputLine(line: string): void {
+    this.historyBrowsing = false;
+    this.historyCollapsed = true;
+    this.escPendingClear = false;
+    this.rHistory.resetIndex();
+
+    this.renderNestedInputLine(line);
+    this.sendReadlineReply(line);
+  }
+
+  private renderNestedInputLine(line: string): void {
+    this.clearReplyPromptRenderTimer();
+    this.renderer.setPrompt(this.replyPromptText, ANSI.brightGreen);
+    this.renderer.clearContinuationPrompt();
+
+    if (!this.promptVisible && !this.lastWriteEndedWithNewline && !this.pendingInitialPromptGap) {
+      this.writeEmitter.fire("\r\n");
+      this.lastWriteEndedWithNewline = true;
+    }
+
+    this.inputState.text = line;
+    this.inputState.cursorToEnd();
+    if (!this.promptVisible) {
+      this.promptBlockStartRow = this.getVisibleOutputCursorRow();
+    }
+    this.renderInput();
+    this.promptVisible = true;
   }
 
   private applyKeyAction(action: KeyAction): void {
@@ -1381,6 +1509,11 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.inBracketPaste = false;
         if (this.pasteBuffer.length > 0) {
           const content = stripBracketedPasteMarkers(this.pasteBuffer);
+          if (this.shouldSuppressEnterAfterPasteEnd(content)) {
+            this.suppressNextEnterAfterPasteEnd = this.handleNestedReplyPaste(content);
+            this.pasteBuffer = "";
+            return;
+          }
           this.inputState.insertText(content);
           this.pasteBuffer = "";
           this.renderInput();
@@ -2375,6 +2508,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang.cleanupCompletionDocument();
     this.clearPendingInputFlushTimer();
     this.pendingProgrammaticInput = "";
+    this.clearPendingConsoleInput();
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
     this.clearResizeRepaintTimer();

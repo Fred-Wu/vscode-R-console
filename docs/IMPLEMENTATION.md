@@ -793,9 +793,10 @@ This means most frontend behavior is platform-independent even though the embedd
 One important shared contract is prompt classification:
 
 - only the locked console prompts `> ` and `+ ` are treated as top-level prompts
-- everything else, including history-enabled prompts such as `Browse[1]>`, is treated as nested input
+- everything else is treated as nested input
+- when multiline text is pasted at a nested prompt, the first line is sent as that prompt's reply and the remaining lines stay in the frontend input buffer until R asks for the next top-level or nested `ReadConsole` prompt
 
-That shared rule is why `browser()`, pager prompts, and other nested reads now behave consistently on both Unix and Windows.
+That shared rule is why browser/debugger prompts, pager prompts, and other nested reads now behave consistently on both Unix and Windows without hard-coding specific prompt text in the host.
 
 ## 14. Recent Backend-Adjacent Fixes
 

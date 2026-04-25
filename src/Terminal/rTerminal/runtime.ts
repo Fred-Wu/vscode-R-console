@@ -54,6 +54,7 @@ type RuntimeAttachOptions = {
 
 export type Submission = {
   code: string;
+  initialPromptKind: "main" | "cont";
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
@@ -94,6 +95,8 @@ export type RuntimeHost = {
   clearPendingInputFlushTimer(): void;
   clearPromptRenderTimer(): void;
   clearReplyPromptRenderTimer(): void;
+  clearPendingConsoleInput(): void;
+  sendPendingConsoleInput(kind: "top-level" | "nested"): boolean;
   schedulePrompt(): void;
   scheduleReplyPrompt(): void;
   clearInputRender(): void;
@@ -143,6 +146,7 @@ export function startRuntime(host: RuntimeHost): void {
   host.clearPromptRenderTimer();
   host.lang.stopConsoleLsp();
   host.lang.clearSessionState();
+  host.clearPendingConsoleInput();
   host.pendingPromptToken = true;
   host.mode = "starting";
   host.promptReady = false;
@@ -511,6 +515,10 @@ export function handleBackendPrompt(
     return;
   }
 
+  if (host.sendPendingConsoleInput("top-level")) {
+    return;
+  }
+
   host.pendingPromptToken = true;
   host.schedulePrompt();
   if (kind === "main" && host.mode === "ready" && host.activeSubmission === null) {
@@ -544,6 +552,9 @@ export function handleBackendInputRequest(
   }
 
   host.mode = "reply";
+  if (host.sendPendingConsoleInput("nested")) {
+    return;
+  }
   host.scheduleReplyPrompt();
 }
 
@@ -1039,6 +1050,7 @@ export async function enqueueRuntimeSubmission(
   for (const block of blocks) {
     host.submissionQueue.push({
       code: block,
+      initialPromptKind: host.promptKind,
     });
   }
 
@@ -1119,7 +1131,11 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
     getContinuationPromptLength(host.renderer.continuationPromptText)
   );
   const styledLines = host.syntax.highlightLines(plan.lines, plan.sourceLineMap);
-  writeRuntimeSubmissionLines(host, styledLines, plan.promptKinds);
+  const promptKinds = [...plan.promptKinds];
+  if (task.initialPromptKind === "cont" && promptKinds.length > 0) {
+    promptKinds[0] = "cont";
+  }
+  writeRuntimeSubmissionLines(host, styledLines, promptKinds);
   host.promptVisible = false;
 }
 
@@ -1165,6 +1181,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.inputState.reset();
     host.promptVisible = false;
     host.pendingPromptToken = false;
+    host.clearPendingConsoleInput();
     return;
   }
 
@@ -1176,6 +1193,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.promptVisible = false;
     host.replyPromptText = "";
     host.mode = "executing";
+    host.clearPendingConsoleInput();
     sendInterrupt();
     return;
   }
@@ -1184,6 +1202,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.clearInputRender();
     host.inputState.reset();
     host.renderInput();
+    host.clearPendingConsoleInput();
     return;
   }
 
@@ -1194,12 +1213,14 @@ export function interruptRuntime(host: RuntimeHost): void {
   host.writeEmitter.fire("^C\r\n");
   host.inputState.reset();
   host.promptVisible = false;
+  host.clearPendingConsoleInput();
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
+  host.clearPendingConsoleInput();
   flushPendingRuntimeRewrite(host);
   setNativeParseCallback(null);
 
