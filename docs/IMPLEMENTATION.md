@@ -251,7 +251,7 @@ The TypeScript/Rust boundary is defined in [`src/Runtime/backendProtocol.ts`](..
 ### 5.1 Transport
 
 - Normal extension runs use a detached sidecar and a session socket: TypeScript passes `VSC_R_BACKEND_SESSION_FILE`, the Rust host binds a localhost command/output socket, writes the selected port and process id to that file, and TypeScript connects to it.
-- That socket is the reload-reconnect boundary. After the first TypeScript client connects, the Rust host keeps the embedded R session alive indefinitely if the extension host disconnects; only explicit shutdown, R exit, sidecar crash, or OS process termination ends the session.
+- That socket is the reload-reconnect boundary. After the first TypeScript client connects, the Rust host keeps the embedded R session alive for a 60-second reconnect grace period if VS Code closes or the extension host disconnects. If no client reconnects within that period, the host shuts down so VS Code closure does not leave a background R process. Closing the console tab itself still sends an explicit shutdown immediately. The grace-period model preserves a path for future self-managed console sessions without making every console self-managed by default.
 - If no session file is configured, the Rust host falls back to stdin commands and framed stdout output.
 - Rust host stderr is only for early process diagnostics; session output uses the protocol socket.
 
