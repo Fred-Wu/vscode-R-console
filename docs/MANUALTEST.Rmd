@@ -527,7 +527,7 @@ Expected:
   checks above should return `124` and `15376`
 
 Also test with:
-
+    
 - a file path containing spaces
 - CRLF line endings
 - no trailing newline at EOF

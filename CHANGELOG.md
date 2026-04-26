@@ -2,7 +2,7 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.2.0] - 2026-04-25
+## unrelease
 
 ### Added
 - Running R consoles now survive an extension-host restart by reconnecting to the existing backend session and restoring the console view.
