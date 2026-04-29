@@ -416,6 +416,7 @@ mod unix_host {
                                     Err(error) => {
                                         if reader_current_client.load(Ordering::SeqCst)
                                             == client_id
+                                            && !is_expected_session_disconnect_error(&error)
                                         {
                                             emit_host_error(&format!(
                                                 "backend command read failed: {error}"
@@ -501,6 +502,16 @@ mod unix_host {
         };
         let _ = runtime.output.emit_session_state(pid, busy, wait);
         let _ = runtime.output.emit_output_flush();
+    }
+
+    fn is_expected_session_disconnect_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        )
     }
 
     fn is_shutdown_requested() -> bool {
@@ -2086,6 +2097,7 @@ mod windows_host {
                                     Err(error) => {
                                         if reader_current_client.load(Ordering::SeqCst)
                                             == client_id
+                                            && !is_expected_session_disconnect_error(&error)
                                         {
                                             emit_host_error(&format!(
                                                 "backend command read failed: {error}"
@@ -2171,6 +2183,16 @@ mod windows_host {
         };
         let _ = runtime.output.emit_session_state(pid, busy, wait);
         let _ = runtime.output.emit_output_flush();
+    }
+
+    fn is_expected_session_disconnect_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        )
     }
 
     fn is_shutdown_requested() -> bool {
