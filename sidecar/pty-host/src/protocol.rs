@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
 use std::{fs::File, os::fd::FromRawFd};
