@@ -582,13 +582,21 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         throw new Error("backend reconnect was cancelled");
       }
 
-      if (state.child && state.child.exitCode !== null) {
+      // On Windows, the spawned child may be only a launcher. It exits after
+      // the real detached host writes the bootstrap file, so a child exit is
+      // not fatal while that bootstrapped host pid is alive.
+      const liveDetachedPid =
+        isRuntimeSessionPid(info.pid) &&
+        info.pid !== state.child?.pid &&
+        isRuntimeSessionPidAlive(info.pid);
+
+      if (state.child && state.child.exitCode !== null && !liveDetachedPid) {
         throw new Error(`R backend exited with code ${state.child.exitCode}`);
       }
-      if (state.child && state.child.signalCode !== null) {
+      if (state.child && state.child.signalCode !== null && !liveDetachedPid) {
         throw new Error(`R backend exited with signal ${state.child.signalCode}`);
       }
-      if (state.child && !isRuntimeSessionPidAlive(state.child.pid)) {
+      if (state.child && !liveDetachedPid && !isRuntimeSessionPidAlive(state.child.pid)) {
         this.cleanupSessionBootstrapFile(state);
         throw new Error(`R backend process ${state.child.pid} is no longer running`);
       }

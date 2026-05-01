@@ -1,6 +1,6 @@
 # Implementation
 
-This document is the current implementation note for `vscode-R-console`.
+This document is the implementation note for `vscode-R-console`.
 
 It is written for another engineer or Codex instance that needs to understand:
 
@@ -9,7 +9,7 @@ It is written for another engineer or Codex instance that needs to understand:
 - how the extension depends on VS Code, `vscode-R`, and `languageserver`
 - what should be tested on Windows
 
-It reflects the current codebase, not older design notes.
+It describes the codebase as implemented.
 
 ## 1. True Runtime Model
 
@@ -23,10 +23,10 @@ The runtime model is:
 6. `vscode-R` is still required for startup/bootstrap/session-watcher integration.
 7. `languageserver` is started in a separate R process for completion, signatures, and semantic tokens.
 
-Important correction:
+Runtime invariants:
 
-- `R_CONSOLE_HOST` is not a wrapper around a second internal session-host process.
-- The sidecar process is the embedded host.
+- `R_CONSOLE_HOST` is the embedded host process.
+- There is one embedded R runtime per console backend.
 
 ### 1.1 Integration summary
 
@@ -127,11 +127,13 @@ When the real R/session pid is known, the vscode-R session watcher hydrates
 from persisted same-pid attachment metadata or from an existing `request.log`
 entry that belongs to the same pid. It does not use request-file modification
 time as durable restore state. After a manually attached sidecar reconnects and
-reaches a safe top-level prompt, the console uses vscode-R's own in-session `request`
-function to re-emit attach metadata from the same R process. It does not call
-`.vsc.attach()` during persistent reattach, because older vscode-R builds may compute
-optional attach metadata through unguarded package-specific code before writing
-`request.log`.
+reaches a safe top-level prompt, the console uses vscode-R's in-session `request`
+function to re-emit attach metadata from the same R process.
+
+Persistent reattach emits attach metadata with `plot_url = NULL`. URL request
+metadata is retained for session metadata and is not replayed as part of terminal
+reattach. Plot and viewer visibility is owned by vscode-R's normal session and
+viewer commands.
 
 r-console persists only essential vscode-R attachment metadata (`attachedPid`,
 `sessionDir`, attach payload fields from `request.log`, session server details,
@@ -273,6 +275,7 @@ The TypeScript/Rust boundary is defined in [`src/Runtime/backendProtocol.ts`](..
 - Normal extension runs use a detached sidecar and a session socket: TypeScript passes `VSC_R_BACKEND_SESSION_FILE`, the Rust host binds a localhost command/output socket, writes the selected port and process id to that file, and TypeScript connects to it.
 - That socket is the reload-reconnect boundary. After the first TypeScript client connects, the Rust host keeps the embedded R session alive if VS Code closes or the extension host disconnects. Closing the console tab itself still sends an explicit shutdown immediately. Startup attempts that never receive an initial client still use an initial connection grace period, so failed launches do not leave a background R process.
 - On Windows, the first `R_CONSOLE_HOST.exe` acts as a short-lived launcher. It starts the real embedded-R host with detached process flags, including breakaway-from-job when Windows allows it, waits only until the real host writes the TCP bootstrap file, then exits. This prevents VS Code's extension-host process tree from owning the actual long-lived R session.
+- Because that launcher is expected to exit with code 0 after bootstrap, TypeScript treats the launcher exit as non-fatal while the bootstrap file points to a live detached host pid.
 - If no session file is configured, the Rust host falls back to stdin commands and framed stdout output.
 - Rust host stderr is only for early process diagnostics; session output uses the protocol socket.
 
@@ -365,39 +368,36 @@ Instead:
 - [`src/Terminal/renderer.ts`](../src/Terminal/renderer.ts) tracks rendered row counts and cursor position inside that viewport
 - the terminal can collapse or window long inputs instead of letting them spill uncontrollably
 
-This matters because earlier duplication bugs came from mismatches between the viewport and submission echo paths.
-
 ### 6.3 Submission echo model
 
-Current submit behavior is intentionally simple:
+Submit behavior:
 
-- when the current input is already fully visible and stable, the visible input can be reused
-- otherwise, the live input render is cleared and the submission is echoed once
+- if the prompt is visible, the live input render is cleared before submission work starts
+- the submitted block is echoed once through `buildSubmissionRenderPlan(...)`
+- syntax for the echo is produced by `ConsoleSyntax.highlightLines(...)`
 - before block splitting, submission normalization strips only true full-line R comment tokens; quoted `#...` text such as `Rcpp::sourceCpp()` headers is preserved
-- the submission echo uses `ConsoleSyntax.snapshotNow(...)`
-- there is no second async restyle/rewrite pass for submitted code
-
-This is the current fix for the long-code duplication regressions.
+- empty prompt-only submits write the styled prompt line into the replay terminal before scheduling the next prompt
 
 ## 7. Screen And Scrollback Restoration
 
-The reattach model changed materially.
-
-Current model:
+Restoration model:
 
 - every terminal write is mirrored into an off-screen `@xterm/headless` terminal
 - on reattach, the extension serializes that headless terminal buffer back into ANSI text
 - style information is preserved per cell
 - wrapped lines are reassembled into logical lines
 - cursor position is restored after replay
+- visible live input can be captured into the replay terminal with `ConsoleSyntax.snapshotNow(...)`
 
-The same replay buffer is also used for resize recovery:
+Resize behavior:
 
-- the viewport and scrollback are cleared first
-- the saved logical lines are replayed at the new width so xterm can wrap them again naturally
+- ordinary output reflow is left to xterm when the column count changes
+- when a column change happens while live input is visible, the viewport and scrollback are cleared and rebuilt from the headless replay buffer
+- saved logical lines are replayed at the new width so xterm can wrap them naturally
 - if the live prompt is visible, it is rendered again after the replay pass
+- row-only changes rerender visible prompt input when needed
 
-Important related behavior:
+Clear behavior:
 
 - `Ctrl+L` resets the replay terminal itself, not just the visible viewport
 - cleared output therefore stays cleared after both resize and reattach
@@ -406,10 +406,8 @@ Relevant implementation:
 
 - [`src/Terminal/rTerminal.ts`](../src/Terminal/rTerminal.ts)
 
-Important consequence:
-
-- reattach restoration is based on a headless terminal buffer, not on a hand-maintained append-only scrollback transcript
-- this is why restored styling now survives reattach
+Reattach restoration is based on a headless terminal buffer with serialized cell
+styling.
 
 ## 8. Syntax Highlighting Model
 
@@ -424,11 +422,9 @@ The console uses a two-layer highlighting model.
 - bracket-pair coloring
 
 The tokenizer comes from [`src/Language/parser.ts`](../src/Language/parser.ts).
-
-Important recent change:
-
-- obvious identifier-followed-by-`(` call sites are classified as `function` immediately
-- for example, `plot(1:100)` now highlights `plot` as a function without waiting for semantic tokens
+Identifier-followed-by-`(` call sites are classified as `function` immediately,
+so calls such as `plot(1:100)` receive function styling before semantic tokens
+arrive.
 
 ### 8.2 Semantic token overlay
 
@@ -533,7 +529,7 @@ Implementation details:
 - the current console input is mirrored into a long-lived virtual completion document
 - completion requests manually send `textDocument/didOpen` / `didChange` notifications before each request so document state is ordered correctly
 - semantic-token requests use short-lived snapshot virtual documents so one semantic request cannot corrupt the completion document state
-- the completion pipeline prefers `languageserver` and session data, but can fall back to recent console/session identifiers when the language server does not return useful symbols
+- the completion pipeline prefers `languageserver` and session data, but can fall back to recorded console/session identifiers when the language server does not return useful symbols
 - `$` and `@` completions can bypass `languageserver` and go through vscode-R's session server when a live object/member lookup is needed
 
 ### 9.6 Error handling and lifecycle
@@ -791,8 +787,8 @@ The host sets:
 
 It also calls `R_CheckUserInterrupt` when needed after interrupted reads.
 
-Important: the current implementation does not use `GenerateConsoleCtrlEvent`.
-If someone is testing interrupts on Windows, they should validate the current flag-based path, not assume Unix-style `SIGINT` behavior.
+Windows interrupt testing should validate the flag-based path. The Windows host
+does not use `GenerateConsoleCtrlEvent`.
 
 ## 13. Shared Backend Logic Between Unix And Windows
 
@@ -800,7 +796,7 @@ Although initialization differs per platform, most host-control logic is shared 
 
 The same high-level state machine exists on both platforms:
 
-- command reader thread reads backend frames from stdin on Unix or the backend named pipe on Windows
+- command reader thread reads backend frames from the localhost session socket, or from stdin when the stdio transport is active
 - commands are queued in shared state
 - `ReadConsole` waits for top-level submits or nested replies
 - parse-status requests are handled while waiting
@@ -819,65 +815,11 @@ One important shared contract is prompt classification:
 
 That shared rule is why browser/debugger prompts, pager prompts, and other nested reads now behave consistently on both Unix and Windows without hard-coding specific prompt text in the host.
 
-## 14. Recent Backend-Adjacent Fixes
-
-These are important for Windows testing because they changed expected behavior.
-
-### 14.1 Long-input duplication fix
-
-Recent fixes removed the bad async submission-restyle model.
-
-Current expected behavior:
-
-- long live input is clipped/windowed in the editable viewport
-- submitted code is echoed once
-- no duplicated top rows
-- no extra leading `R>`
-
-### 14.2 Reattach restore fix
-
-Reattach now restores:
-
-- scrollback
-- current visible screen
-- cursor position
-- ANSI styling
-
-Expected behavior after cancelling a close:
-
-- the console should look materially identical to before the close attempt
-
-### 14.3 Immediate function-call coloring
-
-`plot(1:100)` should color `plot` as a function immediately, even if the user submits quickly.
-
-### 14.4 Resize replay and hard clear
-
-Recent terminal fixes changed both resize recovery and clear-screen semantics.
-
-Current expected behavior:
-
-- terminal resize rebuilds the visible console from the headless replay buffer
-- wrapped output is reflowed at the new width instead of replaying already-wrapped old rows
-- empty prompt-only submits keep the visible `R> ` line after resize
-- `Ctrl+L` clears the current viewport and also drops the replay buffer, so old content does not reappear later
-
-### 14.5 Console completion and LSP cleanup
-
-Recent console-language changes also affect what users should expect.
-
-Current expected behavior:
-
-- completion still prefers `languageserver` and session watcher data
-- when those sources are missing, recent console identifiers can still appear as fallback suggestions
-- console diagnostics are disabled
-- closing a console-scoped `r-console://` virtual document should not leave stale LSP workspace state behind
-
-## 15. Windows Testing Checklist
+## 14. Windows Testing Checklist
 
 This is the minimum useful Windows validation list.
 
-### 15.1 Installation / packaging
+### 14.1 Installation / packaging
 
 - install the correct target-specific VSIX for the machine
 - confirm the installed extension contains one correct sidecar:
@@ -886,7 +828,7 @@ This is the minimum useful Windows validation list.
 - confirm the startup resolution source points to the intended R install:
   `r.rpath.*`, else ambient `R_HOME`, else `PATH`
 
-### 15.2 Startup
+### 14.2 Startup
 
 - create a console from the command palette
 - confirm the sidecar starts cleanly
@@ -894,7 +836,7 @@ This is the minimum useful Windows validation list.
 - confirm the terminal title eventually shows the attached R pid
 - confirm startup still works with `r.sessionWatcher` enabled
 
-### 15.3 Console editing and submission
+### 14.3 Console editing and submission
 
 - single-line commands
 - multi-line functions
@@ -909,8 +851,10 @@ Expected:
 - no duplicated top rows
 - no duplicate `R>`
 - no second rewritten copy of the same submitted block
+- empty prompt-only submits keep the visible `R> ` line after resize
+- `Ctrl+L` clears the visible screen and the replay buffer
 
-### 15.4 Highlighting and language features
+### 14.4 Highlighting and language features
 
 - local highlighting while typing
 - immediate function-call highlighting for `foo(...)`
@@ -918,15 +862,18 @@ Expected:
 - completions from `languageserver`
 - signature help
 - `$` / `@` member completion backed by the session server
+- fallback suggestions from recorded console/session identifiers
+- console diagnostics disabled for `r-console://` buffers
+- console-scoped virtual documents closed cleanly
 
-### 15.5 `vscode-R` integration
+### 14.5 `vscode-R` integration
 
 - confirm `vscode-R` bootstrap still runs
 - confirm session watcher updates search path and global env
 - confirm attached packages / namespaces reach the console LSP
 - confirm `file.show()` stays inside the console pager instead of spawning the external pager
 
-### 15.6 Windows-specific backend behavior
+### 14.6 Windows-specific backend behavior
 
 - `plot()` responsiveness
 - help/browser/graphapp responsiveness while waiting for input
@@ -937,7 +884,7 @@ Expected:
 - `file.edit()`
 - `system()` and `system2()`
 
-### 15.7 Reattach / close behavior
+### 14.7 Reattach / close behavior
 
 - close the terminal tab
 - confirm it immediately reattaches before the modal dialog
@@ -945,7 +892,7 @@ Expected:
 - verify syntax coloring survives reattach
 - confirm scrollback and cursor restoration are sane
 
-## 16. Useful Failure Signals
+## 15. Useful Failure Signals
 
 When Windows testing fails, check these in order:
 
@@ -966,14 +913,14 @@ Typical failure classes:
 - no `languageserver`
 - session watcher not attaching
 
-## 17. Current Assumptions And Limits
+## 16. Current Assumptions And Limits
 
 - The console depends on `vscode-R`; there is no standalone mode.
 - Windows support is for modern 64-bit layouts only.
 - The Windows LSP path uses a socket transport, not stdio.
 - Close interception is still constrained by the VS Code custom-terminal API.
 
-## 18. Files To Read First
+## 17. Files To Read First
 
 If another Codex needs to continue work, start with these files in this order:
 

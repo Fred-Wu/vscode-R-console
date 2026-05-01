@@ -190,7 +190,6 @@ function toRLiteral(value: unknown): string {
 
 function buildVscodeRReannounceCommand(snapshot: SessionWatcherSnapshot | undefined): string {
   const attach = snapshot?.attach;
-  const urlRequest = snapshot?.urlRequest;
   const attachVersion = attach?.version
     ? toRLiteral(attach.version)
     : 'sprintf("%s.%s", R.version$major, R.version$minor)';
@@ -198,10 +197,7 @@ function buildVscodeRReannounceCommand(snapshot: SessionWatcherSnapshot | undefi
   const attachInfo = attach?.info
     ? toRLiteral(attach.info)
     : "list(command = commandArgs()[[1L]], version = R.version.string, start_time = format(file.info(session_tempdir[[1]])$ctime))";
-  const attachPlotUrl = attach && "plotUrl" in attach ? toRLiteral(attach.plotUrl) : "NULL";
   const attachServer = attach?.server ? toRLiteral(attach.server) : "server";
-  const urlRequestCommand = urlRequest?.command ? toRLiteral(urlRequest.command) : "NULL";
-  const urlRequestUrl = urlRequest?.url ? toRLiteral(urlRequest.url) : "NULL";
 
   return String.raw`
 local({
@@ -248,7 +244,7 @@ local({
       version = ${attachVersion},
       tempdir = ${attachTempdir},
       info = ${attachInfo},
-      plot_url = ${attachPlotUrl},
+      plot_url = NULL,
       server = ${attachServer}
     )
     TRUE
@@ -257,14 +253,6 @@ local({
     return(invisible(FALSE))
   }
 
-  url_request_command <- ${urlRequestCommand}
-  url_request_url <- ${urlRequestUrl}
-  if (
-    is.character(url_request_command) && length(url_request_command) > 0 && nzchar(url_request_command[[1]]) &&
-    is.character(url_request_url) && length(url_request_url) > 0 && nzchar(url_request_url[[1]])
-  ) {
-    try(request(url_request_command[[1]], url = url_request_url[[1]]), silent = TRUE)
-  }
   invisible(TRUE)
 })
 `;

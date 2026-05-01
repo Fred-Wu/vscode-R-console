@@ -833,6 +833,31 @@ Expected:
 - closing the attached console still shows the usual confirmation flow
 - `R Console: Manage Persistent Sessions...` can close the selected persistent session permanently
 
+Manual close and fresh launch:
+
+1. close the attached console and confirm permanent close
+2. verify the previous backend process exits
+3. run `R Console: Create R Console`
+
+Expected:
+
+- a fresh console starts normally
+- startup does not print `Failed to start R: R backend exited with code 0`
+
+With an existing plot viewer:
+
+1. create a plot so the `R Plot` viewer opens
+2. restart the extension host
+3. attach the persistent console from `R Console: Manage Persistent Sessions...`
+4. confirm no duplicate `R Plot` viewer opens during attach
+5. close the `R Plot` viewer
+6. run another plot command or use vscode-R's plot viewer command
+
+Expected:
+
+- reattach itself does not reopen or reveal the old plot viewer
+- plot viewing remains handled by vscode-R after the console session is attached
+
 ## 23. Two Concurrent Consoles
 
 Open two R Console instances.

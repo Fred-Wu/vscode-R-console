@@ -12,17 +12,15 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 ## Features
 
 - Custom R console hosted in the VS Code terminal area.
+- Embedded console backend for macOS, Linux, and Windows.
+- Self-managed persistent R backends that can survive extension-host and VS Code restarts until closed from `R Console: Manage Persistent Sessions...` or the console tab close confirmation.
+- Console-scoped completion and signature help through R's `languageserver` package.
+- Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
 - Multiline editing with local history navigation, reverse search, and a windowed/collapsed viewport renderer for long inputs.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
 - Parser-backed completeness checks before submission.
-- Console-scoped completion and signature help through R's `languageserver` package.
-- Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
 - Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
-- Self-managed persistent R backends that can survive extension-host and VS Code restarts until closed from `R Console: Manage Persistent Sessions...` or the console tab close confirmation.
-- Screen, scrollback, cursor, and ANSI style restoration when the terminal UI is recreated after a cancelled close or a manual reattach.
-- Close confirmation that immediately reattaches the running console before showing the modal prompt, which keeps the console visible despite the VS Code terminal API lacking a before-close hook.
-- Embedded console backend for macOS, Linux, and Windows.
 
 https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
 
@@ -50,8 +48,12 @@ interactive console can fit into the same session model.
 
 Launch `R Console` from the Command Palette with:
 
-- `R: Create R Console`
-- `R: Create R Console in Side Editor`
+- `R Console: Create R Console`
+- `R Console: Create R Console in Side Editor`
+- `R Console: Manage Persistent Sessions...`
+
+Use `R Console: Manage Persistent Sessions...` to attach detached persistent
+R backends or close persistent sessions permanently.
 
 The minimum vscode-R setup for those commands to work is:
 
@@ -65,7 +67,7 @@ The minimum vscode-R setup for those commands to work is:
    If `r.rpath.*` is unset, `R Console` falls back to ambient `R_HOME`, then `PATH`.
    After selecting an executable, `R Console` derives `R_HOME` from that executable path and loads the matching shared library from that same installation.
 3. Set `r.alwaysUseActiveTerminal` to `true` if you want vscode-R commands to target `R Console`.
-4. Keep `r.rterm.option` compatible with embedded startup. `R Console` strips some wrapper-only flags, but startup still requires the vscode-R bootstrap path and will reject options such as `--vanilla` and `--no-init-file`.
+4. Keep `r.rterm.option` compatible with embedded startup. `R Console` strips some wrapper-only flags, but startup requires the vscode-R bootstrap path and will reject options such as `--vanilla` and `--no-init-file`.
 
 Useful optional settings:
 
@@ -95,13 +97,13 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.2.0-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-<version>-win32-x64.vsix`.
 
-`vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
+`vscode:prepublish` prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 
 Each target-specific VSIX contains exactly one platform-matching `R_CONSOLE_HOST` binary in `bundled/bin/`.
 
-Pushing a tag that matches `package.json`'s version, for example `v0.2.0`, runs the GitHub release workflow. It packages six target-specific builds (`win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`), generates `SHA256SUMS.txt`, and creates or updates the GitHub release for that tag. `workflow_dispatch` still acts as a packaging-only dry run.
+Pushing a tag that matches `package.json`'s version, for example `v<version>`, runs the GitHub release workflow. It packages six target-specific builds (`win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`), generates `SHA256SUMS.txt`, and creates or updates the GitHub release for that tag. `workflow_dispatch` runs the same packaging matrix without publishing a release.
 
 ## Configuration
 
@@ -129,27 +131,11 @@ R Console also contributes its own settings:
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
 
-## Architecture
-
-R Console is split into a few high-level pieces:
-
-- the terminal UI, which owns editing, prompts, history, and terminal-state restoration
-- the runtime bridge, which starts the bundled backend and keeps the console connected to R
-- the vscode-R bridge, which reads configuration and session state from vscode-R
-- the language bridge, which uses R's `languageserver` for console-aware editor features
-
 ### Dependency Model
 
 - `vscode-R` is a hard dependency. R Console uses vscode-R configuration, bootstrap, and session watcher data.
 - R's `languageserver` package is optional but required for console semantic tokens, completion, and signature help.
 - The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
-
-## Project Layout
-
-- `src/Terminal/` contains the console editor, viewport renderer, history manager, headless replay/restore logic, options, and the main `RTerminal` implementation.
-- `src/Language/` contains completion logic, the console LSP client, parse heuristics, and the virtual in-memory R document.
-- `src/Runtime/` contains the backend control protocol, bundled Rust binary resolution, and the session watcher integration.
-- `sidecar/pty-host/` contains the Rust embedded host and protocol framing code.
 
 ## Acknowledgements
 
@@ -161,7 +147,7 @@ R Console is built on the broader VS Code, Rust, and R ecosystems, and on the wo
 
 ## Development Note
 
-This extension's source code was written with assistance from Codex (GPT-5.3-Codex and GPT-5.4). The overall feature design and logic decisions are mine; GPT models were used to generate and iterate on the implementation.
+This extension's source code was written with assistance of GPT models from Codex. The overall feature design and logic decisions are mine; GPT models were used to generate and iterate on the implementation.
 
 ## License
 
