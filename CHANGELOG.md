@@ -5,15 +5,15 @@ All notable changes to R Console will be documented in this file.
 ## unrelease
 
 ### Added
-- Running R consoles now survive an extension-host restart by reconnecting to the existing backend session and restoring the console view.
-- Multiple open consoles now restore after an extension-host restart.
+- `R Console: Manage Persistent Sessions...` now lets users attach selected/all detached R console sessions or permanently close selected/all persistent sessions.
+- Running R console backends now survive extension-host and VS Code restarts without automatically reattaching on startup.
 
 ### Fixed
 - Closing a non-current console no longer drops the `R: workspace` view for the still-attached console. This is for the custom [vscode-R](https://github.com/Fred-Wu/vscode-R) console build.
 - Multiline pasted code at nested R prompts such as `readline()`, `menu()`, and debugger prompts is now submitted one line at a time, preserving line breaks and indentation.
 - Nested prompt lines and their replies are now preserved when the terminal is resized.
 - Progress bars and other carriage-return rewrites emitted through stderr now update in place instead of accumulating line by line.
-- R console backends now exit after 60 seconds when VS Code closes or disconnects without reconnecting. Closing the console tab itself still shuts down the backend immediately. This preserves a path for future self-managed console sessions.
+- R console backend persistence now uses a durable live-session registry instead of one-shot extension-host reload restoration.
 
 ## [0.1.1] - 2026-04-16
 

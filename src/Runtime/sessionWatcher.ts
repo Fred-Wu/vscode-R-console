@@ -23,6 +23,10 @@ type SessionRequest = {
   command?: string;
   tempdir?: string;
   pid?: number;
+  version?: string;
+  info?: unknown;
+  plot_url?: unknown;
+  url?: unknown;
   server?: {
     host?: string;
     port?: number;
@@ -30,14 +34,35 @@ type SessionRequest = {
   } | null;
 };
 
-type SessionServerInfo = {
+export type SessionServerInfo = {
   host: string;
   port: number;
   token: string;
 };
 
 type SessionWatcherStartOptions = {
-  ignoreExistingRequest?: boolean;
+  skipInitialRequest?: boolean;
+};
+
+export type SessionAttachMetadata = {
+  version?: string;
+  tempdir: string;
+  info?: unknown;
+  plotUrl?: string | null;
+  server?: SessionServerInfo;
+};
+
+export type SessionUrlRequestMetadata = {
+  command: string;
+  url: string;
+};
+
+export type SessionWatcherSnapshot = {
+  attachedPid: number;
+  sessionDir: string;
+  server?: SessionServerInfo;
+  attach?: SessionAttachMetadata;
+  urlRequest?: SessionUrlRequestMetadata;
 };
 
 export type SessionMemberCompletionItem = {
@@ -52,14 +77,14 @@ export class SessionWatcher {
   private requestWatcher: fs.FSWatcher | undefined;
   private workspaceWatcher: fs.FSWatcher | undefined;
   private sessionDirWatcher: fs.FSWatcher | undefined;
-  private startedAt = Date.now();
   private onAttachCallback: (() => void) | undefined;
   private onChangeCallback: ((data: WorkspaceData | undefined) => void) | undefined;
   private expectedPid: number | undefined;
   private expectedPidAutoPinned = false;
   private attachedPid: number | undefined;
   private server: SessionServerInfo | undefined;
-  private ignoreRequestsBefore: number | undefined;
+  private attachMetadata: SessionAttachMetadata | undefined;
+  private urlRequestMetadata: SessionUrlRequestMetadata | undefined;
 
   constructor(private watcherDir: string) {}
 
@@ -79,6 +104,8 @@ export class SessionWatcher {
     }
     this.attachedPid = undefined;
     this.server = undefined;
+    this.attachMetadata = undefined;
+    this.urlRequestMetadata = undefined;
     this.workspaceData = undefined;
     this.sessionDir = undefined;
     this.requestWatcher?.close();
@@ -87,8 +114,6 @@ export class SessionWatcher {
     this.workspaceWatcher = undefined;
     this.sessionDirWatcher?.close();
     this.sessionDirWatcher = undefined;
-    this.startedAt = Date.now();
-    this.ignoreRequestsBefore = options.ignoreExistingRequest ? this.startedAt : undefined;
 
     fs.mkdirSync(this.watcherDir, { recursive: true });
     const lockFile = path.join(this.watcherDir, "request.lock");
@@ -102,7 +127,9 @@ export class SessionWatcher {
     } catch {
       this.requestWatcher = undefined;
     }
-    this.updateFromRequest();
+    if (!options.skipInitialRequest) {
+      this.updateFromRequest();
+    }
   }
 
   dispose(): void {
@@ -124,6 +151,54 @@ export class SessionWatcher {
 
   getAttachedPid(): number | undefined {
     return this.attachedPid;
+  }
+
+  exportSnapshot(): SessionWatcherSnapshot | undefined {
+    if (
+      !isValidSessionPid(this.attachedPid) ||
+      typeof this.sessionDir !== "string" ||
+      this.sessionDir.length === 0
+    ) {
+      return undefined;
+    }
+    return {
+      attachedPid: this.attachedPid,
+      sessionDir: this.sessionDir,
+      server: this.server,
+      attach: this.attachMetadata,
+      urlRequest: this.urlRequestMetadata,
+    };
+  }
+
+  restoreSnapshot(snapshot: SessionWatcherSnapshot): boolean {
+    if (!isValidSessionPid(snapshot.attachedPid) || !isSessionPidAlive(snapshot.attachedPid)) {
+      return false;
+    }
+    if (typeof snapshot.sessionDir !== "string" || snapshot.sessionDir.length === 0) {
+      return false;
+    }
+    if (!fs.existsSync(snapshot.sessionDir)) {
+      return false;
+    }
+    if (
+      this.expectedPid !== undefined &&
+      isValidSessionPid(this.expectedPid) &&
+      snapshot.attachedPid !== this.expectedPid
+    ) {
+      return false;
+    }
+
+    this.expectedPid = snapshot.attachedPid;
+    this.expectedPidAutoPinned = false;
+    this.attachedPid = snapshot.attachedPid;
+    this.sessionDir = snapshot.sessionDir;
+    this.server = this.parseServerInfo(snapshot.server);
+    this.attachMetadata = this.parseAttachMetadata(snapshot.attach);
+    this.urlRequestMetadata = this.parseUrlRequestMetadata(snapshot.urlRequest);
+    this.workspaceData = undefined;
+    this.onAttachCallback?.();
+    this.startWorkspaceWatcher();
+    return true;
   }
 
   async requestMemberCompletions(
@@ -186,13 +261,6 @@ export class SessionWatcher {
     if (!fs.existsSync(requestFile)) {
       return;
     }
-    const stats = fs.statSync(requestFile);
-    if (this.ignoreRequestsBefore !== undefined && stats.mtimeMs < this.ignoreRequestsBefore) {
-      return;
-    }
-    if (this.expectedPid === undefined && stats.mtimeMs < this.startedAt) {
-      return;
-    }
     try {
       const content = fs.readFileSync(requestFile, "utf-8");
       const request = JSON.parse(content) as SessionRequest;
@@ -206,6 +274,8 @@ export class SessionWatcher {
         this.sessionDir = undefined;
         this.attachedPid = undefined;
         this.server = undefined;
+        this.attachMetadata = undefined;
+        this.urlRequestMetadata = undefined;
         this.workspaceWatcher?.close();
         this.workspaceWatcher = undefined;
         this.sessionDirWatcher?.close();
@@ -236,6 +306,8 @@ export class SessionWatcher {
         this.sessionDir = undefined;
         this.attachedPid = undefined;
         this.server = undefined;
+        this.attachMetadata = undefined;
+        this.urlRequestMetadata = undefined;
         this.workspaceWatcher?.close();
         this.workspaceWatcher = undefined;
         this.sessionDirWatcher?.close();
@@ -243,11 +315,28 @@ export class SessionWatcher {
         this.onChangeCallback?.(undefined);
         return;
       }
+      if (typeof request.command === "string" && !isSessionLifecycleCommand(request.command)) {
+        const urlRequestMetadata = this.parseUrlRequestMetadata({
+          command: request.command,
+          url: request.url,
+        });
+        if (urlRequestMetadata) {
+          this.urlRequestMetadata = urlRequestMetadata;
+        }
+        return;
+      }
       if (request.command !== "attach" || !request.tempdir) {
         return;
       }
       this.attachedPid = request.pid;
       this.server = this.parseServerInfo(request.server);
+      this.attachMetadata = this.parseAttachMetadata({
+        version: request.version,
+        tempdir: request.tempdir,
+        info: request.info,
+        plotUrl: request.plot_url,
+        server: this.server,
+      });
       const nextSessionDir = path.join(request.tempdir, "vscode-R");
       if (nextSessionDir === this.sessionDir) {
         return;
@@ -301,10 +390,6 @@ export class SessionWatcher {
     if (!fs.existsSync(workspaceFile)) {
       return;
     }
-    const stats = fs.statSync(workspaceFile);
-    if (this.expectedPid === undefined && stats.mtimeMs < this.startedAt) {
-      return;
-    }
     try {
       const content = fs.readFileSync(workspaceFile, "utf-8");
       this.workspaceData = JSON.parse(content) as WorkspaceData;
@@ -333,6 +418,39 @@ export class SessionWatcher {
       return undefined;
     }
     return { host, port, token };
+  }
+
+  private parseAttachMetadata(value: unknown): SessionAttachMetadata | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return undefined;
+    }
+    const metadata = value as Record<string, unknown>;
+    if (typeof metadata.tempdir !== "string" || metadata.tempdir.length === 0) {
+      return undefined;
+    }
+    const server = this.parseServerInfo(
+      metadata.server as SessionRequest["server"] | undefined
+    );
+    return {
+      tempdir: metadata.tempdir,
+      version: typeof metadata.version === "string" ? metadata.version : undefined,
+      info: metadata.info,
+      plotUrl:
+        typeof metadata.plotUrl === "string" || metadata.plotUrl === null
+          ? metadata.plotUrl
+          : undefined,
+      server,
+    };
+  }
+
+  private parseUrlRequestMetadata(value: unknown): SessionUrlRequestMetadata | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return undefined;
+    }
+    const metadata = value as Record<string, unknown>;
+    const command = typeof metadata.command === "string" ? metadata.command : undefined;
+    const url = typeof metadata.url === "string" ? metadata.url : undefined;
+    return command && url ? { command, url } : undefined;
   }
 
   private async postToSessionServer(payload: unknown): Promise<unknown | undefined> {
@@ -393,6 +511,10 @@ export class SessionWatcher {
       req.end();
     });
   }
+}
+
+function isSessionLifecycleCommand(command: string): boolean {
+  return command === "attach" || command === "detach";
 }
 
 function isValidSessionPid(pid: number | undefined): pid is number {

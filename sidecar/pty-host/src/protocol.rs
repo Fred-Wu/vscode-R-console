@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::thread;
 #[cfg(unix)]
 use std::{fs::File, os::fd::FromRawFd};
@@ -10,10 +10,12 @@ use std::{fs::File, os::windows::io::FromRawHandle};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE, HANDLE_FLAG_INHERIT,
+        CloseHandle, DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE,
+        HANDLE_FLAG_INHERIT,
     },
     System::{
-        Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE},
+        Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE},
+        Pipes::CreatePipe,
         Threading::GetCurrentProcess,
     },
 };
@@ -353,6 +355,21 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
 
 #[cfg(unix)]
 fn capture_process_stdout_to_sink(output: OutputSink) -> io::Result<()> {
+    capture_unix_fd_to_sink(
+        output.clone_handle(),
+        libc::STDOUT_FILENO,
+        OutputStream::Stdout,
+    )?;
+    capture_unix_fd_to_sink(output, libc::STDERR_FILENO, OutputStream::Stderr)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn capture_unix_fd_to_sink(
+    output: OutputSink,
+    fd: libc::c_int,
+    stream: OutputStream,
+) -> io::Result<()> {
     unsafe {
         let mut fds = [0; 2];
         if libc::pipe(fds.as_mut_ptr()) != 0 {
@@ -367,7 +384,7 @@ fn capture_process_stdout_to_sink(output: OutputSink) -> io::Result<()> {
             let _ = libc::fcntl(read_fd, libc::F_SETFD, read_flags | libc::FD_CLOEXEC);
         }
 
-        if libc::dup2(write_fd, libc::STDOUT_FILENO) < 0 {
+        if libc::dup2(write_fd, fd) < 0 {
             let error = io::Error::last_os_error();
             let _ = libc::close(read_fd);
             let _ = libc::close(write_fd);
@@ -382,7 +399,7 @@ fn capture_process_stdout_to_sink(output: OutputSink) -> io::Result<()> {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let _ = output.emit_output(OutputStream::Stdout, &buffer[..count]);
+                        let _ = output.emit_output(stream, &buffer[..count]);
                         let _ = output.emit_output_flush();
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -432,7 +449,78 @@ fn create_protocol_writer() -> Box<dyn Write + Send> {
     Box::new(io::stdout())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn capture_process_stdout_to_sink(output: OutputSink) -> io::Result<()> {
+    capture_windows_fd_to_sink(
+        output.clone_handle(),
+        1,
+        STD_OUTPUT_HANDLE,
+        OutputStream::Stdout,
+    )?;
+    capture_windows_fd_to_sink(output, 2, STD_ERROR_HANDLE, OutputStream::Stderr)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn capture_windows_fd_to_sink(
+    output: OutputSink,
+    fd: libc::c_int,
+    std_handle: STD_HANDLE,
+    stream: OutputStream,
+) -> io::Result<()> {
+    unsafe {
+        let mut read_handle: HANDLE = std::ptr::null_mut();
+        let mut write_handle: HANDLE = std::ptr::null_mut();
+        if CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let _ = SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0);
+        let _ = SetHandleInformation(write_handle, HANDLE_FLAG_INHERIT, 0);
+
+        let write_fd = libc::open_osfhandle(write_handle as libc::intptr_t, libc::O_BINARY);
+        if write_fd < 0 {
+            let error = io::Error::last_os_error();
+            let _ = CloseHandle(read_handle);
+            let _ = CloseHandle(write_handle);
+            return Err(error);
+        }
+
+        if libc::dup2(write_fd, fd) < 0 {
+            let error = io::Error::last_os_error();
+            let _ = libc::close(write_fd);
+            let _ = CloseHandle(read_handle);
+            return Err(error);
+        }
+        let _ = libc::close(write_fd);
+
+        let redirected_handle = libc::get_osfhandle(fd);
+        if redirected_handle >= 0 {
+            let _ = SetStdHandle(std_handle, redirected_handle as HANDLE);
+        }
+
+        let read_handle_value = read_handle as isize;
+        thread::spawn(move || {
+            let mut reader = File::from_raw_handle(read_handle_value as _);
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let _ = output.emit_output(stream, &buffer[..count]);
+                        let _ = output.emit_output_flush();
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn capture_process_stdout_to_sink(_output: OutputSink) -> io::Result<()> {
     Ok(())
 }

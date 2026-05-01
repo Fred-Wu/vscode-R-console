@@ -800,7 +800,7 @@ Expected:
 - reattached console restores visible state reasonably well
 - cancelling close keeps the running session alive
 
-## 22. Extension Reload Reattach
+## 22. Persistent Session Management
 
 With a running console that already has:
 
@@ -812,9 +812,12 @@ Trigger an extension-host style reload:
 
 1. run `Developer: Restart Extension Host`
 2. wait for the window to finish reloading
-3. return to the R Console tab
-4. verify the prompt accepts input again
-5. run:
+3. confirm the extension does not automatically attach a new R Console tab
+4. run `R Console: Manage Persistent Sessions...`
+5. choose `Attach Session...` or `Attach All Detached Sessions`
+6. return to the attached R Console tab
+7. verify the prompt accepts input again
+8. run:
 
 ```{r reload-reattach-test}
 x
@@ -824,10 +827,11 @@ x
 Expected:
 
 - the original R session is still alive
-- the console prompt becomes interactive again without manually starting a new console
+- the console prompt becomes interactive only after choosing the session from the manager
 - existing objects like `x` are still present
 - visible scrollback is restored well enough to continue working
-- closing the restored console still shows the usual confirmation flow
+- closing the attached console still shows the usual confirmation flow
+- `R Console: Manage Persistent Sessions...` can close the selected persistent session permanently
 
 ## 23. Two Concurrent Consoles
 

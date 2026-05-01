@@ -402,8 +402,7 @@ mod unix_host {
                             loop {
                                 match read_next_command(&mut stream) {
                                     Ok(Some(command)) => {
-                                        if reader_current_client.load(Ordering::SeqCst)
-                                            != client_id
+                                        if reader_current_client.load(Ordering::SeqCst) != client_id
                                         {
                                             break;
                                         }
@@ -414,8 +413,7 @@ mod unix_host {
                                     }
                                     Ok(None) => break,
                                     Err(error) => {
-                                        if reader_current_client.load(Ordering::SeqCst)
-                                            == client_id
+                                        if reader_current_client.load(Ordering::SeqCst) == client_id
                                             && !is_expected_session_disconnect_error(&error)
                                         {
                                             emit_host_error(&format!(
@@ -2083,8 +2081,7 @@ mod windows_host {
                             loop {
                                 match read_next_command(&mut stream) {
                                     Ok(Some(command)) => {
-                                        if reader_current_client.load(Ordering::SeqCst)
-                                            != client_id
+                                        if reader_current_client.load(Ordering::SeqCst) != client_id
                                         {
                                             break;
                                         }
@@ -2095,8 +2092,7 @@ mod windows_host {
                                     }
                                     Ok(None) => break,
                                     Err(error) => {
-                                        if reader_current_client.load(Ordering::SeqCst)
-                                            == client_id
+                                        if reader_current_client.load(Ordering::SeqCst) == client_id
                                             && !is_expected_session_disconnect_error(&error)
                                         {
                                             emit_host_error(&format!(

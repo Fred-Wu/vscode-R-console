@@ -13,7 +13,11 @@ import {
   type RuntimeSessionHandle,
   RustSidecarRuntimeBackend,
 } from "../../Runtime/runtimeBackend";
-import type { SessionWatcher, WorkspaceData } from "../../Runtime/sessionWatcher";
+import type {
+  SessionWatcher,
+  SessionWatcherSnapshot,
+  WorkspaceData,
+} from "../../Runtime/sessionWatcher";
 import { ANSI, stripBracketedPasteMarkers } from "../ansi";
 import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
@@ -49,7 +53,7 @@ type Dimensions = {
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
 type RuntimeAttachOptions = {
-  ignoreExistingSessionRequest?: boolean;
+  restoredSessionSnapshot?: SessionWatcherSnapshot;
 };
 
 export type Submission = {
@@ -110,6 +114,7 @@ export type RuntimeHost = {
   getDisplayPid(): number | undefined;
   notifyDisplayPidChanged(): void;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
+  maybeReannounceVscodeRSession(): void;
 };
 
 export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">): string {
@@ -287,9 +292,13 @@ function beginRuntimeAttach(
 
   host.sessionWatcher.onAttach(() => onRuntimeAttached(host));
   host.sessionWatcher.start({
-    ignoreExistingRequest: options.ignoreExistingSessionRequest,
+    skipInitialRequest: !!options.restoredSessionSnapshot,
   });
-  if (options.ignoreExistingSessionRequest) {
+  if (
+    options.restoredSessionSnapshot &&
+    host.sessionWatcher.restoreSnapshot(options.restoredSessionSnapshot)
+  ) {
+    onRuntimeAttached(host);
     return;
   }
   host.sessionWatcher.refresh();
@@ -441,6 +450,7 @@ function applyRuntimeSessionState(
       if (!host.promptVisible) {
         host.pendingPromptToken = true;
       }
+      host.maybeReannounceVscodeRSession();
       return;
     case "nested":
       host.promptReady = false;
@@ -522,6 +532,7 @@ export function handleBackendPrompt(
 
   host.pendingPromptToken = true;
   host.schedulePrompt();
+  host.maybeReannounceVscodeRSession();
   if (kind === "main" && host.mode === "ready" && host.activeSubmission === null) {
     host.startNextSubmission();
   }
@@ -1081,6 +1092,42 @@ export async function enqueueRuntimeSubmission(
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
   startNextRuntimeSubmission(host);
   return blocks;
+}
+
+export function enqueueInternalRuntimeSubmission(host: RuntimeHost, code: string): boolean {
+  if (!host.runtimeBackend || !host.rProcess) {
+    return false;
+  }
+  if (
+    host.mode !== "ready" ||
+    !host.promptReady ||
+    host.promptKind !== "main" ||
+    host.inputState.text.length > 0 ||
+    !host.inputState.isAtEnd ||
+    host.activeSubmission !== null ||
+    host.submissionPending
+  ) {
+    return false;
+  }
+
+  if (host.promptVisible) {
+    host.clearInputRender();
+    host.promptVisible = false;
+  }
+  host.pendingPromptToken = false;
+  host.awaitingExecutionStart = true;
+  host.mode = "executing";
+
+  const sent = host.runtimeBackend.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code: code.trimEnd(),
+  });
+  if (!sent) {
+    host.awaitingExecutionStart = false;
+    host.mode = "ready";
+    host.pendingPromptToken = true;
+  }
+  return sent;
 }
 
 function normalizeSubmissionBlock(code: string): string {

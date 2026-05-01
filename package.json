@@ -69,6 +69,11 @@
         "command": "r-console.createTerminalSide",
         "title": "Create R Console in Side Editor",
         "category": "R"
+      },
+      {
+        "command": "r-console.managePersistentSessions",
+        "title": "Manage Persistent Sessions...",
+        "category": "R Console"
       }
     ],
     "configuration": {

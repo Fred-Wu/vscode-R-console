@@ -106,18 +106,38 @@ and side-editor tabs, but the shutdown model is the same:
 5. if the user confirms close, the backend is shut down
 6. if the user cancels, the reattached terminal remains visible
 
-Extension-host restart uses a different path. Running consoles are persisted
-on deactivate, while their detached sidecars continue running. On activation,
-the extension restores new `RTerminal` instances that reconnect to those
-sidecar sessions. The restored terminal UI is treated as the current owner of
-the console; stale VS Code terminal UI from before the host restart is disposed
-without close confirmation. Terminal ownership is not inferred from a PID label
-alone, because stale and restored terminal tabs can legitimately share the same
-`R Console (<pid>)` label during restore. The vscode-R session watcher is
-restarted in a "fresh attach only" mode, so a restored console does not consume
-the pre-existing global `request.log`. Users reattach vscode-R explicitly
-through the `R: (not attached)` status item or by running `.vsc.attach()` in the
-console.
+Extension-host and VS Code restart use a self-managed persistent-session path.
+Running consoles are written to a durable live-session registry while they run
+and again on deactivate, while their detached sidecars continue running. On
+activation, the extension loads and prunes the registry, but it does not create
+new `RTerminal` instances or reconnect automatically. Stale VS Code terminal UI
+from before the host restart is disposed without close confirmation, and the
+backend remains detached.
+
+`R Console: Manage Persistent Sessions...` is the user-facing owner for those
+detached backends. It lists live sessions from the registry, marks sessions as
+attached or detached, and lets the user attach selected/all detached sessions or
+permanently close selected/all sessions. Launching a new R console through the
+normal create command always starts a new backend; it does not implicitly attach
+to a persistent session. Pseudoterminal disposal and extension deactivation
+release only VS Code-side resources; explicit user close or a persistent-session
+close command is the path that sends backend shutdown.
+
+When the real R/session pid is known, the vscode-R session watcher hydrates
+from persisted same-pid attachment metadata or from an existing `request.log`
+entry that belongs to the same pid. It does not use request-file modification
+time as durable restore state. After a manually attached sidecar reconnects and
+reaches a safe top-level prompt, the console uses vscode-R's own in-session `request`
+function to re-emit attach metadata from the same R process. It does not call
+`.vsc.attach()` during persistent reattach, because older vscode-R builds may compute
+optional attach metadata through unguarded package-specific code before writing
+`request.log`.
+
+r-console persists only essential vscode-R attachment metadata (`attachedPid`,
+`sessionDir`, attach payload fields from `request.log`, session server details,
+and the latest same-pid URL request metadata) so its watcher can resume the
+same session directory and let vscode-R reopen its own UI. It does not persist
+or own workspace data, plot data, viewers, or other vscode-R-managed state.
 
 This is implemented in [`src/extension.ts`](../src/extension.ts).
 
@@ -251,7 +271,8 @@ The TypeScript/Rust boundary is defined in [`src/Runtime/backendProtocol.ts`](..
 ### 5.1 Transport
 
 - Normal extension runs use a detached sidecar and a session socket: TypeScript passes `VSC_R_BACKEND_SESSION_FILE`, the Rust host binds a localhost command/output socket, writes the selected port and process id to that file, and TypeScript connects to it.
-- That socket is the reload-reconnect boundary. After the first TypeScript client connects, the Rust host keeps the embedded R session alive for a 60-second reconnect grace period if VS Code closes or the extension host disconnects. If no client reconnects within that period, the host shuts down so VS Code closure does not leave a background R process. Closing the console tab itself still sends an explicit shutdown immediately. The grace-period model preserves a path for future self-managed console sessions without making every console self-managed by default.
+- That socket is the reload-reconnect boundary. After the first TypeScript client connects, the Rust host keeps the embedded R session alive if VS Code closes or the extension host disconnects. Closing the console tab itself still sends an explicit shutdown immediately. Startup attempts that never receive an initial client still use an initial connection grace period, so failed launches do not leave a background R process.
+- On Windows, the first `R_CONSOLE_HOST.exe` acts as a short-lived launcher. It starts the real embedded-R host with detached process flags, including breakaway-from-job when Windows allows it, waits only until the real host writes the TCP bootstrap file, then exits. This prevents VS Code's extension-host process tree from owning the actual long-lived R session.
 - If no session file is configured, the Rust host falls back to stdin commands and framed stdout output.
 - Rust host stderr is only for early process diagnostics; session output uses the protocol socket.
 

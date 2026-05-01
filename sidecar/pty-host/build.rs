@@ -9,7 +9,11 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-    let icon_path = manifest_dir.join("..").join("..").join("images").join("Rlogo.ico");
+    let icon_path = manifest_dir
+        .join("..")
+        .join("..")
+        .join("images")
+        .join("Rlogo.ico");
     println!("cargo:rerun-if-changed={}", icon_path.display());
 
     let mut res = winresource::WindowsResource::new();

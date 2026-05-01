@@ -29,6 +29,7 @@ import {
 } from "../Runtime/runtimeBackend";
 import {
   SessionWatcher,
+  type SessionWatcherSnapshot,
   type WorkspaceData,
 } from "../Runtime/sessionWatcher";
 import {
@@ -46,6 +47,7 @@ import {
 } from "./rTerminal/view";
 import {
   createRuntimeBackend,
+  enqueueInternalRuntimeSubmission,
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
   getRuntimeTerminalName,
@@ -151,6 +153,123 @@ type ForceCloseOptions = {
   suppressVscodeSessionDetach?: boolean;
 };
 
+const VSCODE_R_REANNOUNCE_DELAY_MS = 300;
+
+function toRString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function toRSymbolName(name: string): string {
+  return /^[A-Za-z.][A-Za-z0-9._]*$/.test(name) ? name : `\`${name.replace(/`/g, "\\`")}\``;
+}
+
+function toRLiteral(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "NULL";
+  }
+  if (typeof value === "string") {
+    return toRString(value);
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "NULL";
+  }
+  if (typeof value === "boolean") {
+    return value ? "TRUE" : "FALSE";
+  }
+  if (Array.isArray(value)) {
+    return `list(${value.map((entry) => toRLiteral(entry)).join(", ")})`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .map(([key, entry]) => `${toRSymbolName(key)} = ${toRLiteral(entry)}`);
+    return `list(${entries.join(", ")})`;
+  }
+  return "NULL";
+}
+
+function buildVscodeRReannounceCommand(snapshot: SessionWatcherSnapshot | undefined): string {
+  const attach = snapshot?.attach;
+  const urlRequest = snapshot?.urlRequest;
+  const attachVersion = attach?.version
+    ? toRLiteral(attach.version)
+    : 'sprintf("%s.%s", R.version$major, R.version$minor)';
+  const attachTempdir = attach?.tempdir ? toRLiteral(attach.tempdir) : "session_tempdir[[1]]";
+  const attachInfo = attach?.info
+    ? toRLiteral(attach.info)
+    : "list(command = commandArgs()[[1L]], version = R.version.string, start_time = format(file.info(session_tempdir[[1]])$ctime))";
+  const attachPlotUrl = attach && "plotUrl" in attach ? toRLiteral(attach.plotUrl) : "NULL";
+  const attachServer = attach?.server ? toRLiteral(attach.server) : "server";
+  const urlRequestCommand = urlRequest?.command ? toRLiteral(urlRequest.command) : "NULL";
+  const urlRequestUrl = urlRequest?.url ? toRLiteral(urlRequest.url) : "NULL";
+
+  return String.raw`
+local({
+  attach <- get0(".vsc.attach", mode = "function", inherits = TRUE)
+  env <- if (is.function(attach)) environment(attach) else NULL
+  if (!is.environment(env)) {
+    tools_env <- tryCatch(as.environment("tools:vscode"), error = function(e) NULL)
+    if (is.environment(tools_env)) {
+      vsc <- get0(".vsc", envir = tools_env, inherits = FALSE)
+      if (is.environment(vsc)) {
+        env <- vsc
+      }
+    }
+  }
+  if (!is.environment(env)) {
+    return(invisible(FALSE))
+  }
+
+  request <- get0("request", envir = env, mode = "function", inherits = FALSE)
+  session_tempdir <- get0("tempdir", envir = env, inherits = FALSE)
+  if (!is.function(request)) {
+    return(invisible(FALSE))
+  }
+  if (!is.character(session_tempdir) || length(session_tempdir) == 0 || !nzchar(session_tempdir[[1]])) {
+    session_tempdir <- base::tempdir()
+  }
+
+  server <- NULL
+  if (isTRUE(get0("use_webserver", envir = env, inherits = FALSE))) {
+    host <- get0("host", envir = env, inherits = FALSE)
+    port <- get0("port", envir = env, inherits = FALSE)
+    token <- get0("token", envir = env, inherits = FALSE)
+    if (
+      is.character(host) && length(host) > 0 &&
+      is.numeric(port) && length(port) > 0 &&
+      is.character(token) && length(token) > 0
+    ) {
+      server <- list(host = host[[1]], port = port[[1]], token = token[[1]])
+    }
+  }
+
+  attached <- tryCatch({
+    request("attach",
+      version = ${attachVersion},
+      tempdir = ${attachTempdir},
+      info = ${attachInfo},
+      plot_url = ${attachPlotUrl},
+      server = ${attachServer}
+    )
+    TRUE
+  }, error = function(e) FALSE)
+  if (!isTRUE(attached)) {
+    return(invisible(FALSE))
+  }
+
+  url_request_command <- ${urlRequestCommand}
+  url_request_url <- ${urlRequestUrl}
+  if (
+    is.character(url_request_command) && length(url_request_command) > 0 && nzchar(url_request_command[[1]]) &&
+    is.character(url_request_url) && length(url_request_url) > 0 && nzchar(url_request_url[[1]])
+  ) {
+    try(request(url_request_command[[1]], url = url_request_url[[1]]), silent = TRUE)
+  }
+  invisible(TRUE)
+})
+`;
+}
+
 export type PersistedRTerminalOptions = Pick<
   RTerminalOptions,
   "rPath" | "rArgs" | "sessionWatcherEnabled" | "watcherDir" | "bracketedPaste" | "cwd"
@@ -159,6 +278,7 @@ export type PersistedRTerminalOptions = Pick<
 export type PersistedRTerminalState = {
   options: PersistedRTerminalOptions;
   runtime: RuntimeSessionReconnectInfo;
+  vscodeRSession?: SessionWatcherSnapshot;
   ui: PersistedUiSnapshot;
 };
 
@@ -238,6 +358,10 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
+  private vscodeRReannouncePending = false;
+  private vscodeRReannounceTimer: NodeJS.Timeout | null = null;
+  private vscodeRReannounceSnapshot: SessionWatcherSnapshot | undefined;
+  private extensionResourcesDisposed = false;
 
   private inBracketPaste = false;
   private pasteBuffer = "";
@@ -305,8 +429,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (restoreState?.runtime && this.runtimeBackend) {
       this.applyPersistedUiSnapshot(restoreState.ui);
       this.rProcess = this.runtimeBackend.reconnect(restoreState.runtime);
+      this.queueVscodeRReannounce(restoreState.vscodeRSession);
       primeRuntimeAttach(this.runtimeHost(), {
-        ignoreExistingSessionRequest: true,
+        restoredSessionSnapshot: restoreState.vscodeRSession,
       });
       attachRuntimeSession(this.runtimeHost(), true);
       updateRuntimeTerminalName(this.runtimeHost());
@@ -613,6 +738,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       getDisplayPid: () => self.getDisplayPid(),
       notifyDisplayPidChanged: () => self.notifyDisplayPidChanged(),
       onSessionDataChanged: (data) => self.onSessionDataChanged(data),
+      maybeReannounceVscodeRSession: () => self.maybeReannounceVscodeRSession(),
     };
 
     return host;
@@ -657,6 +783,38 @@ export class RTerminal implements vscode.Pseudoterminal {
     // Missing watcher bootstrap packages should degrade watcher-driven
     // features only, not block the embedded R session from becoming interactive.
     return true;
+  }
+
+  private queueVscodeRReannounce(snapshot: SessionWatcherSnapshot | undefined): void {
+    if (!this.options.sessionWatcherEnabled) {
+      return;
+    }
+    this.vscodeRReannounceSnapshot = snapshot;
+    this.vscodeRReannouncePending = true;
+  }
+
+  private maybeReannounceVscodeRSession(): void {
+    if (!this.vscodeRReannouncePending) {
+      return;
+    }
+    if (this.vscodeRReannounceTimer) {
+      return;
+    }
+    this.vscodeRReannounceTimer = setTimeout(() => {
+      this.vscodeRReannounceTimer = null;
+      this.tryReannounceVscodeRSession();
+    }, VSCODE_R_REANNOUNCE_DELAY_MS);
+  }
+
+  private tryReannounceVscodeRSession(): void {
+    if (!this.vscodeRReannouncePending) {
+      return;
+    }
+    const command = buildVscodeRReannounceCommand(this.vscodeRReannounceSnapshot);
+    if (enqueueInternalRuntimeSubmission(this.runtimeHost(), command)) {
+      this.vscodeRReannouncePending = false;
+      this.vscodeRReannounceSnapshot = undefined;
+    }
   }
 
   open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -2551,10 +2709,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.closeEmitter.fire(0);
   }
 
-  forceClose(options: ForceCloseOptions = {}): void {
+  private releaseExtensionResources(): void {
+    if (this.extensionResourcesDisposed) {
+      return;
+    }
+    this.extensionResourcesDisposed = true;
     this.saveHistory();
-    if (options.suppressVscodeSessionDetach) {
-      this.markShutdownDetachSuppressed();
+    this.vscodeRReannouncePending = false;
+    this.vscodeRReannounceSnapshot = undefined;
+    if (this.vscodeRReannounceTimer) {
+      clearTimeout(this.vscodeRReannounceTimer);
+      this.vscodeRReannounceTimer = null;
     }
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
@@ -2571,6 +2736,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang.clearSessionState();
     this.lang.stopConsoleLsp();
     setNativeParseCallback(null);
+  }
+
+  forceClose(options: ForceCloseOptions = {}): void {
+    this.releaseExtensionResources();
+    if (options.suppressVscodeSessionDetach) {
+      this.markShutdownDetachSuppressed();
+    }
 
     if (this.rProcess) {
       const processToClose = this.rProcess;
@@ -2614,6 +2786,13 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   isRunning(): boolean {
     return this.rProcess !== null && (this.runtimeBackend?.isAlive(this.rProcess) ?? false);
+  }
+
+  requiresCloseConfirmation(): boolean {
+    return (
+      this.isRunning() ||
+      (this.vscodeRReannouncePending && this.rProcess !== null && this.mode !== "closed")
+    );
   }
 
   getPid(): number | undefined {
@@ -2689,6 +2868,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         cwd: this.options.cwd,
       },
       runtime,
+      vscodeRSession: this.sessionWatcher?.exportSnapshot(),
       ui: {
         replay: this.buildTerminalReplay(),
         replayColumns: this.dimensions.columns,
@@ -2733,7 +2913,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   dispose(): void {
-    this.forceClose();
+    this.releaseExtensionResources();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();

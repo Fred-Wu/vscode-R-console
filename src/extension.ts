@@ -7,6 +7,7 @@ import {
   type PersistedRTerminalOptions,
   resolveRTerminalOptions,
 } from "./Terminal/rTerminal";
+import { createRuntimeBackend } from "./Terminal/rTerminal/runtime";
 import {
   discoverRBinaryPath,
   getPlatformRPathConfigEntry,
@@ -29,27 +30,43 @@ type PersistedConsoleRecord = {
   location: TerminalContext;
 };
 
-type PersistedReloadState = {
-  sessionId: string;
-  consoles: PersistedConsoleRecord[];
+type PersistentSessionState = {
+  sessions: PersistedConsoleRecord[];
 };
 
-type RestoredConsoleRecord = {
-  persisted: PersistedConsoleRecord;
-  record: ConsoleRecord;
-  terminal: vscode.Terminal;
+type ManagedPersistentSession = {
+  sessionId: string;
+  entry: PersistedConsoleRecord;
+  attachedRecord?: ConsoleRecord;
+  pid?: number;
+  attached: boolean;
+};
+
+type ManageAction = vscode.QuickPickItem & {
+  action: "attach" | "attachAll" | "close" | "closeAll" | "refresh";
+};
+
+type ManagedSessionPick = vscode.QuickPickItem & {
+  session: ManagedPersistentSession;
 };
 
 const terminalToRecord: Map<vscode.Terminal, ConsoleRecord> = new Map();
 const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
 const pidToRecord: Map<number, ConsoleRecord> = new Map();
+const persistentSessionRecords: Map<string, PersistedConsoleRecord> = new Map();
 const editorCloseInProgress: Set<number> = new Set();
 const ignoredEditorClosePids: Set<number> = new Set();
 const closeConfirmationInProgress = new WeakSet<ConsoleRecord>();
 const ignoredTerminalCloseEvents = new WeakSet<vscode.Terminal>();
 const R_CONSOLE_PID_LABEL_PATTERN = /^R Console \((\d+)\)$/;
+const PERSIST_DEBOUNCE_MS = 250;
+const PERSIST_HEARTBEAT_MS = 5000;
 let extensionBaseUri: vscode.Uri | undefined;
-let persistedSessionFilePath: string | undefined;
+let persistentSessionFilePath: string | undefined;
+let legacyReloadSessionFilePath: string | undefined;
+let persistDebounceTimer: NodeJS.Timeout | undefined;
+let persistHeartbeatTimer: NodeJS.Timeout | undefined;
+let extensionHostDeactivating = false;
 
 function isVirtualWorkspace(): boolean {
   const folders = vscode.workspace.workspaceFolders;
@@ -63,19 +80,34 @@ function refreshTerminalAppearance(): void {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  extensionHostDeactivating = false;
+  context.subscriptions.push(
+    new vscode.Disposable(() => {
+      extensionHostDeactivating = true;
+    })
+  );
   extensionBaseUri = context.extensionUri;
-  const reloadStorageUri = context.storageUri ?? context.globalStorageUri;
-  persistedSessionFilePath = vscode.Uri.joinPath(
-    reloadStorageUri,
+  const sessionStorageUri = context.storageUri ?? context.globalStorageUri;
+  persistentSessionFilePath = vscode.Uri.joinPath(
+    sessionStorageUri,
+    "persistent-sessions.json"
+  ).fsPath;
+  legacyReloadSessionFilePath = vscode.Uri.joinPath(
+    sessionStorageUri,
     "reload-sessions.json"
   ).fsPath;
-  void fs.promises.mkdir(reloadStorageUri.fsPath, { recursive: true }).catch(() => {});
+  void fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true }).catch(() => {});
+  await initializePersistentSessionRegistry();
+  startPersistentSessionRegistry(context);
   context.subscriptions.push(
     vscode.commands.registerCommand("r-console.createTerminal", () => {
       void createRTerminal(context);
     }),
     vscode.commands.registerCommand("r-console.createTerminalSide", () => {
       void createRTerminal(context, true);
+    }),
+    vscode.commands.registerCommand("r-console.managePersistentSessions", () => {
+      void managePersistentSessions(context);
     }),
     vscode.window.onDidOpenTerminal(handleTerminalOpen),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
@@ -96,7 +128,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   await activateVscodeRExtension();
-  await restorePersistedSessions(context);
+  disposeStalePersistentTerminalViews();
   syncTerminalRecordsFromWindow();
   void ensureConfiguredRPath();
 }
@@ -112,58 +144,56 @@ async function activateVscodeRExtension(): Promise<void> {
   }
 }
 
-async function restorePersistedSessions(context: vscode.ExtensionContext): Promise<void> {
-  const persisted = await loadPersistedSessions(vscode.env.sessionId);
-  if (persisted.length === 0) {
-    return;
+async function initializePersistentSessionRegistry(): Promise<void> {
+  persistentSessionRecords.clear();
+  const records = await loadPersistentSessionsFromDisk();
+  for (const entry of records) {
+    persistentSessionRecords.set(entry.terminal.runtime.sessionId, entry);
   }
-
-  const restored: RestoredConsoleRecord[] = [];
-  const restoringPids = new Set<number>();
-
-  try {
-    for (const entry of persisted) {
-      const options = buildRestoredTerminalOptions(entry.terminal.options);
-      if (!options) {
-        continue;
-      }
-
-      const pid = getPersistedRuntimePid(entry.terminal);
-      if (typeof pid === "number") {
-        restoringPids.add(pid);
-        ignoredEditorClosePids.add(pid);
-      }
-
-      const rTerminal = new RTerminal(options, context.extensionPath, entry.terminal);
-      const record = createConsoleRecord(rTerminal, entry.location);
-      const terminal = attachTerminal(record, true);
-      restored.push({
-        persisted: entry,
-        record,
-        terminal,
-      });
-    }
-
-    if (restored.length === 0) {
-      return;
-    }
-
-    const replacementRecords = getRestoredRecords(restored);
-    const disposedStalePids = disposeStalePersistedTerminals(restored);
-    if (disposedStalePids.size > 0) {
-      await waitForPersistedTerminalsDisposed(disposedStalePids, replacementRecords);
-    }
-    if (restoringPids.size > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-  } finally {
-    for (const pid of restoringPids) {
-      ignoredEditorClosePids.delete(pid);
-    }
+  if (records.length > 0) {
+    persistPersistentSessions();
   }
 }
 
-function buildRestoredTerminalOptions(
+async function loadPersistentSessionsFromDisk(): Promise<PersistedConsoleRecord[]> {
+  const records = new Map<string, PersistedConsoleRecord>();
+
+  for (const filePath of [persistentSessionFilePath, legacyReloadSessionFilePath]) {
+    if (!filePath) {
+      continue;
+    }
+    for (const entry of await readPersistentSessionFile(filePath)) {
+      records.set(entry.terminal.runtime.sessionId, entry);
+    }
+  }
+
+  const liveRecords = [...records.values()].filter(hasLivePersistedRuntime);
+  if (liveRecords.length === 0) {
+    await removePersistentSessionFiles();
+  }
+  return liveRecords;
+}
+
+async function readPersistentSessionFile(filePath: string): Promise<PersistedConsoleRecord[]> {
+  try {
+    const raw = await fs.promises.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const sessions = parsePersistentSessionState(parsed);
+    return sessions ? sessions.filter(hasLivePersistedRuntime) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function removePersistentSessionFiles(): Promise<void> {
+  await Promise.all(
+    [persistentSessionFilePath, legacyReloadSessionFilePath]
+      .filter((filePath): filePath is string => typeof filePath === "string")
+      .map((filePath) => fs.promises.rm(filePath, { force: true }).catch(() => {}))
+  );
+}
+
+function buildPersistentTerminalOptions(
   persistedOptions: PersistedRTerminalOptions
 ): ReturnType<typeof resolveRTerminalOptions> {
   const currentOptions = resolveRTerminalOptions();
@@ -177,80 +207,39 @@ function buildRestoredTerminalOptions(
   };
 }
 
-function disposeStalePersistedTerminals(restored: readonly RestoredConsoleRecord[]): Set<number> {
-  return disposePersistedTerminalsByPid(
-    getRestoredPids(restored),
-    getRestoredRecords(restored)
-  );
-}
-
-function getRestoredPids(restored: readonly RestoredConsoleRecord[]): Set<number> {
-  const restoredPids = new Set<number>();
-  for (const entry of restored) {
-    const pid = getPersistedRuntimePid(entry.persisted.terminal);
+function disposeStalePersistentTerminalViews(): void {
+  const persistentPids = new Set<number>();
+  for (const entry of persistentSessionRecords.values()) {
+    const pid = getPersistedRuntimePid(entry.terminal);
     if (typeof pid === "number") {
-      restoredPids.add(pid);
+      persistentPids.add(pid);
     }
   }
-  return restoredPids;
-}
-
-function getRestoredRecords(restored: readonly RestoredConsoleRecord[]): Set<ConsoleRecord> {
-  const records = new Set<ConsoleRecord>();
-  for (const entry of restored) {
-    records.add(entry.record);
-  }
-  return records;
-}
-
-function disposePersistedTerminalsByPid(
-  pids: ReadonlySet<number>,
-  replacementRecords: ReadonlySet<ConsoleRecord>
-): Set<number> {
-  if (pids.size === 0) {
-    return new Set<number>();
+  if (persistentPids.size === 0) {
+    return;
   }
 
-  const disposedPids = new Set<number>();
+  const ignoredPids = new Set<number>();
   for (const terminal of vscode.window.terminals) {
-    const record = resolveRecordFromTerminal(terminal);
-    if (record && replacementRecords.has(record)) {
+    if (resolveRecordFromTerminal(terminal)) {
       continue;
     }
     const pid = parseConsolePidFromTerminal(terminal);
-    if (typeof pid !== "number" || !pids.has(pid)) {
+    if (typeof pid !== "number" || !persistentPids.has(pid)) {
       continue;
     }
     ignoredTerminalCloseEvents.add(terminal);
     ignoredEditorClosePids.add(pid);
+    ignoredPids.add(pid);
     terminal.dispose();
-    disposedPids.add(pid);
-  }
-  return disposedPids;
-}
-
-async function waitForPersistedTerminalsDisposed(
-  pids: ReadonlySet<number>,
-  replacementRecords: ReadonlySet<ConsoleRecord>
-): Promise<void> {
-  if (pids.size === 0) {
-    return;
   }
 
-  const deadline = Date.now() + 1000;
-  while (Date.now() < deadline) {
-    const stillVisible = vscode.window.terminals.some((terminal) => {
-      const record = resolveRecordFromTerminal(terminal);
-      if (record && replacementRecords.has(record)) {
-        return false;
+  if (ignoredPids.size > 0) {
+    setTimeout(() => {
+      for (const pid of ignoredPids) {
+        ignoredEditorClosePids.delete(pid);
       }
-      const pid = parseConsolePidFromTerminal(terminal);
-      return typeof pid === "number" && pids.has(pid);
-    });
-    if (!stillVisible) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    }, 1000);
   }
 }
 
@@ -264,24 +253,9 @@ function getPersistedRuntimePid(state: PersistedRTerminalState): number | undefi
   return isPositiveInteger(backendChildPid) ? backendChildPid : undefined;
 }
 
-async function loadPersistedSessions(currentSessionId: string): Promise<PersistedConsoleRecord[]> {
-  if (!persistedSessionFilePath) {
-    return [];
-  }
-  try {
-    const raw = await fs.promises.readFile(persistedSessionFilePath, "utf8");
-    await fs.promises.rm(persistedSessionFilePath, { force: true });
-    const parsed = JSON.parse(raw);
-    if (!isPersistedReloadState(parsed)) {
-      return [];
-    }
-    if (parsed.sessionId !== currentSessionId) {
-      return [];
-    }
-    return parsed.consoles;
-  } catch {
-    return [];
-  }
+function hasLivePersistedRuntime(entry: PersistedConsoleRecord): boolean {
+  const pid = getPersistedRuntimePid(entry.terminal);
+  return typeof pid !== "number" || isProcessAlive(pid);
 }
 
 function isPersistedConsoleRecord(value: unknown): value is PersistedConsoleRecord {
@@ -297,17 +271,20 @@ function isPersistedConsoleRecord(value: unknown): value is PersistedConsoleReco
   return true;
 }
 
-function isPersistedReloadState(value: unknown): value is PersistedReloadState {
+function parsePersistentSessionState(value: unknown): PersistedConsoleRecord[] | undefined {
   if (!isObjectRecord(value)) {
-    return false;
+    return undefined;
   }
-  if (typeof value.sessionId !== "string" || value.sessionId.trim().length === 0) {
-    return false;
+  const sessions =
+    Array.isArray(value.sessions)
+      ? value.sessions
+      : Array.isArray(value.consoles)
+        ? value.consoles
+        : undefined;
+  if (!sessions || !sessions.every(isPersistedConsoleRecord)) {
+    return undefined;
   }
-  if (!Array.isArray(value.consoles)) {
-    return false;
-  }
-  return value.consoles.every(isPersistedConsoleRecord);
+  return sessions;
 }
 
 function isPersistedRTerminalState(value: unknown): value is PersistedRTerminalState {
@@ -430,6 +407,15 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function isObjectRecord(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -445,6 +431,10 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   if (!record) return;
 
   detachTerminalFromRecord(record, closedTerminal);
+
+  if (extensionHostDeactivating) {
+    return;
+  }
 
   if (record.location.kind === "editor") {
     return;
@@ -487,6 +477,284 @@ async function createRTerminal(
   );
 
   attachTerminal(record);
+  schedulePersistPersistentSessions();
+}
+
+async function managePersistentSessions(context: vscode.ExtensionContext): Promise<void> {
+  let sessions = await refreshManagedPersistentSessions();
+  if (sessions.length === 0) {
+    void vscode.window.showInformationMessage("No persistent R console sessions are running.");
+    return;
+  }
+
+  while (true) {
+    const action = await pickManageAction(sessions);
+    if (!action) {
+      return;
+    }
+
+    if (action.action === "refresh") {
+      sessions = await refreshManagedPersistentSessions();
+      if (sessions.length === 0) {
+        void vscode.window.showInformationMessage("No persistent R console sessions are running.");
+        return;
+      }
+      continue;
+    }
+
+    if (action.action === "attachAll") {
+      await attachPersistentSessions(sessions.filter((session) => !session.attached), context);
+      return;
+    }
+
+    if (action.action === "attach") {
+      const selected = await pickPersistentSessions(
+        sessions.filter((session) => !session.attached),
+        "Select persistent R console sessions to attach"
+      );
+      if (selected.length > 0) {
+        await attachPersistentSessions(selected, context);
+      }
+      return;
+    }
+
+    if (action.action === "closeAll") {
+      await closePersistentSessions(sessions, context);
+      return;
+    }
+
+    const selected = await pickPersistentSessions(
+      sessions,
+      "Select persistent R console sessions to close permanently"
+    );
+    if (selected.length > 0) {
+      await closePersistentSessions(selected, context);
+    }
+    return;
+  }
+}
+
+async function refreshManagedPersistentSessions(): Promise<ManagedPersistentSession[]> {
+  for (const entry of await loadPersistentSessionsFromDisk()) {
+    persistentSessionRecords.set(entry.terminal.runtime.sessionId, entry);
+  }
+  prunePersistentSessionRegistry();
+  const sessions = collectManagedPersistentSessions();
+  persistPersistentSessions();
+  return sessions;
+}
+
+function collectManagedPersistentSessions(): ManagedPersistentSession[] {
+  const sessions = new Map<string, ManagedPersistentSession>();
+
+  for (const entry of persistentSessionRecords.values()) {
+    const sessionId = entry.terminal.runtime.sessionId;
+    sessions.set(sessionId, {
+      sessionId,
+      entry,
+      pid: getPersistedRuntimePid(entry.terminal),
+      attached: false,
+    });
+  }
+
+  for (const record of new Set(rTerminalToRecord.values())) {
+    if (!record.rTerminal.isRunning()) {
+      continue;
+    }
+    const terminal = record.rTerminal.exportPersistentState();
+    if (!terminal) {
+      continue;
+    }
+    const sessionId = terminal.runtime.sessionId;
+    const entry: PersistedConsoleRecord = {
+      terminal,
+      location: record.location,
+    };
+    persistentSessionRecords.set(sessionId, entry);
+    sessions.set(sessionId, {
+      sessionId,
+      entry,
+      attachedRecord: record,
+      pid: getPersistedRuntimePid(terminal),
+      attached: true,
+    });
+  }
+
+  return [...sessions.values()]
+    .filter((session) => hasLivePersistedRuntime(session.entry))
+    .sort((left, right) => formatManagedSessionLabel(left).localeCompare(formatManagedSessionLabel(right)));
+}
+
+function prunePersistentSessionRegistry(): void {
+  for (const [sessionId, entry] of persistentSessionRecords) {
+    if (!hasLivePersistedRuntime(entry)) {
+      persistentSessionRecords.delete(sessionId);
+    }
+  }
+}
+
+async function pickManageAction(
+  sessions: readonly ManagedPersistentSession[]
+): Promise<ManageAction | undefined> {
+  const detachedCount = sessions.filter((session) => !session.attached).length;
+  const actions: ManageAction[] = [];
+
+  if (detachedCount > 0) {
+    actions.push(
+      {
+        label: "Attach Session...",
+        description: `${detachedCount} detached`,
+        action: "attach",
+      },
+      {
+        label: "Attach All Detached Sessions",
+        description: `${detachedCount} detached`,
+        action: "attachAll",
+      }
+    );
+  }
+
+  actions.push(
+    {
+      label: "Close Session...",
+      description: `${sessions.length} running`,
+      action: "close",
+    },
+    {
+      label: "Close All Sessions",
+      description: `${sessions.length} running`,
+      action: "closeAll",
+    },
+    {
+      label: "Refresh",
+      action: "refresh",
+    }
+  );
+
+  return vscode.window.showQuickPick(actions, {
+    placeHolder: "Manage persistent R console sessions",
+  });
+}
+
+async function pickPersistentSessions(
+  sessions: readonly ManagedPersistentSession[],
+  placeHolder: string
+): Promise<ManagedPersistentSession[]> {
+  if (sessions.length === 0) {
+    void vscode.window.showInformationMessage("No matching persistent R console sessions are running.");
+    return [];
+  }
+
+  const picks = sessions.map((session): ManagedSessionPick => ({
+    label: formatManagedSessionLabel(session),
+    description: session.attached ? "attached" : "detached",
+    detail: formatManagedSessionDetail(session),
+    session,
+  }));
+
+  const selected = await vscode.window.showQuickPick(picks, {
+    canPickMany: true,
+    placeHolder,
+  });
+  return selected?.map((pick) => pick.session) ?? [];
+}
+
+async function attachPersistentSessions(
+  sessions: readonly ManagedPersistentSession[],
+  context: vscode.ExtensionContext
+): Promise<void> {
+  for (const session of sessions) {
+    if (session.attachedRecord) {
+      revealConsoleRecord(session.attachedRecord);
+      continue;
+    }
+
+    if (!hasLivePersistedRuntime(session.entry)) {
+      persistentSessionRecords.delete(session.sessionId);
+      continue;
+    }
+
+    const options = buildPersistentTerminalOptions(session.entry.terminal.options);
+    if (!options) {
+      continue;
+    }
+
+    const rTerminal = new RTerminal(options, context.extensionPath, session.entry.terminal);
+    const record = createConsoleRecord(rTerminal, session.entry.location);
+    attachTerminal(record, true);
+  }
+  schedulePersistPersistentSessions();
+}
+
+function revealConsoleRecord(record: ConsoleRecord): void {
+  if (record.terminal) {
+    record.terminal.show(false);
+    return;
+  }
+  reattachRunningTerminal(record);
+}
+
+async function closePersistentSessions(
+  sessions: readonly ManagedPersistentSession[],
+  context: vscode.ExtensionContext
+): Promise<void> {
+  const liveSessions = sessions.filter((session) => hasLivePersistedRuntime(session.entry));
+  if (liveSessions.length === 0) {
+    void vscode.window.showInformationMessage("No selected persistent R console sessions are still running.");
+    return;
+  }
+
+  const result = await vscode.window.showWarningMessage(
+    `Close ${liveSessions.length} persistent R console session${liveSessions.length === 1 ? "" : "s"} permanently?`,
+    { modal: true },
+    "Close"
+  );
+  if (result !== "Close") {
+    return;
+  }
+
+  const detachedSessions = liveSessions.filter((session) => !session.attachedRecord);
+  closeDetachedPersistentSessions(detachedSessions, context);
+
+  for (const session of liveSessions) {
+    if (session.attachedRecord) {
+      closeConsoleRecordPermanently(session.attachedRecord);
+    }
+  }
+
+  persistPersistentSessions();
+}
+
+function closeDetachedPersistentSessions(
+  sessions: readonly ManagedPersistentSession[],
+  context: vscode.ExtensionContext
+): void {
+  if (sessions.length === 0) {
+    return;
+  }
+
+  const backend = createRuntimeBackend(context.extensionPath);
+  if (!backend) {
+    void vscode.window.showErrorMessage("R Console sidecar backend not found; detached sessions could not be closed.");
+    return;
+  }
+
+  for (const session of sessions) {
+    const handle = backend.reconnect(session.entry.terminal.runtime);
+    backend.close(handle);
+    persistentSessionRecords.delete(session.sessionId);
+  }
+}
+
+function formatManagedSessionLabel(session: ManagedPersistentSession): string {
+  return typeof session.pid === "number"
+    ? `R Console (${session.pid})`
+    : `R Console (${session.sessionId.slice(0, 8)})`;
+}
+
+function formatManagedSessionDetail(session: ManagedPersistentSession): string {
+  const cwd = session.entry.terminal.options.cwd || "default working directory";
+  return `cwd: ${cwd} | session: ${session.sessionId}`;
 }
 
 async function ensureConfiguredRPath(): Promise<void> {
@@ -548,10 +816,12 @@ function createConsoleRecord(
 
   record.pidSubscription = rTerminal.onDidChangePid((pid) => {
     updateConsoleRecordPid(record, pid);
+    schedulePersistPersistentSessions();
   });
 
   rTerminalToRecord.set(rTerminal, record);
   updateConsoleRecordPid(record, rTerminal.getPid());
+  schedulePersistPersistentSessions();
   return record;
 }
 
@@ -573,6 +843,7 @@ function updateConsoleRecordPid(
     pidToRecord.set(pid, record);
     syncConsoleRecordLocationFromTabs(record);
   }
+  schedulePersistPersistentSessions();
 }
 
 function detachTerminalFromRecord(
@@ -583,6 +854,7 @@ function detachTerminalFromRecord(
   if (record.terminal === terminal) {
     record.terminal = undefined;
   }
+  schedulePersistPersistentSessions();
 }
 
 function disposeConsoleRecord(record: ConsoleRecord): void {
@@ -599,6 +871,45 @@ function disposeConsoleRecord(record: ConsoleRecord): void {
     }
   }
   record.terminal = undefined;
+  schedulePersistPersistentSessions();
+}
+
+function closeConsoleRecordPermanently(
+  record: ConsoleRecord,
+  terminalToDispose: vscode.Terminal | undefined = record.terminal
+): void {
+  const suppressVscodeSessionDetach = record.rTerminal.shouldSuppressShutdownDetach();
+  forgetPersistentSessionForRecord(record);
+  disposeConsoleRecord(record);
+  record.rTerminal.forceClose({ suppressVscodeSessionDetach });
+  if (terminalToDispose) {
+    terminalToRecord.delete(terminalToDispose);
+    terminalToDispose.dispose();
+  }
+}
+
+function forgetPersistentSessionForRecord(record: ConsoleRecord): void {
+  const sessionId = getPersistentSessionIdForRecord(record);
+  if (sessionId) {
+    persistentSessionRecords.delete(sessionId);
+  }
+}
+
+function getPersistentSessionIdForRecord(record: ConsoleRecord): string | undefined {
+  const state = record.rTerminal.exportPersistentState();
+  if (state?.runtime.sessionId) {
+    return state.runtime.sessionId;
+  }
+
+  if (typeof record.pid !== "number") {
+    return undefined;
+  }
+  for (const [sessionId, entry] of persistentSessionRecords) {
+    if (getPersistedRuntimePid(entry.terminal) === record.pid) {
+      return sessionId;
+    }
+  }
+  return undefined;
 }
 
 function reattachRunningTerminal(record: ConsoleRecord): vscode.Terminal {
@@ -611,7 +922,8 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
     return;
   }
 
-  if (!record.rTerminal.isRunning()) {
+  if (!record.rTerminal.requiresCloseConfirmation()) {
+    forgetPersistentSessionForRecord(record);
     disposeConsoleRecord(record);
     return;
   }
@@ -628,11 +940,7 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
     );
 
     if (result === "Close") {
-      const suppressVscodeSessionDetach = record.rTerminal.shouldSuppressShutdownDetach();
-      disposeConsoleRecord(record);
-      record.rTerminal.forceClose({ suppressVscodeSessionDetach });
-      terminalToRecord.delete(reattachedTerminal);
-      reattachedTerminal.dispose();
+      closeConsoleRecordPermanently(record, reattachedTerminal);
     }
   } finally {
     closeConfirmationInProgress.delete(record);
@@ -784,6 +1092,7 @@ function handleTerminalTabChange(event: vscode.TabChangeEvent): void {
       kind: "editor",
       viewColumn: tab.group.viewColumn,
     };
+    schedulePersistPersistentSessions();
   }
 
   for (const tab of event.closed) {
@@ -845,6 +1154,7 @@ function syncConsoleRecordLocationFromTabs(record: ConsoleRecord): void {
     kind: "editor",
     viewColumn: tab.group.viewColumn,
   };
+  schedulePersistPersistentSessions();
 }
 
 function findEditorTabByPid(pid: number): vscode.Tab | undefined {
@@ -864,21 +1174,61 @@ function findEditorTabByPid(pid: number): vscode.Tab | undefined {
 }
 
 export function deactivate() {
-  persistRunningSessionsForReload();
+  extensionHostDeactivating = true;
+  flushPersistPersistentSessions();
   for (const record of new Set(rTerminalToRecord.values())) {
     record.pidSubscription.dispose();
+    record.rTerminal.dispose();
   }
   terminalToRecord.clear();
   rTerminalToRecord.clear();
   pidToRecord.clear();
 }
 
-function persistRunningSessionsForReload(): void {
-  if (!persistedSessionFilePath) {
+function startPersistentSessionRegistry(context: vscode.ExtensionContext): void {
+  persistHeartbeatTimer = setInterval(() => {
+    if (rTerminalToRecord.size > 0 || persistentSessionRecords.size > 0) {
+      persistPersistentSessions();
+    }
+  }, PERSIST_HEARTBEAT_MS);
+  context.subscriptions.push(
+    new vscode.Disposable(() => {
+      if (persistHeartbeatTimer) {
+        clearInterval(persistHeartbeatTimer);
+        persistHeartbeatTimer = undefined;
+      }
+      if (persistDebounceTimer) {
+        clearTimeout(persistDebounceTimer);
+        persistDebounceTimer = undefined;
+      }
+    })
+  );
+}
+
+function schedulePersistPersistentSessions(): void {
+  if (!persistentSessionFilePath || persistDebounceTimer) {
+    return;
+  }
+  persistDebounceTimer = setTimeout(() => {
+    persistDebounceTimer = undefined;
+    persistPersistentSessions();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+function flushPersistPersistentSessions(): void {
+  if (persistDebounceTimer) {
+    clearTimeout(persistDebounceTimer);
+    persistDebounceTimer = undefined;
+  }
+  persistPersistentSessions();
+}
+
+function persistPersistentSessions(): void {
+  if (!persistentSessionFilePath) {
     return;
   }
 
-  const persisted: PersistedConsoleRecord[] = [];
+  const sessionMap = new Map(persistentSessionRecords);
   for (const record of new Set(rTerminalToRecord.values())) {
     if (!record.rTerminal.isRunning()) {
       continue;
@@ -887,29 +1237,40 @@ function persistRunningSessionsForReload(): void {
     if (!terminal) {
       continue;
     }
-    persisted.push({
+    sessionMap.set(terminal.runtime.sessionId, {
       terminal,
       location: record.location,
     });
   }
 
+  const persisted = [...sessionMap.values()].filter(hasLivePersistedRuntime);
+  persistentSessionRecords.clear();
+  for (const entry of persisted) {
+    persistentSessionRecords.set(entry.terminal.runtime.sessionId, entry);
+  }
+
   if (persisted.length === 0) {
     try {
-      fs.rmSync(persistedSessionFilePath, { force: true });
+      fs.rmSync(persistentSessionFilePath, { force: true });
+      if (legacyReloadSessionFilePath) {
+        fs.rmSync(legacyReloadSessionFilePath, { force: true });
+      }
     } catch {
     }
     return;
   }
 
   try {
-    fs.mkdirSync(path.dirname(persistedSessionFilePath), {
+    fs.mkdirSync(path.dirname(persistentSessionFilePath), {
       recursive: true,
     });
-    const reloadState: PersistedReloadState = {
-      sessionId: vscode.env.sessionId,
-      consoles: persisted,
+    const sessionState: PersistentSessionState = {
+      sessions: persisted,
     };
-    fs.writeFileSync(persistedSessionFilePath, JSON.stringify(reloadState), "utf8");
+    fs.writeFileSync(persistentSessionFilePath, JSON.stringify(sessionState), "utf8");
+    if (legacyReloadSessionFilePath) {
+      fs.rmSync(legacyReloadSessionFilePath, { force: true });
+    }
   } catch {
   }
 }

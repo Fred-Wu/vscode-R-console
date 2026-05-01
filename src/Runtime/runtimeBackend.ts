@@ -91,7 +91,7 @@ const PARSE_STATUS_TIMEOUT_MS = 150;
 const SESSION_BOOTSTRAP_TIMEOUT_MS = 5000;
 const SESSION_BOOTSTRAP_POLL_MS = 40;
 const INITIAL_CONNECT_GRACE_MS = 60000;
-const PERSISTENT_RECONNECT_GRACE_MS = 60000;
+const PERSISTENT_RECONNECT_GRACE_MS = 0;
 const RECONNECT_SOCKET_RETRY_MS = 100;
 
 export interface RuntimeBackend {
@@ -131,6 +131,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       },
       detached: true,
       stdio: ["ignore", "ignore", "ignore"],
+      windowsHide: true,
     };
 
     const child = spawn(this.sidecarPath, args, spawnOptions);
@@ -198,6 +199,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       });
 
       state.child.on("exit", (code) => {
+        this.refreshReconnectInfo(state);
+        if (
+          !state.explicitClose &&
+          isRuntimeSessionPid(state.reconnectInfo.pid) &&
+          isRuntimeSessionPidAlive(state.reconnectInfo.pid)
+        ) {
+          return;
+        }
         if (state.socket && !state.socket.destroyed) {
           state.socket.destroy();
         }
@@ -347,11 +356,16 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (shutdownSent) {
       return;
     }
-    if (!state.child) {
+    const reconnectInfo = this.readReconnectInfoFromBootstrapFile(state) ?? state.reconnectInfo;
+    if (
+      typeof reconnectInfo.port === "number" &&
+      Number.isFinite(reconnectInfo.port) &&
+      reconnectInfo.port > 0
+    ) {
       void this.shutdownDetachedSession(state);
       return;
     }
-    if (state.child.exitCode === null && state.child.signalCode === null) {
+    if (state.child && state.child.exitCode === null && state.child.signalCode === null) {
       try {
         state.child.kill();
       } catch {
@@ -366,6 +380,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     const state = this.sessionStates.get(session);
     if (!state || state.explicitClose) {
       return false;
+    }
+    this.refreshReconnectInfo(state);
+    if (isRuntimeSessionPid(state.reconnectInfo.pid)) {
+      return isRuntimeSessionPidAlive(state.reconnectInfo.pid);
     }
     if (state.child) {
       return (
@@ -382,7 +400,11 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return undefined;
     }
     const state = this.sessionStates.get(session);
-    return state?.reconnectInfo.pid ?? state?.child?.pid;
+    if (!state) {
+      return undefined;
+    }
+    this.refreshReconnectInfo(state);
+    return state.reconnectInfo.pid ?? state.child?.pid;
   }
 
   getReconnectInfo(session: RuntimeSessionHandle | null): RuntimeSessionReconnectInfo | undefined {
@@ -393,13 +415,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (!state) {
       return undefined;
     }
-    const resolvedInfo = this.readReconnectInfoFromBootstrapFile(state) ?? state.reconnectInfo;
-    if (resolvedInfo !== state.reconnectInfo) {
-      state.reconnectInfo = {
-        ...state.reconnectInfo,
-        ...resolvedInfo,
-      };
-    }
+    this.refreshReconnectInfo(state);
     const { sessionId, port, pid } = state.reconnectInfo;
     if (typeof port !== "number" || !Number.isFinite(port) || port <= 0) {
       return undefined;
@@ -672,6 +688,17 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return;
     }
     void fs.promises.rm(state.sessionFilePath, { force: true }).catch(() => {});
+  }
+
+  private refreshReconnectInfo(state: BackendSessionState): void {
+    const resolvedInfo = this.readReconnectInfoFromBootstrapFile(state);
+    if (!resolvedInfo) {
+      return;
+    }
+    state.reconnectInfo = {
+      ...state.reconnectInfo,
+      ...resolvedInfo,
+    };
   }
 
   private async shutdownDetachedSession(state: BackendSessionState): Promise<void> {

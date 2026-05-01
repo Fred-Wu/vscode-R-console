@@ -19,8 +19,8 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 - Console-scoped completion and signature help through R's `languageserver` package.
 - Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
 - Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
-- Console view restoration after extension-host restart, including multiple open consoles.
-- Screen, scrollback, cursor, and ANSI style restoration when the terminal UI is recreated after a cancelled close or a reattach.
+- Self-managed persistent R backends that can survive extension-host and VS Code restarts until closed from `R Console: Manage Persistent Sessions...` or the console tab close confirmation.
+- Screen, scrollback, cursor, and ANSI style restoration when the terminal UI is recreated after a cancelled close or a manual reattach.
 - Close confirmation that immediately reattaches the running console before showing the modal prompt, which keeps the console visible despite the VS Code terminal API lacking a before-close hook.
 - Embedded console backend for macOS, Linux, and Windows.
 
