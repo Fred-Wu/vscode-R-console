@@ -19,6 +19,8 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 
 https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
 
+https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
+
 ## Requirements
 
 - VS Code 1.85.0 or later.
