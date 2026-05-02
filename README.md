@@ -7,16 +7,15 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 ## Features
 
 - Custom R console hosted in the VS Code terminal area.
+- Embedded console backend for macOS, Linux, and Windows
+- Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
+- Self-managed R console sessions that can be attached to or closed from VS Code.
+- Console-scoped completion and signature help through R's `languageserver` package.
+- Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
 - Multiline editing with local history navigation, reverse search, and a windowed/collapsed viewport renderer for long inputs.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
 - Parser-backed completeness checks before submission.
-- Console-scoped completion and signature help through R's `languageserver` package.
-- Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
-- Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
-- Screen, scrollback, cursor, and ANSI style restoration when the terminal UI is recreated after a cancelled close or a reattach.
-- Close confirmation that immediately reattaches the running console before showing the modal prompt, which keeps the console visible despite the VS Code terminal API lacking a before-close hook.
-- Embedded console backend for macOS, Linux, and Windows.
 
 ## Requirements
 
@@ -33,8 +32,11 @@ Launch `R Console` from the Command Palette with:
 
 - `R Console: Create R Console`
 - `R Console: Create R Console in Side Editor`
+- `R Console: Manage Persistent Sessions...`
 
-The minimum vscode-R setup for those commands to work is:
+Use the session manager to attach to or close running R Console sessions.
+
+The minimum vscode-R setup for R Console commands to work is:
 
 1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
 2. Prefer setting the platform-specific vscode-R `r.rpath.*` entry to the R binary path used by `R Console`:
@@ -110,44 +112,26 @@ R Console also contributes its own settings:
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
 
-## Architecture
-
-### Runtime Layers
-
-1. Terminal layer owns the pseudoterminal implementation, input buffer, cursor movement, multiline editing, history, the long-input viewport renderer, prompt handling, and an off-screen `@xterm/headless` buffer used to restore screen and scrollback state on reattach.
-
-2. Language layer owns completion-context analysis, local parse heuristics, immediate token-based styling, virtual documents, and the console-specific LSP bridge.
-
-3. Runtime layer owns the sidecar/session control protocol, bundled binary resolution, dialog bridging, and the vscode-R session watcher bridge.
-
-4. Rust sidecar
-- `sidecar/pty-host/` builds one binary:
-- `R_CONSOLE_HOST` is the embedded host. It does not spawn a second internal session-host process. It loads the R shared library dynamically, wires console callbacks, and emits prompt, busy, input-request, dialog, and parse-status events back to the extension over the backend protocol.
-
-### Dependency Model
+## Dependency Model
 
 - `vscode-R` is a hard dependency. R Console uses the same configured R binary.
 - R's `languageserver` package is optional but required for console semantic tokens, completion, and signature help.
 - The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
-
-## Project Layout
-
-- `src/Terminal/` contains the console editor, viewport renderer, history manager, headless replay/restore logic, options, and the main `RTerminal` implementation.
-- `src/Language/` contains completion logic, the console LSP client, parse heuristics, and the virtual in-memory R document.
-- `src/Runtime/` contains the backend control protocol, bundled Rust binary resolution, and the session watcher integration.
-- `sidecar/pty-host/` contains the Rust embedded host and protocol framing code.
 
 ## Acknowledgements
 
 R Console is built on the broader VS Code, Rust, and R ecosystems, and on the work of open-source projects that informed the extension. In particular, we would like to highlight the following projects:
 
 - [vscode-R](https://github.com/REditorSupport/vscode-R) - R Console depends on vscode-R for configuration, session bootstrap, session watching, and the surrounding VS Code R workflow.
-- [arf](https://github.com/eitsupi/arf) - The current embedded-R host design was heavily informed by arf's Rust-based approach to loading and embedding R, platform-specific console initialization, callback wiring, and backend architecture.
+- [arf](https://github.com/eitsupi/arf) - The embedded-R host design was heavily informed by arf's Rust-based approach to loading and embedding R, platform-specific console initialization, callback wiring, event/input-handler pumping, and backend architecture.
+- [Ark](https://github.com/posit-dev/ark) - The native R frontend model, nested-input handling, ReadConsole recovery concepts, and generic R event-loop integration were important references for the backend design.
+- [rchitect](https://github.com/randy3k/rchitect) - Rchitect was a reference for embedding R from a non-R host process, including R home/shared-library discovery and callback/FFI boundary concepts.
 - [radian](https://github.com/randy3k/radian) - The terminal-first interaction model and several console UX ideas, including multiline editing, history search/navigation, bracketed paste, and prompt-centric workflows, were inspired by radian.
+- [languageserver](https://github.com/REditorSupport/languageserver) - Console completion, signature help, and semantic-token support are built around R's language server.
 
 ## Development Note
 
-This extension's source code was written with assistance from Codex (GPT-5.3-Codex and GPT-5.4). The overall feature design and logic decisions are mine; GPT models were used to generate and iterate on the implementation.
+This extension's source code was written with assistance from GPT models using OpenAI's Codex. The overall feature design and logic decisions are mine; GPT models were used to generate and iterate on the implementation.
 
 ## License
 

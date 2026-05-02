@@ -2,6 +2,15 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.0] - Unreleased
+
+### Added
+- Self-managed R console sessions with Command Palette management for attaching to or closing running sessions.
+
+### Fixed
+- Nested prompt handling now preserves reply input and multiline paste behavior while R is waiting for input.
+- R event and input-handler pumping now keeps interactive event loops responsive and interruptible.
+
 ## [0.1.1] - 2026-04-16
 
 ### Changed
