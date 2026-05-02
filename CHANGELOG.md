@@ -5,7 +5,10 @@ All notable changes to R Console will be documented in this file.
 ## [0.2.0] - Unreleased
 
 ### Added
-- Self-managed R console sessions with Command Palette management for attaching to or closing running sessions.
+- Persistent self-managed console sessions that can survive VS Code terminal UI detaches.
+- A session manager for attaching to or closing running R Console sessions.
+- Backend/UI transport over a TCP session server with reconnect metadata.
+- Persistence for console runtime state, terminal replay state, prompt/input state, and terminal location for later reattach.
 
 ### Fixed
 - Nested prompt handling now preserves reply input and multiline paste behavior while R is waiting for input.
