@@ -1583,7 +1583,10 @@ mod unix_host {
                 *value = 1;
             }
             if let Some(value) = self.r_signal_handlers {
-                *value = 0;
+                // Unix busy interrupts use SIGINT to wake R. Keep R's signal
+                // handler installed so SIGINT is converted into a user
+                // interrupt instead of terminating the host process.
+                *value = 1;
             }
 
             let mut argv_storage = build_r_args(r_executable, r_args)?;
