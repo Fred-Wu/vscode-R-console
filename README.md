@@ -31,8 +31,8 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 
 Launch `R Console` from the Command Palette with:
 
-- `R: Create R Console`
-- `R: Create R Console in Side Editor`
+- `R Console: Create R Console`
+- `R Console: Create R Console in Side Editor`
 
 The minimum vscode-R setup for those commands to work is:
 

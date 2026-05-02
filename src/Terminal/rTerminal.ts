@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
-import { spawnSync, ChildProcess } from "child_process";
+import { spawnSync } from "child_process";
 import * as path from "path";
 import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
@@ -22,8 +22,10 @@ import {
 } from "./options";
 import {
   RuntimeBackend,
+  type RuntimeSessionHandle,
+  type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
-import { SessionWatcher, WorkspaceData } from "../Runtime/sessionWatcher";
+import { SessionWatcher, type WorkspaceData } from "../Runtime/sessionWatcher";
 import {
   InputSnapshot,
   RTermLang,
@@ -43,6 +45,9 @@ import {
   finishRuntimeSubmission,
   getRuntimeTerminalName,
   interruptRuntime,
+  attachRuntimeSession,
+  primeRuntimeAttach,
+  updateRuntimeTerminalName,
   type RuntimeHost,
   startNextRuntimeSubmission,
   type Submission,
@@ -94,6 +99,42 @@ type SerializedCellStyle = {
   overline: boolean;
 };
 
+type PersistedReplaySnapshot = {
+  lines: string[];
+  finalRow: number;
+  cursorRow: number;
+  cursorCol: number;
+};
+
+type PersistedUiSnapshot = {
+  replay: PersistedReplaySnapshot;
+  replayColumns: number;
+  replayRows: number;
+  mode: TerminalMode;
+  promptReady: boolean;
+  promptKind: "main" | "cont";
+  promptVisible: boolean;
+  replyPromptText: string;
+  pendingPromptToken: boolean;
+  pendingInitialPromptGap: boolean;
+  lastWriteEndedWithNewline: boolean;
+  hasReceivedOutput: boolean;
+  inputText: string;
+  inputCursorPosition: number;
+  backendChildPid?: number;
+};
+
+export type PersistedRTerminalOptions = Pick<
+  RTerminalOptions,
+  "rPath" | "rArgs" | "sessionWatcherEnabled" | "watcherDir" | "bracketedPaste" | "cwd"
+>;
+
+export type PersistedRTerminalState = {
+  options: PersistedRTerminalOptions;
+  runtime: RuntimeSessionReconnectInfo;
+  ui: PersistedUiSnapshot;
+};
+
 export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
   private closeEmitter = new vscode.EventEmitter<number>();
@@ -114,7 +155,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     return this.pidEmitter.event;
   }
 
-  private rProcess: ChildProcess | null = null;
+  private rProcess: RuntimeSessionHandle | null = null;
   private backendChildPid: number | undefined;
   private dimensions: { columns: number; rows: number } = { columns: 80, rows: 24 };
 
@@ -143,7 +184,6 @@ export class RTerminal implements vscode.Pseudoterminal {
   private pendingPromptToken = false;
   private lastWriteEndedWithNewline = true;
   private hasReceivedOutput = false;
-  private promptBlockStartRow = 0;
   private replayStartAbsoluteRow = 0;
   private terminalState: ReplayTerminal;
   private suppressTerminalStateCapture = false;
@@ -166,6 +206,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
+  private extensionResourcesDisposed = false;
 
   private inBracketPaste = false;
   private pasteBuffer = "";
@@ -174,7 +215,24 @@ export class RTerminal implements vscode.Pseudoterminal {
   private tabSize = 2;
   private lastSearchTerm = "";
 
-  constructor(private options: RTerminalOptions, private extensionPath: string = "") {
+  constructor(
+    private options: RTerminalOptions,
+    private extensionPath: string = "",
+    restoreState?: PersistedRTerminalState
+  ) {
+    if (
+      typeof restoreState?.ui.replayColumns === "number" &&
+      Number.isFinite(restoreState.ui.replayColumns) &&
+      restoreState.ui.replayColumns > 0 &&
+      typeof restoreState.ui.replayRows === "number" &&
+      Number.isFinite(restoreState.ui.replayRows) &&
+      restoreState.ui.replayRows > 0
+    ) {
+      this.dimensions = {
+        columns: Math.max(20, restoreState.ui.replayColumns),
+        rows: Math.max(5, restoreState.ui.replayRows),
+      };
+    }
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = this.resolveRuntimeBackend();
@@ -206,6 +264,14 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.loadSettings();
     this.runtimeHostAdapter = this.createRuntimeHost();
+
+    if (restoreState?.runtime && this.runtimeBackend) {
+      this.applyPersistedUiSnapshot(restoreState.ui);
+      this.rProcess = this.runtimeBackend.reconnect(restoreState.runtime);
+      primeRuntimeAttach(this.runtimeHost());
+      attachRuntimeSession(this.runtimeHost(), true);
+      updateRuntimeTerminalName(this.runtimeHost());
+    }
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
@@ -243,6 +309,45 @@ export class RTerminal implements vscode.Pseudoterminal {
       Math.max(20, this.dimensions.columns || 80),
       Math.max(5, this.dimensions.rows || 24)
     );
+  }
+
+  private applyPersistedUiSnapshot(snapshot: PersistedUiSnapshot): void {
+    this.mode = snapshot.mode;
+    this.promptReady = snapshot.promptReady;
+    this.promptKind = snapshot.promptKind;
+    this.promptVisible = snapshot.promptVisible;
+    this.replyPromptText = snapshot.replyPromptText;
+    this.pendingPromptToken = snapshot.pendingPromptToken;
+    this.pendingInitialPromptGap = snapshot.pendingInitialPromptGap;
+    this.lastWriteEndedWithNewline = snapshot.lastWriteEndedWithNewline;
+    this.hasReceivedOutput = snapshot.hasReceivedOutput;
+    this.backendChildPid = snapshot.backendChildPid;
+    this.inputState.text = snapshot.inputText;
+    this.inputState.cursorPosition = snapshot.inputCursorPosition;
+
+    this.terminalState.dispose();
+    this.terminalState = this.createReplayTerminal();
+    this.hydrateReplayTerminal(snapshot.replay);
+  }
+
+  private hydrateReplayTerminal(snapshot: PersistedReplaySnapshot): void {
+    if (snapshot.lines.length === 0) {
+      return;
+    }
+
+    const lines = snapshot.lines.map((line) => this.trimReplayLineRight(line));
+    lines.forEach((line, index) => {
+      this.terminalState._core._writeBuffer.writeSync(line);
+      if (index < lines.length - 1) {
+        this.terminalState._core._writeBuffer.writeSync("\r\n");
+      }
+    });
+
+    const deltaUp = snapshot.finalRow - snapshot.cursorRow;
+    if (deltaUp > 0) {
+      this.terminalState._core._writeBuffer.writeSync(`\x1b[${deltaUp}A`);
+    }
+    this.terminalState._core._writeBuffer.writeSync(`\r\x1b[${snapshot.cursorCol + 1}G`);
   }
 
   private loadSettings(): void {
@@ -449,6 +554,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       clearPromptRenderTimer: () => self.clearPromptRenderTimer(),
       clearReplyPromptRenderTimer: () => self.clearReplyPromptRenderTimer(),
       clearPendingConsoleInput: () => self.clearPendingConsoleInput(),
+      captureVisibleInputForReplay: () => self.captureVisibleInputForReplay(),
       sendPendingConsoleInput: (kind) => self.sendPendingConsoleInput(kind),
       schedulePrompt: () => self.schedulePrompt(),
       scheduleReplyPrompt: () => self.scheduleReplyPrompt(),
@@ -919,6 +1025,29 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.sendReadlineReply(line);
   }
 
+  private captureVisibleInputForReplay(): void {
+    if (!this.promptVisible) {
+      return;
+    }
+
+    const lines = this.inputState.lines;
+    const styledLines = this.syntax.snapshotNow(lines);
+    const continuationPad = "  ";
+
+    styledLines.forEach((line, index) => {
+      if (index > 0) {
+        this.terminalState._core._writeBuffer.writeSync("\r\n");
+      }
+      const prompt =
+        index === 0
+          ? `${ANSI.reset}${this.renderer.promptColor}${this.renderer.promptText}${ANSI.reset}`
+          : this.renderer.continuationPromptText === null
+            ? continuationPad
+            : `${ANSI.reset}${this.renderer.continuationPromptColor}${this.renderer.continuationPromptText}${ANSI.reset}`;
+      this.terminalState._core._writeBuffer.writeSync(`${prompt}${line}`);
+    });
+  }
+
   private applyKeyAction(action: KeyAction): void {
     if (this.mode === "closed") {
       return;
@@ -1073,7 +1202,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
         if (this.promptReady) {
-          this.promptBlockStartRow = 0;
           this.renderInputFresh(this.buildCurrentInputRenderPlan());
           this.promptVisible = true;
         }
@@ -1701,7 +1829,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.withTerminalStateCaptureSuppressed(() => {
       replay.lines.forEach((line, index) => {
-        this.writeEmitter.fire(line);
+        this.writeEmitter.fire(this.trimReplayLineRight(line));
         if (index < replay.lines.length - 1) {
           this.writeEmitter.fire("\r\n");
         }
@@ -1712,21 +1840,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.writeEmitter.fire(`\x1b[${deltaUp}A`);
       }
       this.writeEmitter.fire(`\r\x1b[${replay.cursorCol + 1}G`);
-    });
-  }
-
-  private restoreVisibleTerminalState(): void {
-    const replay = this.buildVisibleTerminalReplay();
-    if (replay.lines.length === 0) {
-      return;
-    }
-
-    this.withTerminalStateCaptureSuppressed(() => {
-      replay.lines.forEach((line, index) => {
-        this.writeEmitter.fire(`\x1b[${index + 1};1H`);
-        this.writeEmitter.fire(line);
-      });
-      this.writeEmitter.fire(`\x1b[${replay.cursorRow + 1};${replay.cursorCol + 1}H`);
     });
   }
 
@@ -1800,54 +1913,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       Math.floor(absoluteCursorCol / safeColumns);
 
     return {
-      lines: lines.map((line) => line.styledText),
+      lines: lines.map((line) => this.trimReplayLineRight(line.styledText)),
       finalRow,
       cursorRow,
       cursorCol: absoluteCursorCol % safeColumns,
-    };
-  }
-
-  private buildVisibleTerminalReplay(maxRows?: number): {
-    lines: string[];
-    finalRow: number;
-    cursorRow: number;
-    cursorCol: number;
-  } {
-    const buffer = this.terminalState.buffer.active;
-    const viewportStart = buffer.viewportY;
-    const visibleRows = Array.from({ length: this.dimensions.rows }, (_, index) =>
-      this.serializeReplayRow(buffer.getLine(viewportStart + index), true)
-    );
-
-    let lastContentRow = -1;
-    for (let index = visibleRows.length - 1; index >= 0; index -= 1) {
-      if (visibleRows[index]?.plainText.trimEnd().length) {
-        lastContentRow = index;
-        break;
-      }
-    }
-
-    const finalRow = Math.max(lastContentRow, buffer.cursorY);
-    if (finalRow < 0) {
-      return { lines: [], finalRow: 0, cursorRow: 0, cursorCol: 0 };
-    }
-
-    const replayLines = visibleRows.slice(0, finalRow + 1).map((row) => row.styledText);
-    const boundedRows =
-      maxRows === undefined
-        ? replayLines.length
-        : Math.max(0, Math.min(maxRows, replayLines.length));
-    const firstVisibleRow = Math.max(0, replayLines.length - boundedRows);
-    const lines = replayLines.slice(firstVisibleRow);
-
-    return {
-      lines,
-      finalRow: Math.max(0, lines.length - 1),
-      cursorRow:
-        lines.length > 0
-          ? Math.max(0, Math.min(buffer.cursorY - firstVisibleRow, lines.length - 1))
-          : 0,
-      cursorCol: buffer.cursorX,
     };
   }
 
@@ -1919,6 +1988,22 @@ export class RTerminal implements vscode.Pseudoterminal {
       styledText,
       wrapped: line.isWrapped,
     };
+  }
+
+  private trimReplayLineRight(line: string): string {
+    let body = line;
+    let suffix = "";
+
+    while (true) {
+      const match = body.match(/(?:\x1b\[[0-9;]*m)+$/);
+      if (!match) {
+        break;
+      }
+      suffix = `${match[0]}${suffix}`;
+      body = body.slice(0, -match[0].length);
+    }
+
+    return `${body.replace(/[ \t]+$/, "")}${suffix}`;
   }
 
   private serializeCellStyle(cell: IBufferCell): SerializedCellStyle {
@@ -2056,7 +2141,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.lastWriteEndedWithNewline = true;
     }
 
-    this.promptBlockStartRow = this.getVisibleOutputCursorRow();
     this.renderInput();
     this.promptVisible = true;
     this.pendingPromptToken = false;
@@ -2076,7 +2160,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.lastWriteEndedWithNewline = true;
     }
 
-    this.promptBlockStartRow = this.getVisibleOutputCursorRow();
     this.renderInput();
     this.promptVisible = true;
   }
@@ -2116,13 +2199,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     });
   }
 
-  private getVisibleOutputCursorRow(): number {
-    return Math.max(
-      0,
-      Math.min(this.terminalState.buffer.active.cursorY, this.dimensions.rows - 1)
-    );
-  }
-
   private renderInputFresh(plan: InputRenderPlan): void {
     this.withTerminalStateCaptureSuppressed(() => {
       this.renderer.renderFreshWithCursor(
@@ -2145,8 +2221,6 @@ export class RTerminal implements vscode.Pseudoterminal {
 
       // Use the full-buffer replay which joins wrapped rows back into logical
       // lines. xterm will re-wrap them naturally at the new column width.
-      // buildVisibleTerminalReplay() returns raw rows already wrapped at the
-      // old width, which would cause double-wrapping artifacts.
       const replay = this.buildTerminalReplay();
       replay.lines.forEach((line, index) => {
         if (index > 0) {
@@ -2174,7 +2248,6 @@ export class RTerminal implements vscode.Pseudoterminal {
           plan.sourceLineMap,
           plan.promptKinds
         );
-        this.promptBlockStartRow = this.getVisibleOutputCursorRow();
         this.promptVisible = true;
       }
     });
@@ -2290,7 +2363,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.closeEmitter.fire(0);
   }
 
-  forceClose(): void {
+  private releaseExtensionResources(): void {
+    if (this.extensionResourcesDisposed) {
+      return;
+    }
+    this.extensionResourcesDisposed = true;
     this.saveHistory();
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
@@ -2305,22 +2382,23 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang.clearSessionState();
     this.lang.stopConsoleLsp();
     setNativeParseCallback(null);
+  }
+
+  forceClose(): void {
+    this.releaseExtensionResources();
 
     if (this.rProcess) {
       const processToClose = this.rProcess;
-      const pid = processToClose.pid;
+      const pid = this.runtimeBackend?.getPid(processToClose);
       if (this.runtimeBackend) {
         this.runtimeBackend.close(processToClose);
         // Give sidecar a short grace window to terminate its PTY child cleanly.
         if (pid) {
-          const forceKillTimer = setTimeout(() => {
-            if (processToClose.exitCode === null && processToClose.signalCode === null) {
+          setTimeout(() => {
+            if (this.runtimeBackend?.isAlive(processToClose)) {
               this.killProcessTree(pid);
             }
           }, 1200);
-          processToClose.once("exit", () => {
-            clearTimeout(forceKillTimer);
-          });
         }
       } else {
         this.killProcessTree(pid);
@@ -2348,11 +2426,58 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   isRunning(): boolean {
-    return this.rProcess !== null && !this.rProcess.killed;
+    return this.rProcess !== null && (this.runtimeBackend?.isAlive(this.rProcess) ?? false);
+  }
+
+  requiresCloseConfirmation(): boolean {
+    return this.isRunning();
   }
 
   getPid(): number | undefined {
     return this.getDisplayPid();
+  }
+
+  getTerminalName(): string {
+    return getRuntimeTerminalName(this.runtimeHost());
+  }
+
+  exportPersistentState(): PersistedRTerminalState | undefined {
+    if (!this.runtimeBackend || !this.rProcess) {
+      return undefined;
+    }
+    const runtime = this.runtimeBackend.getReconnectInfo(this.rProcess);
+    if (!runtime) {
+      return undefined;
+    }
+
+    return {
+      options: {
+        rPath: this.options.rPath,
+        rArgs: [...this.options.rArgs],
+        sessionWatcherEnabled: this.options.sessionWatcherEnabled,
+        watcherDir: this.options.watcherDir,
+        bracketedPaste: this.options.bracketedPaste,
+        cwd: this.options.cwd,
+      },
+      runtime,
+      ui: {
+        replay: this.buildTerminalReplay(),
+        replayColumns: this.dimensions.columns,
+        replayRows: this.dimensions.rows,
+        mode: this.mode,
+        promptReady: this.promptReady,
+        promptKind: this.promptKind,
+        promptVisible: this.promptVisible,
+        replyPromptText: this.replyPromptText,
+        pendingPromptToken: this.pendingPromptToken,
+        pendingInitialPromptGap: this.pendingInitialPromptGap,
+        lastWriteEndedWithNewline: this.lastWriteEndedWithNewline,
+        hasReceivedOutput: this.hasReceivedOutput,
+        inputText: this.inputState.text,
+        inputCursorPosition: this.inputState.cursorPosition,
+        backendChildPid: this.backendChildPid,
+      },
+    };
   }
 
   private getDisplayPid(): number | undefined {
@@ -2365,7 +2490,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (typeof this.backendChildPid === "number") {
       return this.backendChildPid;
     }
-    return this.rProcess?.pid;
+    return this.runtimeBackend?.getPid(this.rProcess);
   }
 
   notifyDisplayPidChanged(): void {
@@ -2378,7 +2503,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   dispose(): void {
-    this.forceClose();
+    this.releaseExtensionResources();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();

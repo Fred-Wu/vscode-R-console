@@ -3,7 +3,6 @@ const FRAME_HEADER_LEN = 12;
 const FrameKind = {
   BackendReady: 1,
   HostConnected: 2,
-  ChildSpawned: 3,
   Prompt: 4,
   Busy: 5,
   InputRequest: 6,
@@ -20,6 +19,7 @@ const FrameKind = {
   Shutdown: 17,
   DialogResult: 18,
   HostError: 19,
+  SessionState: 20,
 } as const;
 
 export type BackendCapability =
@@ -72,10 +72,6 @@ export type BackendControlEvent =
       capabilities: BackendCapability[];
     }
   | {
-      type: "child-spawned";
-      pid?: number;
-    }
-  | {
       type: "prompt";
       kind: "main" | "cont";
     }
@@ -105,6 +101,23 @@ export type BackendControlEvent =
   | {
       type: "host-error";
       message: string;
+    }
+  | {
+      type: "session-state";
+      pid?: number;
+      busy: boolean;
+      wait:
+        | {
+            kind: "none";
+          }
+        | {
+            kind: "top-level";
+            prompt: "main" | "cont";
+          }
+        | {
+            kind: "nested";
+            prompt: string;
+          };
     };
 
 type BackendFrameParseResult = {
@@ -249,17 +262,6 @@ function parseControlFrame(
         capabilities: info.capabilities,
       };
     }
-    case FrameKind.ChildSpawned:
-      if (payload.length === 0) {
-        return { type: "child-spawned" };
-      }
-      if (payload.length !== 4) {
-        throw new Error("invalid child-spawned payload");
-      }
-      return {
-        type: "child-spawned",
-        pid: payload.readUInt32LE(0),
-      };
     case FrameKind.Prompt:
       if (payload.length !== 1) {
         throw new Error("invalid prompt payload");
@@ -301,6 +303,46 @@ function parseControlFrame(
         type: "host-error",
         message: payload.toString("utf8"),
       };
+    case FrameKind.SessionState: {
+      if (payload.length < 6) {
+        throw new Error("invalid session-state payload");
+      }
+      const pid = payload.readUInt32LE(0);
+      const busy = payload[4] !== 0;
+      const waitKind = payload[5];
+      if (waitKind === 0) {
+        return {
+          type: "session-state",
+          pid: pid > 0 ? pid : undefined,
+          busy,
+          wait: { kind: "none" },
+        };
+      }
+      if (waitKind === 1 || waitKind === 2) {
+        return {
+          type: "session-state",
+          pid: pid > 0 ? pid : undefined,
+          busy,
+          wait: {
+            kind: "top-level",
+            prompt: waitKind === 2 ? "cont" : "main",
+          },
+        };
+      }
+      if (waitKind === 3) {
+        const prompt = payload.toString("utf8", 6);
+        return {
+          type: "session-state",
+          pid: pid > 0 ? pid : undefined,
+          busy,
+          wait: {
+            kind: "nested",
+            prompt,
+          },
+        };
+      }
+      throw new Error(`unknown session-state kind ${waitKind}`);
+    }
     default:
       return undefined;
   }
