@@ -1183,8 +1183,10 @@ export function interruptRuntime(host: RuntimeHost): void {
     }) ?? false;
 
   if (host.isSessionProtocolActive() && host.mode === "executing") {
+    if (!sendInterrupt()) {
+      return;
+    }
     host.writeEmitter.fire("^C\r\n");
-    sendInterrupt();
     host.inputState.reset();
     host.promptVisible = false;
     host.pendingPromptToken = false;
@@ -1193,6 +1195,10 @@ export function interruptRuntime(host: RuntimeHost): void {
   }
 
   if (host.isSessionProtocolActive() && host.mode === "reply") {
+    if (!sendInterrupt()) {
+      host.scheduleReplyPrompt();
+      return;
+    }
     host.clearReplyPromptRenderTimer();
     host.writeEmitter.fire("^C\r\n");
     host.clearInputRender();
@@ -1201,7 +1207,6 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.replyPromptText = "";
     host.mode = "executing";
     host.clearPendingConsoleInput();
-    sendInterrupt();
     return;
   }
 

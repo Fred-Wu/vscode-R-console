@@ -28,6 +28,7 @@ mod unix_host {
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
     const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
 
     const SUPPORTED_CAPABILITIES: &[&str] = &[
         "control-channel",
@@ -653,6 +654,18 @@ mod unix_host {
         }
     }
 
+    fn preserve_requested_interrupt() -> bool {
+        let Some(runtime) = host_runtime() else {
+            return false;
+        };
+        let state = runtime.state.lock().expect("host state lock poisoned");
+        if !state.interrupt_requested {
+            return false;
+        }
+        set_r_interrupts_pending(true);
+        true
+    }
+
     fn host_runtime() -> Option<&'static HostRuntime> {
         HOST_RUNTIME.get()
     }
@@ -806,10 +819,12 @@ mod unix_host {
     unsafe fn run_process_events(api: EventLoopApi) {
         if let Some(process_events) = api.r_process_events {
             process_events();
+            preserve_requested_interrupt();
         }
         run_activity_handlers(api);
         if let Some(run_pending_finalizers) = api.r_run_pending_finalizers {
             run_pending_finalizers();
+            preserve_requested_interrupt();
         }
     }
 
@@ -819,9 +834,14 @@ mod unix_host {
             return;
         }
 
+        let mut handled = 0_usize;
         let mut mask = (api.r_check_activity)(0, 1);
-        while !mask.is_null() {
+        while !mask.is_null() && handled < MAX_ACTIVITY_HANDLER_DRAIN {
             (api.r_run_handlers)(handlers, mask);
+            handled += 1;
+            if preserve_requested_interrupt() {
+                break;
+            }
             mask = (api.r_check_activity)(0, 1);
         }
     }
@@ -841,6 +861,7 @@ mod unix_host {
         };
 
         run_activity_handlers(api);
+        preserve_requested_interrupt();
     }
 
     unsafe extern "C-unwind" fn polled_events_callback() {
@@ -849,6 +870,7 @@ mod unix_host {
         };
 
         run_activity_handlers(api);
+        preserve_requested_interrupt();
     }
 
     unsafe extern "C-unwind" fn read_console_callback(
@@ -1733,6 +1755,7 @@ mod windows_host {
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
     const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
     const EMBEDDED_UTF8_PREFIX: &[u8] = &[0x02, 0xff, 0xfe];
     const EMBEDDED_UTF8_SUFFIX: &[u8] = &[0x03, 0xff, 0xfe];
 
@@ -2443,6 +2466,18 @@ mod windows_host {
         }
     }
 
+    fn preserve_requested_interrupt() -> bool {
+        let Some(runtime) = host_runtime() else {
+            return false;
+        };
+        let state = runtime.state.lock().expect("host state lock poisoned");
+        if !state.interrupt_requested {
+            return false;
+        }
+        set_r_interrupts_pending(true);
+        true
+    }
+
     fn host_runtime() -> Option<&'static HostRuntime> {
         HOST_RUNTIME.get()
     }
@@ -2610,9 +2645,14 @@ mod windows_host {
             return;
         }
 
+        let mut handled = 0_usize;
         let mut mask = check_activity(0, 1);
-        while !mask.is_null() {
+        while !mask.is_null() && handled < MAX_ACTIVITY_HANDLER_DRAIN {
             run_handlers(handlers, mask);
+            handled += 1;
+            if preserve_requested_interrupt() {
+                break;
+            }
             mask = check_activity(0, 1);
         }
     }
@@ -2624,10 +2664,12 @@ mod windows_host {
         pump_windows_messages();
         if let Some(process_events) = api.r_process_events {
             process_events();
+            preserve_requested_interrupt();
         }
         run_activity_handlers(api);
         if let Some(run_pending_finalizers) = api.r_run_pending_finalizers {
             run_pending_finalizers();
+            preserve_requested_interrupt();
         }
     }
 
@@ -2643,19 +2685,20 @@ mod windows_host {
         if let Some(api) = event_loop_api() {
             if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
                 if let Some(peek_event) = api.ga_peekevent {
-                    while peek_event() != 0 {}
+                    let mut handled = 0_usize;
+                    while handled < MAX_ACTIVITY_HANDLER_DRAIN && peek_event() != 0 {
+                        handled += 1;
+                        if preserve_requested_interrupt() {
+                            break;
+                        }
+                    }
                 }
                 pump_windows_messages();
                 run_activity_handlers(api);
                 PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
-        if let Some(runtime) = host_runtime() {
-            let state = runtime.state.lock().expect("host state lock poisoned");
-            if state.interrupt_requested {
-                set_r_interrupts_pending(true);
-            }
-        }
+        preserve_requested_interrupt();
     }
 
     unsafe extern "C-unwind" fn polled_events_callback() {
@@ -2666,6 +2709,7 @@ mod windows_host {
                 PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
+        preserve_requested_interrupt();
     }
 
     unsafe extern "C-unwind" fn read_console_callback(
