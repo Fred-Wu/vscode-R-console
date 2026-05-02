@@ -976,7 +976,19 @@ function flushPendingRuntimeRewrite(host: RuntimeHost): void {
 
 export function sendRuntimeReply(host: RuntimeHost, text: string): void {
   host.clearReplyPromptRenderTimer();
+  const sent =
+    host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+      type: "reply-input",
+      text,
+    }) ?? false;
+
+  if (!sent) {
+    host.scheduleReplyPrompt();
+    return;
+  }
+
   if (host.promptVisible) {
+    host.captureVisibleInputForReplay();
     host.writeEmitter.fire("\r\n");
     host.lastWriteEndedWithNewline = true;
     host.renderer.renderedLineCount = 1;
@@ -987,10 +999,6 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
   host.mode = host.activeSubmission ? "executing" : "ready";
   host.awaitingExecutionStart = false;
   host.replyPromptText = "";
-  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-    type: "reply-input",
-    text,
-  });
 }
 
 export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
