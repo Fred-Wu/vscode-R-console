@@ -2,7 +2,7 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-05-02
 
 ### Added
 - Persistent self-managed console sessions that can survive VS Code terminal UI detaches.
