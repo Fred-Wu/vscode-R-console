@@ -158,6 +158,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private awaitingExecutionStart = false;
   private pendingInputFlushTimer: NodeJS.Timeout | null = null;
   private pendingProgrammaticInput = "";
+  private pendingConsoleInputLines: string[] = [];
   private runtimeHostAdapter!: RuntimeHost;
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
@@ -447,6 +448,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       clearPendingInputFlushTimer: () => self.clearPendingInputFlushTimer(),
       clearPromptRenderTimer: () => self.clearPromptRenderTimer(),
       clearReplyPromptRenderTimer: () => self.clearReplyPromptRenderTimer(),
+      clearPendingConsoleInput: () => self.clearPendingConsoleInput(),
+      sendPendingConsoleInput: (kind) => self.sendPendingConsoleInput(kind),
       schedulePrompt: () => self.schedulePrompt(),
       scheduleReplyPrompt: () => self.scheduleReplyPrompt(),
       clearInputRender: () => self.clearInputRender(),
@@ -609,6 +612,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.queueProgrammaticSubmission(data);
       return;
     }
+    if (this.shouldHandleAsNestedProgrammaticReply(data)) {
+      this.sendNestedReplyInput(`${this.inputState.text}${data}`);
+      return;
+    }
     if (this.mode === "executing" && this.isSessionProtocolActive()) {
       const hasCtrlC =
         data.includes("\x03") ||
@@ -671,6 +678,20 @@ export class RTerminal implements vscode.Pseudoterminal {
     );
   }
 
+  private shouldHandleAsNestedProgrammaticReply(data: string): boolean {
+    if (this.inBracketPaste || this.mode !== "reply" || !this.inputState.isAtEnd) {
+      return false;
+    }
+
+    const normalized = this.normalizeProgrammaticInput(data);
+    const fullReplyText = this.stripFinalInputNewline(`${this.inputState.text}${normalized}`);
+    return (
+      fullReplyText.includes("\n") &&
+      !normalized.includes("\x1b") &&
+      !normalized.includes("\x03")
+    );
+  }
+
   private shouldBufferProgrammaticInput(data: string): boolean {
     if (!this.canAcceptProgrammaticSubmission()) {
       return false;
@@ -692,6 +713,12 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private normalizeProgrammaticInput(data: string): string {
     return data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  private stripFinalInputNewline(data: string): string {
+    // The final newline is the Enter that submits the current reply; only
+    // earlier newlines represent additional queued prompt replies.
+    return data.endsWith("\n") ? data.slice(0, -1) : data;
   }
 
   private isPlainTextInputChunk(data: string): boolean {
@@ -823,6 +850,73 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.inputState.insertText(trimmed);
       this.renderInput();
     }
+  }
+
+  private handleNestedReplyPaste(content: string): boolean {
+    const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (!normalized.includes("\n") || !this.inputState.isAtEnd) {
+      this.inputState.insertText(normalized);
+      this.renderInput();
+      return false;
+    }
+
+    this.sendNestedReplyInput(`${this.inputState.text}${normalized}`);
+    return true;
+  }
+
+  private sendNestedReplyInput(text: string): void {
+    const normalized = this.stripFinalInputNewline(
+      stripBracketedPasteMarkers(text)
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+    );
+    const lines = normalized.split("\n");
+    const firstLine = lines.shift() ?? "";
+    this.pendingConsoleInputLines.push(...lines);
+
+    this.sendNestedReplyLine(firstLine);
+  }
+
+  private clearPendingConsoleInput(): void {
+    this.pendingConsoleInputLines = [];
+  }
+
+  private sendPendingConsoleInput(kind: "top-level" | "nested"): boolean {
+    if (this.mode === "closed") {
+      return false;
+    }
+
+    const line = this.pendingConsoleInputLines.shift();
+    if (line === undefined) {
+      return false;
+    }
+
+    if (kind === "nested") {
+      this.sendNestedReplyLine(line);
+      return true;
+    }
+
+    void this.enqueueRSubmission(line, true).then((blocks) => {
+      this.recordSubmissionHistory(blocks);
+    });
+    return true;
+  }
+
+  private sendNestedReplyLine(line: string): void {
+    this.historyBrowsing = false;
+    this.historyCollapsed = true;
+    this.escPendingClear = false;
+    this.rHistory.resetIndex();
+    this.inputState.text = line;
+    this.inputState.cursorToEnd();
+
+    if (this.promptVisible) {
+      this.renderInput();
+    } else {
+      this.showReplyPrompt();
+    }
+
+    this.sendReadlineReply(line);
   }
 
   private applyKeyAction(action: KeyAction): void {
@@ -1239,6 +1333,11 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.inBracketPaste = false;
         if (this.pasteBuffer.length > 0) {
           const content = stripBracketedPasteMarkers(this.pasteBuffer);
+          if (this.shouldSuppressEnterAfterPasteEnd(content)) {
+            this.suppressNextEnterAfterPasteEnd = this.handleNestedReplyPaste(content);
+            this.pasteBuffer = "";
+            return;
+          }
           this.inputState.insertText(content);
           this.pasteBuffer = "";
           this.renderInput();
@@ -2198,6 +2297,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang.cleanupCompletionDocument();
     this.clearPendingInputFlushTimer();
     this.pendingProgrammaticInput = "";
+    this.clearPendingConsoleInput();
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
 
