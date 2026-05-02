@@ -483,8 +483,11 @@ At launch time, `rTerminal/runtime.ts` also sets:
 1. restores and sources the user's original profile through
    `R_PROFILE_USER_OLD`
 2. sources `VSCODE_INIT_R`
-3. installs the console pager
-4. locks the prompt options used by the embedded console contract
+3. for R 4.6 compatibility, bridges vscode-R's legacy global `.First.sys`
+   deferred attach hook through `.First` when `VSCODE_INIT_R` installs it,
+   preserving user `.First()` startup logic before vscode-R attach
+4. installs the console pager
+5. locks the prompt options used by the embedded console contract
 
 ### 3.3 Session Watcher Metadata
 
