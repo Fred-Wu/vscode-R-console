@@ -2,7 +2,7 @@
   "name": "vscode-r-console",
   "displayName": "R Console",
   "description": "A lightweight R console for VS Code",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "RConsole",
   "license": "MIT",
   "icon": "images/Rlogo.png",
@@ -63,12 +63,17 @@
       {
         "command": "r-console.createTerminal",
         "title": "Create R Console",
-        "category": "R"
+        "category": "R Console"
       },
       {
         "command": "r-console.createTerminalSide",
         "title": "Create R Console in Side Editor",
-        "category": "R"
+        "category": "R Console"
+      },
+      {
+        "command": "r-console.managePersistentSessions",
+        "title": "Manage Persistent Sessions...",
+        "category": "R Console"
       }
     ],
     "configuration": {

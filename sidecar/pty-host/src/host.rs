@@ -9,21 +9,26 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
-        OutputStream, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        PromptKind, SessionWaitState,
     };
     use libloading::os::unix::{Library, Symbol};
     use std::collections::VecDeque;
     use std::error::Error;
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
+    use std::fs;
     use std::io;
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Condvar, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
 
     const SUPPORTED_CAPABILITIES: &[&str] = &[
         "control-channel",
@@ -48,7 +53,8 @@ mod unix_host {
     type RfInitializeR = unsafe extern "C" fn(c_int, *mut *mut c_char) -> c_int;
     type SetupRMainloop = unsafe extern "C" fn();
     type RunRMainloop = unsafe extern "C" fn();
-    type ReadConsoleFn = unsafe extern "C" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
+    type ReadConsoleFn =
+        unsafe extern "C-unwind" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
     type WriteConsoleFn = unsafe extern "C" fn(*const c_char, c_int);
     type WriteConsoleExFn = unsafe extern "C" fn(*const c_char, c_int, c_int);
     type ShowMessageFn = unsafe extern "C" fn(*const c_char);
@@ -62,9 +68,11 @@ mod unix_host {
         *const *const c_char,
         *const c_char,
     ) -> c_int;
-    type EventCallbackFn = unsafe extern "C" fn();
+    type EventCallbackFn = unsafe extern "C-unwind" fn();
     type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
+    type ProcessEventsFn = unsafe extern "C" fn();
+    type RunPendingFinalizersFn = unsafe extern "C" fn();
     type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut libc::fd_set;
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut libc::fd_set);
     type Sexp = *mut c_void;
@@ -105,6 +113,8 @@ mod unix_host {
         r_running_as_main_program: Option<*mut c_int>,
         r_interrupts_pending: Option<*mut c_int>,
         r_check_user_interrupt: Option<CheckUserInterruptFn>,
+        r_process_events: Option<ProcessEventsFn>,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
         r_check_activity: CheckActivityFn,
         r_run_handlers: RunHandlersFn,
         r_input_handlers: *mut *mut c_void,
@@ -138,10 +148,26 @@ mod unix_host {
         pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
         current_width: Option<u16>,
+        startup_input_pending: bool,
         busy: bool,
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
+        top_level_recovery_pending: Option<TopLevelRecovery>,
+        top_level_recovery_active: bool,
         shutdown_requested: bool,
+        wait_state: Option<StoredWaitState>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TopLevelRecovery {
+        ParseNull,
+        RecoverFromInterrupt,
+    }
+
+    #[derive(Clone)]
+    enum StoredWaitState {
+        TopLevel(PromptKind),
+        Nested(String),
     }
 
     enum PendingCommand {
@@ -187,6 +213,8 @@ mod unix_host {
 
     #[derive(Clone, Copy)]
     struct EventLoopApi {
+        r_process_events: Option<ProcessEventsFn>,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
         r_check_activity: CheckActivityFn,
         r_run_handlers: RunHandlersFn,
         r_toplevel_exec: TopLevelExecFn,
@@ -205,6 +233,8 @@ mod unix_host {
         success: bool,
     }
 
+    const STARTUP_INTERRUPT_HANDLER_INPUT: &str = r#"base::local({ if (base::getRversion() >= "4.0.0") { handler <- function(e) { restart <- base::findRestart("abort"); if (!base::is.null(restart)) base::invokeRestart(restart) }; handlers <- base::globalCallingHandlers(); base::globalCallingHandlers(NULL); handlers <- c(handlers, list(interrupt = handler)); base::do.call(base::globalCallingHandlers, handlers) }; base::invisible(NULL) }, envir = base::new.env(parent = base::baseenv()))"#;
+
     struct PumpEventsContext {
         api: EventLoopApi,
     }
@@ -220,12 +250,22 @@ mod unix_host {
         let api = unsafe { RApi::load(&library_path)? };
 
         let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
-        output.emit_backend_ready()?;
+        let session_transport = session_transport_config().is_some();
+        if let Err(error) = output.capture_process_stdout() {
+            let _ =
+                output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
+        }
+        if !session_transport {
+            output.emit_backend_ready()?;
+        }
 
         HOST_RUNTIME
             .set(HostRuntime {
                 output: output.clone_handle(),
-                state: Mutex::new(SharedState::default()),
+                state: Mutex::new(SharedState {
+                    startup_input_pending: true,
+                    ..SharedState::default()
+                }),
                 cv: Condvar::new(),
             })
             .map_err(|_| "host runtime already initialized")?;
@@ -252,8 +292,10 @@ mod unix_host {
             }
         }
 
-        output.emit_child_spawned(std::process::id())?;
-        output.emit_host_connected()?;
+        if !session_transport {
+            output.emit_host_connected()?;
+            output.emit_session_state(std::process::id(), false, SessionWaitState::None)?;
+        }
 
         unsafe {
             (api.run_rmainloop)();
@@ -263,7 +305,14 @@ mod unix_host {
     }
 
     fn start_command_reader() {
-        std::thread::spawn(move || {
+        if let Some((session_file, initial_connect_grace, reconnect_grace)) =
+            session_transport_config()
+        {
+            start_session_command_reader(session_file, initial_connect_grace, reconnect_grace);
+            return;
+        }
+
+        thread::spawn(move || {
             let stdin = io::stdin();
             let mut locked = stdin.lock();
             loop {
@@ -281,6 +330,230 @@ mod unix_host {
                 }
             }
         });
+    }
+
+    fn start_session_command_reader(
+        session_file: String,
+        initial_connect_grace: Duration,
+        reconnect_grace: Option<Duration>,
+    ) {
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    emit_host_error(&format!("backend session server bind failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = listener.set_nonblocking(true) {
+                emit_host_error(&format!("backend session server setup failed: {error}"));
+                request_shutdown();
+                return;
+            }
+
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    emit_host_error(&format!("backend session server address failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = write_session_bootstrap(&session_file, port, std::process::id()) {
+                emit_host_error(&format!("backend session bootstrap write failed: {error}"));
+                request_shutdown();
+                return;
+            }
+
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<usize>();
+            let current_client = Arc::new(AtomicUsize::new(0));
+            let client_connected = Arc::new(AtomicBool::new(false));
+            let mut next_client_id = 0_usize;
+            let mut disconnect_deadline = Some(Instant::now() + initial_connect_grace);
+
+            loop {
+                let mut should_break = false;
+                while let Ok(client_id) = disconnect_rx.try_recv() {
+                    if current_client.load(Ordering::SeqCst) != client_id {
+                        continue;
+                    }
+                    if let Some(runtime) = host_runtime() {
+                        runtime.output.detach_client();
+                    }
+                    client_connected.store(false, Ordering::SeqCst);
+                    if is_shutdown_requested() {
+                        should_break = true;
+                        break;
+                    }
+                    disconnect_deadline = reconnect_grace.map(|grace| Instant::now() + grace);
+                }
+                if should_break {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session stream setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        let writer = match stream.try_clone() {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                emit_host_error(&format!(
+                                    "backend session stream clone failed: {error}"
+                                ));
+                                request_shutdown();
+                                break;
+                            }
+                        };
+                        next_client_id = next_client_id.wrapping_add(1).max(1);
+                        let client_id = next_client_id;
+                        current_client.store(client_id, Ordering::SeqCst);
+                        client_connected.store(true, Ordering::SeqCst);
+                        disconnect_deadline = None;
+                        if let Err(error) = writer.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session writer setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        if let Some(runtime) = host_runtime() {
+                            runtime.output.attach_client(writer);
+                            emit_attached_client_state(runtime);
+                        }
+
+                        let reader_current_client = Arc::clone(&current_client);
+                        let reader_disconnect_tx = disconnect_tx.clone();
+                        thread::spawn(move || {
+                            loop {
+                                match read_next_command(&mut stream) {
+                                    Ok(Some(command)) => {
+                                        if reader_current_client.load(Ordering::SeqCst) != client_id
+                                        {
+                                            break;
+                                        }
+                                        handle_command(command);
+                                        if is_shutdown_requested() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(error) => {
+                                        if reader_current_client.load(Ordering::SeqCst) == client_id
+                                            && !is_expected_session_disconnect_error(&error)
+                                        {
+                                            emit_host_error(&format!(
+                                                "backend command read failed: {error}"
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = reader_disconnect_tx.send(client_id);
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if is_shutdown_requested() {
+                            break;
+                        }
+                        if !client_connected.load(Ordering::SeqCst) {
+                            if let Some(deadline) = disconnect_deadline {
+                                if Instant::now() >= deadline {
+                                    request_shutdown();
+                                    break;
+                                }
+                            }
+                        }
+                        thread::sleep(SESSION_ACCEPT_POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        emit_host_error(&format!("backend session accept failed: {error}"));
+                        request_shutdown();
+                        break;
+                    }
+                }
+            }
+            let _ = fs::remove_file(&session_file);
+        });
+    }
+
+    fn session_transport_config() -> Option<(String, Duration, Option<Duration>)> {
+        let session_file = std::env::var("VSC_R_BACKEND_SESSION_FILE").ok()?;
+        if session_file.trim().is_empty() {
+            return None;
+        }
+        let initial_connect_grace_ms = std::env::var("VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60_000);
+        let reconnect_grace = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(value))
+                }
+            });
+        Some((
+            session_file,
+            Duration::from_millis(initial_connect_grace_ms),
+            reconnect_grace,
+        ))
+    }
+
+    fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
+        let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
+        fs::write(session_file, payload)
+    }
+
+    fn emit_attached_client_state(runtime: &HostRuntime) {
+        let pid = std::process::id();
+        let _ = runtime.output.flush_backlog();
+        let _ = runtime.output.emit_backend_ready();
+        let _ = runtime.output.emit_host_connected();
+
+        let (busy, wait_state) = {
+            let state = runtime.state.lock().expect("host state lock poisoned");
+            (state.busy, state.wait_state.clone())
+        };
+        let wait = match wait_state {
+            Some(StoredWaitState::TopLevel(kind)) => SessionWaitState::TopLevel(kind),
+            Some(StoredWaitState::Nested(prompt)) => SessionWaitState::Nested(prompt),
+            None => SessionWaitState::None,
+        };
+        let _ = runtime.output.emit_session_state(pid, busy, wait);
+        let _ = runtime.output.emit_output_flush();
+    }
+
+    fn is_expected_session_disconnect_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    fn is_shutdown_requested() -> bool {
+        host_runtime()
+            .map(|runtime| {
+                runtime
+                    .state
+                    .lock()
+                    .expect("host state lock poisoned")
+                    .shutdown_requested
+            })
+            .unwrap_or(false)
     }
 
     fn handle_command(command: IncomingCommand) {
@@ -356,6 +629,7 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
             should_signal = state.busy;
             runtime.cv.notify_all();
         }
@@ -378,6 +652,18 @@ mod unix_host {
         if should_interrupt {
             set_r_interrupts_pending(true);
         }
+    }
+
+    fn preserve_requested_interrupt() -> bool {
+        let Some(runtime) = host_runtime() else {
+            return false;
+        };
+        let state = runtime.state.lock().expect("host state lock poisoned");
+        if !state.interrupt_requested {
+            return false;
+        }
+        set_r_interrupts_pending(true);
+        true
     }
 
     fn host_runtime() -> Option<&'static HostRuntime> {
@@ -521,8 +807,6 @@ mod unix_host {
             return;
         };
 
-        set_r_interrupts_pending(false);
-
         let mut context = PumpEventsContext { api };
         unsafe {
             (api.r_toplevel_exec)(
@@ -532,21 +816,34 @@ mod unix_host {
         }
     }
 
-    unsafe fn run_input_handlers(api: EventLoopApi) {
+    unsafe fn run_process_events(api: EventLoopApi) {
+        if let Some(process_events) = api.r_process_events {
+            process_events();
+            preserve_requested_interrupt();
+        }
+        run_activity_handlers(api);
+        if let Some(run_pending_finalizers) = api.r_run_pending_finalizers {
+            run_pending_finalizers();
+            preserve_requested_interrupt();
+        }
+    }
+
+    unsafe fn run_activity_handlers(api: EventLoopApi) {
         let handlers = *(api.r_input_handlers as *mut *mut c_void);
         if handlers.is_null() {
             return;
         }
 
-        let mask = (api.r_check_activity)(0, 1);
-
-        #[cfg(target_os = "macos")]
-        if !mask.is_null() {
+        let mut handled = 0_usize;
+        let mut mask = (api.r_check_activity)(0, 1);
+        while !mask.is_null() && handled < MAX_ACTIVITY_HANDLER_DRAIN {
             (api.r_run_handlers)(handlers, mask);
+            handled += 1;
+            if preserve_requested_interrupt() {
+                break;
+            }
+            mask = (api.r_check_activity)(0, 1);
         }
-
-        #[cfg(not(target_os = "macos"))]
-        (api.r_run_handlers)(handlers, mask);
     }
 
     unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
@@ -555,26 +852,28 @@ mod unix_host {
         }
 
         let context = &mut *(data as *mut PumpEventsContext);
-        run_input_handlers(context.api);
+        run_process_events(context.api);
     }
 
-    unsafe extern "C" fn process_events_callback() {
+    unsafe extern "C-unwind" fn process_events_callback() {
         let Some(api) = event_loop_api() else {
             return;
         };
 
-        run_input_handlers(api);
+        run_activity_handlers(api);
+        preserve_requested_interrupt();
     }
 
-    unsafe extern "C" fn polled_events_callback() {
+    unsafe extern "C-unwind" fn polled_events_callback() {
         let Some(api) = event_loop_api() else {
             return;
         };
 
-        run_input_handlers(api);
+        run_activity_handlers(api);
+        preserve_requested_interrupt();
     }
 
-    unsafe extern "C" fn read_console_callback(
+    unsafe extern "C-unwind" fn read_console_callback(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -592,7 +891,7 @@ mod unix_host {
         ret
     }
 
-    unsafe extern "C" fn read_console_callback_inner(
+    unsafe extern "C-unwind" fn read_console_callback_inner(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -605,6 +904,7 @@ mod unix_host {
         let prompt_text = c_string_to_string(prompt);
         let wait_kind = classify_wait_kind(&prompt_text, add_history);
         let mut wait_event_emitted = false;
+        set_r_interrupts_pending(false);
         let mut state = runtime.state.lock().expect("host state lock poisoned");
 
         loop {
@@ -637,12 +937,36 @@ mod unix_host {
             if let Some(fragment) = state.pending_fragment.take() {
                 let signal_input_end = state.pending_fragment_from_nested;
                 state.pending_fragment_from_nested = false;
+                state.wait_state = None;
                 return write_read_buffer(
                     buffer,
                     buflen,
                     fragment,
                     &mut state,
                     signal_input_end,
+                    &runtime.output,
+                );
+            }
+
+            if should_return_startup_input(&wait_kind, &mut state) {
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    STARTUP_INTERRUPT_HANDLER_INPUT.as_bytes().to_vec(),
+                    &mut state,
+                    false,
+                    &runtime.output,
+                );
+            }
+
+            if should_return_top_level_recovery(&wait_kind, &mut state) {
+                let recovery_input = take_top_level_recovery_input(&mut state);
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    recovery_input,
+                    &mut state,
+                    false,
                     &runtime.output,
                 );
             }
@@ -659,6 +983,7 @@ mod unix_host {
             }
 
             if state.shutdown_requested {
+                state.wait_state = None;
                 if matches!(wait_kind, WaitKind::Nested(_)) {
                     let _ = runtime.output.emit_input_end();
                     let _ = runtime.output.emit_output_flush();
@@ -668,6 +993,8 @@ mod unix_host {
 
             if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
                 state.interrupt_requested = false;
+                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
+                state.wait_state = None;
                 let _ = runtime.output.emit_input_end();
                 let _ = runtime.output.emit_output_flush();
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
@@ -677,10 +1004,12 @@ mod unix_host {
             if !wait_event_emitted {
                 match &wait_kind {
                     WaitKind::TopLevel(kind) => {
+                        state.wait_state = Some(StoredWaitState::TopLevel(*kind));
                         let _ = runtime.output.emit_prompt(*kind);
                         let _ = runtime.output.emit_output_flush();
                     }
                     WaitKind::Nested(prompt) => {
+                        state.wait_state = Some(StoredWaitState::Nested(prompt.clone()));
                         let _ = runtime.output.emit_input_request(prompt);
                         let _ = runtime.output.emit_output_flush();
                     }
@@ -736,10 +1065,17 @@ mod unix_host {
             let mut should_signal = false;
             {
                 let mut state = runtime.state.lock().expect("host state lock poisoned");
+                let was_busy = state.busy;
                 state.busy = value != 0;
                 if value != 0 {
+                    state.wait_state = None;
                     should_signal = state.interrupt_requested;
                 } else {
+                    if state.top_level_recovery_active {
+                        state.top_level_recovery_active = false;
+                    } else if was_busy && state.top_level_recovery_pending.is_none() {
+                        state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
+                    }
                     state.suppress_idle_event_pump = state.interrupt_requested;
                     state.interrupt_requested = false;
                     set_r_interrupts_pending(false);
@@ -826,6 +1162,7 @@ mod unix_host {
 
     fn take_next_line(wait_kind: &WaitKind, state: &mut SharedState) -> Option<PendingLine> {
         if let Some(line) = state.active_submission_lines.pop_front() {
+            state.wait_state = None;
             return Some(PendingLine {
                 bytes: line,
                 signal_input_end: false,
@@ -841,6 +1178,7 @@ mod unix_host {
                 match state.pending_commands.remove(index) {
                     Some(PendingCommand::Submit(lines)) => {
                         state.active_submission_lines = lines;
+                        state.wait_state = None;
                         state
                             .active_submission_lines
                             .pop_front()
@@ -858,12 +1196,63 @@ mod unix_host {
                     .iter()
                     .position(|command| matches!(command, PendingCommand::Reply(_)))?;
                 match state.pending_commands.remove(index) {
-                    Some(PendingCommand::Reply(bytes)) => Some(PendingLine {
-                        bytes,
-                        signal_input_end: true,
-                    }),
+                    Some(PendingCommand::Reply(bytes)) => {
+                        state.wait_state = None;
+                        Some(PendingLine {
+                            bytes,
+                            signal_input_end: true,
+                        })
+                    }
                     _ => None,
                 }
+            }
+        }
+    }
+
+    fn should_return_top_level_recovery(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+
+        if state.top_level_recovery_active && !state.busy {
+            state.top_level_recovery_active = false;
+        }
+
+        if state.top_level_recovery_pending.is_none() {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.top_level_recovery_active = true;
+        true
+    }
+
+    fn should_return_startup_input(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !state.startup_input_pending {
+            return false;
+        }
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.startup_input_pending = false;
+        true
+    }
+
+    fn take_top_level_recovery_input(state: &mut SharedState) -> Vec<u8> {
+        match state
+            .top_level_recovery_pending
+            .take()
+            .unwrap_or(TopLevelRecovery::ParseNull)
+        {
+            TopLevelRecovery::ParseNull => b" ".to_vec(),
+            TopLevelRecovery::RecoverFromInterrupt => {
+                b"base::invisible(base::.Last.value)".to_vec()
             }
         }
     }
@@ -899,6 +1288,7 @@ mod unix_host {
             target[bytes.len()] = b'\n';
             target[bytes.len() + 1] = 0;
             if signal_input_end {
+                state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                 let _ = output.emit_input_end();
                 let _ = output.emit_output_flush();
             }
@@ -1159,6 +1549,11 @@ mod unix_host {
                 ),
                 r_interrupts_pending: load_optional_global(&library, b"R_interrupts_pending\0"),
                 r_check_user_interrupt: load_optional_function(&library, b"R_CheckUserInterrupt\0"),
+                r_process_events: load_optional_function(&library, b"R_ProcessEvents\0"),
+                r_run_pending_finalizers: load_optional_function(
+                    &library,
+                    b"R_RunPendingFinalizers\0",
+                ),
                 r_check_activity: load_function(&library, b"R_checkActivity\0")?,
                 r_run_handlers: load_function(&library, b"R_runHandlers\0")?,
                 r_input_handlers: load_global(&library, b"R_InputHandlers\0")?,
@@ -1188,6 +1583,9 @@ mod unix_host {
                 *value = 1;
             }
             if let Some(value) = self.r_signal_handlers {
+                // Unix busy interrupts use SIGINT to wake R. Keep R's signal
+                // handler installed so SIGINT is converted into a user
+                // interrupt instead of terminating the host process.
                 *value = 1;
             }
 
@@ -1269,6 +1667,8 @@ mod unix_host {
 
         fn event_loop_api(&self) -> EventLoopApi {
             EventLoopApi {
+                r_process_events: self.r_process_events,
+                r_run_pending_finalizers: self.r_run_pending_finalizers,
                 r_check_activity: self.r_check_activity,
                 r_run_handlers: self.r_run_handlers,
                 r_toplevel_exec: self.r_toplevel_exec,
@@ -1330,8 +1730,8 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
-        OutputStream, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        PromptKind, SessionWaitState,
     };
     use libloading::os::windows::{
         Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -1340,22 +1740,25 @@ mod windows_host {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
-    use std::fs::OpenOptions;
+    use std::fs;
     use std::io;
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Condvar, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use windows_sys::Win32::{
-        Globalization::{
-            MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS,
+        Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS},
+        UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
         },
-        System::LibraryLoader::{GetModuleHandleA, GetProcAddress},
-        UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE},
     };
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
     const EMBEDDED_UTF8_PREFIX: &[u8] = &[0x02, 0xff, 0xfe];
     const EMBEDDED_UTF8_SUFFIX: &[u8] = &[0x03, 0xff, 0xfe];
 
@@ -1381,7 +1784,8 @@ mod windows_host {
 
     type SetupRMainloop = unsafe extern "C" fn();
     type RunRMainloop = unsafe extern "C" fn();
-    type ReadConsoleFn = unsafe extern "C" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
+    type ReadConsoleFn =
+        unsafe extern "C-unwind" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
     type WriteConsoleFn = unsafe extern "C" fn(*const c_char, c_int);
     type WriteConsoleExFn = unsafe extern "C" fn(*const c_char, c_int, c_int);
     type ShowMessageFn = unsafe extern "C" fn(*const c_char);
@@ -1395,11 +1799,12 @@ mod windows_host {
         *const *const c_char,
         *const c_char,
     ) -> c_int;
-    type EventCallbackFn = unsafe extern "C" fn();
+    type EventCallbackFn = unsafe extern "C-unwind" fn();
     type YesNoCancelFn = unsafe extern "C" fn(*const c_char) -> c_int;
     type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
     type ProcessEventsFn = unsafe extern "C" fn();
+    type RunPendingFinalizersFn = unsafe extern "C" fn();
     type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut c_void;
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
     type Sexp = *mut c_void;
@@ -1407,11 +1812,8 @@ mod windows_host {
     type InstallFn = unsafe extern "C" fn(*const c_char) -> Sexp;
     type FindVarInFrameFn = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
     type ScalarIntegerFn = unsafe extern "C" fn(c_int) -> Sexp;
-    type ScalarLogicalFn = unsafe extern "C" fn(c_int) -> Sexp;
-    type ScalarRealFn = unsafe extern "C" fn(f64) -> Sexp;
     type ProtectFn = unsafe extern "C" fn(Sexp) -> Sexp;
     type UnprotectFn = unsafe extern "C" fn(c_int);
-    type LaterExecCallbacksFn = unsafe extern "C" fn(Sexp, Sexp, Sexp) -> Sexp;
     type ParseVectorFn = unsafe extern "C" fn(Sexp, c_int, *mut c_int, Sexp) -> Sexp;
     type TopLevelExecFn =
         unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int;
@@ -1510,6 +1912,7 @@ mod windows_host {
         ga_initapp: Option<GAInitAppFn>,
         ga_peekevent: Option<GAPeekEventFn>,
         r_process_events: Option<ProcessEventsFn>,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
         ptr_r_process_events: Option<*mut Option<EventCallbackFn>>,
         r_polled_events: Option<*mut Option<EventCallbackFn>>,
         r_check_activity: Option<CheckActivityFn>,
@@ -1530,8 +1933,6 @@ mod windows_host {
         rf_install: InstallFn,
         rf_find_var_in_frame: FindVarInFrameFn,
         rf_scalar_integer: ScalarIntegerFn,
-        rf_scalar_logical: ScalarLogicalFn,
-        rf_scalar_real: ScalarRealFn,
         rf_protect: ProtectFn,
         rf_unprotect: UnprotectFn,
         r_parse_vector: ParseVectorFn,
@@ -1562,10 +1963,26 @@ mod windows_host {
         pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
         current_width: Option<u16>,
+        startup_input_pending: bool,
         busy: bool,
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
+        top_level_recovery_pending: Option<TopLevelRecovery>,
+        top_level_recovery_active: bool,
         shutdown_requested: bool,
+        wait_state: Option<StoredWaitState>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TopLevelRecovery {
+        ParseNull,
+        RecoverFromInterrupt,
+    }
+
+    #[derive(Clone)]
+    enum StoredWaitState {
+        TopLevel(PromptKind),
+        Nested(String),
     }
 
     enum PendingCommand {
@@ -1618,11 +2035,8 @@ mod windows_host {
         r_check_activity: Option<CheckActivityFn>,
         r_run_handlers: Option<RunHandlersFn>,
         r_input_handlers: Option<usize>,
-        rf_scalar_integer: ScalarIntegerFn,
-        rf_scalar_logical: ScalarLogicalFn,
-        rf_scalar_real: ScalarRealFn,
-        rf_protect: ProtectFn,
-        rf_unprotect: UnprotectFn,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
+        r_toplevel_exec: TopLevelExecFn,
     }
 
     struct ParseStatusContext {
@@ -1637,6 +2051,12 @@ mod windows_host {
         success: bool,
     }
 
+    struct PumpEventsContext {
+        api: EventLoopApi,
+    }
+
+    const STARTUP_INTERRUPT_HANDLER_INPUT: &str = r#"base::local({ if (base::getRversion() >= "4.0.0") { handler <- function(e) { restart <- base::findRestart("abort"); if (!base::is.null(restart)) base::invokeRestart(restart) }; handlers <- base::globalCallingHandlers(); base::globalCallingHandlers(NULL); handlers <- c(handlers, list(interrupt = handler)); base::do.call(base::globalCallingHandlers, handlers) }; base::invisible(NULL) }, envir = base::new.env(parent = base::baseenv()))"#;
+
     pub(crate) fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         if args.is_empty() {
             return Err("missing R executable path".into());
@@ -1648,12 +2068,22 @@ mod windows_host {
         let mut api = unsafe { RApi::load(&layout)? };
 
         let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
-        output.emit_backend_ready()?;
+        let session_transport = session_transport_config().is_some();
+        if let Err(error) = output.capture_process_stdout() {
+            let _ =
+                output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
+        }
+        if !session_transport {
+            output.emit_backend_ready()?;
+        }
 
         HOST_RUNTIME
             .set(HostRuntime {
                 output: output.clone_handle(),
-                state: Mutex::new(SharedState::default()),
+                state: Mutex::new(SharedState {
+                    startup_input_pending: true,
+                    ..SharedState::default()
+                }),
                 cv: Condvar::new(),
             })
             .map_err(|_| "host runtime already initialized")?;
@@ -1680,8 +2110,10 @@ mod windows_host {
             }
         }
 
-        output.emit_child_spawned(std::process::id())?;
-        output.emit_host_connected()?;
+        if !session_transport {
+            output.emit_host_connected()?;
+            output.emit_session_state(std::process::id(), false, SessionWaitState::None)?;
+        }
 
         unsafe {
             (api.run_rmainloop)();
@@ -1691,17 +2123,18 @@ mod windows_host {
     }
 
     fn start_command_reader() {
-        std::thread::spawn(move || {
-            let mut reader = match open_command_reader() {
-                Ok(reader) => reader,
-                Err(error) => {
-                    emit_host_error(&format!("backend command channel open failed: {error}"));
-                    request_shutdown();
-                    return;
-                }
-            };
+        if let Some((session_file, initial_connect_grace, reconnect_grace)) =
+            session_transport_config()
+        {
+            start_session_command_reader(session_file, initial_connect_grace, reconnect_grace);
+            return;
+        }
+
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut locked = stdin.lock();
             loop {
-                match read_next_command(&mut reader) {
+                match read_next_command(&mut locked) {
                     Ok(Some(command)) => handle_command(command),
                     Ok(None) => {
                         request_shutdown();
@@ -1717,14 +2150,228 @@ mod windows_host {
         });
     }
 
-    fn open_command_reader() -> io::Result<Box<dyn io::Read + Send>> {
-        match std::env::var("VSC_R_BACKEND_COMMAND_PIPE") {
-            Ok(path) if !path.trim().is_empty() => {
-                let file = OpenOptions::new().read(true).write(true).open(path)?;
-                Ok(Box::new(file))
+    fn start_session_command_reader(
+        session_file: String,
+        initial_connect_grace: Duration,
+        reconnect_grace: Option<Duration>,
+    ) {
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    emit_host_error(&format!("backend session server bind failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = listener.set_nonblocking(true) {
+                emit_host_error(&format!("backend session server setup failed: {error}"));
+                request_shutdown();
+                return;
             }
-            _ => Ok(Box::new(io::stdin())),
+
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    emit_host_error(&format!("backend session server address failed: {error}"));
+                    request_shutdown();
+                    return;
+                }
+            };
+            if let Err(error) = write_session_bootstrap(&session_file, port, std::process::id()) {
+                emit_host_error(&format!("backend session bootstrap write failed: {error}"));
+                request_shutdown();
+                return;
+            }
+
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<usize>();
+            let current_client = Arc::new(AtomicUsize::new(0));
+            let client_connected = Arc::new(AtomicBool::new(false));
+            let mut next_client_id = 0_usize;
+            let mut disconnect_deadline = Some(Instant::now() + initial_connect_grace);
+
+            loop {
+                let mut should_break = false;
+                while let Ok(client_id) = disconnect_rx.try_recv() {
+                    if current_client.load(Ordering::SeqCst) != client_id {
+                        continue;
+                    }
+                    if let Some(runtime) = host_runtime() {
+                        runtime.output.detach_client();
+                    }
+                    client_connected.store(false, Ordering::SeqCst);
+                    if is_shutdown_requested() {
+                        should_break = true;
+                        break;
+                    }
+                    disconnect_deadline = reconnect_grace.map(|grace| Instant::now() + grace);
+                }
+                if should_break {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session stream setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        let writer = match stream.try_clone() {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                emit_host_error(&format!(
+                                    "backend session stream clone failed: {error}"
+                                ));
+                                request_shutdown();
+                                break;
+                            }
+                        };
+                        next_client_id = next_client_id.wrapping_add(1).max(1);
+                        let client_id = next_client_id;
+                        current_client.store(client_id, Ordering::SeqCst);
+                        client_connected.store(true, Ordering::SeqCst);
+                        disconnect_deadline = None;
+                        if let Err(error) = writer.set_nonblocking(false) {
+                            emit_host_error(&format!(
+                                "backend session writer setup failed: {error}"
+                            ));
+                            request_shutdown();
+                            break;
+                        }
+                        if let Some(runtime) = host_runtime() {
+                            runtime.output.attach_client(writer);
+                            emit_attached_client_state(runtime);
+                        }
+
+                        let reader_current_client = Arc::clone(&current_client);
+                        let reader_disconnect_tx = disconnect_tx.clone();
+                        thread::spawn(move || {
+                            loop {
+                                match read_next_command(&mut stream) {
+                                    Ok(Some(command)) => {
+                                        if reader_current_client.load(Ordering::SeqCst) != client_id
+                                        {
+                                            break;
+                                        }
+                                        handle_command(command);
+                                        if is_shutdown_requested() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(error) => {
+                                        if reader_current_client.load(Ordering::SeqCst) == client_id
+                                            && !is_expected_session_disconnect_error(&error)
+                                        {
+                                            emit_host_error(&format!(
+                                                "backend command read failed: {error}"
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = reader_disconnect_tx.send(client_id);
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if is_shutdown_requested() {
+                            break;
+                        }
+                        if !client_connected.load(Ordering::SeqCst) {
+                            if let Some(deadline) = disconnect_deadline {
+                                if Instant::now() >= deadline {
+                                    request_shutdown();
+                                    break;
+                                }
+                            }
+                        }
+                        thread::sleep(SESSION_ACCEPT_POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        emit_host_error(&format!("backend session accept failed: {error}"));
+                        request_shutdown();
+                        break;
+                    }
+                }
+            }
+            let _ = fs::remove_file(&session_file);
+        });
+    }
+
+    fn session_transport_config() -> Option<(String, Duration, Option<Duration>)> {
+        let session_file = std::env::var("VSC_R_BACKEND_SESSION_FILE").ok()?;
+        if session_file.trim().is_empty() {
+            return None;
         }
+        let initial_connect_grace_ms = std::env::var("VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60_000);
+        let reconnect_grace = std::env::var("VSC_R_BACKEND_RECONNECT_GRACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(value))
+                }
+            });
+        Some((
+            session_file,
+            Duration::from_millis(initial_connect_grace_ms),
+            reconnect_grace,
+        ))
+    }
+
+    fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
+        let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
+        fs::write(session_file, payload)
+    }
+
+    fn emit_attached_client_state(runtime: &HostRuntime) {
+        let pid = std::process::id();
+        let _ = runtime.output.flush_backlog();
+        let _ = runtime.output.emit_backend_ready();
+        let _ = runtime.output.emit_host_connected();
+
+        let (busy, wait_state) = {
+            let state = runtime.state.lock().expect("host state lock poisoned");
+            (state.busy, state.wait_state.clone())
+        };
+        let wait = match wait_state {
+            Some(StoredWaitState::TopLevel(kind)) => SessionWaitState::TopLevel(kind),
+            Some(StoredWaitState::Nested(prompt)) => SessionWaitState::Nested(prompt),
+            None => SessionWaitState::None,
+        };
+        let _ = runtime.output.emit_session_state(pid, busy, wait);
+        let _ = runtime.output.emit_output_flush();
+    }
+
+    fn is_expected_session_disconnect_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    fn is_shutdown_requested() -> bool {
+        host_runtime()
+            .map(|runtime| {
+                runtime
+                    .state
+                    .lock()
+                    .expect("host state lock poisoned")
+                    .shutdown_requested
+            })
+            .unwrap_or(false)
     }
 
     fn handle_command(command: IncomingCommand) {
@@ -1801,6 +2448,7 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
             runtime.cv.notify_all();
         }
 
@@ -1819,6 +2467,18 @@ mod windows_host {
         if should_interrupt {
             set_r_interrupts_pending(true);
         }
+    }
+
+    fn preserve_requested_interrupt() -> bool {
+        let Some(runtime) = host_runtime() else {
+            return false;
+        };
+        let state = runtime.state.lock().expect("host state lock poisoned");
+        if !state.interrupt_requested {
+            return false;
+        }
+        set_r_interrupts_pending(true);
+        true
     }
 
     fn host_runtime() -> Option<&'static HostRuntime> {
@@ -1954,12 +2614,25 @@ mod windows_host {
             return;
         };
 
+        let mut context = PumpEventsContext { api };
         unsafe {
-            run_process_events(api);
+            (api.r_toplevel_exec)(
+                execute_pump_events,
+                &mut context as *mut PumpEventsContext as *mut c_void,
+            );
         }
     }
 
-    unsafe fn run_input_handlers(api: EventLoopApi) {
+    unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
+        if data.is_null() {
+            return;
+        }
+
+        let context = &mut *(data as *mut PumpEventsContext);
+        run_process_events(context.api);
+    }
+
+    unsafe fn run_activity_handlers(api: EventLoopApi) {
         let Some(check_activity) = api.r_check_activity else {
             return;
         };
@@ -1975,8 +2648,16 @@ mod windows_host {
             return;
         }
 
-        let mask = check_activity(0, 1);
-        run_handlers(handlers, mask);
+        let mut handled = 0_usize;
+        let mut mask = check_activity(0, 1);
+        while !mask.is_null() && handled < MAX_ACTIVITY_HANDLER_DRAIN {
+            run_handlers(handlers, mask);
+            handled += 1;
+            if preserve_requested_interrupt() {
+                break;
+            }
+            mask = check_activity(0, 1);
+        }
     }
 
     unsafe fn run_process_events(api: EventLoopApi) {
@@ -1984,30 +2665,15 @@ mod windows_host {
         // handled by R's native callback path below, but calling it here can
         // stall the wait loop before the session webserver is serviced.
         pump_windows_messages();
-        run_input_handlers(api);
-        run_later_exec_callbacks(api);
         if let Some(process_events) = api.r_process_events {
             process_events();
+            preserve_requested_interrupt();
         }
-    }
-
-    unsafe fn run_later_exec_callbacks(api: EventLoopApi) {
-        let module = GetModuleHandleA(c"later.dll".as_ptr() as *const u8);
-        if module.is_null() {
-            return;
+        run_activity_handlers(api);
+        if let Some(run_pending_finalizers) = api.r_run_pending_finalizers {
+            run_pending_finalizers();
+            preserve_requested_interrupt();
         }
-
-        let Some(address) = GetProcAddress(module, c"_later_execCallbacks".as_ptr() as *const u8)
-        else {
-            return;
-        };
-
-        let exec_callbacks: LaterExecCallbacksFn = std::mem::transmute(address);
-        let timeout = (api.rf_protect)((api.rf_scalar_real)(0.0));
-        let run_all = (api.rf_protect)((api.rf_scalar_logical)(0));
-        let loop_id = (api.rf_protect)((api.rf_scalar_integer)(0));
-        let _ = exec_callbacks(timeout, run_all, loop_id);
-        (api.rf_unprotect)(3);
     }
 
     unsafe fn pump_windows_messages() {
@@ -2018,39 +2684,38 @@ mod windows_host {
         }
     }
 
-    unsafe extern "C" fn process_events_callback() {
+    unsafe extern "C-unwind" fn process_events_callback() {
         if let Some(api) = event_loop_api() {
             if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
                 if let Some(peek_event) = api.ga_peekevent {
-                    while peek_event() != 0 {}
+                    let mut handled = 0_usize;
+                    while handled < MAX_ACTIVITY_HANDLER_DRAIN && peek_event() != 0 {
+                        handled += 1;
+                        if preserve_requested_interrupt() {
+                            break;
+                        }
+                    }
                 }
                 pump_windows_messages();
-                // Drive the input-handler path that httpuv and other socket-based
-                // integrations rely on, matching the Unix embedded host wiring.
-                run_input_handlers(api);
+                run_activity_handlers(api);
                 PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
-
-        if let Some(runtime) = host_runtime() {
-            let state = runtime.state.lock().expect("host state lock poisoned");
-            if state.interrupt_requested {
-                set_r_interrupts_pending(true);
-            }
-        }
+        preserve_requested_interrupt();
     }
 
-    unsafe extern "C" fn polled_events_callback() {
+    unsafe extern "C-unwind" fn polled_events_callback() {
         if let Some(api) = event_loop_api() {
             if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
                 pump_windows_messages();
-                run_input_handlers(api);
+                run_activity_handlers(api);
                 PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
+        preserve_requested_interrupt();
     }
 
-    unsafe extern "C" fn read_console_callback(
+    unsafe extern "C-unwind" fn read_console_callback(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -2068,7 +2733,7 @@ mod windows_host {
         ret
     }
 
-    unsafe extern "C" fn read_console_callback_inner(
+    unsafe extern "C-unwind" fn read_console_callback_inner(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -2081,6 +2746,7 @@ mod windows_host {
         let prompt_text = c_string_to_string(prompt);
         let wait_kind = classify_wait_kind(&prompt_text, add_history);
         let mut wait_event_emitted = false;
+        set_r_interrupts_pending(false);
         let mut state = runtime.state.lock().expect("host state lock poisoned");
 
         loop {
@@ -2113,12 +2779,36 @@ mod windows_host {
             if let Some(fragment) = state.pending_fragment.take() {
                 let signal_input_end = state.pending_fragment_from_nested;
                 state.pending_fragment_from_nested = false;
+                state.wait_state = None;
                 return write_read_buffer(
                     buffer,
                     buflen,
                     fragment,
                     &mut state,
                     signal_input_end,
+                    &runtime.output,
+                );
+            }
+
+            if should_return_startup_input(&wait_kind, &mut state) {
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    encode_windows_r_source_text(STARTUP_INTERRUPT_HANDLER_INPUT),
+                    &mut state,
+                    false,
+                    &runtime.output,
+                );
+            }
+
+            if should_return_top_level_recovery(&wait_kind, &mut state) {
+                let recovery_input = take_top_level_recovery_input(&mut state);
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    recovery_input,
+                    &mut state,
+                    false,
                     &runtime.output,
                 );
             }
@@ -2135,6 +2825,7 @@ mod windows_host {
             }
 
             if state.shutdown_requested {
+                state.wait_state = None;
                 if matches!(wait_kind, WaitKind::Nested(_)) {
                     let _ = runtime.output.emit_input_end();
                     let _ = runtime.output.emit_output_flush();
@@ -2144,6 +2835,8 @@ mod windows_host {
 
             if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
                 state.interrupt_requested = false;
+                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
+                state.wait_state = None;
                 let _ = runtime.output.emit_input_end();
                 let _ = runtime.output.emit_output_flush();
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
@@ -2153,10 +2846,12 @@ mod windows_host {
             if !wait_event_emitted {
                 match &wait_kind {
                     WaitKind::TopLevel(kind) => {
+                        state.wait_state = Some(StoredWaitState::TopLevel(*kind));
                         let _ = runtime.output.emit_prompt(*kind);
                         let _ = runtime.output.emit_output_flush();
                     }
                     WaitKind::Nested(prompt) => {
+                        state.wait_state = Some(StoredWaitState::Nested(prompt.clone()));
                         let _ = runtime.output.emit_input_request(prompt);
                         let _ = runtime.output.emit_output_flush();
                     }
@@ -2222,11 +2917,19 @@ mod windows_host {
             let should_preserve_interrupt;
             {
                 let mut state = runtime.state.lock().expect("host state lock poisoned");
+                let was_busy = state.busy;
                 state.busy = value != 0;
                 if value == 0 {
+                    if state.top_level_recovery_active {
+                        state.top_level_recovery_active = false;
+                    } else if was_busy && state.top_level_recovery_pending.is_none() {
+                        state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
+                    }
                     state.suppress_idle_event_pump = state.interrupt_requested;
                     state.interrupt_requested = false;
                     set_r_interrupts_pending(false);
+                } else {
+                    state.wait_state = None;
                 }
                 should_preserve_interrupt = value != 0 && state.interrupt_requested;
             }
@@ -2311,6 +3014,7 @@ mod windows_host {
 
     fn take_next_line(wait_kind: &WaitKind, state: &mut SharedState) -> Option<PendingLine> {
         if let Some(line) = state.active_submission_lines.pop_front() {
+            state.wait_state = None;
             return Some(PendingLine {
                 bytes: line,
                 signal_input_end: false,
@@ -2326,6 +3030,7 @@ mod windows_host {
                 match state.pending_commands.remove(index) {
                     Some(PendingCommand::Submit(lines)) => {
                         state.active_submission_lines = lines;
+                        state.wait_state = None;
                         state
                             .active_submission_lines
                             .pop_front()
@@ -2343,12 +3048,63 @@ mod windows_host {
                     .iter()
                     .position(|command| matches!(command, PendingCommand::Reply(_)))?;
                 match state.pending_commands.remove(index) {
-                    Some(PendingCommand::Reply(bytes)) => Some(PendingLine {
-                        bytes,
-                        signal_input_end: true,
-                    }),
+                    Some(PendingCommand::Reply(bytes)) => {
+                        state.wait_state = None;
+                        Some(PendingLine {
+                            bytes,
+                            signal_input_end: true,
+                        })
+                    }
                     _ => None,
                 }
+            }
+        }
+    }
+
+    fn should_return_top_level_recovery(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+
+        if state.top_level_recovery_active && !state.busy {
+            state.top_level_recovery_active = false;
+        }
+
+        if state.top_level_recovery_pending.is_none() {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.top_level_recovery_active = true;
+        true
+    }
+
+    fn should_return_startup_input(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !state.startup_input_pending {
+            return false;
+        }
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.startup_input_pending = false;
+        true
+    }
+
+    fn take_top_level_recovery_input(state: &mut SharedState) -> Vec<u8> {
+        match state
+            .top_level_recovery_pending
+            .take()
+            .unwrap_or(TopLevelRecovery::ParseNull)
+        {
+            TopLevelRecovery::ParseNull => b" ".to_vec(),
+            TopLevelRecovery::RecoverFromInterrupt => {
+                b"base::invisible(base::.Last.value)".to_vec()
             }
         }
     }
@@ -2384,6 +3140,7 @@ mod windows_host {
             target[bytes.len()] = b'\n';
             target[bytes.len() + 1] = 0;
             if signal_input_end {
+                state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                 let _ = output.emit_input_end();
                 let _ = output.emit_output_flush();
             }
@@ -3030,6 +3787,10 @@ mod windows_host {
                 ga_initapp,
                 ga_peekevent,
                 r_process_events: load_optional_function(&library, b"R_ProcessEvents\0"),
+                r_run_pending_finalizers: load_optional_function(
+                    &library,
+                    b"R_RunPendingFinalizers\0",
+                ),
                 ptr_r_process_events: load_optional_global(&library, b"ptr_R_ProcessEvents\0"),
                 r_polled_events: load_optional_global(&library, b"R_PolledEvents\0"),
                 r_check_activity: load_optional_function(&library, b"R_checkActivity\0"),
@@ -3054,8 +3815,6 @@ mod windows_host {
                 rf_install: load_function(&library, b"Rf_install\0")?,
                 rf_find_var_in_frame: load_function(&library, b"Rf_findVarInFrame\0")?,
                 rf_scalar_integer: load_function(&library, b"Rf_ScalarInteger\0")?,
-                rf_scalar_logical: load_function(&library, b"Rf_ScalarLogical\0")?,
-                rf_scalar_real: load_function(&library, b"Rf_ScalarReal\0")?,
                 rf_protect: load_function(&library, b"Rf_protect\0")?,
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
@@ -3220,11 +3979,8 @@ mod windows_host {
                 r_check_activity: self.r_check_activity,
                 r_run_handlers: self.r_run_handlers,
                 r_input_handlers: self.r_input_handlers.map(|value| value as usize),
-                rf_scalar_integer: self.rf_scalar_integer,
-                rf_scalar_logical: self.rf_scalar_logical,
-                rf_scalar_real: self.rf_scalar_real,
-                rf_protect: self.rf_protect,
-                rf_unprotect: self.rf_unprotect,
+                r_run_pending_finalizers: self.r_run_pending_finalizers,
+                r_toplevel_exec: self.r_toplevel_exec,
             }
         }
     }
@@ -3288,8 +4044,11 @@ mod windows_host {
     #[cfg(test)]
     mod tests {
         use super::{
-            decode_windows_console_text_with_code_page, encode_windows_r_source_text_with_code_page,
+            decode_windows_console_text_with_code_page,
+            encode_windows_r_source_text_with_code_page, should_return_top_level_recovery,
+            take_top_level_recovery_input, SharedState, TopLevelRecovery, WaitKind,
         };
+        use crate::protocol::PromptKind;
 
         #[test]
         fn decodes_embedded_utf8_console_segments() {
@@ -3402,6 +4161,73 @@ mod windows_host {
                     1252,
                 ),
                 b"\\u65e5\\u672c\\u8a9e \\U0001f642"
+            );
+        }
+
+        #[test]
+        fn top_level_recovery_runs_once_at_main_prompt() {
+            let mut state = SharedState {
+                top_level_recovery_pending: Some(TopLevelRecovery::ParseNull),
+                ..SharedState::default()
+            };
+            let prompt = WaitKind::TopLevel(PromptKind::Main);
+
+            assert!(should_return_top_level_recovery(&prompt, &mut state));
+            assert_eq!(take_top_level_recovery_input(&mut state), b" ".to_vec());
+            assert!(state.top_level_recovery_pending.is_none());
+            assert!(state.top_level_recovery_active);
+
+            assert!(!should_return_top_level_recovery(&prompt, &mut state));
+            assert!(!state.top_level_recovery_active);
+        }
+
+        #[test]
+        fn top_level_recovery_waits_for_main_prompt_without_active_input() {
+            let mut state = SharedState {
+                top_level_recovery_pending: Some(TopLevelRecovery::ParseNull),
+                ..SharedState::default()
+            };
+
+            assert!(!should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Cont),
+                &mut state
+            ));
+            assert!(state.top_level_recovery_pending.is_some());
+
+            assert!(!should_return_top_level_recovery(
+                &WaitKind::Nested("readline> ".to_string()),
+                &mut state
+            ));
+            assert!(state.top_level_recovery_pending.is_some());
+
+            state.active_submission_lines.push_back(b"next".to_vec());
+            assert!(!should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Main),
+                &mut state
+            ));
+            assert!(state.top_level_recovery_pending.is_some());
+
+            state.active_submission_lines.clear();
+            assert!(should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Main),
+                &mut state
+            ));
+        }
+
+        #[test]
+        fn top_level_recovery_uses_last_value_for_interrupted_evaluation() {
+            let mut state = SharedState {
+                top_level_recovery_pending: Some(TopLevelRecovery::RecoverFromInterrupt),
+                ..SharedState::default()
+            };
+
+            assert!(should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Main),
+                &mut state
+            ));
+            assert_eq!(
+                take_top_level_recovery_input(&mut state),
+                b"base::invisible(base::.Last.value)".to_vec()
             );
         }
 

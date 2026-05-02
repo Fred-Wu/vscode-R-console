@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import type { ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { setNativeParseCallback, stripCommentLines } from "../../Language/parser";
@@ -11,6 +10,7 @@ import {
   getBundledRustSidecarPath,
   resolveRustSidecarPath,
   RuntimeBackend,
+  type RuntimeSessionHandle,
   RustSidecarRuntimeBackend,
 } from "../../Runtime/runtimeBackend";
 import type { SessionWatcher, WorkspaceData } from "../../Runtime/sessionWatcher";
@@ -50,6 +50,7 @@ export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "close
 
 export type Submission = {
   code: string;
+  initialPromptKind: "main" | "cont";
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
@@ -58,7 +59,7 @@ export type RuntimeHost = {
   options: RTerminalOptions;
   extensionPath: string;
   runtimeBackend: RuntimeBackend | undefined;
-  rProcess: ChildProcess | null;
+  rProcess: RuntimeSessionHandle | null;
   backendChildPid: number | undefined;
   dimensions: Dimensions;
   mode: TerminalMode;
@@ -89,6 +90,9 @@ export type RuntimeHost = {
   clearPendingInputFlushTimer(): void;
   clearPromptRenderTimer(): void;
   clearReplyPromptRenderTimer(): void;
+  clearPendingConsoleInput(): void;
+  captureVisibleInputForReplay(): void;
+  sendPendingConsoleInput(kind: "top-level" | "nested"): boolean;
   schedulePrompt(): void;
   scheduleReplyPrompt(): void;
   clearInputRender(): void;
@@ -138,6 +142,7 @@ export function startRuntime(host: RuntimeHost): void {
   host.clearPromptRenderTimer();
   host.lang.stopConsoleLsp();
   host.lang.clearSessionState();
+  host.clearPendingConsoleInput();
   host.pendingPromptToken = true;
   host.mode = "starting";
   host.promptReady = false;
@@ -167,6 +172,9 @@ export function startRuntime(host: RuntimeHost): void {
   }
 
   try {
+    if (host.options.sessionWatcherEnabled) {
+      fs.mkdirSync(host.options.watcherDir, { recursive: true });
+    }
     const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
     if (host.extensionPath) {
@@ -187,37 +195,12 @@ export function startRuntime(host: RuntimeHost): void {
       cwd: host.options.cwd,
       env: runtimeEnv,
     });
+    primeRuntimeAttach(host);
     setNativeParseCallback(null);
     void host.lang.start();
-    host.runtimeBackend.attach(host.rProcess, {
-      onStdout: (output) => {
-        handleRuntimeOutput(host, output);
-      },
-      onStderr: (errorText) => {
-        handleRuntimeError(host, errorText);
-      },
-      onControl: (event) => {
-        handleRuntimeControl(host, event);
-      },
-      onExit: (code) => {
-        handleRuntimeExit(host, code);
-      },
-      onError: (err) => {
-        setNativeParseCallback(null);
-        host.writeEmitter.fire(
-          `${ANSI.red}Failed to start R: ${err.message}${ANSI.reset}\r\n`
-        );
-        host.mode = "closed";
-        host.rProcess = null;
-        host.sessionAttached = false;
-        host.lang.stopConsoleLsp();
-      },
-    });
+    attachRuntimeSession(host, true);
 
     updateRuntimeTerminalName(host);
-    if (!host.options.sessionWatcherEnabled) {
-      host.sessionAttached = true;
-    }
   } catch (err) {
     host.writeEmitter.fire(
       `${ANSI.red}Failed to start R: ${String(err)}${ANSI.reset}\r\n`
@@ -227,6 +210,58 @@ export function startRuntime(host: RuntimeHost): void {
     host.sessionAttached = false;
     host.lang.stopConsoleLsp();
   }
+}
+
+export function primeRuntimeAttach(
+  host: RuntimeHost
+): void {
+  if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
+    return;
+  }
+
+  const runtimePid = host.runtimeBackend?.getPid(host.rProcess) ?? host.getDisplayPid();
+  if (typeof runtimePid === "number" && Number.isFinite(runtimePid) && runtimePid > 0) {
+    host.sessionWatcher.setExpectedPid(runtimePid);
+  }
+
+  beginRuntimeAttach(host);
+}
+
+export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boolean = false): void {
+  if (!host.runtimeBackend || !host.rProcess) {
+    return;
+  }
+  if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
+    host.sessionAttached = true;
+  }
+  setNativeParseCallback(null);
+  void host.lang.start();
+  host.runtimeBackend.attach(host.rProcess, {
+    onStdout: (output) => {
+      handleRuntimeOutput(host, output);
+    },
+    onStderr: (errorText) => {
+      handleRuntimeError(host, errorText);
+    },
+    onControl: (event) => {
+      handleRuntimeControl(host, event);
+    },
+    onExit: (code) => {
+      handleRuntimeExit(host, code);
+    },
+    onError: (err) => {
+      setNativeParseCallback(null);
+      if (showStartupErrors) {
+        host.writeEmitter.fire(
+          `${ANSI.red}Failed to start R: ${err.message}${ANSI.reset}\r\n`
+        );
+      }
+      host.mode = "closed";
+      host.rProcess = null;
+      host.sessionAttached = false;
+      host.lang.stopConsoleLsp();
+    },
+  });
 }
 
 function beginRuntimeAttach(host: RuntimeHost): void {
@@ -287,18 +322,6 @@ export function handleRuntimeControl(
       host.sessionHostConnected = true;
       updateNativeParseCallback(host);
       return;
-    case "child-spawned":
-      if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
-        host.backendChildPid = event.pid;
-        updateRuntimeTerminalName(host);
-        if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
-          host.sessionWatcher.setExpectedPid(event.pid);
-          beginRuntimeAttach(host);
-        }
-      } else if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
-        beginRuntimeAttach(host);
-      }
-      return;
     case "prompt":
       handleBackendPrompt(host, event.kind);
       return;
@@ -352,6 +375,58 @@ export function handleRuntimeControl(
           host,
           event.message.endsWith("\n") ? event.message : `${event.message}\n`
         );
+      }
+      return;
+    case "session-state":
+      applyRuntimeSessionState(host, event);
+      return;
+  }
+}
+
+function applyRuntimeSessionState(
+  host: RuntimeHost,
+  event: Extract<BackendControlEvent, { type: "session-state" }>
+): void {
+  if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
+    host.backendChildPid = event.pid;
+    updateRuntimeTerminalName(host);
+    if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
+      host.sessionWatcher.setExpectedPid(event.pid);
+    }
+  }
+
+  host.sessionHostConnected = true;
+  updateNativeParseCallback(host);
+
+  if (event.busy) {
+    host.promptReady = false;
+    host.promptVisible = false;
+    host.pendingPromptToken = false;
+    if (host.mode !== "closed") {
+      host.mode = "executing";
+    }
+    return;
+  }
+
+  switch (event.wait.kind) {
+    case "none":
+      return;
+    case "top-level":
+      host.promptReady = true;
+      host.promptKind = event.wait.prompt;
+      host.replyPromptText = "";
+      if (host.mode !== "closed") {
+        host.mode = "ready";
+      }
+      if (!host.promptVisible) {
+        host.pendingPromptToken = true;
+      }
+      return;
+    case "nested":
+      host.promptReady = false;
+      host.replyPromptText = event.wait.prompt;
+      if (host.mode !== "closed") {
+        host.mode = "reply";
       }
       return;
   }
@@ -421,6 +496,10 @@ export function handleBackendPrompt(
     return;
   }
 
+  if (host.sendPendingConsoleInput("top-level")) {
+    return;
+  }
+
   host.pendingPromptToken = true;
   host.schedulePrompt();
   if (kind === "main" && host.mode === "ready" && host.activeSubmission === null) {
@@ -454,6 +533,9 @@ export function handleBackendInputRequest(
   }
 
   host.mode = "reply";
+  if (host.sendPendingConsoleInput("nested")) {
+    return;
+  }
   host.scheduleReplyPrompt();
 }
 
@@ -711,7 +793,7 @@ export function handleRuntimeError(host: RuntimeHost, error: string): void {
   const formatted = formatViewOutput(stripBracketedPasteMarkers(error));
   renderRuntimeText(
     host,
-    `${ANSI.red}${formatted}${ANSI.reset}`,
+    colorRuntimeText(formatted, ANSI.red, ANSI.reset),
     didOutputEndWithLineFeed(formatted)
   );
 }
@@ -821,7 +903,7 @@ function shouldPrefixPendingCarriageReturn(text: string): boolean {
 }
 
 function shouldDeferClearFrame(text: string): boolean {
-  return /^\r\s*\| +$/.test(text);
+  return /^\r\s*\| +$/.test(stripSgrCodes(text));
 }
 
 function shouldReplacePendingClearFrame(text: string): boolean {
@@ -829,11 +911,33 @@ function shouldReplacePendingClearFrame(text: string): boolean {
 }
 
 function isSimpleCarriageReturnRewrite(text: string): boolean {
-  return text.startsWith("\r") && !text.includes("\n") && !text.includes("\b") && !/\x1b\[/.test(text);
+  const withoutSgr = stripSgrCodes(text);
+  return (
+    withoutSgr.startsWith("\r") &&
+    !withoutSgr.includes("\n") &&
+    !withoutSgr.includes("\b") &&
+    !/\x1b/.test(withoutSgr)
+  );
 }
 
 function rewriteSimpleCarriageReturnOutput(text: string): string {
   return `\x1b[2K\x1b[1G${text.slice(1)}`;
+}
+
+function colorRuntimeText(text: string, prefix: string, suffix: string): string {
+  if (!text || text === "\r") {
+    return text;
+  }
+
+  if (text.startsWith("\r") && !text.startsWith("\r\n")) {
+    return `\r${prefix}${text.slice(1)}${suffix}`;
+  }
+
+  return `${prefix}${text}${suffix}`;
+}
+
+function stripSgrCodes(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function didOutputEndWithLineFeed(text: string): boolean {
@@ -872,7 +976,19 @@ function flushPendingRuntimeRewrite(host: RuntimeHost): void {
 
 export function sendRuntimeReply(host: RuntimeHost, text: string): void {
   host.clearReplyPromptRenderTimer();
+  const sent =
+    host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+      type: "reply-input",
+      text,
+    }) ?? false;
+
+  if (!sent) {
+    host.scheduleReplyPrompt();
+    return;
+  }
+
   if (host.promptVisible) {
+    host.captureVisibleInputForReplay();
     host.writeEmitter.fire("\r\n");
     host.lastWriteEndedWithNewline = true;
     host.renderer.renderedLineCount = 1;
@@ -883,10 +999,6 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
   host.mode = host.activeSubmission ? "executing" : "ready";
   host.awaitingExecutionStart = false;
   host.replyPromptText = "";
-  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-    type: "reply-input",
-    text,
-  });
 }
 
 export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
@@ -942,6 +1054,7 @@ export async function enqueueRuntimeSubmission(
   for (const block of blocks) {
     host.submissionQueue.push({
       code: block,
+      initialPromptKind: host.promptKind,
     });
   }
 
@@ -996,6 +1109,9 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
   configureMainPrompt(host.renderer);
 
   if (host.promptVisible || host.inputState.text.length > 0) {
+    if (host.promptVisible) {
+      host.captureVisibleInputForReplay();
+    }
     host.clearInputRender();
     host.promptVisible = false;
   } else {
@@ -1022,7 +1138,11 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
     getContinuationPromptLength(host.renderer.continuationPromptText)
   );
   const styledLines = host.syntax.highlightLines(plan.lines, plan.sourceLineMap);
-  writeRuntimeSubmissionLines(host, styledLines, plan.promptKinds);
+  const promptKinds = [...plan.promptKinds];
+  if (task.initialPromptKind === "cont" && promptKinds.length > 0) {
+    promptKinds[0] = "cont";
+  }
+  writeRuntimeSubmissionLines(host, styledLines, promptKinds);
   host.promptVisible = false;
 }
 
@@ -1053,7 +1173,7 @@ function writeRuntimeSubmissionLines(
   host.renderer.cursorRowFromTop = 0;
 }
 export function interruptRuntime(host: RuntimeHost): void {
-  if (!host.rProcess || host.rProcess.killed) {
+  if (!host.rProcess || !host.runtimeBackend?.isAlive(host.rProcess)) {
     return;
   }
 
@@ -1063,15 +1183,22 @@ export function interruptRuntime(host: RuntimeHost): void {
     }) ?? false;
 
   if (host.isSessionProtocolActive() && host.mode === "executing") {
+    if (!sendInterrupt()) {
+      return;
+    }
     host.writeEmitter.fire("^C\r\n");
-    sendInterrupt();
     host.inputState.reset();
     host.promptVisible = false;
     host.pendingPromptToken = false;
+    host.clearPendingConsoleInput();
     return;
   }
 
   if (host.isSessionProtocolActive() && host.mode === "reply") {
+    if (!sendInterrupt()) {
+      host.scheduleReplyPrompt();
+      return;
+    }
     host.clearReplyPromptRenderTimer();
     host.writeEmitter.fire("^C\r\n");
     host.clearInputRender();
@@ -1079,7 +1206,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.promptVisible = false;
     host.replyPromptText = "";
     host.mode = "executing";
-    sendInterrupt();
+    host.clearPendingConsoleInput();
     return;
   }
 
@@ -1087,6 +1214,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.clearInputRender();
     host.inputState.reset();
     host.renderInput();
+    host.clearPendingConsoleInput();
     return;
   }
 
@@ -1097,12 +1225,14 @@ export function interruptRuntime(host: RuntimeHost): void {
   host.writeEmitter.fire("^C\r\n");
   host.inputState.reset();
   host.promptVisible = false;
+  host.clearPendingConsoleInput();
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
+  host.clearPendingConsoleInput();
   flushPendingRuntimeRewrite(host);
   setNativeParseCallback(null);
 

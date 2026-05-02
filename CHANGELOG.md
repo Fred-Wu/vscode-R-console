@@ -2,6 +2,18 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.0] - 2026-05-02
+
+### Added
+- Persistent self-managed console sessions that can survive VS Code terminal UI detaches.
+- A session manager for attaching to or closing running R Console sessions.
+- Backend/UI transport over a TCP session server with reconnect metadata.
+- Persistence for console runtime state, terminal replay state, prompt/input state, and terminal location for later reattach.
+
+### Fixed
+- Nested prompt handling now preserves reply input and multiline paste behavior while R is waiting for input.
+- R event and input-handler pumping now keeps interactive event loops responsive and interruptible.
+
 ## [0.1.1] - 2026-04-16
 
 ### Changed
