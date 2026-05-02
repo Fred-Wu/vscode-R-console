@@ -17,6 +17,9 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 - Bracketed paste handling.
 - Parser-backed completeness checks before submission.
 
+https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
+
+
 ## Requirements
 
 - VS Code 1.85.0 or later.
