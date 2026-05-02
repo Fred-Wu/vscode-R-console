@@ -485,6 +485,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           return;
         }
         this.resolvePendingParseRequests(state, 1);
+        if (state.hostConnected && isSocketDisconnectError(error)) {
+          return;
+        }
         state.handlers?.onError?.(error instanceof Error ? error : new Error(String(error)));
       });
 
@@ -492,10 +495,11 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         if (state.socket !== socket) {
           return;
         }
+        const wasHostConnected = state.hostConnected;
         state.socket = undefined;
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
-        if (!state.explicitClose && !state.child) {
+        if (!state.explicitClose && wasHostConnected) {
           state.handlers?.onExit?.(0);
         }
       });
@@ -795,6 +799,11 @@ function isRuntimeSessionPidAlive(pid: number | undefined): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
+}
+
+function isSocketDisconnectError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ECONNRESET" || code === "EPIPE";
 }
 
 function cleanupRuntimeSessionBootstrapFile(sessionId: string): void {
