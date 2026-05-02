@@ -99,12 +99,44 @@ jobs:
           cd release-artifacts
           sha256sum *.vsix > SHA256SUMS.txt
 
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          extract_section() {
+            awk -v heading="$1" '
+              /^##[[:space:]]+/ {
+                current = $0
+                sub(/^##[[:space:]]+/, "", current)
+                sub(/[[:space:]]+-.*$/, "", current)
+                sub(/^\[/, "", current)
+                sub(/\]$/, "", current)
+                if (current == heading) {
+                  in_section = 1
+                  next
+                }
+                if (in_section) {
+                  exit
+                }
+              }
+              in_section { print }
+            ' CHANGELOG.md
+          }
+          extract_section "$version" > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            extract_section "Unreleased" > release-notes.md
+          fi
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md does not contain a section for ${version} or Unreleased."
+            exit 1
+          fi
+          printf '\nFull changelog: https://github.com/%s/blob/%s/CHANGELOG.md\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> release-notes.md
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
           name: R Console ${{ github.ref_name }}
-          body: |
-            Full changelog: https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
+          body_path: release-notes.md
           files: |
             release-artifacts/*.vsix
             release-artifacts/SHA256SUMS.txt
