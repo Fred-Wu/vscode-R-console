@@ -838,6 +838,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     if (this.mode === "reply") {
+      this.ensureReplyPromptVisibleForInput();
       this.handleReplyInputAction(action);
       return;
     }
@@ -845,6 +846,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode !== "ready" || !this.promptReady) {
       return;
     }
+
+    this.ensureReadyPromptVisibleForInput();
 
     if (action.type !== "escape") {
       this.escPendingClear = false;
@@ -1473,6 +1476,22 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private interruptR(): void {
     interruptRuntime(this.runtimeHost());
+  }
+
+  private ensureReadyPromptVisibleForInput(): void {
+    if (this.promptVisible) {
+      return;
+    }
+    this.clearPromptRenderTimer();
+    this.showPrompt();
+  }
+
+  private ensureReplyPromptVisibleForInput(): void {
+    if (this.promptVisible) {
+      return;
+    }
+    this.clearReplyPromptRenderTimer();
+    this.showReplyPrompt();
   }
 
   private schedulePrompt(): void {

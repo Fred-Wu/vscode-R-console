@@ -9,8 +9,8 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
-        OutputStream, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        PromptKind,
     };
     use libloading::os::unix::{Library, Symbol};
     use std::collections::VecDeque;
@@ -48,7 +48,8 @@ mod unix_host {
     type RfInitializeR = unsafe extern "C" fn(c_int, *mut *mut c_char) -> c_int;
     type SetupRMainloop = unsafe extern "C" fn();
     type RunRMainloop = unsafe extern "C" fn();
-    type ReadConsoleFn = unsafe extern "C" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
+    type ReadConsoleFn =
+        unsafe extern "C-unwind" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
     type WriteConsoleFn = unsafe extern "C" fn(*const c_char, c_int);
     type WriteConsoleExFn = unsafe extern "C" fn(*const c_char, c_int, c_int);
     type ShowMessageFn = unsafe extern "C" fn(*const c_char);
@@ -62,9 +63,11 @@ mod unix_host {
         *const *const c_char,
         *const c_char,
     ) -> c_int;
-    type EventCallbackFn = unsafe extern "C" fn();
+    type EventCallbackFn = unsafe extern "C-unwind" fn();
     type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
+    type ProcessEventsFn = unsafe extern "C" fn();
+    type RunPendingFinalizersFn = unsafe extern "C" fn();
     type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut libc::fd_set;
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut libc::fd_set);
     type Sexp = *mut c_void;
@@ -105,6 +108,8 @@ mod unix_host {
         r_running_as_main_program: Option<*mut c_int>,
         r_interrupts_pending: Option<*mut c_int>,
         r_check_user_interrupt: Option<CheckUserInterruptFn>,
+        r_process_events: Option<ProcessEventsFn>,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
         r_check_activity: CheckActivityFn,
         r_run_handlers: RunHandlersFn,
         r_input_handlers: *mut *mut c_void,
@@ -138,10 +143,19 @@ mod unix_host {
         pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
         current_width: Option<u16>,
+        startup_input_pending: bool,
         busy: bool,
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
+        top_level_recovery_pending: Option<TopLevelRecovery>,
+        top_level_recovery_active: bool,
         shutdown_requested: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TopLevelRecovery {
+        ParseNull,
+        RecoverFromInterrupt,
     }
 
     enum PendingCommand {
@@ -187,6 +201,8 @@ mod unix_host {
 
     #[derive(Clone, Copy)]
     struct EventLoopApi {
+        r_process_events: Option<ProcessEventsFn>,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
         r_check_activity: CheckActivityFn,
         r_run_handlers: RunHandlersFn,
         r_toplevel_exec: TopLevelExecFn,
@@ -204,6 +220,8 @@ mod unix_host {
         width: c_int,
         success: bool,
     }
+
+    const STARTUP_INTERRUPT_HANDLER_INPUT: &str = r#"base::local({ if (base::getRversion() >= "4.0.0") { handler <- function(e) { restart <- base::findRestart("abort"); if (!base::is.null(restart)) base::invokeRestart(restart) }; handlers <- base::globalCallingHandlers(); base::globalCallingHandlers(NULL); handlers <- c(handlers, list(interrupt = handler)); base::do.call(base::globalCallingHandlers, handlers) }; base::invisible(NULL) }, envir = base::new.env(parent = base::baseenv()))"#;
 
     struct PumpEventsContext {
         api: EventLoopApi,
@@ -225,7 +243,10 @@ mod unix_host {
         HOST_RUNTIME
             .set(HostRuntime {
                 output: output.clone_handle(),
-                state: Mutex::new(SharedState::default()),
+                state: Mutex::new(SharedState {
+                    startup_input_pending: true,
+                    ..SharedState::default()
+                }),
                 cv: Condvar::new(),
             })
             .map_err(|_| "host runtime already initialized")?;
@@ -356,6 +377,7 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
             should_signal = state.busy;
             runtime.cv.notify_all();
         }
@@ -521,8 +543,6 @@ mod unix_host {
             return;
         };
 
-        set_r_interrupts_pending(false);
-
         let mut context = PumpEventsContext { api };
         unsafe {
             (api.r_toplevel_exec)(
@@ -532,21 +552,27 @@ mod unix_host {
         }
     }
 
-    unsafe fn run_input_handlers(api: EventLoopApi) {
+    unsafe fn run_process_events(api: EventLoopApi) {
+        if let Some(process_events) = api.r_process_events {
+            process_events();
+        }
+        run_activity_handlers(api);
+        if let Some(run_pending_finalizers) = api.r_run_pending_finalizers {
+            run_pending_finalizers();
+        }
+    }
+
+    unsafe fn run_activity_handlers(api: EventLoopApi) {
         let handlers = *(api.r_input_handlers as *mut *mut c_void);
         if handlers.is_null() {
             return;
         }
 
-        let mask = (api.r_check_activity)(0, 1);
-
-        #[cfg(target_os = "macos")]
-        if !mask.is_null() {
+        let mut mask = (api.r_check_activity)(0, 1);
+        while !mask.is_null() {
             (api.r_run_handlers)(handlers, mask);
+            mask = (api.r_check_activity)(0, 1);
         }
-
-        #[cfg(not(target_os = "macos"))]
-        (api.r_run_handlers)(handlers, mask);
     }
 
     unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
@@ -555,26 +581,26 @@ mod unix_host {
         }
 
         let context = &mut *(data as *mut PumpEventsContext);
-        run_input_handlers(context.api);
+        run_process_events(context.api);
     }
 
-    unsafe extern "C" fn process_events_callback() {
+    unsafe extern "C-unwind" fn process_events_callback() {
         let Some(api) = event_loop_api() else {
             return;
         };
 
-        run_input_handlers(api);
+        run_activity_handlers(api);
     }
 
-    unsafe extern "C" fn polled_events_callback() {
+    unsafe extern "C-unwind" fn polled_events_callback() {
         let Some(api) = event_loop_api() else {
             return;
         };
 
-        run_input_handlers(api);
+        run_activity_handlers(api);
     }
 
-    unsafe extern "C" fn read_console_callback(
+    unsafe extern "C-unwind" fn read_console_callback(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -592,7 +618,7 @@ mod unix_host {
         ret
     }
 
-    unsafe extern "C" fn read_console_callback_inner(
+    unsafe extern "C-unwind" fn read_console_callback_inner(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -605,6 +631,7 @@ mod unix_host {
         let prompt_text = c_string_to_string(prompt);
         let wait_kind = classify_wait_kind(&prompt_text, add_history);
         let mut wait_event_emitted = false;
+        set_r_interrupts_pending(false);
         let mut state = runtime.state.lock().expect("host state lock poisoned");
 
         loop {
@@ -647,6 +674,29 @@ mod unix_host {
                 );
             }
 
+            if should_return_startup_input(&wait_kind, &mut state) {
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    STARTUP_INTERRUPT_HANDLER_INPUT.as_bytes().to_vec(),
+                    &mut state,
+                    false,
+                    &runtime.output,
+                );
+            }
+
+            if should_return_top_level_recovery(&wait_kind, &mut state) {
+                let recovery_input = take_top_level_recovery_input(&mut state);
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    recovery_input,
+                    &mut state,
+                    false,
+                    &runtime.output,
+                );
+            }
+
             if let Some(line) = take_next_line(&wait_kind, &mut state) {
                 return write_read_buffer(
                     buffer,
@@ -668,6 +718,7 @@ mod unix_host {
 
             if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
                 state.interrupt_requested = false;
+                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
                 let _ = runtime.output.emit_input_end();
                 let _ = runtime.output.emit_output_flush();
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
@@ -736,10 +787,16 @@ mod unix_host {
             let mut should_signal = false;
             {
                 let mut state = runtime.state.lock().expect("host state lock poisoned");
+                let was_busy = state.busy;
                 state.busy = value != 0;
                 if value != 0 {
                     should_signal = state.interrupt_requested;
                 } else {
+                    if state.top_level_recovery_active {
+                        state.top_level_recovery_active = false;
+                    } else if was_busy && state.top_level_recovery_pending.is_none() {
+                        state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
+                    }
                     state.suppress_idle_event_pump = state.interrupt_requested;
                     state.interrupt_requested = false;
                     set_r_interrupts_pending(false);
@@ -868,6 +925,54 @@ mod unix_host {
         }
     }
 
+    fn should_return_top_level_recovery(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+
+        if state.top_level_recovery_active && !state.busy {
+            state.top_level_recovery_active = false;
+        }
+
+        if state.top_level_recovery_pending.is_none() {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.top_level_recovery_active = true;
+        true
+    }
+
+    fn should_return_startup_input(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !state.startup_input_pending {
+            return false;
+        }
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.startup_input_pending = false;
+        true
+    }
+
+    fn take_top_level_recovery_input(state: &mut SharedState) -> Vec<u8> {
+        match state
+            .top_level_recovery_pending
+            .take()
+            .unwrap_or(TopLevelRecovery::ParseNull)
+        {
+            TopLevelRecovery::ParseNull => b" ".to_vec(),
+            TopLevelRecovery::RecoverFromInterrupt => {
+                b"base::invisible(base::.Last.value)".to_vec()
+            }
+        }
+    }
+
     fn take_next_parse_request(state: &mut SharedState) -> Option<(u32, String)> {
         let index = state
             .pending_commands
@@ -899,6 +1004,7 @@ mod unix_host {
             target[bytes.len()] = b'\n';
             target[bytes.len() + 1] = 0;
             if signal_input_end {
+                state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                 let _ = output.emit_input_end();
                 let _ = output.emit_output_flush();
             }
@@ -1159,6 +1265,11 @@ mod unix_host {
                 ),
                 r_interrupts_pending: load_optional_global(&library, b"R_interrupts_pending\0"),
                 r_check_user_interrupt: load_optional_function(&library, b"R_CheckUserInterrupt\0"),
+                r_process_events: load_optional_function(&library, b"R_ProcessEvents\0"),
+                r_run_pending_finalizers: load_optional_function(
+                    &library,
+                    b"R_RunPendingFinalizers\0",
+                ),
                 r_check_activity: load_function(&library, b"R_checkActivity\0")?,
                 r_run_handlers: load_function(&library, b"R_runHandlers\0")?,
                 r_input_handlers: load_global(&library, b"R_InputHandlers\0")?,
@@ -1188,7 +1299,7 @@ mod unix_host {
                 *value = 1;
             }
             if let Some(value) = self.r_signal_handlers {
-                *value = 1;
+                *value = 0;
             }
 
             let mut argv_storage = build_r_args(r_executable, r_args)?;
@@ -1269,6 +1380,8 @@ mod unix_host {
 
         fn event_loop_api(&self) -> EventLoopApi {
             EventLoopApi {
+                r_process_events: self.r_process_events,
+                r_run_pending_finalizers: self.r_run_pending_finalizers,
                 r_check_activity: self.r_check_activity,
                 r_run_handlers: self.r_run_handlers,
                 r_toplevel_exec: self.r_toplevel_exec,
@@ -1330,8 +1443,8 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink,
-        OutputStream, PromptKind,
+        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        PromptKind,
     };
     use libloading::os::windows::{
         Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -1347,11 +1460,10 @@ mod windows_host {
     use std::sync::{Condvar, Mutex, OnceLock};
     use std::time::Duration;
     use windows_sys::Win32::{
-        Globalization::{
-            MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS,
+        Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS},
+        UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
         },
-        System::LibraryLoader::{GetModuleHandleA, GetProcAddress},
-        UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE},
     };
 
     const CONT_PROMPT: &str = "+ ";
@@ -1381,7 +1493,8 @@ mod windows_host {
 
     type SetupRMainloop = unsafe extern "C" fn();
     type RunRMainloop = unsafe extern "C" fn();
-    type ReadConsoleFn = unsafe extern "C" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
+    type ReadConsoleFn =
+        unsafe extern "C-unwind" fn(*const c_char, *mut c_uchar, c_int, c_int) -> c_int;
     type WriteConsoleFn = unsafe extern "C" fn(*const c_char, c_int);
     type WriteConsoleExFn = unsafe extern "C" fn(*const c_char, c_int, c_int);
     type ShowMessageFn = unsafe extern "C" fn(*const c_char);
@@ -1395,11 +1508,12 @@ mod windows_host {
         *const *const c_char,
         *const c_char,
     ) -> c_int;
-    type EventCallbackFn = unsafe extern "C" fn();
+    type EventCallbackFn = unsafe extern "C-unwind" fn();
     type YesNoCancelFn = unsafe extern "C" fn(*const c_char) -> c_int;
     type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
     type ProcessEventsFn = unsafe extern "C" fn();
+    type RunPendingFinalizersFn = unsafe extern "C" fn();
     type CheckActivityFn = unsafe extern "C" fn(c_int, c_int) -> *mut c_void;
     type RunHandlersFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
     type Sexp = *mut c_void;
@@ -1407,11 +1521,8 @@ mod windows_host {
     type InstallFn = unsafe extern "C" fn(*const c_char) -> Sexp;
     type FindVarInFrameFn = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
     type ScalarIntegerFn = unsafe extern "C" fn(c_int) -> Sexp;
-    type ScalarLogicalFn = unsafe extern "C" fn(c_int) -> Sexp;
-    type ScalarRealFn = unsafe extern "C" fn(f64) -> Sexp;
     type ProtectFn = unsafe extern "C" fn(Sexp) -> Sexp;
     type UnprotectFn = unsafe extern "C" fn(c_int);
-    type LaterExecCallbacksFn = unsafe extern "C" fn(Sexp, Sexp, Sexp) -> Sexp;
     type ParseVectorFn = unsafe extern "C" fn(Sexp, c_int, *mut c_int, Sexp) -> Sexp;
     type TopLevelExecFn =
         unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int;
@@ -1510,6 +1621,7 @@ mod windows_host {
         ga_initapp: Option<GAInitAppFn>,
         ga_peekevent: Option<GAPeekEventFn>,
         r_process_events: Option<ProcessEventsFn>,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
         ptr_r_process_events: Option<*mut Option<EventCallbackFn>>,
         r_polled_events: Option<*mut Option<EventCallbackFn>>,
         r_check_activity: Option<CheckActivityFn>,
@@ -1530,8 +1642,6 @@ mod windows_host {
         rf_install: InstallFn,
         rf_find_var_in_frame: FindVarInFrameFn,
         rf_scalar_integer: ScalarIntegerFn,
-        rf_scalar_logical: ScalarLogicalFn,
-        rf_scalar_real: ScalarRealFn,
         rf_protect: ProtectFn,
         rf_unprotect: UnprotectFn,
         r_parse_vector: ParseVectorFn,
@@ -1562,10 +1672,19 @@ mod windows_host {
         pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
         current_width: Option<u16>,
+        startup_input_pending: bool,
         busy: bool,
         interrupt_requested: bool,
         suppress_idle_event_pump: bool,
+        top_level_recovery_pending: Option<TopLevelRecovery>,
+        top_level_recovery_active: bool,
         shutdown_requested: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TopLevelRecovery {
+        ParseNull,
+        RecoverFromInterrupt,
     }
 
     enum PendingCommand {
@@ -1618,11 +1737,8 @@ mod windows_host {
         r_check_activity: Option<CheckActivityFn>,
         r_run_handlers: Option<RunHandlersFn>,
         r_input_handlers: Option<usize>,
-        rf_scalar_integer: ScalarIntegerFn,
-        rf_scalar_logical: ScalarLogicalFn,
-        rf_scalar_real: ScalarRealFn,
-        rf_protect: ProtectFn,
-        rf_unprotect: UnprotectFn,
+        r_run_pending_finalizers: Option<RunPendingFinalizersFn>,
+        r_toplevel_exec: TopLevelExecFn,
     }
 
     struct ParseStatusContext {
@@ -1636,6 +1752,12 @@ mod windows_host {
         width: c_int,
         success: bool,
     }
+
+    struct PumpEventsContext {
+        api: EventLoopApi,
+    }
+
+    const STARTUP_INTERRUPT_HANDLER_INPUT: &str = r#"base::local({ if (base::getRversion() >= "4.0.0") { handler <- function(e) { restart <- base::findRestart("abort"); if (!base::is.null(restart)) base::invokeRestart(restart) }; handlers <- base::globalCallingHandlers(); base::globalCallingHandlers(NULL); handlers <- c(handlers, list(interrupt = handler)); base::do.call(base::globalCallingHandlers, handlers) }; base::invisible(NULL) }, envir = base::new.env(parent = base::baseenv()))"#;
 
     pub(crate) fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         if args.is_empty() {
@@ -1653,7 +1775,10 @@ mod windows_host {
         HOST_RUNTIME
             .set(HostRuntime {
                 output: output.clone_handle(),
-                state: Mutex::new(SharedState::default()),
+                state: Mutex::new(SharedState {
+                    startup_input_pending: true,
+                    ..SharedState::default()
+                }),
                 cv: Condvar::new(),
             })
             .map_err(|_| "host runtime already initialized")?;
@@ -1801,6 +1926,7 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
             runtime.cv.notify_all();
         }
 
@@ -1954,12 +2080,25 @@ mod windows_host {
             return;
         };
 
+        let mut context = PumpEventsContext { api };
         unsafe {
-            run_process_events(api);
+            (api.r_toplevel_exec)(
+                execute_pump_events,
+                &mut context as *mut PumpEventsContext as *mut c_void,
+            );
         }
     }
 
-    unsafe fn run_input_handlers(api: EventLoopApi) {
+    unsafe extern "C" fn execute_pump_events(data: *mut c_void) {
+        if data.is_null() {
+            return;
+        }
+
+        let context = &mut *(data as *mut PumpEventsContext);
+        run_process_events(context.api);
+    }
+
+    unsafe fn run_activity_handlers(api: EventLoopApi) {
         let Some(check_activity) = api.r_check_activity else {
             return;
         };
@@ -1975,8 +2114,11 @@ mod windows_host {
             return;
         }
 
-        let mask = check_activity(0, 1);
-        run_handlers(handlers, mask);
+        let mut mask = check_activity(0, 1);
+        while !mask.is_null() {
+            run_handlers(handlers, mask);
+            mask = check_activity(0, 1);
+        }
     }
 
     unsafe fn run_process_events(api: EventLoopApi) {
@@ -1984,30 +2126,13 @@ mod windows_host {
         // handled by R's native callback path below, but calling it here can
         // stall the wait loop before the session webserver is serviced.
         pump_windows_messages();
-        run_input_handlers(api);
-        run_later_exec_callbacks(api);
         if let Some(process_events) = api.r_process_events {
             process_events();
         }
-    }
-
-    unsafe fn run_later_exec_callbacks(api: EventLoopApi) {
-        let module = GetModuleHandleA(c"later.dll".as_ptr() as *const u8);
-        if module.is_null() {
-            return;
+        run_activity_handlers(api);
+        if let Some(run_pending_finalizers) = api.r_run_pending_finalizers {
+            run_pending_finalizers();
         }
-
-        let Some(address) = GetProcAddress(module, c"_later_execCallbacks".as_ptr() as *const u8)
-        else {
-            return;
-        };
-
-        let exec_callbacks: LaterExecCallbacksFn = std::mem::transmute(address);
-        let timeout = (api.rf_protect)((api.rf_scalar_real)(0.0));
-        let run_all = (api.rf_protect)((api.rf_scalar_logical)(0));
-        let loop_id = (api.rf_protect)((api.rf_scalar_integer)(0));
-        let _ = exec_callbacks(timeout, run_all, loop_id);
-        (api.rf_unprotect)(3);
     }
 
     unsafe fn pump_windows_messages() {
@@ -2018,20 +2143,17 @@ mod windows_host {
         }
     }
 
-    unsafe extern "C" fn process_events_callback() {
+    unsafe extern "C-unwind" fn process_events_callback() {
         if let Some(api) = event_loop_api() {
             if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
                 if let Some(peek_event) = api.ga_peekevent {
                     while peek_event() != 0 {}
                 }
                 pump_windows_messages();
-                // Drive the input-handler path that httpuv and other socket-based
-                // integrations rely on, matching the Unix embedded host wiring.
-                run_input_handlers(api);
+                run_activity_handlers(api);
                 PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
-
         if let Some(runtime) = host_runtime() {
             let state = runtime.state.lock().expect("host state lock poisoned");
             if state.interrupt_requested {
@@ -2040,17 +2162,17 @@ mod windows_host {
         }
     }
 
-    unsafe extern "C" fn polled_events_callback() {
+    unsafe extern "C-unwind" fn polled_events_callback() {
         if let Some(api) = event_loop_api() {
             if !PROCESS_EVENTS_CALLBACK_ACTIVE.swap(true, Ordering::AcqRel) {
                 pump_windows_messages();
-                run_input_handlers(api);
+                run_activity_handlers(api);
                 PROCESS_EVENTS_CALLBACK_ACTIVE.store(false, Ordering::Release);
             }
         }
     }
 
-    unsafe extern "C" fn read_console_callback(
+    unsafe extern "C-unwind" fn read_console_callback(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -2068,7 +2190,7 @@ mod windows_host {
         ret
     }
 
-    unsafe extern "C" fn read_console_callback_inner(
+    unsafe extern "C-unwind" fn read_console_callback_inner(
         prompt: *const c_char,
         buffer: *mut c_uchar,
         buflen: c_int,
@@ -2081,6 +2203,7 @@ mod windows_host {
         let prompt_text = c_string_to_string(prompt);
         let wait_kind = classify_wait_kind(&prompt_text, add_history);
         let mut wait_event_emitted = false;
+        set_r_interrupts_pending(false);
         let mut state = runtime.state.lock().expect("host state lock poisoned");
 
         loop {
@@ -2123,6 +2246,29 @@ mod windows_host {
                 );
             }
 
+            if should_return_startup_input(&wait_kind, &mut state) {
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    encode_windows_r_source_text(STARTUP_INTERRUPT_HANDLER_INPUT),
+                    &mut state,
+                    false,
+                    &runtime.output,
+                );
+            }
+
+            if should_return_top_level_recovery(&wait_kind, &mut state) {
+                let recovery_input = take_top_level_recovery_input(&mut state);
+                return write_read_buffer(
+                    buffer,
+                    buflen,
+                    recovery_input,
+                    &mut state,
+                    false,
+                    &runtime.output,
+                );
+            }
+
             if let Some(line) = take_next_line(&wait_kind, &mut state) {
                 return write_read_buffer(
                     buffer,
@@ -2144,6 +2290,7 @@ mod windows_host {
 
             if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
                 state.interrupt_requested = false;
+                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
                 let _ = runtime.output.emit_input_end();
                 let _ = runtime.output.emit_output_flush();
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
@@ -2222,8 +2369,14 @@ mod windows_host {
             let should_preserve_interrupt;
             {
                 let mut state = runtime.state.lock().expect("host state lock poisoned");
+                let was_busy = state.busy;
                 state.busy = value != 0;
                 if value == 0 {
+                    if state.top_level_recovery_active {
+                        state.top_level_recovery_active = false;
+                    } else if was_busy && state.top_level_recovery_pending.is_none() {
+                        state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
+                    }
                     state.suppress_idle_event_pump = state.interrupt_requested;
                     state.interrupt_requested = false;
                     set_r_interrupts_pending(false);
@@ -2353,6 +2506,54 @@ mod windows_host {
         }
     }
 
+    fn should_return_top_level_recovery(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+
+        if state.top_level_recovery_active && !state.busy {
+            state.top_level_recovery_active = false;
+        }
+
+        if state.top_level_recovery_pending.is_none() {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.top_level_recovery_active = true;
+        true
+    }
+
+    fn should_return_startup_input(wait_kind: &WaitKind, state: &mut SharedState) -> bool {
+        if !state.startup_input_pending {
+            return false;
+        }
+        if !matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            return false;
+        }
+        if state.pending_fragment.is_some() || !state.active_submission_lines.is_empty() {
+            return false;
+        }
+
+        state.startup_input_pending = false;
+        true
+    }
+
+    fn take_top_level_recovery_input(state: &mut SharedState) -> Vec<u8> {
+        match state
+            .top_level_recovery_pending
+            .take()
+            .unwrap_or(TopLevelRecovery::ParseNull)
+        {
+            TopLevelRecovery::ParseNull => b" ".to_vec(),
+            TopLevelRecovery::RecoverFromInterrupt => {
+                b"base::invisible(base::.Last.value)".to_vec()
+            }
+        }
+    }
+
     fn take_next_parse_request(state: &mut SharedState) -> Option<(u32, String)> {
         let index = state
             .pending_commands
@@ -2384,6 +2585,7 @@ mod windows_host {
             target[bytes.len()] = b'\n';
             target[bytes.len() + 1] = 0;
             if signal_input_end {
+                state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                 let _ = output.emit_input_end();
                 let _ = output.emit_output_flush();
             }
@@ -3030,6 +3232,10 @@ mod windows_host {
                 ga_initapp,
                 ga_peekevent,
                 r_process_events: load_optional_function(&library, b"R_ProcessEvents\0"),
+                r_run_pending_finalizers: load_optional_function(
+                    &library,
+                    b"R_RunPendingFinalizers\0",
+                ),
                 ptr_r_process_events: load_optional_global(&library, b"ptr_R_ProcessEvents\0"),
                 r_polled_events: load_optional_global(&library, b"R_PolledEvents\0"),
                 r_check_activity: load_optional_function(&library, b"R_checkActivity\0"),
@@ -3054,8 +3260,6 @@ mod windows_host {
                 rf_install: load_function(&library, b"Rf_install\0")?,
                 rf_find_var_in_frame: load_function(&library, b"Rf_findVarInFrame\0")?,
                 rf_scalar_integer: load_function(&library, b"Rf_ScalarInteger\0")?,
-                rf_scalar_logical: load_function(&library, b"Rf_ScalarLogical\0")?,
-                rf_scalar_real: load_function(&library, b"Rf_ScalarReal\0")?,
                 rf_protect: load_function(&library, b"Rf_protect\0")?,
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
@@ -3220,11 +3424,8 @@ mod windows_host {
                 r_check_activity: self.r_check_activity,
                 r_run_handlers: self.r_run_handlers,
                 r_input_handlers: self.r_input_handlers.map(|value| value as usize),
-                rf_scalar_integer: self.rf_scalar_integer,
-                rf_scalar_logical: self.rf_scalar_logical,
-                rf_scalar_real: self.rf_scalar_real,
-                rf_protect: self.rf_protect,
-                rf_unprotect: self.rf_unprotect,
+                r_run_pending_finalizers: self.r_run_pending_finalizers,
+                r_toplevel_exec: self.r_toplevel_exec,
             }
         }
     }
@@ -3288,8 +3489,11 @@ mod windows_host {
     #[cfg(test)]
     mod tests {
         use super::{
-            decode_windows_console_text_with_code_page, encode_windows_r_source_text_with_code_page,
+            decode_windows_console_text_with_code_page,
+            encode_windows_r_source_text_with_code_page, should_return_top_level_recovery,
+            take_top_level_recovery_input, SharedState, TopLevelRecovery, WaitKind,
         };
+        use crate::protocol::PromptKind;
 
         #[test]
         fn decodes_embedded_utf8_console_segments() {
@@ -3402,6 +3606,73 @@ mod windows_host {
                     1252,
                 ),
                 b"\\u65e5\\u672c\\u8a9e \\U0001f642"
+            );
+        }
+
+        #[test]
+        fn top_level_recovery_runs_once_at_main_prompt() {
+            let mut state = SharedState {
+                top_level_recovery_pending: Some(TopLevelRecovery::ParseNull),
+                ..SharedState::default()
+            };
+            let prompt = WaitKind::TopLevel(PromptKind::Main);
+
+            assert!(should_return_top_level_recovery(&prompt, &mut state));
+            assert_eq!(take_top_level_recovery_input(&mut state), b" ".to_vec());
+            assert!(state.top_level_recovery_pending.is_none());
+            assert!(state.top_level_recovery_active);
+
+            assert!(!should_return_top_level_recovery(&prompt, &mut state));
+            assert!(!state.top_level_recovery_active);
+        }
+
+        #[test]
+        fn top_level_recovery_waits_for_main_prompt_without_active_input() {
+            let mut state = SharedState {
+                top_level_recovery_pending: Some(TopLevelRecovery::ParseNull),
+                ..SharedState::default()
+            };
+
+            assert!(!should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Cont),
+                &mut state
+            ));
+            assert!(state.top_level_recovery_pending.is_some());
+
+            assert!(!should_return_top_level_recovery(
+                &WaitKind::Nested("readline> ".to_string()),
+                &mut state
+            ));
+            assert!(state.top_level_recovery_pending.is_some());
+
+            state.active_submission_lines.push_back(b"next".to_vec());
+            assert!(!should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Main),
+                &mut state
+            ));
+            assert!(state.top_level_recovery_pending.is_some());
+
+            state.active_submission_lines.clear();
+            assert!(should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Main),
+                &mut state
+            ));
+        }
+
+        #[test]
+        fn top_level_recovery_uses_last_value_for_interrupted_evaluation() {
+            let mut state = SharedState {
+                top_level_recovery_pending: Some(TopLevelRecovery::RecoverFromInterrupt),
+                ..SharedState::default()
+            };
+
+            assert!(should_return_top_level_recovery(
+                &WaitKind::TopLevel(PromptKind::Main),
+                &mut state
+            ));
+            assert_eq!(
+                take_top_level_recovery_input(&mut state),
+                b"base::invisible(base::.Last.value)".to_vec()
             );
         }
 

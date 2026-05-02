@@ -617,12 +617,16 @@ It marks R as interactive and captures:
 
 Unix idle/event pumping uses:
 
+- optional `R_ProcessEvents`
 - `R_checkActivity`
 - `R_runHandlers`
 - `R_InputHandlers`
 - optional `R_PolledEvents`
+- optional `R_RunPendingFinalizers`
 
-The host pumps these while waiting in `ReadConsole`.
+The host pumps these while waiting in `ReadConsole`. Package event loops are
+serviced only through R's generic event and input-handler APIs; the backend does
+not special-case individual R packages.
 
 ### 11.5 Interrupt model
 
@@ -632,6 +636,12 @@ Unix interrupts use both:
 - a real `SIGINT` to the current process
 
 That combination is what the current Unix backend actually does.
+On the first real top-level `ReadConsole` turn, the host also injects a generic
+base R interrupt calling handler with `globalCallingHandlers()`. That handler
+invokes R's `abort` restart for interrupt conditions, which lets R unwind
+through normal `on.exit` cleanup before the next console command is accepted.
+This is installed through base R only; it does not inspect or call any
+package-specific APIs.
 
 ## 12. Windows Backend Implementation
 
@@ -688,6 +698,7 @@ The host loads Windows-specific symbols when present:
 - `GA_initapp`
 - `GA_peekevent`
 - `R_ProcessEvents`
+- `R_RunPendingFinalizers`
 - `CharacterMode`
 - `UserBreak` or fallback `R_interrupts_pending`
 
@@ -735,12 +746,12 @@ but it does not stop there.
 Current behavior:
 
 - the explicit idle pump drains the Windows message queue with `PeekMessageW` / `DispatchMessageW`
-- optional input handlers still run through `R_checkActivity`, `R_runHandlers`, and `R_InputHandlers` when those symbols are available
-- `later` callbacks are executed when `later.dll` is loaded
 - `R_ProcessEvents()` is called when available
+- optional input handlers still run through `R_checkActivity`, `R_runHandlers`, and `R_InputHandlers` when those symbols are available
+- pending finalizers are run through `R_RunPendingFinalizers()` when available
 - the callback path (`process_events_callback` / `polled_events_callback`) also pumps Windows messages and available handlers
 
-This is what keeps Windows graphapp/help/GUI event processing moving while the console is waiting for input, while still servicing handler-driven and `later`-driven work.
+This is what keeps Windows graphapp/help/GUI event processing moving while the console is waiting for input, while still servicing handler-driven work through R's generic event APIs. The backend does not call package-specific event functions.
 
 ### 12.7 Interrupt model
 
@@ -751,7 +762,12 @@ The host sets:
 - `UserBreak` when exported
 - otherwise `R_interrupts_pending`
 
-It also calls `R_CheckUserInterrupt` when needed after interrupted reads.
+It also calls `R_CheckUserInterrupt` when needed after interrupted nested reads.
+On the first real top-level `ReadConsole` turn, the host injects a generic base
+R interrupt calling handler with `globalCallingHandlers()`. That handler invokes
+R's `abort` restart for interrupt conditions, which lets R unwind through normal
+`on.exit` cleanup before the next console command is accepted. This is installed
+through base R only; it does not inspect or call any package-specific APIs.
 
 Important: the current implementation does not use `GenerateConsoleCtrlEvent`.
 If someone is testing interrupts on Windows, they should validate the current flag-based path, not assume Unix-style `SIGINT` behavior.
@@ -770,6 +786,19 @@ The same high-level state machine exists on both platforms:
 - prompt/input-request events are emitted while waiting
 - output is forwarded through `WriteConsoleEx`
 - dialog requests are bridged back to VS Code
+
+The shared `ReadConsole` state also has a one-shot top-level recovery step.
+After R leaves a busy evaluation, or after nested input returns or is
+interrupted, the next main prompt first consumes a recovery input before any
+queued top-level submit is consumed. Normal returns use a parse-null space.
+Interrupted evaluations use `base::invisible(base::.Last.value)` so the recovery
+turn does not overwrite R's last value while still giving R a clean top-level
+turn. This ports Ark's `ReadConsole` recovery / nested-return concept to the
+host's `run_Rmainloop` model: R gets one clean top-level turn to settle console
+input state, pending warnings, and finalizers before the next user command runs.
+The recovery mode is tracked by the pending recovery enum itself; there is no
+separate stale interrupt-unwind flag. The recovery step is generic and does not
+inspect or special-case any R package.
 
 This means most frontend behavior is platform-independent even though the embedded-R wiring is platform-specific.
 

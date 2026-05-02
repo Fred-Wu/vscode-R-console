@@ -277,7 +277,7 @@ export function handleRuntimeControl(
   event: BackendControlEvent
 ): void {
   if (event.type !== "output-flush") {
-    flushPendingRuntimeRewrite(host);
+    discardPendingRuntimeRewrite(host);
   }
 
   switch (event.type) {
@@ -852,22 +852,14 @@ function getPendingRuntimeRewrite(host: RuntimeHost): PendingRuntimeRewrite {
   return pending;
 }
 
-function flushPendingRuntimeRewrite(host: RuntimeHost): void {
+function discardPendingRuntimeRewrite(host: RuntimeHost): void {
   const pending = pendingRuntimeRewrites.get(host);
   if (!pending) {
     return;
   }
 
-  if (pending.clearFrame) {
-    const clearFrame = pending.clearFrame;
-    pending.clearFrame = null;
-    writeRuntimeText(host, clearFrame.text, clearFrame.endedWithLineFeed);
-  }
-
-  if (pending.bareCarriageReturn) {
-    pending.bareCarriageReturn = false;
-    writeRuntimeText(host, "\r", false);
-  }
+  pending.clearFrame = null;
+  pending.bareCarriageReturn = false;
 }
 
 export function sendRuntimeReply(host: RuntimeHost, text: string): void {
@@ -1103,7 +1095,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
-  flushPendingRuntimeRewrite(host);
+  discardPendingRuntimeRewrite(host);
   setNativeParseCallback(null);
 
   host.lang.cleanupCompletionDocument();
