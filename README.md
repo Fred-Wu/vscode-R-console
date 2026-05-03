@@ -82,13 +82,11 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.2.1-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `r-console-0.2.2-win32-x64.vsix`.
 
 `vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 
 Each target-specific VSIX contains exactly one platform-matching `R_CONSOLE_HOST` binary in `bundled/bin/`.
-
-Pushing a tag that matches `package.json`'s version, for example `v0.2.1`, runs the GitHub release workflow. It packages six target-specific builds (`win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`), generates `SHA256SUMS.txt`, and creates or updates the GitHub release for that tag. `workflow_dispatch` still acts as a packaging-only dry run.
 
 ## Configuration
 
