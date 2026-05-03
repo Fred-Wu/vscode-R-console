@@ -82,7 +82,7 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `r-console-0.2.2-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `vsc-r-console-0.2.2-win32-x64.vsix`.
 
 `vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 
