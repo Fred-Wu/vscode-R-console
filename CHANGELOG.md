@@ -2,6 +2,13 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.2] - 2026-05-03
+
+### Changed
+- Changed the Marketplace package identity to `RConsole.r-console`.
+- Changed the Marketplace display name to `RConsole`.
+- Updated the extension icon to a 128x128 PNG.
+
 ## [0.2.1] - 2026-05-03
 
 ### Fixed
