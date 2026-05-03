@@ -19,6 +19,8 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 
 https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
 
+https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
+
 ## Requirements
 
 - VS Code 1.85.0 or later.
@@ -80,13 +82,13 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.2.0-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `vscode-r-console-0.2.1-win32-x64.vsix`.
 
 `vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 
 Each target-specific VSIX contains exactly one platform-matching `R_CONSOLE_HOST` binary in `bundled/bin/`.
 
-Pushing a tag that matches `package.json`'s version, for example `v0.2.0`, runs the GitHub release workflow. It packages six target-specific builds (`win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`), generates `SHA256SUMS.txt`, and creates or updates the GitHub release for that tag. `workflow_dispatch` still acts as a packaging-only dry run.
+Pushing a tag that matches `package.json`'s version, for example `v0.2.1`, runs the GitHub release workflow. It packages six target-specific builds (`win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`, `darwin-x64`, and `darwin-arm64`), generates `SHA256SUMS.txt`, and creates or updates the GitHub release for that tag. `workflow_dispatch` still acts as a packaging-only dry run.
 
 ## Configuration
 

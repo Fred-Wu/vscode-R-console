@@ -2,6 +2,11 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.1] - 2026-05-03
+
+### Fixed
+- Fixed R 4.6 startup compatibility with vscode-R's legacy deferred `.First.sys` attach hook.
+
 ## [0.2.0] - 2026-05-02
 
 ### Added
