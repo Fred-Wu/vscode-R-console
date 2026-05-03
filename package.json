@@ -1,6 +1,6 @@
 {
-  "name": "r-console",
-  "displayName": "RConsole",
+  "name": "vsc-r-console",
+  "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
   "version": "0.2.2",
   "publisher": "RConsole",

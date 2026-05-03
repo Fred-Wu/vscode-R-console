@@ -76,7 +76,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vsix-${{ matrix.target }}
-          path: r-console-*-${{ matrix.target }}.vsix
+          path: vsc-r-console-*-${{ matrix.target }}.vsix
           if-no-files-found: error
 
   publish:
