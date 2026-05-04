@@ -27,6 +27,10 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 - Node.js 24.x for the extension build and packaging scripts.
 - A local R installation. `R Console` resolves it in this order: vscode-R `r.rpath.*`, ambient `R_HOME`, then `PATH`.
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension declares `REditorSupport.r` in `extensionDependencies` and depends on vscode-R session bootstrap/configuration; there is no standalone startup path.
+  
+> [!IMPORTANT]
+> Only vscode-R official release v2.8.* gets supported as the new version moves to a WebSockets & JSON-RPC 2.0 based approach.
+  
 - The R package `languageserver` if you want completion, signature help, and semantic highlighting.
 - Rust/Cargo only if you are building the sidecar binaries from source.
 
