@@ -239,7 +239,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = this.resolveRuntimeBackend();
-    this.vscodeRSessionReconnectPending = Boolean(restoreState?.runtime && options.sessionWatcherEnabled);
+    this.vscodeRSessionReconnectPending = Boolean(
+      restoreState?.runtime && options.sessionMode === "sess"
+    );
     this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
@@ -261,7 +263,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     );
     this.renderer = new Renderer((text) => this.writeEmitter.fire(text), this.syntax);
 
-    if (options.sessionWatcherEnabled) {
+    if (options.sessionMode === "legacy") {
       this.sessionWatcher = new SessionWatcher(options.watcherDir);
       this.sessionWatcher.onChange((data) => this.onSessionDataChanged(data));
     }
@@ -2501,7 +2503,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private getDisplayPid(): number | undefined {
-    if (this.options.sessionWatcherEnabled) {
+    if (this.options.sessionMode === "legacy") {
       const attachedPid = this.sessionWatcher?.getAttachedPid();
       if (typeof attachedPid === "number") {
         return attachedPid;

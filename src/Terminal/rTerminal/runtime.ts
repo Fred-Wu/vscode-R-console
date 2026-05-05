@@ -164,6 +164,14 @@ function clearVscodeRSessionConnection(host: RuntimeHost): void {
   vscodeRSessionConnections.delete(host);
 }
 
+function usesSessIntegration(host: RuntimeHost): boolean {
+  return host.options.sessionMode === "sess";
+}
+
+function usesLegacySessionWatcher(host: RuntimeHost): boolean {
+  return host.options.sessionMode === "legacy" && !!host.sessionWatcher;
+}
+
 function parseSessConnectCommand(command: string): VscodeRSessionConnection | undefined {
   const match = SESS_CONNECT_PATTERN.exec(command);
   if (!match) {
@@ -451,7 +459,7 @@ function persistVscodeRSessionConnection(host: RuntimeHost, pid: number): void {
 }
 
 async function refreshVscodeRSessionConnection(host: RuntimeHost): Promise<void> {
-  if (!host.options.sessionWatcherEnabled) {
+  if (!usesSessIntegration(host)) {
     return;
   }
 
@@ -503,7 +511,7 @@ function submitHiddenRuntimeCommand(host: RuntimeHost, code: string): boolean {
 }
 
 export function activateRuntimeVscodeRSession(host: RuntimeHost): void {
-  if (!host.options.sessionWatcherEnabled) {
+  if (!usesSessIntegration(host)) {
     return;
   }
   host.vscodeRSessionActivationPending = true;
@@ -520,7 +528,7 @@ function flushRuntimeVscodeRSessionActivation(host: RuntimeHost): void {
 }
 
 async function reconnectVscodeRSessionForRestoredRuntime(host: RuntimeHost): Promise<void> {
-  if (!host.vscodeRSessionReconnectPending || !host.options.sessionWatcherEnabled) {
+  if (!host.vscodeRSessionReconnectPending || !usesSessIntegration(host)) {
     return;
   }
   if (vscodeRSessionReconnectInFlight.has(host)) {
@@ -605,11 +613,15 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
   try {
     const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
-    if (host.options.sessionWatcherEnabled) {
+    if (usesSessIntegration(host)) {
       const connection = await configureVscodeRSessionBootstrap(runtimeEnv);
       if (connection) {
         vscodeRSessionConnections.set(host, connection);
+      } else {
+        runtimeEnv.R_CONSOLE_SESSION_MODE = "disabled";
       }
+    } else if (host.options.sessionMode === "legacy") {
+      fs.mkdirSync(host.options.watcherDir, { recursive: true });
     }
     if (host.extensionPath) {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
@@ -649,15 +661,27 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
 export function primeRuntimeAttach(
   host: RuntimeHost
 ): void {
-  host.sessionAttached = true;
+  if (!usesLegacySessionWatcher(host)) {
+    host.sessionAttached = true;
+    return;
+  }
+
+  const runtimePid = host.runtimeBackend?.getPid(host.rProcess) ?? host.getDisplayPid();
+  if (typeof runtimePid === "number" && Number.isFinite(runtimePid) && runtimePid > 0) {
+    host.sessionWatcher?.setExpectedPid(runtimePid);
+  }
+
+  beginRuntimeAttach(host);
 }
 
 export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boolean = false): void {
   if (!host.runtimeBackend || !host.rProcess) {
     return;
   }
-  void refreshVscodeRSessionConnection(host);
-  if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
+  if (usesSessIntegration(host)) {
+    void refreshVscodeRSessionConnection(host);
+  }
+  if (!usesLegacySessionWatcher(host)) {
     host.sessionAttached = true;
   }
   setNativeParseCallback(null);
@@ -752,18 +776,18 @@ export function handleRuntimeControl(
         const pid = isLivePid(host.backendChildPid)
           ? host.backendChildPid
           : host.runtimeBackend?.getPid(host.rProcess);
-        if (isLivePid(pid)) {
+        if (isLivePid(pid) && usesSessIntegration(host)) {
           persistVscodeRSessionConnection(host, pid);
         }
       }
       updateNativeParseCallback(host);
-      if (host.vscodeRSessionReconnectPending) {
+      if (host.vscodeRSessionReconnectPending && usesSessIntegration(host)) {
         void refreshVscodeRSessionConnection(host);
       }
       return;
     case "prompt":
       handleBackendPrompt(host, event.kind);
-      if (event.kind === "main") {
+      if (event.kind === "main" && usesSessIntegration(host)) {
         void reconnectVscodeRSessionForRestoredRuntime(host);
         flushRuntimeVscodeRSessionActivation(host);
       }
@@ -833,9 +857,11 @@ function applyRuntimeSessionState(
   if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
     host.backendChildPid = event.pid;
     updateRuntimeTerminalName(host);
-    persistVscodeRSessionConnection(host, event.pid);
-    if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
-      host.sessionWatcher.setExpectedPid(event.pid);
+    if (usesSessIntegration(host)) {
+      persistVscodeRSessionConnection(host, event.pid);
+    }
+    if (usesLegacySessionWatcher(host)) {
+      host.sessionWatcher?.setExpectedPid(event.pid);
     }
   }
 
@@ -865,7 +891,7 @@ function applyRuntimeSessionState(
       if (!host.promptVisible) {
         host.pendingPromptToken = true;
       }
-      if (event.wait.prompt === "main") {
+      if (event.wait.prompt === "main" && usesSessIntegration(host)) {
         void reconnectVscodeRSessionForRestoredRuntime(host);
         flushRuntimeVscodeRSessionActivation(host);
       }

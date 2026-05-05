@@ -299,7 +299,18 @@ function isPersistedRTerminalOptions(value: unknown): value is PersistedRTermina
   if (typeof value.sessionWatcherEnabled !== "boolean") {
     return false;
   }
+  if (
+    value.sessionMode !== undefined &&
+    value.sessionMode !== "sess" &&
+    value.sessionMode !== "legacy" &&
+    value.sessionMode !== "disabled"
+  ) {
+    return false;
+  }
   if (typeof value.watcherDir !== "string" || value.watcherDir.trim().length === 0) {
+    return false;
+  }
+  if (value.vscodeRSessionInitPath !== undefined && typeof value.vscodeRSessionInitPath !== "string") {
     return false;
   }
   if (typeof value.bracketedPaste !== "boolean") {

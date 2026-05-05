@@ -41,6 +41,16 @@ export interface CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string
   ): Promise<vscode.SignatureHelp | undefined>;
+  provideMemberCompletionItems?(
+    expression: string,
+    operator: "$" | "@"
+  ): Promise<
+    Array<{
+      name: string;
+      type?: string;
+      str?: string;
+    }> | undefined
+  >;
   provideVscodeRCompletionItems?(
     doc: vscode.TextDocument,
     position: vscode.Position,
@@ -48,6 +58,22 @@ export interface CompletionProvider {
   ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined>;
 }
 
+type GlobalEnvItem = {
+  class?: string[];
+  type?: string;
+  length?: number;
+  str?: string;
+  size?: number;
+  dim?: number[];
+  names?: string[];
+  slots?: string[];
+};
+
+type WorkspaceData = {
+  globalenv?: Record<string, GlobalEnvItem>;
+};
+
+const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
 const R_RESERVED_WORDS = new Set([
@@ -248,10 +274,16 @@ export async function collectCompletionEntries(
   context: CompletionContext,
   doc: vscode.TextDocument,
   position: vscode.Position,
+  sessionData: WorkspaceData | undefined,
   multilineBuffer: string[],
   recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider
 ): Promise<CompletionEntry[]> {
+  const sessionItems = getSessionCompletions(context, sessionData);
+  const runtimeMemberItems =
+    context.kind === "member"
+      ? await getRuntimeMemberCompletions(context, completionProvider)
+      : [];
   const vscodeSessionItems = await getVscodeRSessionCompletions(
     context,
     doc,
@@ -268,42 +300,98 @@ export async function collectCompletionEntries(
     doc.getText(),
     recentConsoleEntries
   );
+  const columnItems = getDataColumnCompletions(context, sessionData);
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...vscodeSessionItems,
+    ...sessionItems,
+    ...columnItems,
   ]);
 
   if (context.kind === "bracket") {
+    const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const vscodeFiltered = filterCompletionEntries(vscodeSessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
+    if (columnFiltered.length > 0) {
+      return dedupeCompletionEntries(columnFiltered);
+    }
     if (vscodeFiltered.length > 0) {
       return dedupeCompletionEntries(vscodeFiltered);
     }
-    return dedupeCompletionEntries(bufferFiltered);
+    return dedupeCompletionEntries([
+      ...filterCompletionEntries(sessionItems, context.prefix),
+      ...bufferFiltered,
+    ]);
   }
 
   if (context.kind === "argument") {
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const vscodeFiltered = filterCompletionEntries(vscodeSessionItems, context.prefix);
+    const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
+    const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
-    return dedupeCompletionEntries([
-      ...lspFiltered,
-      ...vscodeFiltered,
-      ...bufferFiltered,
-    ]);
+    if (context.dataObjectName && columnFiltered.length > 0) {
+      if (context.prefix.length === 0) {
+        return dedupeCompletionEntries([
+          ...columnFiltered,
+          ...vscodeFiltered,
+          ...lspFiltered,
+          ...sessionFiltered,
+          ...bufferFiltered,
+        ]);
+      } else {
+        return dedupeCompletionEntries([
+          ...columnFiltered,
+          ...vscodeFiltered,
+          ...lspFiltered,
+          ...sessionFiltered,
+          ...bufferFiltered,
+        ]);
+      }
+    }
+
+    if (context.prefix.length === 0) {
+      return dedupeCompletionEntries([
+        ...lspFiltered,
+        ...vscodeFiltered,
+        ...sessionFiltered,
+        ...bufferFiltered,
+      ]);
+    } else {
+      return dedupeCompletionEntries([
+        ...lspFiltered,
+        ...vscodeFiltered,
+        ...sessionFiltered,
+        ...bufferFiltered,
+      ]);
+    }
   }
 
   if (context.kind === "member") {
+    const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const vscodeFiltered = filterCompletionEntries(vscodeSessionItems, context.prefix);
+    const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
+    if (runtimeFiltered.length > 0) {
+      return dedupeCompletionEntries(runtimeFiltered);
+    }
     if (vscodeFiltered.length > 0) {
       return dedupeCompletionEntries(vscodeFiltered);
     }
-    return [];
+    return dedupeCompletionEntries(sessionFiltered);
+  }
+
+  const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
+  
+  if (context.dataObjectName && defaultColumnFiltered.length > 0) {
+    return dedupeCompletionEntries(filterCompletionEntries(
+      [...columnItems, ...lspItems, ...vscodeSessionItems, ...sessionItems, ...fallbackBufferItems],
+      context.prefix
+    ));
   }
 
   return dedupeCompletionEntries(filterCompletionEntries(
-    [...lspItems, ...vscodeSessionItems, ...fallbackBufferItems],
+    [...lspItems, ...vscodeSessionItems, ...sessionItems, ...fallbackBufferItems],
     context.prefix
   ));
 }
@@ -324,6 +412,80 @@ export function toCompletionPick(
     snapshotCursor: context.snapshotCursor,
     source: entry.source,
   };
+}
+
+function getSessionCompletions(
+  context: CompletionContext,
+  data: WorkspaceData | undefined
+): CompletionEntry[] {
+  if (!data || !data.globalenv) {
+    return [];
+  }
+
+  if ((context.kind === "member" || context.kind === "bracket") && context.objectName) {
+    if (context.kind === "member" && !TOP_LEVEL_SYMBOL_PATTERN.test(context.objectName)) {
+      return [];
+    }
+    const obj = data.globalenv[context.objectName];
+    if (!obj) {
+      return [];
+    }
+    const members =
+      context.kind === "bracket"
+        ? obj.names || []
+        : context.operator === "@"
+        ? obj.slots || []
+        : obj.names || [];
+    return members.map((name) => ({
+      label: name,
+      insertText: name,
+      kind: vscode.CompletionItemKind.Field,
+      detail: context.objectName,
+      source: "session",
+    }));
+  }
+
+  if (context.kind !== "default") {
+    return [];
+  }
+
+  return Object.entries(data.globalenv).map(([name, obj]) => {
+    const isFunction =
+      obj.type === "closure" ||
+      obj.type === "builtin" ||
+      /^\s*function\s*\(/.test(obj.str || "");
+    return {
+      label: name,
+      insertText: name,
+      kind: isFunction
+        ? vscode.CompletionItemKind.Function
+        : vscode.CompletionItemKind.Variable,
+      detail: "session",
+      source: "session",
+    };
+  });
+}
+
+function getDataColumnCompletions(
+  context: CompletionContext,
+  data: WorkspaceData | undefined
+): CompletionEntry[] {
+  if (!context.dataObjectName || !data?.globalenv) {
+    return [];
+  }
+
+  const obj = data.globalenv[context.dataObjectName];
+  if (!obj?.names || obj.names.length === 0) {
+    return [];
+  }
+
+  return obj.names.map((name) => ({
+    label: name,
+    insertText: name,
+    kind: vscode.CompletionItemKind.Field,
+    detail: context.dataObjectName,
+    source: "session" as const,
+  }));
 }
 
 function getConsoleBufferCompletions(
@@ -376,6 +538,49 @@ function getConsoleBufferCompletions(
   return result;
 }
 
+async function getRuntimeMemberCompletions(
+  context: CompletionContext,
+  completionProvider?: CompletionProvider
+): Promise<CompletionEntry[]> {
+  if (
+    context.kind !== "member" ||
+    !context.objectName ||
+    !context.operator ||
+    !completionProvider?.provideMemberCompletionItems
+  ) {
+    return [];
+  }
+
+  try {
+    const items = await completionProvider.provideMemberCompletionItems(
+      context.objectName,
+      context.operator
+    );
+    if (!items || items.length === 0) {
+      return [];
+    }
+    return items
+      .filter((item) => typeof item.name === "string" && item.name.length > 0)
+      .map((item) => {
+        const isFunction =
+          item.type === "closure" ||
+          item.type === "builtin" ||
+          /^\s*function\s*\(/.test(item.str || "");
+        return {
+          label: item.name,
+          insertText: item.name,
+          kind: isFunction
+            ? vscode.CompletionItemKind.Function
+            : vscode.CompletionItemKind.Field,
+          detail: context.objectName,
+          source: "session" as const,
+        };
+      });
+  } catch {
+    return [];
+  }
+}
+
 async function getVscodeRSessionCompletions(
   context: CompletionContext,
   doc: vscode.TextDocument,
@@ -395,12 +600,7 @@ async function getVscodeRSessionCompletions(
     );
     const items = Array.isArray(result) ? result : result?.items || [];
     return items
-      .filter((item) => {
-        if (item.kind === vscode.CompletionItemKind.Text) {
-          return false;
-        }
-        return true;
-      })
+      .filter((item) => item.kind !== vscode.CompletionItemKind.Text)
       .map((item) => ({
         label: stripSnippetSyntax(getCompletionLabel(item)),
         insertText: getCompletionInsertText(item),
