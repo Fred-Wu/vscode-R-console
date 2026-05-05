@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as net from "net";
+import * as os from "os";
 import * as path from "path";
 import { setNativeParseCallback, stripCommentLines } from "../../Language/parser";
 import {
@@ -51,6 +53,11 @@ export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "close
 export type Submission = {
   code: string;
   initialPromptKind: "main" | "cont";
+};
+
+export type VscodeRSessionConnection = {
+  port: string;
+  token: string;
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
@@ -105,6 +112,8 @@ export type RuntimeHost = {
   getDisplayPid(): number | undefined;
   notifyDisplayPidChanged(): void;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
+  vscodeRSessionReconnectPending: boolean;
+  vscodeRSessionActivationPending: boolean;
 };
 
 export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">): string {
@@ -136,8 +145,428 @@ function getConsoleProfilePath(extensionPath: string): string {
   return path.join(extensionPath, "resources", "r", "console-profile.R");
 }
 
-export function startRuntime(host: RuntimeHost): void {
+const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
+const SESS_CONNECT_PATTERN =
+  /sess::connect\s*\(\s*port\s*=\s*([0-9]+)\s*,\s*token\s*=\s*(["'])(.*?)\2\s*\)/;
+const SESS_ASYNC_PROMPT_PATTERN = /(\r?\[sess\][^\r\n]*)(?:\r\n|\n){2}> ?/g;
+const SESS_RECONNECT_NOISE_PATTERN =
+  /\r?\[sess\] (?:WebSocket error: Connection refused|Disconnected from VS Code\. Retrying in 5 seconds\.\.\.)(?:\r\n|\n)?/g;
+const vscodeRSessionConnections = new WeakMap<RuntimeHost, VscodeRSessionConnection>();
+const vscodeRSessionConnectionRefreshes = new WeakMap<
+  RuntimeHost,
+  Promise<VscodeRSessionConnection | undefined>
+>();
+const vscodeRSessionFiles = new WeakMap<RuntimeHost, string>();
+const vscodeRSessionReconnectInFlight = new WeakSet<RuntimeHost>();
+const vscodeRSessionReconnectNoiseUntil = new WeakMap<RuntimeHost, number>();
+
+function clearVscodeRSessionConnection(host: RuntimeHost): void {
+  vscodeRSessionConnections.delete(host);
+}
+
+function parseSessConnectCommand(command: string): VscodeRSessionConnection | undefined {
+  const match = SESS_CONNECT_PATTERN.exec(command);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    port: match[1],
+    token: match[3],
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isLivePid(pid: number | undefined): pid is number {
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pruneStaleVscodeRSessionFiles(): Promise<void> {
+  const sessionsDir = path.join(os.homedir(), ".vscode-R", "sessions");
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(sessionsDir);
+  } catch {
+    return;
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.endsWith(".json")) {
+      return;
+    }
+    const pid = Number.parseInt(path.basename(entry, ".json"), 10);
+    const filePath = path.join(sessionsDir, entry);
+    let stale = !isLivePid(pid);
+    if (!stale) {
+      try {
+        const raw = await fs.promises.readFile(filePath, "utf8");
+        const parsed = JSON.parse(raw) as { port?: unknown };
+        const port = typeof parsed.port === "number" ? parsed.port : Number(parsed.port);
+        stale = !Number.isFinite(port) || port <= 0 || !(await canConnectToPort(port));
+      } catch {
+        stale = true;
+      }
+    }
+    if (!stale) {
+      return;
+    }
+    await fs.promises.rm(filePath, { force: true }).catch(() => undefined);
+  }));
+}
+
+function canConnectToPort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+
+    const done = (value: boolean): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+
+    socket.setTimeout(250);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+async function waitForVscodeRSessionPort(
+  connection: VscodeRSessionConnection,
+  timeoutMs = 2500
+): Promise<boolean> {
+  const port = Number(connection.port);
+  if (!Number.isFinite(port) || port <= 0) {
+    return false;
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await canConnectToPort(port)) {
+      return true;
+    }
+    await sleep(50);
+  }
+  return false;
+}
+
+async function readClipboardText(): Promise<string | undefined> {
+  try {
+    return await vscode.env.clipboard.readText();
+  } catch {
+    return undefined;
+  }
+}
+
+async function getVscodeRSessionConnection(): Promise<VscodeRSessionConnection | undefined> {
+  await pruneStaleVscodeRSessionFiles();
+
+  const extension = vscode.extensions.getExtension(VSCODE_R_EXTENSION_ID);
+  if (!extension) {
+    return undefined;
+  }
+
+  try {
+    if (!extension.isActive) {
+      await extension.activate();
+    }
+  } catch {
+  }
+
+  const previousClipboard = await readClipboardText();
+  const clipboardProbe = `__vscode_r_console_session_probe_${Date.now()}_${Math.random()}__`;
+
+  try {
+    await vscode.env.clipboard.writeText(clipboardProbe);
+  } catch {
+    return undefined;
+  }
+
+  try {
+    await vscode.commands.executeCommand("r.connectToSession");
+  } catch {
+    if (previousClipboard !== undefined) {
+      void vscode.env.clipboard.writeText(previousClipboard);
+    }
+    return undefined;
+  }
+
+  let connection: VscodeRSessionConnection | undefined;
+  let currentClipboard = "";
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 1000) {
+    currentClipboard = (await readClipboardText()) ?? "";
+    if (currentClipboard === clipboardProbe) {
+      await sleep(50);
+      continue;
+    }
+    connection = parseSessConnectCommand(currentClipboard);
+    if (connection) {
+      break;
+    }
+    await sleep(50);
+  }
+
+  if (previousClipboard !== undefined && currentClipboard !== previousClipboard) {
+    void vscode.env.clipboard.writeText(previousClipboard);
+  }
+
+  if (connection && !(await waitForVscodeRSessionPort(connection))) {
+    return undefined;
+  }
+
+  return connection;
+}
+
+function asRLogical(value: boolean | undefined, defaultValue: boolean): string {
+  return (value ?? defaultValue) ? "TRUE" : "FALSE";
+}
+
+function quoteRString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function buildSessConnectCommand(connection: VscodeRSessionConnection): string {
+  const rConfig = vscode.workspace.getConfiguration("r");
+  return [
+    "if (requireNamespace(\"sess\", quietly = TRUE)) {",
+    "sess::connect(",
+    `port=${connection.port},`,
+    `token=${quoteRString(connection.token)},`,
+    `use_rstudioapi=${asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true)},`,
+    `use_httpgd=${asRLogical(rConfig.get<boolean>("plot.useHttpgd"), true)}`,
+    ")",
+    "}",
+  ].join(" ");
+}
+
+function buildSessAttachNotificationCommand(): string {
+  return [
+    "if (requireNamespace(\"sess\", quietly = TRUE)) {",
+    "sess::notify_client(\"attach\", list(",
+    "version=sprintf(\"%s.%s\", R.version$major, R.version$minor),",
+    "pid=Sys.getpid(),",
+    "tempdir=file.path(tempdir(), \"sess\"),",
+    "wd=getwd(),",
+    "info=list(command=commandArgs()[[1L]], version=R.version.string, start_time=format(Sys.time()))",
+    "))",
+    "}",
+  ].join(" ");
+}
+
+async function configureVscodeRSessionBootstrap(
+  env: NodeJS.ProcessEnv
+): Promise<VscodeRSessionConnection | undefined> {
+  const connection = await getVscodeRSessionConnection();
+  if (!connection) {
+    void vscode.window.showWarningMessage(
+      "R Console could not obtain vscode-R session connection info. The console will start without vscode-R session attachment."
+    );
+    return undefined;
+  }
+
+  env.SESS_PORT = connection.port;
+  env.SESS_TOKEN = connection.token;
+  const rConfig = vscode.workspace.getConfiguration("r");
+  env.SESS_RSTUDIOAPI = asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true);
+  env.SESS_USE_HTTPGD = asRLogical(rConfig.get<boolean>("plot.useHttpgd"), true);
+  delete env.SESS_HOST;
+  return connection;
+}
+
+async function resolveCurrentVscodeRSessionConnection(
+  host: RuntimeHost
+): Promise<VscodeRSessionConnection | undefined> {
+  const existing = vscodeRSessionConnections.get(host);
+  if (existing && await waitForVscodeRSessionPort(existing)) {
+    return existing;
+  }
+
+  let refresh = vscodeRSessionConnectionRefreshes.get(host);
+  if (!refresh) {
+    refresh = getVscodeRSessionConnection().finally(() => {
+      vscodeRSessionConnectionRefreshes.delete(host);
+    });
+    vscodeRSessionConnectionRefreshes.set(host, refresh);
+  }
+
+  const connection = await refresh;
+  if (!connection) {
+    return undefined;
+  }
+
+  vscodeRSessionConnections.set(host, connection);
+  return connection;
+}
+
+async function writeVscodeRSessionFile(
+  host: RuntimeHost,
+  pid: number,
+  connection: VscodeRSessionConnection
+): Promise<void> {
+  const port = Number(connection.port);
+  if (!Number.isFinite(port) || port <= 0 || !connection.token) {
+    return;
+  }
+  if (!(await waitForVscodeRSessionPort(connection))) {
+    return;
+  }
+
+  const filePath = path.join(os.homedir(), ".vscode-R", "sessions", `${pid}.json`);
+  try {
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.promises.writeFile(
+      filePath,
+      JSON.stringify({ port, token: connection.token }),
+      "utf8"
+    );
+    vscodeRSessionFiles.set(host, filePath);
+  } catch {
+  }
+}
+
+function persistVscodeRSessionConnection(host: RuntimeHost, pid: number): void {
+  if (!isLivePid(pid)) {
+    return;
+  }
+  const connection = vscodeRSessionConnections.get(host);
+  if (!connection) {
+    return;
+  }
+  void writeVscodeRSessionFile(host, pid, connection);
+}
+
+async function refreshVscodeRSessionConnection(host: RuntimeHost): Promise<void> {
+  if (!host.options.sessionWatcherEnabled) {
+    return;
+  }
+
+  const pid = isLivePid(host.backendChildPid)
+    ? host.backendChildPid
+    : host.runtimeBackend?.getPid(host.rProcess);
+
+  const connection = await resolveCurrentVscodeRSessionConnection(host);
+  if (!connection) {
+    return;
+  }
+
+  if (isLivePid(pid)) {
+    await writeVscodeRSessionFile(host, pid, connection);
+  }
+}
+
+function canSubmitHiddenRuntimeCommand(host: RuntimeHost): boolean {
+  return Boolean(
+    host.mode === "ready" &&
+    host.promptReady &&
+    host.promptKind === "main" &&
+    host.activeSubmission === null &&
+    !host.submissionPending &&
+    host.inputState.text.length === 0 &&
+    host.runtimeBackend?.canUseSessionCommands(host.rProcess)
+  );
+}
+
+function submitHiddenRuntimeCommand(host: RuntimeHost, code: string): boolean {
+  const sent = host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code,
+  }) ?? false;
+  if (!sent) {
+    return false;
+  }
+
+  host.clearPromptRenderTimer();
+  if (host.promptVisible) {
+    host.clearInputRender();
+    host.promptVisible = false;
+  }
+  host.pendingPromptToken = false;
+  if (host.mode !== "closed") {
+    host.mode = "executing";
+  }
+  return true;
+}
+
+export function activateRuntimeVscodeRSession(host: RuntimeHost): void {
+  if (!host.options.sessionWatcherEnabled) {
+    return;
+  }
+  host.vscodeRSessionActivationPending = true;
+  flushRuntimeVscodeRSessionActivation(host);
+}
+
+function flushRuntimeVscodeRSessionActivation(host: RuntimeHost): void {
+  if (!host.vscodeRSessionActivationPending || !canSubmitHiddenRuntimeCommand(host)) {
+    return;
+  }
+  if (submitHiddenRuntimeCommand(host, buildSessAttachNotificationCommand())) {
+    host.vscodeRSessionActivationPending = false;
+  }
+}
+
+async function reconnectVscodeRSessionForRestoredRuntime(host: RuntimeHost): Promise<void> {
+  if (!host.vscodeRSessionReconnectPending || !host.options.sessionWatcherEnabled) {
+    return;
+  }
+  if (vscodeRSessionReconnectInFlight.has(host)) {
+    return;
+  }
+  if (!host.runtimeBackend?.canUseSessionCommands(host.rProcess)) {
+    return;
+  }
+
+  vscodeRSessionReconnectNoiseUntil.set(host, Date.now() + 10000);
+  vscodeRSessionReconnectInFlight.add(host);
+  try {
+    const connection = await resolveCurrentVscodeRSessionConnection(host);
+    if (!connection) {
+      return;
+    }
+
+    const pid = isLivePid(host.backendChildPid)
+      ? host.backendChildPid
+      : host.runtimeBackend.getPid(host.rProcess);
+    if (isLivePid(pid)) {
+      await writeVscodeRSessionFile(host, pid, connection);
+    }
+
+    if (submitHiddenRuntimeCommand(host, buildSessConnectCommand(connection))) {
+      host.vscodeRSessionReconnectPending = false;
+    }
+  } finally {
+    vscodeRSessionReconnectInFlight.delete(host);
+  }
+}
+
+function removeVscodeRSessionFile(host: RuntimeHost): void {
+  const filePath = vscodeRSessionFiles.get(host);
+  vscodeRSessionFiles.delete(host);
+  clearVscodeRSessionConnection(host);
+  if (!filePath) {
+    return;
+  }
+  void fs.promises.rm(filePath, { force: true }).catch(() => undefined);
+}
+
+export async function startRuntime(host: RuntimeHost): Promise<void> {
   pendingRuntimeRewrites.delete(host);
+  clearVscodeRSessionConnection(host);
+  vscodeRSessionFiles.delete(host);
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.lang.stopConsoleLsp();
@@ -160,6 +589,8 @@ export function startRuntime(host: RuntimeHost): void {
   host.backendChildPid = undefined;
   host.sessionAttached = false;
   host.sessionHostConnected = false;
+  host.vscodeRSessionReconnectPending = false;
+  host.vscodeRSessionActivationPending = false;
 
   if (!host.runtimeBackend) {
     const expectedPath = host.extensionPath ? getBundledRustSidecarPath(host.extensionPath) : "";
@@ -172,11 +603,14 @@ export function startRuntime(host: RuntimeHost): void {
   }
 
   try {
-    if (host.options.sessionWatcherEnabled) {
-      fs.mkdirSync(host.options.watcherDir, { recursive: true });
-    }
     const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
+    if (host.options.sessionWatcherEnabled) {
+      const connection = await configureVscodeRSessionBootstrap(runtimeEnv);
+      if (connection) {
+        vscodeRSessionConnections.set(host, connection);
+      }
+    }
     if (host.extensionPath) {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
       runtimeEnv.VSC_R_COLS = String(Math.max(20, host.dimensions.columns || 80));
@@ -215,22 +649,14 @@ export function startRuntime(host: RuntimeHost): void {
 export function primeRuntimeAttach(
   host: RuntimeHost
 ): void {
-  if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
-    return;
-  }
-
-  const runtimePid = host.runtimeBackend?.getPid(host.rProcess) ?? host.getDisplayPid();
-  if (typeof runtimePid === "number" && Number.isFinite(runtimePid) && runtimePid > 0) {
-    host.sessionWatcher.setExpectedPid(runtimePid);
-  }
-
-  beginRuntimeAttach(host);
+  host.sessionAttached = true;
 }
 
 export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boolean = false): void {
   if (!host.runtimeBackend || !host.rProcess) {
     return;
   }
+  void refreshVscodeRSessionConnection(host);
   if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
     host.sessionAttached = true;
   }
@@ -271,11 +697,13 @@ function beginRuntimeAttach(host: RuntimeHost): void {
   }
 
   host.sessionWatcher.onAttach(() => onRuntimeAttached(host));
-  host.sessionWatcher.start();
-  host.sessionWatcher.refresh();
-  if (host.sessionWatcher.isAttached()) {
-    onRuntimeAttached(host);
-  }
+  void (async () => {
+    await host.sessionWatcher?.start();
+    host.sessionWatcher?.refresh();
+    if (host.sessionWatcher?.isAttached()) {
+      onRuntimeAttached(host);
+    }
+  })();
 }
 
 function onRuntimeAttached(host: RuntimeHost): void {
@@ -320,10 +748,25 @@ export function handleRuntimeControl(
       return;
     case "host-connected":
       host.sessionHostConnected = true;
+      {
+        const pid = isLivePid(host.backendChildPid)
+          ? host.backendChildPid
+          : host.runtimeBackend?.getPid(host.rProcess);
+        if (isLivePid(pid)) {
+          persistVscodeRSessionConnection(host, pid);
+        }
+      }
       updateNativeParseCallback(host);
+      if (host.vscodeRSessionReconnectPending) {
+        void refreshVscodeRSessionConnection(host);
+      }
       return;
     case "prompt":
       handleBackendPrompt(host, event.kind);
+      if (event.kind === "main") {
+        void reconnectVscodeRSessionForRestoredRuntime(host);
+        flushRuntimeVscodeRSessionActivation(host);
+      }
       return;
     case "busy":
       if (event.value) {
@@ -390,6 +833,7 @@ function applyRuntimeSessionState(
   if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
     host.backendChildPid = event.pid;
     updateRuntimeTerminalName(host);
+    persistVscodeRSessionConnection(host, event.pid);
     if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
       host.sessionWatcher.setExpectedPid(event.pid);
     }
@@ -420,6 +864,10 @@ function applyRuntimeSessionState(
       }
       if (!host.promptVisible) {
         host.pendingPromptToken = true;
+      }
+      if (event.wait.prompt === "main") {
+        void reconnectVscodeRSessionForRestoredRuntime(host);
+        flushRuntimeVscodeRSessionActivation(host);
       }
       return;
     case "nested":
@@ -782,7 +1230,10 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
     return;
   }
 
-  const formatted = formatViewOutput(text);
+  const formatted = filterSessRuntimeOutput(host, formatViewOutput(text));
+  if (!formatted) {
+    return;
+  }
   renderRuntimeText(host, formatted, didOutputEndWithLineFeed(formatted));
 }
 
@@ -896,6 +1347,17 @@ function writeRuntimeText(
     host.pendingPromptToken = true;
     host.schedulePrompt();
   }
+}
+
+function filterSessRuntimeOutput(host: RuntimeHost, text: string): string {
+  let filtered = text.replace(SESS_ASYNC_PROMPT_PATTERN, "$1\r\n");
+  const suppressReconnectNoise =
+    host.vscodeRSessionReconnectPending ||
+    (vscodeRSessionReconnectNoiseUntil.get(host) ?? 0) > Date.now();
+  if (suppressReconnectNoise) {
+    filtered = filtered.replace(SESS_RECONNECT_NOISE_PATTERN, "");
+  }
+  return filtered;
 }
 
 function shouldPrefixPendingCarriageReturn(text: string): boolean {
@@ -1229,6 +1691,7 @@ export function interruptRuntime(host: RuntimeHost): void {
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
+  removeVscodeRSessionFile(host);
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();

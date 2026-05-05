@@ -54,6 +54,7 @@ import {
   type TerminalMode,
   sendRuntimeReply,
   startRuntime,
+  activateRuntimeVscodeRSession,
 } from "./rTerminal/runtime";
 
 export { resolveRTerminalOptions } from "./options";
@@ -176,6 +177,8 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private runtimeBackend: RuntimeBackend | undefined;
   private sessionHostConnected = false;
+  private vscodeRSessionReconnectPending = false;
+  private vscodeRSessionActivationPending = false;
 
   private promptReady = false;
   promptKind: "main" | "cont" = "main";
@@ -236,6 +239,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = this.resolveRuntimeBackend();
+    this.vscodeRSessionReconnectPending = Boolean(restoreState?.runtime && options.sessionWatcherEnabled);
     this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
@@ -568,6 +572,18 @@ export class RTerminal implements vscode.Pseudoterminal {
       getDisplayPid: () => self.getDisplayPid(),
       notifyDisplayPidChanged: () => self.notifyDisplayPidChanged(),
       onSessionDataChanged: (data) => self.onSessionDataChanged(data),
+      get vscodeRSessionReconnectPending() {
+        return self.vscodeRSessionReconnectPending;
+      },
+      set vscodeRSessionReconnectPending(value) {
+        self.vscodeRSessionReconnectPending = value;
+      },
+      get vscodeRSessionActivationPending() {
+        return self.vscodeRSessionActivationPending;
+      },
+      set vscodeRSessionActivationPending(value) {
+        self.vscodeRSessionActivationPending = value;
+      },
     };
 
     return host;
@@ -1671,11 +1687,15 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private startR(): void {
-    startRuntime(this.runtimeHost());
+    void startRuntime(this.runtimeHost());
   }
 
   finishActiveSubmission(): void {
     finishRuntimeSubmission(this.runtimeHost());
+  }
+
+  activateVscodeRSession(): void {
+    activateRuntimeVscodeRSession(this.runtimeHost());
   }
 
   private async enqueueRSubmission(

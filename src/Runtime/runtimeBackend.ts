@@ -404,7 +404,13 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return undefined;
     }
     this.refreshReconnectInfo(state);
-    return state.reconnectInfo.pid ?? state.child?.pid;
+    if (isRuntimeSessionPidAlive(state.reconnectInfo.pid)) {
+      return state.reconnectInfo.pid;
+    }
+    if (isRuntimeSessionPidAlive(state.child?.pid)) {
+      return state.child?.pid;
+    }
+    return undefined;
   }
 
   getReconnectInfo(session: RuntimeSessionHandle | null): RuntimeSessionReconnectInfo | undefined {

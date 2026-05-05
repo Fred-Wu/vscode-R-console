@@ -566,30 +566,10 @@ function sanitizeRArgs(): string[] {
   return args;
 }
 
-function requireVscodeRSessionInitPath(): string | undefined {
-  const extension = vscode.extensions.getExtension("REditorSupport.r");
-  const extensionPath = extension?.extensionPath;
-  if (!extensionPath) {
-    void vscode.window.showErrorMessage(
-      "R Console requires the vscode-R extension (REditorSupport.r), but it is not available."
-    );
-    return undefined;
-  }
-  const initPath = path.join(extensionPath, "R", "session", "init.R");
-  if (!fs.existsSync(initPath)) {
-    void vscode.window.showErrorMessage(
-      `R Console requires vscode-R session bootstrap, but init.R was not found at ${initPath}.`
-    );
-    return undefined;
-  }
-  return initPath;
-}
-
 function buildRuntimeEnv(
   rPath: string,
   rHome: string | undefined,
-  startup: RStartupOptions,
-  initPath: string
+  startup: RStartupOptions
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -608,7 +588,6 @@ function buildRuntimeEnv(
     configureRRuntimeEnv(env, rHome, startup);
   }
 
-  env.VSCODE_INIT_R = initPath;
   env.VSCODE_WATCHER_DIR = SESSION_WATCHER_DIR;
 
   env.VSC_R_EXECUTABLE = rPath;
@@ -637,11 +616,7 @@ export function resolveRTerminalOptions(): RTerminalOptions | undefined {
     return undefined;
   }
 
-  const initPath = requireVscodeRSessionInitPath();
-  if (!initPath) {
-    return undefined;
-  }
-  const env = buildRuntimeEnv(rPath, rHome, startup, initPath);
+  const env = buildRuntimeEnv(rPath, rHome, startup);
 
   return {
     rPath,

@@ -974,6 +974,7 @@ function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void
     return;
   }
   syncTerminalRecord(terminal);
+  resolveRecordFromTerminal(terminal)?.rTerminal.activateVscodeRSession();
 }
 
 function resolveRecordFromTerminal(

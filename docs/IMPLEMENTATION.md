@@ -17,7 +17,7 @@ is used as a dependency.
 
 | Project | What is referenced or used | Where it appears here |
 | --- | --- | --- |
-| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used directly for R executable settings, `R/session/init.R`, watcher files, attach/session metadata, and optional session-server member completion. | `src/Terminal/options.ts`, `resources/r/console-profile.R`, `src/Runtime/sessionWatcher.ts` |
+| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings and the JSON-RPC session protocol used for attach metadata, workspace data, and member completion. | `src/Terminal/options.ts`, `resources/r/console-profile.R`, `src/Runtime/sessionWatcher.ts` |
 | [`arf`](https://github.com/eitsupi/arf) | Reference for Rust embedded-R host structure, dynamic R loading, platform-specific R initialization, callback wiring, generic event/input-handler pumping, and interrupt state handling. | `sidecar/pty-host/src/host.rs` |
 | [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
 | [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
@@ -454,18 +454,22 @@ The same selected R executable is used for:
 - the embedded backend
 - the console `languageserver` process
 
-### 3.2 Startup Bootstrap From `vscode-R`
+### 3.2 Startup Bootstrap
 
-The console requires:
+When `r.sessionWatcher` is enabled, `SessionWatcher` starts a per-console
+WebSocket server on the loopback interface, generates a token, and contributes the
+following environment variables to the embedded R launch:
 
-- `REditorSupport.r/R/session/init.R`
+- `SESS_HOST`
+- `SESS_PORT`
+- `SESS_TOKEN`
 
-`options.ts` resolves the installed `REditorSupport.r` extension path through
-the VS Code extension API. Startup is rejected if `init.R` is missing.
+The server speaks JSON-RPC 2.0 over WebSocket and intentionally handles only
+console-scoped session metadata. Plot viewers, data viewers, help viewers,
+browser viewers, and httpgd remain outside the console's ownership.
 
 The backend launch environment includes:
 
-- `VSCODE_INIT_R`
 - `VSCODE_WATCHER_DIR`
 - `R_PROFILE_USER_OLD`
 - `VSC_R_EXECUTABLE`
@@ -482,41 +486,44 @@ At launch time, `rTerminal/runtime.ts` also sets:
 
 1. restores and sources the user's original profile through
    `R_PROFILE_USER_OLD`
-2. sources `VSCODE_INIT_R`
-3. for R 4.6 compatibility, bridges vscode-R's legacy global `.First.sys`
-   deferred attach hook through `.First` when `VSCODE_INIT_R` installs it,
-   preserving user `.First()` startup logic before vscode-R attach
+2. starts a minimal WebSocket JSON-RPC client when `SESS_HOST`, `SESS_PORT`,
+   and `SESS_TOKEN` are present
+3. implements only the console metadata methods: attach notification,
+   `workspace`, `completion`, and `workspace_updated`
 4. installs the console pager
 5. locks the prompt options used by the embedded console contract
 
-### 3.3 Session Watcher Metadata
+### 3.3 Session Metadata
 
-`SessionWatcher` reads files produced by `vscode-R` under
-`VSCODE_WATCHER_DIR`.
+`SessionWatcher` no longer reads the legacy `request.log`, `workspace.lock`,
+or `workspace.json` files. It receives JSON-RPC notifications and sends
+JSON-RPC pull requests over the active WebSocket.
 
-It watches:
+Notifications consumed from R:
 
-- root `request.lock`
-- root `request.log`
-- session `workspace.lock`
-- session `workspace.json`
-- the attached session directory until workspace state appears
+- `attach`
+- `detach`
+- `workspace_updated`
 
-From `request.log`, it reads:
+Requests sent to R:
 
-- attach/detach commands
-- R session tempdir
-- R session pid
-- optional session server host/port/token
+- `workspace`
+- `completion`
 
-From `workspace.json`, it reads:
+The `workspace` response provides:
 
 - search path
 - loaded namespaces
 - global environment summary
 
-The watcher can auto-pin to the first fresh attach event when the backend pid is
-not known yet. Once pinned, it ignores attach events from other R sessions.
+The `completion` response provides runtime `$` and `@` members for an
+expression.
+
+For reconnect, `SessionWatcher` writes the current `{ port, token }` to
+`~/.vscode-R/sessions/{PID}.json`. The R-side bridge can read that file after
+a window reload or terminal detach and reconnect to the replacement console
+server. The console still persists and restores its own Rust backend session;
+the discovery file is only the metadata bridge.
 
 ### 3.4 Metadata Consumers
 
@@ -525,12 +532,12 @@ The console consumes watcher metadata for:
 - display pid selection
 - search-path aware completion
 - global-environment completion
-- `$` and `@` member completion through the `vscode-R` session server when
-  available
+- `$` and `@` member completion through the `completion` request
 - attached package and namespace sync into the console LSP
 
-This integration is read-only with respect to `vscode-R` sessions. The console
-does not create, replace, restore, or stop `vscode-R` sessions.
+This integration is read-only with respect to broader `vscode-R` session
+features. The console does not create, replace, restore, or stop vscode-R plot,
+data, help, browser, httpgd, or addin sessions.
 
 ## 4. Self-managed Console
 
