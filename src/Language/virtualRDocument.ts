@@ -45,7 +45,6 @@ export class VirtualRDocument {
       if (remaining <= lineLen) {
         return new vscode.Position(line, remaining);
       }
-      // Account for newline char.
       remaining -= lineLen + 1;
     }
     const last = lines.length - 1;

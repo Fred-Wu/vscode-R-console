@@ -550,6 +550,7 @@ separate from the `vscode-R` session watcher.
 - `start(args, options)`
 - `reconnect(info)`
 - `attach(session, handlers)`
+- `detach(session)`
 - `sendSessionCommand(session, command)`
 - `requestParseStatus(session, code)`
 - `close(session)`
@@ -585,10 +586,7 @@ snapshot.
 
 ### 4.3 Registry Loading And Pruning
 
-On activation, `extension.ts` loads:
-
-- `persistent-sessions.json`
-- legacy `reload-sessions.json`
+On activation, `extension.ts` loads `persistent-sessions.json`.
 
 Records are validated before use. A record is kept only when:
 
@@ -628,7 +626,11 @@ Attaching a detached console follows this implementation path:
 
 No new embedded R backend is started for a reconnect.
 
-### 4.6 Closing A Managed Console
+### 4.6 Detaching Or Closing A Managed Console
+
+Attached console detach persists the latest reconnect/UI state, disconnects the
+frontend socket, disposes the VS Code terminal UI, and leaves the backend session
+running for the next session-manager attach.
 
 Attached console close uses the active `RTerminal` and active runtime session.
 

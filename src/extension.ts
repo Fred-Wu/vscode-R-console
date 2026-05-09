@@ -43,7 +43,7 @@ type ManagedPersistentSession = {
 };
 
 type ManageAction = vscode.QuickPickItem & {
-  action: "attach" | "attachAll" | "close" | "closeAll" | "refresh";
+  action: "attach" | "attachAll" | "detach" | "detachAll" | "close" | "closeAll" | "refresh";
 };
 
 type ManagedSessionPick = vscode.QuickPickItem & {
@@ -63,7 +63,6 @@ const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_HEARTBEAT_MS = 5000;
 let extensionBaseUri: vscode.Uri | undefined;
 let persistentSessionFilePath: string | undefined;
-let legacyReloadSessionFilePath: string | undefined;
 let persistDebounceTimer: NodeJS.Timeout | undefined;
 let persistHeartbeatTimer: NodeJS.Timeout | undefined;
 let extensionHostDeactivating = false;
@@ -91,10 +90,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   persistentSessionFilePath = vscode.Uri.joinPath(
     sessionStorageUri,
     "persistent-sessions.json"
-  ).fsPath;
-  legacyReloadSessionFilePath = vscode.Uri.joinPath(
-    sessionStorageUri,
-    "reload-sessions.json"
   ).fsPath;
   void fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true }).catch(() => {});
   await initializePersistentSessionRegistry();
@@ -146,11 +141,8 @@ async function initializePersistentSessionRegistry(): Promise<void> {
 async function loadPersistentSessionsFromDisk(): Promise<PersistedConsoleRecord[]> {
   const records = new Map<string, PersistedConsoleRecord>();
 
-  for (const filePath of [persistentSessionFilePath, legacyReloadSessionFilePath]) {
-    if (!filePath) {
-      continue;
-    }
-    for (const entry of await readPersistentSessionFile(filePath)) {
+  if (persistentSessionFilePath) {
+    for (const entry of await readPersistentSessionFile(persistentSessionFilePath)) {
       records.set(entry.terminal.runtime.sessionId, entry);
     }
   }
@@ -174,11 +166,9 @@ async function readPersistentSessionFile(filePath: string): Promise<PersistedCon
 }
 
 async function removePersistentSessionFiles(): Promise<void> {
-  await Promise.all(
-    [persistentSessionFilePath, legacyReloadSessionFilePath]
-      .filter((filePath): filePath is string => typeof filePath === "string")
-      .map((filePath) => fs.promises.rm(filePath, { force: true }).catch(() => {}))
-  );
+  if (persistentSessionFilePath) {
+    await fs.promises.rm(persistentSessionFilePath, { force: true }).catch(() => {});
+  }
 }
 
 function buildPersistentTerminalOptions(
@@ -263,12 +253,7 @@ function parsePersistentSessionState(value: unknown): PersistedConsoleRecord[] |
   if (!isObjectRecord(value)) {
     return undefined;
   }
-  const sessions =
-    Array.isArray(value.sessions)
-      ? value.sessions
-      : Array.isArray(value.consoles)
-        ? value.consoles
-        : undefined;
+  const sessions = Array.isArray(value.sessions) ? value.sessions : undefined;
   if (!sessions || !sessions.every(isPersistedConsoleRecord)) {
     return undefined;
   }
@@ -506,6 +491,22 @@ async function managePersistentSessions(context: vscode.ExtensionContext): Promi
       return;
     }
 
+    if (action.action === "detachAll") {
+      detachPersistentSessions(sessions.filter((session) => session.attached));
+      return;
+    }
+
+    if (action.action === "detach") {
+      const selected = await pickPersistentSessions(
+        sessions.filter((session) => session.attached),
+        "Select persistent R console sessions to detach"
+      );
+      if (selected.length > 0) {
+        detachPersistentSessions(selected);
+      }
+      return;
+    }
+
     if (action.action === "closeAll") {
       await closePersistentSessions(sessions, context);
       return;
@@ -585,6 +586,7 @@ async function pickManageAction(
   sessions: readonly ManagedPersistentSession[]
 ): Promise<ManageAction | undefined> {
   const detachedCount = sessions.filter((session) => !session.attached).length;
+  const attachedCount = sessions.length - detachedCount;
   const actions: ManageAction[] = [];
 
   if (detachedCount > 0) {
@@ -598,6 +600,21 @@ async function pickManageAction(
         label: "Attach All Detached Sessions",
         description: `${detachedCount} detached`,
         action: "attachAll",
+      }
+    );
+  }
+
+  if (attachedCount > 0) {
+    actions.push(
+      {
+        label: "Detach Session...",
+        description: `${attachedCount} attached`,
+        action: "detach",
+      },
+      {
+        label: "Detach All Attached Sessions",
+        description: `${attachedCount} attached`,
+        action: "detachAll",
       }
     );
   }
@@ -672,6 +689,45 @@ async function attachPersistentSessions(
     attachTerminal(record, true);
   }
   schedulePersistPersistentSessions();
+}
+
+function detachPersistentSessions(sessions: readonly ManagedPersistentSession[]): void {
+  for (const session of sessions) {
+    if (session.attachedRecord) {
+      detachConsoleRecord(session.attachedRecord);
+    }
+  }
+  persistPersistentSessions();
+}
+
+function detachConsoleRecord(record: ConsoleRecord): void {
+  const pid = record.pid;
+  const location = record.location;
+  const terminalToDispose = record.terminal;
+  const persistedTerminal = record.rTerminal.detachPersistentSession();
+  if (!persistedTerminal) {
+    return;
+  }
+
+  persistentSessionRecords.set(persistedTerminal.runtime.sessionId, {
+    terminal: persistedTerminal,
+    location,
+  });
+
+  if (terminalToDispose) {
+    ignoredTerminalCloseEvents.add(terminalToDispose);
+    if (typeof pid === "number") {
+      ignoredEditorClosePids.add(pid);
+      setTimeout(() => {
+        ignoredEditorClosePids.delete(pid);
+      }, 1000);
+    }
+  }
+
+  disposeConsoleRecord(record);
+  if (terminalToDispose) {
+    terminalToDispose.dispose();
+  }
 }
 
 function revealConsoleRecord(record: ConsoleRecord): void {
@@ -1239,9 +1295,6 @@ function persistPersistentSessions(): void {
   if (persisted.length === 0) {
     try {
       fs.rmSync(persistentSessionFilePath, { force: true });
-      if (legacyReloadSessionFilePath) {
-        fs.rmSync(legacyReloadSessionFilePath, { force: true });
-      }
     } catch {
     }
     return;
@@ -1255,9 +1308,6 @@ function persistPersistentSessions(): void {
       sessions: persisted,
     };
     fs.writeFileSync(persistentSessionFilePath, JSON.stringify(sessionState), "utf8");
-    if (legacyReloadSessionFilePath) {
-      fs.rmSync(legacyReloadSessionFilePath, { force: true });
-    }
   } catch {
   }
 }
