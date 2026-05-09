@@ -22,7 +22,6 @@ export type KeyAction =
   | { type: "paste-end" }
   | { type: "text"; text: string };
 
-// CSI sequences (ESC [) - 6 characters
 const CSI_6: Map<string, KeyAction> = new Map([
   ["\x1b[200~", { type: "paste-start" }],
   ["\x1b[201~", { type: "paste-end" }],
@@ -30,7 +29,6 @@ const CSI_6: Map<string, KeyAction> = new Map([
   ["\x1b[1;5D", { type: "word-left" }],
 ]);
 
-// CSI sequences - 4 characters
 const CSI_4: Map<string, KeyAction> = new Map([
   ["\x1b[3~", { type: "delete" }],
   ["\x1b[1~", { type: "home" }],
@@ -41,7 +39,6 @@ const CSI_4: Map<string, KeyAction> = new Map([
   ["\x1b[5D", { type: "word-left" }],
 ]);
 
-// CSI sequences - 3 characters
 const CSI_3: Map<string, KeyAction> = new Map([
   ["\x1b[A", { type: "arrow", dir: "up" }],
   ["\x1b[B", { type: "arrow", dir: "down" }],
@@ -52,7 +49,6 @@ const CSI_3: Map<string, KeyAction> = new Map([
   ["\x1b[Z", { type: "backtab" }],
 ]);
 
-// SS3 sequences (ESC O) - Application cursor mode - 3 characters
 const SS3_3: Map<string, KeyAction> = new Map([
   ["\x1bOA", { type: "arrow", dir: "up" }],
   ["\x1bOB", { type: "arrow", dir: "down" }],
@@ -64,14 +60,12 @@ const SS3_3: Map<string, KeyAction> = new Map([
   ["\x1bOd", { type: "word-left" }],
 ]);
 
-// Alt key sequences (ESC + char) - 2 characters
 const ALT_2: Map<string, KeyAction> = new Map([
   ["\x1bb", { type: "word-left" }],
   ["\x1bf", { type: "word-right" }],
   ["\x1b\t", { type: "backtab" }],
 ]);
 
-// Control character codes
 const CTRL_CODES: Map<number, KeyAction> = new Map([
   [1, { type: "ctrl_a" }],
   [3, { type: "ctrl_c" }],
@@ -115,9 +109,6 @@ function getCsiAction(sequence: string): KeyAction | undefined {
   return undefined;
 }
 
-/**
- * Parse terminal input (VT100-ish) into high-level key actions.
- */
 export class KeyProcessor {
   private escapeBuffer = "";
   private inPaste = false;

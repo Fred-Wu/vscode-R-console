@@ -9,7 +9,7 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 - Custom R console hosted in the VS Code terminal area.
 - Embedded console backend for macOS, Linux, and Windows
 - Session watcher integration with vscode-R for search-path data, global-environment data, and runtime `$` / `@` member completion.
-- Self-managed R console sessions that can be attached to or closed from VS Code.
+- Self-managed R console sessions that can be attached, detached, or closed from VS Code.
 - Console-scoped completion and signature help through R's `languageserver` package.
 - Immediate local syntax highlighting plus semantic-token styling also through `languageserver`.
 - Multiline editing with local history navigation, reverse search, and a windowed/collapsed viewport renderer for long inputs.
@@ -29,8 +29,9 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). This extension declares `REditorSupport.r` in `extensionDependencies` and depends on vscode-R session bootstrap/configuration; there is no standalone startup path.
   
 > [!IMPORTANT]
-> Only vscode-R official release v2.8.* gets supported as the new version moves to a WebSockets & JSON-RPC 2.0 based approach.
-  
+> Only official vscode-R 2.8.x releases are currently supported. Newer vscode-R builds are moving to a WebSocket and JSON-RPC 2.0 based architecture.
+> A future R Console update will support both vscode-R architectures once the new architecture is officially released.
+
 - The R package `languageserver` if you want completion, signature help, and semantic highlighting.
 - Rust/Cargo only if you are building the sidecar binaries from source.
 
@@ -42,7 +43,7 @@ Launch `R Console` from the Command Palette with:
 - `R Console: Create R Console in Side Editor`
 - `R Console: Manage Persistent Sessions...`
 
-Use the session manager to attach to or close running R Console sessions.
+Use the session manager to attach to, detach from, or close running R Console sessions.
 
 The minimum vscode-R setup for R Console commands to work is:
 
@@ -86,7 +87,7 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vsc-r-console-0.2.2-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `vsc-r-console-0.2.3-win32-x64.vsix`.
 
 `vscode:prepublish` still prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 

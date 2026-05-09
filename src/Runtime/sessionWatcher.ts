@@ -188,8 +188,6 @@ export class SessionWatcher {
       const content = fs.readFileSync(requestFile, "utf-8");
       const request = JSON.parse(content) as SessionRequest;
 
-      // Sidecar mode does not know child R PID up front; auto-pin to the first
-      // fresh attach request so updates stay scoped to one session (v1 behavior).
       if (
         this.expectedPid === undefined &&
         request.command === "attach" &&
@@ -199,9 +197,7 @@ export class SessionWatcher {
         this.expectedPidAutoPinned = true;
       }
       
-      // PID filtering: only process requests from our expected R session
       if (this.expectedPid !== undefined && request.pid !== this.expectedPid) {
-        // This request is from a different R session, ignore it
         return;
       }
       
@@ -228,12 +224,9 @@ export class SessionWatcher {
       }
       this.sessionDir = nextSessionDir;
       this.workspaceData = undefined;
-      // isAttached() is now true — notify immediately so PID/state updates do
-      // not wait for the next 100ms poll tick.
       this.onAttachCallback?.();
       this.startWorkspaceWatcher();
     } catch {
-      // Ignore malformed request files
     }
   }
 
@@ -284,7 +277,6 @@ export class SessionWatcher {
       this.workspaceData = JSON.parse(content) as WorkspaceData;
       this.onChangeCallback?.(this.workspaceData);
     } catch {
-      // Ignore malformed workspace data
     }
   }
 
