@@ -2,6 +2,15 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.3] - 2026-05-10
+
+### Added
+- Added persistent-session detach actions that remove the VS Code console UI without closing the running R backend session.
+
+### Changed
+- Removed the old `reload-sessions.json` persistent-session compatibility path; current sessions now use only `persistent-sessions.json`.
+- Removed redundant source comments while keeping comments that document non-obvious terminal, R, and platform behavior.
+
 ## [0.2.2] - 2026-05-03
 
 ### Changed

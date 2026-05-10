@@ -2436,6 +2436,28 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.terminalState.dispose();
   }
 
+  detachPersistentSession(): PersistedRTerminalState | undefined {
+    const runtimeBackend = this.runtimeBackend;
+    const runtimeSession = this.rProcess;
+    if (!runtimeBackend || !runtimeSession) {
+      return undefined;
+    }
+
+    const state = this.exportPersistentState();
+    if (!state) {
+      return undefined;
+    }
+
+    runtimeBackend.detach(runtimeSession);
+    this.rProcess = null;
+    this.backendChildPid = undefined;
+    this.sessionHostConnected = false;
+    this.mode = "closed";
+    this.dispose();
+    this.terminalState.dispose();
+    return state;
+  }
+
   reattachToNewTerminal(): void {
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();

@@ -98,6 +98,7 @@ export interface RuntimeBackend {
   start(args: string[], options: RuntimeBackendStartOptions): RuntimeSessionHandle;
   reconnect(info: RuntimeSessionReconnectInfo): RuntimeSessionHandle;
   attach(session: RuntimeSessionHandle, handlers: RuntimeBackendHandlers): void;
+  detach(session: RuntimeSessionHandle): void;
   hasCapability(session: RuntimeSessionHandle | null, capability: BackendCapability): boolean;
   canUseSessionCommands(session: RuntimeSessionHandle | null): boolean;
   sendSessionCommand(session: RuntimeSessionHandle | null, command: RuntimeSessionCommand): boolean;
@@ -230,6 +231,21 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     }
 
     void this.attachSocket(state, generation);
+  }
+
+  detach(session: RuntimeSessionHandle): void {
+    const state = this.sessionStates.get(session);
+    if (!state) {
+      return;
+    }
+
+    state.attachGeneration += 1;
+    state.handlers = undefined;
+    state.hostConnected = false;
+    state.socketCarry = Buffer.alloc(0);
+    this.resolvePendingParseRequests(state, 1);
+    state.socket?.destroy();
+    state.socket = undefined;
   }
 
   canUseSessionCommands(session: RuntimeSessionHandle | null): boolean {

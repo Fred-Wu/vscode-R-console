@@ -8,17 +8,11 @@ type RenderPromptKind = "main" | "cont";
 
 export class Renderer {
   renderedLineCount = 1;
-  /** The row (0-indexed from render start) where cursor is positioned after render */
   cursorRowFromTop = 0;
-  /** The prompt to display (default "R> ") */
   promptText = "R> ";
-  /** The ANSI color for the prompt */
   promptColor = ANSI.brightGreen;
-  /** The prompt length for cursor calculations */
   promptLen = 3;
-  /** The continuation prompt to display for multiline input */
   continuationPromptText: string | null = null;
-  /** The ANSI color for the continuation prompt */
   continuationPromptColor = ANSI.reset;
   private readonly write: (text: string) => void;
   private lineHighlighter: RendererLineHighlighter | undefined;
@@ -44,10 +38,6 @@ export class Renderer {
     this.continuationPromptColor = ANSI.reset;
   }
 
-  /**
-   * Render with 2D cursor position (row, col).
-   * This is the new preferred method for multi-line editing.
-   */
   renderWithCursor(
     lines: string[],
     cursorRow: number,
@@ -104,17 +94,11 @@ export class Renderer {
     }
     const areaRows = this.renderedLineCount;
 
-    // Move to start of render area
-    // The cursor is currently at row `cursorRowFromTop` within the render area
-    // Move up from there to the top of the render area (row 0)
     this.write("\r");
     if (this.cursorRowFromTop > 0) {
       this.write(`\x1b[${this.cursorRowFromTop}A`);
     }
-    // Clear only the previously rendered lines, not beyond
-    // Use \x1b[K (clear line) for each line instead of \x1b[J (clear to end of screen)
     clearRenderedArea(areaRows);
-    // Move back to the top of render area
     if (areaRows > 1) {
       this.write(`\x1b[${areaRows - 1}A\r`);
     } else {
@@ -133,8 +117,6 @@ export class Renderer {
       this.write(prompt + line);
     });
 
-    // Calculate cursor position in terminal
-    // Sum up wrapped rows for lines before cursor line
     const prefixRows = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
     const pLen =
       getPromptKind(cursorRow) === "main"
@@ -151,7 +133,6 @@ export class Renderer {
     }
     this.write(`\r\x1b[${col}G`);
 
-    // Track where the cursor actually is (for clearInputRender)
     this.cursorRowFromTop = terminalRow;
   }
 
