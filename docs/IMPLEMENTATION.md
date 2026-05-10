@@ -456,23 +456,41 @@ The same selected R executable is used for:
 
 ### 3.2 Startup Bootstrap
 
-When `r.sessionWatcher` is enabled, `SessionWatcher` starts a per-console
-WebSocket server on the loopback interface, generates a token, and contributes the
-following environment variables to the embedded R launch:
+When `r.sessionWatcher` is enabled, startup chooses one vscode-R session
+integration:
 
-- `SESS_HOST`
-- `SESS_PORT`
-- `SESS_TOKEN`
+- `sess`: pipe-based architecture exposed by vscode-R's `r.connectToSession`
+  command. `rTerminal/runtime.ts` asks vscode-R for the current attach command,
+  reads the generated attach script, extracts its `pipe_path`, and contributes
+  `SESS_PIPE` to the embedded R launch.
+- `legacy`: legacy file-based watcher architecture. `R Console` sources vscode-R's
+  `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
 
-The server speaks JSON-RPC 2.0 over WebSocket and intentionally handles only
-console-scoped session metadata. Plot viewers, data viewers, help viewers,
-browser viewers, and httpgd remain outside the console's ownership.
+In `sess` mode, vscode-R owns the IPC server and package installation/update
+policy. The `sess` R package may be bundled with vscode-R or installed as a
+regular R package; R Console does not use its filesystem location for
+architecture detection. The transport is a Unix socket on macOS/Linux or a
+Windows named pipe. Messages are JSON-RPC 2.0 objects framed as
+newline-delimited JSON. R Console does not target the obsolete
+WebSocket/port-token `sess` transport.
+
+Startup and restored-runtime reconnect both use `sess::connect(pipe_path = ...)`;
+the `sess` package performs the attach handshake with vscode-R. When a console
+terminal gains focus, R Console sends a lightweight `sess::notify_client("attach",
+...)` refresh from the already-connected R session so vscode-R can make that
+session active; VS Code custom pseudoterminals do not provide a real terminal
+process id for vscode-R's terminal-focus switcher.
 
 The backend launch environment includes:
 
-- `VSCODE_WATCHER_DIR`
 - `R_PROFILE_USER_OLD`
 - `VSC_R_EXECUTABLE`
+
+Depending on the selected session integration, it also includes:
+
+- `SESS_PIPE`
+- `VSCODE_WATCHER_DIR`
+- `VSCODE_INIT_R`
 
 At launch time, `rTerminal/runtime.ts` also sets:
 
@@ -486,18 +504,20 @@ At launch time, `rTerminal/runtime.ts` also sets:
 
 1. restores and sources the user's original profile through
    `R_PROFILE_USER_OLD`
-2. starts a minimal WebSocket JSON-RPC client when `SESS_HOST`, `SESS_PORT`,
-   and `SESS_TOKEN` are present
-3. implements only the console metadata methods: attach notification,
-   `workspace`, `completion`, and `workspace_updated`
+2. in `sess` mode, calls the installed `sess` package when it already exposes
+   the current `pipe_path` API
+3. in `legacy` mode, runs vscode-R's legacy `init.R`
 4. installs the console pager
 5. locks the prompt options used by the embedded console contract
 
 ### 3.3 Session Metadata
 
-`SessionWatcher` no longer reads the legacy `request.log`, `workspace.lock`,
-or `workspace.json` files. It receives JSON-RPC notifications and sends
-JSON-RPC pull requests over the active WebSocket.
+In `legacy` mode, `SessionWatcher` reads the file-based `request.log`,
+`workspace.lock`, and `workspace.json` files.
+
+In `sess` mode, session metadata flows through vscode-R's pipe IPC server. The R
+side sends JSON-RPC notifications such as `attach` and `workspace_updated`;
+vscode-R sends JSON-RPC requests such as `workspace` and `completion`.
 
 Notifications consumed from R:
 
@@ -519,21 +539,25 @@ The `workspace` response provides:
 The `completion` response provides runtime `$` and `@` members for an
 expression.
 
-For reconnect, `SessionWatcher` writes the current `{ port, token }` to
+For reconnect in `sess` mode, `R Console` writes the current `{ pipe }` to
 `~/.vscode-R/sessions/{PID}.json`. The R-side bridge can read that file after
-a window reload or terminal detach and reconnect to the replacement console
+a window reload or terminal detach and reconnect to the replacement vscode-R IPC
 server. The console still persists and restores its own Rust backend session;
 the discovery file is only the metadata bridge.
 
 ### 3.4 Metadata Consumers
 
-The console consumes watcher metadata for:
+In `legacy` mode, the console consumes watcher metadata for:
 
 - display pid selection
 - search-path aware completion
 - global-environment completion
 - `$` and `@` member completion through the `completion` request
 - attached package and namespace sync into the console LSP
+
+In `sess` mode, vscode-R owns the session metadata stream. `R Console` attaches
+the embedded R process to that stream and uses vscode-R-provided editor
+features where available instead of running a second metadata server.
 
 This integration is read-only with respect to broader `vscode-R` session
 features. The console does not create, replace, restore, or stop vscode-R plot,

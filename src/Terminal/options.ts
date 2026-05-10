@@ -248,7 +248,7 @@ function parseRStartupOptions(rHome: string, args: string[]): RStartupOptions | 
     }
     if (arg === "--vanilla") {
       void vscode.window.showErrorMessage(
-        "R Console requires vscode-R session bootstrap and cannot be launched with --vanilla."
+        "R Console requires its startup profile and cannot be launched with --vanilla."
       );
       return undefined;
     }
@@ -262,7 +262,7 @@ function parseRStartupOptions(rHome: string, args: string[]): RStartupOptions | 
     }
     if (arg === "--no-init-file") {
       void vscode.window.showErrorMessage(
-        "R Console requires vscode-R session bootstrap and cannot be launched with --no-init-file."
+        "R Console requires its startup profile and cannot be launched with --no-init-file."
       );
       return undefined;
     }
@@ -596,8 +596,7 @@ function resolveVscodeRSessionIntegration(
     return { mode: "disabled" };
   }
 
-  const hasSessPackage = fs.existsSync(path.join(extension.extensionPath, "sess", "DESCRIPTION"));
-  if (hasSessPackage && extensionContributesCommand(extension, "r.connectToSession")) {
+  if (extensionContributesCommand(extension, "r.connectToSession")) {
     return { mode: "sess" };
   }
 
@@ -606,10 +605,7 @@ function resolveVscodeRSessionIntegration(
     return { mode: "legacy", initPath };
   }
 
-  void vscode.window.showWarningMessage(
-    "R Console could not identify a supported vscode-R session integration; session integration will be disabled."
-  );
-  return { mode: "disabled" };
+  return { mode: "sess" };
 }
 
 function buildRuntimeEnv(
@@ -638,6 +634,7 @@ function buildRuntimeEnv(
 
   delete env.VSCODE_INIT_R;
   delete env.VSCODE_WATCHER_DIR;
+  delete env.SESS_PIPE;
   delete env.SESS_PORT;
   delete env.SESS_TOKEN;
   delete env.SESS_HOST;

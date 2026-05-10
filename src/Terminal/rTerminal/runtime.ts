@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
-import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { setNativeParseCallback, stripCommentLines } from "../../Language/parser";
@@ -56,8 +55,8 @@ export type Submission = {
 };
 
 export type VscodeRSessionConnection = {
-  port: string;
-  token: string;
+  pipePath: string;
+  attachScriptPath?: string;
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
@@ -146,11 +145,9 @@ function getConsoleProfilePath(extensionPath: string): string {
 }
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
-const SESS_CONNECT_PATTERN =
-  /sess::connect\s*\(\s*port\s*=\s*([0-9]+)\s*,\s*token\s*=\s*(["'])(.*?)\2\s*\)/;
 const SESS_ASYNC_PROMPT_PATTERN = /(\r?\[sess\][^\r\n]*)(?:\r\n|\n){2}> ?/g;
 const SESS_RECONNECT_NOISE_PATTERN =
-  /\r?\[sess\] (?:WebSocket error: Connection refused|Disconnected from VS Code\. Retrying in 5 seconds\.\.\.)(?:\r\n|\n)?/g;
+  /\r?\[sess\] Failed to connect to IPC pipe: [^\r\n]*(?:\r\n|\n)?/g;
 const vscodeRSessionConnections = new WeakMap<RuntimeHost, VscodeRSessionConnection>();
 const vscodeRSessionConnectionRefreshes = new WeakMap<
   RuntimeHost,
@@ -170,17 +167,6 @@ function usesSessIntegration(host: RuntimeHost): boolean {
 
 function usesLegacySessionWatcher(host: RuntimeHost): boolean {
   return host.options.sessionMode === "legacy" && !!host.sessionWatcher;
-}
-
-function parseSessConnectCommand(command: string): VscodeRSessionConnection | undefined {
-  const match = SESS_CONNECT_PATTERN.exec(command);
-  if (!match) {
-    return undefined;
-  }
-  return {
-    port: match[1],
-    token: match[3],
-  };
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -214,67 +200,105 @@ async function pruneStaleVscodeRSessionFiles(): Promise<void> {
     }
     const pid = Number.parseInt(path.basename(entry, ".json"), 10);
     const filePath = path.join(sessionsDir, entry);
-    let stale = !isLivePid(pid);
-    if (!stale) {
-      try {
-        const raw = await fs.promises.readFile(filePath, "utf8");
-        const parsed = JSON.parse(raw) as { port?: unknown };
-        const port = typeof parsed.port === "number" ? parsed.port : Number(parsed.port);
-        stale = !Number.isFinite(port) || port <= 0 || !(await canConnectToPort(port));
-      } catch {
-        stale = true;
-      }
-    }
-    if (!stale) {
+    if (isLivePid(pid)) {
       return;
     }
     await fs.promises.rm(filePath, { force: true }).catch(() => undefined);
   }));
 }
 
-function canConnectToPort(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port });
-    let settled = false;
-
-    const done = (value: boolean): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      socket.destroy();
-      resolve(value);
-    };
-
-    socket.setTimeout(250);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-  });
-}
-
-async function waitForVscodeRSessionPort(
-  connection: VscodeRSessionConnection,
-  timeoutMs = 2500
-): Promise<boolean> {
-  const port = Number(connection.port);
-  if (!Number.isFinite(port) || port <= 0) {
-    return false;
-  }
-
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    if (await canConnectToPort(port)) {
-      return true;
-    }
-    await sleep(50);
-  }
-  return false;
-}
-
 async function readClipboardText(): Promise<string | undefined> {
   try {
     return await vscode.env.clipboard.readText();
+  } catch {
+    return undefined;
+  }
+}
+
+function parseRStringLiteralAt(
+  text: string,
+  startIndex: number
+): { value: string; endIndex: number } | undefined {
+  const quote = text[startIndex];
+  if (quote !== "\"" && quote !== "'") {
+    return undefined;
+  }
+
+  let value = "";
+  for (let index = startIndex + 1; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === quote) {
+      return { value, endIndex: index + 1 };
+    }
+    if (char === "\\" && index + 1 < text.length) {
+      const escaped = text[index + 1];
+      switch (escaped) {
+        case "n":
+          value += "\n";
+          break;
+        case "r":
+          value += "\r";
+          break;
+        case "t":
+          value += "\t";
+          break;
+        default:
+          value += escaped;
+          break;
+      }
+      index += 1;
+      continue;
+    }
+    value += char;
+  }
+
+  return undefined;
+}
+
+function parseSourceScriptPath(command: string): string | undefined {
+  const match = /\bsource\s*\(/.exec(command);
+  if (!match) {
+    return undefined;
+  }
+
+  let index = match.index + match[0].length;
+  while (index < command.length && /\s/.test(command[index])) {
+    index += 1;
+  }
+
+  return parseRStringLiteralAt(command, index)?.value;
+}
+
+function parseAssignedRString(content: string, name: string): string | undefined {
+  const pattern = new RegExp(`\\b${name}\\s*<-\\s*`, "g");
+  const match = pattern.exec(content);
+  if (!match) {
+    return undefined;
+  }
+
+  let index = match.index + match[0].length;
+  while (index < content.length && /\s/.test(content[index])) {
+    index += 1;
+  }
+
+  return parseRStringLiteralAt(content, index)?.value;
+}
+
+async function parseVscodeRPipeAttachCommand(
+  command: string
+): Promise<VscodeRSessionConnection | undefined> {
+  const attachScriptPath = parseSourceScriptPath(command);
+  if (!attachScriptPath) {
+    return undefined;
+  }
+
+  try {
+    const content = await fs.promises.readFile(attachScriptPath, "utf8");
+    const pipePath = parseAssignedRString(content, "pipe_path");
+    if (!pipePath) {
+      return undefined;
+    }
+    return { pipePath, attachScriptPath };
   } catch {
     return undefined;
   }
@@ -322,7 +346,7 @@ async function getVscodeRSessionConnection(): Promise<VscodeRSessionConnection |
       await sleep(50);
       continue;
     }
-    connection = parseSessConnectCommand(currentClipboard);
+    connection = await parseVscodeRPipeAttachCommand(currentClipboard);
     if (connection) {
       break;
     }
@@ -331,10 +355,6 @@ async function getVscodeRSessionConnection(): Promise<VscodeRSessionConnection |
 
   if (previousClipboard !== undefined && currentClipboard !== previousClipboard) {
     void vscode.env.clipboard.writeText(previousClipboard);
-  }
-
-  if (connection && !(await waitForVscodeRSessionPort(connection))) {
-    return undefined;
   }
 
   return connection;
@@ -351,10 +371,9 @@ function quoteRString(value: string): string {
 function buildSessConnectCommand(connection: VscodeRSessionConnection): string {
   const rConfig = vscode.workspace.getConfiguration("r");
   return [
-    "if (requireNamespace(\"sess\", quietly = TRUE)) {",
+    "if (requireNamespace(\"sess\", quietly = TRUE) && \"pipe_path\" %in% names(formals(sess::connect))) {",
     "sess::connect(",
-    `port=${connection.port},`,
-    `token=${quoteRString(connection.token)},`,
+    `pipe_path=${quoteRString(connection.pipePath)},`,
     `use_rstudioapi=${asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true)},`,
     `use_httpgd=${asRLogical(rConfig.get<boolean>("plot.useHttpgd"), true)}`,
     ")",
@@ -364,7 +383,7 @@ function buildSessConnectCommand(connection: VscodeRSessionConnection): string {
 
 function buildSessAttachNotificationCommand(): string {
   return [
-    "if (requireNamespace(\"sess\", quietly = TRUE)) {",
+    "if (requireNamespace(\"sess\", quietly = TRUE) && \"notify_client\" %in% getNamespaceExports(\"sess\")) {",
     "sess::notify_client(\"attach\", list(",
     "version=sprintf(\"%s.%s\", R.version$major, R.version$minor),",
     "pid=Sys.getpid(),",
@@ -387,11 +406,12 @@ async function configureVscodeRSessionBootstrap(
     return undefined;
   }
 
-  env.SESS_PORT = connection.port;
-  env.SESS_TOKEN = connection.token;
+  env.SESS_PIPE = connection.pipePath;
   const rConfig = vscode.workspace.getConfiguration("r");
   env.SESS_RSTUDIOAPI = asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true);
   env.SESS_USE_HTTPGD = asRLogical(rConfig.get<boolean>("plot.useHttpgd"), true);
+  delete env.SESS_PORT;
+  delete env.SESS_TOKEN;
   delete env.SESS_HOST;
   return connection;
 }
@@ -400,7 +420,7 @@ async function resolveCurrentVscodeRSessionConnection(
   host: RuntimeHost
 ): Promise<VscodeRSessionConnection | undefined> {
   const existing = vscodeRSessionConnections.get(host);
-  if (existing && await waitForVscodeRSessionPort(existing)) {
+  if (existing) {
     return existing;
   }
 
@@ -426,11 +446,7 @@ async function writeVscodeRSessionFile(
   pid: number,
   connection: VscodeRSessionConnection
 ): Promise<void> {
-  const port = Number(connection.port);
-  if (!Number.isFinite(port) || port <= 0 || !connection.token) {
-    return;
-  }
-  if (!(await waitForVscodeRSessionPort(connection))) {
+  if (!connection.pipePath) {
     return;
   }
 
@@ -439,7 +455,7 @@ async function writeVscodeRSessionFile(
     await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
     await fs.promises.writeFile(
       filePath,
-      JSON.stringify({ port, token: connection.token }),
+      JSON.stringify({ pipe: connection.pipePath }),
       "utf8"
     );
     vscodeRSessionFiles.set(host, filePath);
