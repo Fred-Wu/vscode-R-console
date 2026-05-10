@@ -485,13 +485,15 @@ Console observes workspace responses and injects its own `workspace` and
 vscode-R internal APIs and does not use VS Code's global completion command for
 runtime completion.
 
-Startup and restored-runtime reconnect both use `sess::connect(pipe_path = ...)`
-against the proxy pipe; the `sess` package still performs the normal attach
-handshake, which is forwarded to vscode-R. When a console terminal gains focus,
-R Console sends a lightweight `sess::notify_client("attach", ...)` refresh from
-the already-connected R session so vscode-R can make that session active; VS
-Code custom pseudoterminals do not provide a real terminal process id for
-vscode-R's terminal-focus switcher.
+The proxy is scoped to the embedded backend runtime session and is indexed by
+the backend session id while connected. Startup uses
+`sess::connect(pipe_path = ...)` against the proxy pipe; the `sess` package
+performs the normal attach handshake, which is forwarded to vscode-R. When a
+console terminal gains focus, R Console sends a lightweight
+`sess::notify_client("attach", ...)` refresh from the already-connected R
+session so vscode-R can make that session active; VS Code custom
+pseudoterminals do not provide a real terminal process id for vscode-R's
+terminal-focus switcher.
 
 The backend launch environment includes:
 

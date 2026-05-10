@@ -160,13 +160,25 @@ const vscodeRSessionConnectionRefreshes = new WeakMap<
 >();
 const vscodeRSessionFiles = new WeakMap<RuntimeHost, string>();
 const vscodeRSessionProxies = new WeakMap<RuntimeHost, SessProxy>();
+const vscodeRSessionProxiesByRuntimeSession = new Map<string, SessProxy>();
 const vscodeRSessionReconnectInFlight = new WeakSet<RuntimeHost>();
 const vscodeRSessionReconnectNoiseUntil = new WeakMap<RuntimeHost, number>();
 
 function clearVscodeRSessionConnection(host: RuntimeHost): void {
+  const proxy = vscodeRSessionProxies.get(host);
   vscodeRSessionConnections.delete(host);
-  vscodeRSessionProxies.get(host)?.dispose();
   vscodeRSessionProxies.delete(host);
+  const sessionId = host.rProcess?.sessionId;
+  if (sessionId && vscodeRSessionProxiesByRuntimeSession.get(sessionId) === proxy) {
+    vscodeRSessionProxiesByRuntimeSession.delete(sessionId);
+  }
+  proxy?.dispose();
+}
+
+export function disposeVscodeRSessionProxyForRuntimeSession(sessionId: string): void {
+  const proxy = vscodeRSessionProxiesByRuntimeSession.get(sessionId);
+  vscodeRSessionProxiesByRuntimeSession.delete(sessionId);
+  proxy?.dispose();
 }
 
 function usesSessIntegration(host: RuntimeHost): boolean {
@@ -383,12 +395,17 @@ async function createProxiedVscodeRSessionConnection(
 
   try {
     const pipePath = await proxy.start();
-    vscodeRSessionProxies.get(host)?.dispose();
-    vscodeRSessionProxies.set(host, proxy);
-    return {
+    clearVscodeRSessionConnection(host);
+    const connection = {
       ...upstreamConnection,
       pipePath,
     };
+    vscodeRSessionProxies.set(host, proxy);
+    const sessionId = host.rProcess?.sessionId;
+    if (sessionId) {
+      vscodeRSessionProxiesByRuntimeSession.set(sessionId, proxy);
+    }
+    return connection;
   } catch {
     proxy.dispose();
     return undefined;
@@ -458,6 +475,20 @@ async function resolveCurrentVscodeRSessionConnection(
   const existing = vscodeRSessionConnections.get(host);
   if (existing) {
     return existing;
+  }
+
+  const sessionId = host.rProcess?.sessionId;
+  const proxy = sessionId ? vscodeRSessionProxiesByRuntimeSession.get(sessionId) : undefined;
+  const pipePath = proxy?.getPipePath();
+  if (proxy?.isConnected() && pipePath) {
+    const connection = { pipePath };
+    vscodeRSessionConnections.set(host, connection);
+    vscodeRSessionProxies.set(host, proxy);
+    return connection;
+  }
+  if (proxy && sessionId) {
+    vscodeRSessionProxiesByRuntimeSession.delete(sessionId);
+    proxy.dispose();
   }
 
   let refresh = vscodeRSessionConnectionRefreshes.get(host);
@@ -597,12 +628,21 @@ async function reconnectVscodeRSessionForRestoredRuntime(host: RuntimeHost): Pro
     if (!connection) {
       return;
     }
+    const alreadyConnected =
+      vscodeRSessionProxies.get(host)?.isConnected() ?? false;
 
     const pid = isLivePid(host.backendChildPid)
       ? host.backendChildPid
       : host.runtimeBackend.getPid(host.rProcess);
     if (isLivePid(pid)) {
       await writeVscodeRSessionFile(host, pid, connection);
+    }
+
+    if (alreadyConnected) {
+      host.vscodeRSessionReconnectPending = false;
+      host.vscodeRSessionActivationPending = true;
+      flushRuntimeVscodeRSessionActivation(host);
+      return;
     }
 
     if (submitHiddenRuntimeCommand(host, buildSessConnectCommand(connection))) {
@@ -721,6 +761,10 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
       cwd: host.options.cwd,
       env: runtimeEnv,
     });
+    const vscodeRSessionProxy = vscodeRSessionProxies.get(host);
+    if (vscodeRSessionProxy) {
+      vscodeRSessionProxiesByRuntimeSession.set(host.rProcess.sessionId, vscodeRSessionProxy);
+    }
     primeRuntimeAttach(host);
     setNativeParseCallback(null);
     void host.lang.start();

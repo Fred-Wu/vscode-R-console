@@ -104,6 +104,19 @@ export class SessProxy {
     return this.workspaceData;
   }
 
+  getPipePath(): string | undefined {
+    return this.proxyPipePath;
+  }
+
+  isConnected(): boolean {
+    return Boolean(
+      this.rSocket &&
+        !this.rSocket.destroyed &&
+        this.upstreamSocket &&
+        !this.upstreamSocket.destroyed
+    );
+  }
+
   async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"

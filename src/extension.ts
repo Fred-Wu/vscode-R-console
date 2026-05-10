@@ -7,7 +7,10 @@ import {
   type PersistedRTerminalOptions,
   resolveRTerminalOptions,
 } from "./Terminal/rTerminal";
-import { createRuntimeBackend } from "./Terminal/rTerminal/runtime";
+import {
+  createRuntimeBackend,
+  disposeVscodeRSessionProxyForRuntimeSession,
+} from "./Terminal/rTerminal/runtime";
 import {
   discoverRBinaryPath,
   getPlatformRPathConfigEntry,
@@ -797,6 +800,7 @@ function closeDetachedPersistentSessions(
   for (const session of sessions) {
     const handle = backend.reconnect(session.entry.terminal.runtime);
     backend.close(handle);
+    disposeVscodeRSessionProxyForRuntimeSession(session.sessionId);
     persistentSessionRecords.delete(session.sessionId);
   }
 }
