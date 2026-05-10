@@ -17,7 +17,7 @@ is used as a dependency.
 
 | Project | What is referenced or used | Where it appears here |
 | --- | --- | --- |
-| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings and the JSON-RPC session protocol used for attach metadata, workspace data, and member completion. | `src/Terminal/options.ts`, `resources/r/console-profile.R`, `src/Runtime/sessionWatcher.ts` |
+| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings and the JSON-RPC session protocol used for attach metadata, workspace data, and member completion. | `src/Terminal/options.ts`, `resources/r/console-profile.R`, `src/Runtime/sessionWatcher.ts`, `src/Runtime/sessProxy.ts` |
 | [`arf`](https://github.com/eitsupi/arf) | Reference for Rust embedded-R host structure, dynamic R loading, platform-specific R initialization, callback wiring, generic event/input-handler pumping, and interrupt state handling. | `sidecar/pty-host/src/host.rs` |
 | [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
 | [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
@@ -427,8 +427,10 @@ The console depends on `vscode-R`, but it does not own or manage the
 Implementation files:
 
 - [`src/Terminal/options.ts`](../src/Terminal/options.ts)
+- [`src/Terminal/rTerminal/runtime.ts`](../src/Terminal/rTerminal/runtime.ts)
 - [`resources/r/console-profile.R`](../resources/r/console-profile.R)
 - [`src/Runtime/sessionWatcher.ts`](../src/Runtime/sessionWatcher.ts)
+- [`src/Runtime/sessProxy.ts`](../src/Runtime/sessProxy.ts)
 
 ### 3.1 Startup Settings From `vscode-R`
 
@@ -461,8 +463,9 @@ integration:
 
 - `sess`: pipe-based architecture exposed by vscode-R's `r.connectToSession`
   command. `rTerminal/runtime.ts` asks vscode-R for the current attach command,
-  reads the generated attach script, extracts its `pipe_path`, and contributes
-  `SESS_PIPE` to the embedded R launch.
+  reads the generated attach script, extracts its `pipe_path`, starts a
+  console-owned `SessProxy`, and contributes the proxy pipe path as `SESS_PIPE`
+  to the embedded R launch.
 - `legacy`: legacy file-based watcher architecture. `R Console` sources vscode-R's
   `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
 
@@ -474,12 +477,21 @@ Windows named pipe. Messages are JSON-RPC 2.0 objects framed as
 newline-delimited JSON. R Console does not target the obsolete
 WebSocket/port-token `sess` transport.
 
-Startup and restored-runtime reconnect both use `sess::connect(pipe_path = ...)`;
-the `sess` package performs the attach handshake with vscode-R. When a console
-terminal gains focus, R Console sends a lightweight `sess::notify_client("attach",
-...)` refresh from the already-connected R session so vscode-R can make that
-session active; VS Code custom pseudoterminals do not provide a real terminal
-process id for vscode-R's terminal-focus switcher.
+The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
+the console-owned proxy pipe, and the proxy connects to vscode-R's real pipe.
+Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
+Console observes workspace responses and injects its own `workspace` and
+`completion` requests when the console needs session data. It does not call
+vscode-R internal APIs and does not use VS Code's global completion command for
+runtime completion.
+
+Startup and restored-runtime reconnect both use `sess::connect(pipe_path = ...)`
+against the proxy pipe; the `sess` package still performs the normal attach
+handshake, which is forwarded to vscode-R. When a console terminal gains focus,
+R Console sends a lightweight `sess::notify_client("attach", ...)` refresh from
+the already-connected R session so vscode-R can make that session active; VS
+Code custom pseudoterminals do not provide a real terminal process id for
+vscode-R's terminal-focus switcher.
 
 The backend launch environment includes:
 
@@ -515,9 +527,11 @@ At launch time, `rTerminal/runtime.ts` also sets:
 In `legacy` mode, `SessionWatcher` reads the file-based `request.log`,
 `workspace.lock`, and `workspace.json` files.
 
-In `sess` mode, session metadata flows through vscode-R's pipe IPC server. The R
-side sends JSON-RPC notifications such as `attach` and `workspace_updated`;
-vscode-R sends JSON-RPC requests such as `workspace` and `completion`.
+In `sess` mode, session metadata flows through the proxy between R and vscode-R.
+The R side sends JSON-RPC notifications such as `attach` and
+`workspace_updated`; vscode-R sends JSON-RPC requests such as `workspace` and
+`completion`. R Console may also inject `workspace` and `completion` requests
+to the R-side socket and consumes the matching responses itself.
 
 Notifications consumed from R:
 
@@ -537,7 +551,9 @@ The `workspace` response provides:
 - global environment summary
 
 The `completion` response provides runtime `$` and `@` members for an
-expression.
+expression. Console data-frame bracket completion uses the same runtime
+completion request with the data object expression, because vscode-R 3.0
+workspace summaries do not carry column/member names.
 
 For reconnect in `sess` mode, `R Console` writes the current `{ pipe }` to
 `~/.vscode-R/sessions/{PID}.json`. The R-side bridge can read that file after
@@ -555,9 +571,13 @@ In `legacy` mode, the console consumes watcher metadata for:
 - `$` and `@` member completion through the `completion` request
 - attached package and namespace sync into the console LSP
 
-In `sess` mode, vscode-R owns the session metadata stream. `R Console` attaches
-the embedded R process to that stream and uses vscode-R-provided editor
-features where available instead of running a second metadata server.
+In `sess` mode, vscode-R owns the broader session metadata stream. `R Console`
+owns only the console-side proxy and completion routing needed for the embedded
+console. Runtime `$`, `@`, and data-frame bracket completion are requested from
+the current embedded R session through the `sess` JSON-RPC `completion` method.
+Workspace snapshots are cached from forwarded or console-injected `workspace`
+responses and are used for search-path/package synchronization and top-level
+workspace completions.
 
 This integration is read-only with respect to broader `vscode-R` session
 features. The console does not create, replace, restore, or stop vscode-R plot,

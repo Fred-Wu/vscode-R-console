@@ -4,6 +4,7 @@ import {
   collectCompletionEntries,
   getCompletionContext,
   toCompletionPick,
+  type CompletionProvider,
 } from "../../Language/completion";
 import {
   ConsoleLspClient,
@@ -38,7 +39,7 @@ type LangOptions = {
 type AutocompleteRequest = {
   input: InputSnapshot;
   getCurrentInput: () => InputSnapshot;
-  getWorkspaceData: () => WorkspaceData | undefined;
+  getWorkspaceData: () => WorkspaceData | undefined | Promise<WorkspaceData | undefined>;
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
@@ -89,7 +90,9 @@ export class RTermLang {
         return;
       }
 
-      const sessionData = getWorkspaceData();
+      const needsWorkspaceData =
+        context.kind !== "member" && context.kind !== "bracket";
+      const sessionData = needsWorkspaceData ? await getWorkspaceData() : undefined;
       const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
         return;
@@ -97,6 +100,14 @@ export class RTermLang {
       if (this.consoleLsp) {
         await this.consoleLsp.prepareDocument(doc);
       }
+      const completionProvider: CompletionProvider = {
+        provideCompletionItems: async (document, docPosition, triggerCharacter) =>
+          await this.consoleLsp?.provideCompletionItems(document, docPosition, triggerCharacter),
+        provideSignatureHelp: async (document, docPosition, triggerCharacter) =>
+          await this.consoleLsp?.provideSignatureHelp(document, docPosition, triggerCharacter),
+        provideMemberCompletionItems: async (expression, operator) =>
+          await this.options.requestMemberCompletions(expression, operator),
+      };
 
       const position = new vscode.Position(latestInput.cursorRow, context.snapshotCursor);
 
@@ -108,7 +119,7 @@ export class RTermLang {
         sessionData,
         linesBefore,
         this.options.getRecentSessionEntries?.() ?? [],
-        this.consoleLsp
+        completionProvider
       );
 
       if (entries.length === 0) {
@@ -266,8 +277,6 @@ export class RTermLang {
       consoleId: this.completionDocumentId,
       extensionPath: this.options.extensionPath,
       rPath: this.options.rPath,
-      requestMemberCompletions: async (expression, operator) =>
-        await this.options.requestMemberCompletions(expression, operator),
     });
 
     try {

@@ -48,7 +48,9 @@ import {
   attachRuntimeSession,
   primeRuntimeAttach,
   updateRuntimeTerminalName,
+  getRuntimeWorkspaceData,
   type RuntimeHost,
+  requestRuntimeMemberCompletions,
   startNextRuntimeSubmission,
   type Submission,
   type TerminalMode,
@@ -250,7 +252,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       rPath: this.options.rPath,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       requestMemberCompletions: async (expression, operator) =>
-        await this.sessionWatcher?.requestMemberCompletions(expression, operator),
+        await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
     });
 
     this.syntax = new ConsoleSyntax(
@@ -1650,11 +1652,10 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleAutocomplete(): Promise<void> {
-    this.sessionWatcher?.refresh();
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
-      getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
+      getWorkspaceData: () => getRuntimeWorkspaceData(this.runtimeHost()),
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
       },

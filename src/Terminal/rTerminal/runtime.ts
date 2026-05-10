@@ -14,7 +14,12 @@ import {
   type RuntimeSessionHandle,
   RustSidecarRuntimeBackend,
 } from "../../Runtime/runtimeBackend";
-import type { SessionWatcher, WorkspaceData } from "../../Runtime/sessionWatcher";
+import { SessProxy } from "../../Runtime/sessProxy";
+import type {
+  SessionMemberCompletionItem,
+  SessionWatcher,
+  WorkspaceData,
+} from "../../Runtime/sessionWatcher";
 import { ANSI, stripBracketedPasteMarkers } from "../ansi";
 import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
@@ -154,11 +159,14 @@ const vscodeRSessionConnectionRefreshes = new WeakMap<
   Promise<VscodeRSessionConnection | undefined>
 >();
 const vscodeRSessionFiles = new WeakMap<RuntimeHost, string>();
+const vscodeRSessionProxies = new WeakMap<RuntimeHost, SessProxy>();
 const vscodeRSessionReconnectInFlight = new WeakSet<RuntimeHost>();
 const vscodeRSessionReconnectNoiseUntil = new WeakMap<RuntimeHost, number>();
 
 function clearVscodeRSessionConnection(host: RuntimeHost): void {
   vscodeRSessionConnections.delete(host);
+  vscodeRSessionProxies.get(host)?.dispose();
+  vscodeRSessionProxies.delete(host);
 }
 
 function usesSessIntegration(host: RuntimeHost): boolean {
@@ -360,6 +368,33 @@ async function getVscodeRSessionConnection(): Promise<VscodeRSessionConnection |
   return connection;
 }
 
+async function createProxiedVscodeRSessionConnection(
+  host: RuntimeHost
+): Promise<VscodeRSessionConnection | undefined> {
+  const upstreamConnection = await getVscodeRSessionConnection();
+  if (!upstreamConnection) {
+    return undefined;
+  }
+
+  const proxy = new SessProxy({
+    upstreamPipePath: upstreamConnection.pipePath,
+    onWorkspaceData: (data) => host.onSessionDataChanged(data),
+  });
+
+  try {
+    const pipePath = await proxy.start();
+    vscodeRSessionProxies.get(host)?.dispose();
+    vscodeRSessionProxies.set(host, proxy);
+    return {
+      ...upstreamConnection,
+      pipePath,
+    };
+  } catch {
+    proxy.dispose();
+    return undefined;
+  }
+}
+
 function asRLogical(value: boolean | undefined, defaultValue: boolean): string {
   return (value ?? defaultValue) ? "TRUE" : "FALSE";
 }
@@ -396,9 +431,10 @@ function buildSessAttachNotificationCommand(): string {
 }
 
 async function configureVscodeRSessionBootstrap(
+  host: RuntimeHost,
   env: NodeJS.ProcessEnv
 ): Promise<VscodeRSessionConnection | undefined> {
-  const connection = await getVscodeRSessionConnection();
+  const connection = await createProxiedVscodeRSessionConnection(host);
   if (!connection) {
     void vscode.window.showWarningMessage(
       "R Console could not obtain vscode-R session connection info. The console will start without vscode-R session attachment."
@@ -426,7 +462,7 @@ async function resolveCurrentVscodeRSessionConnection(
 
   let refresh = vscodeRSessionConnectionRefreshes.get(host);
   if (!refresh) {
-    refresh = getVscodeRSessionConnection().finally(() => {
+    refresh = createProxiedVscodeRSessionConnection(host).finally(() => {
       vscodeRSessionConnectionRefreshes.delete(host);
     });
     vscodeRSessionConnectionRefreshes.set(host, refresh);
@@ -587,6 +623,34 @@ function removeVscodeRSessionFile(host: RuntimeHost): void {
   void fs.promises.rm(filePath, { force: true }).catch(() => undefined);
 }
 
+export async function getRuntimeWorkspaceData(
+  host: RuntimeHost
+): Promise<WorkspaceData | undefined> {
+  if (usesLegacySessionWatcher(host)) {
+    host.sessionWatcher?.refresh();
+    return host.sessionWatcher?.getWorkspaceData();
+  }
+  if (!usesSessIntegration(host)) {
+    return undefined;
+  }
+  const proxy = vscodeRSessionProxies.get(host);
+  return proxy?.getWorkspaceData() ?? await proxy?.requestWorkspace();
+}
+
+export async function requestRuntimeMemberCompletions(
+  host: RuntimeHost,
+  expression: string,
+  operator: "$" | "@"
+): Promise<SessionMemberCompletionItem[] | undefined> {
+  if (usesLegacySessionWatcher(host)) {
+    return await host.sessionWatcher?.requestMemberCompletions(expression, operator);
+  }
+  if (!usesSessIntegration(host)) {
+    return undefined;
+  }
+  return await vscodeRSessionProxies.get(host)?.requestMemberCompletions(expression, operator);
+}
+
 export async function startRuntime(host: RuntimeHost): Promise<void> {
   pendingRuntimeRewrites.delete(host);
   clearVscodeRSessionConnection(host);
@@ -630,7 +694,7 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
     const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
     if (usesSessIntegration(host)) {
-      const connection = await configureVscodeRSessionBootstrap(runtimeEnv);
+      const connection = await configureVscodeRSessionBootstrap(host, runtimeEnv);
       if (connection) {
         vscodeRSessionConnections.set(host, connection);
       } else {

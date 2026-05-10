@@ -2,6 +2,14 @@
 
 All notable changes to R Console will be documented in this file.
 
+## Unreleased
+
+### Added
+- Added a `sess` IPC proxy for vscode-R 3.0 session integration, allowing R Console to forward vscode-R session traffic while requesting workspace and runtime member completions from the current embedded R session.
+
+### Changed
+- Changed runtime `$`, `@`, and data-frame bracket completion in vscode-R 3.0 `sess` mode to use the active console session through `sess` JSON-RPC instead of VS Code completion providers or workspace column metadata.
+
 ## [0.2.3] - 2026-05-10
 
 ### Added

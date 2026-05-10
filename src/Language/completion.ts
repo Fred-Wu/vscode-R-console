@@ -276,11 +276,11 @@ export async function collectCompletionEntries(
 ): Promise<CompletionEntry[]> {
   const sessionItems = getSessionCompletions(context, sessionData);
   const runtimeMemberItems =
-    context.kind === "member"
+    context.kind === "member" || context.kind === "bracket" || !!context.dataObjectName
       ? await getRuntimeMemberCompletions(context, completionProvider)
       : [];
   const lspItems =
-    context.kind === "bracket"
+    context.kind === "member" || context.kind === "bracket"
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
   const bufferItems = getConsoleBufferCompletions(
@@ -296,8 +296,12 @@ export async function collectCompletionEntries(
   ]);
 
   if (context.kind === "bracket") {
+    const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
+    if (runtimeFiltered.length > 0) {
+      return dedupeCompletionEntries(runtimeFiltered);
+    }
     if (columnFiltered.length > 0) {
       return dedupeCompletionEntries(columnFiltered);
     }
@@ -309,41 +313,26 @@ export async function collectCompletionEntries(
 
   if (context.kind === "argument") {
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
+    const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
-    if (context.dataObjectName && columnFiltered.length > 0) {
-      if (context.prefix.length === 0) {
-        return dedupeCompletionEntries([
-          ...columnFiltered,
-          ...lspFiltered,
-          ...sessionFiltered,
-          ...bufferFiltered,
-        ]);
-      } else {
-        return dedupeCompletionEntries([
-          ...columnFiltered,
-          ...lspFiltered,
-          ...sessionFiltered,
-          ...bufferFiltered,
-        ]);
-      }
+    if (context.dataObjectName && (runtimeFiltered.length > 0 || columnFiltered.length > 0)) {
+      return dedupeCompletionEntries([
+        ...runtimeFiltered,
+        ...columnFiltered,
+        ...lspFiltered,
+        ...sessionFiltered,
+        ...bufferFiltered,
+      ]);
     }
 
-    if (context.prefix.length === 0) {
-      return dedupeCompletionEntries([
-        ...lspFiltered,
-        ...sessionFiltered,
-        ...bufferFiltered,
-      ]);
-    } else {
-      return dedupeCompletionEntries([
-        ...lspFiltered,
-        ...sessionFiltered,
-        ...bufferFiltered,
-      ]);
-    }
+    return dedupeCompletionEntries([
+      ...lspFiltered,
+      ...sessionFiltered,
+      ...bufferFiltered,
+    ]);
   }
 
   if (context.kind === "member") {
@@ -356,10 +345,11 @@ export async function collectCompletionEntries(
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
+  const defaultRuntimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
   
-  if (context.dataObjectName && defaultColumnFiltered.length > 0) {
+  if (context.dataObjectName && (defaultRuntimeFiltered.length > 0 || defaultColumnFiltered.length > 0)) {
     return dedupeCompletionEntries(filterCompletionEntries(
-      [...columnItems, ...lspItems, ...sessionItems, ...fallbackBufferItems],
+      [...defaultRuntimeFiltered, ...columnItems, ...lspItems, ...sessionItems, ...fallbackBufferItems],
       context.prefix
     ));
   }
@@ -517,18 +507,23 @@ async function getRuntimeMemberCompletions(
   completionProvider?: CompletionProvider
 ): Promise<CompletionEntry[]> {
   if (
-    context.kind !== "member" ||
-    !context.objectName ||
-    !context.operator ||
+    (context.kind !== "member" && context.kind !== "bracket" && !context.dataObjectName) ||
     !completionProvider?.provideMemberCompletionItems
   ) {
     return [];
   }
 
+  const expression =
+    context.kind === "member" ? context.objectName : context.dataObjectName;
+  const operator = context.kind === "member" ? context.operator : "$";
+  if (!expression || !operator) {
+    return [];
+  }
+
   try {
     const items = await completionProvider.provideMemberCompletionItems(
-      context.objectName,
-      context.operator
+      expression,
+      operator
     );
     if (!items || items.length === 0) {
       return [];
@@ -546,7 +541,7 @@ async function getRuntimeMemberCompletions(
           kind: isFunction
             ? vscode.CompletionItemKind.Function
             : vscode.CompletionItemKind.Field,
-          detail: context.objectName,
+          detail: expression,
           source: "session" as const,
         };
       });

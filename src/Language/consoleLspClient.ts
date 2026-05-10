@@ -20,16 +20,11 @@ import {
 } from "vscode-languageclient/node";
 import { SemanticTokensRequest } from "vscode-languageserver-protocol";
 import type { CompletionProvider } from "./completion";
-import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
 
 type ConsoleLspClientOptions = {
   consoleId: string;
   extensionPath: string;
   rPath: string;
-  requestMemberCompletions?: (
-    expression: string,
-    operator: "$" | "@"
-  ) => Promise<SessionMemberCompletionItem[] | undefined>;
 };
 
 export type ConsoleLspSessionState = {
@@ -322,20 +317,6 @@ export class ConsoleLspClient implements CompletionProvider {
         data: Array.from(result.data),
       };
     } catch (error) {
-      return undefined;
-    }
-  }
-
-  async provideMemberCompletionItems(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    if (!this.options.requestMemberCompletions) {
-      return undefined;
-    }
-    try {
-      return await this.options.requestMemberCompletions(expression, operator);
-    } catch {
       return undefined;
     }
   }
