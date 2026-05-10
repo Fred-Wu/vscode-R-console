@@ -107,7 +107,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.managePersistentSessions", () => {
       void managePersistentSessions(context);
     }),
-    vscode.window.onDidOpenTerminal(handleTerminalOpen),
+    vscode.window.onDidOpenTerminal(syncTerminalRecord),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
     vscode.window.onDidCloseTerminal(handleTerminalClose),
     vscode.window.tabGroups.onDidChangeTabs(handleTerminalTabChange),
@@ -1034,10 +1034,6 @@ function attachTerminal(
     preserveFocusOverride ?? alwaysUseActive === false;
   terminal.show(preserveFocus);
   return terminal;
-}
-
-function handleTerminalOpen(terminal: vscode.Terminal): void {
-  syncTerminalRecord(terminal);
 }
 
 function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {

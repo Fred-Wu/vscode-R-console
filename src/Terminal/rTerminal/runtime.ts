@@ -110,7 +110,6 @@ export type RuntimeHost = {
   renderInput(): void;
   recordOutputActivity(): void;
   isSessionProtocolActive(): boolean;
-  isSessionReadyForPrompt(): boolean;
   startNextSubmission(): void;
   finishActiveSubmission(): void;
   getDisplayPid(): number | undefined;
@@ -143,10 +142,6 @@ export function createRuntimeBackend(
     return new RustSidecarRuntimeBackend(sidecarPath);
   }
   return undefined;
-}
-
-function getConsoleProfilePath(extensionPath: string): string {
-  return path.join(extensionPath, "resources", "r", "console-profile.R");
 }
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
@@ -747,7 +742,7 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
       runtimeEnv.VSC_R_COLS = String(Math.max(20, host.dimensions.columns || 80));
       runtimeEnv.VSC_R_ROWS = String(Math.max(5, host.dimensions.rows || 24));
-      const consoleProfilePath = getConsoleProfilePath(host.extensionPath);
+      const consoleProfilePath = path.join(host.extensionPath, "resources", "r", "console-profile.R");
       if (!fs.existsSync(consoleProfilePath)) {
         throw new Error(`Console bootstrap script not found at ${consoleProfilePath}`);
       }
@@ -1044,7 +1039,7 @@ function restoreReadyStateAfterExecution(host: RuntimeHost): void {
 
   host.mode = "ready";
 
-  if (!host.promptReady || host.promptVisible || !host.isSessionReadyForPrompt()) {
+  if (!host.promptReady || host.promptVisible) {
     return;
   }
 

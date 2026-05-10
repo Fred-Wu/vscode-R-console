@@ -145,8 +145,22 @@ export class SessProxy {
     this.upstreamBuffer = "";
     this.resolveRSocketWaiters(socket);
 
-    socket.on("data", (chunk) => this.forwardRData(chunk));
-    this.upstreamSocket.on("data", (chunk) => this.forwardUpstreamData(chunk));
+    socket.on("data", (chunk) => {
+      this.rBuffer = this.forwardLines(
+        this.rBuffer,
+        chunk,
+        (line) => this.handleRLine(line),
+        this.upstreamSocket
+      );
+    });
+    this.upstreamSocket.on("data", (chunk) => {
+      this.upstreamBuffer = this.forwardLines(
+        this.upstreamBuffer,
+        chunk,
+        (line) => this.handleUpstreamLine(line),
+        this.rSocket
+      );
+    });
 
     const close = (): void => {
       if (this.rSocket === socket) {
@@ -161,24 +175,6 @@ export class SessProxy {
     socket.on("error", close);
     this.upstreamSocket.on("close", close);
     this.upstreamSocket.on("error", close);
-  }
-
-  private forwardRData(chunk: Buffer): void {
-    this.rBuffer = this.forwardLines(
-      this.rBuffer,
-      chunk,
-      (line) => this.handleRLine(line),
-      this.upstreamSocket
-    );
-  }
-
-  private forwardUpstreamData(chunk: Buffer): void {
-    this.upstreamBuffer = this.forwardLines(
-      this.upstreamBuffer,
-      chunk,
-      (line) => this.handleUpstreamLine(line),
-      this.rSocket
-    );
   }
 
   private forwardLines(

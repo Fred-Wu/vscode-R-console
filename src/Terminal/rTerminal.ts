@@ -240,7 +240,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
-    this.runtimeBackend = this.resolveRuntimeBackend();
+    this.runtimeBackend = createRuntimeBackend(this.extensionPath);
     this.vscodeRSessionReconnectPending = Boolean(
       restoreState?.runtime && options.sessionMode === "sess"
     );
@@ -570,7 +570,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       renderInput: () => self.renderInput(),
       recordOutputActivity: () => self.recordOutputActivity(),
       isSessionProtocolActive: () => self.isSessionProtocolActive(),
-      isSessionReadyForPrompt: () => self.isSessionReadyForPrompt(),
       startNextSubmission: () => self.startNextSubmission(),
       finishActiveSubmission: () => self.finishActiveSubmission(),
       getDisplayPid: () => self.getDisplayPid(),
@@ -614,10 +613,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
   }
 
-  private resolveRuntimeBackend(): RuntimeBackend | undefined {
-    return createRuntimeBackend(this.extensionPath);
-  }
-
   private isSessionProtocolActive(): boolean {
     return Boolean(
       this.rProcess &&
@@ -625,13 +620,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.sessionHostConnected &&
         this.runtimeBackend.canUseSessionCommands(this.rProcess)
     );
-  }
-
-  private isSessionReadyForPrompt(): boolean {
-    // The console prompt must not depend on vscode-R's session watcher.
-    // Missing watcher bootstrap packages should degrade watcher-driven
-    // features only, not block the embedded R session from becoming interactive.
-    return true;
   }
 
   open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -1752,10 +1740,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode !== "ready") {
       return;
     }
-    if (!this.isSessionReadyForPrompt()) {
-      return;
-    }
-
     const delay = this.getPromptRenderDelay();
     if (delay <= 0) {
       this.showPrompt();
@@ -1768,9 +1752,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       if (this.mode !== "ready") {
-        return;
-      }
-      if (!this.isSessionReadyForPrompt()) {
         return;
       }
       this.showPrompt();
@@ -2144,8 +2125,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (
       this.promptVisible ||
       !this.promptReady ||
-      this.mode !== "ready" ||
-      !this.isSessionReadyForPrompt()
+      this.mode !== "ready"
     ) {
       return;
     }
