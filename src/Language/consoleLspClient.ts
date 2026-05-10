@@ -103,7 +103,6 @@ export class ConsoleLspClient implements CompletionProvider {
   private pendingSocketServer: net.Server | undefined;
   private syncedDocuments = new Map<string, { document: vscode.TextDocument; version: number }>();
   private sessionState: ConsoleLspSessionState | undefined;
-  private vscodeRCompletionDocument: vscode.TextDocument | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.outputChannel = new SilentOutputChannel("R Console");
@@ -341,30 +340,6 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  async provideVscodeRCompletionItems(
-    doc: vscode.TextDocument,
-    position: vscode.Position,
-    triggerCharacter?: string
-  ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined> {
-    const sessionDoc = await this.getOrUpdateVscodeRCompletionDocument(doc.getText());
-    if (!sessionDoc) {
-      return undefined;
-    }
-
-    try {
-      return await vscode.commands.executeCommand<
-        vscode.CompletionList | vscode.CompletionItem[] | undefined
-      >(
-        "vscode.executeCompletionItemProvider",
-        sessionDoc.uri,
-        position,
-        triggerCharacter
-      );
-    } catch {
-      return undefined;
-    }
-  }
-
   async syncSessionState(state: ConsoleLspSessionState): Promise<void> {
     this.sessionState = state;
     const client = await this.ensureClient();
@@ -398,37 +373,6 @@ export class ConsoleLspClient implements CompletionProvider {
       return undefined;
     }
     return this.client;
-  }
-
-  private async getOrUpdateVscodeRCompletionDocument(
-    content: string
-  ): Promise<vscode.TextDocument | undefined> {
-    try {
-      const current = this.vscodeRCompletionDocument;
-      if (
-        current &&
-        vscode.workspace.textDocuments.some((doc) => doc.uri.toString() === current.uri.toString())
-      ) {
-        const fullRange = new vscode.Range(
-          current.positionAt(0),
-          current.positionAt(current.getText().length)
-        );
-        const edit = new vscode.WorkspaceEdit();
-        edit.replace(current.uri, fullRange, content);
-        await vscode.workspace.applyEdit(edit);
-        await current.save();
-        return current;
-      }
-
-      const filePath = path.join(this.workingDirectory, "r-console-session-completion.R");
-      fs.writeFileSync(filePath, content, "utf8");
-      this.vscodeRCompletionDocument = await vscode.workspace.openTextDocument(
-        vscode.Uri.file(filePath)
-      );
-      return this.vscodeRCompletionDocument;
-    } catch {
-      return undefined;
-    }
   }
 
   private async startInternal(): Promise<void> {

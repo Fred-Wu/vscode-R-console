@@ -51,11 +51,6 @@ export interface CompletionProvider {
       str?: string;
     }> | undefined
   >;
-  provideVscodeRCompletionItems?(
-    doc: vscode.TextDocument,
-    position: vscode.Position,
-    triggerCharacter?: string
-  ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined>;
 }
 
 type GlobalEnvItem = {
@@ -284,13 +279,6 @@ export async function collectCompletionEntries(
     context.kind === "member"
       ? await getRuntimeMemberCompletions(context, completionProvider)
       : [];
-  const vscodeSessionItems = await getVscodeRSessionCompletions(
-    context,
-    doc,
-    position,
-    multilineBuffer,
-    completionProvider
-  );
   const lspItems =
     context.kind === "bracket"
       ? []
@@ -303,20 +291,15 @@ export async function collectCompletionEntries(
   const columnItems = getDataColumnCompletions(context, sessionData);
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
-    ...vscodeSessionItems,
     ...sessionItems,
     ...columnItems,
   ]);
 
   if (context.kind === "bracket") {
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
-    const vscodeFiltered = filterCompletionEntries(vscodeSessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (columnFiltered.length > 0) {
       return dedupeCompletionEntries(columnFiltered);
-    }
-    if (vscodeFiltered.length > 0) {
-      return dedupeCompletionEntries(vscodeFiltered);
     }
     return dedupeCompletionEntries([
       ...filterCompletionEntries(sessionItems, context.prefix),
@@ -326,7 +309,6 @@ export async function collectCompletionEntries(
 
   if (context.kind === "argument") {
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
-    const vscodeFiltered = filterCompletionEntries(vscodeSessionItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
@@ -335,7 +317,6 @@ export async function collectCompletionEntries(
       if (context.prefix.length === 0) {
         return dedupeCompletionEntries([
           ...columnFiltered,
-          ...vscodeFiltered,
           ...lspFiltered,
           ...sessionFiltered,
           ...bufferFiltered,
@@ -343,7 +324,6 @@ export async function collectCompletionEntries(
       } else {
         return dedupeCompletionEntries([
           ...columnFiltered,
-          ...vscodeFiltered,
           ...lspFiltered,
           ...sessionFiltered,
           ...bufferFiltered,
@@ -354,14 +334,12 @@ export async function collectCompletionEntries(
     if (context.prefix.length === 0) {
       return dedupeCompletionEntries([
         ...lspFiltered,
-        ...vscodeFiltered,
         ...sessionFiltered,
         ...bufferFiltered,
       ]);
     } else {
       return dedupeCompletionEntries([
         ...lspFiltered,
-        ...vscodeFiltered,
         ...sessionFiltered,
         ...bufferFiltered,
       ]);
@@ -370,13 +348,9 @@ export async function collectCompletionEntries(
 
   if (context.kind === "member") {
     const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
-    const vscodeFiltered = filterCompletionEntries(vscodeSessionItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     if (runtimeFiltered.length > 0) {
       return dedupeCompletionEntries(runtimeFiltered);
-    }
-    if (vscodeFiltered.length > 0) {
-      return dedupeCompletionEntries(vscodeFiltered);
     }
     return dedupeCompletionEntries(sessionFiltered);
   }
@@ -385,13 +359,13 @@ export async function collectCompletionEntries(
   
   if (context.dataObjectName && defaultColumnFiltered.length > 0) {
     return dedupeCompletionEntries(filterCompletionEntries(
-      [...columnItems, ...lspItems, ...vscodeSessionItems, ...sessionItems, ...fallbackBufferItems],
+      [...columnItems, ...lspItems, ...sessionItems, ...fallbackBufferItems],
       context.prefix
     ));
   }
 
   return dedupeCompletionEntries(filterCompletionEntries(
-    [...lspItems, ...vscodeSessionItems, ...sessionItems, ...fallbackBufferItems],
+    [...lspItems, ...sessionItems, ...fallbackBufferItems],
     context.prefix
   ));
 }
@@ -576,39 +550,6 @@ async function getRuntimeMemberCompletions(
           source: "session" as const,
         };
       });
-  } catch {
-    return [];
-  }
-}
-
-async function getVscodeRSessionCompletions(
-  context: CompletionContext,
-  doc: vscode.TextDocument,
-  position: vscode.Position,
-  multilineBuffer: string[],
-  completionProvider?: CompletionProvider
-): Promise<CompletionEntry[]> {
-  if (!completionProvider?.provideVscodeRCompletionItems || context.kind === "package") {
-    return [];
-  }
-
-  try {
-    const result = await completionProvider.provideVscodeRCompletionItems(
-      doc,
-      position,
-      context.triggerCharacter
-    );
-    const items = Array.isArray(result) ? result : result?.items || [];
-    return items
-      .filter((item) => item.kind !== vscode.CompletionItemKind.Text)
-      .map((item) => ({
-        label: stripSnippetSyntax(getCompletionLabel(item)),
-        insertText: getCompletionInsertText(item),
-        kind: item.kind,
-        detail: item.detail ?? "vscode-R session",
-        source: "session" as const,
-        replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
-      }));
   } catch {
     return [];
   }
