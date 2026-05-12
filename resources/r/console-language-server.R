@@ -24,9 +24,11 @@ if (!requireNamespace("languageserver", quietly = TRUE)) {
 }
 
 debug <- Sys.getenv("VSCR_LSP_DEBUG")
+host <- Sys.getenv("VSCR_LSP_HOST")
 port <- Sys.getenv("VSCR_LSP_PORT")
 
 debug <- if (nzchar(debug)) as.logical(debug) else FALSE
+host <- if (nzchar(host)) host else "127.0.0.1"
 port <- if (nzchar(port)) as.integer(port) else NULL
 
 tools::Rd2txt_options(underline_titles = FALSE)
@@ -101,7 +103,7 @@ console_text_document_did_close <- function(self, params) {
     languageserver:::text_document_did_close(self, params)
 }
 
-server <- languageserver:::LanguageServer$new("localhost", port)
+server <- languageserver:::LanguageServer$new(host, port)
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
     loaded_namespaces <- normalize_character(params$loadedNamespaces)
