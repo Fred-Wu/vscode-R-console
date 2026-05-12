@@ -556,7 +556,7 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = Object.create(process.env);
+    const env: NodeJS.ProcessEnv = { ...process.env };
     const debug = config.get<boolean>("lsp.debug") === true;
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
