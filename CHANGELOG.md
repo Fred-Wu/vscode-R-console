@@ -2,6 +2,13 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.4] - 2026-05-13
+
+### Fixed
+- Fixed console LSP startup on Windows by using a consistent loopback host between VS Code and the R language server helper.
+- Preserved the inherited environment when spawning the console LSP R process.
+- Avoided repeated semantic token retry loops when semantic tokens are unavailable.
+
 ## [0.2.3] - 2026-05-10
 
 ### Added
