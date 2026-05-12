@@ -161,8 +161,19 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       ) {
         const requestedVersion = this.wantedSemanticVersion;
         const requestedContent = this.sourceKey;
-        const semanticTokens = await this.requestSemantics(requestedContent);
-        if (!semanticTokens || requestedVersion !== this.sourceVersion) {
+        let semanticTokens: DocumentSemanticTokensResult | undefined;
+        try {
+          semanticTokens = await this.requestSemantics(requestedContent);
+        } catch {
+          semanticTokens = undefined;
+        }
+
+        if (requestedVersion !== this.sourceVersion) {
+          continue;
+        }
+
+        if (!semanticTokens) {
+          this.appliedSemanticVersion = requestedVersion;
           continue;
         }
 
