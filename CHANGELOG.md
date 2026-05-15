@@ -2,10 +2,13 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.2.5] - 2026-05-14
+## [0.2.5] - 2026-05-15
 
 ### Changed
 - Release packaging now reuses unchanged sidecar binaries from the previous GitHub release VSIX instead of rebuilding them for every extension release.
+
+### Fixed
+- Fixed leading blank echo after stripped R comments.
 
 ## [0.2.4] - 2026-05-13
 
