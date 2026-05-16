@@ -1064,7 +1064,9 @@ export async function enqueueRuntimeSubmission(
 }
 
 function normalizeSubmissionBlock(code: string): string {
-  return stripCommentLines(code.replace(/\n+$/, "")).trimEnd();
+  return stripCommentLines(code.replace(/\n+$/, ""))
+    .replace(/^(?:[ \t]*[\r\n])+/, "")
+    .trimEnd();
 }
 
 async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<string[]> {
