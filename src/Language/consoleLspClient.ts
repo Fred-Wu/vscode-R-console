@@ -21,6 +21,8 @@ import {
 import { SemanticTokensRequest } from "vscode-languageserver-protocol";
 import type { CompletionProvider } from "./completion";
 
+const CONSOLE_LSP_HOST = "127.0.0.1";
+
 type ConsoleLspClientOptions = {
   consoleId: string;
   extensionPath: string;
@@ -438,7 +440,7 @@ export class ConsoleLspClient implements CompletionProvider {
         rejectOnce(new Error("Console language server socket closed before connection."));
       });
 
-      server.listen(0, "127.0.0.1", () => {
+      server.listen(0, CONSOLE_LSP_HOST, () => {
         const address = server.address();
         if (!address || typeof address === "string") {
           this.pendingSocketServer = undefined;
@@ -448,6 +450,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         const env: NodeJS.ProcessEnv = {
           ...baseEnv,
+          VSCR_LSP_HOST: CONSOLE_LSP_HOST,
           VSCR_LSP_PORT: String(address.port),
         };
         const child = spawn(this.options.rPath, args, {
@@ -534,7 +537,7 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = Object.create(process.env);
+    const env: NodeJS.ProcessEnv = { ...process.env };
     const debug = config.get<boolean>("lsp.debug") === true;
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";

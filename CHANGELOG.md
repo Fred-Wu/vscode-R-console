@@ -10,6 +10,22 @@ All notable changes to R Console will be documented in this file.
 ### Changed
 - Runtime `$`, `@`, and data-frame bracket completion in vscode-R 3.0 `sess` mode now uses the active console session through `sess` JSON-RPC.
 
+## [0.2.5] - 2026-05-15
+
+### Changed
+- Release packaging now reuses unchanged sidecar binaries from the previous GitHub release VSIX instead of rebuilding them for every extension release.
+- Release workflow now publishes the target-specific VSIX packages to the Open VSX Registry.
+
+### Fixed
+- Fixed leading blank echo after stripped R comments.
+
+## [0.2.4] - 2026-05-13
+
+### Fixed
+- Fixed console LSP startup on Windows by using a consistent loopback host between VS Code and the R language server helper.
+- Preserved the inherited environment when spawning the console LSP R process.
+- Avoided repeated semantic token retry loops when semantic tokens are unavailable.
+
 ## [0.2.3] - 2026-05-10
 
 ### Added
