@@ -1111,9 +1111,6 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
   configureMainPrompt(host.renderer);
 
   if (host.promptVisible || host.inputState.text.length > 0) {
-    if (host.promptVisible) {
-      host.captureVisibleInputForReplay();
-    }
     host.clearInputRender();
     host.promptVisible = false;
   } else {
