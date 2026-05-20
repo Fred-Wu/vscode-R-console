@@ -45,6 +45,12 @@ Launch `R Console` from the Command Palette with:
 
 Use the session manager to attach to, detach from, or close running R Console sessions.
 
+### Restoring A Dropped Console UI
+
+R Console runs in a VS Code custom pseudoterminal. VS Code may close the terminal UI during multi-root workspace folder reorder or removal, and after extension host restart/reload.
+
+Use `R Console: Manage Persistent Sessions...` from the Command Palette, then choose `Attach Session...` or `Attach All Detached Sessions` to restore the console UI for the running session.
+
 The minimum vscode-R setup for R Console commands to work is:
 
 1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
