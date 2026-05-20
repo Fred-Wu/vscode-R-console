@@ -1,3 +1,8 @@
+Source Code License
+
+Unless otherwise noted below, the source code and project documentation are
+licensed as follows:
+
 MIT License
 
 Copyright (c) 2025
@@ -19,3 +24,21 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Third-Party Asset Notice
+
+The R logo files in images/Rlogo.png and images/Rlogo.ico are based on the
+R logo, Copyright (c) 2016 The R Foundation, available from:
+
+https://www.r-project.org/logo/
+
+These logo assets are distributed in this project under the Creative Commons
+Attribution-ShareAlike 4.0 International License:
+
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Changes made for this project: the logo was resized and packaged as
+images/Rlogo.png for the VS Code extension icon and terminal tab icon, and
+converted to images/Rlogo.ico for the Windows backend executable icon.
+
+Use of the R logo does not imply endorsement by The R Foundation.

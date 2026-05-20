@@ -2,6 +2,15 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.6] - 2026-05-20
+
+### Changed
+- Clarified R logo asset licensing in the project license.
+- Documented how to restore a dropped custom pseudoterminal UI from persistent sessions.
+
+### Fixed
+- Fixed duplicate R> prompts after console resize.
+
 ## [0.2.5] - 2026-05-15
 
 ### Changed
