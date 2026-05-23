@@ -350,8 +350,11 @@ export async function collectCompletionEntries(
     context.kind === "member"
       ? await getRuntimeMemberCompletions(context, completionProvider)
       : [];
+  const includeLspItems =
+    context.kind !== "bracket" ||
+    (context.bracketOperator === "[" && !context.bracketQuote && context.prefix.length > 0);
   const rawLspItems =
-    context.kind === "bracket"
+    !includeLspItems
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
   const lspItems =
@@ -376,7 +379,14 @@ export async function collectCompletionEntries(
 
   if (context.kind === "bracket") {
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
+    const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
+    const exactColumnMatch = columnFiltered.some(
+      (entry) => entry.label.toLowerCase() === context.prefix.toLowerCase()
+    );
+    if (lspFiltered.length > 0 && !exactColumnMatch) {
+      return dedupeCompletionEntries([...lspFiltered, ...columnFiltered, ...bufferFiltered]);
+    }
     if (columnFiltered.length > 0) {
       return dedupeCompletionEntries(columnFiltered);
     }
