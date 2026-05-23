@@ -9,6 +9,7 @@ type CompletionContext = {
   operator?: "$" | "@";
   bracketOperator?: "[" | "[[";
   bracketQuote?: "\"" | "'";
+  chainedBracket?: boolean;
   functionName?: string;
   dataObjectName?: string;
   snapshotInput: string;
@@ -110,6 +111,11 @@ type WorkspaceData = {
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
 const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
+const BRACKET_CHAIN_SEGMENT = "(?:\\[[^\\[\\]]*\\]|\\[\\[[^\\[\\]]*\\]\\])";
+const MEMBER_OBJECT_SEGMENT = `(?:${MEMBER_CHAIN_SEGMENT}(?:${BRACKET_CHAIN_SEGMENT})*)`;
+const BRACKET_OBJECT_PATTERN = new RegExp(
+  `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)(\\[\\[?)\\s*(["']?)([a-zA-Z0-9._]*)$`
+);
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
 const R_RESERVED_WORDS = new Set([
   "if",
@@ -133,7 +139,7 @@ const R_RESERVED_WORDS = new Set([
   "NA_character_",
 ]);
 const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
-  `(${MEMBER_CHAIN_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_CHAIN_SEGMENT})*)\\s*$`
+  `(${MEMBER_OBJECT_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_OBJECT_SEGMENT})*)\\s*$`
 );
 
 function isPipePlaceholder(name: string): boolean {
@@ -162,12 +168,15 @@ function getFieldInsertText(name: string, context: CompletionContext): string {
 }
 
 function detectDataContext(beforeCursor: string): string | undefined {
-  const pipePattern = /([a-zA-Z._][a-zA-Z0-9._]*)\s*(%>%|\|>)/g;
+  const pipePattern = new RegExp(
+    `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)\\s*(%>%|\\|>)`,
+    "g"
+  );
   let pipeMatch;
   let firstPipeObject: string | undefined;
   while ((pipeMatch = pipePattern.exec(beforeCursor)) !== null) {
     if (!firstPipeObject) {
-      firstPipeObject = pipeMatch[1];
+      firstPipeObject = /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(pipeMatch[1])?.[0];
     }
   }
   if (firstPipeObject) {
@@ -184,6 +193,9 @@ function detectDataContext(beforeCursor: string): string | undefined {
         return firstPipeObject;
       }
       if (/(\|>)\s*_\s*\[{1,2}[^\]]*$/.test(afterPipe)) {
+        return firstPipeObject;
+      }
+      if (/(\|>)\s*_\s*\[{1,2}[\s\S]*\]\$[a-zA-Z0-9._]*$/.test(afterPipe)) {
         return firstPipeObject;
       }
     }
@@ -232,24 +244,23 @@ export function getCompletionContext(
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
   const dataObjectName = detectDataContext(textForDataContext);
 
-  const bracketMatch = /([a-zA-Z._][a-zA-Z0-9._]*)(\[\[?)\s*(["']?)([a-zA-Z0-9._]*)$/.exec(
-    beforeCursor
-  );
+  const bracketMatch = BRACKET_OBJECT_PATTERN.exec(beforeCursor);
   if (bracketMatch) {
     const bracketOperator = bracketMatch[2] as "[" | "[[";
     const prefix = bracketMatch[4] || "";
     const bracketObject = bracketMatch[1];
-    const effectiveDataObject = (isPipePlaceholder(bracketObject) && dataObjectName)
-      ? dataObjectName 
-      : bracketObject;
+    const baseObject = /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(bracketObject)?.[0] ?? bracketObject;
+    const isPlaceholderBracket = isPipePlaceholder(baseObject) && !!dataObjectName;
+    const effectiveDataObject = isPlaceholderBracket ? dataObjectName : baseObject;
     return {
       kind: "bracket",
       prefix,
       replaceStart: beforeCursor.length - prefix.length,
       triggerCharacter: bracketMatch[3] ? undefined : "[",
-      objectName: bracketObject,
+      objectName: baseObject,
       bracketOperator,
       bracketQuote: bracketMatch[3] ? bracketMatch[3] as "\"" | "'" : undefined,
+      chainedBracket: bracketObject !== baseObject || isPlaceholderBracket,
       dataObjectName: effectiveDataObject,
       operator: undefined,
       snapshotInput,
@@ -265,13 +276,20 @@ export function getCompletionContext(
     const chainMatch = MEMBER_CHAIN_TAIL_PATTERN.exec(objectExprRaw);
     const objectExpr = chainMatch?.[1];
     if (objectExpr) {
+      const isBracketChainMember = operator === "$" && objectExpr.includes("[");
+      const baseObject = isBracketChainMember
+        ? /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(objectExpr)?.[0]
+        : undefined;
+      const isPlaceholderMember = !!baseObject && isPipePlaceholder(baseObject) && !!dataObjectName;
       return {
         kind: "member",
         prefix,
         replaceStart: beforeCursor.length - prefix.length,
         triggerCharacter: prefix.length === 0 ? operator : undefined,
-        objectName: objectExpr,
+        objectName: isPlaceholderMember ? dataObjectName : baseObject ?? objectExpr,
         operator,
+        chainedBracket: isBracketChainMember,
+        dataObjectName: isPlaceholderMember ? dataObjectName : undefined,
         snapshotInput,
         snapshotCursor,
       };
@@ -374,6 +392,7 @@ export async function collectCompletionEntries(
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
+    ...runtimeMemberItems,
     ...columnItems,
   ]);
 
@@ -386,6 +405,9 @@ export async function collectCompletionEntries(
     );
     if (lspFiltered.length > 0 && !exactColumnMatch) {
       return dedupeCompletionEntries([...lspFiltered, ...columnFiltered, ...bufferFiltered]);
+    }
+    if (context.chainedBracket && bufferFiltered.length > 0) {
+      return dedupeCompletionEntries([...columnFiltered, ...bufferFiltered]);
     }
     if (columnFiltered.length > 0) {
       return dedupeCompletionEntries(columnFiltered);
@@ -424,10 +446,14 @@ export async function collectCompletionEntries(
   if (context.kind === "member") {
     const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
+    const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
+    if (context.chainedBracket && bufferFiltered.length > 0) {
+      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]);
+    }
     if (runtimeFiltered.length > 0) {
       return dedupeCompletionEntries(runtimeFiltered);
     }
-    return dedupeCompletionEntries(sessionFiltered);
+    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]);
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
@@ -660,17 +686,21 @@ function getConsoleBufferCompletions(
   recentConsoleEntries: string[]
 ): CompletionEntry[] {
   if (
-    context.prefix.length === 0 ||
+    (context.prefix.length === 0 &&
+      !((context.kind === "bracket" || context.kind === "member") && context.chainedBracket)) ||
     (context.kind !== "default" &&
       context.kind !== "argument" &&
-      context.kind !== "bracket")
+      context.kind !== "bracket" &&
+      !(context.kind === "member" && context.chainedBracket))
   ) {
     return [];
   }
 
   const result: CompletionEntry[] = [];
   const seen = new Set<string>();
-  const sources = [currentInputText, ...[...recentConsoleEntries].reverse()];
+  const sources = context.prefix.length === 0
+    ? [currentInputText]
+    : [currentInputText, ...[...recentConsoleEntries].reverse()];
 
   for (const sourceText of sources) {
     const matches = sourceText.match(CONSOLE_IDENTIFIER_PATTERN);
@@ -681,6 +711,8 @@ function getConsoleBufferCompletions(
     for (const label of matches) {
       if (
         label === context.prefix ||
+        label === context.objectName ||
+        label === context.dataObjectName ||
         R_RESERVED_WORDS.has(label) ||
         seen.has(label)
       ) {
