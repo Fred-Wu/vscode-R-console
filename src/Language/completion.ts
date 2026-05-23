@@ -22,6 +22,41 @@ type CompletionEntry = {
   replaceStart?: number;
 };
 
+const COMPLETION_GROUP_ORDER = {
+  argument: [
+    "Arguments",
+    "Fields",
+    "Runtime Variables",
+    "Runtime Functions",
+    "Packages",
+    "Functions",
+    "Recent Input",
+    "Other",
+  ],
+  bracket: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
+  default: [
+    "Runtime Variables",
+    "Runtime Functions",
+    "Packages",
+    "Functions",
+    "Fields",
+    "Recent Input",
+    "Other",
+  ],
+  member: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
+  package: ["Package Members", "Functions", "Fields", "Recent Input", "Other"],
+} as const satisfies Record<CompletionContext["kind"], readonly string[]>;
+
+const DATA_CONTEXT_GROUP_ORDER = [
+  "Fields",
+  "Runtime Variables",
+  "Runtime Functions",
+  "Packages",
+  "Functions",
+  "Recent Input",
+  "Other",
+] as const;
+
 export type CompletionPickItem = vscode.QuickPickItem & {
   insertText: string;
   replaceStart: number;
@@ -29,6 +64,8 @@ export type CompletionPickItem = vscode.QuickPickItem & {
   snapshotCursor: number;
   source: "lsp" | "session" | "buffer";
 };
+
+export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
 export interface CompletionProvider {
   provideCompletionItems(
@@ -96,6 +133,10 @@ const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
   `(${MEMBER_CHAIN_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_CHAIN_SEGMENT})*)\\s*$`
 );
 
+function isPipePlaceholder(name: string): boolean {
+  return name === "_" || name === ".";
+}
+
 function detectDataContext(beforeCursor: string): string | undefined {
   const pipePattern = /([a-zA-Z._][a-zA-Z0-9._]*)\s*(%>%|\|>)/g;
   let pipeMatch;
@@ -115,6 +156,9 @@ function detectDataContext(beforeCursor: string): string | undefined {
       if (/(%>%|\|>)\s*([a-zA-Z._][a-zA-Z0-9._]*::)?[a-zA-Z._][a-zA-Z0-9._]*\s*\([^)]*$/.test(afterPipe)) {
         return firstPipeObject;
       }
+      if (/(%>%)\s*\.\s*\[{1,2}[^\]]*$/.test(afterPipe)) {
+        return firstPipeObject;
+      }
       if (/(\|>)\s*_\s*\[{1,2}[^\]]*$/.test(afterPipe)) {
         return firstPipeObject;
       }
@@ -125,7 +169,7 @@ function detectDataContext(beforeCursor: string): string | undefined {
   const bracketMatch = bracketPattern.exec(beforeCursor);
   if (bracketMatch) {
     const objectName = bracketMatch[1];
-    if (objectName === '_' && firstPipeObject) {
+    if (isPipePlaceholder(objectName) && firstPipeObject) {
       return firstPipeObject;
     }
     return objectName;
@@ -170,7 +214,7 @@ export function getCompletionContext(
   if (bracketMatch) {
     const prefix = bracketMatch[3] || "";
     const bracketObject = bracketMatch[1];
-    const effectiveDataObject = (bracketObject === '_' && dataObjectName) 
+    const effectiveDataObject = (isPipePlaceholder(bracketObject) && dataObjectName)
       ? dataObjectName 
       : bracketObject;
     return {
@@ -279,16 +323,24 @@ export async function collectCompletionEntries(
     context.kind === "member"
       ? await getRuntimeMemberCompletions(context, completionProvider)
       : [];
-  const lspItems =
+  const rawLspItems =
     context.kind === "bracket"
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
+  const lspItems =
+    context.kind === "default"
+      ? filterShadowedWorkspaceEntries(rawLspItems, sessionItems)
+      : rawLspItems;
   const bufferItems = getConsoleBufferCompletions(
     context,
     doc.getText(),
     recentConsoleEntries
   );
-  const columnItems = getDataColumnCompletions(context, sessionData);
+  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
+  const columnItems =
+    cachedColumnItems.length > 0
+      ? cachedColumnItems
+      : await getRuntimeDataColumnCompletions(context, completionProvider);
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
@@ -314,21 +366,7 @@ export async function collectCompletionEntries(
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
     if (context.dataObjectName && columnFiltered.length > 0) {
-      if (context.prefix.length === 0) {
-        return dedupeCompletionEntries([
-          ...columnFiltered,
-          ...lspFiltered,
-          ...sessionFiltered,
-          ...bufferFiltered,
-        ]);
-      } else {
-        return dedupeCompletionEntries([
-          ...columnFiltered,
-          ...lspFiltered,
-          ...sessionFiltered,
-          ...bufferFiltered,
-        ]);
-      }
+      return dedupeCompletionEntries(columnFiltered);
     }
 
     if (context.prefix.length === 0) {
@@ -358,10 +396,7 @@ export async function collectCompletionEntries(
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
   
   if (context.dataObjectName && defaultColumnFiltered.length > 0) {
-    return dedupeCompletionEntries(filterCompletionEntries(
-      [...columnItems, ...lspItems, ...sessionItems, ...fallbackBufferItems],
-      context.prefix
-    ));
+    return dedupeCompletionEntries(defaultColumnFiltered);
   }
 
   return dedupeCompletionEntries(filterCompletionEntries(
@@ -386,6 +421,96 @@ export function toCompletionPick(
     snapshotCursor: context.snapshotCursor,
     source: entry.source,
   };
+}
+
+export function toCompletionQuickPickItems(
+  entries: CompletionEntry[],
+  context: CompletionContext
+): CompletionQuickPickItem[] {
+  const grouped = new Map<string, CompletionEntry[]>();
+
+  for (const entry of entries) {
+    const group = getCompletionGroup(entry, context);
+    const groupEntries = grouped.get(group) ?? [];
+    groupEntries.push(entry);
+    grouped.set(group, groupEntries);
+  }
+
+  const result: CompletionQuickPickItem[] = [];
+  const preferredGroups =
+    context.kind === "default" && context.dataObjectName
+      ? DATA_CONTEXT_GROUP_ORDER
+      : COMPLETION_GROUP_ORDER[context.kind];
+  const orderedGroups = new Set<string>(preferredGroups);
+  const groups = [
+    ...preferredGroups,
+    ...[...grouped.keys()].filter((group) => !orderedGroups.has(group)),
+  ];
+
+  for (const group of groups) {
+    const groupEntries = grouped.get(group);
+    if (!groupEntries || groupEntries.length === 0) {
+      continue;
+    }
+    result.push({
+      label: group,
+      kind: vscode.QuickPickItemKind.Separator,
+    });
+    result.push(...groupEntries.map((entry) => toCompletionPick(entry, context)));
+  }
+
+  return result;
+}
+
+export function isCompletionPickItem(
+  item: CompletionQuickPickItem | undefined
+): item is CompletionPickItem {
+  return (
+    !!item &&
+    "insertText" in item &&
+    "replaceStart" in item &&
+    "snapshotInput" in item &&
+    "snapshotCursor" in item
+  );
+}
+
+function getCompletionGroup(
+  entry: CompletionEntry,
+  context: CompletionContext
+): string {
+  const kind = entry.kind;
+
+  if (entry.source === "buffer") {
+    return "Recent Input";
+  }
+  if (context.kind === "package") {
+    return "Package Members";
+  }
+  if (context.kind === "argument" && entry.source === "lsp") {
+    return "Arguments";
+  }
+  if (kind === vscode.CompletionItemKind.Field || kind === vscode.CompletionItemKind.Property) {
+    return "Fields";
+  }
+  if (entry.source === "session") {
+    return isCallableCompletionKind(kind) ? "Runtime Functions" : "Runtime Variables";
+  }
+  if (kind === vscode.CompletionItemKind.Module) {
+    return "Packages";
+  }
+  if (isCallableCompletionKind(kind)) {
+    return "Functions";
+  }
+
+  return "Other";
+}
+
+function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): boolean {
+  return (
+    kind === vscode.CompletionItemKind.Function ||
+    kind === vscode.CompletionItemKind.Method ||
+    kind === vscode.CompletionItemKind.Constructor
+  );
 }
 
 function getSessionCompletions(
@@ -460,6 +585,36 @@ function getDataColumnCompletions(
     detail: context.dataObjectName,
     source: "session" as const,
   }));
+}
+
+async function getRuntimeDataColumnCompletions(
+  context: CompletionContext,
+  completionProvider?: CompletionProvider
+): Promise<CompletionEntry[]> {
+  if (!context.dataObjectName || !completionProvider?.provideMemberCompletionItems) {
+    return [];
+  }
+
+  try {
+    const items = await completionProvider.provideMemberCompletionItems(
+      context.dataObjectName,
+      "$"
+    );
+    if (!items || items.length === 0) {
+      return [];
+    }
+    return items
+      .filter((item) => typeof item.name === "string" && item.name.length > 0)
+      .map((item) => ({
+        label: item.name,
+        insertText: item.name,
+        kind: vscode.CompletionItemKind.Field,
+        detail: context.dataObjectName,
+        source: "session" as const,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 function getConsoleBufferCompletions(
@@ -682,6 +837,23 @@ function filterShadowedBufferEntries(
 
   return bufferEntries.filter(
     (entry) => !preferredLabels.has(entry.label.toLowerCase())
+  );
+}
+
+function filterShadowedWorkspaceEntries(
+  entries: CompletionEntry[],
+  workspaceEntries: CompletionEntry[]
+): CompletionEntry[] {
+  if (entries.length === 0 || workspaceEntries.length === 0) {
+    return entries;
+  }
+
+  const workspaceLabels = new Set(
+    workspaceEntries.map((entry) => entry.label.toLowerCase())
+  );
+
+  return entries.filter(
+    (entry) => !workspaceLabels.has(entry.label.toLowerCase())
   );
 }
 
