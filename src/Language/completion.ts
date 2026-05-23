@@ -7,6 +7,8 @@ type CompletionContext = {
   triggerCharacter?: string;
   objectName?: string;
   operator?: "$" | "@";
+  bracketOperator?: "[" | "[[";
+  bracketQuote?: "\"" | "'";
   functionName?: string;
   dataObjectName?: string;
   snapshotInput: string;
@@ -106,6 +108,7 @@ type WorkspaceData = {
 };
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
+const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
 const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
 const R_RESERVED_WORDS = new Set([
@@ -135,6 +138,27 @@ const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
+}
+
+function quoteRNameIfNeeded(name: string): string {
+  if (R_SYNTACTIC_NAME_PATTERN.test(name) && !R_RESERVED_WORDS.has(name)) {
+    return name;
+  }
+  return `\`${name.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\``;
+}
+
+function getFieldInsertText(name: string, context: CompletionContext): string {
+  if (context.kind !== "bracket") {
+    return quoteRNameIfNeeded(name);
+  }
+  if (context.bracketQuote) {
+    const quotePattern = context.bracketQuote === "\"" ? /"/g : /'/g;
+    return name.replace(/\\/g, "\\\\").replace(quotePattern, `\\${context.bracketQuote}`);
+  }
+  if (context.bracketOperator === "[[") {
+    return `"${name.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+  }
+  return quoteRNameIfNeeded(name);
 }
 
 function detectDataContext(beforeCursor: string): string | undefined {
@@ -208,11 +232,12 @@ export function getCompletionContext(
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
   const dataObjectName = detectDataContext(textForDataContext);
 
-  const bracketMatch = /([a-zA-Z._][a-zA-Z0-9._]*)\[\[?\s*(["']?)([a-zA-Z0-9._]*)$/.exec(
+  const bracketMatch = /([a-zA-Z._][a-zA-Z0-9._]*)(\[\[?)\s*(["']?)([a-zA-Z0-9._]*)$/.exec(
     beforeCursor
   );
   if (bracketMatch) {
-    const prefix = bracketMatch[3] || "";
+    const bracketOperator = bracketMatch[2] as "[" | "[[";
+    const prefix = bracketMatch[4] || "";
     const bracketObject = bracketMatch[1];
     const effectiveDataObject = (isPipePlaceholder(bracketObject) && dataObjectName)
       ? dataObjectName 
@@ -221,8 +246,10 @@ export function getCompletionContext(
       kind: "bracket",
       prefix,
       replaceStart: beforeCursor.length - prefix.length,
-      triggerCharacter: bracketMatch[2] ? undefined : "[",
+      triggerCharacter: bracketMatch[3] ? undefined : "[",
       objectName: bracketObject,
+      bracketOperator,
+      bracketQuote: bracketMatch[3] ? bracketMatch[3] as "\"" | "'" : undefined,
       dataObjectName: effectiveDataObject,
       operator: undefined,
       snapshotInput,
@@ -537,7 +564,7 @@ function getSessionCompletions(
         : obj.names || [];
     return members.map((name) => ({
       label: name,
-      insertText: name,
+      insertText: getFieldInsertText(name, context),
       kind: vscode.CompletionItemKind.Field,
       detail: context.objectName,
       source: "session",
@@ -580,7 +607,7 @@ function getDataColumnCompletions(
 
   return obj.names.map((name) => ({
     label: name,
-    insertText: name,
+    insertText: getFieldInsertText(name, context),
     kind: vscode.CompletionItemKind.Field,
     detail: context.dataObjectName,
     source: "session" as const,
@@ -607,7 +634,7 @@ async function getRuntimeDataColumnCompletions(
       .filter((item) => typeof item.name === "string" && item.name.length > 0)
       .map((item) => ({
         label: item.name,
-        insertText: item.name,
+        insertText: getFieldInsertText(item.name, context),
         kind: vscode.CompletionItemKind.Field,
         detail: context.dataObjectName,
         source: "session" as const,
@@ -697,7 +724,7 @@ async function getRuntimeMemberCompletions(
           /^\s*function\s*\(/.test(item.str || "");
         return {
           label: item.name,
-          insertText: item.name,
+          insertText: quoteRNameIfNeeded(item.name),
           kind: isFunction
             ? vscode.CompletionItemKind.Function
             : vscode.CompletionItemKind.Field,
