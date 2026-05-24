@@ -3,7 +3,8 @@ import {
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
-  toCompletionPick,
+  isCompletionPickItem,
+  toCompletionQuickPickItems,
 } from "../../Language/completion";
 import {
   ConsoleLspClient,
@@ -115,14 +116,14 @@ export class RTermLang {
         return;
       }
 
-      const picks = entries.map((entry) => toCompletionPick(entry, context));
+      const picks = toCompletionQuickPickItems(entries, context);
       const selection = await vscode.window.showQuickPick(picks, {
         matchOnDescription: true,
         matchOnDetail: true,
         placeHolder: "R console completions",
       });
 
-      if (!selection) {
+      if (!isCompletionPickItem(selection)) {
         return;
       }
 

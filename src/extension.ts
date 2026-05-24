@@ -59,6 +59,7 @@ const ignoredEditorClosePids: Set<number> = new Set();
 const closeConfirmationInProgress = new WeakSet<ConsoleRecord>();
 const ignoredTerminalCloseEvents = new WeakSet<vscode.Terminal>();
 const R_CONSOLE_PID_LABEL_PATTERN = /^R Console \((\d+)\)$/;
+const R_CONSOLE_ACTIVE_CONTEXT = "rConsole.consoleActive";
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_HEARTBEAT_MS = 5000;
 let extensionBaseUri: vscode.Uri | undefined;
@@ -104,6 +105,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.managePersistentSessions", () => {
       void managePersistentSessions(context);
     }),
+    vscode.commands.registerCommand("r-console.insertPipeOperator", () => {
+      insertPipeOperatorInActiveConsole();
+    }),
     vscode.window.onDidOpenTerminal(handleTerminalOpen),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
     vscode.window.onDidCloseTerminal(handleTerminalClose),
@@ -124,6 +128,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   disposeStalePersistentTerminalViews();
   syncTerminalRecordsFromWindow();
+  syncRConsoleActiveContext();
   void ensureConfiguredRPath();
 }
 
@@ -397,13 +402,18 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   if (ignoredTerminalCloseEvents.has(closedTerminal)) {
     ignoredTerminalCloseEvents.delete(closedTerminal);
     terminalToRecord.delete(closedTerminal);
+    syncRConsoleActiveContext(closedTerminal);
     return;
   }
 
   const record = resolveRecordFromTerminal(closedTerminal);
-  if (!record) return;
+  if (!record) {
+    syncRConsoleActiveContext(closedTerminal);
+    return;
+  }
 
   detachTerminalFromRecord(record, closedTerminal);
+  syncRConsoleActiveContext(closedTerminal);
 
   if (extensionHostDeactivating) {
     return;
@@ -451,6 +461,24 @@ async function createRTerminal(
 
   attachTerminal(record);
   schedulePersistPersistentSessions();
+}
+
+function insertPipeOperatorInActiveConsole(): void {
+  const terminal = vscode.window.activeTerminal;
+  const record = terminal ? resolveRecordFromTerminal(terminal) : undefined;
+  record?.rTerminal.insertPipeOperator();
+}
+
+function syncRConsoleActiveContext(excludedTerminal?: vscode.Terminal): void {
+  const terminal = vscode.window.activeTerminal;
+  const record = terminal && terminal !== excludedTerminal
+    ? resolveRecordFromTerminal(terminal)
+    : undefined;
+  void vscode.commands.executeCommand(
+    "setContext",
+    R_CONSOLE_ACTIVE_CONTEXT,
+    Boolean(record)
+  );
 }
 
 async function managePersistentSessions(context: vscode.ExtensionContext): Promise<void> {
@@ -1018,18 +1046,20 @@ function attachTerminal(
   const preserveFocus =
     preserveFocusOverride ?? alwaysUseActive === false;
   terminal.show(preserveFocus);
+  syncRConsoleActiveContext();
   return terminal;
 }
 
 function handleTerminalOpen(terminal: vscode.Terminal): void {
   syncTerminalRecord(terminal);
+  syncRConsoleActiveContext();
 }
 
 function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {
-  if (!terminal) {
-    return;
+  if (terminal) {
+    syncTerminalRecord(terminal);
   }
-  syncTerminalRecord(terminal);
+  syncRConsoleActiveContext();
 }
 
 function resolveRecordFromTerminal(

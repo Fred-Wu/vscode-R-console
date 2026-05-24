@@ -2,7 +2,7 @@
   "name": "vsc-r-console",
   "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "RConsole",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "images/Rlogo.png",
@@ -74,8 +74,25 @@
         "command": "r-console.managePersistentSessions",
         "title": "Manage Persistent Sessions...",
         "category": "R Console"
+      },
+      {
+        "command": "r-console.insertPipeOperator",
+        "title": "Insert Pipe Operator",
+        "category": "R Console"
       }
     ],
+    "keybindings": [
+      {
+        "command": "r-console.insertPipeOperator",
+        "key": "ctrl+alt+m",
+        "when": "terminalFocus && rConsole.consoleActive"
+      }
+    ],
+    "configurationDefaults": {
+      "terminal.integrated.commandsToSkipShell": [
+        "r-console.insertPipeOperator"
+      ]
+    },
     "configuration": {
       "title": "R Console",
       "properties": {
@@ -88,6 +105,15 @@
           "type": "number",
           "default": 2,
           "description": "Number of spaces for indentation."
+        },
+        "r.console.pipeOperator": {
+          "type": "string",
+          "enum": [
+            "|>",
+            "%>%"
+          ],
+          "default": "|>",
+          "description": "Pipe operator to insert for chain operations. The default keybinding is Ctrl+Alt+M."
         }
       }
     }

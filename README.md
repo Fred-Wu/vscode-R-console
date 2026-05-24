@@ -42,6 +42,7 @@ Launch `R Console` from the Command Palette with:
 - `R Console: Create R Console`
 - `R Console: Create R Console in Side Editor`
 - `R Console: Manage Persistent Sessions...`
+- `R Console: Insert Pipe Operator`
 
 Use the session manager to attach to, detach from, or close running R Console sessions.
 
@@ -124,6 +125,7 @@ R Console also contributes its own settings:
 | --- | --- | --- |
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
+| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
 
 ## Dependency Model
 

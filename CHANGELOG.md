@@ -2,6 +2,17 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.7] - 2026-05-24
+
+### Added
+- Added the Command Palette command `R Console: Insert Pipe Operator`.
+- Added a configurable pipe-insertion keybinding, set to `Ctrl+Alt+M` by default in active R Console terminals.
+- Added `r.console.pipeOperator` to choose whether pipe insertion uses R's native pipe `|>` or the magrittr pipe `%>%`.
+
+### Changed
+- Improved console completions in data-aware contexts.
+- Field completions now quote column names such as `a b` correctly in member and bracket contexts.
+
 ## [0.2.6] - 2026-05-20
 
 ### Changed
