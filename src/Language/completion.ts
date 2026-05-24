@@ -117,6 +117,7 @@ const BRACKET_OBJECT_PATTERN = new RegExp(
   `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)(\\[\\[?)\\s*(["']?)([a-zA-Z0-9._]*)$`
 );
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
+const BACKTICKED_R_NAME_PATTERN = /`(?:\\.|[^`\\])*`/g;
 const R_RESERVED_WORDS = new Set([
   "if",
   "else",
@@ -703,7 +704,9 @@ function getConsoleBufferCompletions(
     : [currentInputText, ...[...recentConsoleEntries].reverse()];
 
   for (const sourceText of sources) {
-    const matches = sourceText.match(CONSOLE_IDENTIFIER_PATTERN);
+    const matches = sourceText
+      .replace(BACKTICKED_R_NAME_PATTERN, "")
+      .match(CONSOLE_IDENTIFIER_PATTERN);
     if (!matches) {
       continue;
     }
