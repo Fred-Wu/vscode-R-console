@@ -2,11 +2,13 @@
 
 All notable changes to R Console will be documented in this file.
 
-## Unreleased
+## [0.2.8] - 2026-06-16
 
 ### Fixed
 
 - Fixed top-level console completion for objects created in the active R session using live session server workspace data instead of relying on stale watcher files.
+- Fixed console semantic syntax highlighting to resolve colors from the active VS Code theme, including auto-detected preferred themes.
+- Fixed console semantic token handling with current R `languageserver` workspace internals.
 
 ## [0.2.7] - 2026-05-24
 
