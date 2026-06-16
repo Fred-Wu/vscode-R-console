@@ -243,14 +243,24 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     const row = baseRow.length === nextLine.length ? [...baseRow] : this.buildDefaultStyles(nextLine);
     const prefixLength = commonPrefixLength(previousLine, nextLine);
     const suffixLength = commonSuffixLength(previousLine, nextLine, prefixLength);
+    const changedStart = prefixLength;
+    const changedEnd = nextLine.length - suffixLength;
+    const rebuiltStart = expandWordStart(nextLine, changedStart);
+    const rebuiltEnd = expandWordEnd(nextLine, changedEnd);
 
     for (let index = 0; index < prefixLength; index += 1) {
+      if (index >= rebuiltStart && index < rebuiltEnd) {
+        continue;
+      }
       row[index] = previousRow[index] ?? row[index];
     }
 
     for (let index = 0; index < suffixLength; index += 1) {
       const previousIndex = previousLine.length - suffixLength + index;
       const nextIndex = nextLine.length - suffixLength + index;
+      if (nextIndex >= rebuiltStart && nextIndex < rebuiltEnd) {
+        continue;
+      }
       row[nextIndex] = previousRow[previousIndex] ?? row[nextIndex];
     }
 
@@ -579,6 +589,22 @@ function commonSuffixLength(left: string, right: string, prefixLength: number): 
 
 function isWordLikeChar(char: string): boolean {
   return /[A-Za-z0-9._]/.test(char);
+}
+
+function expandWordStart(text: string, start: number): number {
+  let cursor = Math.max(0, Math.min(start, text.length));
+  while (cursor > 0 && isWordLikeChar(text[cursor - 1] ?? "")) {
+    cursor -= 1;
+  }
+  return cursor;
+}
+
+function expandWordEnd(text: string, end: number): number {
+  let cursor = Math.max(0, Math.min(end, text.length));
+  while (cursor < text.length && isWordLikeChar(text[cursor] ?? "")) {
+    cursor += 1;
+  }
+  return cursor;
 }
 
 function isWordLikeSegment(value: string): boolean {
