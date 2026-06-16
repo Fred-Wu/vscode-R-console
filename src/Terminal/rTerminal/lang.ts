@@ -30,6 +30,7 @@ type LangOptions = {
   extensionPath: string;
   rPath: string;
   getRecentSessionEntries?: () => string[];
+  requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
   requestMemberCompletions: (
     expression: string,
     operator: "$" | "@"
@@ -90,7 +91,9 @@ export class RTermLang {
         return;
       }
 
-      const sessionData = getWorkspaceData();
+      const sessionData = this.shouldRequestWorkspaceData(context)
+        ? await this.options.requestWorkspaceData?.()
+        : getWorkspaceData();
       const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
         return;
@@ -251,6 +254,12 @@ export class RTermLang {
     } catch {
       return undefined;
     }
+  }
+
+  private shouldRequestWorkspaceData(
+    context: NonNullable<ReturnType<typeof getCompletionContext>>
+  ): boolean {
+    return context.kind === "default" && !context.dataObjectName;
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {
