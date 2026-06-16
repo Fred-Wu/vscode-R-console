@@ -100,8 +100,8 @@ type GlobalEnvItem = {
   str?: string;
   size?: number;
   dim?: number[];
-  names?: string[];
-  slots?: string[];
+  names?: string | string[];
+  slots?: string | string[];
 };
 
 type WorkspaceData = {
@@ -595,10 +595,10 @@ function getSessionCompletions(
     }
     const members =
       context.kind === "bracket"
-        ? obj.names || []
+        ? asStringArray(obj.names)
         : context.operator === "@"
-        ? obj.slots || []
-        : obj.names || [];
+        ? asStringArray(obj.slots)
+        : asStringArray(obj.names);
     return members.map((name) => ({
       label: name,
       insertText: getFieldInsertText(name, context),
@@ -638,17 +638,25 @@ function getDataColumnCompletions(
   }
 
   const obj = data.globalenv[context.dataObjectName];
-  if (!obj?.names || obj.names.length === 0) {
+  const names = asStringArray(obj?.names);
+  if (names.length === 0) {
     return [];
   }
 
-  return obj.names.map((name) => ({
+  return names.map((name) => ({
     label: name,
     insertText: getFieldInsertText(name, context),
     kind: vscode.CompletionItemKind.Field,
     detail: context.dataObjectName,
     source: "session" as const,
   }));
+}
+
+function asStringArray(value: string | string[] | undefined): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item) => item.length > 0);
+  }
+  return value ? [value] : [];
 }
 
 async function getRuntimeDataColumnCompletions(

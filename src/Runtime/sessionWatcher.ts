@@ -120,6 +120,12 @@ export class SessionWatcher {
     return this.attachedPid;
   }
 
+  async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
+    this.updateFromRequest();
+    await this.updateWorkspace();
+    return this.workspaceData;
+  }
+
   async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"
@@ -158,7 +164,7 @@ export class SessionWatcher {
 
   refresh(): void {
     this.updateFromRequest();
-    this.updateWorkspace();
+    void this.updateWorkspace();
   }
 
   /**
@@ -252,32 +258,34 @@ export class SessionWatcher {
     this.sessionDirWatcher?.close();
     try {
       this.workspaceWatcher = fs.watch(lockFile, () => {
-        this.updateWorkspace();
+        void this.updateWorkspace();
       });
     } catch {
       this.workspaceWatcher = undefined;
     }
-    this.updateWorkspace();
+    void this.updateWorkspace();
   }
 
-  private updateWorkspace(): void {
-    if (!this.sessionDir) {
+  private async updateWorkspace(): Promise<void> {
+    const response = await this.postToSessionServer({ type: "workspace" });
+    if (!this.isWorkspaceData(response)) {
       return;
     }
-    const workspaceFile = path.join(this.sessionDir, "workspace.json");
-    if (!fs.existsSync(workspaceFile)) {
-      return;
+    this.workspaceData = response;
+    this.onChangeCallback?.(this.workspaceData);
+  }
+
+  private isWorkspaceData(value: unknown): value is WorkspaceData {
+    if (!value || typeof value !== "object") {
+      return false;
     }
-    const stats = fs.statSync(workspaceFile);
-    if (this.expectedPid === undefined && stats.mtimeMs < this.startedAt) {
-      return;
-    }
-    try {
-      const content = fs.readFileSync(workspaceFile, "utf-8");
-      this.workspaceData = JSON.parse(content) as WorkspaceData;
-      this.onChangeCallback?.(this.workspaceData);
-    } catch {
-    }
+    const data = value as Partial<WorkspaceData>;
+    return (
+      Array.isArray(data.search) &&
+      Array.isArray(data.loaded_namespaces) &&
+      !!data.globalenv &&
+      typeof data.globalenv === "object"
+    );
   }
 
   private parseServerInfo(

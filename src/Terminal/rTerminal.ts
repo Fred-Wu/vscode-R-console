@@ -244,6 +244,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       extensionPath: this.extensionPath,
       rPath: this.options.rPath,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
+      requestWorkspaceData: async () =>
+        await this.sessionWatcher?.requestWorkspaceData(),
       requestMemberCompletions: async (expression, operator) =>
         await this.sessionWatcher?.requestMemberCompletions(expression, operator),
     });
