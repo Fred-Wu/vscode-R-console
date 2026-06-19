@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.2.9] - 2026-06-19
+
+### Fixed
+
+- Fixed completion search for packages with large list of members
+
 ## [0.2.8] - 2026-06-16
 
 ### Fixed
