@@ -54,7 +54,8 @@ normalize_character <- function(value) {
 semantic_tokens_full_sync <- function(self, id, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
-    if (!self$workspace$documents$has(uri)) {
+    workspace <- self$get_workspace(uri)
+    if (!workspace$documents$has(uri)) {
         self$deliver(languageserver:::Response$new(
             id,
             result = languageserver:::encode_semantic_tokens(list())
@@ -62,7 +63,7 @@ semantic_tokens_full_sync <- function(self, id, params) {
         return(invisible(NULL))
     }
 
-    document <- self$workspace$documents$get(uri)
+    document <- workspace$documents$get(uri)
     parse_data <- tryCatch(
         languageserver:::parse_document(
             uri,
@@ -74,7 +75,7 @@ semantic_tokens_full_sync <- function(self, id, params) {
         languageserver:::parse_callback(self, uri, document$version, parse_data)
     }
 
-    reply <- languageserver:::semantic_tokens_full_reply(id, uri, self$workspace, document)
+    reply <- languageserver:::semantic_tokens_full_reply(id, uri, workspace, document)
     if (is.null(reply)) {
         reply <- languageserver:::Response$new(
             id,
@@ -90,11 +91,12 @@ console_text_document_did_close <- function(self, params) {
     path <- languageserver:::path_from_uri(uri)
 
     if (length(path) == 0 || !nzchar(path)) {
-        if (self$workspace$documents$has(uri)) {
-            doc <- self$workspace$documents$get(uri)
+        workspace <- self$get_workspace(uri)
+        if (workspace$documents$has(uri)) {
+            doc <- workspace$documents$get(uri)
             doc$did_close()
-            self$workspace$documents$remove(uri)
-            self$workspace$update_loaded_packages()
+            workspace$documents$remove(uri)
+            workspace$update_loaded_packages()
         }
         self$pending_replies$remove(uri)
         return(invisible(NULL))
@@ -107,13 +109,14 @@ server <- languageserver:::LanguageServer$new(host, port)
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
     loaded_namespaces <- normalize_character(params$loadedNamespaces)
+    workspace <- self$get_workspace(self$rootUri)
 
-    self$workspace$startup_packages <- attached_packages
-    self$workspace$update_loaded_packages()
+    workspace$startup_packages <- attached_packages
+    workspace$update_loaded_packages()
 
     namespaces_to_load <- unique(c(attached_packages, loaded_namespaces))
     for (pkg in namespaces_to_load) {
-        try(self$workspace$get_namespace(pkg), silent = TRUE)
+        try(workspace$get_namespace(pkg), silent = TRUE)
     }
 
     self$deliver(languageserver:::Response$new(id, result = TRUE))

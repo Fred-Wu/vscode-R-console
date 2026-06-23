@@ -7,6 +7,9 @@ type CompletionContext = {
   triggerCharacter?: string;
   objectName?: string;
   operator?: "$" | "@";
+  bracketOperator?: "[" | "[[";
+  bracketQuote?: "\"" | "'";
+  chainedBracket?: boolean;
   functionName?: string;
   dataObjectName?: string;
   snapshotInput: string;
@@ -22,6 +25,41 @@ type CompletionEntry = {
   replaceStart?: number;
 };
 
+const COMPLETION_GROUP_ORDER = {
+  argument: [
+    "Arguments",
+    "Fields",
+    "Runtime Variables",
+    "Runtime Functions",
+    "Packages",
+    "Functions",
+    "Recent Input",
+    "Other",
+  ],
+  bracket: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
+  default: [
+    "Runtime Variables",
+    "Runtime Functions",
+    "Packages",
+    "Functions",
+    "Fields",
+    "Recent Input",
+    "Other",
+  ],
+  member: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
+  package: ["Package Members", "Functions", "Fields", "Recent Input", "Other"],
+} as const satisfies Record<CompletionContext["kind"], readonly string[]>;
+
+const DATA_CONTEXT_GROUP_ORDER = [
+  "Fields",
+  "Runtime Variables",
+  "Runtime Functions",
+  "Packages",
+  "Functions",
+  "Recent Input",
+  "Other",
+] as const;
+
 export type CompletionPickItem = vscode.QuickPickItem & {
   insertText: string;
   replaceStart: number;
@@ -29,6 +67,8 @@ export type CompletionPickItem = vscode.QuickPickItem & {
   snapshotCursor: number;
   source: "lsp" | "session" | "buffer";
 };
+
+export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
 export interface CompletionProvider {
   provideCompletionItems(
@@ -60,8 +100,8 @@ type GlobalEnvItem = {
   str?: string;
   size?: number;
   dim?: number[];
-  names?: string[];
-  slots?: string[];
+  names?: string | string[];
+  slots?: string | string[];
 };
 
 type WorkspaceData = {
@@ -69,8 +109,15 @@ type WorkspaceData = {
 };
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
+const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
 const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
+const BRACKET_CHAIN_SEGMENT = "(?:\\[[^\\[\\]]*\\]|\\[\\[[^\\[\\]]*\\]\\])";
+const MEMBER_OBJECT_SEGMENT = `(?:${MEMBER_CHAIN_SEGMENT}(?:${BRACKET_CHAIN_SEGMENT})*)`;
+const BRACKET_OBJECT_PATTERN = new RegExp(
+  `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)(\\[\\[?)\\s*(["']?)([a-zA-Z0-9._]*)$`
+);
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
+const BACKTICKED_R_NAME_PATTERN = /`(?:\\.|[^`\\])*`/g;
 const R_RESERVED_WORDS = new Set([
   "if",
   "else",
@@ -93,16 +140,44 @@ const R_RESERVED_WORDS = new Set([
   "NA_character_",
 ]);
 const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
-  `(${MEMBER_CHAIN_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_CHAIN_SEGMENT})*)\\s*$`
+  `(${MEMBER_OBJECT_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_OBJECT_SEGMENT})*)\\s*$`
 );
 
+function isPipePlaceholder(name: string): boolean {
+  return name === "_" || name === ".";
+}
+
+function quoteRNameIfNeeded(name: string): string {
+  if (R_SYNTACTIC_NAME_PATTERN.test(name) && !R_RESERVED_WORDS.has(name)) {
+    return name;
+  }
+  return `\`${name.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\``;
+}
+
+function getFieldInsertText(name: string, context: CompletionContext): string {
+  if (context.kind !== "bracket") {
+    return quoteRNameIfNeeded(name);
+  }
+  if (context.bracketQuote) {
+    const quotePattern = context.bracketQuote === "\"" ? /"/g : /'/g;
+    return name.replace(/\\/g, "\\\\").replace(quotePattern, `\\${context.bracketQuote}`);
+  }
+  if (context.bracketOperator === "[[") {
+    return `"${name.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+  }
+  return quoteRNameIfNeeded(name);
+}
+
 function detectDataContext(beforeCursor: string): string | undefined {
-  const pipePattern = /([a-zA-Z._][a-zA-Z0-9._]*)\s*(%>%|\|>)/g;
+  const pipePattern = new RegExp(
+    `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)\\s*(%>%|\\|>)`,
+    "g"
+  );
   let pipeMatch;
   let firstPipeObject: string | undefined;
   while ((pipeMatch = pipePattern.exec(beforeCursor)) !== null) {
     if (!firstPipeObject) {
-      firstPipeObject = pipeMatch[1];
+      firstPipeObject = /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(pipeMatch[1])?.[0];
     }
   }
   if (firstPipeObject) {
@@ -115,7 +190,13 @@ function detectDataContext(beforeCursor: string): string | undefined {
       if (/(%>%|\|>)\s*([a-zA-Z._][a-zA-Z0-9._]*::)?[a-zA-Z._][a-zA-Z0-9._]*\s*\([^)]*$/.test(afterPipe)) {
         return firstPipeObject;
       }
+      if (/(%>%)\s*\.\s*\[{1,2}[^\]]*$/.test(afterPipe)) {
+        return firstPipeObject;
+      }
       if (/(\|>)\s*_\s*\[{1,2}[^\]]*$/.test(afterPipe)) {
+        return firstPipeObject;
+      }
+      if (/(\|>)\s*_\s*\[{1,2}[\s\S]*\]\$[a-zA-Z0-9._]*$/.test(afterPipe)) {
         return firstPipeObject;
       }
     }
@@ -125,7 +206,7 @@ function detectDataContext(beforeCursor: string): string | undefined {
   const bracketMatch = bracketPattern.exec(beforeCursor);
   if (bracketMatch) {
     const objectName = bracketMatch[1];
-    if (objectName === '_' && firstPipeObject) {
+    if (isPipePlaceholder(objectName) && firstPipeObject) {
       return firstPipeObject;
     }
     return objectName;
@@ -164,21 +245,23 @@ export function getCompletionContext(
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
   const dataObjectName = detectDataContext(textForDataContext);
 
-  const bracketMatch = /([a-zA-Z._][a-zA-Z0-9._]*)\[\[?\s*(["']?)([a-zA-Z0-9._]*)$/.exec(
-    beforeCursor
-  );
+  const bracketMatch = BRACKET_OBJECT_PATTERN.exec(beforeCursor);
   if (bracketMatch) {
-    const prefix = bracketMatch[3] || "";
+    const bracketOperator = bracketMatch[2] as "[" | "[[";
+    const prefix = bracketMatch[4] || "";
     const bracketObject = bracketMatch[1];
-    const effectiveDataObject = (bracketObject === '_' && dataObjectName) 
-      ? dataObjectName 
-      : bracketObject;
+    const baseObject = /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(bracketObject)?.[0] ?? bracketObject;
+    const isPlaceholderBracket = isPipePlaceholder(baseObject) && !!dataObjectName;
+    const effectiveDataObject = isPlaceholderBracket ? dataObjectName : baseObject;
     return {
       kind: "bracket",
       prefix,
       replaceStart: beforeCursor.length - prefix.length,
-      triggerCharacter: bracketMatch[2] ? undefined : "[",
-      objectName: bracketObject,
+      triggerCharacter: bracketMatch[3] ? undefined : "[",
+      objectName: baseObject,
+      bracketOperator,
+      bracketQuote: bracketMatch[3] ? bracketMatch[3] as "\"" | "'" : undefined,
+      chainedBracket: bracketObject !== baseObject || isPlaceholderBracket,
       dataObjectName: effectiveDataObject,
       operator: undefined,
       snapshotInput,
@@ -194,13 +277,20 @@ export function getCompletionContext(
     const chainMatch = MEMBER_CHAIN_TAIL_PATTERN.exec(objectExprRaw);
     const objectExpr = chainMatch?.[1];
     if (objectExpr) {
+      const isBracketChainMember = operator === "$" && objectExpr.includes("[");
+      const baseObject = isBracketChainMember
+        ? /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(objectExpr)?.[0]
+        : undefined;
+      const isPlaceholderMember = !!baseObject && isPipePlaceholder(baseObject) && !!dataObjectName;
       return {
         kind: "member",
         prefix,
         replaceStart: beforeCursor.length - prefix.length,
         triggerCharacter: prefix.length === 0 ? operator : undefined,
-        objectName: objectExpr,
+        objectName: isPlaceholderMember ? dataObjectName : baseObject ?? objectExpr,
         operator,
+        chainedBracket: isBracketChainMember,
+        dataObjectName: isPlaceholderMember ? dataObjectName : undefined,
         snapshotInput,
         snapshotCursor,
       };
@@ -279,28 +369,50 @@ export async function collectCompletionEntries(
     context.kind === "member" || context.kind === "bracket" || !!context.dataObjectName
       ? await getRuntimeMemberCompletions(context, completionProvider)
       : [];
-  const lspItems =
-    context.kind === "member" || context.kind === "bracket"
+  const includeLspItems =
+    context.kind !== "bracket" ||
+    (context.bracketOperator === "[" && !context.bracketQuote && context.prefix.length > 0);
+  const rawLspItems =
+    !includeLspItems
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
+  const lspItems =
+    context.kind === "default"
+      ? filterShadowedWorkspaceEntries(rawLspItems, sessionItems)
+      : rawLspItems;
   const bufferItems = getConsoleBufferCompletions(
     context,
     doc.getText(),
     recentConsoleEntries
   );
-  const columnItems = getDataColumnCompletions(context, sessionData);
+  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
+  const columnItems =
+    cachedColumnItems.length > 0
+      ? cachedColumnItems
+      : await getRuntimeDataColumnCompletions(context, completionProvider);
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
+    ...runtimeMemberItems,
     ...columnItems,
   ]);
 
   if (context.kind === "bracket") {
     const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
+    const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (runtimeFiltered.length > 0) {
       return dedupeCompletionEntries(runtimeFiltered);
+    }
+    const exactColumnMatch = columnFiltered.some(
+      (entry) => entry.label.toLowerCase() === context.prefix.toLowerCase()
+    );
+    if (lspFiltered.length > 0 && !exactColumnMatch) {
+      return dedupeCompletionEntries([...lspFiltered, ...columnFiltered, ...bufferFiltered]);
+    }
+    if (context.chainedBracket && bufferFiltered.length > 0) {
+      return dedupeCompletionEntries([...columnFiltered, ...bufferFiltered]);
     }
     if (columnFiltered.length > 0) {
       return dedupeCompletionEntries(columnFiltered);
@@ -338,10 +450,14 @@ export async function collectCompletionEntries(
   if (context.kind === "member") {
     const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
+    const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
+    if (context.chainedBracket && bufferFiltered.length > 0) {
+      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]);
+    }
     if (runtimeFiltered.length > 0) {
       return dedupeCompletionEntries(runtimeFiltered);
     }
-    return dedupeCompletionEntries(sessionFiltered);
+    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]);
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
@@ -378,6 +494,96 @@ export function toCompletionPick(
   };
 }
 
+export function toCompletionQuickPickItems(
+  entries: CompletionEntry[],
+  context: CompletionContext
+): CompletionQuickPickItem[] {
+  const grouped = new Map<string, CompletionEntry[]>();
+
+  for (const entry of entries) {
+    const group = getCompletionGroup(entry, context);
+    const groupEntries = grouped.get(group) ?? [];
+    groupEntries.push(entry);
+    grouped.set(group, groupEntries);
+  }
+
+  const result: CompletionQuickPickItem[] = [];
+  const preferredGroups =
+    context.kind === "default" && context.dataObjectName
+      ? DATA_CONTEXT_GROUP_ORDER
+      : COMPLETION_GROUP_ORDER[context.kind];
+  const orderedGroups = new Set<string>(preferredGroups);
+  const groups = [
+    ...preferredGroups,
+    ...[...grouped.keys()].filter((group) => !orderedGroups.has(group)),
+  ];
+
+  for (const group of groups) {
+    const groupEntries = grouped.get(group);
+    if (!groupEntries || groupEntries.length === 0) {
+      continue;
+    }
+    result.push({
+      label: group,
+      kind: vscode.QuickPickItemKind.Separator,
+    });
+    result.push(...groupEntries.map((entry) => toCompletionPick(entry, context)));
+  }
+
+  return result;
+}
+
+export function isCompletionPickItem(
+  item: CompletionQuickPickItem | undefined
+): item is CompletionPickItem {
+  return (
+    !!item &&
+    "insertText" in item &&
+    "replaceStart" in item &&
+    "snapshotInput" in item &&
+    "snapshotCursor" in item
+  );
+}
+
+function getCompletionGroup(
+  entry: CompletionEntry,
+  context: CompletionContext
+): string {
+  const kind = entry.kind;
+
+  if (entry.source === "buffer") {
+    return "Recent Input";
+  }
+  if (context.kind === "package") {
+    return "Package Members";
+  }
+  if (context.kind === "argument" && entry.source === "lsp") {
+    return "Arguments";
+  }
+  if (kind === vscode.CompletionItemKind.Field || kind === vscode.CompletionItemKind.Property) {
+    return "Fields";
+  }
+  if (entry.source === "session") {
+    return isCallableCompletionKind(kind) ? "Runtime Functions" : "Runtime Variables";
+  }
+  if (kind === vscode.CompletionItemKind.Module) {
+    return "Packages";
+  }
+  if (isCallableCompletionKind(kind)) {
+    return "Functions";
+  }
+
+  return "Other";
+}
+
+function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): boolean {
+  return (
+    kind === vscode.CompletionItemKind.Function ||
+    kind === vscode.CompletionItemKind.Method ||
+    kind === vscode.CompletionItemKind.Constructor
+  );
+}
+
 function getSessionCompletions(
   context: CompletionContext,
   data: WorkspaceData | undefined
@@ -396,13 +602,13 @@ function getSessionCompletions(
     }
     const members =
       context.kind === "bracket"
-        ? obj.names || []
+        ? asStringArray(obj.names)
         : context.operator === "@"
-        ? obj.slots || []
-        : obj.names || [];
+        ? asStringArray(obj.slots)
+        : asStringArray(obj.names);
     return members.map((name) => ({
       label: name,
-      insertText: name,
+      insertText: getFieldInsertText(name, context),
       kind: vscode.CompletionItemKind.Field,
       detail: context.objectName,
       source: "session",
@@ -439,17 +645,55 @@ function getDataColumnCompletions(
   }
 
   const obj = data.globalenv[context.dataObjectName];
-  if (!obj?.names || obj.names.length === 0) {
+  const names = asStringArray(obj?.names);
+  if (names.length === 0) {
     return [];
   }
 
-  return obj.names.map((name) => ({
+  return names.map((name) => ({
     label: name,
-    insertText: name,
+    insertText: getFieldInsertText(name, context),
     kind: vscode.CompletionItemKind.Field,
     detail: context.dataObjectName,
     source: "session" as const,
   }));
+}
+
+function asStringArray(value: string | string[] | undefined): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item) => item.length > 0);
+  }
+  return value ? [value] : [];
+}
+
+async function getRuntimeDataColumnCompletions(
+  context: CompletionContext,
+  completionProvider?: CompletionProvider
+): Promise<CompletionEntry[]> {
+  if (!context.dataObjectName || !completionProvider?.provideMemberCompletionItems) {
+    return [];
+  }
+
+  try {
+    const items = await completionProvider.provideMemberCompletionItems(
+      context.dataObjectName,
+      "$"
+    );
+    if (!items || items.length === 0) {
+      return [];
+    }
+    return items
+      .filter((item) => typeof item.name === "string" && item.name.length > 0)
+      .map((item) => ({
+        label: item.name,
+        insertText: getFieldInsertText(item.name, context),
+        kind: vscode.CompletionItemKind.Field,
+        detail: context.dataObjectName,
+        source: "session" as const,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 function getConsoleBufferCompletions(
@@ -458,20 +702,26 @@ function getConsoleBufferCompletions(
   recentConsoleEntries: string[]
 ): CompletionEntry[] {
   if (
-    context.prefix.length === 0 ||
+    (context.prefix.length === 0 &&
+      !((context.kind === "bracket" || context.kind === "member") && context.chainedBracket)) ||
     (context.kind !== "default" &&
       context.kind !== "argument" &&
-      context.kind !== "bracket")
+      context.kind !== "bracket" &&
+      !(context.kind === "member" && context.chainedBracket))
   ) {
     return [];
   }
 
   const result: CompletionEntry[] = [];
   const seen = new Set<string>();
-  const sources = [currentInputText, ...[...recentConsoleEntries].reverse()];
+  const sources = context.prefix.length === 0
+    ? [currentInputText]
+    : [currentInputText, ...[...recentConsoleEntries].reverse()];
 
   for (const sourceText of sources) {
-    const matches = sourceText.match(CONSOLE_IDENTIFIER_PATTERN);
+    const matches = sourceText
+      .replace(BACKTICKED_R_NAME_PATTERN, "")
+      .match(CONSOLE_IDENTIFIER_PATTERN);
     if (!matches) {
       continue;
     }
@@ -479,6 +729,8 @@ function getConsoleBufferCompletions(
     for (const label of matches) {
       if (
         label === context.prefix ||
+        label === context.objectName ||
+        label === context.dataObjectName ||
         R_RESERVED_WORDS.has(label) ||
         seen.has(label)
       ) {
@@ -537,7 +789,7 @@ async function getRuntimeMemberCompletions(
           /^\s*function\s*\(/.test(item.str || "");
         return {
           label: item.name,
-          insertText: item.name,
+          insertText: getFieldInsertText(item.name, context),
           kind: isFunction
             ? vscode.CompletionItemKind.Function
             : vscode.CompletionItemKind.Field,
@@ -677,6 +929,23 @@ function filterShadowedBufferEntries(
 
   return bufferEntries.filter(
     (entry) => !preferredLabels.has(entry.label.toLowerCase())
+  );
+}
+
+function filterShadowedWorkspaceEntries(
+  entries: CompletionEntry[],
+  workspaceEntries: CompletionEntry[]
+): CompletionEntry[] {
+  if (entries.length === 0 || workspaceEntries.length === 0) {
+    return entries;
+  }
+
+  const workspaceLabels = new Set(
+    workspaceEntries.map((entry) => entry.label.toLowerCase())
+  );
+
+  return entries.filter(
+    (entry) => !workspaceLabels.has(entry.label.toLowerCase())
   );
 }
 

@@ -42,8 +42,15 @@ Launch `R Console` from the Command Palette with:
 - `R Console: Create R Console`
 - `R Console: Create R Console in Side Editor`
 - `R Console: Manage Persistent Sessions...`
+- `R Console: Insert Pipe Operator`
 
 Use the session manager to attach to, detach from, or close running R Console sessions.
+
+### Restoring A Dropped Console UI
+
+R Console runs in a VS Code custom pseudoterminal. VS Code may close the terminal UI during multi-root workspace folder reorder or removal, and after extension host restart/reload.
+
+Use `R Console: Manage Persistent Sessions...` from the Command Palette, then choose `Attach Session...` or `Attach All Detached Sessions` to restore the console UI for the running session.
 
 The minimum vscode-R setup for R Console commands to work is:
 
@@ -118,6 +125,7 @@ R Console also contributes its own settings:
 | --- | --- | --- |
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
+| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
 
 ## Dependency Model
 

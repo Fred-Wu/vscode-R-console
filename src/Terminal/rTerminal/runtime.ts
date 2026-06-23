@@ -662,14 +662,13 @@ export async function getRuntimeWorkspaceData(
   host: RuntimeHost
 ): Promise<WorkspaceData | undefined> {
   if (usesLegacySessionWatcher(host)) {
-    host.sessionWatcher?.refresh();
-    return host.sessionWatcher?.getWorkspaceData();
+    return await host.sessionWatcher?.requestWorkspaceData();
   }
   if (!usesSessIntegration(host)) {
     return undefined;
   }
   const proxy = vscodeRSessionProxies.get(host);
-  return proxy?.getWorkspaceData() ?? await proxy?.requestWorkspace();
+  return await proxy?.requestWorkspace();
 }
 
 export async function requestRuntimeMemberCompletions(
@@ -1718,9 +1717,6 @@ function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
   configureMainPrompt(host.renderer);
 
   if (host.promptVisible || host.inputState.text.length > 0) {
-    if (host.promptVisible) {
-      host.captureVisibleInputForReplay();
-    }
     host.clearInputRender();
     host.promptVisible = false;
   } else {

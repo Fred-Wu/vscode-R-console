@@ -1,5 +1,4 @@
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { ANSI } from "./ansi";
@@ -215,8 +214,7 @@ export class SyntaxTheme {
   }
 
   private ensureLoaded(): LoadedTheme {
-    const themeKey =
-      vscode.workspace.getConfiguration("workbench").get<string>("colorTheme")?.trim() ?? "";
+    const themeKey = resolveActiveThemeName();
     if (this.current?.key === themeKey) {
       return this.current;
     }
@@ -374,6 +372,38 @@ function resolveSemanticScopeAnsi(
   return "";
 }
 
+function resolveActiveThemeName(): string {
+  const workbench = vscode.workspace.getConfiguration("workbench");
+  const configured = workbench.get<string>("colorTheme")?.trim() ?? "";
+  const autoDetect = vscode.workspace
+    .getConfiguration("window")
+    .get<boolean>("autoDetectColorScheme", false);
+
+  if (!autoDetect) {
+    return configured;
+  }
+
+  return resolvePreferredThemeName(workbench) || configured;
+}
+
+function resolvePreferredThemeName(workbench: vscode.WorkspaceConfiguration): string {
+  switch (vscode.window.activeColorTheme.kind) {
+    case vscode.ColorThemeKind.Light:
+      return workbench.get<string>("preferredLightColorTheme")?.trim() ?? "";
+    case vscode.ColorThemeKind.HighContrast:
+      return workbench.get<string>("preferredHighContrastColorTheme")?.trim() ?? "";
+    case vscode.ColorThemeKind.HighContrastLight:
+      return (
+        workbench.get<string>("preferredHighContrastLightColorTheme")?.trim() ||
+        workbench.get<string>("preferredHighContrastColorTheme")?.trim() ||
+        ""
+      );
+    case vscode.ColorThemeKind.Dark:
+    default:
+      return workbench.get<string>("preferredDarkColorTheme")?.trim() ?? "";
+  }
+}
+
 function resolveThemePath(themeName: string): string | undefined {
   if (!themeName) {
     return undefined;
@@ -391,28 +421,11 @@ function resolveThemePath(themeName: string): string | undefined {
       }
 
       const label = resolveThemeLabel(theme, extension.extensionPath);
-      if (theme.id !== themeName && label !== themeName) {
+      if (!themeNameMatches(themeName, theme.id, label)) {
         continue;
       }
 
       return path.join(extension.extensionPath, theme.path);
-    }
-  }
-
-  for (const root of getExtensionRoots()) {
-    let entries: string[] = [];
-    try {
-      entries = fs.readdirSync(root);
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const extensionPath = path.join(root, entry);
-      const themePath = findThemePath(themeName, extensionPath);
-      if (themePath) {
-        return themePath;
-      }
     }
   }
 
@@ -431,6 +444,24 @@ function resolveThemeLabel(theme: ThemeContribution, extensionPath: string): str
   const key = theme.label.slice(1, -1);
   const bundle = loadNlsBundle(extensionPath);
   return bundle[key] ?? theme.id;
+}
+
+function themeNameMatches(
+  requestedName: string,
+  themeId: string | undefined,
+  themeLabel: string | undefined
+): boolean {
+  const normalizedRequestedName = stripDefaultThemePrefix(requestedName);
+  return (
+    themeId === requestedName ||
+    themeLabel === requestedName ||
+    themeId === normalizedRequestedName ||
+    themeLabel === normalizedRequestedName
+  );
+}
+
+function stripDefaultThemePrefix(themeName: string): string {
+  return themeName.startsWith("Default ") ? themeName.slice(8) : themeName;
 }
 
 function loadNlsBundle(extensionPath: string): Record<string, string> {
@@ -457,45 +488,6 @@ function loadNlsBundle(extensionPath: string): Record<string, string> {
 
   extensionNlsCache.set(extensionPath, {});
   return {};
-}
-
-function findThemePath(themeName: string, extensionPath: string): string | undefined {
-  const packageJsonPath = path.join(extensionPath, "package.json");
-  let packageJson: { contributes?: { themes?: ThemeContribution[] } } | undefined;
-  try {
-    packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-  } catch {
-    return undefined;
-  }
-
-  const themes = packageJson?.contributes?.themes;
-  if (!Array.isArray(themes)) {
-    return undefined;
-  }
-
-  for (const theme of themes) {
-    if (typeof theme.path !== "string") {
-      continue;
-    }
-
-    const label = resolveThemeLabel(theme, extensionPath);
-    if (theme.id !== themeName && label !== themeName) {
-      continue;
-    }
-
-    return path.join(extensionPath, theme.path);
-  }
-
-  return undefined;
-}
-
-function getExtensionRoots(): string[] {
-  return [
-    path.join(os.homedir(), ".vscode", "extensions"),
-    path.join(os.homedir(), ".positron", "extensions"),
-    path.resolve(path.dirname(process.execPath), "..", "Resources", "app", "extensions"),
-    path.resolve(path.dirname(process.execPath), "..", "..", "Resources", "app", "extensions"),
-  ];
 }
 
 function readTheme(

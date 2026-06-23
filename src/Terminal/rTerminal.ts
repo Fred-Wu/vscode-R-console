@@ -218,6 +218,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private autoMatch = true;
   private tabSize = 2;
+  private pipeOperator: "|>" | "%>%" = "|>";
   private lastSearchTerm = "";
 
   constructor(
@@ -362,6 +363,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const config = vscode.workspace.getConfiguration("r.console");
     this.autoMatch = config.get<boolean>("autoMatch", true);
     this.tabSize = config.get<number>("tabSize", 2);
+    this.pipeOperator =
+      config.get<string>("pipeOperator", "|>") === "%>%" ? "%>%" : "|>";
   }
 
   private runtimeHost(): RuntimeHost {
@@ -611,6 +614,18 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode === "ready" && this.promptReady) {
       this.showPrompt();
     }
+  }
+
+  public insertPipeOperator(): void {
+    if (this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+
+    this.ensureReadyPromptVisibleForInput();
+    this.escPendingClear = false;
+    this.expandForEdit();
+    this.inputState.insertText(` ${this.pipeOperator} `);
+    this.renderInput();
   }
 
   private isSessionProtocolActive(): boolean {

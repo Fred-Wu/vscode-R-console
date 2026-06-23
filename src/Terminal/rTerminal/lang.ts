@@ -3,7 +3,8 @@ import {
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
-  toCompletionPick,
+  isCompletionPickItem,
+  toCompletionQuickPickItems,
   type CompletionProvider,
 } from "../../Language/completion";
 import {
@@ -90,9 +91,9 @@ export class RTermLang {
         return;
       }
 
-      const needsWorkspaceData =
-        context.kind !== "member" && context.kind !== "bracket";
-      const sessionData = needsWorkspaceData ? await getWorkspaceData() : undefined;
+      const sessionData = this.shouldRequestWorkspaceData(context)
+        ? await getWorkspaceData()
+        : undefined;
       const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
         return;
@@ -126,14 +127,50 @@ export class RTermLang {
         return;
       }
 
-      const picks = entries.map((entry) => toCompletionPick(entry, context));
-      const selection = await vscode.window.showQuickPick(picks, {
+      const picks = toCompletionQuickPickItems(entries, context);
+      const pickOptions = {
         matchOnDescription: true,
         matchOnDetail: true,
         placeHolder: "R console completions",
-      });
+      };
+      const selection = context.kind !== "package"
+        ? await vscode.window.showQuickPick(picks, pickOptions)
+        : await new Promise<CompletionPickItem | undefined>((resolve) => {
+            const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
+            let request = 0;
+            Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
+            pick.onDidChangeValue((value) => void (async () => {
+              const currentRequest = ++request;
+              const prefix = value.startsWith(context.prefix) ? value : context.prefix + value;
+              const cursorCol = context.replaceStart + prefix.length;
+              const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
+              const lines = [...latestInput.lines];
+              lines[latestInput.cursorRow] = currentLine;
+              const nextDoc = this.getOrUpdateCompletionDocument(lines.join("\n"));
+              if (!nextDoc) {
+                return;
+              }
+              const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
+              await this.consoleLsp?.prepareDocument(nextDoc);
+              const nextEntries = await collectCompletionEntries(
+                nextContext,
+                nextDoc,
+                new vscode.Position(latestInput.cursorRow, cursorCol),
+                sessionData,
+                lines.slice(0, latestInput.cursorRow),
+                this.options.getRecentSessionEntries?.() ?? [],
+                completionProvider
+              );
+              if (currentRequest === request) {
+                pick.items = toCompletionQuickPickItems(nextEntries, { ...nextContext, snapshotInput: latestInput.currentLine, snapshotCursor: latestInput.cursorCol });
+              }
+            })().catch(() => undefined));
+            pick.onDidAccept(() => { const item = pick.selectedItems[0]; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
+            pick.onDidHide(() => { request += 1; pick.dispose(); resolve(undefined); });
+            pick.show();
+          });
 
-      if (!selection) {
+      if (!isCompletionPickItem(selection)) {
         return;
       }
 
@@ -261,6 +298,12 @@ export class RTermLang {
     } catch {
       return undefined;
     }
+  }
+
+  private shouldRequestWorkspaceData(
+    context: NonNullable<ReturnType<typeof getCompletionContext>>
+  ): boolean {
+    return context.kind !== "member" && context.kind !== "bracket";
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {
