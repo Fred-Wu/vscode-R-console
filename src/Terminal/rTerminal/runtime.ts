@@ -415,6 +415,13 @@ function quoteRString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+async function setOwnerOnlyPermissions(filePath: string): Promise<void> {
+  if (process.platform === "win32") {
+    return;
+  }
+  await fs.promises.chmod(filePath, 0o600);
+}
+
 function buildSessConnectCommand(connection: VscodeRSessionConnection): string {
   const rConfig = vscode.workspace.getConfiguration("r");
   return [
@@ -518,10 +525,12 @@ async function writeVscodeRSessionFile(
     await fs.promises.writeFile(
       filePath,
       JSON.stringify({ pipe: connection.pipePath }),
-      "utf8"
+      { encoding: "utf8", mode: 0o600 }
     );
+    await setOwnerOnlyPermissions(filePath);
     vscodeRSessionFiles.set(host, filePath);
   } catch {
+    await fs.promises.rm(filePath, { force: true }).catch(() => undefined);
   }
 }
 

@@ -20,6 +20,13 @@ type SessProxyOptions = {
 const REQUEST_TIMEOUT_MS = 2000;
 const R_SOCKET_WAIT_TIMEOUT_MS = 1200;
 
+async function setOwnerOnlyPermissions(filePath: string): Promise<void> {
+  if (process.platform === "win32") {
+    return;
+  }
+  await fs.promises.chmod(filePath, 0o600);
+}
+
 export class SessProxy {
   private server: net.Server | undefined;
   private proxyPipePath: string | undefined;
@@ -37,25 +44,31 @@ export class SessProxy {
   async start(): Promise<string> {
     this.dispose();
     const pipePath = this.createPipePath();
+    this.proxyPipePath = pipePath;
     if (process.platform !== "win32") {
       await fs.promises.rm(pipePath, { force: true }).catch(() => undefined);
     }
 
     this.server = net.createServer((socket) => this.attachRSocket(socket));
-    await new Promise<void>((resolve, reject) => {
-      const server = this.server;
-      if (!server) {
-        reject(new Error("sess proxy server was not created"));
-        return;
-      }
-      server.once("error", reject);
-      server.listen(pipePath, () => {
-        server.off("error", reject);
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const server = this.server;
+        if (!server) {
+          reject(new Error("sess proxy server was not created"));
+          return;
+        }
+        server.once("error", reject);
+        server.listen(pipePath, () => {
+          server.off("error", reject);
+          resolve();
+        });
       });
-    });
+      await setOwnerOnlyPermissions(pipePath);
+    } catch (error) {
+      this.dispose();
+      throw error;
+    }
 
-    this.proxyPipePath = pipePath;
     return pipePath;
   }
 
