@@ -92,7 +92,7 @@ export class RTermLang {
       }
 
       const sessionData = this.shouldRequestWorkspaceData(context)
-        ? await this.options.requestWorkspaceData?.()
+        ? (await this.options.requestWorkspaceData?.()) ?? getWorkspaceData()
         : getWorkspaceData();
       const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
@@ -295,7 +295,10 @@ export class RTermLang {
   private shouldRequestWorkspaceData(
     context: NonNullable<ReturnType<typeof getCompletionContext>>
   ): boolean {
-    return context.kind === "default" && !context.dataObjectName;
+    return (
+      (context.kind === "default" || context.kind === "argument") &&
+      !context.dataObjectName
+    );
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {

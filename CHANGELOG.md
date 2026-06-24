@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.3.0] - 2026-06-24
+
+### Fixed
+
+- Improved autocompletion inside function calls so session objects appear with the usual completion groups.
+
 ## [0.2.9] - 2026-06-19
 
 ### Fixed

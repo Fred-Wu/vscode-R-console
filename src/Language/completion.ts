@@ -25,27 +25,20 @@ type CompletionEntry = {
   replaceStart?: number;
 };
 
+const DEFAULT_COMPLETION_GROUP_ORDER = [
+  "Runtime Variables",
+  "Runtime Functions",
+  "Packages",
+  "Functions",
+  "Fields",
+  "Recent Input",
+  "Other",
+] as const;
+
 const COMPLETION_GROUP_ORDER = {
-  argument: [
-    "Arguments",
-    "Fields",
-    "Runtime Variables",
-    "Runtime Functions",
-    "Packages",
-    "Functions",
-    "Recent Input",
-    "Other",
-  ],
+  argument: ["Arguments", ...DEFAULT_COMPLETION_GROUP_ORDER],
   bracket: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
-  default: [
-    "Runtime Variables",
-    "Runtime Functions",
-    "Packages",
-    "Functions",
-    "Fields",
-    "Recent Input",
-    "Other",
-  ],
+  default: DEFAULT_COMPLETION_GROUP_ORDER,
   member: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
   package: ["Package Members", "Functions", "Fields", "Recent Input", "Other"],
 } as const satisfies Record<CompletionContext["kind"], readonly string[]>;
@@ -377,8 +370,12 @@ export async function collectCompletionEntries(
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
   const lspItems =
-    context.kind === "default"
-      ? filterShadowedWorkspaceEntries(rawLspItems, sessionItems)
+    isGlobalSymbolContext(context)
+      ? filterShadowedWorkspaceEntries(
+          rawLspItems,
+          sessionItems,
+          context.kind === "argument" ? isArgumentCompletionEntry : undefined
+        )
       : rawLspItems;
   const bufferItems = getConsoleBufferCompletions(
     context,
@@ -429,19 +426,11 @@ export async function collectCompletionEntries(
       return dedupeCompletionEntries(columnFiltered);
     }
 
-    if (context.prefix.length === 0) {
-      return dedupeCompletionEntries([
-        ...lspFiltered,
-        ...sessionFiltered,
-        ...bufferFiltered,
-      ]);
-    } else {
-      return dedupeCompletionEntries([
-        ...lspFiltered,
-        ...sessionFiltered,
-        ...bufferFiltered,
-      ]);
-    }
+    return dedupeCompletionEntries([
+      ...lspFiltered,
+      ...sessionFiltered,
+      ...bufferFiltered,
+    ]);
   }
 
   if (context.kind === "member") {
@@ -550,7 +539,11 @@ function getCompletionGroup(
   if (context.kind === "package") {
     return "Package Members";
   }
-  if (context.kind === "argument" && entry.source === "lsp") {
+  if (
+    context.kind === "argument" &&
+    entry.source === "lsp" &&
+    isArgumentCompletionEntry(entry)
+  ) {
     return "Arguments";
   }
   if (kind === vscode.CompletionItemKind.Field || kind === vscode.CompletionItemKind.Property) {
@@ -575,6 +568,17 @@ function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): 
     kind === vscode.CompletionItemKind.Method ||
     kind === vscode.CompletionItemKind.Constructor
   );
+}
+
+function isArgumentCompletionEntry(entry: CompletionEntry): boolean {
+  return (
+    entry.detail === "parameter" ||
+    entry.detail?.startsWith("value for ") === true
+  );
+}
+
+function isGlobalSymbolContext(context: CompletionContext): boolean {
+  return context.kind === "default" || context.kind === "argument";
 }
 
 function getSessionCompletions(
@@ -608,7 +612,7 @@ function getSessionCompletions(
     }));
   }
 
-  if (context.kind !== "default") {
+  if (!isGlobalSymbolContext(context)) {
     return [];
   }
 
@@ -922,7 +926,8 @@ function filterShadowedBufferEntries(
 
 function filterShadowedWorkspaceEntries(
   entries: CompletionEntry[],
-  workspaceEntries: CompletionEntry[]
+  workspaceEntries: CompletionEntry[],
+  preserveEntry?: (entry: CompletionEntry) => boolean
 ): CompletionEntry[] {
   if (entries.length === 0 || workspaceEntries.length === 0) {
     return entries;
@@ -932,9 +937,12 @@ function filterShadowedWorkspaceEntries(
     workspaceEntries.map((entry) => entry.label.toLowerCase())
   );
 
-  return entries.filter(
-    (entry) => !workspaceLabels.has(entry.label.toLowerCase())
-  );
+  return entries.filter((entry) => {
+    if (preserveEntry?.(entry)) {
+      return true;
+    }
+    return !workspaceLabels.has(entry.label.toLowerCase());
+  });
 }
 
 function dedupeCompletionEntries(entries: CompletionEntry[]): CompletionEntry[] {
