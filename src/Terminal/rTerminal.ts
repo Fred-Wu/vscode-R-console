@@ -1649,11 +1649,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleAutocomplete(): Promise<void> {
-    this.sessionWatcher?.refresh();
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
       getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
+      refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
       },

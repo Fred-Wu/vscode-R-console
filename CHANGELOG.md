@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.3.1] - 2026-06-29
+
+### Fixed
+
+- Reduced the delay when opening console suggestions by avoiding duplicate workspace refreshes when Tab is pressed.
+
 ## [0.3.0] - 2026-06-24
 
 ### Fixed
