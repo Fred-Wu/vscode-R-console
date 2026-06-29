@@ -41,6 +41,7 @@ type AutocompleteRequest = {
   input: InputSnapshot;
   getCurrentInput: () => InputSnapshot;
   getWorkspaceData: () => WorkspaceData | undefined;
+  refreshWorkspaceData: () => void;
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
@@ -64,6 +65,7 @@ export class RTermLang {
     input,
     getCurrentInput,
     getWorkspaceData,
+    refreshWorkspaceData,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
     if (this.completionInProgress) {
@@ -81,6 +83,14 @@ export class RTermLang {
 
     this.completionInProgress = true;
     try {
+      const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
+      const workspaceDataRequest = shouldRequestWorkspaceData
+        ? this.options.requestWorkspaceData?.()
+        : undefined;
+      if (!shouldRequestWorkspaceData) {
+        refreshWorkspaceData();
+      }
+
       await this.ensureConsoleLspStarted();
 
       const latestInput = getCurrentInput();
@@ -91,8 +101,8 @@ export class RTermLang {
         return;
       }
 
-      const sessionData = this.shouldRequestWorkspaceData(context)
-        ? (await this.options.requestWorkspaceData?.()) ?? getWorkspaceData()
+      const sessionData = shouldRequestWorkspaceData
+        ? (await workspaceDataRequest) ?? getWorkspaceData()
         : getWorkspaceData();
       const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
