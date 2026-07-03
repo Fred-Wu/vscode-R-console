@@ -81,6 +81,11 @@ export class RTermLang {
 
     this.completionInProgress = true;
     try {
+      const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
+      const workspaceDataRequest = shouldRequestWorkspaceData
+        ? getWorkspaceData()
+        : undefined;
+
       await this.ensureConsoleLspStarted();
 
       const latestInput = getCurrentInput();
@@ -91,8 +96,8 @@ export class RTermLang {
         return;
       }
 
-      const sessionData = this.shouldRequestWorkspaceData(context)
-        ? await getWorkspaceData()
+      const sessionData = shouldRequestWorkspaceData
+        ? await workspaceDataRequest
         : undefined;
       const doc = this.getOrUpdateCompletionDocument(latestInput.text);
       if (!doc) {
@@ -303,7 +308,10 @@ export class RTermLang {
   private shouldRequestWorkspaceData(
     context: NonNullable<ReturnType<typeof getCompletionContext>>
   ): boolean {
-    return context.kind !== "member" && context.kind !== "bracket";
+    return (
+      (context.kind === "default" || context.kind === "argument") &&
+      !context.dataObjectName
+    );
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {

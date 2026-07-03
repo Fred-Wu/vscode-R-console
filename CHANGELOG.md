@@ -12,6 +12,23 @@ All notable changes to R Console will be documented in this file.
 
 - Runtime `$`, `@`, and data-frame bracket completion in vscode-R 3.0 `sess` mode now uses the active console session through `sess` JSON-RPC.
 
+## [0.3.1] - 2026-06-29
+
+### Fixed
+
+- Reduced the delay when opening console suggestions by avoiding duplicate workspace refreshes when Tab is pressed.
+
+## [0.3.0] - 2026-06-24
+
+### Fixed
+
+- Improved autocompletion inside function calls so session objects appear with the usual completion groups.
+- Fixed deduplication across different completion groups.
+
+### Changed
+
+* Updated README, and moved the local development descriptions to the Contributing section.
+
 ## [0.2.9] - 2026-06-19
 
 ### Fixed

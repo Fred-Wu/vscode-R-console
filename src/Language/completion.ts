@@ -25,27 +25,20 @@ type CompletionEntry = {
   replaceStart?: number;
 };
 
+const DEFAULT_COMPLETION_GROUP_ORDER = [
+  "Runtime Variables",
+  "Runtime Functions",
+  "Packages",
+  "Functions",
+  "Fields",
+  "Recent Input",
+  "Other",
+] as const;
+
 const COMPLETION_GROUP_ORDER = {
-  argument: [
-    "Arguments",
-    "Fields",
-    "Runtime Variables",
-    "Runtime Functions",
-    "Packages",
-    "Functions",
-    "Recent Input",
-    "Other",
-  ],
+  argument: ["Arguments", ...DEFAULT_COMPLETION_GROUP_ORDER],
   bracket: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
-  default: [
-    "Runtime Variables",
-    "Runtime Functions",
-    "Packages",
-    "Functions",
-    "Fields",
-    "Recent Input",
-    "Other",
-  ],
+  default: DEFAULT_COMPLETION_GROUP_ORDER,
   member: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
   package: ["Package Members", "Functions", "Fields", "Recent Input", "Other"],
 } as const satisfies Record<CompletionContext["kind"], readonly string[]>;
@@ -377,8 +370,13 @@ export async function collectCompletionEntries(
       ? []
       : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
   const lspItems =
-    context.kind === "default"
-      ? filterShadowedWorkspaceEntries(rawLspItems, sessionItems)
+    isGlobalSymbolContext(context)
+      ? filterShadowedWorkspaceEntries(
+          rawLspItems,
+          sessionItems,
+          context,
+          context.kind === "argument" ? isArgumentCompletionEntry : undefined
+        )
       : rawLspItems;
   const bufferItems = getConsoleBufferCompletions(
     context,
@@ -403,24 +401,24 @@ export async function collectCompletionEntries(
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (runtimeFiltered.length > 0) {
-      return dedupeCompletionEntries(runtimeFiltered);
+      return dedupeCompletionEntries(runtimeFiltered, context);
     }
     const exactColumnMatch = columnFiltered.some(
       (entry) => entry.label.toLowerCase() === context.prefix.toLowerCase()
     );
     if (lspFiltered.length > 0 && !exactColumnMatch) {
-      return dedupeCompletionEntries([...lspFiltered, ...columnFiltered, ...bufferFiltered]);
+      return dedupeCompletionEntries([...lspFiltered, ...columnFiltered, ...bufferFiltered], context);
     }
     if (context.chainedBracket && bufferFiltered.length > 0) {
-      return dedupeCompletionEntries([...columnFiltered, ...bufferFiltered]);
+      return dedupeCompletionEntries([...columnFiltered, ...bufferFiltered], context);
     }
     if (columnFiltered.length > 0) {
-      return dedupeCompletionEntries(columnFiltered);
+      return dedupeCompletionEntries(columnFiltered, context);
     }
     return dedupeCompletionEntries([
       ...filterCompletionEntries(sessionItems, context.prefix),
       ...bufferFiltered,
-    ]);
+    ], context);
   }
 
   if (context.kind === "argument") {
@@ -437,14 +435,14 @@ export async function collectCompletionEntries(
         ...lspFiltered,
         ...sessionFiltered,
         ...bufferFiltered,
-      ]);
+      ], context);
     }
 
     return dedupeCompletionEntries([
       ...lspFiltered,
       ...sessionFiltered,
       ...bufferFiltered,
-    ]);
+    ], context);
   }
 
   if (context.kind === "member") {
@@ -452,12 +450,12 @@ export async function collectCompletionEntries(
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (context.chainedBracket && bufferFiltered.length > 0) {
-      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]);
+      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered], context);
     }
     if (runtimeFiltered.length > 0) {
-      return dedupeCompletionEntries(runtimeFiltered);
+      return dedupeCompletionEntries(runtimeFiltered, context);
     }
-    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]);
+    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered], context);
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
@@ -467,13 +465,13 @@ export async function collectCompletionEntries(
     return dedupeCompletionEntries(filterCompletionEntries(
       [...defaultRuntimeFiltered, ...columnItems, ...lspItems, ...sessionItems, ...fallbackBufferItems],
       context.prefix
-    ));
+    ), context);
   }
 
   return dedupeCompletionEntries(filterCompletionEntries(
     [...lspItems, ...sessionItems, ...fallbackBufferItems],
     context.prefix
-  ));
+  ), context);
 }
 
 export function toCompletionPick(
@@ -557,7 +555,11 @@ function getCompletionGroup(
   if (context.kind === "package") {
     return "Package Members";
   }
-  if (context.kind === "argument" && entry.source === "lsp") {
+  if (
+    context.kind === "argument" &&
+    entry.source === "lsp" &&
+    isArgumentCompletionEntry(entry)
+  ) {
     return "Arguments";
   }
   if (kind === vscode.CompletionItemKind.Field || kind === vscode.CompletionItemKind.Property) {
@@ -582,6 +584,17 @@ function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): 
     kind === vscode.CompletionItemKind.Method ||
     kind === vscode.CompletionItemKind.Constructor
   );
+}
+
+function isArgumentCompletionEntry(entry: CompletionEntry): boolean {
+  return (
+    entry.detail === "parameter" ||
+    entry.detail?.startsWith("value for ") === true
+  );
+}
+
+function isGlobalSymbolContext(context: CompletionContext): boolean {
+  return context.kind === "default" || context.kind === "argument";
 }
 
 function getSessionCompletions(
@@ -615,7 +628,7 @@ function getSessionCompletions(
     }));
   }
 
-  if (context.kind !== "default") {
+  if (!isGlobalSymbolContext(context)) {
     return [];
   }
 
@@ -934,26 +947,34 @@ function filterShadowedBufferEntries(
 
 function filterShadowedWorkspaceEntries(
   entries: CompletionEntry[],
-  workspaceEntries: CompletionEntry[]
+  workspaceEntries: CompletionEntry[],
+  context: CompletionContext,
+  preserveEntry?: (entry: CompletionEntry) => boolean
 ): CompletionEntry[] {
   if (entries.length === 0 || workspaceEntries.length === 0) {
     return entries;
   }
 
   const workspaceLabels = new Set(
-    workspaceEntries.map((entry) => entry.label.toLowerCase())
+    workspaceEntries.map((entry) => getCompletionDedupeKey(entry, context))
   );
 
-  return entries.filter(
-    (entry) => !workspaceLabels.has(entry.label.toLowerCase())
-  );
+  return entries.filter((entry) => {
+    if (preserveEntry?.(entry)) {
+      return true;
+    }
+    return !workspaceLabels.has(getCompletionDedupeKey(entry, context));
+  });
 }
 
-function dedupeCompletionEntries(entries: CompletionEntry[]): CompletionEntry[] {
+function dedupeCompletionEntries(
+  entries: CompletionEntry[],
+  context: CompletionContext
+): CompletionEntry[] {
   const seen = new Set<string>();
   const result: CompletionEntry[] = [];
   for (const entry of entries) {
-    const key = `${entry.label}\u0000${entry.insertText}\u0000${entry.kind ?? -1}`;
+    const key = getCompletionDedupeKey(entry, context);
     if (seen.has(key)) {
       continue;
     }
@@ -961,6 +982,18 @@ function dedupeCompletionEntries(entries: CompletionEntry[]): CompletionEntry[] 
     result.push(entry);
   }
   return result;
+}
+
+function getCompletionDedupeKey(
+  entry: CompletionEntry,
+  context: CompletionContext
+): string {
+  return [
+    getCompletionGroup(entry, context),
+    entry.label.toLowerCase(),
+    entry.insertText,
+    entry.kind ?? -1,
+  ].join("\u0000");
 }
 
 function getCompletionDescription(entry: CompletionEntry): string {
