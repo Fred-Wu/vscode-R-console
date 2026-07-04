@@ -62,6 +62,7 @@ export type Submission = {
 export type VscodeRSessionConnection = {
   pipePath: string;
   attachScriptPath?: string;
+  jgdSocket?: string;
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
@@ -313,7 +314,18 @@ async function parseVscodeRPipeAttachCommand(
     if (!pipePath) {
       return undefined;
     }
-    return { pipePath, attachScriptPath };
+    const jgdSocketAssignment = /\bJGD_SOCKET\s*=\s*/.exec(content);
+    const jgdSocket = jgdSocketAssignment
+      ? parseRStringLiteralAt(
+          content,
+          jgdSocketAssignment.index + jgdSocketAssignment[0].length
+        )?.value
+      : undefined;
+    return {
+      pipePath,
+      attachScriptPath,
+      jgdSocket,
+    };
   } catch {
     return undefined;
   }
@@ -415,6 +427,18 @@ function quoteRString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+function resolveVscodeRPlotBackend(
+  rConfig: vscode.WorkspaceConfiguration
+): "auto" | "standard" | "httpgd" | "jgd" {
+  const backend = rConfig.get<"auto" | "standard" | "httpgd" | "jgd">(
+    "plot.backend",
+    "auto"
+  );
+  return backend === "auto" && rConfig.get<boolean>("plot.useHttpgd", false)
+    ? "httpgd"
+    : backend;
+}
+
 async function setOwnerOnlyPermissions(filePath: string): Promise<void> {
   if (process.platform === "win32") {
     return;
@@ -424,12 +448,18 @@ async function setOwnerOnlyPermissions(filePath: string): Promise<void> {
 
 function buildSessConnectCommand(connection: VscodeRSessionConnection): string {
   const rConfig = vscode.workspace.getConfiguration("r");
+  const plotBackend = resolveVscodeRPlotBackend(rConfig);
+  const jgdSocketCommand = connection.jgdSocket
+    ? `Sys.setenv(JGD_SOCKET=${quoteRString(connection.jgdSocket)});`
+    : "Sys.unsetenv(\"JGD_SOCKET\");";
   return [
     "if (requireNamespace(\"sess\", quietly = TRUE) && \"pipe_path\" %in% names(formals(sess::connect))) {",
+    jgdSocketCommand,
     "sess::connect(",
     `pipe_path=${quoteRString(connection.pipePath)},`,
     `use_rstudioapi=${asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true)},`,
-    `use_httpgd=${asRLogical(rConfig.get<boolean>("plot.useHttpgd"), true)}`,
+    `use_httpgd=${asRLogical(plotBackend === "httpgd" || plotBackend === "auto", true)},`,
+    `use_jgd=${asRLogical(plotBackend === "jgd" || plotBackend === "auto", false)}`,
     ")",
     "}",
   ].join(" ");
@@ -463,8 +493,21 @@ async function configureVscodeRSessionBootstrap(
 
   env.SESS_PIPE = connection.pipePath;
   const rConfig = vscode.workspace.getConfiguration("r");
+  const plotBackend = resolveVscodeRPlotBackend(rConfig);
   env.SESS_RSTUDIOAPI = asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true);
-  env.SESS_USE_HTTPGD = asRLogical(rConfig.get<boolean>("plot.useHttpgd"), true);
+  env.SESS_USE_HTTPGD = asRLogical(
+    plotBackend === "httpgd" || plotBackend === "auto",
+    true
+  );
+  env.SESS_USE_JGD = asRLogical(
+    plotBackend === "jgd" || plotBackend === "auto",
+    false
+  );
+  if (connection.jgdSocket) {
+    env.JGD_SOCKET = connection.jgdSocket;
+  } else {
+    delete env.JGD_SOCKET;
+  }
   delete env.SESS_PORT;
   delete env.SESS_TOKEN;
   delete env.SESS_HOST;

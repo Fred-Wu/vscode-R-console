@@ -54,7 +54,8 @@ if (identical(session_mode, "sess")) {
                 connect(
                     pipe_path = pipe_path,
                     use_rstudioapi = as.logical(Sys.getenv("SESS_RSTUDIOAPI", "TRUE")),
-                    use_httpgd = as.logical(Sys.getenv("SESS_USE_HTTPGD", "TRUE"))
+                    use_httpgd = as.logical(Sys.getenv("SESS_USE_HTTPGD", "TRUE")),
+                    use_jgd = as.logical(Sys.getenv("SESS_USE_JGD", "FALSE"))
                 )
             },
             error = function(err) {
