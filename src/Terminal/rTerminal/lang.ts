@@ -1,16 +1,16 @@
 import * as vscode from "vscode";
 import {
+  type CompletionProvider,
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
   isCompletionPickItem,
+  needsLanguageServerCompletion,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
-import {
-  ConsoleLspClient,
-  type ConsoleLspSessionState,
-  type DocumentSemanticTokensResult,
-} from "../../Language/consoleLspClient";
+import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import type { DocumentSemanticTokensResult } from "../../Language/semanticTokens";
+import { LanguageBridge } from "../../Language/languageBridge";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type {
   SessionMemberCompletionItem,
@@ -27,8 +27,10 @@ export type InputSnapshot = {
 };
 
 type LangOptions = {
+  cwd?: string;
   extensionPath: string;
   rPath: string;
+  languageServer: "vscode-r" | "console";
   getRecentSessionEntries?: () => string[];
   requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
   requestMemberCompletions: (
@@ -45,20 +47,40 @@ type AutocompleteRequest = {
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
+type ConsoleSessionState = {
+  attachedPackages: string[];
+  loadedNamespaces: string[];
+};
+
+type CompletionDocumentContext = {
+  document: vscode.TextDocument;
+  lineOffset: number;
+  preludeLines: string[];
+};
+
 export class RTermLang {
-  private completionInProgress = false;
+  private completionRequestId = 0;
   private completionDocument: VirtualRDocument | undefined;
+  private semanticDocument: VirtualRDocument | undefined;
   private readonly completionDocumentId = `${process.pid}-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}`;
   private semanticRequestCounter = 0;
   private consoleLsp: ConsoleLspClient | undefined;
-  private sessionState: ConsoleLspSessionState | undefined;
+  private readonly languageBridge: LanguageBridge;
+  private sessionState: ConsoleSessionState | undefined;
 
-  constructor(private readonly options: LangOptions) {}
+  constructor(private readonly options: LangOptions) {
+    this.languageBridge = new LanguageBridge({
+      requestMemberCompletions: async (expression, operator) =>
+        await this.options.requestMemberCompletions(expression, operator),
+    });
+  }
 
   async start(): Promise<void> {
-    await this.ensureConsoleLspStarted();
+    if (this.usesConsoleLsp()) {
+      await this.ensureConsoleLspStarted();
+    }
   }
 
   async handleAutocomplete({
@@ -68,10 +90,6 @@ export class RTermLang {
     refreshWorkspaceData,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
-    if (this.completionInProgress) {
-      return;
-    }
-
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -81,8 +99,8 @@ export class RTermLang {
       return;
     }
 
-    this.completionInProgress = true;
-    try {
+    const requestId = ++this.completionRequestId;
+    {
       const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
       const workspaceDataRequest = shouldRequestWorkspaceData
         ? this.options.requestWorkspaceData?.()
@@ -90,8 +108,6 @@ export class RTermLang {
       if (!shouldRequestWorkspaceData) {
         refreshWorkspaceData();
       }
-
-      await this.ensureConsoleLspStarted();
 
       const latestInput = getCurrentInput();
       if (
@@ -104,26 +120,52 @@ export class RTermLang {
       const sessionData = shouldRequestWorkspaceData
         ? (await workspaceDataRequest) ?? getWorkspaceData()
         : getWorkspaceData();
-      const doc = this.getOrUpdateCompletionDocument(latestInput.text);
-      if (!doc) {
+      if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
-      if (this.consoleLsp) {
-        await this.consoleLsp.prepareDocument(doc);
+      const completionProvider = await this.getCompletionProvider();
+      if (!this.isCurrentCompletionRequest(requestId)) {
+        return;
+      }
+      if (!completionProvider) {
+        return;
+      }
+      const filterAggregateProviderItems = !this.usesConsoleLsp();
+      const needsLsp = needsLanguageServerCompletion(context);
+
+      const docContext =
+        needsLsp || this.usesConsoleLsp()
+          ? await this.getOrOpenCompletionDocument(latestInput.text, sessionData)
+          : undefined;
+      if (!this.isCurrentCompletionRequest(requestId)) {
+        return;
+      }
+      if ((needsLsp || this.usesConsoleLsp()) && !docContext) {
+        return;
       }
 
-      const position = new vscode.Position(latestInput.cursorRow, context.snapshotCursor);
-
-      const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
+      const position = new vscode.Position(
+        latestInput.cursorRow + (docContext?.lineOffset ?? 0),
+        context.snapshotCursor
+      );
+      const linesBefore = [
+        ...(docContext?.preludeLines ?? []),
+        ...latestInput.lines.slice(0, latestInput.cursorRow),
+      ];
       const entries = await collectCompletionEntries(
         context,
-        doc,
-        position,
+        docContext?.document,
+        docContext ? position : undefined,
         sessionData,
         linesBefore,
         this.options.getRecentSessionEntries?.() ?? [],
-        this.consoleLsp
+        completionProvider,
+        latestInput.text,
+        filterAggregateProviderItems
       );
+      if (!this.isCurrentCompletionRequest(requestId)) {
+        return;
+      }
 
       if (entries.length === 0) {
         return;
@@ -148,21 +190,35 @@ export class RTermLang {
               const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
               const lines = [...latestInput.lines];
               lines[latestInput.cursorRow] = currentLine;
-              const nextDoc = this.getOrUpdateCompletionDocument(lines.join("\n"));
-              if (!nextDoc) {
+              const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
+              const nextInputText = lines.join("\n");
+              const nextDocContext = await this.getOrOpenCompletionDocument(
+                nextInputText,
+                sessionData
+              );
+              if (!this.isCurrentCompletionRequest(requestId)) {
                 return;
               }
-              const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
-              await this.consoleLsp?.prepareDocument(nextDoc);
+              if (!nextDocContext) {
+                return;
+              }
               const nextEntries = await collectCompletionEntries(
                 nextContext,
-                nextDoc,
-                new vscode.Position(latestInput.cursorRow, cursorCol),
+                nextDocContext.document,
+                new vscode.Position(latestInput.cursorRow + nextDocContext.lineOffset, cursorCol),
                 sessionData,
-                lines.slice(0, latestInput.cursorRow),
+                [
+                  ...nextDocContext.preludeLines,
+                  ...lines.slice(0, latestInput.cursorRow),
+                ],
                 this.options.getRecentSessionEntries?.() ?? [],
-                this.consoleLsp
+                completionProvider,
+                nextInputText,
+                filterAggregateProviderItems
               );
+              if (!this.isCurrentCompletionRequest(requestId)) {
+                return;
+              }
               if (currentRequest === request) {
                 pick.items = toCompletionQuickPickItems(nextEntries, { ...nextContext, snapshotInput: latestInput.currentLine, snapshotCursor: latestInput.cursorCol });
               }
@@ -175,6 +231,9 @@ export class RTermLang {
       if (!isCompletionPickItem(selection)) {
         return;
       }
+      if (!this.isCurrentCompletionRequest(requestId)) {
+        return;
+      }
 
       const currentInput = getCurrentInput();
       if (
@@ -185,27 +244,28 @@ export class RTermLang {
       }
 
       applyCompletion(selection);
-    } finally {
-      this.completionInProgress = false;
     }
   }
 
   cleanupCompletionDocument(): void {
-    if (this.consoleLsp) {
-      if (this.completionDocument) {
-        this.consoleLsp.closeDocument(this.completionDocument as unknown as vscode.TextDocument);
-      }
+    if (this.consoleLsp && this.completionDocument) {
+      this.consoleLsp.closeDocument(
+        this.completionDocument as unknown as vscode.TextDocument
+      );
     }
+    this.completionDocument?.dispose();
     this.completionDocument = undefined;
+    this.semanticDocument?.dispose();
+    this.semanticDocument = undefined;
   }
 
   stopConsoleLsp(): void {
+    this.cleanupCompletionDocument();
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;
-    if (!lsp) {
-      return;
+    if (lsp) {
+      void lsp.dispose();
     }
-    void lsp.dispose();
   }
 
   clearSessionState(): void {
@@ -215,35 +275,47 @@ export class RTermLang {
   async requestSemanticTokens(
     content: string
   ): Promise<DocumentSemanticTokensResult | undefined> {
-    await this.ensureConsoleLspStarted();
-    const lsp = this.consoleLsp;
-    if (!lsp) {
-      return undefined;
+    if (this.usesConsoleLsp()) {
+      await this.ensureConsoleLspStarted();
+      const lsp = this.consoleLsp;
+      if (!lsp) {
+        return undefined;
+      }
+
+      const doc = this.createSemanticSnapshotDocument(content);
+      if (!doc) {
+        return undefined;
+      }
+
+      try {
+        return await lsp.provideDocumentSemanticTokens(doc);
+      } finally {
+        lsp.closeDocument(doc);
+      }
     }
 
-    const doc = this.createSemanticSnapshotDocument(content);
+    const doc = await this.getOrOpenVscodeRSemanticDocument(content);
     if (!doc) {
       return undefined;
     }
 
-    try {
-      return await lsp.provideDocumentSemanticTokens(doc);
-    } finally {
-      lsp.closeDocument(doc);
-    }
+    return await this.languageBridge.provideDocumentSemanticTokens(doc);
   }
 
   async refreshCompletionContextDocument(inputText: string): Promise<void> {
-    await this.ensureConsoleLspStarted();
-    if (!this.consoleLsp) {
+    if (!this.usesConsoleLsp()) {
       return;
     }
-
-    const doc = this.getOrUpdateCompletionDocument(inputText);
-    if (!doc) {
+    if (!this.completionDocument) {
       return;
     }
-    await this.consoleLsp.prepareDocument(doc);
+    try {
+      const docContext = await this.getOrOpenCompletionDocument(inputText);
+      if (this.usesConsoleLsp() && docContext) {
+        await this.consoleLsp?.prepareDocument(docContext.document);
+      }
+    } catch {
+    }
   }
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
@@ -269,65 +341,144 @@ export class RTermLang {
 
   private getOrUpdateCompletionDocument(
     content: string
-  ): vscode.TextDocument | undefined {
+  ): VirtualRDocument {
+    if (this.completionDocument) {
+      this.completionDocument.update(content);
+      return this.completionDocument;
+    }
+
+    this.completionDocument = new VirtualRDocument(
+      this.completionDocumentId,
+      content,
+      "console.rconsole",
+      this.options.cwd,
+      !this.usesConsoleLsp()
+    );
+    return this.completionDocument;
+  }
+
+  private async getOrOpenCompletionDocument(
+    content: string,
+    data?: WorkspaceData
+  ): Promise<CompletionDocumentContext | undefined> {
     try {
-      if (this.completionDocument) {
-        this.completionDocument.update(content);
-        return this.completionDocument as unknown as vscode.TextDocument;
+      if (this.usesConsoleLsp()) {
+        return {
+          document: this.getOrUpdateCompletionDocument(
+            content
+          ) as unknown as vscode.TextDocument,
+          lineOffset: 0,
+          preludeLines: [],
+        };
       }
 
-      this.completionDocument = new VirtualRDocument(
-        this.completionDocumentId,
-        content,
-        "completion.R"
-      );
-      return this.completionDocument as unknown as vscode.TextDocument;
+      const documentContent = this.buildCompletionDocumentContent(content, data);
+      const document = await this
+        .getOrUpdateCompletionDocument(documentContent.text)
+        .writeFileBackedDocument();
+      return {
+        document,
+        lineOffset: documentContent.preludeLines.length,
+        preludeLines: documentContent.preludeLines,
+      };
     } catch {
       return undefined;
     }
+  }
+
+  private buildCompletionDocumentContent(
+    inputText: string,
+    data?: WorkspaceData
+  ): { text: string; preludeLines: string[] } {
+    const attachedPackages = data
+      ? this.getAttachedPackages(data)
+      : this.sessionState?.attachedPackages ?? [];
+    const preludeLines = attachedPackages.map(
+      (pkg) => `library(${JSON.stringify(pkg)})`
+    );
+    if (preludeLines.length === 0) {
+      return { text: inputText, preludeLines };
+    }
+    return {
+      text: `${preludeLines.join("\n")}\n${inputText}`,
+      preludeLines,
+    };
+  }
+
+  private getAttachedPackages(data: WorkspaceData): string[] {
+    return data.search
+      .filter((value) => value.startsWith("package:"))
+      .map((value) => value.slice(8))
+      .filter((value) => value.length > 0);
   }
 
   private createSemanticSnapshotDocument(content: string): vscode.TextDocument | undefined {
     try {
       this.semanticRequestCounter += 1;
-      const requestId = `${this.completionDocumentId}-semantic-${this.semanticRequestCounter}`;
-      const document = new VirtualRDocument(
-        requestId,
+      return new VirtualRDocument(
+        `${this.completionDocumentId}-semantic-${this.semanticRequestCounter}`,
         content,
-        `semantic-${this.semanticRequestCounter}.R`
-      );
-      return document as unknown as vscode.TextDocument;
+        `semantic-${this.semanticRequestCounter}.R`,
+        this.options.cwd,
+        false
+      ) as unknown as vscode.TextDocument;
     } catch {
       return undefined;
     }
   }
 
-  private shouldRequestWorkspaceData(
-    context: NonNullable<ReturnType<typeof getCompletionContext>>
-  ): boolean {
-    return (
-      (context.kind === "default" || context.kind === "argument") &&
-      !context.dataObjectName
-    );
+  private async getOrOpenVscodeRSemanticDocument(
+    content: string
+  ): Promise<vscode.TextDocument | undefined> {
+    try {
+      if (!this.semanticDocument) {
+        this.semanticDocument = new VirtualRDocument(
+          `${this.completionDocumentId}-semantic`,
+          content,
+          "semantic.R",
+          this.options.cwd,
+          false
+        );
+      } else {
+        this.semanticDocument.update(content);
+      }
+      return await this.semanticDocument.openTextDocument();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private usesConsoleLsp(): boolean {
+    return this.options.languageServer === "console";
+  }
+
+  private isCurrentCompletionRequest(requestId: number): boolean {
+    return requestId === this.completionRequestId;
+  }
+
+  private async getCompletionProvider(): Promise<CompletionProvider | undefined> {
+    if (!this.usesConsoleLsp()) {
+      return this.languageBridge;
+    }
+
+    await this.ensureConsoleLspStarted();
+    return this.consoleLsp;
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {
-    if (this.consoleLsp) {
-      try {
-        await this.consoleLsp.start();
-        await this.syncConsoleSessionState();
-      } catch {
-      }
+    if (!this.usesConsoleLsp()) {
       return;
     }
 
-    this.consoleLsp = new ConsoleLspClient({
-      consoleId: this.completionDocumentId,
-      extensionPath: this.options.extensionPath,
-      rPath: this.options.rPath,
-      requestMemberCompletions: async (expression, operator) =>
-        await this.options.requestMemberCompletions(expression, operator),
-    });
+    if (!this.consoleLsp) {
+      this.consoleLsp = new ConsoleLspClient({
+        consoleId: this.completionDocumentId,
+        extensionPath: this.options.extensionPath,
+        rPath: this.options.rPath,
+        requestMemberCompletions: async (expression, operator) =>
+          await this.options.requestMemberCompletions(expression, operator),
+      });
+    }
 
     try {
       await this.consoleLsp.start();
@@ -343,7 +494,16 @@ export class RTermLang {
     await this.consoleLsp.syncSessionState(this.sessionState);
   }
 
-  private toSessionState(data: WorkspaceData): ConsoleLspSessionState {
+  private shouldRequestWorkspaceData(
+    context: NonNullable<ReturnType<typeof getCompletionContext>>
+  ): boolean {
+    return (
+      (context.kind === "default" || context.kind === "argument") &&
+      !context.dataObjectName
+    );
+  }
+
+  private toSessionState(data: WorkspaceData): ConsoleSessionState {
     return {
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))

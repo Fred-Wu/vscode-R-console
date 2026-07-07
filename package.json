@@ -2,7 +2,7 @@
   "name": "vsc-r-console",
   "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "RConsole",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "images/Rlogo.png",
@@ -90,6 +90,13 @@
       }
     ],
     "configurationDefaults": {
+      "files.exclude": {
+        "**/.vscode-R-console": true,
+        "**/.vscode-R-console/**": true
+      },
+      "files.associations": {
+        "*.rconsole": "r"
+      },
       "terminal.integrated.commandsToSkipShell": [
         "r-console.insertPipeOperator"
       ]
@@ -115,6 +122,19 @@
           ],
           "default": "|>",
           "description": "Pipe operator to insert for chain operations. The default keybinding is Ctrl+Alt+M."
+        },
+        "r.console.languageServer": {
+          "type": "string",
+          "enum": [
+            "vscode-r",
+            "console"
+          ],
+          "default": "vscode-r",
+          "enumDescriptions": [
+            "Use vscode-R's existing language server for console completions and semantic highlighting.",
+            "Use the console-owned language server process for console completions and semantic highlighting."
+          ],
+          "description": "Language server route used by the R console."
         }
       }
     }

@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-type CompletionContext = {
+export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
   replaceStart: number;
@@ -16,7 +16,7 @@ type CompletionContext = {
   snapshotCursor: number;
 };
 
-type CompletionEntry = {
+export type CompletionEntry = {
   label: string;
   insertText: string;
   kind?: vscode.CompletionItemKind;
@@ -69,11 +69,6 @@ export interface CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string
   ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined>;
-  provideSignatureHelp(
-    doc: vscode.TextDocument,
-    position: vscode.Position,
-    triggerCharacter?: string
-  ): Promise<vscode.SignatureHelp | undefined>;
   provideMemberCompletionItems?(
     expression: string,
     operator: "$" | "@"
@@ -350,12 +345,14 @@ export function getCompletionContext(
 
 export async function collectCompletionEntries(
   context: CompletionContext,
-  doc: vscode.TextDocument,
-  position: vscode.Position,
+  doc: vscode.TextDocument | undefined,
+  position: vscode.Position | undefined,
   sessionData: WorkspaceData | undefined,
   multilineBuffer: string[],
   recentConsoleEntries: string[] = [],
-  completionProvider?: CompletionProvider
+  completionProvider?: CompletionProvider,
+  consoleInputText?: string,
+  filterAggregateProviderItems = false
 ): Promise<CompletionEntry[]> {
   const sessionItems = getSessionCompletions(context, sessionData);
   const runtimeMemberItems =
@@ -363,12 +360,18 @@ export async function collectCompletionEntries(
       ? await getRuntimeMemberCompletions(context, completionProvider)
       : [];
   const includeLspItems =
-    context.kind !== "bracket" ||
-    (context.bracketOperator === "[" && !context.bracketQuote && context.prefix.length > 0);
+    needsLanguageServerCompletion(context) && !!doc && !!position;
   const rawLspItems =
     !includeLspItems
       ? []
-      : await getLanguageServerCompletions(context, doc, position, multilineBuffer, completionProvider);
+      : await getLanguageServerCompletions(
+          context,
+          doc,
+          position,
+          multilineBuffer,
+          completionProvider,
+          filterAggregateProviderItems
+        );
   const lspItems =
     isGlobalSymbolContext(context)
       ? filterShadowedWorkspaceEntries(
@@ -380,7 +383,7 @@ export async function collectCompletionEntries(
       : rawLspItems;
   const bufferItems = getConsoleBufferCompletions(
     context,
-    doc.getText(),
+    consoleInputText ?? doc?.getText() ?? "",
     recentConsoleEntries
   );
   const cachedColumnItems = getDataColumnCompletions(context, sessionData);
@@ -457,6 +460,22 @@ export async function collectCompletionEntries(
     [...lspItems, ...sessionItems, ...fallbackBufferItems],
     context.prefix
   ), context);
+}
+
+export function needsLanguageServerCompletion(context: CompletionContext): boolean {
+  if (context.kind === "member") {
+    return false;
+  }
+
+  if (context.kind !== "bracket") {
+    return true;
+  }
+
+  return (
+    context.bracketOperator === "[" &&
+    !context.bracketQuote &&
+    context.prefix.length > 0
+  );
 }
 
 export function toCompletionPick(
@@ -800,7 +819,8 @@ async function getLanguageServerCompletions(
   doc: vscode.TextDocument,
   position: vscode.Position,
   multilineBuffer: string[],
-  completionProvider?: CompletionProvider
+  completionProvider?: CompletionProvider,
+  filterAggregateProviderItems = false
 ): Promise<CompletionEntry[]> {
   if (!completionProvider) {
     return [];
@@ -815,16 +835,9 @@ async function getLanguageServerCompletions(
     const items = Array.isArray(result) ? result : result?.items || [];
     
     const filteredItems = items.filter((item) => {
-      if (item.kind === vscode.CompletionItemKind.Text) {
-        return false;
-      }
-      if (
-        (context.kind === "argument" || context.kind === "package") &&
-        item.kind === vscode.CompletionItemKind.Snippet
-      ) {
-        return false;
-      }
-      return true;
+      return filterAggregateProviderItems
+        ? isVscodeAggregateCompletionItem(item)
+        : isConsoleOwnedLanguageServerCompletionItem(context, item);
     });
     
     return filteredItems.map((item) => ({
@@ -838,6 +851,54 @@ async function getLanguageServerCompletions(
   } catch {
     return [];
   }
+}
+
+function isConsoleOwnedLanguageServerCompletionItem(
+  context: CompletionContext,
+  item: vscode.CompletionItem
+): boolean {
+  if (item.kind === vscode.CompletionItemKind.Text) {
+    return false;
+  }
+  if (
+    (context.kind === "argument" || context.kind === "package") &&
+    item.kind === vscode.CompletionItemKind.Snippet
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isVscodeAggregateCompletionItem(item: vscode.CompletionItem): boolean {
+  if (
+    item.kind === vscode.CompletionItemKind.Text ||
+    item.kind === vscode.CompletionItemKind.Snippet
+  ) {
+    return false;
+  }
+
+  const detail = item.detail;
+  if (!detail) {
+    return true;
+  }
+
+  if (
+    detail === "[workspace]" ||
+    detail === "[session]"
+  ) {
+    return false;
+  }
+
+  if (
+    detail === "[scope]" ||
+    detail === "parameter" ||
+    detail.startsWith("value for ") ||
+    /^\{[^}]+\}$/.test(detail)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function getCompletionLabel(item: vscode.CompletionItem): string {

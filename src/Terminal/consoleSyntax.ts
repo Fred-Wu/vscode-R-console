@@ -1,5 +1,5 @@
 import { ANSI } from "./ansi";
-import type { DocumentSemanticTokensResult } from "../Language/consoleLspClient";
+import type { DocumentSemanticTokensResult } from "../Language/semanticTokens";
 import { tokenizeForHighlighting, type HighlightTokenKind } from "../Language/parser";
 import type { RendererLineHighlighter } from "./renderer";
 import { SyntaxTheme } from "./syntaxTheme";
@@ -15,6 +15,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   private appliedSemanticVersion = 0;
   private wantedSemanticVersion = 0;
   private semanticRequestInFlight = false;
+  private semanticRequestsPaused = false;
 
   constructor(
     private readonly onDidChange: () => void,
@@ -70,6 +71,26 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     this.sourceVersion += 1;
     this.wantedSemanticVersion = 0;
     this.semanticRequestInFlight = false;
+    this.semanticRequestsPaused = false;
+  }
+
+  pauseSemanticRequests(): void {
+    this.semanticRequestsPaused = true;
+    this.wantedSemanticVersion = 0;
+  }
+
+  resumeSemanticRequests(): void {
+    if (!this.semanticRequestsPaused) {
+      return;
+    }
+
+    this.semanticRequestsPaused = false;
+    if (!this.sourceKey.trim() || !this.requestSemantics) {
+      return;
+    }
+
+    this.wantedSemanticVersion = ++this.sourceVersion;
+    void this.runLatestSemanticRequest();
   }
 
   highlightLines(lines: string[], sourceLineMap?: Array<number | undefined>): string[] {
@@ -139,7 +160,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
 
   private async buildSnapshot(lines: string[], sourceKey: string): Promise<string[]> {
     const styles = this.buildBaseStyles(lines);
-    const semanticTokens = this.requestSemantics
+    const semanticTokens = this.requestSemantics && !this.semanticRequestsPaused
       ? await this.requestSemantics(sourceKey)
       : undefined;
     if (semanticTokens) {
@@ -149,7 +170,11 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   }
 
   private async runLatestSemanticRequest(): Promise<void> {
-    if (this.semanticRequestInFlight || !this.requestSemantics) {
+    if (
+      this.semanticRequestsPaused ||
+      this.semanticRequestInFlight ||
+      !this.requestSemantics
+    ) {
       return;
     }
 
@@ -157,7 +182,8 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     try {
       while (
         this.wantedSemanticVersion > 0 &&
-        this.wantedSemanticVersion > this.appliedSemanticVersion
+        this.wantedSemanticVersion > this.appliedSemanticVersion &&
+        !this.semanticRequestsPaused
       ) {
         const requestedVersion = this.wantedSemanticVersion;
         const requestedContent = this.sourceKey;
@@ -166,6 +192,10 @@ export class ConsoleSyntax implements RendererLineHighlighter {
           semanticTokens = await this.requestSemantics(requestedContent);
         } catch {
           semanticTokens = undefined;
+        }
+
+        if (this.semanticRequestsPaused) {
+          continue;
         }
 
         if (requestedVersion !== this.sourceVersion) {
@@ -185,7 +215,11 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       }
     } finally {
       this.semanticRequestInFlight = false;
-      if (this.wantedSemanticVersion > 0 && this.wantedSemanticVersion > this.appliedSemanticVersion) {
+      if (
+        !this.semanticRequestsPaused &&
+        this.wantedSemanticVersion > 0 &&
+        this.wantedSemanticVersion > this.appliedSemanticVersion
+      ) {
         void this.runLatestSemanticRequest();
       }
     }

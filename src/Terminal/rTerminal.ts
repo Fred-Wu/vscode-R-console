@@ -240,9 +240,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
+    const consoleConfig = vscode.workspace.getConfiguration("r.console");
     this.lang = new RTermLang({
+      cwd: this.options.cwd,
       extensionPath: this.extensionPath,
       rPath: this.options.rPath,
+      languageServer: this.resolveConsoleLanguageServer(consoleConfig),
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       requestWorkspaceData: async () =>
         await this.sessionWatcher?.requestWorkspaceData(),
@@ -359,6 +362,14 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.tabSize = config.get<number>("tabSize", 2);
     this.pipeOperator =
       config.get<string>("pipeOperator", "|>") === "%>%" ? "%>%" : "|>";
+  }
+
+  private resolveConsoleLanguageServer(
+    config = vscode.workspace.getConfiguration("r.console")
+  ): "vscode-r" | "console" {
+    return config.get<string>("languageServer", "vscode-r") === "console"
+      ? "console"
+      : "vscode-r";
   }
 
   private runtimeHost(): RuntimeHost {
@@ -1649,15 +1660,20 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleAutocomplete(): Promise<void> {
-    await this.lang.handleAutocomplete({
-      input: this.getInputSnapshot(),
-      getCurrentInput: () => this.getInputSnapshot(),
-      getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
-      refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
-      applyCompletion: (selection) => {
-        this.applyCompletion(selection);
-      },
-    });
+    this.syntax.pauseSemanticRequests();
+    try {
+      await this.lang.handleAutocomplete({
+        input: this.getInputSnapshot(),
+        getCurrentInput: () => this.getInputSnapshot(),
+        getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
+        refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+        applyCompletion: (selection) => {
+          this.applyCompletion(selection);
+        },
+      });
+    } finally {
+      this.syntax.resumeSemanticRequests();
+    }
   }
 
   private applyCompletion(selection: CompletionPickItem): void {

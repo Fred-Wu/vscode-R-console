@@ -15,12 +15,14 @@ import {
   LanguageClient,
   LanguageClientOptions,
   RevealOutputChannelOn,
-  SignatureHelpRequest,
   StreamInfo,
 } from "vscode-languageclient/node";
 import { SemanticTokensRequest } from "vscode-languageserver-protocol";
 import type { CompletionProvider } from "./completion";
+import type { DocumentSemanticTokensResult } from "./semanticTokens";
 import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
+
+export type { DocumentSemanticTokensResult } from "./semanticTokens";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -37,14 +39,6 @@ type ConsoleLspClientOptions = {
 export type ConsoleLspSessionState = {
   attachedPackages: string[];
   loadedNamespaces: string[];
-};
-
-export type DocumentSemanticTokensResult = {
-  legend: {
-    tokenTypes: string[];
-    tokenModifiers: string[];
-  };
-  data: number[];
 };
 
 class SilentOutputChannel implements vscode.OutputChannel {
@@ -257,40 +251,6 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.syncedDocuments.delete(key);
-  }
-
-  async provideSignatureHelp(
-    doc: vscode.TextDocument,
-    position: vscode.Position,
-    triggerCharacter?: string
-  ): Promise<vscode.SignatureHelp | undefined> {
-    const client = await this.ensureClient();
-    if (!client) {
-      return undefined;
-    }
-    this.syncDocument(client, doc);
-    await this.applySessionState(client);
-    const context: vscode.SignatureHelpContext = triggerCharacter
-      ? {
-          triggerKind: vscode.SignatureHelpTriggerKind.TriggerCharacter,
-          triggerCharacter,
-          isRetrigger: false,
-          activeSignatureHelp: undefined,
-        }
-      : {
-          triggerKind: vscode.SignatureHelpTriggerKind.Invoke,
-          triggerCharacter: undefined,
-          isRetrigger: false,
-          activeSignatureHelp: undefined,
-        };
-
-    try {
-      const params = client.code2ProtocolConverter.asSignatureHelpParams(doc, position, context);
-      const result = await client.sendRequest(SignatureHelpRequest.type, params);
-      return await client.protocol2CodeConverter.asSignatureHelp(result);
-    } catch {
-      return undefined;
-    }
   }
 
   async provideDocumentSemanticTokens(
