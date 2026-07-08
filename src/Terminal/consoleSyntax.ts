@@ -1,25 +1,16 @@
 import { ANSI } from "./ansi";
-import type { DocumentSemanticTokensResult } from "../Language/semanticTokens";
 import { tokenizeForHighlighting, type HighlightTokenKind } from "../Language/parser";
 import type { RendererLineHighlighter } from "./renderer";
 import { SyntaxTheme } from "./syntaxTheme";
-
-type SemanticProvider = (content: string) => Promise<DocumentSemanticTokensResult | undefined>;
 
 export class ConsoleSyntax implements RendererLineHighlighter {
   private readonly theme = new SyntaxTheme();
   private sourceLines: string[] = [];
   private sourceKey = "";
   private styles: string[][] = [];
-  private sourceVersion = 0;
-  private appliedSemanticVersion = 0;
-  private wantedSemanticVersion = 0;
-  private semanticRequestInFlight = false;
-  private semanticRequestsPaused = false;
 
   constructor(
-    private readonly onDidChange: () => void,
-    private readonly requestSemantics?: SemanticProvider
+    private readonly onDidChange: () => void
   ) {}
 
   setSource(lines: string[]): void {
@@ -34,32 +25,12 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     this.sourceLines = nextLines;
     this.sourceKey = nextKey;
     this.styles = this.buildPendingStyles(previousLines, previousStyles, nextLines);
-    this.appliedSemanticVersion = 0;
-
-    const sourceVersion = ++this.sourceVersion;
-    if (!nextKey.trim() || !this.requestSemantics) {
-      this.wantedSemanticVersion = 0;
-      return;
-    }
-
-    this.wantedSemanticVersion = sourceVersion;
-    void this.runLatestSemanticRequest();
   }
 
   invalidateTheme(): void {
     this.theme.invalidate();
     this.styles = this.buildBaseStyles(this.sourceLines);
-    this.appliedSemanticVersion = 0;
-    const sourceVersion = ++this.sourceVersion;
-
-    if (!this.sourceKey.trim() || !this.requestSemantics) {
-      this.wantedSemanticVersion = 0;
-      this.onDidChange();
-      return;
-    }
-
-    this.wantedSemanticVersion = sourceVersion;
-    void this.runLatestSemanticRequest();
+    this.onDidChange();
   }
 
   dispose(): void {
@@ -67,30 +38,6 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     this.sourceLines = [];
     this.sourceKey = "";
     this.styles = [];
-    this.appliedSemanticVersion = 0;
-    this.sourceVersion += 1;
-    this.wantedSemanticVersion = 0;
-    this.semanticRequestInFlight = false;
-    this.semanticRequestsPaused = false;
-  }
-
-  pauseSemanticRequests(): void {
-    this.semanticRequestsPaused = true;
-    this.wantedSemanticVersion = 0;
-  }
-
-  resumeSemanticRequests(): void {
-    if (!this.semanticRequestsPaused) {
-      return;
-    }
-
-    this.semanticRequestsPaused = false;
-    if (!this.sourceKey.trim() || !this.requestSemantics) {
-      return;
-    }
-
-    this.wantedSemanticVersion = ++this.sourceVersion;
-    void this.runLatestSemanticRequest();
   }
 
   highlightLines(lines: string[], sourceLineMap?: Array<number | undefined>): string[] {
@@ -130,99 +77,19 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   }
 
   prepareSnapshot(input: string | string[]): Promise<string[]> {
-    const lines = Array.isArray(input) ? [...input] : input.split("\n");
-    const sourceKey = lines.join("\n");
-
-    if (!sourceKey.trim()) {
-      return Promise.resolve(lines);
-    }
-
-    if (sourceKey === this.sourceKey && this.appliedSemanticVersion === this.sourceVersion) {
-      return Promise.resolve(
-        lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? []))
-      );
-    }
-
-    return this.buildSnapshot(lines, sourceKey);
+    return Promise.resolve(this.snapshotNow(input));
   }
 
   snapshotNow(input: string | string[]): string[] {
     const lines = Array.isArray(input) ? [...input] : input.split("\n");
     const sourceKey = lines.join("\n");
 
-    if (sourceKey === this.sourceKey && this.appliedSemanticVersion === this.sourceVersion) {
+    if (sourceKey === this.sourceKey) {
       return lines.map((line, index) => this.applyStyles(line, this.styles[index] ?? []));
     }
 
     const styles = this.buildBaseStyles(lines);
     return lines.map((line, index) => this.applyStyles(line, styles[index] ?? []));
-  }
-
-  private async buildSnapshot(lines: string[], sourceKey: string): Promise<string[]> {
-    const styles = this.buildBaseStyles(lines);
-    const semanticTokens = this.requestSemantics && !this.semanticRequestsPaused
-      ? await this.requestSemantics(sourceKey)
-      : undefined;
-    if (semanticTokens) {
-      this.applySemanticStyles(styles, semanticTokens);
-    }
-    return lines.map((line, index) => this.applyStyles(line, styles[index] ?? []));
-  }
-
-  private async runLatestSemanticRequest(): Promise<void> {
-    if (
-      this.semanticRequestsPaused ||
-      this.semanticRequestInFlight ||
-      !this.requestSemantics
-    ) {
-      return;
-    }
-
-    this.semanticRequestInFlight = true;
-    try {
-      while (
-        this.wantedSemanticVersion > 0 &&
-        this.wantedSemanticVersion > this.appliedSemanticVersion &&
-        !this.semanticRequestsPaused
-      ) {
-        const requestedVersion = this.wantedSemanticVersion;
-        const requestedContent = this.sourceKey;
-        let semanticTokens: DocumentSemanticTokensResult | undefined;
-        try {
-          semanticTokens = await this.requestSemantics(requestedContent);
-        } catch {
-          semanticTokens = undefined;
-        }
-
-        if (this.semanticRequestsPaused) {
-          continue;
-        }
-
-        if (requestedVersion !== this.sourceVersion) {
-          continue;
-        }
-
-        if (!semanticTokens) {
-          this.appliedSemanticVersion = requestedVersion;
-          continue;
-        }
-
-        const styles = this.buildBaseStyles(this.sourceLines);
-        this.applySemanticStyles(styles, semanticTokens);
-        this.styles = styles;
-        this.appliedSemanticVersion = requestedVersion;
-        this.onDidChange();
-      }
-    } finally {
-      this.semanticRequestInFlight = false;
-      if (
-        !this.semanticRequestsPaused &&
-        this.wantedSemanticVersion > 0 &&
-        this.wantedSemanticVersion > this.appliedSemanticVersion
-      ) {
-        void this.runLatestSemanticRequest();
-      }
-    }
   }
 
   private buildBaseStyles(lines: string[]): string[][] {
@@ -279,7 +146,16 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     const suffixLength = commonSuffixLength(previousLine, nextLine, prefixLength);
     const changedStart = prefixLength;
     const changedEnd = nextLine.length - suffixLength;
-    const rebuiltStart = expandWordStart(nextLine, changedStart);
+    const beforeChange = nextLine.slice(0, changedStart);
+    const namespaceOperatorLength = beforeChange.endsWith(":::")
+      ? 3
+      : beforeChange.endsWith("::")
+        ? 2
+        : 0;
+    const rebuiltStart = expandWordStart(
+      nextLine,
+      changedStart - namespaceOperatorLength
+    );
     const rebuiltEnd = expandWordEnd(nextLine, changedEnd);
 
     for (let index = 0; index < prefixLength; index += 1) {
@@ -352,47 +228,6 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     for (let index = prefixLength; index < nextChangedEnd; index += 1) {
       row[index] = candidate;
     }
-  }
-
-  private applySemanticStyles(
-    styles: string[][],
-    semanticTokens: DocumentSemanticTokensResult
-  ): void {
-    let line = 0;
-    let char = 0;
-
-    for (let index = 0; index + 4 < semanticTokens.data.length; index += 5) {
-      const deltaLine = semanticTokens.data[index];
-      const deltaStart = semanticTokens.data[index + 1];
-      const length = semanticTokens.data[index + 2];
-      const tokenTypeIndex = semanticTokens.data[index + 3];
-      const tokenModifierBits = semanticTokens.data[index + 4];
-      const tokenType = semanticTokens.legend.tokenTypes[tokenTypeIndex];
-      const tokenModifiers = decodeTokenModifiers(
-        tokenModifierBits,
-        semanticTokens.legend.tokenModifiers
-      );
-
-      line += deltaLine;
-      char = deltaLine === 0 ? char + deltaStart : deltaStart;
-
-      if (!tokenType || line < 0 || line >= styles.length || length <= 0) {
-        continue;
-      }
-
-      const ansi = this.theme.resolveSemanticTokenToAnsi(tokenType, tokenModifiers);
-      if (!ansi) {
-        continue;
-      }
-
-      const row = styles[line];
-      const end = Math.min(row.length, char + length);
-      for (let cursor = Math.max(0, char); cursor < end; cursor += 1) {
-        row[cursor] = ansi;
-      }
-    }
-
-    this.applyBracketPairStyles(this.sourceLines, styles);
   }
 
   private applyLiveTokenStyles(lines: readonly string[], styles: string[][]): void {
@@ -528,25 +363,27 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   private resolveLiveTokenAnsi(kind: HighlightTokenKind): string {
     switch (kind) {
       case "comment":
-        return this.theme.resolveSemanticTokenToAnsi("comment", []);
+        return this.theme.resolveSemanticTokenToAnsi("comment");
       case "string":
-        return this.theme.resolveSemanticTokenToAnsi("string", []);
+        return this.theme.resolveSemanticTokenToAnsi("string");
       case "number":
-        return this.theme.resolveSemanticTokenToAnsi("number", []);
+        return this.theme.resolveSemanticTokenToAnsi("number");
+      case "namespace":
+        return this.theme.resolveSemanticTokenToAnsi("namespace");
       case "function":
         return (
-          this.theme.resolveSemanticTokenToAnsi("function", []) ||
-          this.theme.resolveSemanticTokenToAnsi("method", []) ||
-          this.theme.resolveSemanticTokenToAnsi("variable", []) ||
+          this.theme.resolveSemanticTokenToAnsi("function") ||
+          this.theme.resolveSemanticTokenToAnsi("method") ||
+          this.theme.resolveSemanticTokenToAnsi("variable") ||
           this.theme.resolveDefaultForegroundAnsi()
         );
       case "keyword":
-        return this.theme.resolveSemanticTokenToAnsi("keyword", []);
+        return this.theme.resolveSemanticTokenToAnsi("keyword");
       case "operator":
-        return this.theme.resolveSemanticTokenToAnsi("operator", []);
+        return this.theme.resolveSemanticTokenToAnsi("operator");
       case "identifier":
         return (
-          this.theme.resolveSemanticTokenToAnsi("variable", []) ||
+          this.theme.resolveSemanticTokenToAnsi("variable") ||
           this.theme.resolveDefaultForegroundAnsi()
         );
     }
@@ -578,16 +415,6 @@ export class ConsoleSyntax implements RendererLineHighlighter {
       column = 0;
     }
   }
-}
-
-function decodeTokenModifiers(bits: number, legend: readonly string[]): string[] {
-  const modifiers: string[] = [];
-  for (let index = 0; index < legend.length; index += 1) {
-    if ((bits & (1 << index)) !== 0) {
-      modifiers.push(legend[index]);
-    }
-  }
-  return modifiers;
 }
 
 const OPEN_TO_CLOSE: Record<string, string> = {

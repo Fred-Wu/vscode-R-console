@@ -17,12 +17,8 @@ import {
   RevealOutputChannelOn,
   StreamInfo,
 } from "vscode-languageclient/node";
-import { SemanticTokensRequest } from "vscode-languageserver-protocol";
 import type { CompletionProvider } from "./completion";
-import type { DocumentSemanticTokensResult } from "./semanticTokens";
 import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
-
-export type { DocumentSemanticTokensResult } from "./semanticTokens";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -76,14 +72,6 @@ class ConsoleLanguageClient extends LanguageClient {
   error(message: string, data?: unknown, _showNotification: boolean | "force" = true): void {
     // Console-LSP failures are surfaced in the output channel, not as global popups.
     super.error(message, data, false);
-  }
-
-  async sendRawRequest(method: string, params: unknown): Promise<unknown> {
-    const connection = (this as unknown as { activeConnection?: () => { sendRequest: (m: string, p: unknown) => Promise<unknown> } | undefined }).activeConnection?.();
-    if (!connection) {
-      throw new Error("Console language client connection is not active.");
-    }
-    return await connection.sendRequest(method, params);
   }
 }
 
@@ -251,41 +239,6 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.syncedDocuments.delete(key);
-  }
-
-  async provideDocumentSemanticTokens(
-    doc: vscode.TextDocument
-  ): Promise<DocumentSemanticTokensResult | undefined> {
-    const client = await this.ensureClient();
-    if (!client) {
-      return undefined;
-    }
-    this.syncDocument(client, doc);
-    await this.applySessionState(client);
-
-    const provider = client.initializeResult?.capabilities.semanticTokensProvider;
-    const legend = provider?.legend;
-    if (!legend) {
-      return undefined;
-    }
-
-    try {
-      const result = (await client.sendRawRequest(SemanticTokensRequest.type.method, {
-        textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(doc),
-      })) as { data?: ArrayLike<number> } | undefined;
-      if (!result?.data) {
-        return undefined;
-      }
-      return {
-        legend: {
-          tokenTypes: [...legend.tokenTypes],
-          tokenModifiers: [...legend.tokenModifiers],
-        },
-        data: Array.from(result.data),
-      };
-    } catch (error) {
-      return undefined;
-    }
   }
 
   async provideMemberCompletionItems(

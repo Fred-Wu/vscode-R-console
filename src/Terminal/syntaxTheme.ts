@@ -39,50 +39,17 @@ type LoadedTheme = {
   defaultForegroundAnsi: string;
 };
 
-const BUILTIN_SEMANTIC_SCOPE_RULES = new Map<string, readonly (readonly string[])[]>([
+const SEMANTIC_SCOPE_RULES = new Map<string, readonly (readonly string[])[]>([
   ["comment", [["comment"]]],
   ["string", [["string"]]],
   ["keyword", [["keyword.control"]]],
   ["number", [["constant.numeric"]]],
-  ["regexp", [["constant.regexp"]]],
   ["operator", [["keyword.operator"]]],
   ["namespace", [["entity.name.namespace"]]],
-  ["type", [["entity.name.type"], ["support.type"]]],
-  ["struct", [["entity.name.type.struct"]]],
-  ["class", [["entity.name.type.class"], ["support.class"]]],
-  ["interface", [["entity.name.type.interface"]]],
-  ["enum", [["entity.name.type.enum"]]],
-  ["typeParameter", [["entity.name.type.parameter"]]],
   ["function", [["entity.name.function"], ["support.function"]]],
   ["method", [["entity.name.function.member"], ["support.function"]]],
-  ["member", [["entity.name.function.member"], ["support.function"]]],
-  ["macro", [["entity.name.function.preprocessor"]]],
   ["variable", [["variable.other.readwrite"], ["entity.name.variable"]]],
-  ["parameter", [["variable.parameter"]]],
-  ["property", [["variable.other.property"]]],
-  ["enumMember", [["variable.other.enummember"]]],
-  ["event", [["variable.other.event"]]],
-  ["decorator", [["entity.name.decorator"], ["entity.name.function"]]],
-  ["variable.readonly", [["variable.other.constant"]]],
-  ["property.readonly", [["variable.other.constant.property"]]],
-  ["type.defaultLibrary", [["support.type"]]],
-  ["class.defaultLibrary", [["support.class"]]],
-  ["interface.defaultLibrary", [["support.class"]]],
-  ["variable.defaultLibrary", [["support.variable"], ["support.other.variable"]]],
-  ["variable.defaultLibrary.readonly", [["support.constant"]]],
-  ["property.defaultLibrary", [["support.variable.property"]]],
-  ["property.defaultLibrary.readonly", [["support.constant.property"]]],
-  ["function.defaultLibrary", [["support.function"]]],
-  ["method.defaultLibrary", [["support.function"]]],
-  ["member.defaultLibrary", [["support.function"]]],
 ]);
-
-const DEFAULT_BRACKET_COLORS = {
-  dark: ["#FFD700", "#DA70D6", "#179FFF"],
-  light: ["#0431FA", "#319331", "#7B3814"],
-  highContrastDark: ["#FFD700", "#DA70D6", "#87CEFA"],
-  highContrastLight: ["#0431FA", "#319331", "#7B3814"],
-} as const;
 
 const extensionNlsCache = new Map<string, Record<string, string>>();
 
@@ -178,15 +145,14 @@ export class SyntaxTheme {
     return ansi;
   }
 
-  resolveSemanticTokenToAnsi(tokenType: string, modifiers: readonly string[]): string {
-    const key = `${tokenType}|${modifiers.slice().sort().join(",")}`;
-    const cached = this.semanticCache.get(key);
+  resolveSemanticTokenToAnsi(tokenType: string): string {
+    const cached = this.semanticCache.get(tokenType);
     if (cached !== undefined) {
       return cached;
     }
 
     const theme = this.ensureLoaded();
-    const semanticRule = selectSemanticRule(theme.semanticRules, tokenType, modifiers);
+    const semanticRule = theme.semanticRules.get(tokenType);
     if (semanticRule) {
       const foreground = normalizeHex(semanticRule.foreground);
       const fontStyle = parseFontStyle(semanticRule.fontStyle ?? "");
@@ -198,18 +164,23 @@ export class SyntaxTheme {
       ].join("");
 
       if (ansi) {
-        this.semanticCache.set(key, ansi);
+        this.semanticCache.set(tokenType, ansi);
         return ansi;
       }
     }
 
-    const ansi = resolveSemanticScopeAnsi(
-      theme.semanticScopeRules,
-      tokenType,
-      modifiers,
-      (scopes) => this.resolveScopedRuleToAnsi(scopes)
-    );
-    this.semanticCache.set(key, ansi);
+    let ansi = "";
+    const scopeChains = theme.semanticScopeRules.get(tokenType);
+    if (scopeChains) {
+      for (const scopes of scopeChains) {
+        ansi = this.resolveScopedRuleToAnsi(scopes);
+        if (ansi) {
+          break;
+        }
+      }
+    }
+
+    this.semanticCache.set(tokenType, ansi);
     return ansi;
   }
 
@@ -259,13 +230,7 @@ function loadTheme(themeName: string): {
 
 function buildBracketColors(themeColors: Record<string, string>): string[] {
   return [0, 1, 2, 3, 4, 5]
-    .map((index) => {
-      const configured = normalizeHex(themeColors[`editorBracketHighlight.foreground${index + 1}`]);
-      if (configured) {
-        return configured;
-      }
-      return defaultBracketColor(index);
-    })
+    .map((index) => normalizeHex(themeColors[`editorBracketHighlight.foreground${index + 1}`]))
     .filter((color): color is string => color !== undefined);
 }
 
@@ -289,27 +254,8 @@ function resolveDefaultForegroundAnsi(
   return foreground ? ansiFromHex(foreground) : "";
 }
 
-function defaultBracketColor(index: number): string | undefined {
-  const defaults = getDefaultBracketPalette();
-  return defaults[index];
-}
-
-function getDefaultBracketPalette(): readonly string[] {
-  switch (vscode.window.activeColorTheme.kind) {
-    case vscode.ColorThemeKind.Light:
-      return DEFAULT_BRACKET_COLORS.light;
-    case vscode.ColorThemeKind.HighContrast:
-      return DEFAULT_BRACKET_COLORS.highContrastDark;
-    case vscode.ColorThemeKind.HighContrastLight:
-      return DEFAULT_BRACKET_COLORS.highContrastLight;
-    case vscode.ColorThemeKind.Dark:
-    default:
-      return DEFAULT_BRACKET_COLORS.dark;
-  }
-}
-
 function loadSemanticScopeRules(languageId: string): Map<string, readonly (readonly string[])[]> {
-  const rules = new Map(BUILTIN_SEMANTIC_SCOPE_RULES);
+  const rules = new Map(SEMANTIC_SCOPE_RULES);
 
   for (const extension of vscode.extensions.all) {
     const contributions = extension.packageJSON?.contributes?.semanticTokenScopes;
@@ -326,6 +272,9 @@ function loadSemanticScopeRules(languageId: string): Map<string, readonly (reado
       }
 
       for (const [selector, scopes] of Object.entries(contribution.scopes)) {
+        if (!rules.has(selector)) {
+          continue;
+        }
         const normalizedScopes = normalizeSemanticScopes(scopes);
         if (normalizedScopes.length > 0) {
           rules.set(selector, normalizedScopes);
@@ -347,29 +296,6 @@ function normalizeSemanticScopes(scopes: string | string[]): readonly (readonly 
         .filter((segment) => segment.length > 0)
     )
     .filter((scopeChain) => scopeChain.length > 0);
-}
-
-function resolveSemanticScopeAnsi(
-  semanticScopeRules: Map<string, readonly (readonly string[])[]>,
-  tokenType: string,
-  modifiers: readonly string[],
-  resolveScopes: (scopes: readonly string[]) => string
-): string {
-  for (const selector of buildSemanticSelectorOrder(tokenType, [...modifiers].sort())) {
-    const scopeChains = semanticScopeRules.get(selector);
-    if (!scopeChains) {
-      continue;
-    }
-
-    for (const scopes of scopeChains) {
-      const ansi = resolveScopes(scopes);
-      if (ansi) {
-        return ansi;
-      }
-    }
-  }
-
-  return "";
 }
 
 function resolveActiveThemeName(): string {
@@ -541,7 +467,9 @@ function readTheme(
 
   if (document.semanticTokenColors) {
     for (const [selector, value] of Object.entries(document.semanticTokenColors)) {
-      semanticRules.set(selector, normalizeSemanticRule(value));
+      if (SEMANTIC_SCOPE_RULES.has(selector)) {
+        semanticRules.set(selector, normalizeSemanticRule(value));
+      }
     }
   }
 
@@ -561,60 +489,6 @@ function normalizeSemanticRule(value: string | SemanticTokenRule): SemanticToken
     return { foreground: value };
   }
   return value;
-}
-
-function selectSemanticRule(
-  semanticRules: Map<string, SemanticTokenRule>,
-  tokenType: string,
-  modifiers: readonly string[]
-): SemanticTokenRule | undefined {
-  const orderedModifiers = [...modifiers].sort();
-  const exactKeys = buildSemanticSelectorOrder(tokenType, orderedModifiers);
-  for (const key of exactKeys) {
-    const rule = semanticRules.get(key);
-    if (rule) {
-      return rule;
-    }
-  }
-
-  for (const modifier of orderedModifiers) {
-    const wildcardRule = semanticRules.get(`*.${modifier}`);
-    if (wildcardRule) {
-      return wildcardRule;
-    }
-  }
-
-  return undefined;
-}
-
-function buildSemanticSelectorOrder(tokenType: string, modifiers: string[]): string[] {
-  const selectors = new Set<string>();
-  for (let size = modifiers.length; size >= 1; size -= 1) {
-    appendModifierCombinations(selectors, tokenType, modifiers, size, 0, []);
-  }
-  selectors.add(tokenType);
-
-  return [...selectors];
-}
-
-function appendModifierCombinations(
-  selectors: Set<string>,
-  tokenType: string,
-  modifiers: string[],
-  size: number,
-  start: number,
-  current: string[]
-): void {
-  if (current.length === size) {
-    selectors.add(`${tokenType}.${current.join(".")}`);
-    return;
-  }
-
-  for (let index = start; index <= modifiers.length - (size - current.length); index += 1) {
-    current.push(modifiers[index]);
-    appendModifierCombinations(selectors, tokenType, modifiers, size, index + 1, current);
-    current.pop();
-  }
 }
 
 function readThemeDocument(themePath: string): ThemeDocument | undefined {

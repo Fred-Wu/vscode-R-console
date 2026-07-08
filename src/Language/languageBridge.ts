@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import type { CompletionProvider } from "./completion";
-import type { DocumentSemanticTokensResult } from "./semanticTokens";
 import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
 
 type LanguageBridgeOptions = {
@@ -34,35 +33,6 @@ export class LanguageBridge implements CompletionProvider {
     operator: "$" | "@"
   ): Promise<SessionMemberCompletionItem[] | undefined> {
     return await this.options.requestMemberCompletions?.(expression, operator);
-  }
-
-  async provideDocumentSemanticTokens(
-    doc: vscode.TextDocument
-  ): Promise<DocumentSemanticTokensResult | undefined> {
-    await this.activateVscodeR();
-    const legend = await vscode.commands.executeCommand<vscode.SemanticTokensLegend | undefined>(
-      "vscode.provideDocumentSemanticTokensLegend",
-      doc.uri
-    );
-    if (!legend) {
-      return undefined;
-    }
-
-    const tokens = await vscode.commands.executeCommand<vscode.SemanticTokens | undefined>(
-      "vscode.provideDocumentSemanticTokens",
-      doc.uri
-    );
-    if (!tokens) {
-      return undefined;
-    }
-
-    return {
-      legend: {
-        tokenTypes: [...legend.tokenTypes],
-        tokenModifiers: [...legend.tokenModifiers],
-      },
-      data: Array.from(tokens.data),
-    };
   }
 
   private async activateVscodeR(): Promise<void> {

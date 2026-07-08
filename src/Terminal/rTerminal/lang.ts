@@ -9,7 +9,6 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
-import type { DocumentSemanticTokensResult } from "../../Language/semanticTokens";
 import { LanguageBridge } from "../../Language/languageBridge";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type {
@@ -61,11 +60,9 @@ type CompletionDocumentContext = {
 export class RTermLang {
   private completionRequestId = 0;
   private completionDocument: VirtualRDocument | undefined;
-  private semanticDocument: VirtualRDocument | undefined;
   private readonly completionDocumentId = `${process.pid}-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}`;
-  private semanticRequestCounter = 0;
   private consoleLsp: ConsoleLspClient | undefined;
   private readonly languageBridge: LanguageBridge;
   private sessionState: ConsoleSessionState | undefined;
@@ -296,8 +293,6 @@ export class RTermLang {
     }
     this.completionDocument?.dispose();
     this.completionDocument = undefined;
-    this.semanticDocument?.dispose();
-    this.semanticDocument = undefined;
   }
 
   stopConsoleLsp(): void {
@@ -311,36 +306,6 @@ export class RTermLang {
 
   clearSessionState(): void {
     this.sessionState = undefined;
-  }
-
-  async requestSemanticTokens(
-    content: string
-  ): Promise<DocumentSemanticTokensResult | undefined> {
-    if (this.usesConsoleLsp()) {
-      await this.ensureConsoleLspStarted();
-      const lsp = this.consoleLsp;
-      if (!lsp) {
-        return undefined;
-      }
-
-      const doc = this.createSemanticSnapshotDocument(content);
-      if (!doc) {
-        return undefined;
-      }
-
-      try {
-        return await lsp.provideDocumentSemanticTokens(doc);
-      } finally {
-        lsp.closeDocument(doc);
-      }
-    }
-
-    const doc = await this.getOrOpenVscodeRSemanticDocument(content);
-    if (!doc) {
-      return undefined;
-    }
-
-    return await this.languageBridge.provideDocumentSemanticTokens(doc);
   }
 
   async refreshCompletionContextDocument(inputText: string): Promise<void> {
@@ -451,42 +416,6 @@ export class RTermLang {
       .filter((value) => value.startsWith("package:"))
       .map((value) => value.slice(8))
       .filter((value) => value.length > 0);
-  }
-
-  private createSemanticSnapshotDocument(content: string): vscode.TextDocument | undefined {
-    try {
-      this.semanticRequestCounter += 1;
-      return new VirtualRDocument(
-        `${this.completionDocumentId}-semantic-${this.semanticRequestCounter}`,
-        content,
-        `semantic-${this.semanticRequestCounter}.R`,
-        this.options.cwd,
-        false
-      ) as unknown as vscode.TextDocument;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async getOrOpenVscodeRSemanticDocument(
-    content: string
-  ): Promise<vscode.TextDocument | undefined> {
-    try {
-      if (!this.semanticDocument) {
-        this.semanticDocument = new VirtualRDocument(
-          `${this.completionDocumentId}-semantic`,
-          content,
-          "semantic.R",
-          this.options.cwd,
-          false
-        );
-      } else {
-        this.semanticDocument.update(content);
-      }
-      return await this.semanticDocument.openTextDocument();
-    } catch {
-      return undefined;
-    }
   }
 
   private usesConsoleLsp(): boolean {

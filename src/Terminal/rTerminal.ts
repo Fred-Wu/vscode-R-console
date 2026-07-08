@@ -258,8 +258,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         if (this.promptVisible) {
           this.renderInput();
         }
-      },
-      async (content) => await this.lang.requestSemanticTokens(content)
+      }
     );
     this.renderer = new Renderer((text) => this.writeEmitter.fire(text), this.syntax);
 
@@ -1660,20 +1659,15 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleAutocomplete(): Promise<void> {
-    this.syntax.pauseSemanticRequests();
-    try {
-      await this.lang.handleAutocomplete({
-        input: this.getInputSnapshot(),
-        getCurrentInput: () => this.getInputSnapshot(),
-        getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
-        refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
-        applyCompletion: (selection) => {
-          this.applyCompletion(selection);
-        },
-      });
-    } finally {
-      this.syntax.resumeSemanticRequests();
-    }
+    await this.lang.handleAutocomplete({
+      input: this.getInputSnapshot(),
+      getCurrentInput: () => this.getInputSnapshot(),
+      getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
+      refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+      applyCompletion: (selection) => {
+        this.applyCompletion(selection);
+      },
+    });
   }
 
   private applyCompletion(selection: CompletionPickItem): void {
