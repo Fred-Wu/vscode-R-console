@@ -2,14 +2,18 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.3.2] - 2026-07-08
+## [0.3.2] - Unreleased
 
 ### Added
 
 - Added vscode-R language-server routing for console completions through hidden `.rconsole` documents. This is to reduce extra R language-server processes and memory footprint when the shared route is selected.
 - Added `r.console.languageServer` to choose between vscode-R's language server and the console-owned language server.
-  - When `vscode-R` is selected, console completions use an exsiting language server started by vscode-R, or start one through vscode-R, so language-erver selection follows vscode-R's LSP behaviour, including `` `r.lsp.multiServer`.``
-  - When `console`is selected, the console starts its own separate language-server process.
+  - When `vscode-r` is selected, console completions use an existing language server started by vscode-R, or start one through vscode-R, so language-server selection follows vscode-R's LSP behavior, including `r.lsp.multiServer`.
+  - When `console` is selected, the console starts its own separate language-server process.
+
+### Changed
+
+- Runtime completions now appear before waiting for LSP completion results in both language-server routes.
 
 ## [0.3.1] - 2026-06-29
 
