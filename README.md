@@ -7,7 +7,7 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Custom R console hosted in the VS Code terminal area.
 - Persistent R console sessions that can be attached, detached, or closed from VS Code.
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion.
-- Syntax highlighting that follows the active VS Code color theme.
+- Syntax highlighting that follows the active VS Code color theme. ~~Syntax highlighting with semantic-token styling when `languageserver` is available.~~
 - Multiline editing with local history navigation, reverse search, and long-input rendering.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
    ```
 
    This setting is enabled by default unless explicitly set to `false`.
-6. Optional: install the R package `languageserver` for language-server completion.
+6. Optional: install the R package `languageserver` for language-server completion. ~~Optional: install the R package `languageserver` for completion, signature help, and semantic highlighting.~~
 
 `R Console` launches from `r.rpath.*`, `R_HOME`, or `PATH`. It does not launch from `r.rterm.windows`, `r.rterm.mac`, or `r.rterm.linux`.
 
@@ -93,12 +93,12 @@ R Console also contributes its own settings:
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
 | `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
-| `r.console.languageServer` | `console` | Language-server route for console completions. Restart or reattach R Console required to switch route. `console` starts a console-owned language-server process, while `vscode-r` uses vscode-R's shared language server and respects `r.lsp.multiServer` |
+| `r.console.languageServer` | `console` | Language-server route for console completions. ~~Language-server route for console completions and semantic highlighting.~~ Restart or reattach R Console required to switch route. `console` starts a console-owned language-server process, while `vscode-r` uses vscode-R's shared language server and respects `r.lsp.multiServer` |
 
 ## Dependency Model
 
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary.
-- R's `languageserver` package is optional at runtime but required for language-server completion.
+- R's `languageserver` package is optional at runtime but required for language-server completion. ~~R's `languageserver` package is optional at runtime but required for console semantic tokens, completion, and signature help.~~
 - The bundled R backend is required at runtime. If the bundled backend for the current target is missing, the console does not fall back to a separate backend.
 
 ## Acknowledgements
@@ -110,7 +110,7 @@ R Console is built on the broader VS Code, Rust, and R ecosystems, and on the wo
 - [Ark](https://github.com/posit-dev/ark) - The native R frontend model, nested-input handling, ReadConsole recovery concepts, and generic R event-loop integration were important references for the backend design.
 - [rchitect](https://github.com/randy3k/rchitect) - Rchitect was a reference for embedding R from a non-R host process, including R home/shared-library discovery and callback/FFI boundary concepts.
 - [radian](https://github.com/randy3k/radian) - The terminal-first interaction model and several console UX ideas, including multiline editing, history search/navigation, bracketed paste, and prompt-centric workflows, were inspired by radian.
-- [languageserver](https://github.com/REditorSupport/languageserver) - Language-server completion is built around R's language server.
+- [languageserver](https://github.com/REditorSupport/languageserver) - Language-server completion is built around R's language server. ~~Console completion, signature help, and semantic-token support are built around R's language server.~~
 
 ## Development Note
 
