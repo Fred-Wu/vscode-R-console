@@ -66,6 +66,7 @@ export class RTermLang {
   private consoleLsp: ConsoleLspClient | undefined;
   private readonly languageBridge: LanguageBridge;
   private sessionState: ConsoleSessionState | undefined;
+  private silentCompletionRequest: Promise<void> | undefined;
 
   constructor(private readonly options: LangOptions) {
     this.languageBridge = new LanguageBridge({
@@ -77,7 +78,9 @@ export class RTermLang {
   async start(): Promise<void> {
     if (this.usesConsoleLsp()) {
       await this.ensureConsoleLspStarted();
+      return;
     }
+    await this.getOrOpenCompletionDocument("");
   }
 
   async handleAutocomplete({
@@ -125,19 +128,22 @@ export class RTermLang {
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
       let completionProvider: CompletionProvider | undefined;
       const fullEntriesPromise = (async () => {
-        completionProvider = await this.getCompletionProvider();
+        const needsDocument = needsLsp || this.usesConsoleLsp();
+        const completionProviderRequest = this.getCompletionProvider();
+        const docContextRequest = needsDocument
+          ? this.getOrOpenCompletionDocument(latestInput.text, sessionData)
+          : Promise.resolve(undefined);
+
+        completionProvider = await completionProviderRequest;
         if (!this.isCurrentCompletionRequest(requestId) || !completionProvider) {
           return undefined;
         }
 
-        const docContext =
-          needsLsp || this.usesConsoleLsp()
-            ? await this.getOrOpenCompletionDocument(latestInput.text, sessionData)
-            : undefined;
+        const docContext = await docContextRequest;
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
-        if ((needsLsp || this.usesConsoleLsp()) && !docContext) {
+        if (needsDocument && !docContext) {
           return undefined;
         }
 
@@ -317,8 +323,21 @@ export class RTermLang {
     }
     try {
       const docContext = await this.getOrOpenCompletionDocument(inputText);
-      if (this.usesConsoleLsp() && docContext) {
+      if (docContext) {
         await this.consoleLsp?.prepareDocument(docContext.document);
+      }
+    } catch {
+    }
+  }
+
+  async refreshSessionCompletionDocument(): Promise<void> {
+    if (this.usesConsoleLsp()) {
+      return;
+    }
+    try {
+      const docContext = await this.getOrOpenCompletionDocument("");
+      if (docContext) {
+        this.requestSilentCompletion(docContext.document);
       }
     } catch {
     }
@@ -433,6 +452,22 @@ export class RTermLang {
 
     await this.ensureConsoleLspStarted();
     return this.consoleLsp;
+  }
+
+  private requestSilentCompletion(document: vscode.TextDocument): void {
+    if (this.silentCompletionRequest) {
+      return;
+    }
+
+    this.silentCompletionRequest = (async () => {
+      try {
+        const position = document.positionAt(document.getText().length);
+        await this.languageBridge.provideCompletionItems(document, position);
+      } catch {
+      } finally {
+        this.silentCompletionRequest = undefined;
+      }
+    })();
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {

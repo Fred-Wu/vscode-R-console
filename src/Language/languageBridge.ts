@@ -39,14 +39,17 @@ export class LanguageBridge implements CompletionProvider {
     if (!this.activationPromise) {
       this.activationPromise = this.doActivateVscodeR();
     }
-    await this.activationPromise;
+    try {
+      await this.activationPromise;
+    } catch (error) {
+      this.activationPromise = undefined;
+      throw error;
+    }
   }
 
   private async doActivateVscodeR(): Promise<void> {
-    const extension =
-      vscode.extensions.getExtension("REditorSupport.r") ??
-      vscode.extensions.getExtension("reditorsupport.r");
-    if (extension && !extension.isActive) {
+    const extension = vscode.extensions.getExtension("REditorSupport.r")!;
+    if (!extension.isActive) {
       await extension.activate();
     }
   }

@@ -1694,6 +1694,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     void this.lang.refreshCompletionContextDocument(this.inputState.text);
+    void this.lang.refreshSessionCompletionDocument();
     this.refreshSyntax();
   }
 

@@ -99,20 +99,6 @@ async function makeGeneratedFileWritable(filePath: string): Promise<void> {
   }
 }
 
-async function unhideGeneratedPath(filePath: string): Promise<void> {
-  if (process.platform === "win32") {
-    await new Promise<void>((resolve) => {
-      execFile("attrib", ["-h", filePath], { windowsHide: true }, () => resolve());
-    });
-    return;
-  }
-  if (process.platform === "darwin") {
-    await new Promise<void>((resolve) => {
-      execFile("chflags", ["nohidden", filePath], () => resolve());
-    });
-  }
-}
-
 async function hideGeneratedPath(filePath: string): Promise<void> {
   if (process.platform === "win32") {
     await new Promise<void>((resolve) => {
@@ -138,13 +124,11 @@ async function writeGeneratedFile(
   filePath: string,
   content: string
 ): Promise<void> {
-  await unhideGeneratedPath(filePath);
   await makeGeneratedFileWritable(filePath);
   await fs.promises.writeFile(filePath, content, {
     encoding: "utf8",
     mode: 0o600,
   });
-  await hideGeneratedPath(filePath);
 }
 
 async function ensureDocumentDir(dir: string): Promise<void> {
@@ -197,6 +181,7 @@ export class VirtualRDocument {
   private text: string;
   private readonly fileBacked: boolean;
   private fileBackedWriteQueue: Promise<unknown> = Promise.resolve();
+  private fileBackedSaveTimer: NodeJS.Timeout | undefined;
 
   constructor(
     id: string,
@@ -245,6 +230,10 @@ export class VirtualRDocument {
       return;
     }
 
+    if (this.fileBackedSaveTimer) {
+      clearTimeout(this.fileBackedSaveTimer);
+      this.fileBackedSaveTimer = undefined;
+    }
     const dir = path.dirname(this.uri.fsPath);
     const openDocument = vscode.workspace.textDocuments.find(
       (document) => document.uri.toString() === this.uri.toString()
@@ -305,12 +294,27 @@ export class VirtualRDocument {
         this.languageId
       );
     }
-    if (document.isDirty) {
-      await makeGeneratedFileWritable(this.uri.fsPath);
-      await document.save();
-      await hideGeneratedPath(this.uri.fsPath);
-    }
+    this.scheduleFileBackedSave(document);
     return document;
+  }
+
+  private scheduleFileBackedSave(document: vscode.TextDocument): void {
+    if (!document.isDirty) {
+      return;
+    }
+    if (this.fileBackedSaveTimer) {
+      clearTimeout(this.fileBackedSaveTimer);
+    }
+    this.fileBackedSaveTimer = setTimeout(() => {
+      this.fileBackedSaveTimer = undefined;
+      void (async () => {
+        if (!document.isDirty) {
+          return;
+        }
+        await makeGeneratedFileWritable(this.uri.fsPath);
+        await document.save();
+      })().catch(() => undefined);
+    }, 500);
   }
 
   async openTextDocument(): Promise<vscode.TextDocument> {
@@ -327,12 +331,6 @@ export class VirtualRDocument {
       );
     }
     return document;
-  }
-
-  private async writeFileBackedContent(): Promise<void> {
-    const dir = path.dirname(this.uri.fsPath);
-    await ensureDocumentDir(dir);
-    await writeGeneratedFile(this.uri.fsPath, this.text);
   }
 
   getText(range?: vscode.Range): string {
