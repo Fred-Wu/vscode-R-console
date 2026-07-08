@@ -87,6 +87,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private pendingSocketServer: net.Server | undefined;
   private syncedDocuments = new Map<string, { document: vscode.TextDocument; version: number }>();
   private sessionState: ConsoleLspSessionState | undefined;
+  private syncedSessionStateKey: string | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.outputChannel = new SilentOutputChannel("R Console");
@@ -143,6 +144,7 @@ export class ConsoleLspClient implements CompletionProvider {
         this.closePendingSocketServer();
         this.terminateSpawnedServer();
         this.syncedDocuments.clear();
+        this.syncedSessionStateKey = undefined;
         return;
       }
 
@@ -167,6 +169,7 @@ export class ConsoleLspClient implements CompletionProvider {
       }
       this.closePendingSocketServer();
       this.terminateSpawnedServer();
+      this.syncedSessionStateKey = undefined;
     });
     await this.stopPromise;
   }
@@ -269,12 +272,24 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!this.sessionState) {
       return;
     }
+    const stateKey = this.getSessionStateKey(this.sessionState);
+    if (this.syncedSessionStateKey === stateKey) {
+      return;
+    }
 
     try {
       await client.sendRequest("rConsole/syncSessionState", this.sessionState);
+      this.syncedSessionStateKey = stateKey;
     } catch (error) {
       this.logError(`Failed to sync console session state: ${String(error)}`);
     }
+  }
+
+  private getSessionStateKey(state: ConsoleLspSessionState): string {
+    return [
+      state.attachedPackages.join("\u0000"),
+      state.loadedNamespaces.join("\u0000"),
+    ].join("\u0001");
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
@@ -331,6 +346,7 @@ export class ConsoleLspClient implements CompletionProvider {
     );
     client.setSuppressShutdownCloseMessage(this.suppressShutdownCloseMessage);
     this.client = client;
+    this.syncedSessionStateKey = undefined;
     await client.start();
     await this.disableConsoleDiagnostics(client);
   }

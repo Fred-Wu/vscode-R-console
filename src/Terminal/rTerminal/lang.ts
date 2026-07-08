@@ -105,6 +105,7 @@ export class RTermLang {
       const workspaceDataRequest = shouldRequestWorkspaceData
         ? this.options.requestWorkspaceData?.()
         : undefined;
+      const cachedSessionData = getWorkspaceData();
       if (!shouldRequestWorkspaceData) {
         refreshWorkspaceData();
       }
@@ -117,17 +118,18 @@ export class RTermLang {
         return;
       }
 
-      const sessionData = shouldRequestWorkspaceData
-        ? (await workspaceDataRequest) ?? getWorkspaceData()
-        : getWorkspaceData();
-      if (!this.isCurrentCompletionRequest(requestId)) {
-        return;
-      }
       const filterAggregateProviderItems = !this.usesConsoleLsp();
       const needsLsp = needsLanguageServerCompletion(context);
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
       let completionProvider: CompletionProvider | undefined;
       const fullEntriesPromise = (async () => {
+        const sessionData = shouldRequestWorkspaceData
+          ? (await workspaceDataRequest) ?? getWorkspaceData() ?? cachedSessionData
+          : cachedSessionData;
+        if (!this.isCurrentCompletionRequest(requestId)) {
+          return undefined;
+        }
+
         const needsDocument = needsLsp || this.usesConsoleLsp();
         const completionProviderRequest = this.getCompletionProvider();
         const docContextRequest = needsDocument
@@ -172,7 +174,7 @@ export class RTermLang {
             context,
             undefined,
             undefined,
-            sessionData,
+            cachedSessionData,
             [],
             recentEntries,
             undefined,
@@ -234,7 +236,7 @@ export class RTermLang {
               const nextInputText = lines.join("\n");
               const nextDocContext = await this.getOrOpenCompletionDocument(
                 nextInputText,
-                sessionData
+                cachedSessionData
               );
               if (!this.isCurrentCompletionRequest(requestId)) {
                 return;
@@ -249,7 +251,7 @@ export class RTermLang {
                 nextContext,
                 nextDocContext.document,
                 new vscode.Position(latestInput.cursorRow + nextDocContext.lineOffset, cursorCol),
-                sessionData,
+                cachedSessionData,
                 [
                   ...nextDocContext.preludeLines,
                   ...lines.slice(0, latestInput.cursorRow),
