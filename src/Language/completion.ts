@@ -889,16 +889,7 @@ function isVscodeAggregateCompletionItem(item: vscode.CompletionItem): boolean {
     return false;
   }
 
-  if (
-    detail === "[scope]" ||
-    detail === "parameter" ||
-    detail.startsWith("value for ") ||
-    /^\{[^}]+\}$/.test(detail)
-  ) {
-    return true;
-  }
-
-  return false;
+  return true;
 }
 
 function getCompletionLabel(item: vscode.CompletionItem): string {

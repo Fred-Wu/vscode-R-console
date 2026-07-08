@@ -92,6 +92,7 @@ R Console also contributes its own settings:
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
 | `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
+| `r.console.languageServer` | `vscode-r` | Language-server route for console completions and semantic highlighting; `vscode-r` uses vscode-R's shared language server and respects `r.lsp.multiServer`, while `console` starts a console-owned language-server process |
 
 ## Dependency Model
 
