@@ -860,6 +860,9 @@ function isConsoleOwnedLanguageServerCompletionItem(
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }
+  if (item.detail === "[workspace]") {
+    return false;
+  }
   if (
     (context.kind === "argument" || context.kind === "package") &&
     item.kind === vscode.CompletionItemKind.Snippet
@@ -882,10 +885,7 @@ function isVscodeAggregateCompletionItem(item: vscode.CompletionItem): boolean {
     return true;
   }
 
-  if (
-    detail === "[workspace]" ||
-    detail === "[session]"
-  ) {
+  if (detail === "[workspace]" || detail === "[session]") {
     return false;
   }
 

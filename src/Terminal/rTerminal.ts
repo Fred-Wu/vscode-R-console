@@ -367,7 +367,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private resolveConsoleLanguageServer(
     config = vscode.workspace.getConfiguration("r.console")
   ): "vscode-r" | "console" {
-    return config.get<string>("languageServer", "vscode-r") === "console"
+    return config.get<string>("languageServer", "console") === "console"
       ? "console"
       : "vscode-r";
   }

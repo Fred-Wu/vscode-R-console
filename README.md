@@ -64,6 +64,7 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 
 - Attach to a detached R Console session.
 - Detach a console UI or close VS Code while leaving the R process running.
+- Detach and reattach a console to pick up setting change, such as `r.console.languageServer`.
 - Close a session and stop its R process.
 - Restore a dropped console UI after workspace folder changes or an extension host reload.
 
@@ -92,7 +93,7 @@ R Console also contributes its own settings:
 | `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
 | `r.console.tabSize` | `2` | Indentation width |
 | `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
-| `r.console.languageServer` | `vscode-r` | Language-server route for console completions and semantic highlighting; `vscode-r` uses vscode-R's shared language server and respects `r.lsp.multiServer`, while `console` starts a console-owned language-server process |
+| `r.console.languageServer` | `console` | Language-server route for console completions and semantic highlighting. Restart or reattach R Console required to switch route. `console` starts a console-owned language-server process, while `vscode-r` uses vscode-R's shared language server and respects `r.lsp.multiServer` |
 
 ## Dependency Model
 
