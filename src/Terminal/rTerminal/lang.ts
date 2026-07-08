@@ -203,6 +203,16 @@ export class RTermLang {
         matchOnDetail: true,
         placeHolder: "R console completions",
       };
+      const shouldPrefillQuickPick =
+        context.prefix.length > 0 &&
+        context.kind !== "package" &&
+        context.kind !== "member";
+      const prefillQuickPick = (pick: vscode.QuickPick<vscode.QuickPickItem>): void => {
+        if (!shouldPrefillQuickPick) {
+          return;
+        }
+        setTimeout(() => { if (pick.value.length === 0) { pick.value = context.prefix; } }, 0);
+      };
       let selection: vscode.QuickPickItem | undefined;
       if (context.kind !== "package" && stagedEntries?.length) {
         selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
@@ -217,9 +227,20 @@ export class RTermLang {
           pick.onDidAccept(() => { const item = pick.selectedItems[0]; active = false; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
           pick.onDidHide(() => { const cancelled = active; active = false; pick.dispose(); if (cancelled) { resolve(undefined); } });
           pick.show();
+          prefillQuickPick(pick);
         });
       } else if (context.kind !== "package") {
-        selection = await vscode.window.showQuickPick(picks, pickOptions);
+        selection = shouldPrefillQuickPick
+          ? await new Promise<CompletionPickItem | undefined>((resolve) => {
+              const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
+              let active = true;
+              Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
+              pick.onDidAccept(() => { const item = pick.selectedItems[0]; active = false; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
+              pick.onDidHide(() => { const cancelled = active; active = false; pick.dispose(); if (cancelled) { resolve(undefined); } });
+              pick.show();
+              prefillQuickPick(pick);
+            })
+          : await vscode.window.showQuickPick(picks, pickOptions);
       } else {
         selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
             const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
