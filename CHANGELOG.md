@@ -14,6 +14,7 @@ All notable changes to R Console will be documented in this file.
 ### Changed
 
 - Runtime completions now appear before waiting for LSP completion results in both language-server routes.
+- Removed languageserver-based semantic-token syntax highlighting, and mapped console token types directly to the VS Code color theme based on languageserver semantic token types.
 
 ## [0.3.1] - 2026-06-29
 
