@@ -196,6 +196,7 @@ export class VirtualRDocument {
   version = 1;
   private text: string;
   private readonly fileBacked: boolean;
+  private fileBackedWriteQueue: Promise<unknown> = Promise.resolve();
 
   constructor(
     id: string,
@@ -264,8 +265,52 @@ export class VirtualRDocument {
       return await this.openTextDocument();
     }
 
-    await this.writeFileBackedContent();
-    return this as unknown as vscode.TextDocument;
+    const write = this.fileBackedWriteQueue
+      .catch(() => undefined)
+      .then(() => this.writeFileBackedDocumentNow());
+    this.fileBackedWriteQueue = write.catch(() => undefined);
+    return await write;
+  }
+
+  private async writeFileBackedDocumentNow(): Promise<vscode.TextDocument> {
+    const dir = path.dirname(this.uri.fsPath);
+    await ensureDocumentDir(dir);
+
+    let document = vscode.workspace.textDocuments.find(
+      (item) => item.uri.toString() === this.uri.toString()
+    );
+    if (!document) {
+      await writeGeneratedFile(this.uri.fsPath, this.text);
+      document = await vscode.workspace.openTextDocument(this.uri);
+    }
+
+    if (document.getText() !== this.text) {
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(
+        document.uri,
+        new vscode.Range(
+          document.positionAt(0),
+          document.positionAt(document.getText().length)
+        ),
+        this.text
+      );
+      if (!(await vscode.workspace.applyEdit(edit))) {
+        throw new Error(`Failed to update R console document ${document.uri.toString()}`);
+      }
+    }
+
+    if (document.languageId !== this.languageId) {
+      document = await vscode.languages.setTextDocumentLanguage(
+        document,
+        this.languageId
+      );
+    }
+    if (document.isDirty) {
+      await makeGeneratedFileWritable(this.uri.fsPath);
+      await document.save();
+      await hideGeneratedPath(this.uri.fsPath);
+    }
+    return document;
   }
 
   async openTextDocument(): Promise<vscode.TextDocument> {
