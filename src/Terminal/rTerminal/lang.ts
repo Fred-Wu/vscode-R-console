@@ -123,51 +123,72 @@ export class RTermLang {
       if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
-      const completionProvider = await this.getCompletionProvider();
-      if (!this.isCurrentCompletionRequest(requestId)) {
-        return;
-      }
-      if (!completionProvider) {
-        return;
-      }
       const filterAggregateProviderItems = !this.usesConsoleLsp();
       const needsLsp = needsLanguageServerCompletion(context);
+      const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
+      let completionProvider: CompletionProvider | undefined;
+      const fullEntriesPromise = (async () => {
+        completionProvider = await this.getCompletionProvider();
+        if (!this.isCurrentCompletionRequest(requestId) || !completionProvider) {
+          return undefined;
+        }
 
-      const docContext =
-        needsLsp || this.usesConsoleLsp()
-          ? await this.getOrOpenCompletionDocument(latestInput.text, sessionData)
-          : undefined;
+        const docContext =
+          needsLsp || this.usesConsoleLsp()
+            ? await this.getOrOpenCompletionDocument(latestInput.text, sessionData)
+            : undefined;
+        if (!this.isCurrentCompletionRequest(requestId)) {
+          return undefined;
+        }
+        if ((needsLsp || this.usesConsoleLsp()) && !docContext) {
+          return undefined;
+        }
+
+        const position = new vscode.Position(
+          latestInput.cursorRow + (docContext?.lineOffset ?? 0),
+          context.snapshotCursor
+        );
+        const linesBefore = [
+          ...(docContext?.preludeLines ?? []),
+          ...latestInput.lines.slice(0, latestInput.cursorRow),
+        ];
+        return await collectCompletionEntries(
+          context,
+          docContext?.document,
+          docContext ? position : undefined,
+          sessionData,
+          linesBefore,
+          recentEntries,
+          completionProvider,
+          latestInput.text,
+          filterAggregateProviderItems
+        );
+      })();
+      const stagedEntries = needsLsp && context.kind !== "package"
+        ? await collectCompletionEntries(
+            context,
+            undefined,
+            undefined,
+            sessionData,
+            [],
+            recentEntries,
+            undefined,
+            latestInput.text,
+            filterAggregateProviderItems
+          )
+        : undefined;
       if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
-      if ((needsLsp || this.usesConsoleLsp()) && !docContext) {
-        return;
-      }
 
-      const position = new vscode.Position(
-        latestInput.cursorRow + (docContext?.lineOffset ?? 0),
-        context.snapshotCursor
-      );
-      const linesBefore = [
-        ...(docContext?.preludeLines ?? []),
-        ...latestInput.lines.slice(0, latestInput.cursorRow),
-      ];
-      const entries = await collectCompletionEntries(
-        context,
-        docContext?.document,
-        docContext ? position : undefined,
-        sessionData,
-        linesBefore,
-        this.options.getRecentSessionEntries?.() ?? [],
-        completionProvider,
-        latestInput.text,
-        filterAggregateProviderItems
-      );
+      const entries = stagedEntries?.length
+        ? stagedEntries
+        : await fullEntriesPromise;
       if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
 
-      if (entries.length === 0) {
+      if (!entries || entries.length === 0) {
         return;
       }
 
@@ -177,9 +198,25 @@ export class RTermLang {
         matchOnDetail: true,
         placeHolder: "R console completions",
       };
-      const selection = context.kind !== "package"
-        ? await vscode.window.showQuickPick(picks, pickOptions)
-        : await new Promise<CompletionPickItem | undefined>((resolve) => {
+      let selection: vscode.QuickPickItem | undefined;
+      if (context.kind !== "package" && stagedEntries?.length) {
+        selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
+          const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
+          let active = true;
+          Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
+          void fullEntriesPromise.then((nextEntries) => {
+            if (active && nextEntries?.length && this.isCurrentCompletionRequest(requestId)) {
+              pick.items = toCompletionQuickPickItems(nextEntries, context);
+            }
+          }).catch(() => undefined);
+          pick.onDidAccept(() => { const item = pick.selectedItems[0]; active = false; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
+          pick.onDidHide(() => { const cancelled = active; active = false; pick.dispose(); if (cancelled) { resolve(undefined); } });
+          pick.show();
+        });
+      } else if (context.kind !== "package") {
+        selection = await vscode.window.showQuickPick(picks, pickOptions);
+      } else {
+        selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
             const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
             let request = 0;
             Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
@@ -202,6 +239,9 @@ export class RTermLang {
               if (!nextDocContext) {
                 return;
               }
+              if (!completionProvider) {
+                return;
+              }
               const nextEntries = await collectCompletionEntries(
                 nextContext,
                 nextDocContext.document,
@@ -211,7 +251,7 @@ export class RTermLang {
                   ...nextDocContext.preludeLines,
                   ...lines.slice(0, latestInput.cursorRow),
                 ],
-                this.options.getRecentSessionEntries?.() ?? [],
+                recentEntries,
                 completionProvider,
                 nextInputText,
                 filterAggregateProviderItems
@@ -227,6 +267,7 @@ export class RTermLang {
             pick.onDidHide(() => { request += 1; pick.dispose(); resolve(undefined); });
             pick.show();
           });
+      }
 
       if (!isCompletionPickItem(selection)) {
         return;
