@@ -93,6 +93,7 @@ type GlobalEnvItem = {
 };
 
 type WorkspaceData = {
+  search?: string[];
   globalenv?: Record<string, GlobalEnvItem>;
 };
 
@@ -370,7 +371,8 @@ export async function collectCompletionEntries(
           position,
           multilineBuffer,
           completionProvider,
-          filterAggregateProviderItems
+          filterAggregateProviderItems,
+          sessionData
         );
   const lspItems =
     isGlobalSymbolContext(context)
@@ -820,7 +822,8 @@ async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider,
-  filterAggregateProviderItems = false
+  filterAggregateProviderItems = false,
+  sessionData?: WorkspaceData
 ): Promise<CompletionEntry[]> {
   if (!completionProvider) {
     return [];
@@ -836,7 +839,7 @@ async function getLanguageServerCompletions(
     
     const filteredItems = items.filter((item) => {
       return filterAggregateProviderItems
-        ? isVscodeAggregateCompletionItem(item)
+        ? isVscodeAggregateCompletionItem(context, item, sessionData?.search)
         : isConsoleOwnedLanguageServerCompletionItem(context, item);
     });
     
@@ -872,7 +875,11 @@ function isConsoleOwnedLanguageServerCompletionItem(
   return true;
 }
 
-function isVscodeAggregateCompletionItem(item: vscode.CompletionItem): boolean {
+function isVscodeAggregateCompletionItem(
+  context: CompletionContext,
+  item: vscode.CompletionItem,
+  attachedPackages: string[] | undefined
+): boolean {
   if (
     item.kind === vscode.CompletionItemKind.Text ||
     item.kind === vscode.CompletionItemKind.Snippet
@@ -889,7 +896,13 @@ function isVscodeAggregateCompletionItem(item: vscode.CompletionItem): boolean {
     return false;
   }
 
-  return true;
+  const packageName = /^\{(.+)\}$/.exec(detail)?.[1];
+  return (
+    !packageName ||
+    context.kind === "package" ||
+    !attachedPackages ||
+    attachedPackages.includes(`package:${packageName}`)
+  );
 }
 
 function getCompletionLabel(item: vscode.CompletionItem): string {

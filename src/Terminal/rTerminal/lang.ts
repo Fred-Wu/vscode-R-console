@@ -199,8 +199,8 @@ export class RTermLang {
 
       const picks = toCompletionQuickPickItems(entries, context);
       const pickOptions = {
-        matchOnDescription: true,
-        matchOnDetail: true,
+        matchOnDescription: false,
+        matchOnDetail: false,
         placeHolder: "R console completions",
       };
       const shouldPrefillQuickPick =
@@ -218,7 +218,7 @@ export class RTermLang {
         selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
           const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
           let active = true;
-          Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
+          Object.assign(pick, { matchOnDescription: false, matchOnDetail: false, placeholder: pickOptions.placeHolder, items: picks });
           void fullEntriesPromise.then((nextEntries) => {
             if (active && nextEntries?.length && this.isCurrentCompletionRequest(requestId)) {
               pick.items = toCompletionQuickPickItems(nextEntries, context);
@@ -234,7 +234,7 @@ export class RTermLang {
           ? await new Promise<CompletionPickItem | undefined>((resolve) => {
               const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
               let active = true;
-              Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
+              Object.assign(pick, { matchOnDescription: false, matchOnDetail: false, placeholder: pickOptions.placeHolder, items: picks });
               pick.onDidAccept(() => { const item = pick.selectedItems[0]; active = false; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
               pick.onDidHide(() => { const cancelled = active; active = false; pick.dispose(); if (cancelled) { resolve(undefined); } });
               pick.show();
@@ -245,7 +245,7 @@ export class RTermLang {
         selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
             const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
             let request = 0;
-            Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
+            Object.assign(pick, { matchOnDescription: false, matchOnDetail: false, placeholder: pickOptions.placeHolder, items: picks });
             pick.onDidChangeValue((value) => void (async () => {
               const currentRequest = ++request;
               const prefix = value.startsWith(context.prefix) ? value : context.prefix + value;
