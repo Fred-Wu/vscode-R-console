@@ -120,6 +120,9 @@ export class RTermLang {
 
       const filterAggregateProviderItems = !this.usesConsoleLsp();
       const needsLsp = needsLanguageServerCompletion(context);
+      const needsStagedEntries = needsLsp || (
+        context.kind === "bracket" && !!context.dataObjectName
+      );
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
       let completionProvider: CompletionProvider | undefined;
       const fullEntriesPromise = (async () => {
@@ -169,14 +172,14 @@ export class RTermLang {
           filterAggregateProviderItems
         );
       })();
-      const stagedEntries = needsLsp && context.kind !== "package"
+      const stagedEntries = needsStagedEntries && context.kind !== "package"
         ? await collectCompletionEntries(
             context,
             undefined,
             undefined,
             cachedSessionData,
             [],
-            recentEntries,
+            [],
             undefined,
             latestInput.text,
             filterAggregateProviderItems
