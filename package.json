@@ -90,13 +90,6 @@
       }
     ],
     "configurationDefaults": {
-      "files.exclude": {
-        "**/.vscode-R-console": true,
-        "**/.vscode-R-console/**": true
-      },
-      "files.associations": {
-        "*.rconsole": "r"
-      },
       "terminal.integrated.commandsToSkipShell": [
         "r-console.insertPipeOperator"
       ]
@@ -122,19 +115,6 @@
           ],
           "default": "|>",
           "description": "Pipe operator to insert for chain operations. The default keybinding is Ctrl+Alt+M."
-        },
-        "r.console.languageServer": {
-          "type": "string",
-          "enum": [
-            "vscode-r",
-            "console"
-          ],
-          "default": "console",
-          "enumDescriptions": [
-            "Use vscode-R's existing language server for console completions.",
-            "Use the console-owned language server process for console completions."
-          ],
-          "description": "Language server route used by the R console. Restart or reattach existing consoles to switch route."
         }
       }
     }

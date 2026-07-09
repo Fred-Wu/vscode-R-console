@@ -5,12 +5,12 @@ import {
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
+  getCompletionIdentityKey,
   isCompletionPickItem,
   needsLanguageServerCompletion,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
-import { LanguageBridge } from "../../Language/languageBridge";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type {
   SessionMemberCompletionItem,
@@ -27,10 +27,8 @@ export type InputSnapshot = {
 };
 
 type LangOptions = {
-  cwd?: string;
   extensionPath: string;
   rPath: string;
-  languageServer: "vscode-r" | "console";
   getRecentSessionEntries?: () => string[];
   requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
   requestMemberCompletions: (
@@ -55,8 +53,6 @@ type ConsoleSessionState = {
 
 type CompletionDocumentContext = {
   document: vscode.TextDocument;
-  lineOffset: number;
-  preludeLines: string[];
 };
 
 export class RTermLang {
@@ -66,27 +62,17 @@ export class RTermLang {
     .toString(36)
     .slice(2)}`;
   private consoleLsp: ConsoleLspClient | undefined;
-  private readonly languageBridge: LanguageBridge;
   private sessionState: ConsoleSessionState | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
 
-  constructor(private readonly options: LangOptions) {
-    this.languageBridge = new LanguageBridge({
-      requestMemberCompletions: async (expression, operator) =>
-        await this.options.requestMemberCompletions(expression, operator),
-    });
-  }
+  constructor(private readonly options: LangOptions) {}
 
   async start(): Promise<void> {
-    if (this.usesConsoleLsp()) {
-      await this.ensureConsoleLspStarted();
-      const docContext = await this.getOrOpenCompletionDocument("");
-      if (docContext) {
-        this.requestSilentCompletion(docContext.document);
-      }
-      return;
+    await this.ensureConsoleLspStarted();
+    const docContext = await this.getOrOpenCompletionDocument("");
+    if (docContext) {
+      this.requestSilentCompletion(docContext.document);
     }
-    await this.getOrOpenCompletionDocument("");
   }
 
   async handleAutocomplete({
@@ -133,7 +119,6 @@ export class RTermLang {
         return;
       }
 
-      const filterAggregateProviderItems = !this.usesConsoleLsp();
       const needsLsp = needsLanguageServerCompletion(context);
       const needsStagedEntries = needsLsp || (
         context.kind === "bracket" && !!context.dataObjectName
@@ -148,10 +133,10 @@ export class RTermLang {
           return undefined;
         }
 
-        const needsDocument = needsLsp || this.usesConsoleLsp();
+        const needsDocument = needsLsp || !!this.consoleLsp;
         const completionProviderRequest = this.getCompletionProvider();
         const docContextRequest = needsDocument
-          ? this.getOrOpenCompletionDocument(latestInput.text, sessionData)
+          ? this.getOrOpenCompletionDocument(latestInput.text)
           : Promise.resolve(undefined);
 
         completionProvider = await completionProviderRequest;
@@ -168,13 +153,10 @@ export class RTermLang {
         }
 
         const position = new vscode.Position(
-          latestInput.cursorRow + (docContext?.lineOffset ?? 0),
+          latestInput.cursorRow,
           context.snapshotCursor
         );
-        const linesBefore = [
-          ...(docContext?.preludeLines ?? []),
-          ...latestInput.lines.slice(0, latestInput.cursorRow),
-        ];
+        const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
         return await collectCompletionEntries(
           context,
           docContext?.document,
@@ -183,8 +165,7 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          latestInput.text,
-          filterAggregateProviderItems
+          latestInput.text
         );
       })();
       const stagedEntries = needsStagedEntries && context.kind !== "package"
@@ -196,8 +177,7 @@ export class RTermLang {
             [],
             [],
             undefined,
-            latestInput.text,
-            filterAggregateProviderItems
+            latestInput.text
           )
         : undefined;
       if (!this.isCurrentCompletionRequest(requestId)) {
@@ -270,12 +250,17 @@ export class RTermLang {
       ): CompletionEntry[] => {
         const seen = new Set<string>();
         const merged: CompletionEntry[] = [];
-        for (const entry of [...firstEntries, ...secondEntries]) {
-          const key = [
-            entry.label.toLowerCase(),
-            entry.insertText,
-            entry.kind ?? -1,
-          ].join("\u0000");
+        const entries = [...firstEntries, ...secondEntries];
+        const preferredLabels = new Set(
+          entries
+            .filter((entry) => entry.source !== "buffer")
+            .map((entry) => entry.label.toLowerCase())
+        );
+        for (const entry of entries) {
+          if (entry.source === "buffer" && preferredLabels.has(entry.label.toLowerCase())) {
+            continue;
+          }
+          const key = getCompletionIdentityKey(entry);
           if (seen.has(key)) {
             continue;
           }
@@ -392,9 +377,12 @@ export class RTermLang {
             nextContext.triggerCharacter = undefined;
           }
           const nextInputText = lines.join("\n");
+          const refinedSessionData =
+            (await this.options.requestWorkspaceData?.()) ??
+            getWorkspaceData() ??
+            cachedSessionData;
           const nextDocContext = await this.getOrOpenCompletionDocument(
-            nextInputText,
-            cachedSessionData
+            nextInputText
           );
           if (!this.isCurrentCompletionRequest(requestId)) {
             return;
@@ -409,16 +397,12 @@ export class RTermLang {
           const nextEntries = await collectCompletionEntries(
             nextContext,
             nextDocContext.document,
-            new vscode.Position(latestInput.cursorRow + nextDocContext.lineOffset, cursorCol),
-            cachedSessionData,
-            [
-              ...nextDocContext.preludeLines,
-              ...lines.slice(0, latestInput.cursorRow),
-            ],
+            new vscode.Position(latestInput.cursorRow, cursorCol),
+            refinedSessionData,
+            lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            nextInputText,
-            filterAggregateProviderItems
+            nextInputText
           );
           if (!this.isCurrentCompletionRequest(requestId)) {
             return;
@@ -502,9 +486,6 @@ export class RTermLang {
   }
 
   async refreshCompletionContextDocument(inputText: string): Promise<void> {
-    if (!this.usesConsoleLsp()) {
-      return;
-    }
     if (!this.completionDocument) {
       return;
     }
@@ -512,19 +493,6 @@ export class RTermLang {
       const docContext = await this.getOrOpenCompletionDocument(inputText);
       if (docContext) {
         await this.consoleLsp?.prepareDocument(docContext.document);
-      }
-    } catch {
-    }
-  }
-
-  async refreshSessionCompletionDocument(): Promise<void> {
-    if (this.usesConsoleLsp()) {
-      return;
-    }
-    try {
-      const docContext = await this.getOrOpenCompletionDocument("");
-      if (docContext) {
-        this.requestSilentCompletion(docContext.document);
       }
     } catch {
     }
@@ -561,70 +529,23 @@ export class RTermLang {
 
     this.completionDocument = new VirtualRDocument(
       this.completionDocumentId,
-      content,
-      "console.rconsole",
-      this.options.cwd,
-      !this.usesConsoleLsp()
+      content
     );
     return this.completionDocument;
   }
 
   private async getOrOpenCompletionDocument(
-    content: string,
-    data?: WorkspaceData
+    content: string
   ): Promise<CompletionDocumentContext | undefined> {
     try {
-      if (this.usesConsoleLsp()) {
-        return {
-          document: this.getOrUpdateCompletionDocument(
-            content
-          ) as unknown as vscode.TextDocument,
-          lineOffset: 0,
-          preludeLines: [],
-        };
-      }
-
-      const documentContent = this.buildCompletionDocumentContent(content, data);
-      const document = this.getOrUpdateCompletionDocument(documentContent.text);
-      await document.writeFileBackedContent();
       return {
-        document: document as unknown as vscode.TextDocument,
-        lineOffset: documentContent.preludeLines.length,
-        preludeLines: documentContent.preludeLines,
+        document: this.getOrUpdateCompletionDocument(
+          content
+        ) as unknown as vscode.TextDocument,
       };
     } catch {
       return undefined;
     }
-  }
-
-  private buildCompletionDocumentContent(
-    inputText: string,
-    data?: WorkspaceData
-  ): { text: string; preludeLines: string[] } {
-    const attachedPackages = data
-      ? this.getAttachedPackages(data)
-      : this.sessionState?.attachedPackages ?? [];
-    const preludeLines = attachedPackages.map(
-      (pkg) => `library(${JSON.stringify(pkg)})`
-    );
-    if (preludeLines.length === 0) {
-      return { text: inputText, preludeLines };
-    }
-    return {
-      text: `${preludeLines.join("\n")}\n${inputText}`,
-      preludeLines,
-    };
-  }
-
-  private getAttachedPackages(data: WorkspaceData): string[] {
-    return data.search
-      .filter((value) => value.startsWith("package:"))
-      .map((value) => value.slice(8))
-      .filter((value) => value.length > 0);
-  }
-
-  private usesConsoleLsp(): boolean {
-    return this.options.languageServer === "console";
   }
 
   private isCurrentCompletionRequest(requestId: number): boolean {
@@ -632,10 +553,6 @@ export class RTermLang {
   }
 
   private async getCompletionProvider(): Promise<CompletionProvider | undefined> {
-    if (!this.usesConsoleLsp()) {
-      return this.languageBridge;
-    }
-
     await this.ensureConsoleLspStarted();
     return this.consoleLsp;
   }
@@ -647,9 +564,7 @@ export class RTermLang {
 
     this.silentCompletionRequest = (async () => {
       try {
-        const completionProvider = this.usesConsoleLsp()
-          ? this.consoleLsp
-          : this.languageBridge;
+        const completionProvider = this.consoleLsp;
         if (!completionProvider) {
           return;
         }
@@ -663,10 +578,6 @@ export class RTermLang {
   }
 
   private async ensureConsoleLspStarted(): Promise<void> {
-    if (!this.usesConsoleLsp()) {
-      return;
-    }
-
     if (!this.consoleLsp) {
       this.consoleLsp = new ConsoleLspClient({
         consoleId: this.completionDocumentId,
@@ -694,10 +605,7 @@ export class RTermLang {
   private shouldRequestWorkspaceData(
     context: NonNullable<ReturnType<typeof getCompletionContext>>
   ): boolean {
-    return (
-      (context.kind === "default" || context.kind === "argument") &&
-      !context.dataObjectName
-    );
+    return context.kind !== "member" && context.kind !== "package";
   }
 
   private toSessionState(data: WorkspaceData): ConsoleSessionState {

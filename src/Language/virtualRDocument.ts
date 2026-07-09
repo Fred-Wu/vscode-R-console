@@ -1,174 +1,20 @@
-import { execFile } from "child_process";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 import * as vscode from "vscode";
 
-const DOCUMENT_DIR_NAME = ".vscode-R-console";
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
-const GENERATED_CONTROL_FILES = new Set([".gitignore", ".lintr"]);
-const initializedDocumentDirs = new Set<string>();
 
 function sanitizePathPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function resolveDocumentRoot(workspacePath: string | undefined): string {
-  if (workspacePath) {
-    const candidate = path.resolve(workspacePath);
-    const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(candidate));
-    if (folder?.uri.scheme === "file") {
-      return folder.uri.fsPath;
-    }
-    return candidate;
-  }
-
-  const workspaceFolder = vscode.workspace.workspaceFolders?.find(
-    (folder) => folder.uri.scheme === "file"
-  );
-  return workspaceFolder?.uri.fsPath ?? path.join(os.tmpdir(), "vscode-R-console");
-}
-
-async function writeFileIfMissing(filePath: string, content: string): Promise<void> {
-  try {
-    await fs.promises.writeFile(filePath, content, {
-      encoding: "utf8",
-      flag: "wx",
-    });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-      throw error;
-    }
-  }
-}
-
-async function writeFileIfChanged(filePath: string, content: string): Promise<void> {
-  try {
-    const existing = await fs.promises.readFile(filePath, "utf8");
-    if (existing === content) {
-      return;
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  }
-  await fs.promises.writeFile(filePath, content, "utf8");
-}
-
-async function makeGeneratedFileWritable(filePath: string): Promise<void> {
-  try {
-    await fs.promises.chmod(filePath, 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  }
-}
-
-async function hideGeneratedPath(filePath: string): Promise<void> {
-  if (process.platform === "win32") {
-    await new Promise<void>((resolve) => {
-      execFile("attrib", ["+h", filePath], { windowsHide: true }, () => resolve());
-    });
-    return;
-  }
-  if (process.platform === "darwin") {
-    await new Promise<void>((resolve) => {
-      execFile("chflags", ["hidden", filePath], () => resolve());
-    });
-  }
-}
-
-function makeGeneratedFileWritableSync(filePath: string): void {
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-  }
-}
-
-async function writeGeneratedFile(
-  filePath: string,
-  content: string
-): Promise<void> {
-  await makeGeneratedFileWritable(filePath);
-  await fs.promises.writeFile(filePath, content, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-}
-
-async function ensureDocumentDir(dir: string): Promise<void> {
-  if (initializedDocumentDirs.has(dir)) {
-    return;
-  }
-
-  await fs.promises.mkdir(dir, { recursive: true });
-  const gitignorePath = path.join(dir, ".gitignore");
-  const lintrPath = path.join(dir, ".lintr");
-  await writeFileIfMissing(gitignorePath, "*\n");
-  await writeFileIfChanged(
-    lintrPath,
-    'linters: NULL\nexclusions: list("*.R" = Inf, "*.r" = Inf, "*.rconsole" = Inf)\n'
-  );
-  await Promise.all([
-    hideGeneratedPath(dir),
-    hideGeneratedPath(gitignorePath),
-    hideGeneratedPath(lintrPath),
-  ]);
-  initializedDocumentDirs.add(dir);
-}
-
-function removeDocumentDirIfEmpty(dir: string): void {
-  try {
-    const entries = fs.readdirSync(dir);
-    const generatedDocuments = entries.filter(
-      (entry) => !GENERATED_CONTROL_FILES.has(entry)
-    );
-    if (generatedDocuments.length > 0) {
-      return;
-    }
-    fs.rmSync(dir, { recursive: true, force: true });
-    initializedDocumentDirs.delete(dir);
-  } catch {
-  }
-}
-
-/**
- * R document adapter used for console language requests. It can either be a
- * hidden workspace R file for vscode-R completion routing or an in-memory
- * r-console document for console-owned language-server synchronization.
- */
 export class VirtualRDocument {
   readonly uri: vscode.Uri;
   readonly languageId = "r";
   version = 1;
   private text: string;
-  private readonly fileBacked: boolean;
-  private fileBackedWriteQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(
-    id: string,
-    initialText = "",
-    fileName = "console.rconsole",
-    workspacePath?: string,
-    fileBacked = true
-  ) {
-    this.fileBacked = fileBacked;
-    if (!fileBacked) {
-      this.uri = vscode.Uri.parse(
-        `${VIRTUAL_DOCUMENT_SCHEME}://${sanitizePathPart(id)}/${sanitizePathPart(fileName)}`
-      );
-      this.text = initialText;
-      return;
-    }
-
-    const root = resolveDocumentRoot(workspacePath);
-    const safeId = sanitizePathPart(id);
-    const safeFileName = sanitizePathPart(fileName) || "console.rconsole";
-    const dir = path.join(root, DOCUMENT_DIR_NAME);
-    this.uri = vscode.Uri.file(
-      path.join(dir, `${safeId || "console"}-${safeFileName}`)
+  constructor(id: string, initialText = "") {
+    this.uri = vscode.Uri.parse(
+      `${VIRTUAL_DOCUMENT_SCHEME}://${sanitizePathPart(id)}/console.R`
     );
     this.text = initialText;
   }
@@ -185,37 +31,7 @@ export class VirtualRDocument {
     this.version += 1;
   }
 
-  dispose(): void {
-    if (!this.fileBacked) {
-      return;
-    }
-
-    const dir = path.dirname(this.uri.fsPath);
-    makeGeneratedFileWritableSync(this.uri.fsPath);
-    try {
-      fs.rmSync(this.uri.fsPath, { force: true });
-    } catch {
-    }
-    removeDocumentDirIfEmpty(dir);
-  }
-
-  async writeFileBackedContent(): Promise<void> {
-    if (!this.fileBacked) {
-      throw new Error("R console document is not file-backed.");
-    }
-
-    const write = this.fileBackedWriteQueue
-      .catch(() => undefined)
-      .then(() => this.writeFileBackedContentNow());
-    this.fileBackedWriteQueue = write.catch(() => undefined);
-    await write;
-  }
-
-  private async writeFileBackedContentNow(): Promise<void> {
-    const dir = path.dirname(this.uri.fsPath);
-    await ensureDocumentDir(dir);
-    await writeGeneratedFile(this.uri.fsPath, this.text);
-  }
+  dispose(): void {}
 
   getText(range?: vscode.Range): string {
     if (!range) {

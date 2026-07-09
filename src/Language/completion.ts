@@ -369,8 +369,7 @@ export async function collectCompletionEntries(
   multilineBuffer: string[],
   recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider,
-  consoleInputText?: string,
-  filterAggregateProviderItems = false
+  consoleInputText?: string
 ): Promise<CompletionEntry[]> {
   const sessionItems = getSessionCompletions(context, sessionData);
   const runtimeMemberItems =
@@ -388,7 +387,6 @@ export async function collectCompletionEntries(
           position,
           multilineBuffer,
           completionProvider,
-          filterAggregateProviderItems,
           sessionData
         );
   const lspItems =
@@ -396,7 +394,6 @@ export async function collectCompletionEntries(
       ? filterShadowedWorkspaceEntries(
           rawLspItems,
           sessionItems,
-          context,
           context.kind === "argument" ? isArgumentCompletionEntry : undefined
         )
       : rawLspItems;
@@ -427,7 +424,7 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...sessionFiltered,
       ...bufferFiltered,
-    ], context);
+    ]);
   }
 
   if (context.kind === "argument") {
@@ -441,7 +438,7 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...sessionFiltered,
       ...bufferFiltered,
-    ], context);
+    ]);
   }
 
   if (context.kind === "member") {
@@ -449,12 +446,12 @@ export async function collectCompletionEntries(
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (context.chainedBracket && bufferFiltered.length > 0) {
-      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered], context);
+      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]);
     }
     if (runtimeFiltered.length > 0) {
-      return dedupeCompletionEntries(runtimeFiltered, context);
+      return dedupeCompletionEntries(runtimeFiltered);
     }
-    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered], context);
+    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]);
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
@@ -467,7 +464,7 @@ export async function collectCompletionEntries(
       ...fallbackBufferItems,
     ],
     context.prefix
-  ), context);
+  ));
 }
 
 export function needsLanguageServerCompletion(context: CompletionContext): boolean {
@@ -675,20 +672,17 @@ function getSessionCompletions(
     return [];
   }
 
-  if ((context.kind === "member" || context.kind === "bracket") && context.objectName) {
-    if (context.kind === "member" && !TOP_LEVEL_SYMBOL_PATTERN.test(context.objectName)) {
+  if (context.kind === "member" && context.objectName) {
+    if (!TOP_LEVEL_SYMBOL_PATTERN.test(context.objectName)) {
       return [];
     }
     const obj = data.globalenv[context.objectName];
     if (!obj) {
       return [];
     }
-    const members =
-      context.kind === "bracket"
-        ? asStringArray(obj.names)
-        : context.operator === "@"
-        ? asStringArray(obj.slots)
-        : asStringArray(obj.names);
+    const members = context.operator === "@"
+      ? asStringArray(obj.slots)
+      : asStringArray(obj.names);
     return members.map((name) => ({
       label: name,
       insertText: getFieldInsertText(name, context),
@@ -698,7 +692,7 @@ function getSessionCompletions(
     }));
   }
 
-  if (!isGlobalSymbolContext(context)) {
+  if (context.kind === "package") {
     return [];
   }
 
@@ -812,8 +806,8 @@ function getConsoleBufferCompletions(
     for (const label of matches) {
       if (
         label === context.prefix ||
-        label === context.objectName ||
-        label === context.dataObjectName ||
+        (context.kind === "member" &&
+          (label === context.objectName || label === context.dataObjectName)) ||
         R_RESERVED_WORDS.has(label) ||
         seen.has(label)
       ) {
@@ -886,7 +880,6 @@ async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider,
-  filterAggregateProviderItems = false,
   sessionData?: WorkspaceData
 ): Promise<CompletionEntry[]> {
   if (!completionProvider) {
@@ -901,11 +894,9 @@ async function getLanguageServerCompletions(
 
     const items = Array.isArray(result) ? result : result?.items || [];
     
-    const filteredItems = items.filter((item) => {
-      return filterAggregateProviderItems
-        ? isVscodeAggregateCompletionItem(context, item, sessionData?.search)
-        : isConsoleOwnedLanguageServerCompletionItem(context, item);
-    });
+    const filteredItems = items.filter((item) =>
+      isLanguageServerCompletionItem(context, item, sessionData?.search)
+    );
     
     return filteredItems.map((item) => ({
       label: stripSnippetSyntax(getCompletionLabel(item)),
@@ -920,44 +911,29 @@ async function getLanguageServerCompletions(
   }
 }
 
-function isConsoleOwnedLanguageServerCompletionItem(
+function isLanguageServerCompletionItem(
   context: CompletionContext,
-  item: vscode.CompletionItem
+  item: vscode.CompletionItem,
+  attachedPackages: string[] | undefined
 ): boolean {
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }
-  if (item.detail === "[workspace]") {
+
+  const detail = item.detail;
+  if (detail === "[workspace]" || detail === "[session]") {
     return false;
   }
+
   if (
     (context.kind === "argument" || context.kind === "package") &&
     item.kind === vscode.CompletionItemKind.Snippet
   ) {
     return false;
   }
-  return true;
-}
 
-function isVscodeAggregateCompletionItem(
-  context: CompletionContext,
-  item: vscode.CompletionItem,
-  attachedPackages: string[] | undefined
-): boolean {
-  if (
-    item.kind === vscode.CompletionItemKind.Text ||
-    item.kind === vscode.CompletionItemKind.Snippet
-  ) {
-    return false;
-  }
-
-  const detail = item.detail;
   if (!detail) {
     return true;
-  }
-
-  if (detail === "[workspace]" || detail === "[session]") {
-    return false;
   }
 
   const packageName = /^\{(.+)\}$/.exec(detail)?.[1];
@@ -1057,7 +1033,6 @@ function filterShadowedBufferEntries(
 function filterShadowedWorkspaceEntries(
   entries: CompletionEntry[],
   workspaceEntries: CompletionEntry[],
-  context: CompletionContext,
   preserveEntry?: (entry: CompletionEntry) => boolean
 ): CompletionEntry[] {
   if (entries.length === 0 || workspaceEntries.length === 0) {
@@ -1065,25 +1040,24 @@ function filterShadowedWorkspaceEntries(
   }
 
   const workspaceLabels = new Set(
-    workspaceEntries.map((entry) => getCompletionDedupeKey(entry, context))
+    workspaceEntries.map(getCompletionIdentityKey)
   );
 
   return entries.filter((entry) => {
     if (preserveEntry?.(entry)) {
       return true;
     }
-    return !workspaceLabels.has(getCompletionDedupeKey(entry, context));
+    return !workspaceLabels.has(getCompletionIdentityKey(entry));
   });
 }
 
 function dedupeCompletionEntries(
-  entries: CompletionEntry[],
-  context: CompletionContext
+  entries: CompletionEntry[]
 ): CompletionEntry[] {
   const seen = new Set<string>();
   const result: CompletionEntry[] = [];
   for (const entry of entries) {
-    const key = getCompletionDedupeKey(entry, context);
+    const key = getCompletionIdentityKey(entry);
     if (seen.has(key)) {
       continue;
     }
@@ -1093,15 +1067,11 @@ function dedupeCompletionEntries(
   return result;
 }
 
-function getCompletionDedupeKey(
-  entry: CompletionEntry,
-  context: CompletionContext
-): string {
+export function getCompletionIdentityKey(entry: CompletionEntry): string {
   return [
-    getCompletionGroup(entry, context),
     entry.label.toLowerCase(),
-    entry.insertText,
-    entry.kind ?? -1,
+    entry.detail ? stripSnippetSyntax(entry.detail) : "",
+    getCompletionDescription(entry),
   ].join("\u0000");
 }
 

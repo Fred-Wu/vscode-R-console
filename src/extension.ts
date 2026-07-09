@@ -79,15 +79,6 @@ function refreshTerminalAppearance(): void {
   }
 }
 
-function warnIfConsoleLanguageServerRouteChanged(): void {
-  if (rTerminalToRecord.size === 0) {
-    return;
-  }
-  void vscode.window.showWarningMessage(
-    "Restart or reattach R Console required to use the new language-server route."
-  );
-}
-
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionHostDeactivating = false;
   context.subscriptions.push(
@@ -125,9 +116,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       refreshTerminalAppearance();
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("r.console.languageServer")) {
-        warnIfConsoleLanguageServerRouteChanged();
-      }
       if (event.affectsConfiguration("r.console")) {
         refreshTerminalAppearance();
       }
