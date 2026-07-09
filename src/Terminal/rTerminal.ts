@@ -1183,6 +1183,10 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
+      case "ctrl_space":
+        this.expandForEdit();
+        void this.handleAutocomplete(true);
+        return;
       case "backtab": {
         this.expandForEdit();
         const beforeCursor = this.inputState.currentLineBeforeCursor;
@@ -1658,12 +1662,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
   }
 
-  private async handleAutocomplete(): Promise<void> {
+  private async handleAutocomplete(force = false): Promise<void> {
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
       getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
       refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+      force,
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
       },

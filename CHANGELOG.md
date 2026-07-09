@@ -10,14 +10,14 @@ All notable changes to R Console will be documented in this file.
 - Added `r.console.languageServer` to choose between vscode-R's language server and the console-owned language server.
   - When `vscode-r` is selected, console completions use an existing language server started by vscode-R, or start one through vscode-R, so language-server selection follows vscode-R's LSP behavior, including `r.lsp.multiServer`.
   - When `console` is selected, the console starts its own separate language-server process.
-
+  - Added `Ctrl+Space` to open console completions anywhere, including positions without a completion prefix or context.
+  
 ### Changed
 
 - Removed languageserver-based semantic-token syntax highlighting, and mapped console token types directly to the VS Code color theme based on languageserver semantic token types.
 - Re-designed Qick Pick item display to preserve the groupings of completion results.
 - Runtime completions now appear immediately while language-server suggestions continue loading in both language-server routes.
 - Further reduced the delay when opening suggestions in the console-owned language-server route.
-- 
 
 ## [0.3.1] - 2026-06-29
 

@@ -119,20 +119,18 @@ async function ensureDocumentDir(dir: string): Promise<void> {
   initializedDocumentDirs.add(dir);
 }
 
-function removeDocumentDirIfEmpty(dir: string): boolean {
+function removeDocumentDirIfEmpty(dir: string): void {
   try {
     const entries = fs.readdirSync(dir);
     const generatedDocuments = entries.filter(
       (entry) => !GENERATED_CONTROL_FILES.has(entry)
     );
     if (generatedDocuments.length > 0) {
-      return false;
+      return;
     }
     fs.rmSync(dir, { recursive: true, force: true });
     initializedDocumentDirs.delete(dir);
-    return true;
   } catch {
-    return false;
   }
 }
 
@@ -193,12 +191,6 @@ export class VirtualRDocument {
     }
 
     const dir = path.dirname(this.uri.fsPath);
-    const openDocument = vscode.workspace.textDocuments.find(
-      (document) => document.uri.toString() === this.uri.toString()
-    );
-    if (openDocument?.languageId === this.languageId) {
-      void vscode.languages.setTextDocumentLanguage(openDocument, "plaintext");
-    }
     makeGeneratedFileWritableSync(this.uri.fsPath);
     try {
       fs.rmSync(this.uri.fsPath, { force: true });

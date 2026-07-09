@@ -114,9 +114,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.managePersistentSessions", () => {
       void managePersistentSessions(context);
     }),
-    vscode.commands.registerCommand("r-console.insertPipeOperator", () => {
-      insertPipeOperatorInActiveConsole();
-    }),
+    vscode.commands.registerCommand("r-console.insertPipeOperator", () =>
+      getActiveRTerminal()?.insertPipeOperator()
+    ),
     vscode.window.onDidOpenTerminal(handleTerminalOpen),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
     vscode.window.onDidCloseTerminal(handleTerminalClose),
@@ -475,10 +475,9 @@ async function createRTerminal(
   schedulePersistPersistentSessions();
 }
 
-function insertPipeOperatorInActiveConsole(): void {
+function getActiveRTerminal(): RTerminal | undefined {
   const terminal = vscode.window.activeTerminal;
-  const record = terminal ? resolveRecordFromTerminal(terminal) : undefined;
-  record?.rTerminal.insertPipeOperator();
+  return terminal ? resolveRecordFromTerminal(terminal)?.rTerminal : undefined;
 }
 
 function syncRConsoleActiveContext(excludedTerminal?: vscode.Terminal): void {

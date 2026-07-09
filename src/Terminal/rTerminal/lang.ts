@@ -44,6 +44,7 @@ type AutocompleteRequest = {
   getCurrentInput: () => InputSnapshot;
   getWorkspaceData: () => WorkspaceData | undefined;
   refreshWorkspaceData: () => void;
+  force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
@@ -93,13 +94,22 @@ export class RTermLang {
     getCurrentInput,
     getWorkspaceData,
     refreshWorkspaceData,
+    force = false,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
       input.textBeforeCursor
-    );
+    ) ?? (force
+      ? {
+          kind: "default" as const,
+          prefix: "",
+          replaceStart: input.cursorCol,
+          snapshotInput: input.currentLine,
+          snapshotCursor: input.cursorCol,
+        }
+      : undefined);
     if (!context) {
       return;
     }
@@ -194,16 +204,22 @@ export class RTermLang {
         return;
       }
 
+      const opensEmptyQuickPick = force && context.prefix.length === 0;
       const entries = stagedEntries?.length
         ? stagedEntries
+        : opensEmptyQuickPick
+        ? []
         : await fullEntriesPromise;
       if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
 
       if (!entries || entries.length === 0) {
-        return;
+        if (!force) {
+          return;
+        }
       }
+      const initialEntries = entries ?? [];
 
       const pickOptions = {
         matchOnDescription: false,
@@ -300,6 +316,7 @@ export class RTermLang {
         const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
         let active = true;
         let request = 0;
+        let blankContextRefined = false;
         let baselineEntries = initialEntries;
         let sourceEntries = initialEntries;
         Object.assign(pick, {
@@ -323,23 +340,37 @@ export class RTermLang {
         pick.onDidChangeValue((value) => void (async () => {
           const refinesBlankContext =
             context.prefix.length === 0 &&
-            (context.kind === "argument" ||
+            (force ||
+              context.kind === "argument" ||
               (context.kind === "bracket" && !!context.dataObjectName));
           if (value.length === 0 && refinesBlankContext) {
+            blankContextRefined = false;
             request += 1;
             sourceEntries = baselineEntries;
             setQuickPickItems(pick, sourceEntries, value);
             return;
           }
 
-          setQuickPickItems(pick, sourceEntries, value);
           const refinesEmptyContext =
             value.length > 0 &&
             refinesBlankContext;
+          setQuickPickItems(pick, sourceEntries, value);
           if (context.kind !== "package" && !refinesEmptyContext) {
             return;
           }
+          if (refinesEmptyContext && blankContextRefined) {
+            return;
+          }
+          if (refinesEmptyContext) {
+            blankContextRefined = true;
+          }
           const currentRequest = ++request;
+          await requestRefinedEntries(value, currentRequest);
+        })().catch(() => undefined));
+        const requestRefinedEntries = async (
+          value: string,
+          currentRequest: number
+        ): Promise<void> => {
           const prefix = context.kind === "package" && !value.startsWith(context.prefix)
             ? context.prefix + value
             : value;
@@ -396,9 +427,9 @@ export class RTermLang {
             sourceEntries = context.kind === "package"
               ? nextEntries
               : mergeCompletionEntries(baselineEntries, nextEntries);
-            setQuickPickItems(pick, sourceEntries, value);
+            setQuickPickItems(pick, sourceEntries, pick.value);
           }
-        })().catch(() => undefined));
+        };
         pick.onDidAccept(() => {
           const item = pick.selectedItems[0];
           if (!isCompletionPickItem(item)) {
@@ -422,10 +453,10 @@ export class RTermLang {
         prefillQuickPick(pick);
       });
       let selection: vscode.QuickPickItem | undefined;
-      if (context.kind !== "package" && stagedEntries?.length) {
-        selection = await showCompletionQuickPick(entries, fullEntriesPromise);
+      if (context.kind !== "package" && (stagedEntries?.length || opensEmptyQuickPick)) {
+        selection = await showCompletionQuickPick(initialEntries, fullEntriesPromise);
       } else {
-        selection = await showCompletionQuickPick(entries);
+        selection = await showCompletionQuickPick(initialEntries);
       }
 
       if (!isCompletionPickItem(selection)) {
