@@ -78,6 +78,10 @@ export class RTermLang {
   async start(): Promise<void> {
     if (this.usesConsoleLsp()) {
       await this.ensureConsoleLspStarted();
+      const docContext = await this.getOrOpenCompletionDocument("");
+      if (docContext) {
+        this.requestSilentCompletion(docContext.document);
+      }
       return;
     }
     await this.getOrOpenCompletionDocument("");
@@ -487,8 +491,14 @@ export class RTermLang {
 
     this.silentCompletionRequest = (async () => {
       try {
+        const completionProvider = this.usesConsoleLsp()
+          ? this.consoleLsp
+          : this.languageBridge;
+        if (!completionProvider) {
+          return;
+        }
         const position = document.positionAt(document.getText().length);
-        await this.languageBridge.provideCompletionItems(document, position);
+        await completionProvider.provideCompletionItems(document, position);
       } catch {
       } finally {
         this.silentCompletionRequest = undefined;
