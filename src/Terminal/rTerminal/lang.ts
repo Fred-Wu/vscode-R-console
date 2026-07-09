@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  type CompletionEntry,
   type CompletionProvider,
   CompletionPickItem,
   collectCompletionEntries,
@@ -204,7 +205,6 @@ export class RTermLang {
         return;
       }
 
-      const picks = toCompletionQuickPickItems(entries, context);
       const pickOptions = {
         matchOnDescription: false,
         matchOnDetail: false,
@@ -220,86 +220,141 @@ export class RTermLang {
         }
         setTimeout(() => { if (pick.value.length === 0) { pick.value = context.prefix; } }, 0);
       };
+      const searchValue = (value: string): string => {
+        if (context.kind === "package" && value.length > 0 && !value.startsWith(context.prefix)) {
+          return context.prefix + value;
+        }
+        return value;
+      };
+      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] => {
+        const query = searchValue(value).toLowerCase();
+        if (query.length === 0) {
+          return sourceEntries;
+        }
+        return sourceEntries.filter((entry) => entry.label.toLowerCase().startsWith(query));
+      };
+      const quickPickContext = (value: string) => ({
+        ...context,
+        prefix: searchValue(value),
+        snapshotInput: latestInput.currentLine,
+        snapshotCursor: latestInput.cursorCol,
+      });
+      const toGroupedItems = (
+        sourceEntries: CompletionEntry[],
+        value: string
+      ): vscode.QuickPickItem[] => toCompletionQuickPickItems(
+        filterEntries(sourceEntries, value),
+        quickPickContext(value)
+      );
+      const setQuickPickItems = (
+        pick: vscode.QuickPick<vscode.QuickPickItem>,
+        sourceEntries: CompletionEntry[],
+        value: string
+      ): void => {
+        const items = toGroupedItems(sourceEntries, value);
+        pick.items = items;
+        const firstCompletion = items.find(isCompletionPickItem);
+        if (firstCompletion) {
+          pick.activeItems = [firstCompletion];
+        }
+      };
+      const showCompletionQuickPick = async (
+        initialEntries: CompletionEntry[],
+        delayedEntries?: typeof fullEntriesPromise
+      ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
+        const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
+        let active = true;
+        let request = 0;
+        let sourceEntries = initialEntries;
+        Object.assign(pick, {
+          matchOnDescription: false,
+          matchOnDetail: false,
+          sortByLabel: false,
+          placeholder: pickOptions.placeHolder,
+        });
+        setQuickPickItems(pick, sourceEntries, "");
+        void delayedEntries?.then((nextEntries) => {
+          if (!active || !nextEntries?.length || !this.isCurrentCompletionRequest(requestId)) {
+            return;
+          }
+          sourceEntries = nextEntries;
+          setQuickPickItems(pick, sourceEntries, pick.value);
+        }).catch(() => undefined);
+        pick.onDidChangeValue((value) => void (async () => {
+          setQuickPickItems(pick, sourceEntries, value);
+          if (context.kind !== "package") {
+            return;
+          }
+          const currentRequest = ++request;
+          const prefix = value.startsWith(context.prefix) ? value : context.prefix + value;
+          const cursorCol = context.replaceStart + prefix.length;
+          const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
+          const lines = [...latestInput.lines];
+          lines[latestInput.cursorRow] = currentLine;
+          const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
+          const nextInputText = lines.join("\n");
+          const nextDocContext = await this.getOrOpenCompletionDocument(
+            nextInputText,
+            cachedSessionData
+          );
+          if (!this.isCurrentCompletionRequest(requestId)) {
+            return;
+          }
+          if (!nextDocContext) {
+            return;
+          }
+          if (!completionProvider) {
+            return;
+          }
+          const nextEntries = await collectCompletionEntries(
+            nextContext,
+            nextDocContext.document,
+            new vscode.Position(latestInput.cursorRow + nextDocContext.lineOffset, cursorCol),
+            cachedSessionData,
+            [
+              ...nextDocContext.preludeLines,
+              ...lines.slice(0, latestInput.cursorRow),
+            ],
+            recentEntries,
+            completionProvider,
+            nextInputText,
+            filterAggregateProviderItems
+          );
+          if (!this.isCurrentCompletionRequest(requestId)) {
+            return;
+          }
+          if (currentRequest === request) {
+            sourceEntries = nextEntries;
+            setQuickPickItems(pick, sourceEntries, value);
+          }
+        })().catch(() => undefined));
+        pick.onDidAccept(() => {
+          const item = pick.selectedItems[0];
+          if (!isCompletionPickItem(item)) {
+            return;
+          }
+          active = false;
+          request += 1;
+          resolve(item);
+          pick.hide();
+        });
+        pick.onDidHide(() => {
+          const cancelled = active;
+          active = false;
+          request += 1;
+          pick.dispose();
+          if (cancelled) {
+            resolve(undefined);
+          }
+        });
+        pick.show();
+        prefillQuickPick(pick);
+      });
       let selection: vscode.QuickPickItem | undefined;
       if (context.kind !== "package" && stagedEntries?.length) {
-        selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
-          const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
-          let active = true;
-          Object.assign(pick, { matchOnDescription: false, matchOnDetail: false, placeholder: pickOptions.placeHolder, items: picks });
-          void fullEntriesPromise.then((nextEntries) => {
-            if (active && nextEntries?.length && this.isCurrentCompletionRequest(requestId)) {
-              pick.items = toCompletionQuickPickItems(nextEntries, context);
-            }
-          }).catch(() => undefined);
-          pick.onDidAccept(() => { const item = pick.selectedItems[0]; active = false; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
-          pick.onDidHide(() => { const cancelled = active; active = false; pick.dispose(); if (cancelled) { resolve(undefined); } });
-          pick.show();
-          prefillQuickPick(pick);
-        });
-      } else if (context.kind !== "package") {
-        selection = shouldPrefillQuickPick
-          ? await new Promise<CompletionPickItem | undefined>((resolve) => {
-              const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
-              let active = true;
-              Object.assign(pick, { matchOnDescription: false, matchOnDetail: false, placeholder: pickOptions.placeHolder, items: picks });
-              pick.onDidAccept(() => { const item = pick.selectedItems[0]; active = false; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
-              pick.onDidHide(() => { const cancelled = active; active = false; pick.dispose(); if (cancelled) { resolve(undefined); } });
-              pick.show();
-              prefillQuickPick(pick);
-            })
-          : await vscode.window.showQuickPick(picks, pickOptions);
+        selection = await showCompletionQuickPick(entries, fullEntriesPromise);
       } else {
-        selection = await new Promise<CompletionPickItem | undefined>((resolve) => {
-            const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
-            let request = 0;
-            Object.assign(pick, { matchOnDescription: false, matchOnDetail: false, placeholder: pickOptions.placeHolder, items: picks });
-            pick.onDidChangeValue((value) => void (async () => {
-              const currentRequest = ++request;
-              const prefix = value.startsWith(context.prefix) ? value : context.prefix + value;
-              const cursorCol = context.replaceStart + prefix.length;
-              const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
-              const lines = [...latestInput.lines];
-              lines[latestInput.cursorRow] = currentLine;
-              const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
-              const nextInputText = lines.join("\n");
-              const nextDocContext = await this.getOrOpenCompletionDocument(
-                nextInputText,
-                cachedSessionData
-              );
-              if (!this.isCurrentCompletionRequest(requestId)) {
-                return;
-              }
-              if (!nextDocContext) {
-                return;
-              }
-              if (!completionProvider) {
-                return;
-              }
-              const nextEntries = await collectCompletionEntries(
-                nextContext,
-                nextDocContext.document,
-                new vscode.Position(latestInput.cursorRow + nextDocContext.lineOffset, cursorCol),
-                cachedSessionData,
-                [
-                  ...nextDocContext.preludeLines,
-                  ...lines.slice(0, latestInput.cursorRow),
-                ],
-                recentEntries,
-                completionProvider,
-                nextInputText,
-                filterAggregateProviderItems
-              );
-              if (!this.isCurrentCompletionRequest(requestId)) {
-                return;
-              }
-              if (currentRequest === request) {
-                pick.items = toCompletionQuickPickItems(nextEntries, { ...nextContext, snapshotInput: latestInput.currentLine, snapshotCursor: latestInput.cursorCol });
-              }
-            })().catch(() => undefined));
-            pick.onDidAccept(() => { const item = pick.selectedItems[0]; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
-            pick.onDidHide(() => { request += 1; pick.dispose(); resolve(undefined); });
-            pick.show();
-          });
+        selection = await showCompletionQuickPick(entries);
       }
 
       if (!isCompletionPickItem(selection)) {
