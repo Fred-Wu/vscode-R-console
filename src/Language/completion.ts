@@ -45,10 +45,23 @@ const COMPLETION_GROUP_ORDER = {
 
 const DATA_CONTEXT_GROUP_ORDER = [
   "Fields",
+  "Arguments",
   "Runtime Variables",
   "Runtime Functions",
   "Packages",
   "Functions",
+  "Recent Input",
+  "Other",
+] as const;
+
+const EXACT_MATCH_GROUP_ORDER = [
+  "Runtime Variables",
+  "Runtime Functions",
+  "Functions",
+  "Package Members",
+  "Packages",
+  "Fields",
+  "Arguments",
   "Recent Input",
   "Other",
 ] as const;
@@ -103,7 +116,7 @@ const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
 const BRACKET_CHAIN_SEGMENT = "(?:\\[[^\\[\\]]*\\]|\\[\\[[^\\[\\]]*\\]\\])";
 const MEMBER_OBJECT_SEGMENT = `(?:${MEMBER_CHAIN_SEGMENT}(?:${BRACKET_CHAIN_SEGMENT})*)`;
 const BRACKET_OBJECT_PATTERN = new RegExp(
-  `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)(\\[\\[?)\\s*(["']?)([a-zA-Z0-9._]*)$`
+  `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)\\s*(\\[\\[?)([^\\]]*)$`
 );
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
 const BACKTICKED_R_NAME_PATTERN = /`(?:\\.|[^`\\])*`/g;
@@ -236,9 +249,13 @@ export function getCompletionContext(
 
   const bracketMatch = BRACKET_OBJECT_PATTERN.exec(beforeCursor);
   if (bracketMatch) {
-    const bracketOperator = bracketMatch[2] as "[" | "[[";
-    const prefix = bracketMatch[4] || "";
     const bracketObject = bracketMatch[1];
+    const bracketOperator = bracketMatch[2] as "[" | "[[";
+    const bracketTail = bracketMatch[3];
+    const quotedPrefix = /(["'])([a-zA-Z0-9._]*)$/.exec(bracketTail);
+    const prefix = quotedPrefix
+      ? quotedPrefix[2]
+      : /([a-zA-Z0-9._]*)$/.exec(bracketTail)?.[1] ?? "";
     const baseObject = /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(bracketObject)?.[0] ?? bracketObject;
     const isPlaceholderBracket = isPipePlaceholder(baseObject) && !!dataObjectName;
     const effectiveDataObject = isPlaceholderBracket ? dataObjectName : baseObject;
@@ -246,10 +263,10 @@ export function getCompletionContext(
       kind: "bracket",
       prefix,
       replaceStart: beforeCursor.length - prefix.length,
-      triggerCharacter: bracketMatch[3] ? undefined : "[",
+      triggerCharacter: quotedPrefix ? undefined : "[",
       objectName: baseObject,
       bracketOperator,
-      bracketQuote: bracketMatch[3] ? bracketMatch[3] as "\"" | "'" : undefined,
+      bracketQuote: quotedPrefix?.[1] as "\"" | "'" | undefined,
       chainedBracket: bracketObject !== baseObject || isPlaceholderBracket,
       dataObjectName: effectiveDataObject,
       operator: undefined,
@@ -403,21 +420,12 @@ export async function collectCompletionEntries(
   if (context.kind === "bracket") {
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
+    const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
-    const exactColumnMatch = columnFiltered.some(
-      (entry) => entry.label.toLowerCase() === context.prefix.toLowerCase()
-    );
-    if (lspFiltered.length > 0 && !exactColumnMatch) {
-      return dedupeCompletionEntries([...lspFiltered, ...columnFiltered, ...bufferFiltered], context);
-    }
-    if (context.chainedBracket && bufferFiltered.length > 0) {
-      return dedupeCompletionEntries([...columnFiltered, ...bufferFiltered], context);
-    }
-    if (columnFiltered.length > 0) {
-      return dedupeCompletionEntries(columnFiltered, context);
-    }
     return dedupeCompletionEntries([
-      ...filterCompletionEntries(sessionItems, context.prefix),
+      ...columnFiltered,
+      ...lspFiltered,
+      ...sessionFiltered,
       ...bufferFiltered,
     ], context);
   }
@@ -428,11 +436,8 @@ export async function collectCompletionEntries(
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
-    if (context.dataObjectName && columnFiltered.length > 0) {
-      return dedupeCompletionEntries(columnFiltered, context);
-    }
-
     return dedupeCompletionEntries([
+      ...columnFiltered,
       ...lspFiltered,
       ...sessionFiltered,
       ...bufferFiltered,
@@ -453,13 +458,14 @@ export async function collectCompletionEntries(
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
-  
-  if (context.dataObjectName && defaultColumnFiltered.length > 0) {
-    return dedupeCompletionEntries(defaultColumnFiltered, context);
-  }
 
   return dedupeCompletionEntries(filterCompletionEntries(
-    [...lspItems, ...sessionItems, ...fallbackBufferItems],
+    [
+      ...defaultColumnFiltered,
+      ...lspItems,
+      ...sessionItems,
+      ...fallbackBufferItems,
+    ],
     context.prefix
   ), context);
 }
@@ -513,14 +519,29 @@ export function toCompletionQuickPickItems(
 
   const result: CompletionQuickPickItem[] = [];
   const preferredGroups =
-    context.kind === "default" && context.dataObjectName
+    isDataCompletionContext(context)
       ? DATA_CONTEXT_GROUP_ORDER
       : COMPLETION_GROUP_ORDER[context.kind];
   const orderedGroups = new Set<string>(preferredGroups);
-  const groups = [
+  const baseGroups = [
     ...preferredGroups,
     ...[...grouped.keys()].filter((group) => !orderedGroups.has(group)),
   ];
+  const pinnedGroups = getPinnedCompletionGroups(context).filter((group) =>
+    grouped.has(group)
+  );
+  const exactMatchGroups = getExactMatchGroups(grouped, context.prefix).filter(
+    (group) => !pinnedGroups.includes(group)
+  );
+  const groups = exactMatchGroups.length === 0
+    ? baseGroups
+    : [
+        ...pinnedGroups,
+        ...exactMatchGroups,
+        ...baseGroups.filter((group) =>
+          !pinnedGroups.includes(group) && !exactMatchGroups.includes(group)
+        ),
+      ];
 
   for (const group of groups) {
     const groupEntries = grouped.get(group);
@@ -535,6 +556,40 @@ export function toCompletionQuickPickItems(
   }
 
   return result;
+}
+
+function getPinnedCompletionGroups(context: CompletionContext): string[] {
+  return [
+    ...(isDataCompletionContext(context) ? ["Fields"] : []),
+    ...(context.kind === "argument" ? ["Arguments"] : []),
+  ];
+}
+
+function getExactMatchGroups(
+  grouped: Map<string, CompletionEntry[]>,
+  prefix: string
+): string[] {
+  const query = prefix.toLowerCase();
+  if (query.length === 0) {
+    return [];
+  }
+
+  const exactGroups = [...grouped.entries()]
+    .filter(([, entries]) =>
+      entries.some((entry) => entry.label.toLowerCase() === query)
+    )
+    .map(([group]) => group);
+
+  return exactGroups.sort((a, b) =>
+    getExactMatchGroupRank(a) - getExactMatchGroupRank(b)
+  );
+}
+
+function getExactMatchGroupRank(group: string): number {
+  const index = EXACT_MATCH_GROUP_ORDER.indexOf(
+    group as typeof EXACT_MATCH_GROUP_ORDER[number]
+  );
+  return index === -1 ? EXACT_MATCH_GROUP_ORDER.length : index;
 }
 
 export function isCompletionPickItem(
@@ -562,13 +617,15 @@ function getCompletionGroup(
     return "Package Members";
   }
   if (
-    context.kind === "argument" &&
     entry.source === "lsp" &&
     isArgumentCompletionEntry(entry)
   ) {
     return "Arguments";
   }
   if (kind === vscode.CompletionItemKind.Field || kind === vscode.CompletionItemKind.Property) {
+    if (entry.source === "lsp" && isDataCompletionContext(context)) {
+      return "Other";
+    }
     return "Fields";
   }
   if (entry.source === "session") {
@@ -582,6 +639,13 @@ function getCompletionGroup(
   }
 
   return "Other";
+}
+
+function isDataCompletionContext(context: CompletionContext): boolean {
+  return (
+    !!context.dataObjectName &&
+    (context.kind === "default" || context.kind === "argument" || context.kind === "bracket")
+  );
 }
 
 function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): boolean {
@@ -963,7 +1027,7 @@ function filterCompletionEntries(
   const result: CompletionEntry[] = [];
   for (const entry of entries) {
     const label = entry.label;
-    if (normalizedPrefix && !label.toLowerCase().startsWith(normalizedPrefix)) {
+    if (normalizedPrefix && !label.toLowerCase().includes(normalizedPrefix)) {
       continue;
     }
     result.push(entry);

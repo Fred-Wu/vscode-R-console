@@ -6,7 +6,7 @@ All notable changes to R Console will be documented in this file.
 
 ### Added
 
-- Added vscode-R language-server routing for console completions through hidden `.rconsole` documents. This is to reduce extra R language-server processes and memory footprint when the shared route is selected.
+- Added vscode-R language-server routing for console completions through hidden `.rconsole` documents. This is to reduce extra R language-server processes when the shared route is selected.
 - Added `r.console.languageServer` to choose between vscode-R's language server and the console-owned language server.
   - When `vscode-r` is selected, console completions use an existing language server started by vscode-R, or start one through vscode-R, so language-server selection follows vscode-R's LSP behavior, including `r.lsp.multiServer`.
   - When `console` is selected, the console starts its own separate language-server process.

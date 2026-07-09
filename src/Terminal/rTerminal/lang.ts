@@ -231,7 +231,42 @@ export class RTermLang {
         if (query.length === 0) {
           return sourceEntries;
         }
-        return sourceEntries.filter((entry) => entry.label.toLowerCase().startsWith(query));
+        return sourceEntries
+          .map((entry, index) => ({ entry, index }))
+          .filter(({ entry }) => entry.label.toLowerCase().includes(query))
+          .sort((a, b) => {
+            const aLabel = a.entry.label.toLowerCase();
+            const bLabel = b.entry.label.toLowerCase();
+            const aRank = aLabel === query ? 0 : aLabel.startsWith(query) ? 1 : 2;
+            const bRank = bLabel === query ? 0 : bLabel.startsWith(query) ? 1 : 2;
+            return (
+              aRank - bRank ||
+              aLabel.indexOf(query) - bLabel.indexOf(query) ||
+              aLabel.length - bLabel.length ||
+              a.index - b.index
+            );
+          })
+          .map(({ entry }) => entry);
+      };
+      const mergeCompletionEntries = (
+        firstEntries: CompletionEntry[],
+        secondEntries: CompletionEntry[]
+      ): CompletionEntry[] => {
+        const seen = new Set<string>();
+        const merged: CompletionEntry[] = [];
+        for (const entry of [...firstEntries, ...secondEntries]) {
+          const key = [
+            entry.label.toLowerCase(),
+            entry.insertText,
+            entry.kind ?? -1,
+          ].join("\u0000");
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          merged.push(entry);
+        }
+        return merged;
       };
       const quickPickContext = (value: string) => ({
         ...context,
@@ -265,6 +300,7 @@ export class RTermLang {
         const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
         let active = true;
         let request = 0;
+        let baselineEntries = initialEntries;
         let sourceEntries = initialEntries;
         Object.assign(pick, {
           matchOnDescription: false,
@@ -277,21 +313,53 @@ export class RTermLang {
           if (!active || !nextEntries?.length || !this.isCurrentCompletionRequest(requestId)) {
             return;
           }
+          if (request !== 0) {
+            return;
+          }
+          baselineEntries = nextEntries;
           sourceEntries = nextEntries;
           setQuickPickItems(pick, sourceEntries, pick.value);
         }).catch(() => undefined);
         pick.onDidChangeValue((value) => void (async () => {
+          const refinesBlankContext =
+            context.prefix.length === 0 &&
+            (context.kind === "argument" ||
+              (context.kind === "bracket" && !!context.dataObjectName));
+          if (value.length === 0 && refinesBlankContext) {
+            request += 1;
+            sourceEntries = baselineEntries;
+            setQuickPickItems(pick, sourceEntries, value);
+            return;
+          }
+
           setQuickPickItems(pick, sourceEntries, value);
-          if (context.kind !== "package") {
+          const refinesEmptyContext =
+            value.length > 0 &&
+            refinesBlankContext;
+          if (context.kind !== "package" && !refinesEmptyContext) {
             return;
           }
           const currentRequest = ++request;
-          const prefix = value.startsWith(context.prefix) ? value : context.prefix + value;
+          const prefix = context.kind === "package" && !value.startsWith(context.prefix)
+            ? context.prefix + value
+            : value;
           const cursorCol = context.replaceStart + prefix.length;
           const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
           const lines = [...latestInput.lines];
           lines[latestInput.cursorRow] = currentLine;
-          const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
+          const fullTextBeforeCursor = [
+            ...lines.slice(0, latestInput.cursorRow),
+            currentLine.slice(0, cursorCol),
+          ].join("\n");
+          const nextContext = context.kind === "package"
+            ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
+            : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor);
+          if (!nextContext) {
+            return;
+          }
+          if (prefix.length > 0) {
+            nextContext.triggerCharacter = undefined;
+          }
           const nextInputText = lines.join("\n");
           const nextDocContext = await this.getOrOpenCompletionDocument(
             nextInputText,
@@ -303,6 +371,7 @@ export class RTermLang {
           if (!nextDocContext) {
             return;
           }
+          completionProvider ??= await this.getCompletionProvider();
           if (!completionProvider) {
             return;
           }
@@ -324,7 +393,9 @@ export class RTermLang {
             return;
           }
           if (currentRequest === request) {
-            sourceEntries = nextEntries;
+            sourceEntries = context.kind === "package"
+              ? nextEntries
+              : mergeCompletionEntries(baselineEntries, nextEntries);
             setQuickPickItems(pick, sourceEntries, value);
           }
         })().catch(() => undefined));
@@ -483,11 +554,10 @@ export class RTermLang {
       }
 
       const documentContent = this.buildCompletionDocumentContent(content, data);
-      const document = await this
-        .getOrUpdateCompletionDocument(documentContent.text)
-        .writeFileBackedDocument();
+      const document = this.getOrUpdateCompletionDocument(documentContent.text);
+      await document.writeFileBackedContent();
       return {
-        document,
+        document: document as unknown as vscode.TextDocument,
         lineOffset: documentContent.preludeLines.length,
         preludeLines: documentContent.preludeLines,
       };

@@ -148,7 +148,6 @@ export class VirtualRDocument {
   private text: string;
   private readonly fileBacked: boolean;
   private fileBackedWriteQueue: Promise<unknown> = Promise.resolve();
-  private fileBackedSaveTimer: NodeJS.Timeout | undefined;
 
   constructor(
     id: string,
@@ -193,10 +192,6 @@ export class VirtualRDocument {
       return;
     }
 
-    if (this.fileBackedSaveTimer) {
-      clearTimeout(this.fileBackedSaveTimer);
-      this.fileBackedSaveTimer = undefined;
-    }
     const dir = path.dirname(this.uri.fsPath);
     const openDocument = vscode.workspace.textDocuments.find(
       (document) => document.uri.toString() === this.uri.toString()
@@ -212,72 +207,22 @@ export class VirtualRDocument {
     removeDocumentDirIfEmpty(dir);
   }
 
-  async writeFileBackedDocument(): Promise<vscode.TextDocument> {
+  async writeFileBackedContent(): Promise<void> {
     if (!this.fileBacked) {
       throw new Error("R console document is not file-backed.");
     }
 
     const write = this.fileBackedWriteQueue
       .catch(() => undefined)
-      .then(() => this.writeFileBackedDocumentNow());
+      .then(() => this.writeFileBackedContentNow());
     this.fileBackedWriteQueue = write.catch(() => undefined);
-    return await write;
+    await write;
   }
 
-  private async writeFileBackedDocumentNow(): Promise<vscode.TextDocument> {
+  private async writeFileBackedContentNow(): Promise<void> {
     const dir = path.dirname(this.uri.fsPath);
     await ensureDocumentDir(dir);
-
-    let document = vscode.workspace.textDocuments.find(
-      (item) => item.uri.toString() === this.uri.toString()
-    );
-    if (!document) {
-      await writeGeneratedFile(this.uri.fsPath, this.text);
-      document = await vscode.workspace.openTextDocument(this.uri);
-    }
-
-    if (document.getText() !== this.text) {
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(
-        document.uri,
-        new vscode.Range(
-          document.positionAt(0),
-          document.positionAt(document.getText().length)
-        ),
-        this.text
-      );
-      if (!(await vscode.workspace.applyEdit(edit))) {
-        throw new Error(`Failed to update R console document ${document.uri.toString()}`);
-      }
-    }
-
-    if (document.languageId !== this.languageId) {
-      document = await vscode.languages.setTextDocumentLanguage(
-        document,
-        this.languageId
-      );
-    }
-    this.scheduleFileBackedSave(document);
-    return document;
-  }
-
-  private scheduleFileBackedSave(document: vscode.TextDocument): void {
-    if (!document.isDirty) {
-      return;
-    }
-    if (this.fileBackedSaveTimer) {
-      clearTimeout(this.fileBackedSaveTimer);
-    }
-    this.fileBackedSaveTimer = setTimeout(() => {
-      this.fileBackedSaveTimer = undefined;
-      void (async () => {
-        if (!document.isDirty) {
-          return;
-        }
-        await makeGeneratedFileWritable(this.uri.fsPath);
-        await document.save();
-      })().catch(() => undefined);
-    }, 500);
+    await writeGeneratedFile(this.uri.fsPath, this.text);
   }
 
   getText(range?: vscode.Range): string {
