@@ -14,7 +14,7 @@ All notable changes to R Console will be documented in this file.
 ### Changed
 
 - Runtime completions now appear immediately while language-server suggestions continue loading in both language-server routes.
-- Further reduced the delay when opening suggestions in the console-owned language-server route by showing cached runtime suggestions first and avoiding repeated checks for unchanged attached packages and loaded namespaces.
+- Further reduced the delay when opening suggestions in the console-owned language-server route.
 - Removed languageserver-based semantic-token syntax highlighting, and mapped console token types directly to the VS Code color theme based on languageserver semantic token types.
 
 ## [0.3.1] - 2026-06-29

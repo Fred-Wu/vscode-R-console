@@ -1602,8 +1602,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const sanitized = stripBracketedPasteMarkers(fullText).trimEnd();
     if (this.promptVisible) {
       // Clear the live input viewport before any async submission work starts.
-      // Otherwise semantic-token callbacks can rerender against the reset input
-      // state and leave stale viewport content behind.
+      // Otherwise async completion context updates can race against the reset
+      // input state and leave stale viewport content behind.
       this.clearInputRender();
       this.promptVisible = false;
       this.lastWriteEndedWithNewline = true;

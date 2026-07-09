@@ -22,7 +22,7 @@ is used as a dependency.
 | [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
 | [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
 | [`radian`](https://github.com/randy3k/radian) | Reference for terminal-first console interaction, prompt-centric editing, multiline editing, history, reverse search, and bracketed paste expectations. | `src/Terminal/rTerminal.ts` and supporting terminal modules |
-| [`languageserver`](https://github.com/REditorSupport/languageserver) | Used directly as the R language server package for completion, signature help, semantic tokens, and console virtual documents. | `src/Language/consoleLspClient.ts`, `resources/r/console-language-server.R` |
+| [`languageserver`](https://github.com/REditorSupport/languageserver) | Used directly as the R language server package for language-server completion in the console-owned route. It is no longer used for console syntax highlighting. | `src/Language/consoleLspClient.ts`, `resources/r/console-language-server.R` |
 
 No Ark, arf, radian, or rchitect source files are vendored into this repository.
 The embedded backend, protocol, and terminal frontend are local
@@ -452,7 +452,8 @@ The selected executable is used to derive:
 The same selected R executable is used for:
 
 - the embedded backend
-- the console `languageserver` process
+- the console-owned `languageserver` process when `r.console.languageServer`
+  is set to `console`
 
 ### 3.2 Startup Bootstrap From `vscode-R`
 
@@ -527,10 +528,63 @@ The console consumes watcher metadata for:
 - global-environment completion
 - `$` and `@` member completion through the `vscode-R` session server when
   available
-- attached package and namespace sync into the console LSP
+- attached package and namespace sync into the console-owned language-server
+  route
 
 This integration is read-only with respect to `vscode-R` sessions. The console
 does not create, replace, restore, or stop `vscode-R` sessions.
+
+### 3.5 Completion And Language-server Routes
+
+Completion route selection is controlled by `r.console.languageServer`.
+
+Implementation files:
+
+- [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
+- [`src/Language/completion.ts`](../src/Language/completion.ts)
+- [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
+- [`src/Language/languageBridge.ts`](../src/Language/languageBridge.ts)
+- [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
+- [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+
+`RTermLang` owns the console completion flow. It detects the completion
+context, builds fast runtime suggestions from cached session data and the
+current input, then merges the full completion result when language-server and
+fresh session data are available.
+
+The two language-server routes share the same completion merging and QuickPick
+presentation code:
+
+- runtime/global-environment symbols come from `SessionWatcher` workspace data
+- `$` and `@` member completion uses the session-server completion endpoint
+  when available
+- data-aware bracket and pipe-placeholder contexts use cached session metadata
+  and current input for the first suggestion pass
+- language-server symbols are added by the selected route
+
+For `r.console.languageServer = "console"`, the console starts and owns a
+separate `languageserver` process through `ConsoleLspClient`. The client
+manually sends open/change/close notifications for in-memory `r-console://`
+documents so completion requests observe the latest console input. Attached
+packages and loaded namespaces are synced through `rConsole/syncSessionState`;
+unchanged state is not resent on every completion request. The console route
+starts the language server when the console opens and sends one silent
+completion request to warm the first language-server completion path.
+
+For `r.console.languageServer = "vscode-r"`, the console routes completion
+through VS Code's `vscode.executeCompletionItemProvider`, so vscode-R's shared
+language server handles the `.rconsole` document. The completion document is a
+file-backed `.rconsole` document under the hidden `.vscode-R-console`
+workspace folder, with a package prelude built from the active console session
+plus the current console input. The document is opened in VS Code memory for
+language-server use but is not shown to the user. Session-data changes refresh
+this document and can trigger a silent completion request so vscode-R's shared
+language server has seen the console context before Tab.
+
+Console syntax highlighting is separate from language-server completion. It is
+implemented locally by `src/Terminal/consoleSyntax.ts` and
+`src/Terminal/syntaxTheme.ts`, mapping local token types to the active VS Code
+theme's semantic-token colors.
 
 ## 4. Self-managed Console
 
@@ -672,5 +726,9 @@ not persisted.
 9. [`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs)
 10. [`sidecar/pty-host/src/protocol.rs`](../sidecar/pty-host/src/protocol.rs)
 11. [`sidecar/pty-host/src/main.rs`](../sidecar/pty-host/src/main.rs)
-12. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
-13. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+12. [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
+13. [`src/Language/completion.ts`](../src/Language/completion.ts)
+14. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
+15. [`src/Language/languageBridge.ts`](../src/Language/languageBridge.ts)
+16. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
+17. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)

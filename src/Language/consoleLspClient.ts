@@ -70,7 +70,6 @@ class ConsoleLanguageClient extends LanguageClient {
   }
 
   error(message: string, data?: unknown, _showNotification: boolean | "force" = true): void {
-    // Console-LSP failures are surfaced in the output channel, not as global popups.
     super.error(message, data, false);
   }
 }
@@ -280,8 +279,7 @@ export class ConsoleLspClient implements CompletionProvider {
     try {
       await client.sendRequest("rConsole/syncSessionState", this.sessionState);
       this.syncedSessionStateKey = stateKey;
-    } catch (error) {
-      this.logError(`Failed to sync console session state: ${String(error)}`);
+    } catch {
     }
   }
 
@@ -298,8 +296,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
     try {
       await this.start();
-    } catch (error) {
-      this.logError(`Failed to start console language server: ${String(error)}`);
+    } catch {
       return undefined;
     }
     return this.client;
@@ -315,7 +312,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const clientOptions: LanguageClientOptions = {
       documentSelector: [
         // We synchronize console completion documents manually to guarantee
-        // notification ordering before completion/signature requests.
+        // notification ordering before completion requests.
       ],
       uriConverters: {
         code2Protocol: (uri: vscode.Uri) => new URL(uri.toString(true)).toString(),
@@ -408,22 +405,12 @@ export class ConsoleLspClient implements CompletionProvider {
           shell: false,
         });
         this.spawnedServer = child;
-        this.logInfo(`R Console Language Server (${child.pid ?? "unknown"}) started`);
         child.stderr?.on("data", (data: Buffer | string) => {
           this.outputChannel.appendLine(data.toString());
         });
-        child.on("error", (error) => {
-          this.logError(`R Console Language Server process error: ${error.message}`);
+        child.on("error", () => {
         });
-        child.on("exit", (code, signal) => {
-          const exitText = `R Console Language Server (${child.pid ?? "unknown"}) exited ${
-            signal ? `from signal ${signal}` : `with exit code ${code ?? "null"}`
-          }`;
-          if (signal || (code ?? 0) !== 0) {
-            this.logError(exitText);
-          } else {
-            this.logInfo(exitText);
-          }
+        child.on("exit", (code) => {
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -571,16 +558,7 @@ export class ConsoleLspClient implements CompletionProvider {
           },
         },
       });
-    } catch (error) {
-      this.logError(`Failed to disable console diagnostics: ${String(error)}`);
+    } catch {
     }
-  }
-
-  private logInfo(message: string): void {
-    void message;
-  }
-
-  private logError(message: string): void {
-    void message;
   }
 }

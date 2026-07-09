@@ -76,10 +76,6 @@ export class ConsoleSyntax implements RendererLineHighlighter {
     });
   }
 
-  prepareSnapshot(input: string | string[]): Promise<string[]> {
-    return Promise.resolve(this.snapshotNow(input));
-  }
-
   snapshotNow(input: string | string[]): string[] {
     const lines = Array.isArray(input) ? [...input] : input.split("\n");
     const sourceKey = lines.join("\n");

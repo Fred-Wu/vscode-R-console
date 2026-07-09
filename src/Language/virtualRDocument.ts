@@ -8,39 +8,6 @@ const DOCUMENT_DIR_NAME = ".vscode-R-console";
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 const GENERATED_CONTROL_FILES = new Set([".gitignore", ".lintr"]);
 const initializedDocumentDirs = new Set<string>();
-const virtualDocumentContents = new Map<string, string>();
-
-class RConsoleDocumentContentProvider implements vscode.TextDocumentContentProvider {
-  private readonly didChangeEmitter = new vscode.EventEmitter<vscode.Uri>();
-  readonly onDidChange = this.didChangeEmitter.event;
-
-  provideTextDocumentContent(uri: vscode.Uri): string {
-    return virtualDocumentContents.get(uri.toString()) ?? "";
-  }
-
-  update(uri: vscode.Uri, content: string): void {
-    virtualDocumentContents.set(uri.toString(), content);
-    this.didChangeEmitter.fire(uri);
-  }
-
-  delete(uri: vscode.Uri): void {
-    virtualDocumentContents.delete(uri.toString());
-    this.didChangeEmitter.fire(uri);
-  }
-}
-
-let virtualDocumentProvider: RConsoleDocumentContentProvider | undefined;
-
-function ensureVirtualDocumentProvider(): RConsoleDocumentContentProvider {
-  if (!virtualDocumentProvider) {
-    virtualDocumentProvider = new RConsoleDocumentContentProvider();
-    vscode.workspace.registerTextDocumentContentProvider(
-      VIRTUAL_DOCUMENT_SCHEME,
-      virtualDocumentProvider
-    );
-  }
-  return virtualDocumentProvider;
-}
 
 function sanitizePathPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -172,7 +139,7 @@ function removeDocumentDirIfEmpty(dir: string): boolean {
 /**
  * R document adapter used for console language requests. It can either be a
  * hidden workspace R file for vscode-R completion routing or an in-memory
- * r-console document for transient semantic requests.
+ * r-console document for console-owned language-server synchronization.
  */
 export class VirtualRDocument {
   readonly uri: vscode.Uri;
@@ -219,14 +186,10 @@ export class VirtualRDocument {
     }
     this.text = nextText;
     this.version += 1;
-    if (!this.fileBacked && virtualDocumentContents.has(this.uri.toString())) {
-      ensureVirtualDocumentProvider().update(this.uri, this.text);
-    }
   }
 
   dispose(): void {
     if (!this.fileBacked) {
-      virtualDocumentProvider?.delete(this.uri);
       return;
     }
 
@@ -251,7 +214,7 @@ export class VirtualRDocument {
 
   async writeFileBackedDocument(): Promise<vscode.TextDocument> {
     if (!this.fileBacked) {
-      return await this.openTextDocument();
+      throw new Error("R console document is not file-backed.");
     }
 
     const write = this.fileBackedWriteQueue
@@ -315,22 +278,6 @@ export class VirtualRDocument {
         await document.save();
       })().catch(() => undefined);
     }, 500);
-  }
-
-  async openTextDocument(): Promise<vscode.TextDocument> {
-    if (this.fileBacked) {
-      throw new Error("File-backed R console documents must not be opened.");
-    }
-
-    ensureVirtualDocumentProvider().update(this.uri, this.text);
-    const document = await vscode.workspace.openTextDocument(this.uri);
-    if (document.languageId !== this.languageId) {
-      return await vscode.languages.setTextDocumentLanguage(
-        document,
-        this.languageId
-      );
-    }
-    return document;
   }
 
   getText(range?: vscode.Range): string {

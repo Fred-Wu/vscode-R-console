@@ -1,6 +1,6 @@
 # R Console
 
-R Console is a lightweight R console for VS Code that runs R inside a custom pseudoterminal. It combines a console frontend, a bundled R backend, and a console-scoped language server client. It is designed to work with VS Code, the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) extension, and R's `languageserver` package.
+R Console is a lightweight R console for VS Code that runs R inside a custom pseudoterminal. It combines a console frontend, a bundled R backend, and language-server completion integration. It is designed to work with VS Code, the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) extension, and R's `languageserver` package.
 
 ## Features
 

@@ -435,7 +435,7 @@ Expected:
 - the `cli` info marker is colored and not plain white
 - ANSI colors do not leak into the prompt
 
-## 12. Completion, Signatures, And Session Watcher
+## 12. Completion And Session Watcher
 
 Run:
 
@@ -447,7 +447,6 @@ lm_test <- lm(mpg ~ wt + cyl, data = mtcars)
 Now test in the console:
 
 - type `df_test$` and request completion
-- type `lm(` and request signature help
 - type `df_test[` and request completion inside brackets
 - type `stats::f` and request package completion
 
@@ -455,7 +454,6 @@ Expected:
 
 - `$` completions include `alpha`, `beta`, `gamma`
 - `[` completions on `df_test` include `alpha`, `beta`, `gamma`
-- signature help shows `lm` arguments
 - completion still works after several commands, not just right after startup
 
 Failure signs:
