@@ -446,12 +446,14 @@ lm_test <- lm(mpg ~ wt + cyl, data = mtcars)
 
 Now test in the console:
 
+- press `Alt+Esc` at an empty prompt and after typing a partial name
 - type `df_test$` and request completion
 - type `df_test[` and request completion inside brackets
 - type `stats::f` and request package completion
 
 Expected:
 
+- `Alt+Esc` opens the R Console completion window
 - `$` completions include `alpha`, `beta`, `gamma`
 - `[` completions on `df_test` include `alpha`, `beta`, `gamma`
 - completion still works after several commands, not just right after startup

@@ -189,10 +189,10 @@ export class RTermLang {
         return;
       }
 
-      const opensEmptyQuickPick = force && context.prefix.length === 0;
+      const opensBeforeFullResults = force || !!stagedEntries?.length;
       const entries = stagedEntries?.length
         ? stagedEntries
-        : opensEmptyQuickPick
+        : opensBeforeFullResults
         ? []
         : await fullEntriesPromise;
       if (!this.isCurrentCompletionRequest(requestId)) {
@@ -433,7 +433,7 @@ export class RTermLang {
         prefillQuickPick(pick);
       });
       let selection: vscode.QuickPickItem | undefined;
-      if (context.kind !== "package" && (stagedEntries?.length || opensEmptyQuickPick)) {
+      if (opensBeforeFullResults) {
         selection = await showCompletionQuickPick(initialEntries, fullEntriesPromise);
       } else {
         selection = await showCompletionQuickPick(initialEntries);

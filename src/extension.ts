@@ -108,6 +108,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.insertPipeOperator", () =>
       getActiveRTerminal()?.insertPipeOperator()
     ),
+    vscode.commands.registerCommand("r-console.triggerCompletion", () =>
+      getActiveRTerminal()?.triggerCompletion()
+    ),
     vscode.window.onDidOpenTerminal(handleTerminalOpen),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
     vscode.window.onDidCloseTerminal(handleTerminalClose),
@@ -128,7 +131,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   disposeStalePersistentTerminalViews();
   syncTerminalRecordsFromWindow();
-  syncRConsoleActiveContext();
+  setRConsoleActiveContext(vscode.window.activeTerminal);
   void ensureConfiguredRPath();
 }
 
@@ -402,18 +405,18 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   if (ignoredTerminalCloseEvents.has(closedTerminal)) {
     ignoredTerminalCloseEvents.delete(closedTerminal);
     terminalToRecord.delete(closedTerminal);
-    syncRConsoleActiveContext(closedTerminal);
+    setRConsoleActiveContext(vscode.window.activeTerminal, closedTerminal);
     return;
   }
 
   const record = resolveRecordFromTerminal(closedTerminal);
   if (!record) {
-    syncRConsoleActiveContext(closedTerminal);
+    setRConsoleActiveContext(vscode.window.activeTerminal, closedTerminal);
     return;
   }
 
   detachTerminalFromRecord(record, closedTerminal);
-  syncRConsoleActiveContext(closedTerminal);
+  setRConsoleActiveContext(vscode.window.activeTerminal, closedTerminal);
 
   if (extensionHostDeactivating) {
     return;
@@ -473,8 +476,10 @@ function getActiveRTerminal(): RTerminal | undefined {
   return terminal ? resolveRecordFromTerminal(terminal)?.rTerminal : undefined;
 }
 
-function syncRConsoleActiveContext(excludedTerminal?: vscode.Terminal): void {
-  const terminal = vscode.window.activeTerminal;
+function setRConsoleActiveContext(
+  terminal: vscode.Terminal | undefined,
+  excludedTerminal?: vscode.Terminal
+): void {
   const record = terminal && terminal !== excludedTerminal
     ? resolveRecordFromTerminal(terminal)
     : undefined;
@@ -1051,20 +1056,20 @@ function attachTerminal(
   const preserveFocus =
     preserveFocusOverride ?? alwaysUseActive === false;
   terminal.show(preserveFocus);
-  syncRConsoleActiveContext();
+  setRConsoleActiveContext(vscode.window.activeTerminal);
   return terminal;
 }
 
 function handleTerminalOpen(terminal: vscode.Terminal): void {
   syncTerminalRecord(terminal);
-  syncRConsoleActiveContext();
+  setRConsoleActiveContext(vscode.window.activeTerminal);
 }
 
 function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {
   if (terminal) {
     syncTerminalRecord(terminal);
   }
-  syncRConsoleActiveContext();
+  setRConsoleActiveContext(terminal);
 }
 
 function resolveRecordFromTerminal(

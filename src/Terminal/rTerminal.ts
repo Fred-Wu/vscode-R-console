@@ -611,6 +611,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.renderInput();
   }
 
+  public triggerCompletion(): void {
+    if (this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+
+    this.ensureReadyPromptVisibleForInput();
+    this.escPendingClear = false;
+    this.expandForEdit();
+    void this.handleAutocomplete(true);
+  }
+
   private resolveRuntimeBackend(): RuntimeBackend | undefined {
     return createRuntimeBackend(this.extensionPath);
   }
@@ -1179,10 +1190,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
-      case "ctrl_space":
-        this.expandForEdit();
-        void this.handleAutocomplete(true);
-        return;
       case "backtab": {
         this.expandForEdit();
         const beforeCursor = this.inputState.currentLineBeforeCursor;

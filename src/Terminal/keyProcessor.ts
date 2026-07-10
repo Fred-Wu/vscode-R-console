@@ -18,7 +18,6 @@ export type KeyAction =
   | { type: "ctrl_n" }
   | { type: "ctrl_p" }
   | { type: "ctrl_r" }
-  | { type: "ctrl_space" }
   | { type: "paste-start" }
   | { type: "paste-end" }
   | { type: "text"; text: string };
@@ -68,7 +67,6 @@ const ALT_2: Map<string, KeyAction> = new Map([
 ]);
 
 const CTRL_CODES: Map<number, KeyAction> = new Map([
-  [0, { type: "ctrl_space" }],
   [1, { type: "ctrl_a" }],
   [3, { type: "ctrl_c" }],
   [4, { type: "ctrl_d" }],
