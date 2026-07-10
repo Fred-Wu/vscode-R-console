@@ -1,17 +1,21 @@
 import * as vscode from "vscode";
 
-/**
- * In-memory R document used only for console LSP synchronization.
- * It is never opened in VS Code's workspace document registry.
- */
+const VIRTUAL_DOCUMENT_SCHEME = "r-console";
+
+function sanitizePathPart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
 export class VirtualRDocument {
   readonly uri: vscode.Uri;
   readonly languageId = "r";
   version = 1;
   private text: string;
 
-  constructor(id: string, initialText = "", fileName = "completion.R") {
-    this.uri = vscode.Uri.parse(`r-console://${id}/${fileName}`);
+  constructor(id: string, initialText = "") {
+    this.uri = vscode.Uri.parse(
+      `${VIRTUAL_DOCUMENT_SCHEME}://${sanitizePathPart(id)}/console.R`
+    );
     this.text = initialText;
   }
 

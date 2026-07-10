@@ -15,10 +15,8 @@ import {
   LanguageClient,
   LanguageClientOptions,
   RevealOutputChannelOn,
-  SignatureHelpRequest,
   StreamInfo,
 } from "vscode-languageclient/node";
-import { SemanticTokensRequest } from "vscode-languageserver-protocol";
 import type { CompletionProvider } from "./completion";
 import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
 
@@ -34,17 +32,9 @@ type ConsoleLspClientOptions = {
   ) => Promise<SessionMemberCompletionItem[] | undefined>;
 };
 
-export type ConsoleLspSessionState = {
+type ConsoleLspSessionState = {
   attachedPackages: string[];
   loadedNamespaces: string[];
-};
-
-export type DocumentSemanticTokensResult = {
-  legend: {
-    tokenTypes: string[];
-    tokenModifiers: string[];
-  };
-  data: number[];
 };
 
 class SilentOutputChannel implements vscode.OutputChannel {
@@ -80,16 +70,7 @@ class ConsoleLanguageClient extends LanguageClient {
   }
 
   error(message: string, data?: unknown, _showNotification: boolean | "force" = true): void {
-    // Console-LSP failures are surfaced in the output channel, not as global popups.
     super.error(message, data, false);
-  }
-
-  async sendRawRequest(method: string, params: unknown): Promise<unknown> {
-    const connection = (this as unknown as { activeConnection?: () => { sendRequest: (m: string, p: unknown) => Promise<unknown> } | undefined }).activeConnection?.();
-    if (!connection) {
-      throw new Error("Console language client connection is not active.");
-    }
-    return await connection.sendRequest(method, params);
   }
 }
 
@@ -105,6 +86,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private pendingSocketServer: net.Server | undefined;
   private syncedDocuments = new Map<string, { document: vscode.TextDocument; version: number }>();
   private sessionState: ConsoleLspSessionState | undefined;
+  private syncedSessionStateKey: string | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.outputChannel = new SilentOutputChannel("R Console");
@@ -161,6 +143,7 @@ export class ConsoleLspClient implements CompletionProvider {
         this.closePendingSocketServer();
         this.terminateSpawnedServer();
         this.syncedDocuments.clear();
+        this.syncedSessionStateKey = undefined;
         return;
       }
 
@@ -185,6 +168,7 @@ export class ConsoleLspClient implements CompletionProvider {
       }
       this.closePendingSocketServer();
       this.terminateSpawnedServer();
+      this.syncedSessionStateKey = undefined;
     });
     await this.stopPromise;
   }
@@ -259,75 +243,6 @@ export class ConsoleLspClient implements CompletionProvider {
     this.syncedDocuments.delete(key);
   }
 
-  async provideSignatureHelp(
-    doc: vscode.TextDocument,
-    position: vscode.Position,
-    triggerCharacter?: string
-  ): Promise<vscode.SignatureHelp | undefined> {
-    const client = await this.ensureClient();
-    if (!client) {
-      return undefined;
-    }
-    this.syncDocument(client, doc);
-    await this.applySessionState(client);
-    const context: vscode.SignatureHelpContext = triggerCharacter
-      ? {
-          triggerKind: vscode.SignatureHelpTriggerKind.TriggerCharacter,
-          triggerCharacter,
-          isRetrigger: false,
-          activeSignatureHelp: undefined,
-        }
-      : {
-          triggerKind: vscode.SignatureHelpTriggerKind.Invoke,
-          triggerCharacter: undefined,
-          isRetrigger: false,
-          activeSignatureHelp: undefined,
-        };
-
-    try {
-      const params = client.code2ProtocolConverter.asSignatureHelpParams(doc, position, context);
-      const result = await client.sendRequest(SignatureHelpRequest.type, params);
-      return await client.protocol2CodeConverter.asSignatureHelp(result);
-    } catch {
-      return undefined;
-    }
-  }
-
-  async provideDocumentSemanticTokens(
-    doc: vscode.TextDocument
-  ): Promise<DocumentSemanticTokensResult | undefined> {
-    const client = await this.ensureClient();
-    if (!client) {
-      return undefined;
-    }
-    this.syncDocument(client, doc);
-    await this.applySessionState(client);
-
-    const provider = client.initializeResult?.capabilities.semanticTokensProvider;
-    const legend = provider?.legend;
-    if (!legend) {
-      return undefined;
-    }
-
-    try {
-      const result = (await client.sendRawRequest(SemanticTokensRequest.type.method, {
-        textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(doc),
-      })) as { data?: ArrayLike<number> } | undefined;
-      if (!result?.data) {
-        return undefined;
-      }
-      return {
-        legend: {
-          tokenTypes: [...legend.tokenTypes],
-          tokenModifiers: [...legend.tokenModifiers],
-        },
-        data: Array.from(result.data),
-      };
-    } catch (error) {
-      return undefined;
-    }
-  }
-
   async provideMemberCompletionItems(
     expression: string,
     operator: "$" | "@"
@@ -356,12 +271,23 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!this.sessionState) {
       return;
     }
+    const stateKey = this.getSessionStateKey(this.sessionState);
+    if (this.syncedSessionStateKey === stateKey) {
+      return;
+    }
 
     try {
       await client.sendRequest("rConsole/syncSessionState", this.sessionState);
-    } catch (error) {
-      this.logError(`Failed to sync console session state: ${String(error)}`);
+      this.syncedSessionStateKey = stateKey;
+    } catch {
     }
+  }
+
+  private getSessionStateKey(state: ConsoleLspSessionState): string {
+    return [
+      state.attachedPackages.join("\u0000"),
+      state.loadedNamespaces.join("\u0000"),
+    ].join("\u0001");
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
@@ -370,8 +296,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
     try {
       await this.start();
-    } catch (error) {
-      this.logError(`Failed to start console language server: ${String(error)}`);
+    } catch {
       return undefined;
     }
     return this.client;
@@ -387,7 +312,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const clientOptions: LanguageClientOptions = {
       documentSelector: [
         // We synchronize console completion documents manually to guarantee
-        // notification ordering before completion/signature requests.
+        // notification ordering before completion requests.
       ],
       uriConverters: {
         code2Protocol: (uri: vscode.Uri) => new URL(uri.toString(true)).toString(),
@@ -418,6 +343,7 @@ export class ConsoleLspClient implements CompletionProvider {
     );
     client.setSuppressShutdownCloseMessage(this.suppressShutdownCloseMessage);
     this.client = client;
+    this.syncedSessionStateKey = undefined;
     await client.start();
     await this.disableConsoleDiagnostics(client);
   }
@@ -479,22 +405,12 @@ export class ConsoleLspClient implements CompletionProvider {
           shell: false,
         });
         this.spawnedServer = child;
-        this.logInfo(`R Console Language Server (${child.pid ?? "unknown"}) started`);
         child.stderr?.on("data", (data: Buffer | string) => {
           this.outputChannel.appendLine(data.toString());
         });
-        child.on("error", (error) => {
-          this.logError(`R Console Language Server process error: ${error.message}`);
+        child.on("error", () => {
         });
-        child.on("exit", (code, signal) => {
-          const exitText = `R Console Language Server (${child.pid ?? "unknown"}) exited ${
-            signal ? `from signal ${signal}` : `with exit code ${code ?? "null"}`
-          }`;
-          if (signal || (code ?? 0) !== 0) {
-            this.logError(exitText);
-          } else {
-            this.logInfo(exitText);
-          }
+        child.on("exit", (code) => {
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -642,16 +558,7 @@ export class ConsoleLspClient implements CompletionProvider {
           },
         },
       });
-    } catch (error) {
-      this.logError(`Failed to disable console diagnostics: ${String(error)}`);
+    } catch {
     }
-  }
-
-  private logInfo(message: string): void {
-    void message;
-  }
-
-  private logError(message: string): void {
-    void message;
   }
 }

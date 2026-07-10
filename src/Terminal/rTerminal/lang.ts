@@ -1,16 +1,16 @@
 import * as vscode from "vscode";
 import {
+  type CompletionEntry,
+  type CompletionProvider,
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
+  getCompletionIdentityKey,
   isCompletionPickItem,
+  needsLanguageServerCompletion,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
-import {
-  ConsoleLspClient,
-  type ConsoleLspSessionState,
-  type DocumentSemanticTokensResult,
-} from "../../Language/consoleLspClient";
+import { ConsoleLspClient } from "../../Language/consoleLspClient";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type {
   SessionMemberCompletionItem,
@@ -42,23 +42,33 @@ type AutocompleteRequest = {
   getCurrentInput: () => InputSnapshot;
   getWorkspaceData: () => WorkspaceData | undefined;
   refreshWorkspaceData: () => void;
+  force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
+type ConsoleSessionState = {
+  attachedPackages: string[];
+  loadedNamespaces: string[];
+};
+
 export class RTermLang {
-  private completionInProgress = false;
+  private completionRequestId = 0;
   private completionDocument: VirtualRDocument | undefined;
   private readonly completionDocumentId = `${process.pid}-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}`;
-  private semanticRequestCounter = 0;
   private consoleLsp: ConsoleLspClient | undefined;
-  private sessionState: ConsoleLspSessionState | undefined;
+  private sessionState: ConsoleSessionState | undefined;
+  private silentCompletionRequest: Promise<void> | undefined;
 
   constructor(private readonly options: LangOptions) {}
 
   async start(): Promise<void> {
     await this.ensureConsoleLspStarted();
+    const document = await this.getOrOpenCompletionDocument("");
+    if (document) {
+      this.requestSilentCompletion(document);
+    }
   }
 
   async handleAutocomplete({
@@ -66,32 +76,36 @@ export class RTermLang {
     getCurrentInput,
     getWorkspaceData,
     refreshWorkspaceData,
+    force = false,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
-    if (this.completionInProgress) {
-      return;
-    }
-
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
       input.textBeforeCursor
-    );
+    ) ?? (force
+      ? {
+          kind: "default" as const,
+          prefix: "",
+          replaceStart: input.cursorCol,
+          snapshotInput: input.currentLine,
+          snapshotCursor: input.cursorCol,
+        }
+      : undefined);
     if (!context) {
       return;
     }
 
-    this.completionInProgress = true;
-    try {
+    const requestId = ++this.completionRequestId;
+    {
       const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
       const workspaceDataRequest = shouldRequestWorkspaceData
         ? this.options.requestWorkspaceData?.()
         : undefined;
+      const cachedSessionData = getWorkspaceData();
       if (!shouldRequestWorkspaceData) {
         refreshWorkspaceData();
       }
-
-      await this.ensureConsoleLspStarted();
 
       const latestInput = getCurrentInput();
       if (
@@ -101,78 +115,325 @@ export class RTermLang {
         return;
       }
 
-      const sessionData = shouldRequestWorkspaceData
-        ? (await workspaceDataRequest) ?? getWorkspaceData()
-        : getWorkspaceData();
-      const doc = this.getOrUpdateCompletionDocument(latestInput.text);
-      if (!doc) {
-        return;
-      }
-      if (this.consoleLsp) {
-        await this.consoleLsp.prepareDocument(doc);
-      }
-
-      const position = new vscode.Position(latestInput.cursorRow, context.snapshotCursor);
-
-      const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
-      const entries = await collectCompletionEntries(
-        context,
-        doc,
-        position,
-        sessionData,
-        linesBefore,
-        this.options.getRecentSessionEntries?.() ?? [],
-        this.consoleLsp
+      const needsLsp = needsLanguageServerCompletion(context);
+      const needsStagedEntries = needsLsp || (
+        context.kind === "bracket" && !!context.dataObjectName
       );
+      const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
+      let completionProvider: CompletionProvider | undefined;
+      const fullEntriesPromise = (async () => {
+        const sessionData = shouldRequestWorkspaceData
+          ? (await workspaceDataRequest) ?? getWorkspaceData() ?? cachedSessionData
+          : cachedSessionData;
+        if (!this.isCurrentCompletionRequest(requestId)) {
+          return undefined;
+        }
 
-      if (entries.length === 0) {
+        const needsDocument = needsLsp || !!this.consoleLsp;
+        const completionProviderRequest = this.getCompletionProvider();
+        const documentRequest = needsDocument
+          ? this.getOrOpenCompletionDocument(latestInput.text)
+          : Promise.resolve(undefined);
+
+        completionProvider = await completionProviderRequest;
+        if (!this.isCurrentCompletionRequest(requestId) || !completionProvider) {
+          return undefined;
+        }
+
+        const document = await documentRequest;
+        if (!this.isCurrentCompletionRequest(requestId)) {
+          return undefined;
+        }
+        if (needsDocument && !document) {
+          return undefined;
+        }
+
+        const position = new vscode.Position(
+          latestInput.cursorRow,
+          context.snapshotCursor
+        );
+        const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
+        return await collectCompletionEntries(
+          context,
+          document,
+          document ? position : undefined,
+          sessionData,
+          linesBefore,
+          recentEntries,
+          completionProvider,
+          latestInput.text
+        );
+      })();
+      const stagedEntries = needsStagedEntries && context.kind !== "package"
+        ? await collectCompletionEntries(
+            context,
+            undefined,
+            undefined,
+            cachedSessionData,
+            [],
+            [],
+            undefined,
+            latestInput.text
+          )
+        : undefined;
+      if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
 
-      const picks = toCompletionQuickPickItems(entries, context);
-      const pickOptions = {
-        matchOnDescription: true,
-        matchOnDetail: true,
-        placeHolder: "R console completions",
+      const opensEmptyQuickPick = force && context.prefix.length === 0;
+      const entries = stagedEntries?.length
+        ? stagedEntries
+        : opensEmptyQuickPick
+        ? []
+        : await fullEntriesPromise;
+      if (!this.isCurrentCompletionRequest(requestId)) {
+        return;
+      }
+
+      if (!entries || entries.length === 0) {
+        if (!force) {
+          return;
+        }
+      }
+      const initialEntries = entries ?? [];
+
+      const completionPlaceHolder = "R console completions";
+      const shouldPrefillQuickPick =
+        context.prefix.length > 0 &&
+        context.kind !== "package" &&
+        context.kind !== "member";
+      const prefillQuickPick = (pick: vscode.QuickPick<vscode.QuickPickItem>): void => {
+        if (!shouldPrefillQuickPick) {
+          return;
+        }
+        setTimeout(() => { if (pick.value.length === 0) { pick.value = context.prefix; } }, 0);
       };
-      const selection = context.kind !== "package"
-        ? await vscode.window.showQuickPick(picks, pickOptions)
-        : await new Promise<CompletionPickItem | undefined>((resolve) => {
-            const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
-            let request = 0;
-            Object.assign(pick, { matchOnDescription: true, matchOnDetail: true, placeholder: pickOptions.placeHolder, items: picks });
-            pick.onDidChangeValue((value) => void (async () => {
-              const currentRequest = ++request;
-              const prefix = value.startsWith(context.prefix) ? value : context.prefix + value;
-              const cursorCol = context.replaceStart + prefix.length;
-              const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
-              const lines = [...latestInput.lines];
-              lines[latestInput.cursorRow] = currentLine;
-              const nextDoc = this.getOrUpdateCompletionDocument(lines.join("\n"));
-              if (!nextDoc) {
-                return;
-              }
-              const nextContext = { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol };
-              await this.consoleLsp?.prepareDocument(nextDoc);
-              const nextEntries = await collectCompletionEntries(
-                nextContext,
-                nextDoc,
-                new vscode.Position(latestInput.cursorRow, cursorCol),
-                sessionData,
-                lines.slice(0, latestInput.cursorRow),
-                this.options.getRecentSessionEntries?.() ?? [],
-                this.consoleLsp
-              );
-              if (currentRequest === request) {
-                pick.items = toCompletionQuickPickItems(nextEntries, { ...nextContext, snapshotInput: latestInput.currentLine, snapshotCursor: latestInput.cursorCol });
-              }
-            })().catch(() => undefined));
-            pick.onDidAccept(() => { const item = pick.selectedItems[0]; resolve(isCompletionPickItem(item) ? item : undefined); pick.hide(); });
-            pick.onDidHide(() => { request += 1; pick.dispose(); resolve(undefined); });
-            pick.show();
-          });
+      const searchValue = (value: string): string => {
+        if (context.kind === "package" && value.length > 0 && !value.startsWith(context.prefix)) {
+          return context.prefix + value;
+        }
+        return value;
+      };
+      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] => {
+        const query = searchValue(value).toLowerCase();
+        if (query.length === 0) {
+          return sourceEntries;
+        }
+        return sourceEntries
+          .map((entry, index) => ({ entry, index }))
+          .filter(({ entry }) => entry.label.toLowerCase().includes(query))
+          .sort((a, b) => {
+            const aLabel = a.entry.label.toLowerCase();
+            const bLabel = b.entry.label.toLowerCase();
+            const aRank = aLabel === query ? 0 : aLabel.startsWith(query) ? 1 : 2;
+            const bRank = bLabel === query ? 0 : bLabel.startsWith(query) ? 1 : 2;
+            return (
+              aRank - bRank ||
+              aLabel.indexOf(query) - bLabel.indexOf(query) ||
+              aLabel.length - bLabel.length ||
+              a.index - b.index
+            );
+          })
+          .map(({ entry }) => entry);
+      };
+      const mergeCompletionEntries = (
+        firstEntries: CompletionEntry[],
+        secondEntries: CompletionEntry[]
+      ): CompletionEntry[] => {
+        const seen = new Set<string>();
+        const merged: CompletionEntry[] = [];
+        const entries = [...firstEntries, ...secondEntries];
+        for (const entry of entries) {
+          const key = getCompletionIdentityKey(entry);
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          merged.push(entry);
+        }
+        return merged;
+      };
+      const quickPickContext = (value: string) => ({
+        ...context,
+        prefix: searchValue(value),
+        snapshotInput: latestInput.currentLine,
+        snapshotCursor: latestInput.cursorCol,
+      });
+      const toGroupedItems = (
+        sourceEntries: CompletionEntry[],
+        value: string
+      ): vscode.QuickPickItem[] => toCompletionQuickPickItems(
+        filterEntries(sourceEntries, value),
+        quickPickContext(value)
+      );
+      const setQuickPickItems = (
+        pick: vscode.QuickPick<vscode.QuickPickItem>,
+        sourceEntries: CompletionEntry[],
+        value: string
+      ): void => {
+        const items = toGroupedItems(sourceEntries, value);
+        pick.items = items;
+        const firstCompletion = items.find(isCompletionPickItem);
+        if (firstCompletion) {
+          pick.activeItems = [firstCompletion];
+        }
+      };
+      const showCompletionQuickPick = async (
+        initialEntries: CompletionEntry[],
+        delayedEntries?: typeof fullEntriesPromise
+      ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
+        const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
+        let active = true;
+        let request = 0;
+        let blankContextRefined = false;
+        let baselineEntries = initialEntries;
+        let sourceEntries = initialEntries;
+        Object.assign(pick, {
+          matchOnDescription: false,
+          matchOnDetail: false,
+          sortByLabel: false,
+          placeholder: completionPlaceHolder,
+        });
+        setQuickPickItems(pick, sourceEntries, "");
+        void delayedEntries?.then((nextEntries) => {
+          if (!active || !nextEntries?.length || !this.isCurrentCompletionRequest(requestId)) {
+            return;
+          }
+          if (request !== 0) {
+            return;
+          }
+          baselineEntries = nextEntries;
+          sourceEntries = nextEntries;
+          setQuickPickItems(pick, sourceEntries, pick.value);
+        }).catch(() => undefined);
+        pick.onDidChangeValue((value) => void (async () => {
+          const refinesBlankContext =
+            context.prefix.length === 0 &&
+            ((context.kind === "default" && (force || !!context.dataObjectName)) ||
+              context.kind === "argument" ||
+              (context.kind === "bracket" && !!context.dataObjectName));
+          if (value.length === 0 && refinesBlankContext) {
+            blankContextRefined = false;
+            request += 1;
+            sourceEntries = baselineEntries;
+            setQuickPickItems(pick, sourceEntries, value);
+            return;
+          }
+
+          const refinesEmptyContext =
+            value.length > 0 &&
+            refinesBlankContext;
+          setQuickPickItems(pick, sourceEntries, value);
+          if (refinesEmptyContext) {
+            if (blankContextRefined) {
+              return;
+            }
+            blankContextRefined = true;
+            const currentRequest = ++request;
+            await requestRefinedEntries(value[0], currentRequest);
+            return;
+          }
+          if (context.kind !== "package") {
+            return;
+          }
+          const currentRequest = ++request;
+          await requestRefinedEntries(value, currentRequest);
+        })().catch(() => undefined));
+        const requestRefinedEntries = async (
+          value: string,
+          currentRequest: number
+        ): Promise<void> => {
+          const prefix = context.kind === "package" && !value.startsWith(context.prefix)
+            ? context.prefix + value
+            : value;
+          const cursorCol = context.replaceStart + prefix.length;
+          const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
+          const lines = [...latestInput.lines];
+          lines[latestInput.cursorRow] = currentLine;
+          const fullTextBeforeCursor = [
+            ...lines.slice(0, latestInput.cursorRow),
+            currentLine.slice(0, cursorCol),
+          ].join("\n");
+          const nextContext = context.kind === "package"
+            ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
+            : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor);
+          if (!nextContext) {
+            return;
+          }
+          if (prefix.length > 0) {
+            nextContext.triggerCharacter = undefined;
+          }
+          const nextInputText = lines.join("\n");
+          const refinedSessionData =
+            (await this.options.requestWorkspaceData?.()) ??
+            getWorkspaceData() ??
+            cachedSessionData;
+          const nextDocument = await this.getOrOpenCompletionDocument(
+            nextInputText
+          );
+          if (!this.isCurrentCompletionRequest(requestId)) {
+            return;
+          }
+          if (!nextDocument) {
+            return;
+          }
+          completionProvider ??= await this.getCompletionProvider();
+          if (!completionProvider) {
+            return;
+          }
+          const nextEntries = await collectCompletionEntries(
+            nextContext,
+            nextDocument,
+            new vscode.Position(latestInput.cursorRow, cursorCol),
+            refinedSessionData,
+            lines.slice(0, latestInput.cursorRow),
+            recentEntries,
+            completionProvider,
+            nextInputText
+          );
+          if (!this.isCurrentCompletionRequest(requestId)) {
+            return;
+          }
+          if (currentRequest === request) {
+            sourceEntries = context.kind === "package"
+              ? nextEntries
+              : mergeCompletionEntries(baselineEntries, nextEntries);
+            setQuickPickItems(pick, sourceEntries, pick.value);
+          }
+        };
+        pick.onDidAccept(() => {
+          const item = pick.selectedItems[0];
+          if (!isCompletionPickItem(item)) {
+            return;
+          }
+          active = false;
+          request += 1;
+          resolve(item);
+          pick.hide();
+        });
+        pick.onDidHide(() => {
+          const cancelled = active;
+          active = false;
+          request += 1;
+          pick.dispose();
+          if (cancelled) {
+            resolve(undefined);
+          }
+        });
+        pick.show();
+        prefillQuickPick(pick);
+      });
+      let selection: vscode.QuickPickItem | undefined;
+      if (context.kind !== "package" && (stagedEntries?.length || opensEmptyQuickPick)) {
+        selection = await showCompletionQuickPick(initialEntries, fullEntriesPromise);
+      } else {
+        selection = await showCompletionQuickPick(initialEntries);
+      }
 
       if (!isCompletionPickItem(selection)) {
+        return;
+      }
+      if (!this.isCurrentCompletionRequest(requestId)) {
         return;
       }
 
@@ -185,65 +446,42 @@ export class RTermLang {
       }
 
       applyCompletion(selection);
-    } finally {
-      this.completionInProgress = false;
     }
   }
 
   cleanupCompletionDocument(): void {
-    if (this.consoleLsp) {
-      if (this.completionDocument) {
-        this.consoleLsp.closeDocument(this.completionDocument as unknown as vscode.TextDocument);
-      }
+    if (this.consoleLsp && this.completionDocument) {
+      this.consoleLsp.closeDocument(
+        this.completionDocument as unknown as vscode.TextDocument
+      );
     }
     this.completionDocument = undefined;
   }
 
   stopConsoleLsp(): void {
+    this.cleanupCompletionDocument();
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;
-    if (!lsp) {
-      return;
+    if (lsp) {
+      void lsp.dispose();
     }
-    void lsp.dispose();
   }
 
   clearSessionState(): void {
     this.sessionState = undefined;
   }
 
-  async requestSemanticTokens(
-    content: string
-  ): Promise<DocumentSemanticTokensResult | undefined> {
-    await this.ensureConsoleLspStarted();
-    const lsp = this.consoleLsp;
-    if (!lsp) {
-      return undefined;
-    }
-
-    const doc = this.createSemanticSnapshotDocument(content);
-    if (!doc) {
-      return undefined;
-    }
-
-    try {
-      return await lsp.provideDocumentSemanticTokens(doc);
-    } finally {
-      lsp.closeDocument(doc);
-    }
-  }
-
   async refreshCompletionContextDocument(inputText: string): Promise<void> {
-    await this.ensureConsoleLspStarted();
-    if (!this.consoleLsp) {
+    if (!this.completionDocument) {
       return;
     }
-
-    const doc = this.getOrUpdateCompletionDocument(inputText);
-    if (!doc) {
-      return;
+    try {
+      const document = await this.getOrOpenCompletionDocument(inputText);
+      if (document) {
+        await this.consoleLsp?.prepareDocument(document);
+      }
+    } catch {
     }
-    await this.consoleLsp.prepareDocument(doc);
   }
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
@@ -269,65 +507,70 @@ export class RTermLang {
 
   private getOrUpdateCompletionDocument(
     content: string
-  ): vscode.TextDocument | undefined {
-    try {
-      if (this.completionDocument) {
-        this.completionDocument.update(content);
-        return this.completionDocument as unknown as vscode.TextDocument;
-      }
-
-      this.completionDocument = new VirtualRDocument(
-        this.completionDocumentId,
-        content,
-        "completion.R"
-      );
-      return this.completionDocument as unknown as vscode.TextDocument;
-    } catch {
-      return undefined;
+  ): VirtualRDocument {
+    if (this.completionDocument) {
+      this.completionDocument.update(content);
+      return this.completionDocument;
     }
-  }
 
-  private createSemanticSnapshotDocument(content: string): vscode.TextDocument | undefined {
-    try {
-      this.semanticRequestCounter += 1;
-      const requestId = `${this.completionDocumentId}-semantic-${this.semanticRequestCounter}`;
-      const document = new VirtualRDocument(
-        requestId,
-        content,
-        `semantic-${this.semanticRequestCounter}.R`
-      );
-      return document as unknown as vscode.TextDocument;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private shouldRequestWorkspaceData(
-    context: NonNullable<ReturnType<typeof getCompletionContext>>
-  ): boolean {
-    return (
-      (context.kind === "default" || context.kind === "argument") &&
-      !context.dataObjectName
+    this.completionDocument = new VirtualRDocument(
+      this.completionDocumentId,
+      content
     );
+    return this.completionDocument;
   }
 
-  private async ensureConsoleLspStarted(): Promise<void> {
-    if (this.consoleLsp) {
-      try {
-        await this.consoleLsp.start();
-        await this.syncConsoleSessionState();
-      } catch {
-      }
+  private async getOrOpenCompletionDocument(
+    content: string
+  ): Promise<vscode.TextDocument | undefined> {
+    try {
+      return this.getOrUpdateCompletionDocument(
+        content
+      ) as unknown as vscode.TextDocument;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isCurrentCompletionRequest(requestId: number): boolean {
+    return requestId === this.completionRequestId;
+  }
+
+  private async getCompletionProvider(): Promise<CompletionProvider | undefined> {
+    await this.ensureConsoleLspStarted();
+    return this.consoleLsp;
+  }
+
+  private requestSilentCompletion(document: vscode.TextDocument): void {
+    if (this.silentCompletionRequest) {
       return;
     }
 
-    this.consoleLsp = new ConsoleLspClient({
-      consoleId: this.completionDocumentId,
-      extensionPath: this.options.extensionPath,
-      rPath: this.options.rPath,
-      requestMemberCompletions: async (expression, operator) =>
-        await this.options.requestMemberCompletions(expression, operator),
-    });
+    this.silentCompletionRequest = (async () => {
+      try {
+        const completionProvider = this.consoleLsp;
+        if (!completionProvider) {
+          return;
+        }
+        const position = document.positionAt(document.getText().length);
+        await completionProvider.provideCompletionItems(document, position);
+      } catch {
+      } finally {
+        this.silentCompletionRequest = undefined;
+      }
+    })();
+  }
+
+  private async ensureConsoleLspStarted(): Promise<void> {
+    if (!this.consoleLsp) {
+      this.consoleLsp = new ConsoleLspClient({
+        consoleId: this.completionDocumentId,
+        extensionPath: this.options.extensionPath,
+        rPath: this.options.rPath,
+        requestMemberCompletions: async (expression, operator) =>
+          await this.options.requestMemberCompletions(expression, operator),
+      });
+    }
 
     try {
       await this.consoleLsp.start();
@@ -343,7 +586,13 @@ export class RTermLang {
     await this.consoleLsp.syncSessionState(this.sessionState);
   }
 
-  private toSessionState(data: WorkspaceData): ConsoleLspSessionState {
+  private shouldRequestWorkspaceData(
+    context: NonNullable<ReturnType<typeof getCompletionContext>>
+  ): boolean {
+    return context.kind !== "member" && context.kind !== "package";
+  }
+
+  private toSessionState(data: WorkspaceData): ConsoleSessionState {
     return {
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))

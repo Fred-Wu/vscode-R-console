@@ -255,8 +255,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         if (this.promptVisible) {
           this.renderInput();
         }
-      },
-      async (content) => await this.lang.requestSemanticTokens(content)
+      }
     );
     this.renderer = new Renderer((text) => this.writeEmitter.fire(text), this.syntax);
 
@@ -1173,6 +1172,10 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
+      case "ctrl_space":
+        this.expandForEdit();
+        void this.handleAutocomplete(true);
+        return;
       case "backtab": {
         this.expandForEdit();
         const beforeCursor = this.inputState.currentLineBeforeCursor;
@@ -1592,8 +1595,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const sanitized = stripBracketedPasteMarkers(fullText).trimEnd();
     if (this.promptVisible) {
       // Clear the live input viewport before any async submission work starts.
-      // Otherwise semantic-token callbacks can rerender against the reset input
-      // state and leave stale viewport content behind.
+      // Otherwise async completion context updates can race against the reset
+      // input state and leave stale viewport content behind.
       this.clearInputRender();
       this.promptVisible = false;
       this.lastWriteEndedWithNewline = true;
@@ -1648,12 +1651,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
   }
 
-  private async handleAutocomplete(): Promise<void> {
+  private async handleAutocomplete(force = false): Promise<void> {
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
       getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
       refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+      force,
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
       },

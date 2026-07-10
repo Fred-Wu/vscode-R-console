@@ -102,6 +102,7 @@ export type HighlightTokenKind =
   | "comment"
   | "string"
   | "number"
+  | "namespace"
   | "function"
   | "identifier"
   | "keyword"
@@ -125,6 +126,18 @@ const KEYWORDS: Record<string, TokenType> = {
   break: TokenType.Break,
   return: TokenType.Return,
 };
+
+const NUMERIC_CONSTANTS = new Set([
+  "TRUE",
+  "FALSE",
+  "NA",
+  "NA_integer_",
+  "NA_real_",
+  "NA_complex_",
+  "NA_character_",
+  "Inf",
+  "NaN",
+]);
 
 const MULTI_CHAR_OPS = [
   "<<-",
@@ -348,7 +361,11 @@ export function tokenizeForHighlighting(code: string): HighlightToken[] {
         case TokenType.Return:
           return { kind: "keyword", value: token.value, position: token.position };
         case TokenType.Operator:
-          return { kind: "operator", value: token.value, position: token.position };
+          return {
+            kind: token.value === "\\" ? "keyword" : "operator",
+            value: token.value,
+            position: token.position,
+          };
         default:
           return undefined;
       }
@@ -359,7 +376,17 @@ export function tokenizeForHighlighting(code: string): HighlightToken[] {
 function getIdentifierHighlightKind(
   tokens: readonly Token[],
   index: number
-): Extract<HighlightTokenKind, "function" | "identifier"> {
+): Extract<HighlightTokenKind, "namespace" | "function" | "identifier"> {
+  const namespaceOperator = tokens[index + 1];
+  const namespaceMember = tokens[index + 2];
+  if (
+    namespaceOperator?.type === TokenType.Operator &&
+    (namespaceOperator.value === "::" || namespaceOperator.value === ":::") &&
+    namespaceMember?.type === TokenType.Identifier
+  ) {
+    return "namespace";
+  }
+
   const nextToken = findNextMeaningfulToken(tokens, index);
   return nextToken?.type === TokenType.LeftParen ? "function" : "identifier";
 }
@@ -541,6 +568,13 @@ function parseIdentifier(code: string, pos: number): { token: Token; newPos: num
   }
 
   const value = code.slice(start, pos);
+  if (NUMERIC_CONSTANTS.has(value)) {
+    return {
+      token: { type: TokenType.Number, value, position: start },
+      newPos: pos,
+    };
+  }
+
   const keywordType = KEYWORDS[value];
   return {
     token: { type: keywordType ?? TokenType.Identifier, value, position: start },

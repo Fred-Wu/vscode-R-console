@@ -10,7 +10,7 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 - Node.js 24.x for the extension build and packaging scripts.
 - A local R installation. R Console resolves it in this order: [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) `r.rpath.*`, ambient `R_HOME`, then `PATH`.
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). R Console declares `REditorSupport.r` in `extensionDependencies` and depends on [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session bootstrap/configuration.
-- The R package `languageserver` for completion, signature help, and semantic highlighting during local testing.
+- The R package `languageserver` for language-server completion during local testing.
 - Rust/Cargo if you are building the sidecar binaries from source.
 
 ## Local Build
