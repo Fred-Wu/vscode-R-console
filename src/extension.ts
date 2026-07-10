@@ -419,6 +419,11 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
     return;
   }
 
+  if (!record.rTerminal.requiresCloseConfirmation()) {
+    await handleRunningConsoleClose(record);
+    return;
+  }
+
   if (record.location.kind === "editor") {
     return;
   }
@@ -994,6 +999,7 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
 
   if (!record.rTerminal.requiresCloseConfirmation()) {
     forgetPersistentSessionForRecord(record);
+    record.rTerminal.dispose();
     disposeConsoleRecord(record);
     return;
   }

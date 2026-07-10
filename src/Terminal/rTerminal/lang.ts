@@ -29,6 +29,7 @@ export type InputSnapshot = {
 type LangOptions = {
   extensionPath: string;
   rPath: string;
+  env: NodeJS.ProcessEnv;
   getRecentSessionEntries?: () => string[];
   requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
   requestMemberCompletions: (
@@ -60,14 +61,19 @@ export class RTermLang {
   private consoleLsp: ConsoleLspClient | undefined;
   private sessionState: ConsoleSessionState | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
+  private disposed = false;
+  private disposePromise: Promise<void> | undefined;
 
   constructor(private readonly options: LangOptions) {}
 
   async start(): Promise<void> {
-    await this.ensureConsoleLspStarted();
+    const completionProvider = await this.ensureConsoleLspStarted();
+    if (!completionProvider) {
+      return;
+    }
     const document = await this.getOrOpenCompletionDocument("");
-    if (document) {
-      this.requestSilentCompletion(document);
+    if (document && this.consoleLsp === completionProvider) {
+      this.requestSilentCompletion(document, completionProvider);
     }
   }
 
@@ -79,6 +85,9 @@ export class RTermLang {
     force = false,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -449,22 +458,20 @@ export class RTermLang {
     }
   }
 
-  cleanupCompletionDocument(): void {
-    if (this.consoleLsp && this.completionDocument) {
-      this.consoleLsp.closeDocument(
-        this.completionDocument as unknown as vscode.TextDocument
-      );
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
     }
-    this.completionDocument = undefined;
-  }
 
-  stopConsoleLsp(): void {
-    this.cleanupCompletionDocument();
+    this.disposed = true;
+    this.completionRequestId += 1;
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;
-    if (lsp) {
-      void lsp.dispose();
-    }
+    this.completionDocument = undefined;
+    this.sessionState = undefined;
+
+    this.disposePromise = lsp ? lsp.dispose() : Promise.resolve();
+    return this.disposePromise;
   }
 
   clearSessionState(): void {
@@ -472,7 +479,7 @@ export class RTermLang {
   }
 
   async refreshCompletionContextDocument(inputText: string): Promise<void> {
-    if (!this.completionDocument) {
+    if (this.disposed || !this.completionDocument) {
       return;
     }
     try {
@@ -485,7 +492,7 @@ export class RTermLang {
   }
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
-    if (!data) {
+    if (this.disposed || !data) {
       return false;
     }
 
@@ -523,6 +530,9 @@ export class RTermLang {
   private async getOrOpenCompletionDocument(
     content: string
   ): Promise<vscode.TextDocument | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
     try {
       return this.getOrUpdateCompletionDocument(
         content
@@ -537,21 +547,19 @@ export class RTermLang {
   }
 
   private async getCompletionProvider(): Promise<CompletionProvider | undefined> {
-    await this.ensureConsoleLspStarted();
-    return this.consoleLsp;
+    return await this.ensureConsoleLspStarted();
   }
 
-  private requestSilentCompletion(document: vscode.TextDocument): void {
+  private requestSilentCompletion(
+    document: vscode.TextDocument,
+    completionProvider: CompletionProvider
+  ): void {
     if (this.silentCompletionRequest) {
       return;
     }
 
     this.silentCompletionRequest = (async () => {
       try {
-        const completionProvider = this.consoleLsp;
-        if (!completionProvider) {
-          return;
-        }
         const position = document.positionAt(document.getText().length);
         await completionProvider.provideCompletionItems(document, position);
       } catch {
@@ -561,29 +569,36 @@ export class RTermLang {
     })();
   }
 
-  private async ensureConsoleLspStarted(): Promise<void> {
-    if (!this.consoleLsp) {
-      this.consoleLsp = new ConsoleLspClient({
+  private async ensureConsoleLspStarted(): Promise<ConsoleLspClient | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
+
+    let lsp = this.consoleLsp;
+    if (!lsp) {
+      lsp = new ConsoleLspClient({
         consoleId: this.completionDocumentId,
         extensionPath: this.options.extensionPath,
         rPath: this.options.rPath,
+        env: this.options.env,
         requestMemberCompletions: async (expression, operator) =>
           await this.options.requestMemberCompletions(expression, operator),
       });
+      this.consoleLsp = lsp;
     }
 
     try {
-      await this.consoleLsp.start();
-      await this.syncConsoleSessionState();
+      await lsp.start();
+      if (this.disposed || this.consoleLsp !== lsp) {
+        return undefined;
+      }
+      if (this.sessionState) {
+        await lsp.syncSessionState(this.sessionState);
+      }
+      return this.disposed || this.consoleLsp !== lsp ? undefined : lsp;
     } catch {
+      return undefined;
     }
-  }
-
-  private async syncConsoleSessionState(): Promise<void> {
-    if (!this.consoleLsp || !this.sessionState) {
-      return;
-    }
-    await this.consoleLsp.syncSessionState(this.sessionState);
   }
 
   private shouldRequestWorkspaceData(

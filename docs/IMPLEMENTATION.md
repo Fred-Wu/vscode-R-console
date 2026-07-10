@@ -563,7 +563,12 @@ latest console input. Attached packages and loaded namespaces are synced
 through `rConsole/syncSessionState`; unchanged state is not resent on every
 completion request. The console starts the language server when the console
 opens and sends one silent completion request to warm the first language-server
-completion path.
+completion path. Runtime start and attach events reuse that same client rather
+than replacing it. Each client owns a unique temporary working directory and
+removes it only after its R process has stopped. The language-server child also
+inherits the normalized R environment used by the console runtime. Diagnostics
+are disabled because the virtual console document exists only to provide
+completion context and must not be linted as a source file.
 
 Console syntax highlighting is separate from language-server completion. It is
 implemented locally by `src/Terminal/consoleSyntax.ts` and

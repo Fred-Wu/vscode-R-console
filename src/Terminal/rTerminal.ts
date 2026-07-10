@@ -243,6 +243,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang = new RTermLang({
       extensionPath: this.extensionPath,
       rPath: this.options.rPath,
+      env: this.options.env,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       requestWorkspaceData: async () =>
         await this.sessionWatcher?.requestWorkspaceData(),
@@ -631,8 +632,6 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   open(initialDimensions: vscode.TerminalDimensions | undefined): void {
-    void this.lang.start();
-
     if (initialDimensions) {
       this.dimensions = initialDimensions;
       this.syncReplayTerminalSize();
@@ -642,8 +641,16 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.writeEmitter.fire("\x1b[?2004h");
     }
 
-    if (!this.isRunning()) {
+    const runtimeWasRunning = this.isRunning();
+    if (!runtimeWasRunning) {
       this.startR();
+    }
+    // The terminal owns one language server for its full UI lifetime. Runtime
+    // start and attach events must not replace it.
+    if (runtimeWasRunning || this.mode !== "closed") {
+      void this.lang.start();
+    }
+    if (!runtimeWasRunning) {
       return;
     }
 
@@ -2392,7 +2399,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.saveHistory();
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
-    this.lang.cleanupCompletionDocument();
     this.clearPendingInputFlushTimer();
     this.pendingProgrammaticInput = "";
     this.clearPendingConsoleInput();
@@ -2400,8 +2406,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearReplyPromptRenderTimer();
 
     this.sessionAttached = false;
-    this.lang.clearSessionState();
-    this.lang.stopConsoleLsp();
+    void this.lang.dispose();
     setNativeParseCallback(null);
   }
 

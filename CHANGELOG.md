@@ -17,6 +17,10 @@ All notable changes to R Console will be documented in this file.
 - Run-time and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
 - Further reduced the delay when opening language-server suggestions.
 
+### Fixed
+
+- Fixed console language-server ownership and cleanup across macOS, Windows, and Linux so Tab completion no longer loses its working directory during runtime startup.
+
 ## [0.3.1] - 2026-06-29
 
 ### Fixed
