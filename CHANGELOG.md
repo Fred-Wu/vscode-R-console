@@ -2,7 +2,7 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.3.2] - 2026-07-10
+## [0.4.0] - 2026-07-10
 
 ### Added
 
@@ -11,19 +11,20 @@ All notable changes to R Console will be documented in this file.
 
 ### Changed
 
-- Removed language-server semantic-token requests for console syntax highlighting; console syntax highlighting now uses local tokenization mapped to VS Code theme colors.
-- Redesigned Quick Pick completion display to preserve grouped completion results.
+- Console syntax highlighting now follows the active VS Code theme without depending on the language server.
+- Completion suggestions now keep runtime and language-server results in their existing groups.
 - Runtime completions now appear immediately while language-server suggestions continue loading.
-- Empty-prefix completion Quick Picks now load matching runtime and language-server results as you type, including blank `[]` / `()` contexts and `Alt+Esc` completions.
-- Run-time and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
+- Completions opened without a prefix now update as you type, including inside empty `[]` / `()` contexts and when using `Alt+Esc`.
+- Runtime and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
 - Further reduced the delay when opening language-server suggestions.
+- Renamed consoles and their session-manager labels now keep their names when the console is reopened or detached and reattached.
 - Persistent-session reattachment now warns when the configured R path differs from the running session, with options to close the session or open the R path setting.
 
 ### Fixed
 
-- Fixed console language-server ownership and cleanup across macOS, Windows, and Linux so Tab completion no longer loses its working directory during runtime startup.
+- Improved how the console language server starts, runs, and stops.
 - Fixed runtime session completions becoming unavailable when language-server completion is still starting or unavailable.
-- Fixed closing a renamed or moved editor-area console so it is not left running without a visible tab, and cancelling the close restores the same name and editor location.
+- Fixed the Close button hiding a renamed or moved console while its R session remained running.
 
 ## [0.3.1] - 2026-06-29
 
