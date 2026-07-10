@@ -52,19 +52,6 @@ class SilentOutputChannel implements vscode.OutputChannel {
 }
 
 class ConsoleLanguageClient extends LanguageClient {
-  private suppressShutdownCloseMessage = false;
-
-  setSuppressShutdownCloseMessage(value: boolean): void {
-    this.suppressShutdownCloseMessage = value;
-  }
-
-  protected async handleConnectionClosed(): Promise<void> {
-    if (this.suppressShutdownCloseMessage) {
-      return;
-    }
-    await super.handleConnectionClosed();
-  }
-
   error(message: string, data?: unknown, _showNotification: boolean | "force" = true): void {
     super.error(message, data, false);
   }
@@ -75,7 +62,6 @@ export class ConsoleLspClient implements CompletionProvider {
   private readonly workingDirectory: string;
 
   private client: ConsoleLanguageClient | undefined;
-  private suppressShutdownCloseMessage = false;
   private startPromise: Promise<void> | undefined;
   private disposePromise: Promise<void> | undefined;
   private terminationPromise: Promise<boolean> | undefined;
@@ -97,10 +83,6 @@ export class ConsoleLspClient implements CompletionProvider {
     if (this.disposed) {
       throw new Error("Cannot start a disposed console language server.");
     }
-    this.suppressShutdownCloseMessage = false;
-    if (this.client) {
-      this.client.setSuppressShutdownCloseMessage(false);
-    }
     if (this.client?.isRunning()) {
       return;
     }
@@ -113,7 +95,6 @@ export class ConsoleLspClient implements CompletionProvider {
         const staleClient = this.client;
         this.client = undefined;
         if (staleClient) {
-          staleClient.setSuppressShutdownCloseMessage(true);
           try {
             await staleClient.dispose();
           } catch {
@@ -150,11 +131,6 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private async stop(): Promise<boolean> {
-    this.suppressShutdownCloseMessage = true;
-    if (this.client) {
-      this.client.setSuppressShutdownCloseMessage(true);
-    }
-
     const startPromise = this.startPromise;
     if (startPromise && !this.client?.isRunning()) {
       // Cancel startup before waiting for it, so a child that has not connected
@@ -193,7 +169,6 @@ export class ConsoleLspClient implements CompletionProvider {
       }
     }
     this.syncedDocuments.clear();
-    client.setSuppressShutdownCloseMessage(true);
     try {
       await client.stop();
     } catch {
@@ -355,7 +330,6 @@ export class ConsoleLspClient implements CompletionProvider {
         : () => this.createSocketTransport(args, env),
       clientOptions
     );
-    client.setSuppressShutdownCloseMessage(this.suppressShutdownCloseMessage);
     this.client = client;
     this.syncedSessionStateKey = undefined;
     await client.start();
