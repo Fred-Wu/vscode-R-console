@@ -251,15 +251,7 @@ export class RTermLang {
         const seen = new Set<string>();
         const merged: CompletionEntry[] = [];
         const entries = [...firstEntries, ...secondEntries];
-        const preferredLabels = new Set(
-          entries
-            .filter((entry) => entry.source !== "buffer")
-            .map((entry) => entry.label.toLowerCase())
-        );
         for (const entry of entries) {
-          if (entry.source === "buffer" && preferredLabels.has(entry.label.toLowerCase())) {
-            continue;
-          }
           const key = getCompletionIdentityKey(entry);
           if (seen.has(key)) {
             continue;
@@ -325,7 +317,7 @@ export class RTermLang {
         pick.onDidChangeValue((value) => void (async () => {
           const refinesBlankContext =
             context.prefix.length === 0 &&
-            (force ||
+            ((force && context.kind === "default" && !context.dataObjectName) ||
               context.kind === "argument" ||
               (context.kind === "bracket" && !!context.dataObjectName));
           if (value.length === 0 && refinesBlankContext) {
@@ -340,14 +332,17 @@ export class RTermLang {
             value.length > 0 &&
             refinesBlankContext;
           setQuickPickItems(pick, sourceEntries, value);
-          if (context.kind !== "package" && !refinesEmptyContext) {
-            return;
-          }
-          if (refinesEmptyContext && blankContextRefined) {
-            return;
-          }
           if (refinesEmptyContext) {
+            if (blankContextRefined) {
+              return;
+            }
             blankContextRefined = true;
+            const currentRequest = ++request;
+            await requestRefinedEntries(value[0], currentRequest);
+            return;
+          }
+          if (context.kind !== "package") {
+            return;
           }
           const currentRequest = ++request;
           await requestRefinedEntries(value, currentRequest);

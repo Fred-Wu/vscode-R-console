@@ -386,8 +386,7 @@ export async function collectCompletionEntries(
           doc,
           position,
           multilineBuffer,
-          completionProvider,
-          sessionData
+          completionProvider
         );
   const lspItems =
     isGlobalSymbolContext(context)
@@ -879,8 +878,7 @@ async function getLanguageServerCompletions(
   doc: vscode.TextDocument,
   position: vscode.Position,
   multilineBuffer: string[],
-  completionProvider?: CompletionProvider,
-  sessionData?: WorkspaceData
+  completionProvider?: CompletionProvider
 ): Promise<CompletionEntry[]> {
   if (!completionProvider) {
     return [];
@@ -895,7 +893,7 @@ async function getLanguageServerCompletions(
     const items = Array.isArray(result) ? result : result?.items || [];
     
     const filteredItems = items.filter((item) =>
-      isLanguageServerCompletionItem(context, item, sessionData?.search)
+      isLanguageServerCompletionItem(context, item)
     );
     
     return filteredItems.map((item) => ({
@@ -913,15 +911,13 @@ async function getLanguageServerCompletions(
 
 function isLanguageServerCompletionItem(
   context: CompletionContext,
-  item: vscode.CompletionItem,
-  attachedPackages: string[] | undefined
+  item: vscode.CompletionItem
 ): boolean {
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }
 
-  const detail = item.detail;
-  if (detail === "[workspace]" || detail === "[session]") {
+  if (item.detail === "[workspace]") {
     return false;
   }
 
@@ -932,17 +928,7 @@ function isLanguageServerCompletionItem(
     return false;
   }
 
-  if (!detail) {
-    return true;
-  }
-
-  const packageName = /^\{(.+)\}$/.exec(detail)?.[1];
-  return (
-    !packageName ||
-    context.kind === "package" ||
-    !attachedPackages ||
-    attachedPackages.includes(`package:${packageName}`)
-  );
+  return true;
 }
 
 function getCompletionLabel(item: vscode.CompletionItem): string {
@@ -1019,14 +1005,14 @@ function filterShadowedBufferEntries(
     return bufferEntries;
   }
 
-  const preferredLabels = new Set(
+  const preferredKeys = new Set(
     preferredEntries
       .filter((entry) => entry.source !== "buffer")
-      .map((entry) => entry.label.toLowerCase())
+      .map(getCompletionIdentityKey)
   );
 
   return bufferEntries.filter(
-    (entry) => !preferredLabels.has(entry.label.toLowerCase())
+    (entry) => !preferredKeys.has(getCompletionIdentityKey(entry))
   );
 }
 
