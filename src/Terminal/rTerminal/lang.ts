@@ -309,7 +309,7 @@ export class RTermLang {
         pick.onDidChangeValue((value) => void (async () => {
           const refinesBlankContext =
             context.prefix.length === 0 &&
-            ((force && context.kind === "default" && !context.dataObjectName) ||
+            ((context.kind === "default" && (force || !!context.dataObjectName)) ||
               context.kind === "argument" ||
               (context.kind === "bracket" && !!context.dataObjectName));
           if (value.length === 0 && refinesBlankContext) {

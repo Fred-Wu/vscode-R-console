@@ -2,7 +2,7 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.3.2] - Unreleased
+## [0.3.2] - 2026-07-10
 
 ### Added
 
@@ -10,9 +10,11 @@ All notable changes to R Console will be documented in this file.
 
 ### Changed
 
-- Removed languageserver-based semantic-token syntax highlighting, and mapped console token types directly to the VS Code color theme based on languageserver semantic token types.
-- Re-designed Quick Pick item display to preserve the groupings of completion results.
+- Removed language-server semantic-token requests for console syntax highlighting; console syntax highlighting now uses local tokenization mapped to VS Code theme colors.
+- Redesigned Quick Pick completion display to preserve grouped completion results.
 - Runtime completions now appear immediately while language-server suggestions continue loading.
+- Empty-prefix completion Quick Picks now load matching runtime and language-server results as you type, including blank `[]` / `()` contexts and `Ctrl+Space` completions.
+- Run-time and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
 - Further reduced the delay when opening language-server suggestions.
 
 ## [0.3.1] - 2026-06-29
