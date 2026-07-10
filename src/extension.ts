@@ -179,18 +179,13 @@ async function removePersistentSessionFiles(): Promise<void> {
   }
 }
 
-function buildPersistentTerminalOptions(
-  persistedOptions: PersistedRTerminalOptions
-): ReturnType<typeof resolveRTerminalOptions> {
-  const currentOptions = resolveRTerminalOptions();
-  if (!currentOptions) {
-    return undefined;
+function normalizeRExecutablePathForComparison(rPath: string): string {
+  let normalized = path.resolve(rPath);
+  try {
+    normalized = fs.realpathSync.native(normalized);
+  } catch {
   }
-  return {
-    ...currentOptions,
-    ...persistedOptions,
-    rArgs: [...persistedOptions.rArgs],
-  };
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function disposeStalePersistentTerminalViews(): void {
@@ -716,10 +711,39 @@ async function attachPersistentSessions(
       continue;
     }
 
-    const options = buildPersistentTerminalOptions(session.entry.terminal.options);
-    if (!options) {
+    const currentOptions = resolveRTerminalOptions();
+    if (!currentOptions) {
       continue;
     }
+    const persistedOptions = session.entry.terminal.options;
+    const rPathChanged =
+      normalizeRExecutablePathForComparison(currentOptions.rPath) !==
+      normalizeRExecutablePathForComparison(persistedOptions.rPath);
+    if (rPathChanged) {
+      const result = await vscode.window.showWarningMessage(
+        `A new R version was detected. Close the persistent R session before relaunching it, or change the R path setting back to "${persistedOptions.rPath}".`,
+        { modal: true },
+        "Close R Sessions",
+        "Change R Path"
+      );
+      if (result === "Close R Sessions") {
+        closeDetachedPersistentSessions([session], context);
+        continue;
+      }
+      if (result === "Change R Path") {
+        await vscode.commands.executeCommand(
+          "workbench.action.openSettings",
+          `r.${getPlatformRPathConfigEntry()}`
+        );
+      }
+      return;
+    }
+
+    const options = {
+      ...currentOptions,
+      ...persistedOptions,
+      rArgs: [...persistedOptions.rArgs],
+    };
 
     const rTerminal = new RTerminal(options, context.extensionPath, session.entry.terminal);
     const record = createConsoleRecord(rTerminal, session.entry.location);

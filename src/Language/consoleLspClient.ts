@@ -645,7 +645,7 @@ export class ConsoleLspClient implements CompletionProvider {
             } catch (error) {
               processHasExited = (error as NodeJS.ErrnoException).code === "ESRCH";
             }
-            if (!processHasExited) {
+            if (!processHasExited && !child.kill()) {
               child.removeListener("exit", resolveExit);
               return false;
             }
