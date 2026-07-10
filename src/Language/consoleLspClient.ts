@@ -83,6 +83,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private spawnedServer: ChildProcess | undefined;
   private pendingSocketServer: net.Server | undefined;
   private syncedDocuments = new Map<string, { document: vscode.TextDocument; version: number }>();
+  private documentSyncPromise: Promise<void> = Promise.resolve();
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
 
@@ -242,19 +243,18 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return undefined;
     }
-    this.syncDocument(client, doc);
-    await this.applySessionState(client);
-    const context: vscode.CompletionContext = triggerCharacter
-      ? {
-          triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
-          triggerCharacter,
-        }
-      : {
-          triggerKind: vscode.CompletionTriggerKind.Invoke,
-          triggerCharacter: undefined,
-        };
-
     try {
+      await this.syncDocument(client, doc);
+      await this.applySessionState(client);
+      const context: vscode.CompletionContext = triggerCharacter
+        ? {
+            triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
+            triggerCharacter,
+          }
+        : {
+            triggerKind: vscode.CompletionTriggerKind.Invoke,
+            triggerCharacter: undefined,
+          };
       const params = client.code2ProtocolConverter.asCompletionParams(doc, position, context);
       const result = await client.sendRequest(CompletionRequest.type, params);
       return await client.protocol2CodeConverter.asCompletionResult(result);
@@ -268,7 +268,7 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return;
     }
-    this.syncDocument(client, doc);
+    await this.syncDocument(client, doc);
     await this.applySessionState(client);
   }
 
@@ -529,36 +529,44 @@ export class ConsoleLspClient implements CompletionProvider {
     ];
   }
 
-  private syncDocument(client: LanguageClient, document: vscode.TextDocument): void {
-    const key = document.uri.toString();
-    const existing = this.syncedDocuments.get(key);
-    if (!existing) {
-      try {
-        client.sendNotification(
+  private syncDocument(client: LanguageClient, document: vscode.TextDocument): Promise<void> {
+    const syncPromise = this.documentSyncPromise.then(async () => {
+      const key = document.uri.toString();
+      const existing = this.syncedDocuments.get(key);
+      if (!existing) {
+        const version = document.version;
+        const params = client.code2ProtocolConverter.asOpenTextDocumentParams(document);
+        await client.sendNotification(
           DidOpenTextDocumentNotification.type,
-          client.code2ProtocolConverter.asOpenTextDocumentParams(document)
+          params
         );
-      } catch {
+        if (this.client !== client || !client.isRunning()) {
+          throw new Error("Console language server changed during document synchronization.");
+        }
+        this.syncedDocuments.set(key, { document, version });
+        return;
       }
-      this.syncedDocuments.set(key, { document, version: document.version });
-      return;
-    }
 
-    if (existing.version !== document.version) {
-      try {
-        client.sendNotification(
+      if (existing.version !== document.version) {
+        const version = document.version;
+        const params = client.code2ProtocolConverter.asChangeTextDocumentParams(document);
+        await client.sendNotification(
           DidChangeTextDocumentNotification.type,
-          client.code2ProtocolConverter.asChangeTextDocumentParams(document)
+          params
         );
-      } catch {
+        if (this.client !== client || !client.isRunning()) {
+          throw new Error("Console language server changed during document synchronization.");
+        }
+        this.syncedDocuments.set(key, { document, version });
+        return;
       }
-      this.syncedDocuments.set(key, { document, version: document.version });
-      return;
-    }
 
-    if (existing.document !== document) {
-      this.syncedDocuments.set(key, { document, version: document.version });
-    }
+      if (existing.document !== document) {
+        this.syncedDocuments.set(key, { document, version: document.version });
+      }
+    });
+    this.documentSyncPromise = syncPromise.catch(() => {});
+    return syncPromise;
   }
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
