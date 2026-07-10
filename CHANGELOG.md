@@ -17,7 +17,6 @@ All notable changes to R Console will be documented in this file.
 - Empty-prefix completion Quick Picks now load matching runtime and language-server results as you type, including blank `[]` / `()` contexts and `Alt+Esc` completions.
 - Run-time and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
 - Further reduced the delay when opening language-server suggestions.
-- Renamed consoles and their session-manager labels now keep their names when the console is reopened or detached and reattached.
 - Persistent-session reattachment now warns when the configured R path differs from the running session, with options to close the session or open the R path setting.
 
 ### Fixed

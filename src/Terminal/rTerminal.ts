@@ -208,7 +208,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
-  private extensionResourcesDisposed = false;
+  private extensionResourcesDisposePromise: Promise<void> | undefined;
 
   private inBracketPaste = false;
   private pasteBuffer = "";
@@ -2402,15 +2402,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     this.writeEmitter.fire("\r\n");
-    this.forceClose();
+    await this.forceClose();
     this.closeEmitter.fire(0);
   }
 
-  private releaseExtensionResources(): void {
-    if (this.extensionResourcesDisposed) {
-      return;
+  private releaseExtensionResources(): Promise<void> {
+    if (this.extensionResourcesDisposePromise) {
+      return this.extensionResourcesDisposePromise;
     }
-    this.extensionResourcesDisposed = true;
     this.saveHistory();
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
@@ -2421,12 +2420,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearReplyPromptRenderTimer();
 
     this.sessionAttached = false;
-    void this.lang.dispose();
     setNativeParseCallback(null);
+    this.extensionResourcesDisposePromise = this.lang.dispose();
+    return this.extensionResourcesDisposePromise;
   }
 
-  forceClose(): void {
-    this.releaseExtensionResources();
+  forceClose(): Promise<void> {
+    const cleanup = this.releaseExtensionResources();
 
     if (this.rProcess) {
       const processToClose = this.rProcess;
@@ -2453,6 +2453,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.replyPromptText = "";
     this.notifyDisplayPidChanged();
     this.terminalState.dispose();
+    return cleanup;
   }
 
   detachPersistentSession(): PersistedRTerminalState | undefined {
@@ -2472,7 +2473,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.backendChildPid = undefined;
     this.sessionHostConnected = false;
     this.mode = "closed";
-    this.dispose();
     this.terminalState.dispose();
     return state;
   }
@@ -2581,11 +2581,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.pidEmitter.fire(nextPid);
   }
 
-  dispose(): void {
-    this.releaseExtensionResources();
+  dispose(): Promise<void> {
+    const cleanup = this.releaseExtensionResources();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
     this.pidEmitter.dispose();
+    return cleanup;
   }
 }

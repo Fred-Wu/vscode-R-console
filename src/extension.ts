@@ -60,6 +60,7 @@ const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
 const pidToRecord: Map<number, ConsoleRecord> = new Map();
 const editorTabToRecord: Map<vscode.Tab, ConsoleRecord> = new Map();
 const persistentSessionRecords: Map<string, PersistedConsoleRecord> = new Map();
+const pendingTerminalCleanups = new Set<Promise<void>>();
 const closeConfirmationInProgress = new WeakSet<ConsoleRecord>();
 const ignoredTerminalCloseEvents = new WeakSet<vscode.Terminal>();
 const R_CONSOLE_PID_LABEL_PATTERN = /^R Console \((\d+)\)$/;
@@ -71,6 +72,14 @@ let persistentSessionFilePath: string | undefined;
 let persistDebounceTimer: NodeJS.Timeout | undefined;
 let persistHeartbeatTimer: NodeJS.Timeout | undefined;
 let extensionHostDeactivating = false;
+
+function trackTerminalCleanup(cleanup: Promise<void>): void {
+  pendingTerminalCleanups.add(cleanup);
+  void cleanup.then(
+    () => pendingTerminalCleanups.delete(cleanup),
+    () => pendingTerminalCleanups.delete(cleanup)
+  );
+}
 
 function isVirtualWorkspace(): boolean {
   const folders = vscode.workspace.workspaceFolders;
@@ -809,6 +818,7 @@ function detachConsoleRecord(record: ConsoleRecord): void {
   if (!persistedTerminal) {
     return;
   }
+  trackTerminalCleanup(record.rTerminal.dispose());
 
   persistentSessionRecords.set(persistedTerminal.runtime.sessionId, {
     terminal: persistedTerminal,
@@ -1028,8 +1038,8 @@ function disposeConsoleRecord(record: ConsoleRecord): void {
 function closeConsoleRecordPermanently(record: ConsoleRecord): void {
   const terminalToDispose = record.terminal;
   forgetPersistentSessionForRecord(record);
+  trackTerminalCleanup(record.rTerminal.forceClose());
   disposeConsoleRecord(record);
-  record.rTerminal.forceClose();
   if (terminalToDispose) {
     terminalToDispose.dispose();
   }
@@ -1071,7 +1081,7 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
 
   if (!record.rTerminal.requiresCloseConfirmation()) {
     forgetPersistentSessionForRecord(record);
-    record.rTerminal.dispose();
+    trackTerminalCleanup(record.rTerminal.dispose());
     disposeConsoleRecord(record);
     return;
   }
@@ -1337,17 +1347,18 @@ function findEditorTabByPid(pid: number): vscode.Tab | undefined {
   return undefined;
 }
 
-export function deactivate() {
+export async function deactivate(): Promise<void> {
   extensionHostDeactivating = true;
   flushPersistPersistentSessions();
   for (const record of new Set(rTerminalToRecord.values())) {
     record.pidSubscription.dispose();
-    record.rTerminal.dispose();
+    trackTerminalCleanup(record.rTerminal.dispose());
   }
   terminalToRecord.clear();
   rTerminalToRecord.clear();
   pidToRecord.clear();
   editorTabToRecord.clear();
+  await Promise.allSettled([...pendingTerminalCleanups]);
 }
 
 function startPersistentSessionRegistry(context: vscode.ExtensionContext): void {
