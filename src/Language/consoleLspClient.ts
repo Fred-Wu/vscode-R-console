@@ -32,7 +32,7 @@ type ConsoleLspClientOptions = {
   ) => Promise<SessionMemberCompletionItem[] | undefined>;
 };
 
-export type ConsoleLspSessionState = {
+type ConsoleLspSessionState = {
   attachedPackages: string[];
   loadedNamespaces: string[];
 };

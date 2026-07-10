@@ -713,6 +713,5 @@ not persisted.
 12. [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
 13. [`src/Language/completion.ts`](../src/Language/completion.ts)
 14. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
-15. [`src/Language/languageBridge.ts`](../src/Language/languageBridge.ts)
-16. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
-17. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+15. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
+16. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)

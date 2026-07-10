@@ -51,10 +51,6 @@ type ConsoleSessionState = {
   loadedNamespaces: string[];
 };
 
-type CompletionDocumentContext = {
-  document: vscode.TextDocument;
-};
-
 export class RTermLang {
   private completionRequestId = 0;
   private completionDocument: VirtualRDocument | undefined;
@@ -69,9 +65,9 @@ export class RTermLang {
 
   async start(): Promise<void> {
     await this.ensureConsoleLspStarted();
-    const docContext = await this.getOrOpenCompletionDocument("");
-    if (docContext) {
-      this.requestSilentCompletion(docContext.document);
+    const document = await this.getOrOpenCompletionDocument("");
+    if (document) {
+      this.requestSilentCompletion(document);
     }
   }
 
@@ -135,7 +131,7 @@ export class RTermLang {
 
         const needsDocument = needsLsp || !!this.consoleLsp;
         const completionProviderRequest = this.getCompletionProvider();
-        const docContextRequest = needsDocument
+        const documentRequest = needsDocument
           ? this.getOrOpenCompletionDocument(latestInput.text)
           : Promise.resolve(undefined);
 
@@ -144,11 +140,11 @@ export class RTermLang {
           return undefined;
         }
 
-        const docContext = await docContextRequest;
+        const document = await documentRequest;
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
-        if (needsDocument && !docContext) {
+        if (needsDocument && !document) {
           return undefined;
         }
 
@@ -159,8 +155,8 @@ export class RTermLang {
         const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
         return await collectCompletionEntries(
           context,
-          docContext?.document,
-          docContext ? position : undefined,
+          document,
+          document ? position : undefined,
           sessionData,
           linesBefore,
           recentEntries,
@@ -201,11 +197,7 @@ export class RTermLang {
       }
       const initialEntries = entries ?? [];
 
-      const pickOptions = {
-        matchOnDescription: false,
-        matchOnDetail: false,
-        placeHolder: "R console completions",
-      };
+      const completionPlaceHolder = "R console completions";
       const shouldPrefillQuickPick =
         context.prefix.length > 0 &&
         context.kind !== "package" &&
@@ -300,7 +292,7 @@ export class RTermLang {
           matchOnDescription: false,
           matchOnDetail: false,
           sortByLabel: false,
-          placeholder: pickOptions.placeHolder,
+          placeholder: completionPlaceHolder,
         });
         setQuickPickItems(pick, sourceEntries, "");
         void delayedEntries?.then((nextEntries) => {
@@ -376,13 +368,13 @@ export class RTermLang {
             (await this.options.requestWorkspaceData?.()) ??
             getWorkspaceData() ??
             cachedSessionData;
-          const nextDocContext = await this.getOrOpenCompletionDocument(
+          const nextDocument = await this.getOrOpenCompletionDocument(
             nextInputText
           );
           if (!this.isCurrentCompletionRequest(requestId)) {
             return;
           }
-          if (!nextDocContext) {
+          if (!nextDocument) {
             return;
           }
           completionProvider ??= await this.getCompletionProvider();
@@ -391,7 +383,7 @@ export class RTermLang {
           }
           const nextEntries = await collectCompletionEntries(
             nextContext,
-            nextDocContext.document,
+            nextDocument,
             new vscode.Position(latestInput.cursorRow, cursorCol),
             refinedSessionData,
             lines.slice(0, latestInput.cursorRow),
@@ -463,7 +455,6 @@ export class RTermLang {
         this.completionDocument as unknown as vscode.TextDocument
       );
     }
-    this.completionDocument?.dispose();
     this.completionDocument = undefined;
   }
 
@@ -485,9 +476,9 @@ export class RTermLang {
       return;
     }
     try {
-      const docContext = await this.getOrOpenCompletionDocument(inputText);
-      if (docContext) {
-        await this.consoleLsp?.prepareDocument(docContext.document);
+      const document = await this.getOrOpenCompletionDocument(inputText);
+      if (document) {
+        await this.consoleLsp?.prepareDocument(document);
       }
     } catch {
     }
@@ -531,13 +522,11 @@ export class RTermLang {
 
   private async getOrOpenCompletionDocument(
     content: string
-  ): Promise<CompletionDocumentContext | undefined> {
+  ): Promise<vscode.TextDocument | undefined> {
     try {
-      return {
-        document: this.getOrUpdateCompletionDocument(
-          content
-        ) as unknown as vscode.TextDocument,
-      };
+      return this.getOrUpdateCompletionDocument(
+        content
+      ) as unknown as vscode.TextDocument;
     } catch {
       return undefined;
     }

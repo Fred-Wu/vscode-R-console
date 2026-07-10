@@ -12,7 +12,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
   constructor(
     private readonly onDidChange: () => void
   ) {}
-  
+
   setSource(lines: string[]): void {
     const nextLines = [...lines];
     const nextKey = nextLines.join("\n");

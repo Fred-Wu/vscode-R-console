@@ -106,7 +106,6 @@ type GlobalEnvItem = {
 };
 
 type WorkspaceData = {
-  search?: string[];
   globalenv?: Record<string, GlobalEnvItem>;
 };
 

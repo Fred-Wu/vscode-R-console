@@ -51,6 +51,13 @@ const SEMANTIC_SCOPE_RULES = new Map<string, readonly (readonly string[])[]>([
   ["variable", [["variable.other.readwrite"], ["entity.name.variable"]]],
 ]);
 
+const DEFAULT_BRACKET_COLORS = {
+  dark: ["#FFD700", "#DA70D6", "#179FFF"],
+  light: ["#0431FA", "#319331", "#7B3814"],
+  highContrastDark: ["#FFD700", "#DA70D6", "#87CEFA"],
+  highContrastLight: ["#0431FA", "#319331", "#7B3814"],
+} as const;
+
 const extensionNlsCache = new Map<string, Record<string, string>>();
 
 export class SyntaxTheme {
@@ -230,8 +237,32 @@ function loadTheme(themeName: string): {
 
 function buildBracketColors(themeColors: Record<string, string>): string[] {
   return [0, 1, 2, 3, 4, 5]
-    .map((index) => normalizeHex(themeColors[`editorBracketHighlight.foreground${index + 1}`]))
+    .map((index) => {
+      const configured = normalizeHex(themeColors[`editorBracketHighlight.foreground${index + 1}`]);
+      if (configured) {
+        return configured;
+      }
+      return defaultBracketColor(index);
+    })
     .filter((color): color is string => color !== undefined);
+}
+
+function defaultBracketColor(index: number): string | undefined {
+  return getDefaultBracketPalette()[index];
+}
+
+function getDefaultBracketPalette(): readonly string[] {
+  switch (vscode.window.activeColorTheme.kind) {
+    case vscode.ColorThemeKind.Light:
+      return DEFAULT_BRACKET_COLORS.light;
+    case vscode.ColorThemeKind.HighContrast:
+      return DEFAULT_BRACKET_COLORS.highContrastDark;
+    case vscode.ColorThemeKind.HighContrastLight:
+      return DEFAULT_BRACKET_COLORS.highContrastLight;
+    case vscode.ColorThemeKind.Dark:
+    default:
+      return DEFAULT_BRACKET_COLORS.dark;
+  }
 }
 
 function resolveDefaultForegroundAnsi(

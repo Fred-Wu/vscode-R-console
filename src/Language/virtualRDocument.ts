@@ -31,8 +31,6 @@ export class VirtualRDocument {
     this.version += 1;
   }
 
-  dispose(): void {}
-
   getText(range?: vscode.Range): string {
     if (!range) {
       return this.text;
