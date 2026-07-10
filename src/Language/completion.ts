@@ -82,17 +82,18 @@ export interface CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string
   ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined>;
-  provideMemberCompletionItems?(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<
-    Array<{
-      name: string;
-      type?: string;
-      str?: string;
-    }> | undefined
-  >;
 }
+
+export type RuntimeMemberCompletionRequester = (
+  expression: string,
+  operator: "$" | "@"
+) => Promise<
+  Array<{
+    name: string;
+    type?: string;
+    str?: string;
+  }> | undefined
+> | undefined;
 
 type GlobalEnvItem = {
   class?: string[];
@@ -368,12 +369,13 @@ export async function collectCompletionEntries(
   multilineBuffer: string[],
   recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider,
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string
 ): Promise<CompletionEntry[]> {
   const sessionItems = getSessionCompletions(context, sessionData);
   const runtimeMemberItems =
     context.kind === "member"
-      ? await getRuntimeMemberCompletions(context, completionProvider)
+      ? await getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
       : [];
   const includeLspItems =
     needsLanguageServerCompletion(context) && !!doc && !!position;
@@ -404,7 +406,10 @@ export async function collectCompletionEntries(
   const columnItems =
     cachedColumnItems.length > 0
       ? cachedColumnItems
-      : await getRuntimeDataColumnCompletions(context, completionProvider);
+      : await getRuntimeDataColumnCompletions(
+          context,
+          requestRuntimeMemberCompletions
+        );
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
@@ -743,14 +748,14 @@ function asStringArray(value: string | string[] | undefined): string[] {
 
 async function getRuntimeDataColumnCompletions(
   context: CompletionContext,
-  completionProvider?: CompletionProvider
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
 ): Promise<CompletionEntry[]> {
-  if (!context.dataObjectName || !completionProvider?.provideMemberCompletionItems) {
+  if (!context.dataObjectName || !requestRuntimeMemberCompletions) {
     return [];
   }
 
   try {
-    const items = await completionProvider.provideMemberCompletionItems(
+    const items = await requestRuntimeMemberCompletions(
       context.dataObjectName,
       "$"
     );
@@ -831,19 +836,19 @@ function getConsoleBufferCompletions(
 
 async function getRuntimeMemberCompletions(
   context: CompletionContext,
-  completionProvider?: CompletionProvider
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
 ): Promise<CompletionEntry[]> {
   if (
     context.kind !== "member" ||
     !context.objectName ||
     !context.operator ||
-    !completionProvider?.provideMemberCompletionItems
+    !requestRuntimeMemberCompletions
   ) {
     return [];
   }
 
   try {
-    const items = await completionProvider.provideMemberCompletionItems(
+    const items = await requestRuntimeMemberCompletions(
       context.objectName,
       context.operator
     );

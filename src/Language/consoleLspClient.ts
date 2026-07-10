@@ -18,7 +18,6 @@ import {
   StreamInfo,
 } from "vscode-languageclient/node";
 import type { CompletionProvider } from "./completion";
-import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -27,10 +26,6 @@ type ConsoleLspClientOptions = {
   extensionPath: string;
   rPath: string;
   env: NodeJS.ProcessEnv;
-  requestMemberCompletions?: (
-    expression: string,
-    operator: "$" | "@"
-  ) => Promise<SessionMemberCompletionItem[] | undefined>;
 };
 
 type ConsoleLspSessionState = {
@@ -275,20 +270,6 @@ export class ConsoleLspClient implements CompletionProvider {
     }
     this.syncDocument(client, doc);
     await this.applySessionState(client);
-  }
-
-  async provideMemberCompletionItems(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    if (this.disposed || !this.options.requestMemberCompletions) {
-      return undefined;
-    }
-    try {
-      return await this.options.requestMemberCompletions(expression, operator);
-    } catch {
-      return undefined;
-    }
   }
 
   async syncSessionState(state: ConsoleLspSessionState): Promise<void> {
