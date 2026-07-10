@@ -7,7 +7,10 @@ import {
   type PersistedRTerminalOptions,
   resolveRTerminalOptions,
 } from "./Terminal/rTerminal";
-import { createRuntimeBackend } from "./Terminal/rTerminal/runtime";
+import {
+  createRuntimeBackend,
+  isDefaultRuntimeTerminalName,
+} from "./Terminal/rTerminal/runtime";
 import {
   discoverRBinaryPath,
   getPlatformRPathConfigEntry,
@@ -21,6 +24,7 @@ type ConsoleRecord = {
   rTerminal: RTerminal;
   location: TerminalContext;
   terminal?: vscode.Terminal;
+  terminalName?: string;
   pid?: number;
   pidSubscription: vscode.Disposable;
 };
@@ -28,6 +32,7 @@ type ConsoleRecord = {
 type PersistedConsoleRecord = {
   terminal: PersistedRTerminalState;
   location: TerminalContext;
+  terminalName?: string;
 };
 
 type PersistentSessionState = {
@@ -53,9 +58,8 @@ type ManagedSessionPick = vscode.QuickPickItem & {
 const terminalToRecord: Map<vscode.Terminal, ConsoleRecord> = new Map();
 const rTerminalToRecord: Map<RTerminal, ConsoleRecord> = new Map();
 const pidToRecord: Map<number, ConsoleRecord> = new Map();
+const editorTabToRecord: Map<vscode.Tab, ConsoleRecord> = new Map();
 const persistentSessionRecords: Map<string, PersistedConsoleRecord> = new Map();
-const editorCloseInProgress: Set<number> = new Set();
-const ignoredEditorClosePids: Set<number> = new Set();
 const closeConfirmationInProgress = new WeakSet<ConsoleRecord>();
 const ignoredTerminalCloseEvents = new WeakSet<vscode.Terminal>();
 const R_CONSOLE_PID_LABEL_PATTERN = /^R Console \((\d+)\)$/;
@@ -111,6 +115,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.triggerCompletion", () =>
       getActiveRTerminal()?.triggerCompletion()
     ),
+    vscode.commands.registerCommand("r-console.restoreDefaultName", (target?: unknown) => {
+      restoreDefaultConsoleName(target);
+    }),
     vscode.window.onDidOpenTerminal(handleTerminalOpen),
     vscode.window.onDidChangeActiveTerminal(handleActiveTerminalChange),
     vscode.window.onDidCloseTerminal(handleTerminalClose),
@@ -200,7 +207,6 @@ function disposeStalePersistentTerminalViews(): void {
     return;
   }
 
-  const ignoredPids = new Set<number>();
   for (const terminal of vscode.window.terminals) {
     if (resolveRecordFromTerminal(terminal)) {
       continue;
@@ -210,17 +216,7 @@ function disposeStalePersistentTerminalViews(): void {
       continue;
     }
     ignoredTerminalCloseEvents.add(terminal);
-    ignoredEditorClosePids.add(pid);
-    ignoredPids.add(pid);
     terminal.dispose();
-  }
-
-  if (ignoredPids.size > 0) {
-    setTimeout(() => {
-      for (const pid of ignoredPids) {
-        ignoredEditorClosePids.delete(pid);
-      }
-    }, 1000);
   }
 }
 
@@ -247,6 +243,9 @@ function isPersistedConsoleRecord(value: unknown): value is PersistedConsoleReco
     return false;
   }
   if (!isPersistedTerminalContext(value.location)) {
+    return false;
+  }
+  if (value.terminalName !== undefined && typeof value.terminalName !== "string") {
     return false;
   }
   return true;
@@ -410,19 +409,12 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
     return;
   }
 
+  record.terminalName = closedTerminal.name;
+  record.rTerminal.preserveTerminalName(closedTerminal.name);
   detachTerminalFromRecord(record, closedTerminal);
   setRConsoleActiveContext(vscode.window.activeTerminal, closedTerminal);
 
   if (extensionHostDeactivating) {
-    return;
-  }
-
-  if (!record.rTerminal.requiresCloseConfirmation()) {
-    await handleRunningConsoleClose(record);
-    return;
-  }
-
-  if (record.location.kind === "editor") {
     return;
   }
 
@@ -469,6 +461,40 @@ async function createRTerminal(
 function getActiveRTerminal(): RTerminal | undefined {
   const terminal = vscode.window.activeTerminal;
   return terminal ? resolveRecordFromTerminal(terminal)?.rTerminal : undefined;
+}
+
+function restoreDefaultConsoleName(target?: unknown): void {
+  let record: ConsoleRecord | undefined;
+  if (target && typeof target === "object") {
+    record = terminalToRecord.get(target as vscode.Terminal);
+  }
+
+  const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  if (!record && activeTab?.input instanceof vscode.TabInputTerminal) {
+    record = editorTabToRecord.get(activeTab);
+  }
+  if (!record && vscode.window.activeTerminal) {
+    record = resolveRecordFromTerminal(vscode.window.activeTerminal);
+  }
+  if (!record) {
+    return;
+  }
+
+  record.terminalName = record.rTerminal.restoreDefaultTerminalName();
+  schedulePersistPersistentSessions();
+}
+
+function captureCustomConsoleName(record: ConsoleRecord): string | undefined {
+  const terminalName =
+    record.location.kind === "editor" && record.terminalName
+      ? record.terminalName
+      : record.terminal?.name ?? record.terminalName;
+  if (terminalName) {
+    record.rTerminal.preserveTerminalName(terminalName);
+  }
+  return terminalName && !isDefaultRuntimeTerminalName(terminalName)
+    ? terminalName
+    : undefined;
 }
 
 function setRConsoleActiveContext(
@@ -587,9 +613,12 @@ function collectManagedPersistentSessions(): ManagedPersistentSession[] {
       continue;
     }
     const sessionId = terminal.runtime.sessionId;
+    const terminalName = captureCustomConsoleName(record);
+    record.terminalName = terminalName;
     const entry: PersistedConsoleRecord = {
       terminal,
       location: record.location,
+      terminalName,
     };
     persistentSessionRecords.set(sessionId, entry);
     sessions.set(sessionId, {
@@ -745,8 +774,19 @@ async function attachPersistentSessions(
       rArgs: [...persistedOptions.rArgs],
     };
 
-    const rTerminal = new RTerminal(options, context.extensionPath, session.entry.terminal);
+    const terminalName =
+      session.entry.terminalName &&
+      !isDefaultRuntimeTerminalName(session.entry.terminalName)
+        ? session.entry.terminalName
+        : undefined;
+    const rTerminal = new RTerminal(
+      options,
+      context.extensionPath,
+      session.entry.terminal,
+      terminalName
+    );
     const record = createConsoleRecord(rTerminal, session.entry.location);
+    record.terminalName = terminalName;
     attachTerminal(record, true);
   }
   schedulePersistPersistentSessions();
@@ -762,9 +802,9 @@ function detachPersistentSessions(sessions: readonly ManagedPersistentSession[])
 }
 
 function detachConsoleRecord(record: ConsoleRecord): void {
-  const pid = record.pid;
   const location = record.location;
   const terminalToDispose = record.terminal;
+  const terminalName = captureCustomConsoleName(record);
   const persistedTerminal = record.rTerminal.detachPersistentSession();
   if (!persistedTerminal) {
     return;
@@ -773,16 +813,11 @@ function detachConsoleRecord(record: ConsoleRecord): void {
   persistentSessionRecords.set(persistedTerminal.runtime.sessionId, {
     terminal: persistedTerminal,
     location,
+    terminalName,
   });
 
   if (terminalToDispose) {
     ignoredTerminalCloseEvents.add(terminalToDispose);
-    if (typeof pid === "number") {
-      ignoredEditorClosePids.add(pid);
-      setTimeout(() => {
-        ignoredEditorClosePids.delete(pid);
-      }, 1000);
-    }
   }
 
   disposeConsoleRecord(record);
@@ -852,6 +887,12 @@ function closeDetachedPersistentSessions(
 }
 
 function formatManagedSessionLabel(session: ManagedPersistentSession): string {
+  if (
+    session.entry.terminalName &&
+    !isDefaultRuntimeTerminalName(session.entry.terminalName)
+  ) {
+    return session.entry.terminalName;
+  }
   return typeof session.pid === "number"
     ? `R Console (${session.pid})`
     : `R Console (${session.sessionId.slice(0, 8)})`;
@@ -975,19 +1016,21 @@ function disposeConsoleRecord(record: ConsoleRecord): void {
       terminalToRecord.delete(terminal);
     }
   }
+  for (const [tab, mappedRecord] of editorTabToRecord) {
+    if (mappedRecord === record) {
+      editorTabToRecord.delete(tab);
+    }
+  }
   record.terminal = undefined;
   schedulePersistPersistentSessions();
 }
 
-function closeConsoleRecordPermanently(
-  record: ConsoleRecord,
-  terminalToDispose: vscode.Terminal | undefined = record.terminal
-): void {
+function closeConsoleRecordPermanently(record: ConsoleRecord): void {
+  const terminalToDispose = record.terminal;
   forgetPersistentSessionForRecord(record);
   disposeConsoleRecord(record);
   record.rTerminal.forceClose();
   if (terminalToDispose) {
-    terminalToRecord.delete(terminalToDispose);
     terminalToDispose.dispose();
   }
 }
@@ -1016,9 +1059,9 @@ function getPersistentSessionIdForRecord(record: ConsoleRecord): string | undefi
   return undefined;
 }
 
-function reattachRunningTerminal(record: ConsoleRecord): vscode.Terminal {
-  record.rTerminal.reattachToNewTerminal();
-  return attachTerminal(record, true);
+function reattachRunningTerminal(record: ConsoleRecord): void {
+  record.rTerminal.reattachToNewTerminal(record.terminalName);
+  attachTerminal(record, true);
 }
 
 async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
@@ -1035,8 +1078,7 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
 
   closeConfirmationInProgress.add(record);
   try {
-    const reattachedTerminal = reattachRunningTerminal(record);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    reattachRunningTerminal(record);
 
     const result = await vscode.window.showWarningMessage(
       "Are you sure you want to close the R console?",
@@ -1044,8 +1086,9 @@ async function handleRunningConsoleClose(record: ConsoleRecord): Promise<void> {
       "Close"
     );
 
-    if (result === "Close") {
-      closeConsoleRecordPermanently(record, reattachedTerminal);
+    if (result === "Close" || !record.rTerminal.requiresCloseConfirmation()) {
+      closeConsoleRecordPermanently(record);
+      return;
     }
   } finally {
     closeConfirmationInProgress.delete(record);
@@ -1057,7 +1100,7 @@ function attachTerminal(
   preserveFocusOverride?: boolean
 ): vscode.Terminal {
   const terminalOptions: vscode.ExtensionTerminalOptions = {
-    name: record.rTerminal.getTerminalName(),
+    name: record.terminalName ?? record.rTerminal.getTerminalName(),
     pty: record.rTerminal,
     iconPath: extensionBaseUri
       ? vscode.Uri.joinPath(extensionBaseUri, "images", "Rlogo.png")
@@ -1180,26 +1223,43 @@ function parseConsolePidFromLabel(label: string): number | undefined {
 function handleTerminalTabChange(event: vscode.TabChangeEvent): void {
   syncTerminalRecordsFromWindow();
 
-  for (const tab of [...event.opened, ...event.changed]) {
-    if (!(tab.input instanceof vscode.TabInputTerminal)) {
-      continue;
-    }
+  const openTabs = new Set<vscode.Tab>();
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      openTabs.add(tab);
+      if (!(tab.input instanceof vscode.TabInputTerminal)) {
+        continue;
+      }
 
-    const pid = parseConsolePidFromLabel(tab.label);
-    if (typeof pid !== "number") {
-      continue;
-    }
+      const pid = parseConsolePidFromLabel(tab.label);
+      let record = editorTabToRecord.get(tab);
+      if (!record && typeof pid === "number") {
+        record = pidToRecord.get(pid);
+      }
+      if (!record) {
+        const records = new Set<ConsoleRecord>();
+        for (const [terminal, mappedRecord] of terminalToRecord) {
+          if (terminal.name === tab.label) {
+            records.add(mappedRecord);
+          }
+        }
+        if (records.size === 1) {
+          record = [...records][0];
+        }
+      }
+      if (!record) {
+        continue;
+      }
 
-    const record = pidToRecord.get(pid);
-    if (!record) {
-      continue;
+      editorTabToRecord.set(tab, record);
+      record.terminalName = tab.label;
+      record.rTerminal.preserveTerminalName(tab.label);
+      record.location = {
+        kind: "editor",
+        viewColumn: tab.group.viewColumn,
+      };
+      schedulePersistPersistentSessions();
     }
-
-    record.location = {
-      kind: "editor",
-      viewColumn: tab.group.viewColumn,
-    };
-    schedulePersistPersistentSessions();
   }
 
   for (const tab of event.closed) {
@@ -1207,43 +1267,37 @@ function handleTerminalTabChange(event: vscode.TabChangeEvent): void {
       continue;
     }
 
-    const pid = parseConsolePidFromLabel(tab.label);
-    if (typeof pid !== "number") {
+    const record = editorTabToRecord.get(tab);
+    editorTabToRecord.delete(tab);
+    if (!record || extensionHostDeactivating || closeConfirmationInProgress.has(record)) {
       continue;
     }
 
-    void handleEditorTerminalTabClosed(pid);
-  }
-}
-
-async function handleEditorTerminalTabClosed(pid: number): Promise<void> {
-  if (ignoredEditorClosePids.has(pid)) {
-    return;
-  }
-
-  if (editorCloseInProgress.has(pid)) {
-    return;
-  }
-
-  const record = pidToRecord.get(pid);
-  if (!record || record.location.kind !== "editor") {
-    return;
-  }
-
-  editorCloseInProgress.add(pid);
-
-  try {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    syncTerminalRecordsFromWindow();
-
-    if (findEditorTabByPid(pid)) {
-      syncConsoleRecordLocationFromTabs(record);
-      return;
+    let stillOpenInEditor = false;
+    for (const [openTab, mappedRecord] of editorTabToRecord) {
+      if (mappedRecord === record && openTabs.has(openTab)) {
+        stillOpenInEditor = true;
+        break;
+      }
+    }
+    if (stillOpenInEditor) {
+      continue;
     }
 
-    await handleRunningConsoleClose(record);
-  } finally {
-    editorCloseInProgress.delete(pid);
+    record.terminalName = tab.label;
+    record.rTerminal.preserveTerminalName(tab.label);
+    record.location = {
+      kind: "editor",
+      viewColumn: tab.group.viewColumn,
+    };
+
+    const terminal = record.terminal;
+    if (terminal) {
+      ignoredTerminalCloseEvents.add(terminal);
+      detachTerminalFromRecord(record, terminal);
+      terminal.dispose();
+    }
+    void handleRunningConsoleClose(record);
   }
 }
 
@@ -1257,6 +1311,9 @@ function syncConsoleRecordLocationFromTabs(record: ConsoleRecord): void {
     return;
   }
 
+  editorTabToRecord.set(tab, record);
+  record.terminalName = tab.label;
+  record.rTerminal.preserveTerminalName(tab.label);
   record.location = {
     kind: "editor",
     viewColumn: tab.group.viewColumn,
@@ -1290,6 +1347,7 @@ export function deactivate() {
   terminalToRecord.clear();
   rTerminalToRecord.clear();
   pidToRecord.clear();
+  editorTabToRecord.clear();
 }
 
 function startPersistentSessionRegistry(context: vscode.ExtensionContext): void {
@@ -1344,9 +1402,12 @@ function persistPersistentSessions(): void {
     if (!terminal) {
       continue;
     }
+    const terminalName = captureCustomConsoleName(record);
+    record.terminalName = terminalName;
     sessionMap.set(terminal.runtime.sessionId, {
       terminal,
       location: record.location,
+      terminalName,
     });
   }
 

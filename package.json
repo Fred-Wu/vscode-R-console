@@ -85,12 +85,35 @@
         "command": "r-console.triggerCompletion",
         "title": "Show Completions",
         "category": "R Console"
+      },
+      {
+        "command": "r-console.restoreDefaultName",
+        "title": "Restore Default Name",
+        "category": "R Console"
       }
     ],
     "menus": {
+      "editor/title/context": [
+        {
+          "command": "r-console.restoreDefaultName",
+          "when": "resourceScheme == vscode-terminal && rConsole.consoleActive",
+          "group": "1_modification"
+        }
+      ],
+      "terminal/title/context": [
+        {
+          "command": "r-console.restoreDefaultName",
+          "when": "rConsole.consoleActive",
+          "group": "1_modification"
+        }
+      ],
       "commandPalette": [
         {
           "command": "r-console.triggerCompletion",
+          "when": "false"
+        },
+        {
+          "command": "r-console.restoreDefaultName",
           "when": "false"
         }
       ]

@@ -44,6 +44,7 @@ import {
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
   getRuntimeTerminalName,
+  isDefaultRuntimeTerminalName,
   interruptRuntime,
   attachRuntimeSession,
   primeRuntimeAttach,
@@ -141,6 +142,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private nameEmitter = new vscode.EventEmitter<string>();
   private pidEmitter = new vscode.EventEmitter<number | undefined>();
   private lastKnownPid: number | undefined;
+  private customTerminalName: string | undefined;
 
   get onDidWrite(): vscode.Event<string> {
     return this.writeEmitter.event;
@@ -219,8 +221,12 @@ export class RTerminal implements vscode.Pseudoterminal {
   constructor(
     private options: RTerminalOptions,
     private extensionPath: string = "",
-    restoreState?: PersistedRTerminalState
+    restoreState?: PersistedRTerminalState,
+    terminalName?: string
   ) {
+    if (terminalName && !isDefaultRuntimeTerminalName(terminalName)) {
+      this.customTerminalName = terminalName;
+    }
     if (
       typeof restoreState?.ui.replayColumns === "number" &&
       Number.isFinite(restoreState.ui.replayColumns) &&
@@ -571,6 +577,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       startNextSubmission: () => self.startNextSubmission(),
       finishActiveSubmission: () => self.finishActiveSubmission(),
       getDisplayPid: () => self.getDisplayPid(),
+      getTerminalName: () => self.getTerminalName(),
       notifyDisplayPidChanged: () => self.notifyDisplayPidChanged(),
       onSessionDataChanged: (data) => self.onSessionDataChanged(data),
     };
@@ -667,10 +674,11 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const hadPromptVisible = this.promptVisible;
     this.restoreTerminalState();
+    const terminalName = this.getTerminalName();
     // Defer the name update: VSCode drops nameEmitter events fired
     // synchronously during open() because the terminal UI hasn't attached yet.
     setTimeout(() => {
-      this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
+      this.nameEmitter.fire(terminalName);
       this.notifyDisplayPidChanged();
     }, 0);
 
@@ -2469,9 +2477,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     return state;
   }
 
-  reattachToNewTerminal(): void {
+  reattachToNewTerminal(terminalName?: string): void {
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
+    if (terminalName) {
+      this.preserveTerminalName(terminalName);
+    }
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
@@ -2493,7 +2504,20 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   getTerminalName(): string {
-    return getRuntimeTerminalName(this.runtimeHost());
+    return this.customTerminalName ?? getRuntimeTerminalName(this.runtimeHost());
+  }
+
+  preserveTerminalName(terminalName: string): void {
+    this.customTerminalName = isDefaultRuntimeTerminalName(terminalName)
+      ? undefined
+      : terminalName;
+  }
+
+  restoreDefaultTerminalName(): string {
+    const terminalName = getRuntimeTerminalName(this.runtimeHost());
+    this.customTerminalName = undefined;
+    this.nameEmitter.fire(terminalName);
+    return terminalName;
   }
 
   exportPersistentState(): PersistedRTerminalState | undefined {

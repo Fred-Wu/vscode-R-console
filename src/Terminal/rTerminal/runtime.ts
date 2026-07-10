@@ -103,6 +103,7 @@ export type RuntimeHost = {
   startNextSubmission(): void;
   finishActiveSubmission(): void;
   getDisplayPid(): number | undefined;
+  getTerminalName(): string;
   notifyDisplayPidChanged(): void;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
 };
@@ -115,10 +116,20 @@ export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">)
   return VSCODE_R_TERMINAL_NAME;
 }
 
+export function isDefaultRuntimeTerminalName(terminalName: string): boolean {
+  return (
+    terminalName === VSCODE_R_TERMINAL_NAME ||
+    /^R Console \(\d+\)$/.test(terminalName)
+  );
+}
+
 export function updateRuntimeTerminalName(
-  host: Pick<RuntimeHost, "getDisplayPid" | "nameEmitter" | "notifyDisplayPidChanged">
+  host: Pick<
+    RuntimeHost,
+    "getTerminalName" | "nameEmitter" | "notifyDisplayPidChanged"
+  >
 ): void {
-  host.nameEmitter.fire(getRuntimeTerminalName(host));
+  host.nameEmitter.fire(host.getTerminalName());
   host.notifyDisplayPidChanged();
 }
 
@@ -252,9 +263,12 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
           `${ANSI.red}Failed to start R: ${err.message}${ANSI.reset}\r\n`
         );
       }
-      host.mode = "closed";
-      host.rProcess = null;
-      host.sessionAttached = false;
+      const failedRuntime = host.rProcess;
+      if (failedRuntime && host.runtimeBackend) {
+        host.runtimeBackend.detach(failedRuntime);
+        host.runtimeBackend.close(failedRuntime);
+      }
+      handleRuntimeExit(host, 1);
     },
   });
 }
