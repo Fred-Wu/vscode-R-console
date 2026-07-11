@@ -9,6 +9,7 @@ export type KeyAction =
   | { type: "word-right" }
   | { type: "tab" }
   | { type: "backtab" }
+  | { type: "completion" }
   | { type: "escape" }
   | { type: "ctrl_c" }
   | { type: "ctrl_d" }
@@ -27,6 +28,10 @@ const CSI_6: Map<string, KeyAction> = new Map([
   ["\x1b[201~", { type: "paste-end" }],
   ["\x1b[1;5C", { type: "word-right" }],
   ["\x1b[1;5D", { type: "word-left" }],
+]);
+
+const CSI_5: Map<string, KeyAction> = new Map([
+  ["\x1b[18~", { type: "completion" }],
 ]);
 
 const CSI_4: Map<string, KeyAction> = new Map([
@@ -99,6 +104,9 @@ function readCsiSequence(
 function getCsiAction(sequence: string): KeyAction | undefined {
   if (sequence.length === 6) {
     return CSI_6.get(sequence);
+  }
+  if (sequence.length === 5) {
+    return CSI_5.get(sequence);
   }
   if (sequence.length === 4) {
     return CSI_4.get(sequence);

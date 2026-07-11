@@ -446,14 +446,22 @@ lm_test <- lm(mpg ~ wt + cyl, data = mtcars)
 
 Now test in the console:
 
-- press `Alt+Esc` at an empty prompt and after typing a partial name
+- press `F7` at an empty prompt and after typing a partial name (use `Fn+F7`
+  on macOS when the top row controls media features)
+- press Tab at an empty prompt, then after typing a partial name
 - type `df_test$` and request completion
 - type `df_test[` and request completion inside brackets
 - type `stats::f` and request package completion
+- temporarily set `terminal.integrated.sendKeybindingsToShell` to `true`,
+  reload the VS Code window, and repeat the F7 checks; restore the setting
+  afterward
 
 Expected:
 
-- `Alt+Esc` opens the R Console completion window
+- F7 opens the R Console completion window with either terminal keybinding
+  dispatch mode
+- Tab at an empty prompt inserts indentation, while Tab after a partial name
+  requests contextual completion
 - `$` completions include `alpha`, `beta`, `gamma`
 - `[` completions on `df_test` include `alpha`, `beta`, `gamma`
 - completion still works after several commands, not just right after startup

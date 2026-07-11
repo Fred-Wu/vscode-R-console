@@ -1198,6 +1198,9 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
+      case "completion":
+        this.triggerCompletion();
+        return;
       case "backtab": {
         this.expandForEdit();
         const beforeCursor = this.inputState.currentLineBeforeCursor;
