@@ -2,23 +2,23 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.4.0] - 2026-07-11
+## [0.4.1] - 2026-07-11
 
 ### Added
 
-- Added `Alt+Esc` (`⌥ Esc` on macOS) to open console completions anywhere, including positions without a completion prefix or context.
+- Added `F7` to open console completions anywhere, including positions without a completion prefix or context.
 - Added `Restore Default Name` to the console tab menu for returning a renamed console to `R Console (PID)`.
 
 ### Changed
 
 - Console syntax highlighting now follows the active VS Code theme without depending on the language server.
+- Persistent-session reattachment now warns when the configured R path differs from the running session, with options to close the session or open the R path setting.
 - Completion suggestions now keep runtime and language-server results in their existing groups.
 - Runtime completions now appear immediately while language-server suggestions continue loading.
-- Completions opened without a prefix now update as you type, including inside empty `[]` / `()` contexts and when using `Alt+Esc`.
+- Completions opened without a prefix now update as you type, including inside empty `[]` / `()` contexts and when using the completion shortcut.
 - Runtime and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
 - Further reduced the delay when opening language-server suggestions.
 - Renamed consoles and their session-manager labels now keep their names when the console is reopened or detached and reattached.
-- Persistent-session reattachment now warns when the configured R path differs from the running session, with options to close the session or open the R path setting.
 
 ### Fixed
 

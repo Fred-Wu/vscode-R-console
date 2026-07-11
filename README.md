@@ -9,7 +9,7 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 
 - Custom R console hosted in the VS Code terminal area.
 - Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
-- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `Alt+Esc` (`⌥ Esc` on macOS) opens the completion window at the cursor, including empty positions where Tab is used for indentation.
+- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
 - Multiline editing with local history navigation, reverse search, and long-input rendering.
 - Auto-matching brackets and quotes.

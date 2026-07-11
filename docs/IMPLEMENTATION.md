@@ -570,11 +570,15 @@ inherits the normalized R environment used by the console runtime. Diagnostics
 are disabled because the virtual console document exists only to provide
 completion context and must not be linted as a source file.
 
-The contributed `Alt+Esc` keybinding is limited to an active R Console and
-invokes its internal forced-completion handler, preventing VS Code's terminal
-suggestion command from consuming the shortcut first. Forced completion shows
-the Quick Pick before full workspace and language-server results arrive, then
-fills the open window asynchronously.
+The contributed `F7` keybinding is limited to an active R Console and invokes
+its internal forced-completion handler when VS Code handles the keybinding. If
+VS Code instead forwards F7 to the pseudoterminal, `KeyProcessor` maps the
+standard xterm `ESC [ 18 ~` sequence to the same forced-completion handler.
+This fallback keeps completion available when
+`terminal.integrated.sendKeybindingsToShell` is enabled without changing the
+separate Tab action used for indentation and contextual completion. Forced
+completion shows the Quick Pick before full workspace and language-server
+results arrive, then fills the open window asynchronously.
 
 Console syntax highlighting is separate from language-server completion. It is
 implemented locally by `src/Terminal/consoleSyntax.ts` and
