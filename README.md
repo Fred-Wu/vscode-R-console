@@ -2,11 +2,14 @@
 
 R Console is a lightweight R console for VS Code that runs R inside a custom pseudoterminal. It combines a console frontend, a bundled R backend, and language-server completion integration. It is designed to work with VS Code, the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) extension, and R's `languageserver` package.
 
+> [!IMPORTANT]
+> The bundled backend executable, R_CONSOLE_HOST, is not currently code-signed. Depending on your OS and security settings, it may trigger a security warning or be blocked when first launched. Install R Console only from the official VS Code Marketplace or this repository's GitHub Releases.
+
 ## Features
 
 - Custom R console hosted in the VS Code terminal area.
-- Persistent R console sessions that can be attached, detached, or closed from VS Code.
-- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `Ctrl+Space` opens completion window at the cursor, including empty positions where Tab is used for indentation.
+- Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
+- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `Alt+Esc` (`⌥ Esc` on macOS) opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
 - Multiline editing with local history navigation, reverse search, and long-input rendering.
 - Auto-matching brackets and quotes.
@@ -47,10 +50,6 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 
 `R Console` launches from `r.rpath.*`, `R_HOME`, or `PATH`. It does not launch from `r.rterm.windows`, `r.rterm.mac`, or `r.rterm.linux`.
 
-> [!IMPORTANT]
-> Only official [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) 2.8.x releases are currently supported. Newer [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) builds are moving to a WebSocket and JSON-RPC 2.0 based architecture.
-> A future R Console update will support both [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) architectures once the new architecture is officially released.
-
 ### Launch R Console
 
 Launch R Console from the Command Palette:
@@ -72,33 +71,40 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 
 R Console reads several settings from [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r):
 
-| Setting | Purpose |
-| --- | --- |
-| `r.rpath.windows` | R executable path on Windows for R Console startup |
-| `r.rpath.mac` | R executable path on macOS for R Console startup |
-| `r.rpath.linux` | R executable path on Linux for R Console startup |
-| `r.rterm.option` | Extra arguments passed to R |
-| `r.sessionWatcher` | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher bridge |
-| `r.bracketedPaste` | Enables bracketed paste mode |
-| `r.lsp.args` | Extra arguments passed when starting `languageserver` |
-| `r.lsp.use_stdio` | Uses stdio instead of a loopback socket for the console LSP client when supported |
-| `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused |
+| Setting                       | Purpose                                                                                                           |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `r.rpath.windows`           | R executable path on Windows for R Console startup                                                                |
+| `r.rpath.mac`               | R executable path on macOS for R Console startup                                                                  |
+| `r.rpath.linux`             | R executable path on Linux for R Console startup                                                                  |
+| `r.rterm.option`            | Extra arguments passed to R                                                                                       |
+| `r.sessionWatcher`          | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher bridge |
+| `r.bracketedPaste`          | Enables bracketed paste mode                                                                                      |
+| `r.lsp.args`                | Extra arguments passed when starting`languageserver`                                                            |
+| `r.lsp.use_stdio`           | Uses stdio instead of a loopback socket for the console LSP client when supported                                 |
+| `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused                                                           |
 
 If `r.rpath.*` is set, an ambient `R_HOME` does not override it. If `r.rpath.*` is unset, ambient `R_HOME` is used before `PATH`.
 
 R Console also contributes its own settings:
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `r.console.autoMatch` | `true` | Auto-insert matching brackets and quotes |
-| `r.console.tabSize` | `2` | Indentation width |
-| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
+| Setting                    | Default       | Purpose                                                                                                                       |
+| -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
+| `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
+| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
 
 ## Dependency Model
 
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary.
 - R's `languageserver` package is optional at runtime but required for language-server completion.
 - The bundled R backend is required at runtime. If the bundled backend for the current target is missing, the console does not fall back to a separate backend.
+
+> [!WARNING]
+> Future compatibility change
+>
+> Only official vscode-R 2.8.x releases are currently supported. Newer vscode-R builds are moving to a WebSocket and JSON-RPC 2.0 architecture.
+>
+> A future R Console update will support both vscode-R architectures once the new architecture is officially released.
 
 ## Acknowledgements
 

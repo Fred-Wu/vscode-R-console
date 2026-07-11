@@ -2,20 +2,29 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.3.2] - 2026-07-10
+## [0.4.0] - 2026-07-11
 
 ### Added
 
-- Added `Ctrl+Space` to open console completions anywhere, including positions without a completion prefix or context.
+- Added `Alt+Esc` (`⌥ Esc` on macOS) to open console completions anywhere, including positions without a completion prefix or context.
+- Added `Restore Default Name` to the console tab menu for returning a renamed console to `R Console (PID)`.
 
 ### Changed
 
-- Removed language-server semantic-token requests for console syntax highlighting; console syntax highlighting now uses local tokenization mapped to VS Code theme colors.
-- Redesigned Quick Pick completion display to preserve grouped completion results.
+- Console syntax highlighting now follows the active VS Code theme without depending on the language server.
+- Completion suggestions now keep runtime and language-server results in their existing groups.
 - Runtime completions now appear immediately while language-server suggestions continue loading.
-- Empty-prefix completion Quick Picks now load matching runtime and language-server results as you type, including blank `[]` / `()` contexts and `Ctrl+Space` completions.
-- Run-time and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
+- Completions opened without a prefix now update as you type, including inside empty `[]` / `()` contexts and when using `Alt+Esc`.
+- Runtime and language-server completions are now both available in normal expression positions, including function calls and data-frame/table expressions; `pkg::`, `pkg:::`, `$`, `@`, quoted column-name, and `[[` completions remain limited to their matching context.
 - Further reduced the delay when opening language-server suggestions.
+- Renamed consoles and their session-manager labels now keep their names when the console is reopened or detached and reattached.
+- Persistent-session reattachment now warns when the configured R path differs from the running session, with options to close the session or open the R path setting.
+
+### Fixed
+
+- Improved how the console language server starts, runs, and stops.
+- Fixed runtime session completions becoming unavailable when language-server completion is still starting or unavailable.
+- Fixed the Close button hiding a renamed or moved console while its R session remained running.
 
 ## [0.3.1] - 2026-06-29
 

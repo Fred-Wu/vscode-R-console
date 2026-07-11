@@ -18,7 +18,6 @@ import {
   StreamInfo,
 } from "vscode-languageclient/node";
 import type { CompletionProvider } from "./completion";
-import type { SessionMemberCompletionItem } from "../Runtime/sessionWatcher";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -26,10 +25,7 @@ type ConsoleLspClientOptions = {
   consoleId: string;
   extensionPath: string;
   rPath: string;
-  requestMemberCompletions?: (
-    expression: string,
-    operator: "$" | "@"
-  ) => Promise<SessionMemberCompletionItem[] | undefined>;
+  env: NodeJS.ProcessEnv;
 };
 
 type ConsoleLspSessionState = {
@@ -56,19 +52,6 @@ class SilentOutputChannel implements vscode.OutputChannel {
 }
 
 class ConsoleLanguageClient extends LanguageClient {
-  private suppressShutdownCloseMessage = false;
-
-  setSuppressShutdownCloseMessage(value: boolean): void {
-    this.suppressShutdownCloseMessage = value;
-  }
-
-  protected async handleConnectionClosed(): Promise<void> {
-    if (this.suppressShutdownCloseMessage) {
-      return;
-    }
-    await super.handleConnectionClosed();
-  }
-
   error(message: string, data?: unknown, _showNotification: boolean | "force" = true): void {
     super.error(message, data, false);
   }
@@ -79,25 +62,26 @@ export class ConsoleLspClient implements CompletionProvider {
   private readonly workingDirectory: string;
 
   private client: ConsoleLanguageClient | undefined;
-  private suppressShutdownCloseMessage = false;
   private startPromise: Promise<void> | undefined;
-  private stopPromise: Promise<void> = Promise.resolve();
+  private disposePromise: Promise<void> | undefined;
+  private terminationPromise: Promise<boolean> | undefined;
+  private disposed = false;
   private spawnedServer: ChildProcess | undefined;
   private pendingSocketServer: net.Server | undefined;
   private syncedDocuments = new Map<string, { document: vscode.TextDocument; version: number }>();
+  private documentSyncPromise: Promise<void> = Promise.resolve();
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.outputChannel = new SilentOutputChannel("R Console");
-    this.workingDirectory = path.join(os.tmpdir(), "r-console", "lsp", this.options.consoleId);
-    fs.mkdirSync(this.workingDirectory, { recursive: true });
+    // A client removes only its own cwd after its R process has stopped.
+    this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
   }
 
   async start(): Promise<void> {
-    this.suppressShutdownCloseMessage = false;
-    if (this.client) {
-      this.client.setSuppressShutdownCloseMessage(false);
+    if (this.disposed) {
+      throw new Error("Cannot start a disposed console language server.");
     }
     if (this.client?.isRunning()) {
       return;
@@ -106,13 +90,35 @@ export class ConsoleLspClient implements CompletionProvider {
       await this.startPromise;
       return;
     }
-    this.startPromise = this.startInternal()
-      .catch((error) => {
+    this.startPromise = (async () => {
+      if (this.client || this.spawnedServer) {
+        const staleClient = this.client;
+        this.client = undefined;
+        if (staleClient) {
+          try {
+            await staleClient.dispose();
+          } catch {
+          }
+        }
+        if (!(await this.terminateSpawnedServer())) {
+          throw new Error("Cannot stop the previous console language server process.");
+        }
+        this.syncedDocuments.clear();
+        this.syncedSessionStateKey = undefined;
+      }
+      if (this.disposed) {
+        throw new Error("Cannot start a disposed console language server.");
+      }
+      await this.startInternal();
+    })()
+      .catch(async (error) => {
         const failedClient = this.client;
         this.client = undefined;
+        this.closePendingSocketServer();
+        await this.terminateSpawnedServer();
         if (failedClient) {
           try {
-            failedClient.dispose();
+            await failedClient.dispose();
           } catch {
           }
         }
@@ -124,62 +130,83 @@ export class ConsoleLspClient implements CompletionProvider {
     await this.startPromise;
   }
 
-  async stop(): Promise<void> {
-    this.suppressShutdownCloseMessage = true;
-    if (this.client) {
-      this.client.setSuppressShutdownCloseMessage(true);
+  private async stop(): Promise<boolean> {
+    const startPromise = this.startPromise;
+    if (startPromise && !this.client?.isRunning()) {
+      // Cancel startup before waiting for it, so a child that has not connected
+      // cannot block disposal.
+      this.closePendingSocketServer();
+      if (!(await this.terminateSpawnedServer())) {
+        return false;
+      }
     }
-    this.stopPromise = this.stopPromise.then(async () => {
-      if (this.startPromise) {
-        try {
-          await this.startPromise;
-        } catch {
-        }
+    if (startPromise) {
+      try {
+        await startPromise;
+      } catch {
       }
+    }
 
-      const client = this.client;
-      this.client = undefined;
-      if (!client) {
-        this.closePendingSocketServer();
-        this.terminateSpawnedServer();
-        this.syncedDocuments.clear();
-        this.syncedSessionStateKey = undefined;
-        return;
-      }
-
-      for (const { document } of this.syncedDocuments.values()) {
-        try {
-          client.sendNotification(
-            DidCloseTextDocumentNotification.type,
-            client.code2ProtocolConverter.asCloseTextDocumentParams(document)
-          );
-        } catch {
-        }
+    const client = this.client;
+    this.client = undefined;
+    if (!client) {
+      this.closePendingSocketServer();
+      if (!(await this.terminateSpawnedServer())) {
+        return false;
       }
       this.syncedDocuments.clear();
-      client.setSuppressShutdownCloseMessage(true);
-      try {
-        await client.stop();
-      } catch {
-      }
-      try {
-        client.dispose();
-      } catch {
-      }
-      this.closePendingSocketServer();
-      this.terminateSpawnedServer();
       this.syncedSessionStateKey = undefined;
-    });
-    await this.stopPromise;
-  }
+      return true;
+    }
 
-  async dispose(): Promise<void> {
-    await this.stop();
-    this.outputChannel.dispose();
+    for (const { document } of this.syncedDocuments.values()) {
+      try {
+        await client.sendNotification(
+          DidCloseTextDocumentNotification.type,
+          client.code2ProtocolConverter.asCloseTextDocumentParams(document)
+        );
+      } catch {
+      }
+    }
+    this.syncedDocuments.clear();
     try {
-      fs.rmSync(this.workingDirectory, { recursive: true, force: true });
+      await client.stop();
     } catch {
     }
+    try {
+      await client.dispose();
+    } catch {
+    }
+    this.closePendingSocketServer();
+    if (!(await this.terminateSpawnedServer())) {
+      return false;
+    }
+    this.syncedSessionStateKey = undefined;
+    return true;
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+
+    this.disposed = true;
+    this.disposePromise = (async () => {
+      while (!(await this.stop())) {
+        const child = this.spawnedServer;
+        if (child && child.exitCode === null && child.signalCode === null) {
+          await new Promise<void>((resolve) => {
+            child.once("exit", resolve);
+          });
+        }
+      }
+      this.outputChannel.dispose();
+      try {
+        fs.rmSync(this.workingDirectory, { recursive: true, force: true });
+      } catch {
+      }
+    })();
+    return this.disposePromise;
   }
 
   async provideCompletionItems(
@@ -191,19 +218,18 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return undefined;
     }
-    this.syncDocument(client, doc);
-    await this.applySessionState(client);
-    const context: vscode.CompletionContext = triggerCharacter
-      ? {
-          triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
-          triggerCharacter,
-        }
-      : {
-          triggerKind: vscode.CompletionTriggerKind.Invoke,
-          triggerCharacter: undefined,
-        };
-
     try {
+      await this.syncDocument(client, doc);
+      await this.applySessionState(client);
+      const context: vscode.CompletionContext = triggerCharacter
+        ? {
+            triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
+            triggerCharacter,
+          }
+        : {
+            triggerKind: vscode.CompletionTriggerKind.Invoke,
+            triggerCharacter: undefined,
+          };
       const params = client.code2ProtocolConverter.asCompletionParams(doc, position, context);
       const result = await client.sendRequest(CompletionRequest.type, params);
       return await client.protocol2CodeConverter.asCompletionResult(result);
@@ -217,44 +243,8 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return;
     }
-    this.syncDocument(client, doc);
+    await this.syncDocument(client, doc);
     await this.applySessionState(client);
-  }
-
-  closeDocument(doc: vscode.TextDocument): void {
-    const client = this.client;
-    if (!client) {
-      return;
-    }
-
-    const key = doc.uri.toString();
-    if (!this.syncedDocuments.has(key)) {
-      return;
-    }
-
-    try {
-      client.sendNotification(
-        DidCloseTextDocumentNotification.type,
-        client.code2ProtocolConverter.asCloseTextDocumentParams(doc)
-      );
-    } catch {
-    }
-
-    this.syncedDocuments.delete(key);
-  }
-
-  async provideMemberCompletionItems(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    if (!this.options.requestMemberCompletions) {
-      return undefined;
-    }
-    try {
-      return await this.options.requestMemberCompletions(expression, operator);
-    } catch {
-      return undefined;
-    }
   }
 
   async syncSessionState(state: ConsoleLspSessionState): Promise<void> {
@@ -291,6 +281,9 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
     if (this.client?.isRunning()) {
       return this.client;
     }
@@ -299,7 +292,10 @@ export class ConsoleLspClient implements CompletionProvider {
     } catch {
       return undefined;
     }
-    return this.client;
+    if (this.disposed) {
+      return undefined;
+    }
+    return this.client?.isRunning() ? this.client : undefined;
   }
 
   private async startInternal(): Promise<void> {
@@ -330,66 +326,122 @@ export class ConsoleLspClient implements CompletionProvider {
       `r-console-${this.options.consoleId}`,
       "R Console",
       useStdio
-        ? {
-            command: this.options.rPath,
-            args,
-            options: {
-              cwd: this.workingDirectory,
-              env,
-            },
-          }
+        ? () => this.createStdioTransport(args, env)
         : () => this.createSocketTransport(args, env),
       clientOptions
     );
-    client.setSuppressShutdownCloseMessage(this.suppressShutdownCloseMessage);
     this.client = client;
     this.syncedSessionStateKey = undefined;
     await client.start();
     await this.disableConsoleDiagnostics(client);
   }
 
-  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<StreamInfo> {
+  private createStdioTransport(args: string[], env: NodeJS.ProcessEnv): Promise<StreamInfo> {
     return new Promise<StreamInfo>((resolve, reject) => {
       let settled = false;
-      const resolveOnce = (value: StreamInfo): void => {
+      let child: ChildProcess;
+      try {
+        child = spawn(this.options.rPath, args, {
+          cwd: this.workingDirectory,
+          env,
+          stdio: ["pipe", "pipe", "pipe"],
+          shell: false,
+        });
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+
+      this.spawnedServer = child;
+      child.stderr?.on("data", (data: Buffer | string) => {
+        this.outputChannel.appendLine(data.toString());
+      });
+      child.once("spawn", () => {
         if (settled) {
           return;
         }
+        if (!child.stdout || !child.stdin) {
+          settled = true;
+          reject(new Error("Console language server started without stdio streams."));
+          return;
+        }
         settled = true;
-        resolve(value);
-      };
+        resolve({ reader: child.stdout, writer: child.stdin });
+      });
+      child.once("error", (error) => {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
+      child.once("exit", (code, signal) => {
+        if (code === 10) {
+          void vscode.window.showWarningMessage(
+            "R package {languageserver} is required for console autocompletion."
+          );
+        }
+        if (this.spawnedServer === child) {
+          this.spawnedServer = undefined;
+        }
+        if (!settled) {
+          settled = true;
+          reject(new Error(
+            `Console language server exited before stdio startup completed (${
+              signal ? `signal ${signal}` : `code ${code ?? "unknown"}`
+            }).`
+          ));
+        }
+      });
+    });
+  }
+
+  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<StreamInfo> {
+    return new Promise<StreamInfo>((resolve, reject) => {
+      let settled = false;
+      const server = net.createServer((socket) => {
+        if (settled) {
+          socket.destroy();
+          return;
+        }
+        settled = true;
+        if (this.pendingSocketServer === server) {
+          this.pendingSocketServer = undefined;
+        }
+        socket.on("error", (error) => {
+          this.outputChannel.appendLine(`LSP socket error: ${error.message}`);
+        });
+        server.close();
+        resolve({ reader: socket, writer: socket });
+      });
       const rejectOnce = (error: Error): void => {
         if (settled) {
           return;
         }
         settled = true;
+        if (this.pendingSocketServer === server) {
+          this.pendingSocketServer = undefined;
+        }
+        if (server.listening) {
+          server.close();
+        }
         reject(error);
       };
 
-      const server = net.createServer((socket) => {
-        this.pendingSocketServer = undefined;
-        server.close();
-        socket.on("error", (error) => {
-          this.outputChannel.appendLine(`LSP socket error: ${error.message}`);
-        });
-        resolveOnce({ reader: socket, writer: socket });
-      });
-
       this.pendingSocketServer = server;
-      server.on("error", (error) => {
-        this.pendingSocketServer = undefined;
+      server.once("error", (error) => {
         rejectOnce(error);
       });
-      server.on("close", () => {
-        this.pendingSocketServer = undefined;
+      server.once("close", () => {
         rejectOnce(new Error("Console language server socket closed before connection."));
       });
 
       server.listen(0, CONSOLE_LSP_HOST, () => {
+        if (settled || this.pendingSocketServer !== server) {
+          rejectOnce(new Error("Console language server startup was cancelled."));
+          return;
+        }
         const address = server.address();
         if (!address || typeof address === "string") {
-          this.pendingSocketServer = undefined;
-          server.close();
           rejectOnce(new Error("Failed to allocate loopback port for console language server."));
           return;
         }
@@ -398,19 +450,26 @@ export class ConsoleLspClient implements CompletionProvider {
           VSCR_LSP_HOST: CONSOLE_LSP_HOST,
           VSCR_LSP_PORT: String(address.port),
         };
-        const child = spawn(this.options.rPath, args, {
-          cwd: this.workingDirectory,
-          env,
-          stdio: ["ignore", "ignore", "pipe"],
-          shell: false,
-        });
+        let child: ChildProcess;
+        try {
+          child = spawn(this.options.rPath, args, {
+            cwd: this.workingDirectory,
+            env,
+            stdio: ["ignore", "ignore", "pipe"],
+            shell: false,
+          });
+        } catch (error) {
+          rejectOnce(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
         this.spawnedServer = child;
         child.stderr?.on("data", (data: Buffer | string) => {
           this.outputChannel.appendLine(data.toString());
         });
-        child.on("error", () => {
+        child.once("error", (error) => {
+          rejectOnce(error);
         });
-        child.on("exit", (code) => {
+        child.once("exit", (code, signal) => {
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -419,6 +478,11 @@ export class ConsoleLspClient implements CompletionProvider {
           if (this.spawnedServer === child) {
             this.spawnedServer = undefined;
           }
+          rejectOnce(new Error(
+            `Console language server exited before connecting (${
+              signal ? `signal ${signal}` : `code ${code ?? "unknown"}`
+            }).`
+          ));
         });
       });
     });
@@ -439,40 +503,48 @@ export class ConsoleLspClient implements CompletionProvider {
     ];
   }
 
-  private syncDocument(client: LanguageClient, document: vscode.TextDocument): void {
-    const key = document.uri.toString();
-    const existing = this.syncedDocuments.get(key);
-    if (!existing) {
-      try {
-        client.sendNotification(
+  private syncDocument(client: LanguageClient, document: vscode.TextDocument): Promise<void> {
+    const syncPromise = this.documentSyncPromise.then(async () => {
+      const key = document.uri.toString();
+      const existing = this.syncedDocuments.get(key);
+      if (!existing) {
+        const version = document.version;
+        const params = client.code2ProtocolConverter.asOpenTextDocumentParams(document);
+        await client.sendNotification(
           DidOpenTextDocumentNotification.type,
-          client.code2ProtocolConverter.asOpenTextDocumentParams(document)
+          params
         );
-      } catch {
+        if (this.client !== client || !client.isRunning()) {
+          throw new Error("Console language server changed during document synchronization.");
+        }
+        this.syncedDocuments.set(key, { document, version });
+        return;
       }
-      this.syncedDocuments.set(key, { document, version: document.version });
-      return;
-    }
 
-    if (existing.version !== document.version) {
-      try {
-        client.sendNotification(
+      if (existing.version !== document.version) {
+        const version = document.version;
+        const params = client.code2ProtocolConverter.asChangeTextDocumentParams(document);
+        await client.sendNotification(
           DidChangeTextDocumentNotification.type,
-          client.code2ProtocolConverter.asChangeTextDocumentParams(document)
+          params
         );
-      } catch {
+        if (this.client !== client || !client.isRunning()) {
+          throw new Error("Console language server changed during document synchronization.");
+        }
+        this.syncedDocuments.set(key, { document, version });
+        return;
       }
-      this.syncedDocuments.set(key, { document, version: document.version });
-      return;
-    }
 
-    if (existing.document !== document) {
-      this.syncedDocuments.set(key, { document, version: document.version });
-    }
+      if (existing.document !== document) {
+        this.syncedDocuments.set(key, { document, version: document.version });
+      }
+    });
+    this.documentSyncPromise = syncPromise.catch(() => {});
+    return syncPromise;
   }
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = { ...this.options.env };
     const debug = config.get<boolean>("lsp.debug") === true;
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
@@ -511,40 +583,78 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  private terminateSpawnedServer(): void {
-    const child = this.spawnedServer;
-    this.spawnedServer = undefined;
-    if (!child) {
-      return;
-    }
-    if (child.exitCode !== null || child.signalCode !== null) {
-      return;
-    }
-    const pid = child.pid;
-    if (!pid) {
-      return;
+  private terminateSpawnedServer(): Promise<boolean> {
+    if (this.terminationPromise) {
+      return this.terminationPromise;
     }
 
-    try {
-      if (process.platform === "win32") {
-        spawnSync("taskkill", ["/pid", pid.toString(), "/T", "/F"], {
-          stdio: "ignore",
-          windowsHide: true,
-          shell: false,
-        });
-        return;
+    const child = this.spawnedServer;
+    if (!child) {
+      return Promise.resolve(true);
+    }
+
+    const terminationPromise = (async (): Promise<boolean> => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        if (this.spawnedServer === child) {
+          this.spawnedServer = undefined;
+        }
+        return true;
+      }
+      const pid = child.pid;
+      if (!pid) {
+        if (this.spawnedServer === child) {
+          this.spawnedServer = undefined;
+        }
+        return true;
       }
 
-      process.kill(pid, "SIGTERM");
-      setTimeout(() => {
-        try {
-          process.kill(pid, 0);
+      let resolveExit!: () => void;
+      const exitPromise = new Promise<void>((resolve) => {
+        resolveExit = resolve;
+        child.once("exit", resolveExit);
+      });
+      try {
+        if (process.platform === "win32") {
+          const result = spawnSync("taskkill", ["/pid", pid.toString(), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+            shell: false,
+          });
+          if (result.status !== 0 && child.exitCode === null && child.signalCode === null) {
+            let processHasExited = false;
+            try {
+              process.kill(pid, 0);
+            } catch (error) {
+              processHasExited = (error as NodeJS.ErrnoException).code === "ESRCH";
+            }
+            if (!processHasExited && !child.kill()) {
+              child.removeListener("exit", resolveExit);
+              return false;
+            }
+          }
+        } else {
           process.kill(pid, "SIGKILL");
-        } catch {
         }
-      }, 1000);
-    } catch {
-    }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+          child.removeListener("exit", resolveExit);
+          return false;
+        }
+      }
+
+      await exitPromise;
+      if (this.spawnedServer === child) {
+        this.spawnedServer = undefined;
+      }
+      return true;
+    })();
+    this.terminationPromise = terminationPromise;
+    void terminationPromise.finally(() => {
+      if (this.terminationPromise === terminationPromise) {
+        this.terminationPromise = undefined;
+      }
+    });
+    return terminationPromise;
   }
 
   private async disableConsoleDiagnostics(client: ConsoleLanguageClient): Promise<void> {

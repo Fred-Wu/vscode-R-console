@@ -2,7 +2,7 @@
   "name": "vsc-r-console",
   "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "RConsole",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "images/Rlogo.png",
@@ -80,9 +80,50 @@
         "command": "r-console.insertPipeOperator",
         "title": "Insert Pipe Operator",
         "category": "R Console"
+      },
+      {
+        "command": "r-console.triggerCompletion",
+        "title": "Show Completions",
+        "category": "R Console"
+      },
+      {
+        "command": "r-console.restoreDefaultName",
+        "title": "Restore Default Name",
+        "category": "R Console"
       }
     ],
+    "menus": {
+      "editor/title/context": [
+        {
+          "command": "r-console.restoreDefaultName",
+          "when": "resourceScheme == vscode-terminal && rConsole.consoleActive",
+          "group": "1_modification"
+        }
+      ],
+      "terminal/title/context": [
+        {
+          "command": "r-console.restoreDefaultName",
+          "when": "rConsole.consoleActive",
+          "group": "1_modification"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "r-console.triggerCompletion",
+          "when": "false"
+        },
+        {
+          "command": "r-console.restoreDefaultName",
+          "when": "false"
+        }
+      ]
+    },
     "keybindings": [
+      {
+        "command": "r-console.triggerCompletion",
+        "key": "alt+escape",
+        "when": "terminalFocus && rConsole.consoleActive"
+      },
       {
         "command": "r-console.insertPipeOperator",
         "key": "ctrl+alt+m",
@@ -91,7 +132,8 @@
     ],
     "configurationDefaults": {
       "terminal.integrated.commandsToSkipShell": [
-        "r-console.insertPipeOperator"
+        "r-console.insertPipeOperator",
+        "r-console.triggerCompletion"
       ]
     },
     "configuration": {
