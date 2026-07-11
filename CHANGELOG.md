@@ -2,7 +2,7 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.4.0] - 2026-07-10
+## [0.4.0] - 2026-07-11
 
 ### Added
 

@@ -77,7 +77,7 @@ R Console reads several settings from [vscode-R](https://marketplace.visualstudi
 | `r.rpath.mac`               | R executable path on macOS for R Console startup                                                                  |
 | `r.rpath.linux`             | R executable path on Linux for R Console startup                                                                  |
 | `r.rterm.option`            | Extra arguments passed to R                                                                                       |
-| `r.sessionWatcher`          | Enables the[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher bridge |
+| `r.sessionWatcher`          | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher bridge |
 | `r.bracketedPaste`          | Enables bracketed paste mode                                                                                      |
 | `r.lsp.args`                | Extra arguments passed when starting`languageserver`                                                            |
 | `r.lsp.use_stdio`           | Uses stdio instead of a loopback socket for the console LSP client when supported                                 |
@@ -91,7 +91,7 @@ R Console also contributes its own settings:
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
-| `r.console.pipeOperator` | <code></code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code></code> and `%>%` |
+| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
 
 ## Dependency Model
 
