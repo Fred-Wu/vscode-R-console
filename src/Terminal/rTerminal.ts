@@ -44,6 +44,7 @@ import {
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
   getRuntimeTerminalName,
+  isDefaultRuntimeTerminalName,
   interruptRuntime,
   attachRuntimeSession,
   primeRuntimeAttach,
@@ -144,6 +145,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private nameEmitter = new vscode.EventEmitter<string>();
   private pidEmitter = new vscode.EventEmitter<number | undefined>();
   private lastKnownPid: number | undefined;
+  private customTerminalName: string | undefined;
 
   get onDidWrite(): vscode.Event<string> {
     return this.writeEmitter.event;
@@ -211,7 +213,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
-  private extensionResourcesDisposed = false;
+  private extensionResourcesDisposePromise: Promise<void> | undefined;
 
   private inBracketPaste = false;
   private pasteBuffer = "";
@@ -224,8 +226,12 @@ export class RTerminal implements vscode.Pseudoterminal {
   constructor(
     private options: RTerminalOptions,
     private extensionPath: string = "",
-    restoreState?: PersistedRTerminalState
+    restoreState?: PersistedRTerminalState,
+    terminalName?: string
   ) {
+    if (terminalName && !isDefaultRuntimeTerminalName(terminalName)) {
+      this.customTerminalName = terminalName;
+    }
     if (
       typeof restoreState?.ui.replayColumns === "number" &&
       Number.isFinite(restoreState.ui.replayColumns) &&
@@ -251,7 +257,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang = new RTermLang({
       extensionPath: this.extensionPath,
       rPath: this.options.rPath,
+      env: this.options.env,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
+      requestWorkspaceData: async () =>
+        await getRuntimeWorkspaceData(this.runtimeHost()),
       requestMemberCompletions: async (expression, operator) =>
         await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
     });
@@ -261,8 +270,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         if (this.promptVisible) {
           this.renderInput();
         }
-      },
-      async (content) => await this.lang.requestSemanticTokens(content)
+      }
     );
     this.renderer = new Renderer((text) => this.writeEmitter.fire(text), this.syntax);
 
@@ -576,6 +584,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       startNextSubmission: () => self.startNextSubmission(),
       finishActiveSubmission: () => self.finishActiveSubmission(),
       getDisplayPid: () => self.getDisplayPid(),
+      getTerminalName: () => self.getTerminalName(),
       notifyDisplayPidChanged: () => self.notifyDisplayPidChanged(),
       onSessionDataChanged: (data) => self.onSessionDataChanged(data),
       get vscodeRSessionReconnectPending() {
@@ -628,6 +637,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.renderInput();
   }
 
+  public triggerCompletion(): void {
+    if (this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+
+    this.ensureReadyPromptVisibleForInput();
+    this.escPendingClear = false;
+    this.expandForEdit();
+    void this.handleAutocomplete(true);
+  }
+
   private isSessionProtocolActive(): boolean {
     return Boolean(
       this.rProcess &&
@@ -638,8 +658,6 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   open(initialDimensions: vscode.TerminalDimensions | undefined): void {
-    void this.lang.start();
-
     if (initialDimensions) {
       this.dimensions = initialDimensions;
       this.syncReplayTerminalSize();
@@ -649,17 +667,26 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.writeEmitter.fire("\x1b[?2004h");
     }
 
-    if (!this.isRunning()) {
+    const runtimeWasRunning = this.isRunning();
+    if (!runtimeWasRunning) {
       this.startR();
+    }
+    // The terminal owns one language server for its full UI lifetime. Runtime
+    // start and attach events must not replace it.
+    if (runtimeWasRunning || this.mode !== "closed") {
+      void this.lang.start();
+    }
+    if (!runtimeWasRunning) {
       return;
     }
 
     const hadPromptVisible = this.promptVisible;
     this.restoreTerminalState();
+    const terminalName = this.getTerminalName();
     // Defer the name update: VSCode drops nameEmitter events fired
     // synchronously during open() because the terminal UI hasn't attached yet.
     setTimeout(() => {
-      this.nameEmitter.fire(getRuntimeTerminalName(this.runtimeHost()));
+      this.nameEmitter.fire(terminalName);
       this.notifyDisplayPidChanged();
     }, 0);
 
@@ -1179,6 +1206,9 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
+      case "completion":
+        this.triggerCompletion();
+        return;
       case "backtab": {
         this.expandForEdit();
         const beforeCursor = this.inputState.currentLineBeforeCursor;
@@ -1598,8 +1628,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const sanitized = stripBracketedPasteMarkers(fullText).trimEnd();
     if (this.promptVisible) {
       // Clear the live input viewport before any async submission work starts.
-      // Otherwise semantic-token callbacks can rerender against the reset input
-      // state and leave stale viewport content behind.
+      // Otherwise async completion context updates can race against the reset
+      // input state and leave stale viewport content behind.
       this.clearInputRender();
       this.promptVisible = false;
       this.lastWriteEndedWithNewline = true;
@@ -1654,11 +1684,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
   }
 
-  private async handleAutocomplete(): Promise<void> {
+  private async handleAutocomplete(force = false): Promise<void> {
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
-      getWorkspaceData: () => getRuntimeWorkspaceData(this.runtimeHost()),
+      getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
+      refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+      force,
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
       },
@@ -2377,19 +2409,17 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     this.writeEmitter.fire("\r\n");
-    this.forceClose();
+    await this.forceClose();
     this.closeEmitter.fire(0);
   }
 
-  private releaseExtensionResources(): void {
-    if (this.extensionResourcesDisposed) {
-      return;
+  private releaseExtensionResources(): Promise<void> {
+    if (this.extensionResourcesDisposePromise) {
+      return this.extensionResourcesDisposePromise;
     }
-    this.extensionResourcesDisposed = true;
     this.saveHistory();
     this.sessionWatcher?.dispose();
     this.syntax.dispose();
-    this.lang.cleanupCompletionDocument();
     this.clearPendingInputFlushTimer();
     this.pendingProgrammaticInput = "";
     this.clearPendingConsoleInput();
@@ -2397,13 +2427,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearReplyPromptRenderTimer();
 
     this.sessionAttached = false;
-    this.lang.clearSessionState();
-    this.lang.stopConsoleLsp();
     setNativeParseCallback(null);
+    this.extensionResourcesDisposePromise = this.lang.dispose();
+    return this.extensionResourcesDisposePromise;
   }
 
-  forceClose(): void {
-    this.releaseExtensionResources();
+  forceClose(): Promise<void> {
+    const cleanup = this.releaseExtensionResources();
 
     if (this.rProcess) {
       const processToClose = this.rProcess;
@@ -2430,6 +2460,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.replyPromptText = "";
     this.notifyDisplayPidChanged();
     this.terminalState.dispose();
+    return cleanup;
   }
 
   detachPersistentSession(): PersistedRTerminalState | undefined {
@@ -2449,14 +2480,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.backendChildPid = undefined;
     this.sessionHostConnected = false;
     this.mode = "closed";
-    this.dispose();
     this.terminalState.dispose();
     return state;
   }
 
-  reattachToNewTerminal(): void {
+  reattachToNewTerminal(terminalName?: string): void {
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
+    if (terminalName) {
+      this.preserveTerminalName(terminalName);
+    }
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
@@ -2478,7 +2511,20 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   getTerminalName(): string {
-    return getRuntimeTerminalName(this.runtimeHost());
+    return this.customTerminalName ?? getRuntimeTerminalName(this.runtimeHost());
+  }
+
+  preserveTerminalName(terminalName: string): void {
+    this.customTerminalName = isDefaultRuntimeTerminalName(terminalName)
+      ? undefined
+      : terminalName;
+  }
+
+  restoreDefaultTerminalName(): string {
+    const terminalName = getRuntimeTerminalName(this.runtimeHost());
+    this.customTerminalName = undefined;
+    this.nameEmitter.fire(terminalName);
+    return terminalName;
   }
 
   exportPersistentState(): PersistedRTerminalState | undefined {
@@ -2542,11 +2588,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.pidEmitter.fire(nextPid);
   }
 
-  dispose(): void {
-    this.releaseExtensionResources();
+  dispose(): Promise<void> {
+    const cleanup = this.releaseExtensionResources();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();
     this.pidEmitter.dispose();
+    return cleanup;
   }
 }

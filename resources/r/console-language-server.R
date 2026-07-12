@@ -51,40 +51,6 @@ normalize_character <- function(value) {
     unique(value)
 }
 
-semantic_tokens_full_sync <- function(self, id, params) {
-    textDocument <- params$textDocument
-    uri <- languageserver:::uri_escape_unicode(textDocument$uri)
-    workspace <- self$get_workspace(uri)
-    if (!workspace$documents$has(uri)) {
-        self$deliver(languageserver:::Response$new(
-            id,
-            result = languageserver:::encode_semantic_tokens(list())
-        ))
-        return(invisible(NULL))
-    }
-
-    document <- workspace$documents$get(uri)
-    parse_data <- tryCatch(
-        languageserver:::parse_document(
-            uri,
-            languageserver:::normalize_parse_content(document$content, document$is_rmarkdown)
-        ),
-        error = function(e) NULL
-    )
-    if (!is.null(parse_data)) {
-        languageserver:::parse_callback(self, uri, document$version, parse_data)
-    }
-
-    reply <- languageserver:::semantic_tokens_full_reply(id, uri, workspace, document)
-    if (is.null(reply)) {
-        reply <- languageserver:::Response$new(
-            id,
-            result = languageserver:::encode_semantic_tokens(list())
-        )
-    }
-    self$deliver(reply)
-}
-
 console_text_document_did_close <- function(self, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -121,7 +87,6 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
 
     self$deliver(languageserver:::Response$new(id, result = TRUE))
 }
-server$request_handlers[["textDocument/semanticTokens/full"]] <- semantic_tokens_full_sync
 server$notification_handlers[["textDocument/didClose"]] <- console_text_document_did_close
 
 server$run()

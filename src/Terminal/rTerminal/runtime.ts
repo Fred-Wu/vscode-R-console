@@ -114,6 +114,7 @@ export type RuntimeHost = {
   startNextSubmission(): void;
   finishActiveSubmission(): void;
   getDisplayPid(): number | undefined;
+  getTerminalName(): string;
   notifyDisplayPidChanged(): void;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
   vscodeRSessionReconnectPending: boolean;
@@ -128,10 +129,20 @@ export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">)
   return VSCODE_R_TERMINAL_NAME;
 }
 
+export function isDefaultRuntimeTerminalName(terminalName: string): boolean {
+  return (
+    terminalName === VSCODE_R_TERMINAL_NAME ||
+    /^R Console \(\d+\)$/.test(terminalName)
+  );
+}
+
 export function updateRuntimeTerminalName(
-  host: Pick<RuntimeHost, "getDisplayPid" | "nameEmitter" | "notifyDisplayPidChanged">
+  host: Pick<
+    RuntimeHost,
+    "getTerminalName" | "nameEmitter" | "notifyDisplayPidChanged"
+  >
 ): void {
-  host.nameEmitter.fire(getRuntimeTerminalName(host));
+  host.nameEmitter.fire(host.getTerminalName());
   host.notifyDisplayPidChanged();
 }
 
@@ -743,7 +754,6 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
   vscodeRSessionFiles.delete(host);
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
-  host.lang.stopConsoleLsp();
   host.lang.clearSessionState();
   host.clearPendingConsoleInput();
   host.pendingPromptToken = true;
@@ -813,7 +823,6 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
     }
     primeRuntimeAttach(host);
     setNativeParseCallback(null);
-    void host.lang.start();
     attachRuntimeSession(host, true);
 
     updateRuntimeTerminalName(host);
@@ -824,7 +833,6 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
     host.rProcess = null;
     host.mode = "closed";
     host.sessionAttached = false;
-    host.lang.stopConsoleLsp();
   }
 }
 
@@ -855,7 +863,6 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
     host.sessionAttached = true;
   }
   setNativeParseCallback(null);
-  void host.lang.start();
   host.runtimeBackend.attach(host.rProcess, {
     onStdout: (output) => {
       handleRuntimeOutput(host, output);
@@ -876,10 +883,12 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
           `${ANSI.red}Failed to start R: ${err.message}${ANSI.reset}\r\n`
         );
       }
-      host.mode = "closed";
-      host.rProcess = null;
-      host.sessionAttached = false;
-      host.lang.stopConsoleLsp();
+      const failedRuntime = host.rProcess;
+      if (failedRuntime && host.runtimeBackend) {
+        host.runtimeBackend.detach(failedRuntime);
+        host.runtimeBackend.close(failedRuntime);
+      }
+      handleRuntimeExit(host, 1);
     },
   });
 }
@@ -1894,10 +1903,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   flushPendingRuntimeRewrite(host);
   setNativeParseCallback(null);
 
-  host.lang.cleanupCompletionDocument();
   host.lang.clearSessionState();
-  host.lang.stopConsoleLsp();
-
   host.rProcess = null;
   host.backendChildPid = undefined;
   host.sessionHostConnected = false;
