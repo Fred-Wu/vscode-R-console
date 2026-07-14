@@ -57,6 +57,32 @@ Launch R Console from the Command Palette:
 - `R Console: Create R Console`
 - `R Console: Create R Console in Side Editor`
 
+### Experimental terminal IntelliSense
+
+This branch can use VS Code's native terminal suggestion popup instead of the
+Quick Pick completion window. The feature is off by default because the terminal
+completion provider API is still proposed.
+
+1. Run VS Code 1.95 or newer using a compatible development build, or launch VS
+   Code with the extension's proposal enabled:
+
+   ```text
+   code --enable-proposed-api=RConsole.vsc-r-console
+   ```
+
+2. Enable terminal suggestions and the R Console provider:
+
+   ```json
+   "terminal.integrated.suggest.enabled": true,
+   "r.console.experimentalTerminalCompletionProvider": true
+   ```
+
+3. Create or focus an R Console. Use `Tab` while completing an expression, or
+   press `F7` to request suggestions explicitly.
+
+If the proposed API is unavailable, R Console continues to use its existing Quick
+Pick completion window.
+
 ### Persistent Session Management
 
 Use `R Console: Manage Persistent Sessions...` to manage running R Console sessions.
@@ -87,11 +113,12 @@ If `r.rpath.*` is set, an ambient `R_HOME` does not override it. If `r.rpath.*` 
 
 R Console also contributes its own settings:
 
-| Setting                    | Default       | Purpose                                                                                                                       |
-| -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
-| `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
-| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
+| Setting                                           | Default       | Purpose                                                                                                                       |
+| ------------------------------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `r.console.autoMatch`                             | `true`        | Auto-insert matching brackets and quotes                                                                                      |
+| `r.console.tabSize`                               | `2`           | Indentation width                                                                                                             |
+| `r.console.pipeOperator`                          | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
+| `r.console.experimentalTerminalCompletionProvider` | `false`       | Uses VS Code's proposed native terminal IntelliSense popup when the API is available                                          |
 
 ## Dependency Model
 

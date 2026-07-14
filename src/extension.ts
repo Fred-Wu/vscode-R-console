@@ -15,6 +15,7 @@ import {
   discoverRBinaryPath,
   getPlatformRPathConfigEntry,
 } from "./Terminal/options";
+import { registerTerminalCompletionProvider } from "./Language/terminalCompletion";
 
 type TerminalContext =
   | { kind: "panel" }
@@ -108,6 +109,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   void fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true }).catch(() => {});
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
+  const terminalCompletionRegistration = registerTerminalCompletionProvider(
+    {
+      provideTerminalCompletions: async (terminal, completionContext, token) => {
+        const record = resolveRecordFromTerminal(terminal);
+        return await record?.rTerminal.provideTerminalCompletions(
+          completionContext.commandLine,
+          completionContext.cursorIndex,
+          token
+        );
+      },
+    },
+    "$",
+    "@",
+    ":"
+  );
+  if (terminalCompletionRegistration) {
+    context.subscriptions.push(terminalCompletionRegistration);
+  }
   context.subscriptions.push(
     vscode.commands.registerCommand("r-console.createTerminal", () => {
       void createRTerminal(context);
@@ -136,6 +155,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("r.console")) {
+        refreshTerminalAppearance();
+      }
+      if (event.affectsConfiguration("terminal.integrated.sendKeybindingsToShell")) {
         refreshTerminalAppearance();
       }
       const bracketedPasteScope = getBracketedPasteConfigScope();

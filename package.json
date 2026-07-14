@@ -19,8 +19,11 @@
   },
   "homepage": "https://github.com/Fred-Wu/vscode-R-console#readme",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.95.0"
   },
+  "enabledApiProposals": [
+    "terminalCompletionProvider"
+  ],
   "categories": [
     "Programming Languages"
   ],
@@ -135,6 +138,13 @@
         "r-console.insertPipeOperator"
       ]
     },
+    "terminal": {
+      "completionProviders": [
+        {
+          "description": "Show R language and live-session completions in the terminal IntelliSense widget."
+        }
+      ]
+    },
     "configuration": {
       "title": "R Console",
       "properties": {
@@ -156,6 +166,11 @@
           ],
           "default": "|>",
           "description": "Pipe operator to insert for chain operations. The default keybinding is Ctrl+Alt+M."
+        },
+        "r.console.experimentalTerminalCompletionProvider": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Use VS Code's native terminal IntelliSense popup for R console completions. This experimental option requires the proposed `terminalCompletionProvider` API and a VS Code build launched with that proposal enabled. The existing completion Quick Pick remains the fallback."
         }
       }
     }

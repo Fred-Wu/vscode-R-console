@@ -6,6 +6,10 @@ import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
 import { setNativeParseCallback } from "../Language/parser";
 import {
+  isTerminalCompletionProviderAvailable,
+  toTerminalCompletionItems,
+} from "../Language/terminalCompletion";
+import {
   ANSI,
   stripBracketedPasteMarkers,
 } from "./ansi";
@@ -14,6 +18,7 @@ import { HistoryManager } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
+import { TerminalShellIntegration } from "./shellIntegration";
 import {
   getContinuationPromptLength,
 } from "./inputViewport";
@@ -138,6 +143,7 @@ export type PersistedRTerminalState = {
 
 export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
+  private readonly shellIntegration: TerminalShellIntegration;
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
   private pidEmitter = new vscode.EventEmitter<number | undefined>();
@@ -216,6 +222,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   private autoMatch = true;
   private tabSize = 2;
   private pipeOperator: "|>" | "%>%" = "|>";
+  private nativeTerminalCompletionEnabled = false;
+  private forwardNativeTerminalSuggestionKeys = false;
+  private nativeTerminalSuggestionActive = false;
   private lastSearchTerm = "";
 
   constructor(
@@ -242,6 +251,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
+    this.shellIntegration = new TerminalShellIntegration(
+      (data) => this.writeEmitter.fire(data)
+    );
     this.runtimeBackend = this.resolveRuntimeBackend();
     this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
     this.rHistory.load();
@@ -365,6 +377,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.tabSize = config.get<number>("tabSize", 2);
     this.pipeOperator =
       config.get<string>("pipeOperator", "|>") === "%>%" ? "%>%" : "|>";
+    this.nativeTerminalCompletionEnabled =
+      config.get<boolean>("experimentalTerminalCompletionProvider", false) &&
+      isTerminalCompletionProviderAvailable();
+    this.forwardNativeTerminalSuggestionKeys = vscode.workspace
+      .getConfiguration("terminal.integrated")
+      .get<boolean>("sendKeybindingsToShell", false);
+    if (!this.nativeTerminalCompletionEnabled || !this.forwardNativeTerminalSuggestionKeys) {
+      this.nativeTerminalSuggestionActive = false;
+    }
+    this.shellIntegration.setEnabled(this.nativeTerminalCompletionEnabled);
   }
 
   private runtimeHost(): RuntimeHost {
@@ -549,6 +571,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       set writeEmitter(value) {
         self.writeEmitter = value;
       },
+      shellIntegration: self.shellIntegration,
       get closeEmitter() {
         return self.closeEmitter;
       },
@@ -626,7 +649,102 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.ensureReadyPromptVisibleForInput();
     this.escPendingClear = false;
     this.expandForEdit();
+    if (this.usesNativeTerminalCompletion()) {
+      this.nativeTerminalSuggestionActive = false;
+      void vscode.commands.executeCommand("workbench.action.terminal.triggerSuggest");
+      return;
+    }
     void this.handleAutocomplete(true);
+  }
+
+  public async provideTerminalCompletions(
+    commandLine: string,
+    cursorIndex: number,
+    token: vscode.CancellationToken
+  ): Promise<vscode.TerminalCompletionItem[] | undefined> {
+    if (
+      !this.usesNativeTerminalCompletion() ||
+      this.mode !== "ready" ||
+      !this.promptReady ||
+      token.isCancellationRequested
+    ) {
+      return undefined;
+    }
+
+    const input = this.getInputSnapshot();
+    if (
+      commandLine !== input.text ||
+      cursorIndex !== input.textBeforeCursor.length
+    ) {
+      return undefined;
+    }
+
+    const result = await this.lang.provideTerminalCompletionEntries({
+      input,
+      getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
+      refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+      token,
+    });
+    if (!result || token.isCancellationRequested) {
+      return undefined;
+    }
+
+    const currentInput = this.getInputSnapshot();
+    if (
+      currentInput.text !== input.text ||
+      currentInput.cursorRow !== input.cursorRow ||
+      currentInput.cursorCol !== input.cursorCol
+    ) {
+      return undefined;
+    }
+
+    const lineStartIndex = cursorIndex - input.cursorCol;
+    const items = toTerminalCompletionItems(
+      result.entries,
+      result.context,
+      lineStartIndex,
+      cursorIndex
+    );
+    this.nativeTerminalSuggestionActive =
+      this.forwardNativeTerminalSuggestionKeys && items.length > 0;
+    return items;
+  }
+
+  private usesNativeTerminalCompletion(): boolean {
+    return (
+      this.nativeTerminalCompletionEnabled &&
+      this.shellIntegration.hasActivePrompt
+    );
+  }
+
+  /**
+   * VS Code normally consumes suggestion keys before they reach the PTY. When
+   * terminal.integrated.sendKeybindingsToShell is enabled, those keys are sent
+   * here instead, so forward them to the terminal suggest contribution while a
+   * result from this provider is active.
+   */
+  private acceptNativeTerminalSuggestion(): boolean {
+    if (!this.nativeTerminalSuggestionActive) {
+      return false;
+    }
+
+    this.nativeTerminalSuggestionActive = false;
+    void vscode.commands.executeCommand(
+      "workbench.action.terminal.acceptSelectedSuggestion"
+    );
+    return true;
+  }
+
+  private navigateNativeTerminalSuggestion(direction: "up" | "down"): boolean {
+    if (!this.nativeTerminalSuggestionActive) {
+      return false;
+    }
+
+    const command = direction === "up"
+      ? "workbench.action.terminal.selectPrevSuggestion"
+      : "workbench.action.terminal.selectNextSuggestion";
+    void vscode.commands.executeCommand(command);
+    return true;
   }
 
   private resolveRuntimeBackend(): RuntimeBackend | undefined {
@@ -1135,14 +1253,26 @@ export class RTerminal implements vscode.Pseudoterminal {
           this.pasteBuffer += action.text;
           return;
         }
+        if (/\s/.test(action.text)) {
+          this.nativeTerminalSuggestionActive = false;
+        }
         this.expandForEdit();
         this.handleTextInsert(action.text);
         this.renderInput();
         return;
       case "enter":
+        if (this.acceptNativeTerminalSuggestion()) {
+          return;
+        }
         void this.handleEnterKey();
         return;
       case "arrow":
+        if (
+          (action.dir === "up" || action.dir === "down") &&
+          this.navigateNativeTerminalSuggestion(action.dir)
+        ) {
+          return;
+        }
         this.handleArrow(action.dir);
         return;
       case "backspace":
@@ -1188,11 +1318,17 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       case "tab": {
+        if (this.acceptNativeTerminalSuggestion()) {
+          return;
+        }
         this.expandForEdit();
         const beforeCursor = this.inputState.currentLineBeforeCursor;
         if (/^\s*$/.test(beforeCursor)) {
           this.inputState.insertText(" ".repeat(this.tabSize));
           this.renderInput();
+        } else if (this.usesNativeTerminalCompletion()) {
+          this.nativeTerminalSuggestionActive = false;
+          void vscode.commands.executeCommand("workbench.action.terminal.triggerSuggest");
         } else {
           void this.handleAutocomplete();
         }
@@ -1231,6 +1367,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       case "ctrl_l":
+        this.nativeTerminalSuggestionActive = false;
         if (this.promptVisible) {
           this.clearInputRender();
           this.promptVisible = false;
@@ -1247,11 +1384,24 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
         if (this.promptReady) {
+          const shouldMarkPrompt =
+            this.nativeTerminalCompletionEnabled &&
+            this.shellIntegration.startPrompt();
           this.renderInputFresh(this.buildCurrentInputRenderPlan());
+          if (shouldMarkPrompt) {
+            this.shellIntegration.finishPrompt();
+          }
           this.promptVisible = true;
         }
         return;
       case "escape":
+        if (this.nativeTerminalSuggestionActive) {
+          this.nativeTerminalSuggestionActive = false;
+          void vscode.commands.executeCommand(
+            "workbench.action.terminal.hideSuggestWidget"
+          );
+          return;
+        }
         if (this.historyBrowsing) {
           if (!this.historyCollapsed) {
             this.clearInputRender();
@@ -1289,6 +1439,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       case "ctrl_c":
+        this.nativeTerminalSuggestionActive = false;
         if (this.inputState.text.length > 0) {
           this.clearInputRender();
           this.inputState.reset();
@@ -1606,9 +1757,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       // terminalState. Without this, only a bare \r\n was recorded there, and
       // the "R> " characters would disappear from the visible screen after a
       // resize replay (which rebuilds the viewport solely from terminalState).
+      const markedEmptyCommand = this.shellIntegration.startCommand("");
       this.writeEmitter.fire(
         `${ANSI.reset}${this.renderer.promptColor}${this.renderer.promptText}${ANSI.reset}\r\n`
       );
+      if (markedEmptyCommand) {
+        this.shellIntegration.finishCommand(0);
+      }
       this.lastWriteEndedWithNewline = true;
       this.renderer.renderedLineCount = 1;
       this.renderer.cursorRowFromTop = 0;
@@ -2173,6 +2328,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
+    this.nativeTerminalSuggestionActive = false;
     this.configureRendererPrompt();
 
     if (this.pendingInitialPromptGap) {
@@ -2187,7 +2343,16 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.lastWriteEndedWithNewline = true;
     }
 
+    const shouldMarkPrompt =
+      this.nativeTerminalCompletionEnabled &&
+      !this.shellIntegration.hasActivePrompt &&
+      this.inputState.text.length === 0 &&
+      this.inputState.cursorPosition === 0 &&
+      this.shellIntegration.startPrompt();
     this.renderInput();
+    if (shouldMarkPrompt) {
+      this.shellIntegration.finishPrompt();
+    }
     this.promptVisible = true;
     this.pendingPromptToken = false;
   }
@@ -2586,6 +2751,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   dispose(): Promise<void> {
     const cleanup = this.releaseExtensionResources();
+    this.shellIntegration.setEnabled(false);
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
     this.nameEmitter.dispose();

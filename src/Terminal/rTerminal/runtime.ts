@@ -25,6 +25,7 @@ import {
   type RTerminalOptions,
 } from "../options";
 import { Renderer } from "../renderer";
+import type { TerminalShellIntegration } from "../shellIntegration";
 import { RTermLang } from "./lang";
 import {
   configureMainPrompt,
@@ -85,6 +86,7 @@ export type RuntimeHost = {
   renderer: Renderer;
   lang: RTermLang;
   writeEmitter: vscode.EventEmitter<string>;
+  shellIntegration: TerminalShellIntegration;
   closeEmitter: vscode.EventEmitter<number>;
   nameEmitter: vscode.EventEmitter<string>;
   clearPendingInputFlushTimer(): void;
@@ -474,6 +476,8 @@ export function handleBackendPrompt(
     host.pendingPromptToken = false;
     return;
   }
+
+  host.shellIntegration.finishCommand();
 
   host.promptReady = true;
   host.promptKind = kind;
@@ -1016,6 +1020,7 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
   host.awaitingExecutionStart = true;
   host.mode = "executing";
   writeRuntimeSubmissionEcho(host, task);
+  host.shellIntegration.startCommand(task.code);
   host.clearPromptRenderTimer();
   host.runtimeBackend?.sendSessionCommand(host.rProcess, {
     type: "submit",

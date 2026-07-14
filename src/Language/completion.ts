@@ -1012,11 +1012,11 @@ function filterShadowedBufferEntries(
   const preferredKeys = new Set(
     preferredEntries
       .filter((entry) => entry.source !== "buffer")
-      .map(getCompletionIdentityKey)
+      .map(getCompletionLabelKey)
   );
 
   return bufferEntries.filter(
-    (entry) => !preferredKeys.has(getCompletionIdentityKey(entry))
+    (entry) => !preferredKeys.has(getCompletionLabelKey(entry))
   );
 }
 
@@ -1030,15 +1030,19 @@ function filterShadowedWorkspaceEntries(
   }
 
   const workspaceLabels = new Set(
-    workspaceEntries.map(getCompletionIdentityKey)
+    workspaceEntries.map(getCompletionLabelKey)
   );
 
   return entries.filter((entry) => {
     if (preserveEntry?.(entry)) {
       return true;
     }
-    return !workspaceLabels.has(getCompletionIdentityKey(entry));
+    return !workspaceLabels.has(getCompletionLabelKey(entry));
   });
+}
+
+function getCompletionLabelKey(entry: CompletionEntry): string {
+  return entry.label.toLowerCase();
 }
 
 function dedupeCompletionEntries(

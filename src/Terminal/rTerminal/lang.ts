@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  type CompletionContext,
   type CompletionEntry,
   type CompletionProvider,
   type RuntimeMemberCompletionRequester,
@@ -42,6 +43,18 @@ type AutocompleteRequest = {
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
+type TerminalCompletionEntriesRequest = {
+  input: InputSnapshot;
+  getWorkspaceData: () => WorkspaceData | undefined;
+  refreshWorkspaceData: () => void;
+  token: vscode.CancellationToken;
+};
+
+export type TerminalCompletionEntriesResult = {
+  context: CompletionContext;
+  entries: CompletionEntry[];
+};
+
 type ConsoleSessionState = {
   attachedPackages: string[];
   loadedNamespaces: string[];
@@ -69,6 +82,84 @@ export class RTermLang {
     const document = await this.getOrOpenCompletionDocument("");
     if (document && this.consoleLsp === completionProvider) {
       this.requestSilentCompletion(document, completionProvider);
+    }
+  }
+
+  async provideTerminalCompletionEntries({
+    input,
+    getWorkspaceData,
+    refreshWorkspaceData,
+    token,
+  }: TerminalCompletionEntriesRequest): Promise<TerminalCompletionEntriesResult | undefined> {
+    if (this.disposed || token.isCancellationRequested) {
+      return undefined;
+    }
+
+    const context = getCompletionContext(
+      input.currentLine,
+      input.cursorCol,
+      input.textBeforeCursor
+    ) ?? {
+      kind: "default" as const,
+      prefix: "",
+      replaceStart: input.cursorCol,
+      snapshotInput: input.currentLine,
+      snapshotCursor: input.cursorCol,
+    };
+    const requestId = ++this.completionRequestId;
+    const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
+    const cachedSessionData = getWorkspaceData();
+
+    try {
+      const workspaceDataRequest = shouldRequestWorkspaceData
+        ? this.options.requestWorkspaceData?.()
+        : undefined;
+      if (!shouldRequestWorkspaceData) {
+        refreshWorkspaceData();
+      }
+
+      const needsLsp = needsLanguageServerCompletion(context);
+      const completionProviderRequest = needsLsp
+        ? this.ensureConsoleLspStarted()
+        : Promise.resolve(undefined);
+      const documentRequest = needsLsp
+        ? this.getOrOpenCompletionDocument(input.text)
+        : Promise.resolve(undefined);
+      const sessionData = shouldRequestWorkspaceData
+        ? (await workspaceDataRequest) ?? getWorkspaceData() ?? cachedSessionData
+        : cachedSessionData;
+      const completionProvider = await completionProviderRequest;
+      const document = await documentRequest;
+
+      if (
+        token.isCancellationRequested ||
+        !this.isCurrentCompletionRequest(requestId)
+      ) {
+        return undefined;
+      }
+
+      const entries = await collectCompletionEntries(
+        context,
+        document,
+        document
+          ? new vscode.Position(input.cursorRow, context.snapshotCursor)
+          : undefined,
+        sessionData,
+        input.lines.slice(0, input.cursorRow),
+        this.options.getRecentSessionEntries?.() ?? [],
+        completionProvider,
+        this.options.requestMemberCompletions,
+        input.text
+      );
+      if (
+        token.isCancellationRequested ||
+        !this.isCurrentCompletionRequest(requestId)
+      ) {
+        return undefined;
+      }
+      return { context, entries };
+    } catch {
+      return undefined;
     }
   }
 
