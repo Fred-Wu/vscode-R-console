@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.4.2] - 2026-07-15
+
+### Added
+
+- Added a dedicated `R Console Language Server` output channel that reports server starts, stops, errors and the R executable location, without showing language-server protocol traffic.
+
 ## [0.4.1] - 2026-07-11
 
 ### Added
