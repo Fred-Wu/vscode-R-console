@@ -50,7 +50,7 @@ type TerminalCompletionEntriesRequest = {
   token: vscode.CancellationToken;
 };
 
-export type TerminalCompletionEntriesResult = {
+type TerminalCompletionEntriesResult = {
   context: CompletionContext;
   entries: CompletionEntry[];
 };

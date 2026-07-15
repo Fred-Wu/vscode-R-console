@@ -8,9 +8,10 @@ type ProposedTerminalWindow = typeof vscode.window & {
   registerTerminalCompletionProvider?: typeof vscode.window.registerTerminalCompletionProvider;
 };
 
+let terminalCompletionProviderRegistered = false;
+
 export function isTerminalCompletionProviderAvailable(): boolean {
-  return typeof (vscode.window as ProposedTerminalWindow)
-    .registerTerminalCompletionProvider === "function";
+  return terminalCompletionProviderRegistered;
 }
 
 export function registerTerminalCompletionProvider(
@@ -24,7 +25,12 @@ export function registerTerminalCompletionProvider(
   }
 
   try {
-    return register(provider, ...triggerCharacters);
+    const registration = register(provider, ...triggerCharacters);
+    terminalCompletionProviderRegistered = true;
+    return new vscode.Disposable(() => {
+      terminalCompletionProviderRegistered = false;
+      registration.dispose();
+    });
   } catch {
     return undefined;
   }
@@ -52,24 +58,19 @@ export function toTerminalCompletionItems(
       label: entry.insertText,
       replacementRange: [replaceStart, cursorIndex] as const,
       detail,
-      kind: toTerminalCompletionKind(entry, context),
+      kind: toTerminalCompletionKind(entry),
     }];
   });
 }
 
 function toTerminalCompletionKind(
-  entry: CompletionEntry,
-  context: CompletionContext
+  entry: CompletionEntry
 ): vscode.TerminalCompletionItemKind {
   switch (entry.kind) {
     case vscode.CompletionItemKind.Function:
     case vscode.CompletionItemKind.Method:
     case vscode.CompletionItemKind.Constructor:
       return vscode.TerminalCompletionItemKind.Method;
-  }
-
-  if (context.kind === "argument") {
-    return vscode.TerminalCompletionItemKind.Argument;
   }
 
   return vscode.TerminalCompletionItemKind.Argument;

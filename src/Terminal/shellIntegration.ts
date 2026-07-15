@@ -41,15 +41,14 @@ export class TerminalShellIntegration {
     this.enabled = enabled;
   }
 
-  startPrompt(): boolean {
+  startPrompt(): void {
     if (!this.enabled) {
-      return false;
+      return;
     }
 
     this.closeOpenLifecycle();
     this.write(vscodeSequence("A"));
     this.promptStarted = true;
-    return true;
   }
 
   finishPrompt(): void {
@@ -61,9 +60,9 @@ export class TerminalShellIntegration {
     this.promptActive = true;
   }
 
-  startCommand(commandLine: string): boolean {
+  startCommand(commandLine: string): void {
     if (!this.enabled || !this.promptActive) {
-      return false;
+      return;
     }
 
     this.write(vscodeSequence("E", serializeMessage(commandLine)));
@@ -71,7 +70,6 @@ export class TerminalShellIntegration {
     this.promptStarted = false;
     this.promptActive = false;
     this.commandActive = true;
-    return true;
   }
 
   finishCommand(exitCode?: number): void {

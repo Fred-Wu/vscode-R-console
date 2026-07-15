@@ -1384,13 +1384,9 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
         if (this.promptReady) {
-          const shouldMarkPrompt =
-            this.nativeTerminalCompletionEnabled &&
-            this.shellIntegration.startPrompt();
+          this.shellIntegration.startPrompt();
           this.renderInputFresh(this.buildCurrentInputRenderPlan());
-          if (shouldMarkPrompt) {
-            this.shellIntegration.finishPrompt();
-          }
+          this.shellIntegration.finishPrompt();
           this.promptVisible = true;
         }
         return;
@@ -1757,13 +1753,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       // terminalState. Without this, only a bare \r\n was recorded there, and
       // the "R> " characters would disappear from the visible screen after a
       // resize replay (which rebuilds the viewport solely from terminalState).
-      const markedEmptyCommand = this.shellIntegration.startCommand("");
+      this.shellIntegration.startCommand("");
       this.writeEmitter.fire(
         `${ANSI.reset}${this.renderer.promptColor}${this.renderer.promptText}${ANSI.reset}\r\n`
       );
-      if (markedEmptyCommand) {
-        this.shellIntegration.finishCommand(0);
-      }
+      this.shellIntegration.finishCommand(0);
       this.lastWriteEndedWithNewline = true;
       this.renderer.renderedLineCount = 1;
       this.renderer.cursorRowFromTop = 0;
@@ -2343,16 +2337,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.lastWriteEndedWithNewline = true;
     }
 
-    const shouldMarkPrompt =
-      this.nativeTerminalCompletionEnabled &&
+    if (
       !this.shellIntegration.hasActivePrompt &&
       this.inputState.text.length === 0 &&
-      this.inputState.cursorPosition === 0 &&
+      this.inputState.cursorPosition === 0
+    ) {
       this.shellIntegration.startPrompt();
-    this.renderInput();
-    if (shouldMarkPrompt) {
-      this.shellIntegration.finishPrompt();
     }
+    this.renderInput();
+    this.shellIntegration.finishPrompt();
     this.promptVisible = true;
     this.pendingPromptToken = false;
   }
