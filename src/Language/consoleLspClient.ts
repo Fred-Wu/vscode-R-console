@@ -20,6 +20,19 @@ import {
 import type { CompletionProvider } from "./completion";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
+const lifecycleOutputChannel = vscode.window.createOutputChannel(
+  "R Console Language Server"
+);
+
+function formatLogTimestamp(date = new Date()): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+export function disposeConsoleLspOutputChannel(): void {
+  lifecycleOutputChannel.dispose();
+}
 
 type ConsoleLspClientOptions = {
   consoleId: string;
@@ -112,6 +125,9 @@ export class ConsoleLspClient implements CompletionProvider {
       await this.startInternal();
     })()
       .catch(async (error) => {
+        if (!this.disposed) {
+          this.logServerError(error, this.spawnedServer);
+        }
         const failedClient = this.client;
         this.client = undefined;
         this.closePendingSocketServer();
@@ -317,8 +333,18 @@ export class ConsoleLspClient implements CompletionProvider {
       outputChannel: this.outputChannel,
       revealOutputChannelOn: RevealOutputChannelOn.Never,
       errorHandler: {
-        error: () => ({ action: ErrorAction.Continue, handled: true }),
-        closed: () => ({ action: CloseAction.DoNotRestart, handled: true }),
+        error: (error) => {
+          if (this.client) {
+            this.logServerError(error, this.spawnedServer);
+          }
+          return { action: ErrorAction.Continue, handled: true };
+        },
+        closed: () => {
+          if (this.client) {
+            this.logServerError("connection closed unexpectedly", this.spawnedServer);
+          }
+          return { action: CloseAction.DoNotRestart, handled: true };
+        },
       },
     };
 
@@ -357,6 +383,7 @@ export class ConsoleLspClient implements CompletionProvider {
         this.outputChannel.appendLine(data.toString());
       });
       child.once("spawn", () => {
+        this.logServerStarted(child);
         if (settled) {
           return;
         }
@@ -369,12 +396,16 @@ export class ConsoleLspClient implements CompletionProvider {
         resolve({ reader: child.stdout, writer: child.stdin });
       });
       child.once("error", (error) => {
+        if (settled) {
+          this.logServerError(error, child);
+        }
         if (!settled) {
           settled = true;
           reject(error);
         }
       });
       child.once("exit", (code, signal) => {
+        this.logServerStopped(child);
         if (code === 10) {
           void vscode.window.showWarningMessage(
             "R package {languageserver} is required for console autocompletion."
@@ -408,7 +439,7 @@ export class ConsoleLspClient implements CompletionProvider {
           this.pendingSocketServer = undefined;
         }
         socket.on("error", (error) => {
-          this.outputChannel.appendLine(`LSP socket error: ${error.message}`);
+          this.logServerError(error);
         });
         server.close();
         resolve({ reader: socket, writer: socket });
@@ -466,10 +497,17 @@ export class ConsoleLspClient implements CompletionProvider {
         child.stderr?.on("data", (data: Buffer | string) => {
           this.outputChannel.appendLine(data.toString());
         });
+        child.once("spawn", () => {
+          this.logServerStarted(child);
+        });
         child.once("error", (error) => {
+          if (settled) {
+            this.logServerError(error, child);
+          }
           rejectOnce(error);
         });
         child.once("exit", (code, signal) => {
+          this.logServerStopped(child);
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -581,6 +619,31 @@ export class ConsoleLspClient implements CompletionProvider {
       server.close();
     } catch {
     }
+  }
+
+  private logServerStarted(child: ChildProcess): void {
+    const timestamp = formatLogTimestamp();
+    lifecycleOutputChannel.appendLine(
+      `[Info - ${timestamp}] R Console Language Server (${child.pid ?? "unknown"}) started`
+    );
+    lifecycleOutputChannel.appendLine(
+      `[Info - ${timestamp}] R executable: "${this.options.rPath}"`
+    );
+  }
+
+  private logServerError(error: unknown, child: ChildProcess | undefined = this.spawnedServer): void {
+    const message = error instanceof Error ? error.message : String(error);
+    lifecycleOutputChannel.appendLine(
+      `[Error - ${formatLogTimestamp()}] ` +
+      `R Console Language Server (${child?.pid ?? "unknown"}) error: ${message}`
+    );
+  }
+
+  private logServerStopped(child: ChildProcess): void {
+    lifecycleOutputChannel.appendLine(
+      `[Info - ${formatLogTimestamp()}] ` +
+      `R Console Language Server (${child.pid ?? "unknown"}) stopped`
+    );
   }
 
   private terminateSpawnedServer(): Promise<boolean> {
