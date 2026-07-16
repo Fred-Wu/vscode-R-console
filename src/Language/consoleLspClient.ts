@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import * as readline from "readline";
 import { URL } from "url";
 import * as vscode from "vscode";
 import {
@@ -126,7 +127,7 @@ export class ConsoleLspClient implements CompletionProvider {
     })()
       .catch(async (error) => {
         if (!this.disposed) {
-          this.logServerError(error, this.spawnedServer);
+          this.logServerError(error);
         }
         const failedClient = this.client;
         this.client = undefined;
@@ -335,13 +336,13 @@ export class ConsoleLspClient implements CompletionProvider {
       errorHandler: {
         error: (error) => {
           if (this.client) {
-            this.logServerError(error, this.spawnedServer);
+            this.logServerError(error);
           }
           return { action: ErrorAction.Continue, handled: true };
         },
         closed: () => {
           if (this.client) {
-            this.logServerError("connection closed unexpectedly", this.spawnedServer);
+            this.logServerError("connection closed unexpectedly");
           }
           return { action: CloseAction.DoNotRestart, handled: true };
         },
@@ -379,11 +380,9 @@ export class ConsoleLspClient implements CompletionProvider {
       }
 
       this.spawnedServer = child;
-      child.stderr?.on("data", (data: Buffer | string) => {
-        this.outputChannel.appendLine(data.toString());
-      });
+      this.forwardServerStderr(child);
       child.once("spawn", () => {
-        this.logServerStarted(child);
+        this.logServerStarted();
         if (settled) {
           return;
         }
@@ -397,7 +396,7 @@ export class ConsoleLspClient implements CompletionProvider {
       });
       child.once("error", (error) => {
         if (settled) {
-          this.logServerError(error, child);
+          this.logServerError(error);
         }
         if (!settled) {
           settled = true;
@@ -405,7 +404,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
       });
       child.once("exit", (code, signal) => {
-        this.logServerStopped(child);
+        this.logServerStopped(code, signal);
         if (code === 10) {
           void vscode.window.showWarningMessage(
             "R package {languageserver} is required for console autocompletion."
@@ -494,20 +493,18 @@ export class ConsoleLspClient implements CompletionProvider {
           return;
         }
         this.spawnedServer = child;
-        child.stderr?.on("data", (data: Buffer | string) => {
-          this.outputChannel.appendLine(data.toString());
-        });
+        this.forwardServerStderr(child);
         child.once("spawn", () => {
-          this.logServerStarted(child);
+          this.logServerStarted();
         });
         child.once("error", (error) => {
           if (settled) {
-            this.logServerError(error, child);
+            this.logServerError(error);
           }
           rejectOnce(error);
         });
         child.once("exit", (code, signal) => {
-          this.logServerStopped(child);
+          this.logServerStopped(code, signal);
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -583,12 +580,13 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
-    const debug = config.get<boolean>("lsp.debug") === true;
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
     const libPaths = config.get<string[]>("libPaths") ?? [];
 
-    env.VSCR_LSP_DEBUG = debug ? "TRUE" : "FALSE";
+    // The lifecycle channel reports errors only; languageserver writes its
+    // debug and info entries to the same stderr stream as errors.
+    env.VSCR_LSP_DEBUG = "FALSE";
     env.VSCR_USE_RENV_LIB_PATH = useRenvLibPath ? "TRUE" : "FALSE";
     env.VSCR_LIB_PATHS = libPaths.join("\n");
     if (lang) {
@@ -621,28 +619,42 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  private logServerStarted(child: ChildProcess): void {
+  private logServerStarted(): void {
     const timestamp = formatLogTimestamp();
     lifecycleOutputChannel.appendLine(
-      `[Info - ${timestamp}] R Console Language Server (${child.pid ?? "unknown"}) started`
+      `[Info - ${timestamp}] R Console language server started`
     );
     lifecycleOutputChannel.appendLine(
       `[Info - ${timestamp}] R executable: "${this.options.rPath}"`
     );
   }
 
-  private logServerError(error: unknown, child: ChildProcess | undefined = this.spawnedServer): void {
+  private logServerError(error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     lifecycleOutputChannel.appendLine(
-      `[Error - ${formatLogTimestamp()}] ` +
-      `R Console Language Server (${child?.pid ?? "unknown"}) error: ${message}`
+      `[Error - ${formatLogTimestamp()}] ${message}`
     );
   }
 
-  private logServerStopped(child: ChildProcess): void {
+  private forwardServerStderr(child: ChildProcess): void {
+    if (!child.stderr) {
+      return;
+    }
+    const lines = readline.createInterface({ input: child.stderr });
+    lines.on("line", (line) => {
+      lifecycleOutputChannel.appendLine(
+        `[R stderr - ${formatLogTimestamp()}] ${line}`
+      );
+    });
+  }
+
+  private logServerStopped(
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): void {
+    const result = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
     lifecycleOutputChannel.appendLine(
-      `[Info - ${formatLogTimestamp()}] ` +
-      `R Console Language Server (${child.pid ?? "unknown"}) stopped`
+      `[Info - ${formatLogTimestamp()}] stopped (${result})`
     );
   }
 

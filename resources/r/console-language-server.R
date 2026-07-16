@@ -17,7 +17,6 @@ if (use_renv_lib_path) {
 }
 
 .libPaths(.paths)
-message("R library paths: ", paste(.libPaths(), collapse = "\n"))
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
     q(save = "no", status = 10)
@@ -35,8 +34,8 @@ tools::Rd2txt_options(underline_titles = FALSE)
 tools::Rd2txt_options(itemBullet = "* ")
 languageserver:::lsp_settings$update_from_options()
 languageserver:::lsp_settings$set("diagnostics", FALSE)
+languageserver:::lsp_settings$set("debug", isTRUE(debug))
 if (isTRUE(debug)) {
-    languageserver:::lsp_settings$set("debug", TRUE)
     languageserver:::lsp_settings$set("log_file", NULL)
 }
 
