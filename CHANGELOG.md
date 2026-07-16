@@ -2,6 +2,18 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.4.3] - 2026-07-16
+
+### Recent changes
+
+- Added a dedicated `R Console Language Server` output channel that reports server starts, stops, errors and the R executable location, without showing language-server protocol traffic.
+- Added `F7` to open console completions anywhere, including positions without a completion prefix or context.
+- Added `Restore Default Name` to the console tab menu for returning a renamed console to `R Console (PID)`.
+
+### Fixed
+
+- Fixed R errors not appearing in the output channel, while keeping debug and language-server protocol traffic hidden.
+
 ## [0.4.2] - 2026-07-15
 
 ### Added
