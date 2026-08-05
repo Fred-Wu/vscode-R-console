@@ -604,7 +604,6 @@ interface ParserState {
   parenDepth: number;
   braceDepth: number;
   bracketDepth: number;
-  dblBracketDepth: number;
 }
 
 export async function isExpressionCompleteAsync(code: string): Promise<boolean> {
@@ -648,7 +647,6 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
     parenDepth: 0,
     braceDepth: 0,
     bracketDepth: 0,
-    dblBracketDepth: 0,
   };
   let sawUnknownToken = false;
 
@@ -685,18 +683,10 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
         state.braceDepth -= 1;
         break;
       case TokenType.LeftBracket:
-        if (token.value === "[[") {
-          state.dblBracketDepth += 1;
-        } else {
-          state.bracketDepth += 1;
-        }
+        state.bracketDepth += token.value.length;
         break;
       case TokenType.RightBracket:
-        if (token.value === "]]") {
-          state.dblBracketDepth -= 1;
-        } else {
-          state.bracketDepth -= 1;
-        }
+        state.bracketDepth -= token.value.length;
         break;
       case TokenType.Unknown:
         sawUnknownToken = true;
@@ -709,8 +699,7 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
   if (
     state.parenDepth > 0 ||
     state.braceDepth > 0 ||
-    state.bracketDepth > 0 ||
-    state.dblBracketDepth > 0
+    state.bracketDepth > 0
   ) {
     return "incomplete";
   }
