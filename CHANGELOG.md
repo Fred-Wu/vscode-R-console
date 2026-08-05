@@ -2,11 +2,11 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [Unreleased]
+## [0.4.4] - 2026-08-05
 
 ### Fixed
 
-- Fixed some valid R commands with balanced square brackets being incorrectly treated as incomplete.
+- Fixed some valid R commands with balanced square brackets being incorrectly treated as incomplete during execution.
 
 ## [0.4.3] - 2026-07-16
 
