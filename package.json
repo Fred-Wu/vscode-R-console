@@ -2,7 +2,7 @@
   "name": "vsc-r-console",
   "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
-  "version": "0.4.1",
+  "version": "0.4.4",
   "publisher": "RConsole",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "images/Rlogo.png",

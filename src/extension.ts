@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
+import { disposeConsoleLspOutputChannel } from "./Language/consoleLspClient";
 import {
   RTerminal,
   type PersistedRTerminalState,
@@ -1373,6 +1374,7 @@ export async function deactivate(): Promise<void> {
   pidToRecord.clear();
   editorTabToRecord.clear();
   await Promise.allSettled([...pendingTerminalCleanups]);
+  disposeConsoleLspOutputChannel();
 }
 
 function startPersistentSessionRegistry(context: vscode.ExtensionContext): void {
