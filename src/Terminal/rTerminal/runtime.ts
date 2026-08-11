@@ -165,6 +165,9 @@ const vscodeRSessionConnectionRefreshes = new WeakMap<
   RuntimeHost,
   Promise<VscodeRSessionConnection | undefined>
 >();
+let vscodeRSessionConnectionDiscovery:
+  | Promise<VscodeRSessionConnection | undefined>
+  | undefined;
 const vscodeRSessionFiles = new WeakMap<RuntimeHost, string>();
 const vscodeRSessionProxies = new WeakMap<RuntimeHost, SessProxy>();
 const vscodeRSessionProxiesByRuntimeSession = new Map<string, SessProxy>();
@@ -342,7 +345,9 @@ async function parseVscodeRPipeAttachCommand(
   }
 }
 
-async function getVscodeRSessionConnection(): Promise<VscodeRSessionConnection | undefined> {
+async function discoverVscodeRSessionConnection(): Promise<
+  VscodeRSessionConnection | undefined
+> {
   await pruneStaleVscodeRSessionFiles();
 
   const extension = vscode.extensions.getExtension(VSCODE_R_EXTENSION_ID);
@@ -368,34 +373,47 @@ async function getVscodeRSessionConnection(): Promise<VscodeRSessionConnection |
 
   try {
     await vscode.commands.executeCommand("r.connectToSession");
-  } catch {
-    if (previousClipboard !== undefined) {
-      void vscode.env.clipboard.writeText(previousClipboard);
-    }
-    return undefined;
-  }
 
-  let connection: VscodeRSessionConnection | undefined;
-  let currentClipboard = "";
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 1000) {
-    currentClipboard = (await readClipboardText()) ?? "";
-    if (currentClipboard === clipboardProbe) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 1000) {
+      const currentClipboard = (await readClipboardText()) ?? "";
+      if (currentClipboard === clipboardProbe) {
+        await sleep(50);
+        continue;
+      }
+
+      const connection = await parseVscodeRPipeAttachCommand(currentClipboard);
+      if (connection) {
+        return connection;
+      }
       await sleep(50);
-      continue;
     }
-    connection = await parseVscodeRPipeAttachCommand(currentClipboard);
-    if (connection) {
-      break;
+
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (previousClipboard !== undefined) {
+      const currentClipboard = await readClipboardText();
+      if (currentClipboard !== previousClipboard) {
+        try {
+          await vscode.env.clipboard.writeText(previousClipboard);
+        } catch {}
+      }
     }
-    await sleep(50);
   }
+}
 
-  if (previousClipboard !== undefined && currentClipboard !== previousClipboard) {
-    void vscode.env.clipboard.writeText(previousClipboard);
+function getVscodeRSessionConnection(): Promise<
+  VscodeRSessionConnection | undefined
+> {
+  if (!vscodeRSessionConnectionDiscovery) {
+    vscodeRSessionConnectionDiscovery =
+      discoverVscodeRSessionConnection().finally(() => {
+        vscodeRSessionConnectionDiscovery = undefined;
+      });
   }
-
-  return connection;
+  return vscodeRSessionConnectionDiscovery;
 }
 
 async function createProxiedVscodeRSessionConnection(
