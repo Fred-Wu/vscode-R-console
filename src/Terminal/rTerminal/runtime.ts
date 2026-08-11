@@ -697,8 +697,6 @@ async function reconnectVscodeRSessionForRestoredRuntime(host: RuntimeHost): Pro
 
     if (alreadyConnected) {
       host.vscodeRSessionReconnectPending = false;
-      host.vscodeRSessionActivationPending = true;
-      flushRuntimeVscodeRSessionActivation(host);
       return;
     }
 
