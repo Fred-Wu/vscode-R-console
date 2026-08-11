@@ -57,7 +57,7 @@ import {
   type TerminalMode,
   sendRuntimeReply,
   startRuntime,
-  activateRuntimeVscodeRSession,
+  setRuntimeVscodeRSessionActive,
 } from "./rTerminal/runtime";
 
 export { resolveRTerminalOptions } from "./options";
@@ -1732,8 +1732,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     finishRuntimeSubmission(this.runtimeHost());
   }
 
-  activateVscodeRSession(): void {
-    activateRuntimeVscodeRSession(this.runtimeHost());
+  setVscodeRSessionActive(active: boolean): void {
+    setRuntimeVscodeRSessionActive(this.runtimeHost(), active);
   }
 
   private async enqueueRSubmission(

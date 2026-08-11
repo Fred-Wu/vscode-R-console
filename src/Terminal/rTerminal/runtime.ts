@@ -651,12 +651,11 @@ function submitHiddenRuntimeCommand(host: RuntimeHost, code: string): boolean {
   return true;
 }
 
-export function activateRuntimeVscodeRSession(host: RuntimeHost): void {
-  if (!usesSessIntegration(host)) {
-    return;
+export function setRuntimeVscodeRSessionActive(host: RuntimeHost, active: boolean): void {
+  host.vscodeRSessionActivationPending = usesSessIntegration(host) && active;
+  if (host.vscodeRSessionActivationPending) {
+    flushRuntimeVscodeRSessionActivation(host);
   }
-  host.vscodeRSessionActivationPending = true;
-  flushRuntimeVscodeRSessionActivation(host);
 }
 
 function flushRuntimeVscodeRSessionActivation(host: RuntimeHost): void {
