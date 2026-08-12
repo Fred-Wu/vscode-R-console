@@ -3,6 +3,8 @@ run-name: Release ${{ github.ref_name }}
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -156,6 +158,50 @@ jobs:
           name: vsix-${{ matrix.target }}
           path: vsc-r-console-*-${{ matrix.target }}.vsix
           if-no-files-found: error
+
+  publish-development:
+    if: github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+          path: release-artifacts
+
+      - name: Generate checksums
+        run: |
+          cd release-artifacts
+          sha256sum *.vsix > SHA256SUMS.txt
+
+      - name: Replace development release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view development >/dev/null 2>&1; then
+            gh release delete development --yes
+          fi
+          git tag --force development
+          git push origin development --force
+
+      - name: Publish development release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: development
+          name: R Console Development Build
+          body: Development build from the latest push to main.
+          prerelease: true
+          make_latest: false
+          files: |
+            release-artifacts/*.vsix
+            release-artifacts/SHA256SUMS.txt
+          fail_on_unmatched_files: true
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
