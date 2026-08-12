@@ -297,6 +297,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private reconnectInFlight = false;
   private reconnectNoiseUntil = 0;
   private reconnectPending: boolean;
+  private active = false;
   private activationPending = false;
 
   constructor(host: RuntimeHost) {
@@ -376,7 +377,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override attachRuntime(): void {
-    void this.refreshConnection();
+    // Restoring the persistent runtime only reattaches the console UI to the
+    // sidecar. Defer its new sess connection until this console is focused.
+    if (!this.reconnectPending) {
+      void this.refreshConnection();
+    }
   }
 
   override handleHostConnected(): void {
@@ -386,13 +391,18 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     if (isLivePid(pid)) {
       this.persistConnection(pid);
     }
-    if (this.reconnectPending) {
+    if (this.reconnectPending && this.active) {
       void this.refreshConnection();
     }
   }
 
   override handleMainPrompt(): void {
-    void this.reconnectRestoredRuntime();
+    if (this.reconnectPending) {
+      if (this.active) {
+        void this.reconnectRestoredRuntime();
+      }
+      return;
+    }
     this.flushActivation();
   }
 
@@ -401,10 +411,16 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override setActive(active: boolean): void {
+    this.active = active;
     this.activationPending = active;
-    if (active) {
-      this.flushActivation();
+    if (!active) {
+      return;
     }
+    if (this.reconnectPending) {
+      void this.reconnectRestoredRuntime();
+      return;
+    }
+    this.flushActivation();
   }
 
   override getCachedWorkspaceData(): WorkspaceData | undefined {
@@ -610,7 +626,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.reconnectInFlight = true;
     try {
       const connection = await this.resolveCurrentConnection();
-      if (!connection) {
+      if (!connection || !this.active) {
         return;
       }
       const alreadyConnected = this.proxy?.isConnected() ?? false;
@@ -620,13 +636,20 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       if (isLivePid(pid)) {
         await this.writeSessionFile(pid, connection);
       }
+      if (!this.active) {
+        return;
+      }
 
       if (alreadyConnected) {
         this.reconnectPending = false;
+        this.flushActivation();
         return;
       }
       if (this.submitHiddenCommand(buildConnectCommand(connection))) {
         this.reconnectPending = false;
+        // sess::connect() sends the attach notification itself. Later focus
+        // changes use flushActivation() to select this existing connection.
+        this.activationPending = false;
       }
     } finally {
       this.reconnectInFlight = false;
