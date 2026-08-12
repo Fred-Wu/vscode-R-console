@@ -1,23 +1,10 @@
 import * as fs from "fs";
 import * as http from "http";
 import * as path from "path";
-
-type GlobalEnvItem = {
-  class: string[];
-  type: string;
-  length: number;
-  str: string;
-  size?: number;
-  dim?: number[];
-  names?: string[];
-  slots?: string[];
-};
-
-export type WorkspaceData = {
-  search: string[];
-  loaded_namespaces: string[];
-  globalenv: Record<string, GlobalEnvItem>;
-};
+import type {
+  SessionMemberCompletionItem,
+  WorkspaceData,
+} from "../types";
 
 type SessionRequest = {
   command?: string;
@@ -34,12 +21,6 @@ type SessionServerInfo = {
   host: string;
   port: number;
   token: string;
-};
-
-export type SessionMemberCompletionItem = {
-  name: string;
-  type?: string;
-  str?: string;
 };
 
 export class SessionWatcher {

@@ -3,23 +3,20 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-
-export type RSessionMode = "sess" | "legacy" | "disabled";
+import {
+  resolveVscodeRIntegrationOptions,
+  sanitizeVscodeRIntegrationEnv,
+  type VscodeRIntegrationOptions,
+} from "../Runtime/VSCR";
 
 export type RTerminalOptions = {
   rPath: string;
   rArgs: string[];
   env: NodeJS.ProcessEnv;
-  sessionWatcherEnabled: boolean;
-  sessionMode: RSessionMode;
-  watcherDir: string;
-  vscodeRSessionInitPath?: string;
+  vscodeR: VscodeRIntegrationOptions;
   bracketedPaste: boolean;
   cwd?: string;
 };
-
-const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
-const SESSION_WATCHER_DIR = path.join(os.homedir(), ".vscode-R");
 
 type RStartupOptions = {
   rArch: string;
@@ -571,49 +568,10 @@ function sanitizeRArgs(): string[] {
   return args;
 }
 
-function extensionContributesCommand(
-  extension: vscode.Extension<unknown>,
-  command: string
-): boolean {
-  const packageJson = extension.packageJSON as {
-    contributes?: { commands?: Array<{ command?: unknown }> };
-  };
-  return packageJson.contributes?.commands?.some((entry) => entry.command === command) ?? false;
-}
-
-function resolveVscodeRSessionIntegration(
-  enabled: boolean
-): { mode: RSessionMode; initPath?: string } {
-  if (!enabled) {
-    return { mode: "disabled" };
-  }
-
-  const extension = vscode.extensions.getExtension(VSCODE_R_EXTENSION_ID);
-  if (!extension) {
-    void vscode.window.showWarningMessage(
-      "R Console could not find vscode-R; session integration will be disabled."
-    );
-    return { mode: "disabled" };
-  }
-
-  if (extensionContributesCommand(extension, "r.connectToSession")) {
-    return { mode: "sess" };
-  }
-
-  const initPath = path.join(extension.extensionPath, "R", "session", "init.R");
-  if (fs.existsSync(initPath)) {
-    return { mode: "legacy", initPath };
-  }
-
-  return { mode: "sess" };
-}
-
 function buildRuntimeEnv(
   rPath: string,
   rHome: string | undefined,
-  startup: RStartupOptions,
-  sessionMode: RSessionMode,
-  initPath?: string
+  startup: RStartupOptions
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -632,18 +590,7 @@ function buildRuntimeEnv(
     configureRRuntimeEnv(env, rHome, startup);
   }
 
-  delete env.VSCODE_INIT_R;
-  delete env.VSCODE_WATCHER_DIR;
-  delete env.SESS_PIPE;
-  delete env.SESS_PORT;
-  delete env.SESS_TOKEN;
-  delete env.SESS_HOST;
-
-  env.R_CONSOLE_SESSION_MODE = sessionMode;
-  if (sessionMode === "legacy" && initPath) {
-    env.VSCODE_INIT_R = initPath;
-    env.VSCODE_WATCHER_DIR = SESSION_WATCHER_DIR;
-  }
+  sanitizeVscodeRIntegrationEnv(env);
 
   env.VSC_R_EXECUTABLE = rPath;
   return env;
@@ -671,23 +618,14 @@ export function resolveRTerminalOptions(): RTerminalOptions | undefined {
     return undefined;
   }
 
-  const sessionIntegration = resolveVscodeRSessionIntegration(sessionWatcherConfigured);
-  const env = buildRuntimeEnv(
-    rPath,
-    rHome,
-    startup,
-    sessionIntegration.mode,
-    sessionIntegration.initPath
-  );
+  const sessionIntegration = resolveVscodeRIntegrationOptions(sessionWatcherConfigured);
+  const env = buildRuntimeEnv(rPath, rHome, startup);
 
   return {
     rPath,
     rArgs,
     env,
-    sessionWatcherEnabled: sessionIntegration.mode !== "disabled",
-    sessionMode: sessionIntegration.mode,
-    watcherDir: SESSION_WATCHER_DIR,
-    vscodeRSessionInitPath: sessionIntegration.initPath,
+    vscodeR: sessionIntegration,
     bracketedPaste,
     cwd: getWorkspaceFolderPath(),
   };

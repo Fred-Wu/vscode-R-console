@@ -10,9 +10,9 @@ import {
 } from "./Terminal/rTerminal";
 import {
   createRuntimeBackend,
-  disposeVscodeRSessionProxyForRuntimeSession,
   isDefaultRuntimeTerminalName,
 } from "./Terminal/rTerminal/runtime";
+import { disposeVscodeRIntegrationForRuntimeSession } from "./Runtime/VSCR";
 import {
   discoverRBinaryPath,
   getPlatformRPathConfigEntry,
@@ -292,23 +292,6 @@ function isPersistedRTerminalOptions(value: unknown): value is PersistedRTermina
     return false;
   }
   if (!Array.isArray(value.rArgs) || value.rArgs.some((entry) => typeof entry !== "string")) {
-    return false;
-  }
-  if (typeof value.sessionWatcherEnabled !== "boolean") {
-    return false;
-  }
-  if (
-    value.sessionMode !== undefined &&
-    value.sessionMode !== "sess" &&
-    value.sessionMode !== "legacy" &&
-    value.sessionMode !== "disabled"
-  ) {
-    return false;
-  }
-  if (typeof value.watcherDir !== "string" || value.watcherDir.trim().length === 0) {
-    return false;
-  }
-  if (value.vscodeRSessionInitPath !== undefined && typeof value.vscodeRSessionInitPath !== "string") {
     return false;
   }
   if (typeof value.bracketedPaste !== "boolean") {
@@ -905,7 +888,7 @@ function closeDetachedPersistentSessions(
   for (const session of sessions) {
     const handle = backend.reconnect(session.entry.terminal.runtime);
     backend.close(handle);
-    disposeVscodeRSessionProxyForRuntimeSession(session.sessionId);
+    disposeVscodeRIntegrationForRuntimeSession(session.sessionId);
     persistentSessionRecords.delete(session.sessionId);
   }
 }

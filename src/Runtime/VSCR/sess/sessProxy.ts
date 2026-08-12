@@ -5,7 +5,7 @@ import * as path from "path";
 import type {
   SessionMemberCompletionItem,
   WorkspaceData,
-} from "./sessionWatcher";
+} from "../types";
 
 type PendingRequest = {
   resolve: (value: unknown | undefined) => void;
@@ -38,8 +38,11 @@ export class SessProxy {
   private forwardedRequests = new Map<string, string>();
   private rSocketWaiters: Array<(socket: net.Socket | undefined) => void> = [];
   private workspaceData: WorkspaceData | undefined;
+  private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
 
-  constructor(private readonly options: SessProxyOptions) {}
+  constructor(private readonly options: SessProxyOptions) {
+    this.onWorkspaceData = options.onWorkspaceData;
+  }
 
   async start(): Promise<string> {
     this.dispose();
@@ -115,6 +118,13 @@ export class SessProxy {
 
   getWorkspaceData(): WorkspaceData | undefined {
     return this.workspaceData;
+  }
+
+  setWorkspaceDataListener(listener: ((data: WorkspaceData) => void) | undefined): void {
+    this.onWorkspaceData = listener;
+    if (listener && this.workspaceData) {
+      listener(this.workspaceData);
+    }
   }
 
   getPipePath(): string | undefined {
@@ -310,7 +320,7 @@ export class SessProxy {
 
   private setWorkspaceData(data: WorkspaceData): void {
     this.workspaceData = data;
-    this.options.onWorkspaceData?.(data);
+    this.onWorkspaceData?.(data);
   }
 
   private resolvePendingRequests(): void {

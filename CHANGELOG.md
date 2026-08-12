@@ -11,6 +11,7 @@ All notable changes to R Console will be documented in this file.
 ### Changed
 
 - Runtime `$`, `@`, and data-frame bracket completion in vscode-R 3.0 `sess` mode now uses the active console session through `sess` JSON-RPC.
+- Separated legacy watcher and `sess` integrations behind a common runtime interface, with independent directories under `Runtime/VSCR` and separate R bootstrap files so the legacy path can be removed without changing the socket implementation.
 
 ## [0.4.4] - 2026-08-05
 

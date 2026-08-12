@@ -17,7 +17,7 @@ is used as a dependency.
 
 | Project | What is referenced or used | Where it appears here |
 | --- | --- | --- |
-| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings and the JSON-RPC session protocol used for attach metadata, workspace data, and member completion. | `src/Terminal/options.ts`, `resources/r/console-profile.R`, `src/Runtime/sessionWatcher.ts`, `src/Runtime/sessProxy.ts` |
+| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings and the JSON-RPC session protocol used for attach metadata, workspace data, and member completion. | `src/Terminal/options.ts`, `src/Runtime/VSCR/`, `resources/r/VSCR/` |
 | [`arf`](https://github.com/eitsupi/arf) | Reference for Rust embedded-R host structure, dynamic R loading, platform-specific R initialization, callback wiring, generic event/input-handler pumping, and interrupt state handling. | `sidecar/pty-host/src/host.rs` |
 | [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
 | [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
@@ -428,9 +428,32 @@ Implementation files:
 
 - [`src/Terminal/options.ts`](../src/Terminal/options.ts)
 - [`src/Terminal/rTerminal/runtime.ts`](../src/Terminal/rTerminal/runtime.ts)
+- [`src/Runtime/VSCR/index.ts`](../src/Runtime/VSCR/index.ts)
+- [`src/Runtime/VSCR/integration.ts`](../src/Runtime/VSCR/integration.ts)
+- [`src/Runtime/VSCR/types.ts`](../src/Runtime/VSCR/types.ts)
+- [`src/Runtime/VSCR/legacy/integration.ts`](../src/Runtime/VSCR/legacy/integration.ts)
+- [`src/Runtime/VSCR/legacy/sessionWatcher.ts`](../src/Runtime/VSCR/legacy/sessionWatcher.ts)
+- [`src/Runtime/VSCR/sess/integration.ts`](../src/Runtime/VSCR/sess/integration.ts)
+- [`src/Runtime/VSCR/sess/sessProxy.ts`](../src/Runtime/VSCR/sess/sessProxy.ts)
 - [`resources/r/console-profile.R`](../resources/r/console-profile.R)
-- [`src/Runtime/sessionWatcher.ts`](../src/Runtime/sessionWatcher.ts)
-- [`src/Runtime/sessProxy.ts`](../src/Runtime/sessProxy.ts)
+- [`resources/r/VSCR/legacy.R`](../resources/r/VSCR/legacy.R)
+- [`resources/r/VSCR/sess.R`](../resources/r/VSCR/sess.R)
+
+The terminal and shared runtime depend only on `VscodeRSessionIntegration`.
+`src/Runtime/VSCR/index.ts` is the factory boundary that selects the disabled,
+legacy, or `sess` implementation. Transport-specific state, startup, completion,
+activation, reconnect, output filtering, and disposal stay inside the selected
+implementation directory.
+
+When legacy support is retired, its removal boundary is:
+
+1. delete `src/Runtime/VSCR/legacy/` and `resources/r/VSCR/legacy.R`
+2. remove the legacy option variant and detection branch from
+   `src/Runtime/VSCR/types.ts` and `src/Runtime/VSCR/config.ts`
+3. remove the legacy factory branch from `src/Runtime/VSCR/index.ts`
+
+No terminal, runtime, language-service, or persistence code should require a
+legacy-specific edit.
 
 ### 3.1 Startup Settings From `vscode-R`
 
@@ -462,7 +485,7 @@ When `r.sessionWatcher` is enabled, startup chooses one vscode-R session
 integration:
 
 - `sess`: pipe-based architecture exposed by vscode-R's `r.connectToSession`
-  command. `rTerminal/runtime.ts` asks vscode-R for the current attach command,
+  command. `vscodeR/sess/integration.ts` asks vscode-R for the current attach command,
   reads the generated attach script, extracts its `pipe_path`, starts a
   console-owned `SessProxy`, and contributes the proxy pipe path as `SESS_PIPE`
   to the embedded R launch.
@@ -502,6 +525,7 @@ The backend launch environment includes:
 
 Depending on the selected session integration, it also includes:
 
+- `R_CONSOLE_SESSION_BOOTSTRAP`
 - `SESS_PIPE`
 - `VSCODE_WATCHER_DIR`
 - `VSCODE_INIT_R`
@@ -518,11 +542,13 @@ At launch time, `rTerminal/runtime.ts` also sets:
 
 1. restores and sources the user's original profile through
    `R_PROFILE_USER_OLD`
-2. in `sess` mode, calls the installed `sess` package when it already exposes
-   the current `pipe_path` API
-3. in `legacy` mode, runs vscode-R's legacy `init.R`
-4. installs the console pager
-5. locks the prompt options used by the embedded console contract
+2. sources the selected `R_CONSOLE_SESSION_BOOTSTRAP`, when present
+3. installs the console pager
+4. locks the prompt options used by the embedded console contract
+
+The selected bootstrap is physically isolated: `resources/r/VSCR/sess.R`
+connects through `sess`, while `resources/r/VSCR/legacy.R` runs vscode-R's
+legacy `init.R`.
 
 ### 3.3 Session Metadata
 
@@ -774,13 +800,15 @@ not persisted.
 4. [`src/Terminal/rTerminal.ts`](../src/Terminal/rTerminal.ts)
 5. [`src/Terminal/rTerminal/runtime.ts`](../src/Terminal/rTerminal/runtime.ts)
 6. [`src/Terminal/options.ts`](../src/Terminal/options.ts)
-7. [`src/Runtime/sessionWatcher.ts`](../src/Runtime/sessionWatcher.ts)
-8. [`resources/r/console-profile.R`](../resources/r/console-profile.R)
-9. [`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs)
-10. [`sidecar/pty-host/src/protocol.rs`](../sidecar/pty-host/src/protocol.rs)
-11. [`sidecar/pty-host/src/main.rs`](../sidecar/pty-host/src/main.rs)
-12. [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
-13. [`src/Language/completion.ts`](../src/Language/completion.ts)
-14. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
-15. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
-16. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+7. [`src/Runtime/VSCR/index.ts`](../src/Runtime/VSCR/index.ts)
+8. [`src/Runtime/VSCR/legacy/integration.ts`](../src/Runtime/VSCR/legacy/integration.ts)
+9. [`src/Runtime/VSCR/sess/integration.ts`](../src/Runtime/VSCR/sess/integration.ts)
+10. [`resources/r/console-profile.R`](../resources/r/console-profile.R)
+11. [`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs)
+12. [`sidecar/pty-host/src/protocol.rs`](../sidecar/pty-host/src/protocol.rs)
+13. [`sidecar/pty-host/src/main.rs`](../sidecar/pty-host/src/main.rs)
+14. [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
+15. [`src/Language/completion.ts`](../src/Language/completion.ts)
+16. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
+17. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
+18. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
