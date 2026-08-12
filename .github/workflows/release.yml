@@ -9,6 +9,10 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      publish_development:
+        description: Publish the built VSIX packages as the GitHub development prerelease
+        type: boolean
+        default: false
       publish_marketplace:
         description: Publish the built VSIX packages to the VS Code Marketplace
         type: boolean
@@ -160,7 +164,9 @@ jobs:
           if-no-files-found: error
 
   publish-development:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_development)
     needs: package
     runs-on: ubuntu-latest
     permissions:
@@ -195,7 +201,7 @@ jobs:
         with:
           tag_name: development
           name: R Console Development Build
-          body: Development build from the latest push to main.
+          body: Development build from ${{ github.ref_name }}.
           prerelease: true
           make_latest: false
           files: |
