@@ -409,7 +409,12 @@ function applyRuntimeSessionState(
   host.sessionHostConnected = true;
   updateNativeParseCallback(host);
 
-  if (event.busy) {
+  if (event.busy || event.wait.kind === "none") {
+    host.clearPromptRenderTimer();
+    host.clearReplyPromptRenderTimer();
+    if (host.promptVisible) {
+      host.clearInputRender();
+    }
     host.promptReady = false;
     host.promptVisible = false;
     host.pendingPromptToken = false;
@@ -420,8 +425,6 @@ function applyRuntimeSessionState(
   }
 
   switch (event.wait.kind) {
-    case "none":
-      return;
     case "top-level":
       host.promptReady = true;
       host.promptKind = event.wait.prompt;

@@ -297,12 +297,14 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private reconnectInFlight = false;
   private reconnectNoiseUntil = 0;
   private reconnectPending: boolean;
+  private mainPromptObserved: boolean;
   private active = false;
   private activationPending = false;
 
   constructor(host: RuntimeHost) {
     super(host);
     this.reconnectPending = Boolean(host.rProcess);
+    this.mainPromptObserved = !this.reconnectPending;
   }
 
   static disposeForRuntimeSession(sessionId: string): void {
@@ -315,6 +317,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.clearConnection();
     this.sessionFile = undefined;
     this.reconnectPending = false;
+    this.mainPromptObserved = true;
     this.activationPending = false;
     this.reconnectInFlight = false;
     this.reconnectNoiseUntil = 0;
@@ -397,6 +400,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override handleMainPrompt(): void {
+    this.mainPromptObserved = true;
     if (this.reconnectPending) {
       if (this.active) {
         void this.reconnectRestoredRuntime();
@@ -417,7 +421,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       return;
     }
     if (this.reconnectPending) {
-      void this.reconnectRestoredRuntime();
+      if (!this.mainPromptObserved || !this.canSubmitHiddenCommand()) {
+        void this.refreshConnection();
+      } else {
+        void this.reconnectRestoredRuntime();
+      }
       return;
     }
     this.flushActivation();
@@ -617,7 +625,8 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     if (
       !this.reconnectPending ||
       this.reconnectInFlight ||
-      !this.host.runtimeBackend?.canUseSessionCommands(this.host.rProcess)
+      !this.mainPromptObserved ||
+      !this.canSubmitHiddenCommand()
     ) {
       return;
     }
@@ -626,26 +635,29 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.reconnectInFlight = true;
     try {
       const connection = await this.resolveCurrentConnection();
-      if (!connection || !this.active) {
+      const runtimeBackend = this.host.runtimeBackend;
+      if (!connection || !this.active || !runtimeBackend) {
         return;
       }
-      const alreadyConnected = this.proxy?.isConnected() ?? false;
       const pid = isLivePid(this.host.backendChildPid)
         ? this.host.backendChildPid
-        : this.host.runtimeBackend.getPid(this.host.rProcess);
+        : runtimeBackend.getPid(this.host.rProcess);
       if (isLivePid(pid)) {
         await this.writeSessionFile(pid, connection);
       }
-      if (!this.active) {
+      if (!this.active || !this.reconnectPending) {
         return;
       }
 
-      if (alreadyConnected) {
+      if (this.proxy?.isConnected()) {
         this.reconnectPending = false;
         this.flushActivation();
         return;
       }
-      if (this.submitHiddenCommand(buildConnectCommand(connection))) {
+      if (
+        this.canSubmitHiddenCommand() &&
+        this.submitHiddenCommand(buildConnectCommand(connection))
+      ) {
         this.reconnectPending = false;
         // sess::connect() sends the attach notification itself. Later focus
         // changes use flushActivation() to select this existing connection.
