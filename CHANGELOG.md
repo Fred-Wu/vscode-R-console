@@ -19,10 +19,6 @@ All notable changes to R Console will be documented in this file.
 - Persistent consoles now reuse their existing `sess` proxy when the console UI is detached and reattached, refresh their pipe metadata after a vscode-R extension-host restart, preserve an executing session's busy state, and defer `sess` reconnection until the focused session reaches a top-level prompt.
 - Unix `sess` proxy sockets and persistent-session connection files now use owner-only permissions consistent with vscode-R 3.0.
 
-### Development builds
-
-- Added a rolling GitHub development prerelease with platform-specific VSIX packages and checksums for testing changes from the `dev` branch.
-
 ## [0.4.4] - 2026-08-05
 
 ### Fixed
