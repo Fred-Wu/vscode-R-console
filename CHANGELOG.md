@@ -4,14 +4,24 @@ All notable changes to R Console will be documented in this file.
 
 ## Unreleased
 
-### Added
+### vscode-R 3.0 session architecture compatibility
 
-- Added a `sess` IPC proxy for vscode-R 3.0 session integration, allowing R Console to forward vscode-R session traffic while requesting workspace and runtime member completions from the current embedded R session.
+#### Added
 
-### Changed
+- Added a console-scoped `sess` IPC proxy for vscode-R's pipe-based transport, allowing R Console to forward vscode-R session traffic while requesting workspace data and runtime member completions from the current embedded R session.
+- Added `jgd` plot-hook support alongside `httpgd` when selected through vscode-R's plot settings.
 
+#### Changed
+
+- R Console now detects vscode-R's pipe-based `r.connectToSession` architecture while retaining the legacy file-based watcher integration for older vscode-R versions.
 - Runtime `$`, `@`, and data-frame bracket completion in vscode-R 3.0 `sess` mode now uses the active console session through `sess` JSON-RPC.
-- Separated legacy watcher and `sess` integrations behind a common runtime interface, with independent directories under `Runtime/VSCR` and separate R bootstrap files so the legacy path can be removed without changing the socket implementation.
+- Legacy watcher and `sess` integrations now use a common runtime interface with isolated implementation directories and R bootstrap files.
+- Persistent consoles now reuse their existing `sess` proxy when the console UI is detached and reattached, refresh their pipe metadata after a vscode-R extension-host restart, preserve an executing session's busy state, and defer `sess` reconnection until the focused session reaches a top-level prompt.
+- Unix `sess` proxy sockets and persistent-session connection files now use owner-only permissions consistent with vscode-R 3.0.
+
+### Development builds
+
+- Added a rolling GitHub development prerelease with platform-specific VSIX packages and checksums for testing changes from the `dev` branch.
 
 ## [0.4.4] - 2026-08-05
 
