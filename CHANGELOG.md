@@ -2,6 +2,16 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.4.5] - 2026-08-24
+
+### Changed
+
+- Rebuilt the R Console runtime binaries for macOS and Linux. Windows packages continue to use the binaries from the previous release; no newly built Windows binary is included.
+
+### Fixed
+
+- Fixed plots not appearing when vscode-R's Session Watcher is turned off. R can now use its normal graphics device and show native plot windows, such as Quartz on macOS.
+
 ## [0.4.4] - 2026-08-05
 
 ### Fixed

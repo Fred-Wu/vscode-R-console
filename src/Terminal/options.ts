@@ -597,7 +597,6 @@ function buildRuntimeEnv(
     // dynamic redraw support through the env-based cli/crayon knobs.
     COLORTERM: "truecolor",
     TERM: "xterm-256color",
-    TERM_PROGRAM: "vscode",
     R_CLI_NUM_COLORS: "256",
     R_CLI_DYNAMIC: "true",
     R_PROFILE_USER_OLD: process.env.R_PROFILE_USER ?? "",
