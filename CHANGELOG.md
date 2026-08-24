@@ -19,6 +19,14 @@ All notable changes to R Console will be documented in this file.
 - Persistent consoles now reuse their existing `sess` proxy when the console UI is detached and reattached, refresh their pipe metadata after a vscode-R extension-host restart, preserve an executing session's busy state, and defer `sess` reconnection until the focused session reaches a top-level prompt.
 - Unix `sess` proxy sockets and persistent-session connection files now use owner-only permissions consistent with vscode-R 3.0.
 
+### Changed
+
+- Rebuilt the R Console runtime binaries for macOS and Linux. Windows packages continue to use the binaries from the previous release; no newly built Windows binary is included.
+
+### Fixed
+
+- Fixed plots not appearing when vscode-R's Session Watcher is turned off. R can now use its normal graphics device and show native plot windows, such as Quartz on macOS.
+
 ## [0.4.4] - 2026-08-05
 
 ### Fixed

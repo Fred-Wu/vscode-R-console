@@ -70,9 +70,9 @@ jobs:
           restored=false
           trap 'echo "restored=${restored}" >> "$GITHUB_OUTPUT"' EXIT
 
-          if ! command -v gh >/dev/null || ! command -v unzip >/dev/null; then
-            echo "gh or unzip is unavailable; building sidecar."
-            exit 0
+          if ! command -v gh >/dev/null; then
+            echo "gh is required to restore unchanged R Console runtime binaries." >&2
+            exit 1
           fi
 
           git fetch --force --tags --quiet
@@ -87,20 +87,61 @@ jobs:
             exit 0
           fi
 
-          sidecar_inputs=(sidecar/pty-host scripts/build-sidecar.js scripts/sidecar-targets.js)
-          if [[ "${TARGET}" == win32-* ]]; then
-            sidecar_inputs+=(images/Rlogo.ico)
+          runtime_version_from_json() {
+            RUNTIME_VERSIONS_JSON="$1" node -e '
+              const versions = JSON.parse(process.env.RUNTIME_VERSIONS_JSON);
+              const version = versions[process.env.TARGET];
+              if (typeof version !== "string" || version.length === 0) {
+                throw new Error(`R Console runtime version is missing for ${process.env.TARGET}`);
+              }
+              process.stdout.write(version);
+            '
+          }
+
+          current_runtime_versions="$(< sidecar/pty-host/runtime-versions.json)"
+          current_runtime_version="$(runtime_version_from_json "${current_runtime_versions}")"
+          if previous_runtime_versions="$(git show "${previous_tag}:sidecar/pty-host/runtime-versions.json" 2>/dev/null)"; then
+            previous_runtime_version="$(runtime_version_from_json "${previous_runtime_versions}")"
+          else
+            previous_runtime_version="$(git show "${previous_tag}:sidecar/pty-host/Cargo.toml" | awk '
+              $0 == "[package]" { in_package = 1; next }
+              in_package && /^\[/ { exit }
+              in_package && /^version = "/ {
+                value = $0
+                sub(/^version = "/, "", value)
+                sub(/".*$/, "", value)
+                print value
+                exit
+              }
+            ')"
           fi
-          if ! git diff --quiet "${previous_tag}" HEAD -- "${sidecar_inputs[@]}"; then
-            echo "Sidecar build inputs changed; building sidecar."
+          if [[ -z "${previous_runtime_version}" ]]; then
+            echo "R Console runtime version is missing from ${previous_tag}." >&2
+            exit 1
+          fi
+          if [[ "${current_runtime_version}" != "${previous_runtime_version}" ]]; then
+            echo "R Console runtime binary changed from ${previous_runtime_version} to ${current_runtime_version} for ${TARGET}; building it."
             exit 0
+          fi
+
+          runtime_build_inputs=(scripts/build-sidecar.js scripts/sidecar-targets.js)
+          if [[ "${TARGET}" == win32-* ]]; then
+            runtime_build_inputs+=(images/Rlogo.ico)
+          fi
+          if ! git diff --quiet "${previous_tag}" HEAD -- "${runtime_build_inputs[@]}"; then
+            echo "R Console runtime build inputs changed without a version change for ${TARGET}." >&2
+            exit 1
+          fi
+          if ! command -v unzip >/dev/null; then
+            echo "unzip is required to restore the unchanged ${TARGET} runtime binary." >&2
+            exit 1
           fi
 
           rm -rf .restore-sidecar
           mkdir -p .restore-sidecar bundled/bin
           if ! gh release download "${previous_tag}" --pattern "*-${TARGET}.vsix" --dir .restore-sidecar --clobber; then
-            echo "Previous release ${previous_tag} has no VSIX for ${TARGET}; building sidecar."
-            exit 0
+            echo "Previous release ${previous_tag} has no reusable VSIX for ${TARGET}." >&2
+            exit 1
           fi
 
           vsix="$(find .restore-sidecar -type f -name "*-${TARGET}.vsix" | head -n 1)"
@@ -111,8 +152,8 @@ jobs:
 
           if [[ -z "${vsix}" ]] || ! unzip -p "${vsix}" "extension/bundled/bin/${executable}" > "bundled/bin/${executable}"; then
             rm -f "bundled/bin/${executable}"
-            echo "Could not extract ${executable} from ${previous_tag} VSIX; building sidecar."
-            exit 0
+            echo "Could not restore ${executable} from the ${previous_tag} VSIX." >&2
+            exit 1
           fi
           if [[ "${executable}" != *.exe ]]; then
             chmod 755 "bundled/bin/${executable}"
