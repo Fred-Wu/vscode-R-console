@@ -25,7 +25,8 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
-import type { WorkspaceData } from "../Runtime/VSCR";
+import { getVscodeRIntegration, type WorkspaceData } from "../Runtime/VSCR";
+import { SessVscodeRIntegration } from "../Runtime/VSCR/sess/integration";
 import {
   InputSnapshot,
   RTermLang,
@@ -949,6 +950,14 @@ export class RTerminal implements vscode.Pseudoterminal {
     const trimmed = normalized.replace(/\n+$/, "");
     const submission = trimmed.trimEnd();
     if (!submission) {
+      return;
+    }
+
+    const integration = getVscodeRIntegration(this.runtimeHost());
+    if (
+      integration instanceof SessVscodeRIntegration &&
+      integration.isRedundantAttachSubmission(submission)
+    ) {
       return;
     }
 

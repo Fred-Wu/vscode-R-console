@@ -2,16 +2,14 @@
 
 All notable changes to R Console will be documented in this file.
 
-## Unreleased
+## [0.5.0] - 2026-09-04 - vscode-R 3.0 architecture compatibility introduced
 
-### vscode-R 3.0 session architecture compatibility
-
-#### Added
+### Added
 
 - Added a console-scoped `sess` IPC proxy for vscode-R's pipe-based transport, allowing R Console to forward vscode-R session traffic while requesting workspace data and runtime member completions from the current embedded R session.
 - Added `jgd` plot-hook support alongside `httpgd` when selected through vscode-R's plot settings.
 
-#### Changed
+### Changed
 
 - R Console now detects vscode-R's pipe-based `r.connectToSession` architecture while retaining the legacy file-based watcher integration for older vscode-R versions.
 - Runtime `$`, `@`, and data-frame bracket completion in vscode-R 3.0 `sess` mode now uses the active console session through `sess` JSON-RPC.
@@ -19,13 +17,9 @@ All notable changes to R Console will be documented in this file.
 - Persistent consoles now reuse their existing `sess` proxy when the console UI is detached and reattached, refresh their pipe metadata after a vscode-R extension-host restart, preserve an executing session's busy state, and defer `sess` reconnection until the focused session reaches a top-level prompt.
 - Unix `sess` proxy sockets and persistent-session connection files now use owner-only permissions consistent with vscode-R 3.0.
 
-### Changed
-
-- Rebuilt the R Console runtime binaries for macOS and Linux. Windows packages continue to use the binaries from the previous release; no newly built Windows binary is included.
-
 ### Fixed
 
-- Fixed plots not appearing when vscode-R's Session Watcher is turned off. R can now use its normal graphics device and show native plot windows, such as Quartz on macOS.
+- Fixed plots not appearing when vscode-R's Session Watcher is turned off. R can now use its normal graphics device and show native plot windows, such as Quartz on macOS. As a result, the R Console runtime binaries for macOS and Linux were rebuilt.
 
 ## [0.4.4] - 2026-08-05
 

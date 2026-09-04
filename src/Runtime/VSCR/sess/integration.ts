@@ -13,6 +13,7 @@ import { SessProxy } from "./sessProxy";
 type VscodeRSessionConnection = {
   pipePath: string;
   jgdSocket?: string;
+  attachCommand?: string;
 };
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
@@ -22,6 +23,7 @@ const SESS_RECONNECT_NOISE_PATTERN =
 
 let connectionDiscovery: Promise<VscodeRSessionConnection | undefined> | undefined;
 const proxiesByRuntimeSession = new Map<string, SessProxy>();
+const attachCommandsByProxy = new WeakMap<SessProxy, string>();
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -157,7 +159,7 @@ async function parsePipeAttachCommand(
           jgdSocketAssignment.index + jgdSocketAssignment[0].length
         )
       : undefined;
-    return { pipePath, jgdSocket };
+    return { pipePath, jgdSocket, attachCommand: command.trim() };
   } catch {
     return undefined;
   }
@@ -431,6 +433,14 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.flushActivation();
   }
 
+  isRedundantAttachSubmission(code: string): boolean {
+    const proxy = this.proxy;
+    return Boolean(
+      proxy?.isConnected() &&
+      code.trim() === attachCommandsByProxy.get(proxy)
+    );
+  }
+
   override getCachedWorkspaceData(): WorkspaceData | undefined {
     return this.proxy?.getWorkspaceData();
   }
@@ -493,6 +503,9 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     });
     try {
       const pipePath = await proxy.start();
+      if (upstreamConnection.attachCommand) {
+        attachCommandsByProxy.set(proxy, upstreamConnection.attachCommand);
+      }
       this.clearConnection();
       this.proxy = proxy;
       const sessionId = this.host.rProcess?.sessionId;
