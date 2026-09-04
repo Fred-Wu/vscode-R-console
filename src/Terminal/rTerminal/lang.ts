@@ -13,7 +13,7 @@ import {
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
-import type { WorkspaceData } from "../../Runtime/sessionWatcher";
+import type { WorkspaceData } from "../../Runtime/VSCR";
 
 export type InputSnapshot = {
   text: string;

@@ -71,17 +71,17 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 
 R Console reads several settings from [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r):
 
-| Setting                       | Purpose                                                                                                           |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `r.rpath.windows`           | R executable path on Windows for R Console startup                                                                |
-| `r.rpath.mac`               | R executable path on macOS for R Console startup                                                                  |
-| `r.rpath.linux`             | R executable path on Linux for R Console startup                                                                  |
-| `r.rterm.option`            | Extra arguments passed to R                                                                                       |
-| `r.sessionWatcher`          | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher bridge |
-| `r.bracketedPaste`          | Enables bracketed paste mode                                                                                      |
-| `r.lsp.args`                | Extra arguments passed when starting`languageserver`                                                            |
-| `r.lsp.use_stdio`           | Uses stdio instead of a loopback socket for the console LSP client when supported                                 |
-| `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused                                                           |
+| Setting | Purpose |
+| --- | --- |
+| `r.rpath.windows` | R executable path on Windows for R Console startup |
+| `r.rpath.mac` | R executable path on macOS for R Console startup |
+| `r.rpath.linux` | R executable path on Linux for R Console startup |
+| `r.rterm.option` | Extra arguments passed to R |
+| `r.sessionWatcher` | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher or console-scoped JSON-RPC bridge |
+| `r.bracketedPaste` | Enables bracketed paste mode |
+| `r.lsp.args` | Extra arguments passed when starting `languageserver` |
+| `r.lsp.use_stdio` | Uses stdio instead of a loopback socket for the console LSP client when supported |
+| `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused |
 
 If `r.rpath.*` is set, an ambient `R_HOME` does not override it. If `r.rpath.*` is unset, ambient `R_HOME` is used before `PATH`.
 
@@ -95,22 +95,15 @@ R Console also contributes its own settings:
 
 ## Dependency Model
 
-- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary.
+- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary, session bootstrap, session watcher, and supported JSON-RPC session protocol.
 - R's `languageserver` package is optional at runtime but required for language-server completion.
-- The bundled R backend is required at runtime. If the bundled backend for the current target is missing, the console does not fall back to a separate backend.
-
-> [!WARNING]
-> Future compatibility change
->
-> Only official vscode-R 2.8.x releases are currently supported. Newer vscode-R builds are moving to a WebSocket and JSON-RPC 2.0 architecture.
->
-> A future R Console update will support both vscode-R architectures once the new architecture is officially released.
+- The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
 
 ## Acknowledgements
 
 R Console is built on the broader VS Code, Rust, and R ecosystems, and on the work of open-source projects that informed the extension. In particular:
 
-- [vscode-R](https://github.com/REditorSupport/vscode-R) - R Console depends on [vscode-R](https://github.com/REditorSupport/vscode-R) for configuration, session bootstrap, session watching, and the surrounding VS Code R workflow.
+- [vscode-R](https://github.com/REditorSupport/vscode-R) - R Console depends on vscode-R for configuration, session bootstrap, session watching, the supported JSON-RPC session protocol, and the surrounding VS Code R workflow.
 - [arf](https://github.com/eitsupi/arf) - The embedded-R host design was heavily informed by arf's Rust-based approach to loading and embedding R, platform-specific console initialization, callback wiring, event/input-handler pumping, and backend architecture.
 - [Ark](https://github.com/posit-dev/ark) - The native R frontend model, nested-input handling, ReadConsole recovery concepts, and generic R event-loop integration were important references for the backend design.
 - [rchitect](https://github.com/randy3k/rchitect) - Rchitect was a reference for embedding R from a non-R host process, including R home/shared-library discovery and callback/FFI boundary concepts.

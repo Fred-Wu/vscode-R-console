@@ -25,7 +25,8 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
-import { SessionWatcher, type WorkspaceData } from "../Runtime/sessionWatcher";
+import { getVscodeRIntegration, type WorkspaceData } from "../Runtime/VSCR";
+import { SessVscodeRIntegration } from "../Runtime/VSCR/sess/integration";
 import {
   InputSnapshot,
   RTermLang,
@@ -41,20 +42,28 @@ import {
 } from "./rTerminal/view";
 import {
   createRuntimeBackend,
+  closeRuntimeVscodeRIntegration,
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
+  getCachedRuntimeWorkspaceData,
   getRuntimeTerminalName,
+  getRuntimeVscodeRDisplayPid,
   isDefaultRuntimeTerminalName,
   interruptRuntime,
   attachRuntimeSession,
   primeRuntimeAttach,
   updateRuntimeTerminalName,
+  getRuntimeWorkspaceData,
   type RuntimeHost,
+  requestRuntimeMemberCompletions,
+  refreshRuntimeWorkspaceData,
   startNextRuntimeSubmission,
   type Submission,
   type TerminalMode,
   sendRuntimeReply,
   startRuntime,
+  setRuntimeVscodeRSessionActive,
+  disposeRuntimeVscodeRIntegrationUi,
 } from "./rTerminal/runtime";
 
 export { resolveRTerminalOptions } from "./options";
@@ -127,7 +136,7 @@ type PersistedUiSnapshot = {
 
 export type PersistedRTerminalOptions = Pick<
   RTerminalOptions,
-  "rPath" | "rArgs" | "sessionWatcherEnabled" | "watcherDir" | "bracketedPaste" | "cwd"
+  "rPath" | "rArgs" | "bracketedPaste" | "cwd"
 >;
 
 export type PersistedRTerminalState = {
@@ -170,9 +179,6 @@ export class RTerminal implements vscode.Pseudoterminal {
   private historyBrowsing = false;
   private historyCollapsed = true;
   private escPendingClear = false;
-
-  private sessionWatcher: SessionWatcher | undefined;
-  private sessionAttached = false;
 
   private lang: RTermLang;
 
@@ -242,7 +248,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
-    this.runtimeBackend = this.resolveRuntimeBackend();
+    this.runtimeBackend = createRuntimeBackend(this.extensionPath);
     this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
@@ -252,9 +258,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       env: this.options.env,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       requestWorkspaceData: async () =>
-        await this.sessionWatcher?.requestWorkspaceData(),
+        await getRuntimeWorkspaceData(this.runtimeHost()),
       requestMemberCompletions: async (expression, operator) =>
-        await this.sessionWatcher?.requestMemberCompletions(expression, operator),
+        await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
     });
 
     this.syntax = new ConsoleSyntax(
@@ -265,11 +271,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       }
     );
     this.renderer = new Renderer((text) => this.writeEmitter.fire(text), this.syntax);
-
-    if (options.sessionWatcherEnabled) {
-      this.sessionWatcher = new SessionWatcher(options.watcherDir);
-      this.sessionWatcher.onChange((data) => this.onSessionDataChanged(data));
-    }
 
     this.loadSettings();
     this.runtimeHostAdapter = this.createRuntimeHost();
@@ -477,12 +478,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       set hasReceivedOutput(value) {
         self.hasReceivedOutput = value;
       },
-      get sessionAttached() {
-        return self.sessionAttached;
-      },
-      set sessionAttached(value) {
-        self.sessionAttached = value;
-      },
       get sessionHostConnected() {
         return self.sessionHostConnected;
       },
@@ -512,12 +507,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       },
       set historyCollapsed(value) {
         self.historyCollapsed = value;
-      },
-      get sessionWatcher() {
-        return self.sessionWatcher;
-      },
-      set sessionWatcher(value) {
-        self.sessionWatcher = value;
       },
       get inputState() {
         return self.inputState;
@@ -573,7 +562,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       renderInput: () => self.renderInput(),
       recordOutputActivity: () => self.recordOutputActivity(),
       isSessionProtocolActive: () => self.isSessionProtocolActive(),
-      isSessionReadyForPrompt: () => self.isSessionReadyForPrompt(),
       startNextSubmission: () => self.startNextSubmission(),
       finishActiveSubmission: () => self.finishActiveSubmission(),
       getDisplayPid: () => self.getDisplayPid(),
@@ -629,10 +617,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     void this.handleAutocomplete(true);
   }
 
-  private resolveRuntimeBackend(): RuntimeBackend | undefined {
-    return createRuntimeBackend(this.extensionPath);
-  }
-
   private isSessionProtocolActive(): boolean {
     return Boolean(
       this.rProcess &&
@@ -640,13 +624,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.sessionHostConnected &&
         this.runtimeBackend.canUseSessionCommands(this.rProcess)
     );
-  }
-
-  private isSessionReadyForPrompt(): boolean {
-    // The console prompt must not depend on vscode-R's session watcher.
-    // Missing watcher bootstrap packages should degrade watcher-driven
-    // features only, not block the embedded R session from becoming interactive.
-    return true;
   }
 
   open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -973,6 +950,14 @@ export class RTerminal implements vscode.Pseudoterminal {
     const trimmed = normalized.replace(/\n+$/, "");
     const submission = trimmed.trimEnd();
     if (!submission) {
+      return;
+    }
+
+    const integration = getVscodeRIntegration(this.runtimeHost());
+    if (
+      integration instanceof SessVscodeRIntegration &&
+      integration.isRedundantAttachSubmission(submission)
+    ) {
       return;
     }
 
@@ -1680,8 +1665,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
-      getWorkspaceData: () => this.sessionWatcher?.getWorkspaceData(),
-      refreshWorkspaceData: () => this.sessionWatcher?.refresh(),
+      getWorkspaceData: () => getCachedRuntimeWorkspaceData(this.runtimeHost()),
+      refreshWorkspaceData: () => refreshRuntimeWorkspaceData(this.runtimeHost()),
       force,
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
@@ -1717,11 +1702,15 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private startR(): void {
-    startRuntime(this.runtimeHost());
+    void startRuntime(this.runtimeHost());
   }
 
   finishActiveSubmission(): void {
     finishRuntimeSubmission(this.runtimeHost());
+  }
+
+  setVscodeRSessionActive(active: boolean): void {
+    setRuntimeVscodeRSessionActive(this.runtimeHost(), active);
   }
 
   private async enqueueRSubmission(
@@ -1775,10 +1764,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode !== "ready") {
       return;
     }
-    if (!this.isSessionReadyForPrompt()) {
-      return;
-    }
-
     const delay = this.getPromptRenderDelay();
     if (delay <= 0) {
       this.showPrompt();
@@ -1791,9 +1776,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       if (this.mode !== "ready") {
-        return;
-      }
-      if (!this.isSessionReadyForPrompt()) {
         return;
       }
       this.showPrompt();
@@ -2167,8 +2149,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (
       this.promptVisible ||
       !this.promptReady ||
-      this.mode !== "ready" ||
-      !this.isSessionReadyForPrompt()
+      this.mode !== "ready"
     ) {
       return;
     }
@@ -2414,15 +2395,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       return this.extensionResourcesDisposePromise;
     }
     this.saveHistory();
-    this.sessionWatcher?.dispose();
+    disposeRuntimeVscodeRIntegrationUi(this.runtimeHost());
     this.syntax.dispose();
     this.clearPendingInputFlushTimer();
     this.pendingProgrammaticInput = "";
     this.clearPendingConsoleInput();
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
-
-    this.sessionAttached = false;
     setNativeParseCallback(null);
     this.extensionResourcesDisposePromise = this.lang.dispose();
     return this.extensionResourcesDisposePromise;
@@ -2434,6 +2413,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.rProcess) {
       const processToClose = this.rProcess;
       const pid = this.runtimeBackend?.getPid(processToClose);
+      closeRuntimeVscodeRIntegration(this.runtimeHost());
       if (this.runtimeBackend) {
         this.runtimeBackend.close(processToClose);
         // Give sidecar a short grace window to terminate its PTY child cleanly.
@@ -2536,8 +2516,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       options: {
         rPath: this.options.rPath,
         rArgs: [...this.options.rArgs],
-        sessionWatcherEnabled: this.options.sessionWatcherEnabled,
-        watcherDir: this.options.watcherDir,
         bracketedPaste: this.options.bracketedPaste,
         cwd: this.options.cwd,
       },
@@ -2563,11 +2541,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private getDisplayPid(): number | undefined {
-    if (this.options.sessionWatcherEnabled) {
-      const attachedPid = this.sessionWatcher?.getAttachedPid();
-      if (typeof attachedPid === "number") {
-        return attachedPid;
-      }
+    const integrationPid = getRuntimeVscodeRDisplayPid(this.runtimeHost());
+    if (typeof integrationPid === "number") {
+      return integrationPid;
     }
     if (typeof this.backendChildPid === "number") {
       return this.backendChildPid;

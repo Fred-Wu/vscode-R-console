@@ -68,7 +68,6 @@ mod unix_host {
         *const *const c_char,
         *const c_char,
     ) -> c_int;
-    type EventCallbackFn = unsafe extern "C-unwind" fn();
     type ExpandFileNameFn = unsafe extern "C" fn(*const c_char) -> *const c_char;
     type CheckUserInterruptFn = unsafe extern "C" fn();
     type ProcessEventsFn = unsafe extern "C" fn();
@@ -104,8 +103,6 @@ mod unix_host {
         ptr_r_choose_file: Option<*mut Option<ChooseFileFn>>,
         ptr_r_edit_file: Option<*mut Option<EditFileFn>>,
         ptr_r_edit_files: Option<*mut Option<EditFilesFn>>,
-        ptr_r_process_events: Option<*mut Option<EventCallbackFn>>,
-        r_polled_events: Option<*mut Option<EventCallbackFn>>,
         r_outputfile: Option<*mut *mut c_void>,
         r_consolefile: Option<*mut *mut c_void>,
         r_interactive: Option<*mut c_int>,
@@ -855,24 +852,6 @@ mod unix_host {
         run_process_events(context.api);
     }
 
-    unsafe extern "C-unwind" fn process_events_callback() {
-        let Some(api) = event_loop_api() else {
-            return;
-        };
-
-        run_activity_handlers(api);
-        preserve_requested_interrupt();
-    }
-
-    unsafe extern "C-unwind" fn polled_events_callback() {
-        let Some(api) = event_loop_api() else {
-            return;
-        };
-
-        run_activity_handlers(api);
-        preserve_requested_interrupt();
-    }
-
     unsafe extern "C-unwind" fn read_console_callback(
         prompt: *const c_char,
         buffer: *mut c_uchar,
@@ -1537,8 +1516,6 @@ mod unix_host {
                 ptr_r_choose_file: load_optional_global(&library, b"ptr_R_ChooseFile\0"),
                 ptr_r_edit_file: load_optional_global(&library, b"ptr_R_EditFile\0"),
                 ptr_r_edit_files: load_optional_global(&library, b"ptr_R_EditFiles\0"),
-                ptr_r_process_events: load_optional_global(&library, b"ptr_R_ProcessEvents\0"),
-                r_polled_events: load_optional_global(&library, b"R_PolledEvents\0"),
                 r_outputfile: load_optional_global(&library, b"R_Outputfile\0"),
                 r_consolefile: load_optional_global(&library, b"R_Consolefile\0"),
                 r_interactive: load_optional_global(&library, b"R_Interactive\0"),
@@ -1635,12 +1612,6 @@ mod unix_host {
             }
             if let Some(value) = self.ptr_r_edit_files {
                 *value = Some(edit_files_callback);
-            }
-            if let Some(value) = self.ptr_r_process_events {
-                *value = Some(process_events_callback);
-            }
-            if let Some(value) = self.r_polled_events {
-                *value = Some(polled_events_callback);
             }
             (self.setup_rmainloop)();
             Ok(())

@@ -13,7 +13,14 @@ import {
   type RuntimeSessionHandle,
   RustSidecarRuntimeBackend,
 } from "../../Runtime/runtimeBackend";
-import type { SessionWatcher, WorkspaceData } from "../../Runtime/sessionWatcher";
+import {
+  getVscodeRIntegration,
+  type SessionMemberCompletionItem,
+  type WorkspaceData,
+} from "../../Runtime/VSCR";
+import type {
+  VscodeRSessionIntegration,
+} from "../../Runtime/VSCR";
 import { ANSI, stripBracketedPasteMarkers } from "../ansi";
 import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
@@ -73,13 +80,11 @@ export type RuntimeHost = {
   awaitingExecutionStart: boolean;
   lastWriteEndedWithNewline: boolean;
   hasReceivedOutput: boolean;
-  sessionAttached: boolean;
   sessionHostConnected: boolean;
   activeSubmission: Submission | null;
   submissionQueue: Submission[];
   historyBrowsing: boolean;
   historyCollapsed: boolean;
-  sessionWatcher: SessionWatcher | undefined;
   inputState: InputState;
   syntax: ConsoleSyntax;
   renderer: Renderer;
@@ -99,7 +104,6 @@ export type RuntimeHost = {
   renderInput(): void;
   recordOutputActivity(): void;
   isSessionProtocolActive(): boolean;
-  isSessionReadyForPrompt(): boolean;
   startNextSubmission(): void;
   finishActiveSubmission(): void;
   getDisplayPid(): number | undefined;
@@ -143,12 +147,54 @@ export function createRuntimeBackend(
   return undefined;
 }
 
-function getConsoleProfilePath(extensionPath: string): string {
-  return path.join(extensionPath, "resources", "r", "console-profile.R");
+function vscodeRIntegration(host: RuntimeHost): VscodeRSessionIntegration {
+  return getVscodeRIntegration(host);
 }
 
-export function startRuntime(host: RuntimeHost): void {
+export function setRuntimeVscodeRSessionActive(host: RuntimeHost, active: boolean): void {
+  vscodeRIntegration(host).setActive(active);
+}
+
+export function getCachedRuntimeWorkspaceData(
+  host: RuntimeHost
+): WorkspaceData | undefined {
+  return vscodeRIntegration(host).getCachedWorkspaceData();
+}
+
+export function refreshRuntimeWorkspaceData(host: RuntimeHost): void {
+  vscodeRIntegration(host).refreshWorkspaceData();
+}
+
+export function getRuntimeVscodeRDisplayPid(host: RuntimeHost): number | undefined {
+  return vscodeRIntegration(host).getDisplayPid();
+}
+
+export function disposeRuntimeVscodeRIntegrationUi(host: RuntimeHost): void {
+  vscodeRIntegration(host).disposeUi();
+}
+
+export function closeRuntimeVscodeRIntegration(host: RuntimeHost): void {
+  vscodeRIntegration(host).handleRuntimeExit();
+}
+
+export async function getRuntimeWorkspaceData(
+  host: RuntimeHost
+): Promise<WorkspaceData | undefined> {
+  return await vscodeRIntegration(host).requestWorkspaceData();
+}
+
+export async function requestRuntimeMemberCompletions(
+  host: RuntimeHost,
+  expression: string,
+  operator: "$" | "@"
+): Promise<SessionMemberCompletionItem[] | undefined> {
+  return await vscodeRIntegration(host).requestMemberCompletions(expression, operator);
+}
+
+export async function startRuntime(host: RuntimeHost): Promise<void> {
   pendingRuntimeRewrites.delete(host);
+  const integration = vscodeRIntegration(host);
+  integration.resetForStart();
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.lang.clearSessionState();
@@ -168,7 +214,6 @@ export function startRuntime(host: RuntimeHost): void {
   host.submissionQueue = [];
   host.activeSubmission = null;
   host.backendChildPid = undefined;
-  host.sessionAttached = false;
   host.sessionHostConnected = false;
 
   if (!host.runtimeBackend) {
@@ -182,16 +227,14 @@ export function startRuntime(host: RuntimeHost): void {
   }
 
   try {
-    if (host.options.sessionWatcherEnabled) {
-      fs.mkdirSync(host.options.watcherDir, { recursive: true });
-    }
     const args = [host.options.rPath, ...host.options.rArgs];
     const runtimeEnv: NodeJS.ProcessEnv = { ...host.options.env };
+    await integration.prepareStart(runtimeEnv);
     if (host.extensionPath) {
       runtimeEnv.VSC_R_EXT = host.extensionPath;
       runtimeEnv.VSC_R_COLS = String(Math.max(20, host.dimensions.columns || 80));
       runtimeEnv.VSC_R_ROWS = String(Math.max(5, host.dimensions.rows || 24));
-      const consoleProfilePath = getConsoleProfilePath(host.extensionPath);
+      const consoleProfilePath = path.join(host.extensionPath, "resources", "r", "console-profile.R");
       if (!fs.existsSync(consoleProfilePath)) {
         throw new Error(`Console bootstrap script not found at ${consoleProfilePath}`);
       }
@@ -205,6 +248,7 @@ export function startRuntime(host: RuntimeHost): void {
       cwd: host.options.cwd,
       env: runtimeEnv,
     });
+    integration.afterRuntimeStarted();
     primeRuntimeAttach(host);
     setNativeParseCallback(null);
     attachRuntimeSession(host, true);
@@ -214,34 +258,23 @@ export function startRuntime(host: RuntimeHost): void {
     host.writeEmitter.fire(
       `${ANSI.red}Failed to start R: ${String(err)}${ANSI.reset}\r\n`
     );
+    integration.handleRuntimeExit();
     host.rProcess = null;
     host.mode = "closed";
-    host.sessionAttached = false;
   }
 }
 
 export function primeRuntimeAttach(
   host: RuntimeHost
 ): void {
-  if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
-    return;
-  }
-
-  const runtimePid = host.runtimeBackend?.getPid(host.rProcess) ?? host.getDisplayPid();
-  if (typeof runtimePid === "number" && Number.isFinite(runtimePid) && runtimePid > 0) {
-    host.sessionWatcher.setExpectedPid(runtimePid);
-  }
-
-  beginRuntimeAttach(host);
+  vscodeRIntegration(host).primeAttach();
 }
 
 export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boolean = false): void {
   if (!host.runtimeBackend || !host.rProcess) {
     return;
   }
-  if (!host.options.sessionWatcherEnabled || !host.sessionWatcher) {
-    host.sessionAttached = true;
-  }
+  vscodeRIntegration(host).attachRuntime();
   setNativeParseCallback(null);
   host.runtimeBackend.attach(host.rProcess, {
     onStdout: (output) => {
@@ -273,39 +306,6 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
   });
 }
 
-function beginRuntimeAttach(host: RuntimeHost): void {
-  if (!host.sessionWatcher) {
-    host.sessionAttached = true;
-    return;
-  }
-
-  host.sessionWatcher.onAttach(() => onRuntimeAttached(host));
-  host.sessionWatcher.start();
-  host.sessionWatcher.refresh();
-  if (host.sessionWatcher.isAttached()) {
-    onRuntimeAttached(host);
-  }
-}
-
-function onRuntimeAttached(host: RuntimeHost): void {
-  if (host.sessionAttached) {
-    return;
-  }
-  host.sessionAttached = true;
-  host.onSessionDataChanged(host.sessionWatcher?.getWorkspaceData());
-  updateRuntimeTerminalName(host);
-  if (host.mode === "starting" && host.promptReady) {
-    host.mode = "ready";
-  }
-  if (host.mode === "ready" && host.promptReady && !host.promptVisible) {
-    host.pendingPromptToken = true;
-    host.schedulePrompt();
-    if (host.activeSubmission === null && host.promptKind === "main") {
-      host.startNextSubmission();
-    }
-  }
-}
-
 export function handleRuntimeOutput(host: RuntimeHost, output: string): void {
   if (host.awaitingExecutionStart && host.activeSubmission) {
     host.awaitingExecutionStart = false;
@@ -329,10 +329,14 @@ export function handleRuntimeControl(
       return;
     case "host-connected":
       host.sessionHostConnected = true;
+      vscodeRIntegration(host).handleHostConnected();
       updateNativeParseCallback(host);
       return;
     case "prompt":
       handleBackendPrompt(host, event.kind);
+      if (event.kind === "main") {
+        vscodeRIntegration(host).handleMainPrompt();
+      }
       return;
     case "busy":
       if (event.value) {
@@ -399,15 +403,18 @@ function applyRuntimeSessionState(
   if (typeof event.pid === "number" && Number.isFinite(event.pid) && event.pid > 0) {
     host.backendChildPid = event.pid;
     updateRuntimeTerminalName(host);
-    if (host.options.sessionWatcherEnabled && host.sessionWatcher) {
-      host.sessionWatcher.setExpectedPid(event.pid);
-    }
+    vscodeRIntegration(host).handleRuntimePid(event.pid);
   }
 
   host.sessionHostConnected = true;
   updateNativeParseCallback(host);
 
-  if (event.busy) {
+  if (event.busy || event.wait.kind === "none") {
+    host.clearPromptRenderTimer();
+    host.clearReplyPromptRenderTimer();
+    if (host.promptVisible) {
+      host.clearInputRender();
+    }
     host.promptReady = false;
     host.promptVisible = false;
     host.pendingPromptToken = false;
@@ -418,8 +425,6 @@ function applyRuntimeSessionState(
   }
 
   switch (event.wait.kind) {
-    case "none":
-      return;
     case "top-level":
       host.promptReady = true;
       host.promptKind = event.wait.prompt;
@@ -429,6 +434,9 @@ function applyRuntimeSessionState(
       }
       if (!host.promptVisible) {
         host.pendingPromptToken = true;
+      }
+      if (event.wait.prompt === "main") {
+        vscodeRIntegration(host).handleMainPrompt();
       }
       return;
     case "nested":
@@ -455,7 +463,7 @@ function restoreReadyStateAfterExecution(host: RuntimeHost): void {
 
   host.mode = "ready";
 
-  if (!host.promptReady || host.promptVisible || !host.isSessionReadyForPrompt()) {
+  if (!host.promptReady || host.promptVisible) {
     return;
   }
 
@@ -791,7 +799,12 @@ export function renderRuntimeOutput(host: RuntimeHost, text: string): void {
     return;
   }
 
-  const formatted = formatViewOutput(text);
+  const formatted = vscodeRIntegration(host).filterRuntimeOutput(
+    formatViewOutput(text)
+  );
+  if (!formatted) {
+    return;
+  }
   renderRuntimeText(host, formatted, didOutputEndWithLineFeed(formatted));
 }
 
@@ -1237,6 +1250,7 @@ export function interruptRuntime(host: RuntimeHost): void {
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
+  vscodeRIntegration(host).handleRuntimeExit();
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
@@ -1252,7 +1266,6 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.promptReady = false;
   host.promptVisible = false;
   host.replyPromptText = "";
-  host.sessionAttached = false;
   host.awaitingExecutionStart = false;
   host.submissionPending = false;
 

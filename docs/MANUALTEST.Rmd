@@ -58,7 +58,7 @@ Run:
 
 ```{r startup-and-prompt}
 sessionInfo()
-Sys.getenv(c("R_HOME", "R_PROFILE_USER", "VSCODE_INIT_R", "VSC_R_SESSION_CWD"))
+Sys.getenv(c("R_HOME", "R_PROFILE_USER", "SESS_PIPE", "VSC_R_SESSION_CWD"))
 getOption("prompt")
 getOption("continue") 
 getOption("menu.graphics")

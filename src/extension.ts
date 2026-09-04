@@ -12,6 +12,7 @@ import {
   createRuntimeBackend,
   isDefaultRuntimeTerminalName,
 } from "./Terminal/rTerminal/runtime";
+import { disposeVscodeRIntegrationForRuntimeSession } from "./Runtime/VSCR";
 import {
   discoverRBinaryPath,
   getPlatformRPathConfigEntry,
@@ -291,12 +292,6 @@ function isPersistedRTerminalOptions(value: unknown): value is PersistedRTermina
     return false;
   }
   if (!Array.isArray(value.rArgs) || value.rArgs.some((entry) => typeof entry !== "string")) {
-    return false;
-  }
-  if (typeof value.sessionWatcherEnabled !== "boolean") {
-    return false;
-  }
-  if (typeof value.watcherDir !== "string" || value.watcherDir.trim().length === 0) {
     return false;
   }
   if (typeof value.bracketedPaste !== "boolean") {
@@ -893,6 +888,7 @@ function closeDetachedPersistentSessions(
   for (const session of sessions) {
     const handle = backend.reconnect(session.entry.terminal.runtime);
     backend.close(handle);
+    disposeVscodeRIntegrationForRuntimeSession(session.sessionId);
     persistentSessionRecords.delete(session.sessionId);
   }
 }
@@ -1146,6 +1142,10 @@ function handleTerminalOpen(terminal: vscode.Terminal): void {
 function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {
   if (terminal) {
     syncTerminalRecord(terminal);
+  }
+  const activeRecord = terminal ? resolveRecordFromTerminal(terminal) : undefined;
+  for (const record of rTerminalToRecord.values()) {
+    record.rTerminal.setVscodeRSessionActive(record === activeRecord);
   }
   setRConsoleActiveContext(terminal);
 }
