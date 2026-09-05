@@ -211,19 +211,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download VSIX artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: vsix-*
-          merge-multiple: true
-          path: release-artifacts
-
-      - name: Generate checksums
-        run: |
-          cd release-artifacts
-          sha256sum *.vsix > SHA256SUMS.txt
-
       - name: Extract development release notes
+        id: development-notes
         run: |
           awk '
             /^## Unreleased$/ { in_section = 1; next }
@@ -231,15 +220,32 @@ jobs:
             in_section { print }
           ' CHANGELOG.md > unreleased-notes.md
           if ! grep -q '[^[:space:]]' unreleased-notes.md; then
-            echo "::error::CHANGELOG.md does not contain a non-empty Unreleased section."
-            exit 1
+            echo "Skipping development release: no non-empty Unreleased section in CHANGELOG.md."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           {
             printf 'Development build from %s.\n\n' "$GITHUB_REF_NAME"
             cat unreleased-notes.md
           } > development-release-notes.md
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download VSIX artifacts
+        if: steps.development-notes.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+          path: release-artifacts
+
+      - name: Generate checksums
+        if: steps.development-notes.outputs.publish == 'true'
+        run: |
+          cd release-artifacts
+          sha256sum *.vsix > SHA256SUMS.txt
 
       - name: Replace development release
+        if: steps.development-notes.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -250,6 +256,7 @@ jobs:
           git push origin development --force
 
       - name: Publish development release
+        if: steps.development-notes.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: development
