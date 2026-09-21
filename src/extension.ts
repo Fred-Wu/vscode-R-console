@@ -14,7 +14,6 @@ import {
 } from "./Terminal/rTerminal/runtime";
 import { disposeVscodeRIntegrationForRuntimeSession } from "./Runtime/VSCR";
 import {
-  discoverRBinaryPath,
   getPlatformRPathConfigEntry,
 } from "./Terminal/options";
 
@@ -150,7 +149,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   disposeStalePersistentTerminalViews();
   syncTerminalRecordsFromWindow();
   setRConsoleActiveContext(vscode.window.activeTerminal);
-  void ensureConfiguredRPath();
 }
 
 async function initializePersistentSessionRegistry(): Promise<void> {
@@ -908,22 +906,6 @@ function formatManagedSessionLabel(session: ManagedPersistentSession): string {
 function formatManagedSessionDetail(session: ManagedPersistentSession): string {
   const cwd = session.entry.terminal.options.cwd || "default working directory";
   return `cwd: ${cwd} | session: ${session.sessionId}`;
-}
-
-async function ensureConfiguredRPath(): Promise<void> {
-  const config = vscode.workspace.getConfiguration("r");
-  const configEntry = getPlatformRPathConfigEntry();
-  const configured = (config.get<string>(configEntry) || "").trim();
-  if (configured.length > 0) {
-    return;
-  }
-
-  const discovered = discoverRBinaryPath();
-  if (!discovered) {
-    return;
-  }
-
-  await config.update(configEntry, discovered, vscode.ConfigurationTarget.Global);
 }
 
 function warnIfBracketedPasteDisabled(force: boolean = false): void {
