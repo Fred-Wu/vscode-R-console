@@ -25,7 +25,11 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
   package:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

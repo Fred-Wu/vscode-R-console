@@ -164,6 +164,9 @@
     "REditorSupport.r"
   ],
   "scripts": {
+    "test": "node --test tests/unit/*.test.cjs",
+    "test:runtime": "node --test tests/runtime.test.cjs",
+    "test:package": "node --test tests/package.test.cjs",
     "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",
     "build:sidecar": "node scripts/build-sidecar.js",
     "stage:sidecar": "node scripts/stage-sidecar.js",
