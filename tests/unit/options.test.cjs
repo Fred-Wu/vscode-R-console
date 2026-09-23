@@ -8,6 +8,10 @@ function resolver(platform) {
   const settings = {};
   const extension = { exports: {} };
   const folder = path.resolve("test workspace");
+  const pathFolder =
+    platform !== "win32" && process.platform === "win32"
+      ? path.relative(path.parse(folder).root, folder)
+      : folder;
   let registry = "";
   const api = loadSource("src/Terminal/options.ts", {
     vscode: {
@@ -21,8 +25,8 @@ function resolver(platform) {
     },
     fs: { existsSync: (file) => files.has(file) },
     child_process: { spawnSync: () => ({ stdout: registry }) },
-  }, { "process.platform": JSON.stringify(platform), "process.env.PATH": JSON.stringify(folder) });
-  return { ...api, files, settings, extension, folder, setRegistry: (value) => { registry = value; } };
+  }, { "process.platform": JSON.stringify(platform), "process.env.PATH": JSON.stringify(pathFolder) });
+  return { ...api, files, settings, extension, folder, pathFolder, setRegistry: (value) => { registry = value; } };
 }
 
 for (const platform of ["linux", "darwin", "win32"]) {
@@ -31,7 +35,7 @@ for (const platform of ["linux", "darwin", "win32"]) {
     const help = path.join(r.folder, "help-R");
     const configured = path.join(r.folder, "configured-R");
     const legacy = path.join(r.folder, "legacy-R");
-    const onPath = path.join(r.folder, platform === "win32" ? "R.exe" : "R");
+    const onPath = path.join(r.pathFolder, platform === "win32" ? "R.exe" : "R");
     [help, configured, legacy, onPath].forEach((file) => r.files.add(file));
     r.extension.exports.helpPanel = { rPath: help };
     r.settings.executablePath = configured;
