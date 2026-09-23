@@ -23,3 +23,14 @@ test("vscode-R selects disabled, legacy, or sess integration by available capabi
   sanitizeVscodeRIntegrationEnv(env);
   assert.deepEqual(env, { PATH: "keep", R_HOME: "keep" });
 });
+
+test("disabled and legacy integrations do not suppress attach submissions", () => {
+  const { getVscodeRIntegration } = loadSource("src/Runtime/VSCR/index.ts", { vscode: {} });
+  for (const options of [
+    { kind: "disabled" },
+    { kind: "legacy", watcherDir: "/unused", initPath: "/unused/init.R" },
+  ]) {
+    const integration = getVscodeRIntegration({ options: { vscodeR: options } });
+    assert.equal(integration.isRedundantAttachSubmission('source("attach.R")'), false);
+  }
+});

@@ -110,7 +110,42 @@ export type RuntimeHost = {
   getTerminalName(): string;
   notifyDisplayPidChanged(): void;
   onSessionDataChanged(data: WorkspaceData | undefined): void;
+  canSubmitHiddenCommand(): boolean;
+  submitHiddenCommand(code: string): boolean;
 };
+
+export function canSubmitRuntimeHiddenCommand(host: RuntimeHost): boolean {
+  return Boolean(
+    host.mode === "ready" &&
+      host.promptReady &&
+      host.promptKind === "main" &&
+      host.activeSubmission === null &&
+      !host.submissionPending &&
+      host.inputState.text.length === 0 &&
+      host.runtimeBackend?.canUseSessionCommands(host.rProcess)
+  );
+}
+
+export function submitRuntimeHiddenCommand(host: RuntimeHost, code: string): boolean {
+  const sent = host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code,
+  }) ?? false;
+  if (!sent) {
+    return false;
+  }
+
+  host.clearPromptRenderTimer();
+  if (host.promptVisible) {
+    host.clearInputRender();
+    host.promptVisible = false;
+  }
+  host.pendingPromptToken = false;
+  if (host.mode !== "closed") {
+    host.mode = "executing";
+  }
+  return true;
+}
 
 export function getRuntimeTerminalName(host: Pick<RuntimeHost, "getDisplayPid">): string {
   const pid = host.getDisplayPid();

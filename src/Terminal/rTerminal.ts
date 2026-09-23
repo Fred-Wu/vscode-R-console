@@ -26,7 +26,6 @@ import {
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
 import { getVscodeRIntegration, type WorkspaceData } from "../Runtime/VSCR";
-import { SessVscodeRIntegration } from "../Runtime/VSCR/sess/integration";
 import {
   InputSnapshot,
   RTermLang,
@@ -42,6 +41,8 @@ import {
 } from "./rTerminal/view";
 import {
   createRuntimeBackend,
+  canSubmitRuntimeHiddenCommand,
+  submitRuntimeHiddenCommand,
   closeRuntimeVscodeRIntegration,
   enqueueRuntimeSubmission,
   finishRuntimeSubmission,
@@ -568,6 +569,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       getTerminalName: () => self.getTerminalName(),
       notifyDisplayPidChanged: () => self.notifyDisplayPidChanged(),
       onSessionDataChanged: (data) => self.onSessionDataChanged(data),
+      canSubmitHiddenCommand: () => canSubmitRuntimeHiddenCommand(host),
+      submitHiddenCommand: (code) => submitRuntimeHiddenCommand(host, code),
     };
 
     return host;
@@ -954,10 +957,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const integration = getVscodeRIntegration(this.runtimeHost());
-    if (
-      integration instanceof SessVscodeRIntegration &&
-      integration.isRedundantAttachSubmission(submission)
-    ) {
+    if (integration.isRedundantAttachSubmission(submission)) {
       return;
     }
 

@@ -15,6 +15,7 @@ export interface VscodeRSessionIntegration {
   handleRuntimePid(pid: number): void;
   handleRuntimeExit(): void;
   setActive(active: boolean): void;
+  isRedundantAttachSubmission(code: string): boolean;
 
   getDisplayPid(): number | undefined;
   getCachedWorkspaceData(): WorkspaceData | undefined;
@@ -44,6 +45,10 @@ export abstract class BaseVscodeRSessionIntegration
   handleRuntimePid(_pid: number): void {}
   handleRuntimeExit(): void {}
   setActive(_active: boolean): void {}
+
+  isRedundantAttachSubmission(_code: string): boolean {
+    return false;
+  }
 
   getDisplayPid(): number | undefined {
     return undefined;

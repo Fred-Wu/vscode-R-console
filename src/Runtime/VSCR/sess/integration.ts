@@ -13,11 +13,15 @@ import { SessProxy } from "./sessProxy";
 type VscodeRSessionConnection = {
   pipePath: string;
   jgdSocket?: string;
-  plotBackend?: "auto" | "standard" | "httpgd" | "jgd";
   useRStudioApi?: boolean;
   useHttpgd?: boolean;
   useJgd?: boolean;
   attachCommand?: string;
+};
+
+type ProxiedSession = {
+  proxy: SessProxy;
+  connection: VscodeRSessionConnection;
 };
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
@@ -26,9 +30,7 @@ const SESS_RECONNECT_NOISE_PATTERN =
   /\r?\[sess\] Failed to connect to IPC pipe: [^\r\n]*(?:\r\n|\n)?/g;
 
 let connectionDiscovery: Promise<VscodeRSessionConnection | undefined> | undefined;
-const proxiesByRuntimeSession = new Map<string, SessProxy>();
-const connectionsByProxy = new WeakMap<SessProxy, VscodeRSessionConnection>();
-const attachCommandsByProxy = new WeakMap<SessProxy, string>();
+const sessionsByRuntimeSession = new Map<string, ProxiedSession>();
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -169,21 +171,14 @@ async function parsePipeAttachCommand(
           jgdSocketAssignment.index + jgdSocketAssignment[0].length
         )
       : undefined;
-    const useHttpgd = parseNamedRLogical(content, "use_httpgd");
-    const useJgd = parseNamedRLogical(content, "use_jgd");
-    const plotBackend: VscodeRSessionConnection["plotBackend"] =
-      useHttpgd === undefined || useJgd === undefined ? undefined :
-      useHttpgd ? (useJgd ? "auto" : "httpgd") :
-      useJgd ? "jgd" : "standard";
     return {
       pipePath,
       jgdSocket,
-      plotBackend,
       useRStudioApi: vscode.workspace
         .getConfiguration("r")
         .get<boolean>("session.emulateRStudioAPI", true),
-      useHttpgd,
-      useJgd,
+      useHttpgd: parseNamedRLogical(content, "use_httpgd"),
+      useJgd: parseNamedRLogical(content, "use_jgd"),
       attachCommand: command.trim(),
     };
   } catch {
@@ -261,6 +256,15 @@ function asRLogical(value: boolean | undefined, defaultValue: boolean): string {
   return (value ?? defaultValue) ? "TRUE" : "FALSE";
 }
 
+function getPlotBackend(
+  { useHttpgd, useJgd }: VscodeRSessionConnection
+): "auto" | "standard" | "httpgd" | "jgd" | undefined {
+  if (useHttpgd === undefined || useJgd === undefined) {
+    return undefined;
+  }
+  return useHttpgd ? (useJgd ? "auto" : "httpgd") : (useJgd ? "jgd" : "standard");
+}
+
 function quoteRString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
@@ -304,10 +308,9 @@ function buildAttachNotificationCommand(): string {
 }
 
 export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
-  private connection: VscodeRSessionConnection | undefined;
-  private connectionRefresh: Promise<VscodeRSessionConnection | undefined> | undefined;
+  private session: ProxiedSession | undefined;
+  private connectionRefresh: Promise<ProxiedSession | undefined> | undefined;
   private sessionFile: string | undefined;
-  private proxy: SessProxy | undefined;
   private reconnectInFlight = false;
   private reconnectNoiseUntil = 0;
   private reconnectPending: boolean;
@@ -322,9 +325,9 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   static disposeForRuntimeSession(sessionId: string): void {
-    const proxy = proxiesByRuntimeSession.get(sessionId);
-    proxiesByRuntimeSession.delete(sessionId);
-    proxy?.dispose();
+    const session = sessionsByRuntimeSession.get(sessionId);
+    sessionsByRuntimeSession.delete(sessionId);
+    session?.proxy.dispose();
   }
 
   override resetForStart(): void {
@@ -349,8 +352,8 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       throw new Error(`vscode-R sess bootstrap script not found at ${bootstrapPath}`);
     }
 
-    const connection = await this.createProxiedConnection();
-    if (!connection) {
+    const session = await this.createProxiedSession();
+    if (!session) {
       delete env.R_CONSOLE_SESSION_BOOTSTRAP;
       void vscode.window.showWarningMessage(
         "R Console could not obtain vscode-R session connection info. The console will start without vscode-R session attachment."
@@ -358,14 +361,15 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       return;
     }
 
-    this.connection = connection;
+    const { connection } = session;
     env.R_CONSOLE_SESSION_BOOTSTRAP = bootstrapPath;
     env.SESS_PIPE = connection.pipePath;
     env.SESS_RSTUDIOAPI = asRLogical(connection.useRStudioApi, true);
     env.SESS_USE_HTTPGD = asRLogical(connection.useHttpgd, true);
     env.SESS_USE_JGD = asRLogical(connection.useJgd, false);
-    if (connection.plotBackend) {
-      env.SESS_PLOT_BACKEND = connection.plotBackend;
+    const plotBackend = getPlotBackend(connection);
+    if (plotBackend) {
+      env.SESS_PLOT_BACKEND = plotBackend;
     } else {
       delete env.SESS_PLOT_BACKEND;
     }
@@ -382,8 +386,8 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override afterRuntimeStarted(): void {
-    if (this.proxy && this.host.rProcess) {
-      proxiesByRuntimeSession.set(this.host.rProcess.sessionId, this.proxy);
+    if (this.session && this.host.rProcess) {
+      sessionsByRuntimeSession.set(this.host.rProcess.sessionId, this.session);
     }
   }
 
@@ -429,7 +433,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       return;
     }
     if (this.reconnectPending) {
-      if (!this.mainPromptObserved || !this.canSubmitHiddenCommand()) {
+      if (!this.mainPromptObserved || !this.host.canSubmitHiddenCommand()) {
         void this.refreshConnection();
       } else {
         void this.reconnectRestoredRuntime();
@@ -439,31 +443,31 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.flushActivation();
   }
 
-  isRedundantAttachSubmission(code: string): boolean {
-    const proxy = this.proxy;
+  override isRedundantAttachSubmission(code: string): boolean {
+    const session = this.session;
     return Boolean(
-      proxy?.isConnected() &&
-      code.trim() === attachCommandsByProxy.get(proxy)
+      session?.proxy.isConnected() &&
+      code.trim() === session.connection.attachCommand
     );
   }
 
   override getCachedWorkspaceData(): WorkspaceData | undefined {
-    return this.proxy?.getWorkspaceData();
+    return this.session?.proxy.getWorkspaceData();
   }
 
   override async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
-    return await this.proxy?.requestWorkspace();
+    return await this.session?.proxy.requestWorkspace();
   }
 
   override refreshWorkspaceData(): void {
-    void this.proxy?.requestWorkspace();
+    void this.session?.proxy.requestWorkspace();
   }
 
   override async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"
   ): Promise<SessionMemberCompletionItem[] | undefined> {
-    return await this.proxy?.requestMemberCompletions(expression, operator);
+    return await this.session?.proxy.requestMemberCompletions(expression, operator);
   }
 
   override filterRuntimeOutput(text: string): string {
@@ -481,23 +485,20 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override disposeUi(): void {
-    this.proxy?.setWorkspaceDataListener(undefined);
+    this.session?.proxy.setWorkspaceDataListener(undefined);
   }
 
   private clearConnection(): void {
-    const proxy = this.proxy;
-    this.connection = undefined;
-    this.proxy = undefined;
+    const session = this.session;
+    this.session = undefined;
     const sessionId = this.host.rProcess?.sessionId;
-    if (sessionId && proxiesByRuntimeSession.get(sessionId) === proxy) {
-      proxiesByRuntimeSession.delete(sessionId);
+    if (sessionId && sessionsByRuntimeSession.get(sessionId) === session) {
+      sessionsByRuntimeSession.delete(sessionId);
     }
-    proxy?.dispose();
+    session?.proxy.dispose();
   }
 
-  private async createProxiedConnection(): Promise<
-    VscodeRSessionConnection | undefined
-  > {
+  private async createProxiedSession(): Promise<ProxiedSession | undefined> {
     const upstreamConnection = await getSessionConnection();
     if (!upstreamConnection) {
       return undefined;
@@ -509,18 +510,14 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     });
     try {
       const pipePath = await proxy.start();
-      if (upstreamConnection.attachCommand) {
-        attachCommandsByProxy.set(proxy, upstreamConnection.attachCommand);
-      }
       this.clearConnection();
-      this.proxy = proxy;
+      const session = { proxy, connection: { ...upstreamConnection, pipePath } };
+      this.session = session;
       const sessionId = this.host.rProcess?.sessionId;
       if (sessionId) {
-        proxiesByRuntimeSession.set(sessionId, proxy);
+        sessionsByRuntimeSession.set(sessionId, session);
       }
-      const connection = { ...upstreamConnection, pipePath };
-      connectionsByProxy.set(proxy, connection);
-      return connection;
+      return session;
     } catch {
       proxy.dispose();
       return undefined;
@@ -530,37 +527,30 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private async resolveCurrentConnection(): Promise<
     VscodeRSessionConnection | undefined
   > {
-    if (this.connection) {
-      return this.connection;
+    if (this.session) {
+      return this.session.connection;
     }
 
     const sessionId = this.host.rProcess?.sessionId;
-    const proxy = sessionId ? proxiesByRuntimeSession.get(sessionId) : undefined;
+    const session = sessionId ? sessionsByRuntimeSession.get(sessionId) : undefined;
+    const proxy = session?.proxy;
     const pipePath = proxy?.getPipePath();
-    if (proxy?.isConnected() && pipePath) {
+    if (session && proxy?.isConnected() && pipePath) {
       proxy.setWorkspaceDataListener((data) => this.host.onSessionDataChanged(data));
-      this.proxy = proxy;
-      this.connection = {
-        ...connectionsByProxy.get(proxy),
-        pipePath,
-      };
-      return this.connection;
+      this.session = session;
+      return session.connection;
     }
     if (proxy && sessionId) {
-      proxiesByRuntimeSession.delete(sessionId);
+      sessionsByRuntimeSession.delete(sessionId);
       proxy.dispose();
     }
 
     if (!this.connectionRefresh) {
-      this.connectionRefresh = this.createProxiedConnection().finally(() => {
+      this.connectionRefresh = this.createProxiedSession().finally(() => {
         this.connectionRefresh = undefined;
       });
     }
-    const connection = await this.connectionRefresh;
-    if (connection) {
-      this.connection = connection;
-    }
-    return connection;
+    return (await this.connectionRefresh)?.connection;
   }
 
   private async writeSessionFile(
@@ -587,10 +577,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   private persistConnection(pid: number): void {
-    if (!isLivePid(pid) || !this.connection) {
+    if (!isLivePid(pid) || !this.session) {
       return;
     }
-    void this.writeSessionFile(pid, this.connection);
+    void this.writeSessionFile(pid, this.session.connection);
   }
 
   private async refreshConnection(): Promise<void> {
@@ -603,44 +593,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     }
   }
 
-  private canSubmitHiddenCommand(): boolean {
-    return Boolean(
-      this.host.mode === "ready" &&
-        this.host.promptReady &&
-        this.host.promptKind === "main" &&
-        this.host.activeSubmission === null &&
-        !this.host.submissionPending &&
-        this.host.inputState.text.length === 0 &&
-        this.host.runtimeBackend?.canUseSessionCommands(this.host.rProcess)
-    );
-  }
-
-  private submitHiddenCommand(code: string): boolean {
-    const sent = this.host.runtimeBackend?.sendSessionCommand(this.host.rProcess, {
-      type: "submit",
-      code,
-    }) ?? false;
-    if (!sent) {
-      return false;
-    }
-
-    this.host.clearPromptRenderTimer();
-    if (this.host.promptVisible) {
-      this.host.clearInputRender();
-      this.host.promptVisible = false;
-    }
-    this.host.pendingPromptToken = false;
-    if (this.host.mode !== "closed") {
-      this.host.mode = "executing";
-    }
-    return true;
-  }
-
   private flushActivation(): void {
-    if (!this.activationPending || !this.canSubmitHiddenCommand()) {
+    if (!this.activationPending || !this.host.canSubmitHiddenCommand()) {
       return;
     }
-    if (this.submitHiddenCommand(buildAttachNotificationCommand())) {
+    if (this.host.submitHiddenCommand(buildAttachNotificationCommand())) {
       this.activationPending = false;
     }
   }
@@ -650,7 +607,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       !this.reconnectPending ||
       this.reconnectInFlight ||
       !this.mainPromptObserved ||
-      !this.canSubmitHiddenCommand()
+      !this.host.canSubmitHiddenCommand()
     ) {
       return;
     }
@@ -673,14 +630,14 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
         return;
       }
 
-      if (this.proxy?.isConnected()) {
+      if (this.session?.proxy.isConnected()) {
         this.reconnectPending = false;
         this.flushActivation();
         return;
       }
       if (
-        this.canSubmitHiddenCommand() &&
-        this.submitHiddenCommand(buildConnectCommand(connection))
+        this.host.canSubmitHiddenCommand() &&
+        this.host.submitHiddenCommand(buildConnectCommand(connection))
       ) {
         this.reconnectPending = false;
         // sess::connect() sends the attach notification itself. Later focus
