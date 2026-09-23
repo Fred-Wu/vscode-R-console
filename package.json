@@ -165,6 +165,7 @@
   ],
   "scripts": {
     "test": "node --test tests/unit/*.test.cjs",
+    "test:extension-host": "npx --yes @vscode/test-cli@0.0.12",
     "test:runtime": "node --test tests/runtime.test.cjs",
     "test:package": "node --test tests/package.test.cjs",
     "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",

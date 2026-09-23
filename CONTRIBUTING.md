@@ -51,6 +51,7 @@ For the same checks as CI, with Node.js 24, Rust, and R on `PATH`:
 npm ci
 npm run package:extension
 npm test
+npm run test:extension-host
 cargo test --locked --manifest-path sidecar/pty-host/Cargo.toml
 npm run build:sidecar
 npm run stage:sidecar
@@ -59,6 +60,8 @@ npm run package:vsix
 npm run test:package
 ```
 
+The extension host smoke test launches VS Code, installs declared extension
+dependencies, activates R Console, and checks its core commands are registered.
 The runtime smoke test starts an isolated R session using a temporary profile,
 checks evaluation, nested input, interruption, persistence, and shutdown, then
 cleans up. Set `R_TEST_EXECUTABLE` to choose the R executable used to locate R.
@@ -67,8 +70,8 @@ The package test inspects the generated VSIX for the current platform.
 CI runs on every pull request and pushes to `main` and `dev` on Linux, Windows,
 and macOS. Releases must pass the same workflow before packaging or publishing.
 The separate runtime build workflow retains checks for all six target platforms.
-Native graphics, VS Code UI behavior, and external package integrations remain
-covered by the manual checklist.
+Native graphics, interactive VS Code UI behavior, and external package integrations
+remain covered by the manual checklist.
 
 - [Implementation notes](docs/IMPLEMENTATION.md)
 - [Manual test checklist](docs/MANUALTEST.Rmd)
