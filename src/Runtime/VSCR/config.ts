@@ -58,6 +58,7 @@ export function sanitizeVscodeRIntegrationEnv(env: NodeJS.ProcessEnv): void {
   delete env.SESS_TOKEN;
   delete env.SESS_HOST;
   delete env.SESS_RSTUDIOAPI;
+  delete env.SESS_PLOT_BACKEND;
   delete env.SESS_USE_HTTPGD;
   delete env.SESS_USE_JGD;
 }

@@ -13,6 +13,7 @@ import { SessProxy } from "./sessProxy";
 type VscodeRSessionConnection = {
   pipePath: string;
   jgdSocket?: string;
+  plotBackend?: "auto" | "standard" | "httpgd" | "jgd";
   useRStudioApi?: boolean;
   useHttpgd?: boolean;
   useJgd?: boolean;
@@ -26,6 +27,7 @@ const SESS_RECONNECT_NOISE_PATTERN =
 
 let connectionDiscovery: Promise<VscodeRSessionConnection | undefined> | undefined;
 const proxiesByRuntimeSession = new Map<string, SessProxy>();
+const connectionsByProxy = new WeakMap<SessProxy, VscodeRSessionConnection>();
 const attachCommandsByProxy = new WeakMap<SessProxy, string>();
 
 async function sleep(ms: number): Promise<void> {
@@ -167,12 +169,21 @@ async function parsePipeAttachCommand(
           jgdSocketAssignment.index + jgdSocketAssignment[0].length
         )
       : undefined;
+    const useHttpgd = parseNamedRLogical(content, "use_httpgd");
+    const useJgd = parseNamedRLogical(content, "use_jgd");
+    const plotBackend: VscodeRSessionConnection["plotBackend"] =
+      useHttpgd === undefined || useJgd === undefined ? undefined :
+      useHttpgd ? (useJgd ? "auto" : "httpgd") :
+      useJgd ? "jgd" : "standard";
     return {
       pipePath,
       jgdSocket,
-      useRStudioApi: parseNamedRLogical(content, "use_rstudioapi"),
-      useHttpgd: parseNamedRLogical(content, "use_httpgd"),
-      useJgd: parseNamedRLogical(content, "use_jgd"),
+      plotBackend,
+      useRStudioApi: vscode.workspace
+        .getConfiguration("r")
+        .get<boolean>("session.emulateRStudioAPI", true),
+      useHttpgd,
+      useJgd,
       attachCommand: command.trim(),
     };
   } catch {
@@ -353,6 +364,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     env.SESS_RSTUDIOAPI = asRLogical(connection.useRStudioApi, true);
     env.SESS_USE_HTTPGD = asRLogical(connection.useHttpgd, true);
     env.SESS_USE_JGD = asRLogical(connection.useJgd, false);
+    if (connection.plotBackend) {
+      env.SESS_PLOT_BACKEND = connection.plotBackend;
+    } else {
+      delete env.SESS_PLOT_BACKEND;
+    }
     if (connection.jgdSocket) {
       env.JGD_SOCKET = connection.jgdSocket;
     } else {
@@ -502,7 +518,9 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       if (sessionId) {
         proxiesByRuntimeSession.set(sessionId, proxy);
       }
-      return { ...upstreamConnection, pipePath };
+      const connection = { ...upstreamConnection, pipePath };
+      connectionsByProxy.set(proxy, connection);
+      return connection;
     } catch {
       proxy.dispose();
       return undefined;
@@ -522,7 +540,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     if (proxy?.isConnected() && pipePath) {
       proxy.setWorkspaceDataListener((data) => this.host.onSessionDataChanged(data));
       this.proxy = proxy;
-      this.connection = { pipePath };
+      this.connection = {
+        ...connectionsByProxy.get(proxy),
+        pipePath,
+      };
       return this.connection;
     }
     if (proxy && sessionId) {

@@ -12,6 +12,7 @@ All notable changes to R Console will be documented in this file.
 ### Changed
 
 - Updated R executable resolution to follow vscode-R's new path handling, including `r.executablePath`, while retaining support for legacy `r.rpath.*` settings.
+- Updated vscode-R session integration to preserve resolved plot backend settings and RStudio API emulation across R Console startup and reconnection.
 
 ## [0.5.0] - 2026-09-04 - vscode-R 3.0 architecture compatibility introduced
 
