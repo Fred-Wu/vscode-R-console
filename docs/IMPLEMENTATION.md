@@ -457,14 +457,18 @@ legacy-specific edit.
 
 ### 3.1 Startup Settings From `vscode-R`
 
-R executable selection reads the `vscode-R` settings:
+R executable selection first reuses vscode-R's resolved help/background R path
+(`helpPanel.rPath`) when it is available. If it is unavailable, R Console
+falls back to its own resolver in this order:
 
-- `r.rpath.windows`
-- `r.rpath.mac`
-- `r.rpath.linux`
+1. `r.executablePath`
+2. legacy `r.rpath.windows`, `r.rpath.mac`, or `r.rpath.linux`
+3. `R` on `PATH`
+4. the Windows R registry entry on Windows
 
-If those are unset, the console falls back to ambient `R_HOME`, then `R` on
-`PATH`.
+Ambient `R_HOME` is not used to choose an R executable. After an executable is
+selected, R Console derives `R_HOME` from that executable so the embedded
+runtime stays anchored to the same R installation.
 
 The selected executable is used to derive:
 

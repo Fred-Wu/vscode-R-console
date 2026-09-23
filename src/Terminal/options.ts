@@ -24,6 +24,22 @@ type RStartupOptions = {
   noSiteFile: boolean;
 };
 
+type VscodeRApi = {
+  helpPanel?: {
+    rPath?: string;
+  };
+};
+
+function getVscodeRHelpPath(): string | undefined {
+  const extension = vscode.extensions.getExtension<VscodeRApi>("REditorSupport.r");
+  const rPath = extension?.exports?.helpPanel?.rPath;
+  if (typeof rPath !== "string" || !rPath.trim()) {
+    return undefined;
+  }
+  const resolved = rPath.trim();
+  return fs.existsSync(resolved) ? resolved : undefined;
+}
+
 function getRConfig(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("r");
 }
@@ -42,6 +58,11 @@ export function getPlatformRPathConfigEntry(): string {
   return getPlatformConfigEntry("rpath");
 }
 
+function getActiveFileWorkspaceFolderPath(): string | undefined {
+  const active = vscode.window.activeTextEditor?.document.uri;
+  return active ? vscode.workspace.getWorkspaceFolder(active)?.uri.fsPath : undefined;
+}
+
 function getWorkspaceFolderPath(): string | undefined {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
@@ -50,14 +71,7 @@ function getWorkspaceFolderPath(): string | undefined {
   if (folders.length === 1) {
     return folders[0].uri.fsPath;
   }
-  const active = vscode.window.activeTextEditor?.document.uri;
-  if (active) {
-    const folder = vscode.workspace.getWorkspaceFolder(active);
-    if (folder) {
-      return folder.uri.fsPath;
-    }
-  }
-  return folders[0].uri.fsPath;
+  return getActiveFileWorkspaceFolderPath() ?? folders[0].uri.fsPath;
 }
 
 function substituteVariable(
@@ -79,6 +93,7 @@ function substituteVariables(value: string): string {
   }
   result = substituteVariable(result, "${userHome}", () => os.homedir());
   result = substituteVariable(result, "${workspaceFolder}", () => getWorkspaceFolderPath());
+  result = substituteVariable(result, "${fileWorkspaceFolder}", () => getActiveFileWorkspaceFolderPath());
   result = substituteVariable(result, "${fileDirname}", () => {
     const activeFilePath = vscode.window.activeTextEditor?.document.uri.fsPath;
     return activeFilePath ? path.dirname(activeFilePath) : undefined;
@@ -96,9 +111,16 @@ function resolveConfiguredExecutablePath(
   }
 
   const resolved = substituteVariables(configured)
+    .trim()
     .replace(/^"(.*)"$/, "$1")
     .replace(/^'(.*)'$/, "$1");
-  if (!fs.existsSync(resolved)) {
+  const candidate =
+    !resolved.includes("/") && !resolved.includes("\\")
+      ? findExecutableOnPath(resolved)
+      : fs.existsSync(resolved)
+      ? resolved
+      : undefined;
+  if (!candidate) {
     if (showErrors) {
       void vscode.window.showErrorMessage(
         `Cannot find R at ${resolved}. Check setting r.${configEntry}.`
@@ -106,64 +128,59 @@ function resolveConfiguredExecutablePath(
     }
     return undefined;
   }
-  return resolved;
-}
-
-function resolveExecutableFromRHome(
-  rHomeValue: string | undefined,
-  showErrors: boolean = true
-): string | undefined {
-  const trimmed = (rHomeValue ?? "")
-    .trim()
-    .replace(/^"(.*)"$/, "$1")
-    .replace(/^'(.*)'$/, "$1");
-  if (!trimmed) {
-    return undefined;
-  }
-
-  const rHome = path.resolve(trimmed);
-  if (!fs.existsSync(rHome)) {
-    if (showErrors) {
-      void vscode.window.showErrorMessage(
-        `Cannot find R_HOME at ${rHome}. Check your environment configuration.`
-      );
-    }
-    return undefined;
-  }
-
-  const candidate =
-    process.platform === "win32" ? path.join(rHome, "bin", "R.exe") : path.join(rHome, "bin", "R");
-  if (!fs.existsSync(candidate)) {
-    if (showErrors) {
-      void vscode.window.showErrorMessage(
-        `Cannot find R under R_HOME at ${candidate}. Check your environment configuration.`
-      );
-    }
-    return undefined;
-  }
-
   return candidate;
 }
 
 export function discoverRBinaryPath(): string | undefined {
   return (
+    getVscodeRHelpPath() ??
+    resolveConfiguredExecutablePath("executablePath", false) ??
     resolveConfiguredExecutablePath(getPlatformRPathConfigEntry(), false) ??
-    resolveExecutableFromRHome(process.env.R_HOME, false) ??
-    findROnPath()
+    findROnPath() ??
+    findRFromWindowsRegistry()
   );
 }
 
-function findROnPath(): string | undefined {
+function findExecutableOnPath(executableName: string): string | undefined {
   const delimiter = process.platform === "win32" ? ";" : ":";
-  const executableName = process.platform === "win32" ? "R.exe" : "R";
+  const extension =
+    process.platform === "win32" && !path.win32.extname(executableName) ? ".exe" : "";
   const pathEntries = (process.env.PATH ?? "").split(delimiter).filter((entry) => entry.length > 0);
   for (const entry of pathEntries) {
-    const candidate = path.join(entry, executableName);
+    const candidate = path.join(entry, executableName + extension);
     if (fs.existsSync(candidate)) {
       return candidate;
     }
   }
   return undefined;
+}
+
+function findROnPath(): string | undefined {
+  return findExecutableOnPath("R");
+}
+
+function findRFromWindowsRegistry(): string | undefined {
+  if (process.platform !== "win32") {
+    return undefined;
+  }
+
+  try {
+    const result = spawnSync(
+      "reg",
+      ["query", "HKLM\\Software\\R-Core\\R", "/v", "InstallPath"],
+      { encoding: "utf8", windowsHide: true }
+    );
+    const stdout = typeof result.stdout === "string" ? result.stdout : "";
+    const match = stdout.match(/InstallPath\s+REG_\w+\s+(.+)$/im);
+    const installPath = match?.[1]?.trim();
+    if (!installPath) {
+      return undefined;
+    }
+    const candidate = path.join(installPath, "bin", "R.exe");
+    return fs.existsSync(candidate) ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function guessRHomeFromExecutable(rPath: string): string | undefined {
@@ -484,7 +501,7 @@ function configureRRuntimeEnv(
   rHome: string,
   startup: RStartupOptions
 ): void {
-  // Keep the embedded host anchored to the same installation as `r.rpath.*`.
+  // Keep the embedded host anchored to the same installation as the selected R executable.
   // An ambient `R_HOME` from the outer environment must not redirect the
   // sidecar to a different shared-library tree.
   env.R_HOME = rHome;
@@ -509,25 +526,13 @@ function configureRRuntimeEnv(
 }
 
 function resolveRBinaryPath(): string | undefined {
-  const rPathConfigEntry = getPlatformConfigEntry("rpath");
-  const config = getRConfig();
-  const configured = (config.get<string>(rPathConfigEntry) || "").trim();
-  if (configured.length > 0) {
-    return resolveConfiguredExecutablePath(rPathConfigEntry);
-  }
-
-  const fromRHome = resolveExecutableFromRHome(process.env.R_HOME);
-  if (fromRHome) {
-    return fromRHome;
-  }
-
-  const discovered = findROnPath();
-  if (discovered) {
-    return discovered;
+  const rPath = discoverRBinaryPath();
+  if (rPath) {
+    return rPath;
   }
 
   void vscode.window.showErrorMessage(
-    `Cannot find R. Configure r.${rPathConfigEntry}, set R_HOME, or install R on PATH.`
+    `Cannot find R. Configure r.executablePath or r.${getPlatformRPathConfigEntry()}, or install R on PATH.`
   );
   return undefined;
 }
