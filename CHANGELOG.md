@@ -4,6 +4,11 @@ All notable changes to R Console will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Added a CI pipeline for Linux, Windows, and macOS with automated TypeScript, Rust, real-R runtime, VS Code Extension Host, and VSIX packaging tests.
+- Added a VS Code Extension Host smoke test to verify R Console activation, vscode-R availability, and core command registration.
+
 ### Changed
 
 - Updated R executable resolution to follow vscode-R's new path handling, including `r.executablePath`, while retaining support for legacy `r.rpath.*` settings.
