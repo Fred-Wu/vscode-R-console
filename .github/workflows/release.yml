@@ -54,12 +54,12 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '24'
 
@@ -213,7 +213,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Extract development release notes
         id: development-notes
@@ -280,7 +280,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches package version
         run: |
@@ -349,7 +349,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -357,7 +357,7 @@ jobs:
           node -e "const pkg=require('./package.json'); const tag=process.env.GITHUB_REF_NAME; const expected='v' + pkg.version; if(tag !== expected){throw new Error('Tag ' + tag + ' does not match package version ' + expected);}"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '24'
 
@@ -381,7 +381,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -389,7 +389,7 @@ jobs:
           node -e "const pkg=require('./package.json'); const tag=process.env.GITHUB_REF_NAME; const expected='v' + pkg.version; if(tag !== expected){throw new Error('Tag ' + tag + ' does not match package version ' + expected);}"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '24'
 
