@@ -47,6 +47,8 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
     env.R_CONSOLE_SESSION_BOOTSTRAP = bootstrapPath;
     env.VSCODE_INIT_R = this.options.initPath;
     env.VSCODE_WATCHER_DIR = this.options.watcherDir;
+    delete env.SESS_ENDPOINT;
+    delete env.SESS_DISCOVERY_FILE;
     delete env.SESS_PIPE;
     delete env.SESS_PORT;
     delete env.SESS_TOKEN;

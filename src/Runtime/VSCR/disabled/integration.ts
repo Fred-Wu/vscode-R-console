@@ -5,6 +5,8 @@ export class DisabledVscodeRIntegration extends BaseVscodeRSessionIntegration {
     delete env.R_CONSOLE_SESSION_BOOTSTRAP;
     delete env.VSCODE_INIT_R;
     delete env.VSCODE_WATCHER_DIR;
+    delete env.SESS_ENDPOINT;
+    delete env.SESS_DISCOVERY_FILE;
     delete env.SESS_PIPE;
     delete env.SESS_PORT;
     delete env.SESS_TOKEN;

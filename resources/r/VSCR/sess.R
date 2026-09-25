@@ -4,12 +4,12 @@ local({
         message("R Console: continuing without vscode-R session bootstrap.")
     }
 
-    get_pipe_sess_connect <- function() {
+    get_endpoint_sess_connect <- function() {
         if (!requireNamespace("sess", quietly = TRUE)) {
             return(NULL)
         }
         connect <- get("connect", envir = asNamespace("sess"))
-        if (!("pipe_path" %in% names(formals(connect)))) {
+        if (!("endpoint" %in% names(formals(connect)))) {
             return(NULL)
         }
         connect
@@ -17,13 +17,13 @@ local({
 
     tryCatch(
         {
-            connect <- get_pipe_sess_connect()
-            pipe_path <- Sys.getenv("SESS_PIPE")
-            if (is.null(connect) || !nzchar(pipe_path)) {
+            connect <- get_endpoint_sess_connect()
+            endpoint <- Sys.getenv("SESS_ENDPOINT")
+            if (is.null(connect) || !nzchar(endpoint)) {
                 return(invisible(NULL))
             }
             connect(
-                pipe_path = pipe_path,
+                endpoint = endpoint,
                 use_rstudioapi = as.logical(Sys.getenv("SESS_RSTUDIOAPI", "TRUE")),
                 use_httpgd = as.logical(Sys.getenv("SESS_USE_HTTPGD", "TRUE")),
                 use_jgd = as.logical(Sys.getenv("SESS_USE_JGD", "FALSE"))
