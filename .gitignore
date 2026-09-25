@@ -2,7 +2,7 @@ node_modules/
 dist/
 .vscode/
 out/
-/agent.md
+/AGENTS.md
 
 *.log
 *.vsix
