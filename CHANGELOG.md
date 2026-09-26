@@ -19,6 +19,10 @@ All notable changes to R Console will be documented in this file.
 
 - Added automated checks on Linux, Windows, and macOS for TypeScript, Rust, real R sessions, VS Code activation and commands, and extension packaging. Release packaging now requires these checks to pass.
 
+### Fixed
+
+- Reduced console language-server startup delays by giving each console an empty workspace, avoiding a scan of the open project before completion requests can be handled.
+
 ## [0.5.0] - 2026-09-04 - vscode-R 3.0 architecture compatibility introduced
 
 ### Added
