@@ -471,9 +471,19 @@ export class RTermLang {
 
   clearSessionState(): void {
     this.sessionState = undefined;
+    this.consoleLsp?.updateInput("");
+  }
+
+  updateInput(input: string): void {
+    this.consoleLsp?.updateInput(input);
+  }
+
+  recordCompletion(input: string, start: number, selection: CompletionPickItem): void {
+    this.consoleLsp?.recordCompletion(input, start, selection);
   }
 
   async refreshCompletionContextDocument(inputText: string): Promise<void> {
+    this.updateInput(inputText);
     if (this.disposed || !this.completionDocument) {
       return;
     }

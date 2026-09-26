@@ -2,7 +2,25 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const completion = loadSource("src/Language/completion.ts", {
-  vscode: { CompletionItemKind: { Field: 4, Function: 2, Variable: 5, Property: 9, Module: 8 } },
+  vscode: {
+    CompletionItemKind: { Field: 4, Function: 2, Variable: 5, Property: 9, Module: 8 },
+    SnippetString: class SnippetString {},
+  },
+});
+
+test("same-name functions keep their selected package through the picker without changing inserted text", async () => {
+  const context = completion.getCompletionContext("filt", 4);
+  const entries = await completion.collectCompletionEntries(
+    context, { getText: () => "filt" }, { line: 0, character: 4 }, undefined, [], [],
+    { provideCompletionItems: async () => [
+      { label: "filter", insertText: "filter()", kind: 2, detail: "{stats}", data: { type: "function", package: "stats" } },
+      { label: "filter", insertText: "filter()", kind: 2, detail: "{dplyr}", data: { type: "function", package: "dplyr" } },
+    ] }
+  );
+  assert.equal(entries.length, 2);
+  const picks = entries.map((entry) => completion.toCompletionPick(entry, context));
+  assert.deepEqual(picks.map((pick) => pick.packageName), ["stats", "dplyr"]);
+  assert.ok(picks.every((pick) => pick.insertText === "filter()"));
 });
 
 test("completion recognizes member, namespace, argument, and bracket contexts", () => {
@@ -26,4 +44,136 @@ test("cached column completions work without LSP and quote non-syntactic names",
     assert.equal(entries.find((entry) => entry.label === "a b").insertText, expected);
     assert.equal(entries.filter((entry) => entry.label === "alpha").length, 1);
   }
+});
+
+class Position {
+  constructor(line, character) { Object.assign(this, { line, character }); }
+}
+const { VirtualRDocument } = loadSource("src/Language/virtualRDocument.ts", {
+  vscode: { Position, Uri: { parse: (value) => ({ toString: () => value }) } },
+});
+
+function select(document, input, start, text, packageName) {
+  document.update(input);
+  document.selectFunction(start, text, packageName);
+}
+
+test("selected packages qualify only virtual calls and map multiline UTF-16 positions", () => {
+  const selections = new VirtualRDocument("test");
+  const input = 'x <- "😀"; filter(\n  filter(x)\n)';
+  select(selections, input, input.indexOf("filter"), "filter()", "stats");
+  select(selections, input, input.lastIndexOf("filter"), "filter()", "dplyr");
+  const projection = selections.project(input);
+  assert.equal(projection.document.getText(), 'x <- "😀"; stats::filter(\n  dplyr::filter(x)\n)');
+  for (const position of [new Position(0, 0), new Position(0, 18), new Position(1, 9), new Position(2, 1)]) {
+    assert.deepEqual(projection.toConsolePosition(projection.toServerPosition(position)), position);
+  }
+  assert.deepEqual(projection.toServerPosition(new Position(1, 9)), new Position(1, 16));
+  assert.deepEqual(projection.toConsolePosition(new Position(1, 4)), new Position(1, 2));
+});
+
+test("selections follow edits outside names and expire when names or qualification change", () => {
+  const selections = new VirtualRDocument("test");
+  select(selections, "filter()", 0, "filter()", "stats");
+  selections.update("result <- filter()");
+  selections.update("result <- filter(x, sides = 1)");
+  assert.equal(selections.project("result <- filter(x, sides = 1)").document.getText(), "result <- stats::filter(x, sides = 1)");
+  selections.update("result <- filte(x, sides = 1)");
+  selections.update("result <- filter(x, sides = 1)");
+  assert.equal(selections.project("result <- filter(x, sides = 1)").document.getText(), "result <- filter(x, sides = 1)");
+
+  for (const input of ["dplyr::filter()", "obj$filter()", '"filter()"', 'r"---(filter())---"', "# filter()", "filtering()"]) {
+    selections.update("");
+    select(selections, "filter()", 0, "filter()", "stats");
+    selections.update(input);
+    assert.equal(selections.project(input).document.getText(), input);
+  }
+});
+
+test("picker previews do not overwrite the actual input's package choices", () => {
+  const selections = new VirtualRDocument("test");
+  select(selections, "filter()", 0, "filter()", "stats");
+  const first = selections.project("filter()");
+  assert.equal(selections.project("filter(si)").document.getText(), "stats::filter(si)");
+  assert.equal(selections.project("filter()").document.getText(), "stats::filter()");
+  select(selections, "filter()", 0, "filter()", "dplyr");
+  const next = selections.project("filter()");
+  assert.equal(next.document.getText(), "dplyr::filter()");
+  assert.ok(next.document.version > first.document.version);
+  assert.equal(first.document.getText(), "stats::filter()");
+  selections.update("");
+  assert.equal(selections.project("filter()").document.getText(), "filter()");
+});
+
+test("a selected function without a call is qualified once its parentheses are typed", () => {
+  const selections = new VirtualRDocument("test");
+  select(selections, "filter", 0, "filter", "stats");
+  assert.equal(selections.project("filter").document.getText(), "filter");
+  selections.update("filter(");
+  assert.equal(selections.project("filter(").document.getText(), "stats::filter(");
+  select(selections, "stats::filter()", 7, "filter()", "stats");
+  assert.equal(selections.project("stats::filter()").document.getText(), "stats::filter()");
+});
+
+test("the LSP client sends qualified input and maps both completion range formats back", async (t) => {
+  class Range {
+    constructor(start, end) { Object.assign(this, { start, end }); }
+  }
+  const vscode = {
+    Position, Range,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const input = "filter() + filter(si)";
+  const client = new ConsoleLspClient({ consoleId: "client-test", env: {} });
+  t.after(() => client.dispose());
+  client.recordCompletion(input, 0, { insertText: "filter()", packageName: "stats" });
+  client.recordCompletion(input, 11, { insertText: "filter(si)", packageName: "dplyr" });
+  const synced = [];
+  client.client = {
+    isRunning: () => true,
+    code2ProtocolConverter: {
+      asOpenTextDocumentParams: (doc) => ({ text: doc.getText(), version: doc.version }),
+      asChangeTextDocumentParams: (doc) => ({ text: doc.getText(), version: doc.version }),
+      asCloseTextDocumentParams: () => ({}),
+      asCompletionParams: (doc, position) => ({ text: doc.getText(), position }),
+    },
+    protocol2CodeConverter: { asCompletionResult: async (result) => result },
+    sendNotification: async (method, params) => { if (method !== "close") synced.push(params); },
+    sendRequest: async (_method, params) => {
+      assert.equal(params.text, "stats::filter() + dplyr::filter(si)");
+      assert.deepEqual(params.position, new Position(0, 34));
+      const range = new Range(new Position(0, 32), new Position(0, 34));
+      return { isIncomplete: false, items: [
+        { label: "first", range },
+        { label: "second", range: { inserting: range, replacing: range } },
+      ] };
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  const doc = { getText: () => input };
+  await client.prepareDocument(doc);
+  const result = await client.provideCompletionItems(doc, new Position(0, 20));
+  assert.equal(synced.length, 1);
+  const expected = new Range(new Position(0, 18), new Position(0, 20));
+  assert.deepEqual(result.items[0].range, expected);
+  assert.deepEqual(result.items[1].range, { inserting: expected, replacing: expected });
+
+  client.recordCompletion(input, 0, { insertText: "filter()", packageName: "dplyr" });
+  await client.prepareDocument(doc);
+  assert.equal(synced[1].text, "dplyr::filter() + dplyr::filter(si)");
+  assert.ok(synced[1].version > synced[0].version);
+  assert.equal(doc.getText(), input);
 });

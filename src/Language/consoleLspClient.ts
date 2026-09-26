@@ -18,7 +18,8 @@ import {
   RevealOutputChannelOn,
   StreamInfo,
 } from "vscode-languageclient/node";
-import type { CompletionProvider } from "./completion";
+import type { CompletionPickItem, CompletionProvider } from "./completion";
+import { VirtualRDocument } from "./virtualRDocument";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -74,6 +75,7 @@ class ConsoleLanguageClient extends LanguageClient {
 export class ConsoleLspClient implements CompletionProvider {
   private readonly outputChannel: vscode.OutputChannel;
   private readonly workingDirectory: string;
+  private readonly inputDocument: VirtualRDocument;
 
   private client: ConsoleLanguageClient | undefined;
   private startPromise: Promise<void> | undefined;
@@ -88,6 +90,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private syncedSessionStateKey: string | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
+    this.inputDocument = new VirtualRDocument(options.consoleId);
     this.outputChannel = new SilentOutputChannel("R Console");
     // A client removes only its own cwd after its R process has stopped.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
@@ -236,7 +239,8 @@ export class ConsoleLspClient implements CompletionProvider {
       return undefined;
     }
     try {
-      await this.syncDocument(client, doc);
+      const projection = this.inputDocument.project(doc.getText());
+      await this.syncDocument(client, projection.document);
       await this.applySessionState(client);
       const context: vscode.CompletionContext = triggerCharacter
         ? {
@@ -247,9 +251,22 @@ export class ConsoleLspClient implements CompletionProvider {
             triggerKind: vscode.CompletionTriggerKind.Invoke,
             triggerCharacter: undefined,
           };
-      const params = client.code2ProtocolConverter.asCompletionParams(doc, position, context);
+      const params = client.code2ProtocolConverter.asCompletionParams(
+        projection.document, projection.toServerPosition(position), context
+      );
       const result = await client.sendRequest(CompletionRequest.type, params);
-      return await client.protocol2CodeConverter.asCompletionResult(result);
+      const completions = await client.protocol2CodeConverter.asCompletionResult(result);
+      const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
+        projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
+      );
+      for (const item of Array.isArray(completions) ? completions : completions?.items ?? []) {
+        if (item.range) {
+          item.range = item.range instanceof vscode.Range
+            ? mapRange(item.range)
+            : { inserting: mapRange(item.range.inserting), replacing: mapRange(item.range.replacing) };
+        }
+      }
+      return completions;
     } catch {
       return undefined;
     }
@@ -260,8 +277,17 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return;
     }
-    await this.syncDocument(client, doc);
+    await this.syncDocument(client, this.inputDocument.project(doc.getText()).document);
     await this.applySessionState(client);
+  }
+
+  updateInput(input: string): void {
+    this.inputDocument.update(input);
+  }
+
+  recordCompletion(input: string, start: number, selection: CompletionPickItem): void {
+    this.inputDocument.update(input);
+    this.inputDocument.selectFunction(start, selection.insertText, selection.packageName);
   }
 
   async syncSessionState(state: ConsoleLspSessionState): Promise<void> {

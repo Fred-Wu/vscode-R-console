@@ -76,7 +76,8 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     loaded_namespaces <- normalize_character(params$loadedNamespaces)
     workspace <- self$get_workspace(self$rootUri)
 
-    workspace$startup_packages <- attached_packages
+    # languageserver resolves package conflicts from the end of this list.
+    workspace$startup_packages <- rev(attached_packages)
     workspace$update_loaded_packages()
 
     namespaces_to_load <- unique(c(attached_packages, loaded_namespaces))

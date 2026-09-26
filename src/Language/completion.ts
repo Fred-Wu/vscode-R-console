@@ -23,6 +23,7 @@ export type CompletionEntry = {
   detail?: string;
   source: "lsp" | "session" | "buffer";
   replaceStart?: number;
+  packageName?: string;
 };
 
 const DEFAULT_COMPLETION_GROUP_ORDER = [
@@ -67,6 +68,7 @@ const EXACT_MATCH_GROUP_ORDER = [
 ] as const;
 
 export type CompletionPickItem = vscode.QuickPickItem & {
+  packageName?: string;
   insertText: string;
   replaceStart: number;
   snapshotInput: string;
@@ -501,6 +503,7 @@ export function toCompletionPick(
     snapshotInput: context.snapshotInput,
     snapshotCursor: context.snapshotCursor,
     source: entry.source,
+    packageName: entry.packageName,
   };
 }
 
@@ -907,10 +910,22 @@ async function getLanguageServerCompletions(
       detail: item.detail,
       source: "lsp",
       replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
+      packageName: getCompletionPackage(item),
     }));
   } catch {
     return [];
   }
+}
+
+function getCompletionPackage(item: vscode.CompletionItem): string | undefined {
+  if (!isCallableCompletionKind(item.kind)) {
+    return undefined;
+  }
+  const data = (item as vscode.CompletionItem & { data?: { package?: unknown } }).data;
+  if (typeof data?.package === "string" && /^[A-Za-z][A-Za-z0-9.]*$/.test(data.package)) {
+    return data.package;
+  }
+  return /^\{([A-Za-z][A-Za-z0-9.]*)\}$/.exec(item.detail ?? "")?.[1];
 }
 
 function isLanguageServerCompletionItem(
