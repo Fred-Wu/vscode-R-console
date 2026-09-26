@@ -37,7 +37,7 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   const settings = {
     executablePath: rPath,
     sessionWatcher: false,
-    "rterm.option": ["--quiet", "--no-save", "--no-restore", "--no-site-file", "--no-environ"],
+    consoleArgs: ["--quiet", "--no-save", "--no-restore", "--no-site-file", "--no-environ"],
   };
   const { resolveRTerminalOptions } = loadSource("src/Terminal/options.ts", {
     vscode: {

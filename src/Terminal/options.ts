@@ -539,7 +539,7 @@ function resolveRBinaryPath(): string | undefined {
 
 function sanitizeRArgs(): string[] {
   const config = getRConfig();
-  const configuredArgs = config.get<string[]>("rterm.option") ?? [];
+  const configuredArgs = config.get<string[]>("consoleArgs") ?? config.get<string[]>("rterm.option") ?? [];
   const args: string[] = [];
 
   for (let index = 0; index < configuredArgs.length; index += 1) {
