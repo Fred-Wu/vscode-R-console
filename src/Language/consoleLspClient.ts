@@ -323,6 +323,11 @@ export class ConsoleLspClient implements CompletionProvider {
     const useStdio = config.get<boolean>("lsp.use_stdio") === true && process.platform !== "win32";
 
     const clientOptions: LanguageClientOptions = {
+      workspaceFolder: {
+        uri: vscode.Uri.file(this.workingDirectory),
+        name: "R Console",
+        index: 0,
+      },
       documentSelector: [
         // We synchronize console completion documents manually to guarantee
         // notification ordering before completion requests.
