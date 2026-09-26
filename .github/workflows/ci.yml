@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    # main and version tags run this workflow through release.yml.
+    branches: [dev]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+          rtools-version: none
+      - run: npm ci
+      - name: Type-check and bundle
+        run: npm run package:extension
+      - name: Unit tests
+        run: npm test
+      - name: Extension host smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:extension-host
+      - name: Extension host smoke test
+        if: runner.os != 'Linux'
+        run: npm run test:extension-host
+      - name: Rust tests
+        run: cargo test --locked --manifest-path sidecar/pty-host/Cargo.toml
+      - name: Build and stage runtime
+        run: |
+          npm run build:sidecar
+          npm run stage:sidecar
+      - name: Real R smoke test
+        run: npm run test:runtime
+      - name: Package and verify VSIX
+        run: |
+          npm run package:vsix
+          npm run test:package

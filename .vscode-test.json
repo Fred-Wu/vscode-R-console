@@ -1,0 +1,7 @@
+{
+  "files": "tests/extension-host/*.test.cjs",
+  "mocha": {
+    "ui": "tdd",
+    "timeout": 60000
+  }
+}

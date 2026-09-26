@@ -24,11 +24,7 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 ### Setup
 
 1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
-2. Configure the platform-specific [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) R path setting, or make sure R is available from `R_HOME` or `PATH`:
-
-   - Windows: `r.rpath.windows`
-   - macOS: `r.rpath.mac`
-   - Linux: `r.rpath.linux`
+2. R Console first reuses vscode-R's resolved vanilla R path when available. Otherwise configure `r.executablePath`, keep a legacy `r.rpath.<platform>` setting if needed, or make sure R is available on `PATH`.
 3. Enable bracketed paste mode:
 
    ```json
@@ -48,7 +44,7 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
    This setting is enabled by default unless explicitly set to `false`.
 6. Optional: install the R package `languageserver` for language-server completion.
 
-`R Console` launches from `r.rpath.*`, `R_HOME`, or `PATH`. It does not launch from `r.rterm.windows`, `r.rterm.mac`, or `r.rterm.linux`.
+`R Console` first reuses vscode-R's resolved help/background R path. If that is unavailable, it resolves `r.executablePath`, then legacy `r.rpath.*`, then `PATH`, with the Windows registry as the final Windows fallback. Ambient `R_HOME` is not used to select the executable; it is derived from the selected R executable instead.
 
 ### Launch R Console
 
@@ -73,9 +69,10 @@ R Console reads several settings from [vscode-R](https://marketplace.visualstudi
 
 | Setting | Purpose |
 | --- | --- |
-| `r.rpath.windows` | R executable path on Windows for R Console startup |
-| `r.rpath.mac` | R executable path on macOS for R Console startup |
-| `r.rpath.linux` | R executable path on Linux for R Console startup |
+| `r.executablePath` | Canonical vanilla R executable path used as the first configuration fallback |
+| `r.rpath.windows` | Legacy R executable path on Windows |
+| `r.rpath.mac` | Legacy R executable path on macOS |
+| `r.rpath.linux` | Legacy R executable path on Linux |
 | `r.rterm.option` | Extra arguments passed to R |
 | `r.sessionWatcher` | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher or console-scoped JSON-RPC bridge |
 | `r.bracketedPaste` | Enables bracketed paste mode |
@@ -83,7 +80,7 @@ R Console reads several settings from [vscode-R](https://marketplace.visualstudi
 | `r.lsp.use_stdio` | Uses stdio instead of a loopback socket for the console LSP client when supported |
 | `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused |
 
-If `r.rpath.*` is set, an ambient `R_HOME` does not override it. If `r.rpath.*` is unset, ambient `R_HOME` is used before `PATH`.
+When vscode-R exposes its resolved help/background R path, R Console uses that path directly. Otherwise the fallback order is `r.executablePath`, legacy `r.rpath.*`, `PATH`, then the Windows registry on Windows.
 
 R Console also contributes its own settings:
 

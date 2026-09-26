@@ -2,6 +2,23 @@
 
 All notable changes to R Console will be documented in this file.
 
+## Unreleased
+
+### Recent changes
+
+- Added support for vscode-R 3.0's `sess` package, which connects R sessions to VS Code, while retaining the older session watcher for earlier vscode-R versions.
+- Aligned session connections with the latest vscode-R public APIs. R Console now obtains connection details directly from vscode-R and uses stable session IDs to select the focused console, replacing clipboard-based connection discovery and manually generated attach messages.
+- Each console has its own connection bridge to vscode-R, keeping workspace data and `$`, `@`, and data-frame bracket completions tied to the correct R session.
+- Added support for the `jgd` and `httpgd` plot viewers, following vscode-R's resolved plot settings.
+- Persistent consoles reuse their connections when detached and reattached. After a window reload, they obtain a new connection and reconnect when focused at an empty main prompt, preserving the busy state of sessions that are still running.
+- The older session watcher and the new `sess` integration share common startup and session handling. Local connection sockets on macOS and Linux are accessible only to their owner.
+- Plots can open in R's normal graphics windows, such as Quartz on macOS, when vscode-R's Session Watcher is turned off.
+- R Console now follows vscode-R's selected R installation and supports `r.executablePath`, while retaining older `r.rpath.*` settings. It no longer writes detected paths to global settings or uses an existing `R_HOME` environment variable to select R.
+
+### Added
+
+- Added automated checks on Linux, Windows, and macOS for TypeScript, Rust, real R sessions, VS Code activation and commands, and extension packaging. Release packaging now requires these checks to pass.
+
 ## [0.5.0] - 2026-09-04 - vscode-R 3.0 architecture compatibility introduced
 
 ### Added

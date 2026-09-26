@@ -457,14 +457,18 @@ legacy-specific edit.
 
 ### 3.1 Startup Settings From `vscode-R`
 
-R executable selection reads the `vscode-R` settings:
+R executable selection first reuses vscode-R's resolved help/background R path
+(`helpPanel.rPath`) when it is available. If it is unavailable, R Console
+falls back to its own resolver in this order:
 
-- `r.rpath.windows`
-- `r.rpath.mac`
-- `r.rpath.linux`
+1. `r.executablePath`
+2. legacy `r.rpath.windows`, `r.rpath.mac`, or `r.rpath.linux`
+3. `R` on `PATH`
+4. the Windows R registry entry on Windows
 
-If those are unset, the console falls back to ambient `R_HOME`, then `R` on
-`PATH`.
+Ambient `R_HOME` is not used to choose an R executable. After an executable is
+selected, R Console derives `R_HOME` from that executable so the embedded
+runtime stays anchored to the same R installation.
 
 The selected executable is used to derive:
 
@@ -484,11 +488,11 @@ The same selected R executable is used for:
 When `r.sessionWatcher` is enabled, startup chooses one vscode-R session
 integration:
 
-- `sess`: pipe-based architecture exposed by vscode-R's `r.connectToSession`
-  command. `vscodeR/sess/integration.ts` asks vscode-R for the current attach command,
-  reads the generated attach script, extracts its `pipe_path`, starts a
-  console-owned `SessProxy`, and contributes the proxy pipe path as `SESS_PIPE`
-  to the embedded R launch.
+- `sess`: pipe-based architecture exposed by vscode-R's public session API.
+  `vscodeR/sess/integration.ts` calls `session.getConnectionInfo()` to obtain
+  the protocol version, IPC endpoint, resolved plot backend, and optional JGD
+  socket, starts a console-owned `SessProxy`, and contributes the proxy endpoint
+  as `SESS_ENDPOINT` to the embedded R launch.
 - `legacy`: legacy file-based watcher architecture. `R Console` sources vscode-R's
   `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
 
@@ -504,19 +508,25 @@ The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
 the console-owned proxy pipe, and the proxy connects to vscode-R's real pipe.
 Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
 Console observes workspace responses and injects its own `workspace` and
-`completion` requests when the console needs session data. It does not call
-vscode-R internal APIs and does not use VS Code's global completion command for
-runtime completion.
+`completion` requests when the console needs session data. It uses only
+vscode-R's public session API for connection discovery and session activation,
+and does not use VS Code's global completion command for runtime completion.
 
 The proxy is scoped to the embedded backend runtime session and is indexed by
 the backend session id while connected. Startup uses
-`sess::connect(pipe_path = ...)` against the proxy pipe; the `sess` package
-performs the normal attach handshake, which is forwarded to vscode-R. When a
-console terminal gains focus, R Console sends a lightweight
-`sess::notify_client("attach", ...)` refresh from the already-connected R
-session so vscode-R can make that session active; VS Code custom
+`sess::connect(endpoint = ...)` against the proxy endpoint; the `sess` package
+performs the normal versioned attach handshake, which is forwarded to vscode-R.
+The proxy records the stable sess `session_id`. When a console terminal gains
+focus, R Console calls vscode-R's public `session.activate(sessionId)` API
+instead of synthesizing another attach notification; VS Code custom
 pseudoterminals do not provide a real terminal process id for vscode-R's
 terminal-focus switcher.
+
+The console passes its endpoint directly and does not create discovery files.
+It clears inherited `SESS_DISCOVERY_FILE` values so a console cannot attach
+through another terminal's settings. After a window reload, it obtains a new
+endpoint and reconnects when the restored console reaches an empty main prompt.
+Detached consoles in the same window reuse their existing proxy connection.
 
 The backend launch environment includes:
 
@@ -526,7 +536,7 @@ The backend launch environment includes:
 Depending on the selected session integration, it also includes:
 
 - `R_CONSOLE_SESSION_BOOTSTRAP`
-- `SESS_PIPE`
+- `SESS_ENDPOINT`
 - `VSCODE_WATCHER_DIR`
 - `VSCODE_INIT_R`
 

@@ -689,3 +689,83 @@ fn decode_string(payload: &[u8], offset: usize) -> io::Result<(String, usize)> {
     };
     Ok((String::from_utf8_lossy(value_slice).into_owned(), end))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn frame(kind: u16, request_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&request_id.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn reads_consecutive_commands_with_utf8_and_request_ids() {
+        let mut bytes = frame(FRAME_SUBMIT, 0, "日本語".as_bytes());
+        bytes.extend(frame(FRAME_PARSE_STATUS_REQUEST, 42, b"x["));
+        bytes.extend(frame(FRAME_REPLY_INPUT, 0, b"yes"));
+        bytes.extend(frame(FRAME_INTERRUPT, 0, &[]));
+        bytes.extend(frame(FRAME_SHUTDOWN, 0, &[]));
+        let mut reader = Cursor::new(bytes);
+        assert!(
+            matches!(read_next_command(&mut reader).unwrap(), Some(IncomingCommand::Submit(code)) if code == "日本語")
+        );
+        assert!(
+            matches!(read_next_command(&mut reader).unwrap(), Some(IncomingCommand::ParseStatus { request_id: 42, code }) if code == "x[")
+        );
+        assert!(
+            matches!(read_next_command(&mut reader).unwrap(), Some(IncomingCommand::ReplyInput(text)) if text == "yes")
+        );
+        assert!(matches!(
+            read_next_command(&mut reader).unwrap(),
+            Some(IncomingCommand::Interrupt)
+        ));
+        assert!(matches!(
+            read_next_command(&mut reader).unwrap(),
+            Some(IncomingCommand::Shutdown)
+        ));
+        assert!(read_next_command(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_truncated_and_unknown_frames() {
+        let bytes = frame(FRAME_SUBMIT, 0, b"hello");
+        for length in 1..bytes.len() {
+            let error = read_next_command(&mut Cursor::new(&bytes[..length])).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+        let error = read_next_command(&mut Cursor::new(frame(65535, 0, &[]))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn clamps_width_and_decodes_cancelled_dialogs() {
+        for (input, expected) in [(0_u32, 1_u16), (80, 80), (u32::MAX, u16::MAX)] {
+            let command = read_next_command(&mut Cursor::new(frame(
+                FRAME_SET_WIDTH,
+                0,
+                &input.to_le_bytes(),
+            )))
+            .unwrap();
+            assert!(
+                matches!(command, Some(IncomingCommand::SetWidth { columns }) if columns == expected)
+            );
+        }
+        let command =
+            read_next_command(&mut Cursor::new(frame(FRAME_DIALOG_RESULT, 0, &[0, 0]))).unwrap();
+        assert!(matches!(
+            command,
+            Some(IncomingCommand::DialogResult(DialogResult::ChooseFile {
+                path: None
+            }))
+        ));
+        assert!(decode_dialog_result(&[2]).is_err());
+        assert!(decode_dialog_result(&[0, 1, 10, 0, 0, 0]).is_err());
+    }
+}

@@ -14,7 +14,6 @@ import {
 } from "./Terminal/rTerminal/runtime";
 import { disposeVscodeRIntegrationForRuntimeSession } from "./Runtime/VSCR";
 import {
-  discoverRBinaryPath,
   getPlatformRPathConfigEntry,
 } from "./Terminal/options";
 
@@ -150,7 +149,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   disposeStalePersistentTerminalViews();
   syncTerminalRecordsFromWindow();
   setRConsoleActiveContext(vscode.window.activeTerminal);
-  void ensureConfiguredRPath();
 }
 
 async function initializePersistentSessionRegistry(): Promise<void> {
@@ -910,22 +908,6 @@ function formatManagedSessionDetail(session: ManagedPersistentSession): string {
   return `cwd: ${cwd} | session: ${session.sessionId}`;
 }
 
-async function ensureConfiguredRPath(): Promise<void> {
-  const config = vscode.workspace.getConfiguration("r");
-  const configEntry = getPlatformRPathConfigEntry();
-  const configured = (config.get<string>(configEntry) || "").trim();
-  if (configured.length > 0) {
-    return;
-  }
-
-  const discovered = discoverRBinaryPath();
-  if (!discovered) {
-    return;
-  }
-
-  await config.update(configEntry, discovered, vscode.ConfigurationTarget.Global);
-}
-
 function warnIfBracketedPasteDisabled(force: boolean = false): void {
   if (!force && rTerminalToRecord.size === 0) {
     return;
@@ -1139,15 +1121,25 @@ function handleTerminalOpen(terminal: vscode.Terminal): void {
   setRConsoleActiveContext(vscode.window.activeTerminal);
 }
 
-function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {
+async function handleActiveTerminalChange(
+  terminal: vscode.Terminal | undefined
+): Promise<void> {
   if (terminal) {
     syncTerminalRecord(terminal);
   }
+  setRConsoleActiveContext(terminal);
+
+  if (terminal) {
+    await terminal.processId;
+  }
+  if (vscode.window.activeTerminal !== terminal) {
+    return;
+  }
+
   const activeRecord = terminal ? resolveRecordFromTerminal(terminal) : undefined;
   for (const record of rTerminalToRecord.values()) {
     record.rTerminal.setVscodeRSessionActive(record === activeRecord);
   }
-  setRConsoleActiveContext(terminal);
 }
 
 function resolveRecordFromTerminal(

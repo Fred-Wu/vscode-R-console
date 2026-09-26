@@ -38,6 +38,7 @@ export class SessProxy {
   private forwardedRequests = new Map<string, string>();
   private rSocketWaiters: Array<(socket: net.Socket | undefined) => void> = [];
   private workspaceData: WorkspaceData | undefined;
+  private sessionId: string | undefined;
   private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
 
   constructor(private readonly options: SessProxyOptions) {
@@ -90,6 +91,7 @@ export class SessProxy {
     this.rBuffer = "";
     this.upstreamBuffer = "";
     this.workspaceData = undefined;
+    this.sessionId = undefined;
 
     const server = this.server;
     this.server = undefined;
@@ -140,6 +142,10 @@ export class SessProxy {
     );
   }
 
+  getSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
   async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"
@@ -162,51 +168,69 @@ export class SessProxy {
   private attachRSocket(socket: net.Socket): void {
     this.rSocket?.destroy();
     this.upstreamSocket?.destroy();
+    this.resolvePendingRequests();
+    this.forwardedRequests.clear();
+    this.sessionId = undefined;
+    this.workspaceData = undefined;
     this.rSocket = socket;
-    this.upstreamSocket = net.createConnection({ path: this.options.upstreamPipePath });
+    const upstream = net.createConnection({ path: this.options.upstreamPipePath });
+    this.upstreamSocket = upstream;
+    socket.setEncoding("utf8");
+    upstream.setEncoding("utf8");
     this.rBuffer = "";
     this.upstreamBuffer = "";
     this.resolveRSocketWaiters(socket);
 
     socket.on("data", (chunk) => {
+      if (this.rSocket !== socket) {
+        return;
+      }
       this.rBuffer = this.forwardLines(
         this.rBuffer,
         chunk,
         (line) => this.handleRLine(line),
-        this.upstreamSocket
+        upstream
       );
     });
-    this.upstreamSocket.on("data", (chunk) => {
+    upstream.on("data", (chunk) => {
+      if (this.rSocket !== socket) {
+        return;
+      }
       this.upstreamBuffer = this.forwardLines(
         this.upstreamBuffer,
         chunk,
         (line) => this.handleUpstreamLine(line),
-        this.rSocket
+        socket
       );
     });
 
     const close = (): void => {
-      if (this.rSocket === socket) {
-        this.rSocket = undefined;
-        this.resolveRSocketWaiters(undefined);
+      if (this.rSocket !== socket) {
+        return;
       }
-      this.upstreamSocket?.destroy();
+      this.rSocket = undefined;
       this.upstreamSocket = undefined;
+      socket.destroy();
+      upstream.destroy();
+      this.sessionId = undefined;
+      this.workspaceData = undefined;
+      this.forwardedRequests.clear();
+      this.resolveRSocketWaiters(undefined);
       this.resolvePendingRequests();
     };
     socket.on("close", close);
     socket.on("error", close);
-    this.upstreamSocket.on("close", close);
-    this.upstreamSocket.on("error", close);
+    upstream.on("close", close);
+    upstream.on("error", close);
   }
 
   private forwardLines(
     buffer: string,
-    chunk: Buffer,
+    chunk: string | Buffer,
     handleLine: (line: string) => boolean,
     target: net.Socket | undefined
   ): string {
-    const combined = buffer + chunk.toString("utf8");
+    const combined = buffer + chunk.toString();
     const lines = combined.split("\n");
     const carry = lines.pop() ?? "";
     for (const rawLine of lines) {
@@ -247,8 +271,17 @@ export class SessProxy {
       return true;
     }
 
-    if (message.method === "attach" || message.method === "workspace_updated") {
-      setTimeout(() => void this.requestWorkspace(), 0);
+    if (message.method === "attach") {
+      const params = message.params;
+      if (params && typeof params === "object" && !Array.isArray(params)) {
+        const sessionId = (params as Record<string, unknown>).session_id;
+        if (typeof sessionId === "string" && sessionId.length > 0) {
+          this.sessionId = sessionId;
+        }
+      }
+      void this.requestWorkspace();
+    } else if (message.method === "workspace_updated") {
+      void this.requestWorkspace();
     }
     return true;
   }

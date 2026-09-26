@@ -164,6 +164,10 @@
     "REditorSupport.r"
   ],
   "scripts": {
+    "test": "node --test tests/unit/*.test.cjs",
+    "test:extension-host": "vscode-test",
+    "test:runtime": "node --test tests/runtime.test.cjs",
+    "test:package": "node --test tests/package.test.cjs",
     "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",
     "build:sidecar": "node scripts/build-sidecar.js",
     "stage:sidecar": "node scripts/stage-sidecar.js",
@@ -179,7 +183,9 @@
     "@types/vscode": "1.85.0",
     "@vscode/vsce": "^3.7.1",
     "esbuild": "^0.27.7",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/test-cli": "^0.0.12"
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0",
