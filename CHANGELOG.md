@@ -22,6 +22,7 @@ All notable changes to R Console will be documented in this file.
 ### Fixed
 
 - Reduced console language-server startup delays by giving each console an empty workspace, avoiding a scan of the open project before completion requests can be handled.
+- Function-argument suggestions now remember the package selected in the completion picker, while keeping the displayed and executed code unchanged. Manually typed calls follow R's package search order.
 
 ## [0.5.0] - 2026-09-04 - vscode-R 3.0 architecture compatibility introduced
 

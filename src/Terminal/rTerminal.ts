@@ -1606,6 +1606,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.historyBrowsing = false;
     this.historyCollapsed = true;
     this.rHistory.resetIndex();
+    this.lang.updateInput("");
 
     if (!sanitized) {
       this.showPrompt();
@@ -1624,6 +1625,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (entry === undefined) {
       return;
     }
+    this.lang.updateInput("");
     if (entry === null) {
       this.clearInputRender();
       this.historyBrowsing = false;
@@ -1666,6 +1668,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private applyCompletion(selection: CompletionPickItem): void {
+    const selectionStart = this.inputState.translateRowColToIndex(
+      this.inputState.cursorRow, selection.replaceStart
+    );
     const currentLine = this.inputState.currentLine;
     const before = currentLine.slice(0, selection.replaceStart);
     const after = currentLine.slice(this.inputState.cursorCol);
@@ -1677,6 +1682,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const cursorInsideEmptyCall = selection.insertText.endsWith("()") ? 1 : 0;
     const newCursorCol = before.length + selection.insertText.length - cursorInsideEmptyCall;
     this.inputState.text = lines.join("\n");
+    this.lang.recordCompletion(this.inputState.text, selectionStart, selection);
     this.inputState.cursorPosition = this.inputState.translateRowColToIndex(
       this.inputState.cursorRow,
       newCursorCol
@@ -2194,6 +2200,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private renderInput(): void {
+    this.lang.updateInput(this.inputState.text);
     this.withTerminalStateCaptureSuppressed(() => {
       renderViewInput({
         syntax: this.syntax,

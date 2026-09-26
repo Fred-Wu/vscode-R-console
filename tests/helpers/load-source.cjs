@@ -10,7 +10,7 @@ module.exports = function loadSource(source, mocks = {}, define = {}) {
     bundle: true,
     platform: "node",
     format: "cjs",
-    external: ["vscode"],
+    external: ["vscode", ...Object.keys(mocks)],
     write: false,
     define,
   });
