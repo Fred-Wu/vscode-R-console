@@ -19,7 +19,25 @@ test("vscode-R selects disabled, legacy, or sess integration by available capabi
   assert.equal(resolveVscodeRIntegrationOptions(true).kind, "legacy");
   extension.packageJSON.contributes = { commands: [{ command: "r.connectToSession" }] };
   assert.equal(resolveVscodeRIntegrationOptions(true).kind, "sess");
-  const env = { PATH: "keep", R_HOME: "keep", VSCODE_INIT_R: "old", SESS_PIPE: "old", SESS_TOKEN: "old", R_CONSOLE_SESSION_BOOTSTRAP: "old" };
+  const env = { PATH: "keep", R_HOME: "keep", VSCODE_INIT_R: "old", SESS_ENDPOINT: "old", SESS_DISCOVERY_FILE: "old", SESS_PIPE: "old", SESS_TOKEN: "old", R_CONSOLE_SESSION_BOOTSTRAP: "old" };
   sanitizeVscodeRIntegrationEnv(env);
   assert.deepEqual(env, { PATH: "keep", R_HOME: "keep" });
+});
+
+test("disabled and legacy integration remove inherited sess discovery settings", async () => {
+  const { DisabledVscodeRIntegration } = loadSource("src/Runtime/VSCR/disabled/integration.ts");
+  const { LegacyVscodeRIntegration } = loadSource("src/Runtime/VSCR/legacy/integration.ts", {
+    fs: { existsSync: () => true, mkdirSync: () => {} },
+  });
+  const host = { extensionPath: "/console", onSessionDataChanged: () => {} };
+  for (const integration of [
+    new DisabledVscodeRIntegration(host),
+    new LegacyVscodeRIntegration(host, { initPath: "/init.R", watcherDir: "/watcher" }),
+  ]) {
+    const env = { SESS_ENDPOINT: "old", SESS_DISCOVERY_FILE: "another-terminal", PATH: "keep" };
+    await integration.prepareStart(env);
+    assert.equal(env.SESS_ENDPOINT, undefined);
+    assert.equal(env.SESS_DISCOVERY_FILE, undefined);
+    assert.equal(env.PATH, "keep");
+  }
 });

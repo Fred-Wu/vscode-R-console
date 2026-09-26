@@ -1121,15 +1121,25 @@ function handleTerminalOpen(terminal: vscode.Terminal): void {
   setRConsoleActiveContext(vscode.window.activeTerminal);
 }
 
-function handleActiveTerminalChange(terminal: vscode.Terminal | undefined): void {
+async function handleActiveTerminalChange(
+  terminal: vscode.Terminal | undefined
+): Promise<void> {
   if (terminal) {
     syncTerminalRecord(terminal);
   }
+  setRConsoleActiveContext(terminal);
+
+  if (terminal) {
+    await terminal.processId;
+  }
+  if (vscode.window.activeTerminal !== terminal) {
+    return;
+  }
+
   const activeRecord = terminal ? resolveRecordFromTerminal(terminal) : undefined;
   for (const record of rTerminalToRecord.values()) {
     record.rTerminal.setVscodeRSessionActive(record === activeRecord);
   }
-  setRConsoleActiveContext(terminal);
 }
 
 function resolveRecordFromTerminal(

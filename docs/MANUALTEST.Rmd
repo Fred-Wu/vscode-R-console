@@ -58,7 +58,7 @@ Run:
 
 ```{r startup-and-prompt}
 sessionInfo()
-Sys.getenv(c("R_HOME", "R_PROFILE_USER", "SESS_PIPE", "VSC_R_SESSION_CWD"))
+Sys.getenv(c("R_HOME", "R_PROFILE_USER", "SESS_ENDPOINT", "VSC_R_SESSION_CWD"))
 getOption("prompt")
 getOption("continue") 
 getOption("menu.graphics")
@@ -816,6 +816,17 @@ Expected:
 
 - outputs and completions stay scoped to the correct console / session
 - watcher / LSP state from one console does not bleed into the other
+
+With vscode-R's public session API available, also check:
+
+1. Switch focus between A and B without running a command. The vscode-R
+   workspace viewer should show the objects belonging to the focused console.
+2. Detach and reattach a console through **Manage Persistent Sessions**.
+   Its objects and completion results should remain available.
+3. Reload the VS Code window, then focus each restored console at an empty
+   prompt. Check that its objects, completions, and plots still work.
+4. After reload, run `sess::connect()` with no arguments. It should reconnect
+   using the current `SESS_ENDPOINT` and keep the same R objects.
 
 ## Good Final Smoke Check
 

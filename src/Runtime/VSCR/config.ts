@@ -53,6 +53,8 @@ export function sanitizeVscodeRIntegrationEnv(env: NodeJS.ProcessEnv): void {
   delete env.VSCODE_WATCHER_DIR;
   delete env.R_CONSOLE_SESSION_MODE;
   delete env.R_CONSOLE_SESSION_BOOTSTRAP;
+  delete env.SESS_ENDPOINT;
+  delete env.SESS_DISCOVERY_FILE;
   delete env.SESS_PIPE;
   delete env.SESS_PORT;
   delete env.SESS_TOKEN;
