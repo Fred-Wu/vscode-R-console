@@ -6,7 +6,6 @@ const loadSource = require("../helpers/load-source.cjs");
 function resolver(platform) {
   const files = new Set();
   const settings = {};
-  const extension = { exports: {} };
   const folder = path.resolve("test workspace");
   const pathFolder =
     platform !== "win32" && process.platform === "win32"
@@ -15,7 +14,6 @@ function resolver(platform) {
   let registry = "";
   const api = loadSource("src/Terminal/options.ts", {
     vscode: {
-      extensions: { getExtension: () => extension },
       workspace: {
         getConfiguration: () => ({ get: (key) => settings[key] }),
         workspaceFolders: [{ uri: { fsPath: folder } }],
@@ -26,22 +24,18 @@ function resolver(platform) {
     fs: { existsSync: (file) => files.has(file) },
     child_process: { spawnSync: () => ({ stdout: registry }) },
   }, { "process.platform": JSON.stringify(platform), "process.env.PATH": JSON.stringify(pathFolder) });
-  return { ...api, files, settings, extension, folder, pathFolder, setRegistry: (value) => { registry = value; } };
+  return { ...api, files, settings, folder, pathFolder, setRegistry: (value) => { registry = value; } };
 }
 
 for (const platform of ["linux", "darwin", "win32"]) {
   test(`R resolution precedence and vscode-R rollback (${platform})`, () => {
     const r = resolver(platform);
-    const help = path.join(r.folder, "help-R");
     const configured = path.join(r.folder, "configured-R");
     const legacy = path.join(r.folder, "legacy-R");
     const onPath = path.join(r.pathFolder, platform === "win32" ? "R.exe" : "R");
-    [help, configured, legacy, onPath].forEach((file) => r.files.add(file));
-    r.extension.exports.helpPanel = { rPath: help };
+    [configured, legacy, onPath].forEach((file) => r.files.add(file));
     r.settings.executablePath = configured;
     r.settings[r.getPlatformRPathConfigEntry()] = legacy;
-    assert.equal(r.discoverRBinaryPath(), help);
-    r.extension.exports = {}; // Older/newer vscode-R without the help API.
     assert.equal(r.discoverRBinaryPath(), configured);
     delete r.settings.executablePath;
     assert.equal(r.discoverRBinaryPath(), legacy);

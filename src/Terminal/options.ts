@@ -24,22 +24,6 @@ type RStartupOptions = {
   noSiteFile: boolean;
 };
 
-type VscodeRApi = {
-  helpPanel?: {
-    rPath?: string;
-  };
-};
-
-function getVscodeRHelpPath(): string | undefined {
-  const extension = vscode.extensions.getExtension<VscodeRApi>("REditorSupport.r");
-  const rPath = extension?.exports?.helpPanel?.rPath;
-  if (typeof rPath !== "string" || !rPath.trim()) {
-    return undefined;
-  }
-  const resolved = rPath.trim();
-  return fs.existsSync(resolved) ? resolved : undefined;
-}
-
 function getRConfig(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration("r");
 }
@@ -133,7 +117,6 @@ function resolveConfiguredExecutablePath(
 
 export function discoverRBinaryPath(): string | undefined {
   return (
-    getVscodeRHelpPath() ??
     resolveConfiguredExecutablePath("executablePath", false) ??
     resolveConfiguredExecutablePath(getPlatformRPathConfigEntry(), false) ??
     findROnPath() ??
