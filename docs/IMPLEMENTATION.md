@@ -17,7 +17,7 @@ is used as a dependency.
 
 | Project | What is referenced or used | Where it appears here |
 | --- | --- | --- |
-| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings and the JSON-RPC session protocol used for attach metadata, workspace data, and member completion. | `src/Terminal/options.ts`, `src/Runtime/VSCR/`, `resources/r/VSCR/` |
+| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings, the vscode-R 3.x `sess` JSON-RPC 2.0 protocol, and deprecated pre-3.0 session-watcher compatibility. | `src/Terminal/options.ts`, `src/Runtime/VSCR/`, `resources/r/VSCR/` |
 | [`arf`](https://github.com/eitsupi/arf) | Reference for Rust embedded-R host structure, dynamic R loading, platform-specific R initialization, callback wiring, generic event/input-handler pumping, and interrupt state handling. | `sidecar/pty-host/src/host.rs` |
 | [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
 | [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
@@ -445,6 +445,10 @@ legacy, or `sess` implementation. Transport-specific state, startup, completion,
 activation, reconnect, output filtering, and disposal stay inside the selected
 implementation directory.
 
+Support for vscode-R versions earlier than 3.0 is deprecated and may be removed
+in a future R Console version. The legacy integration remains isolated so it can
+be removed without changing the terminal or runtime architecture.
+
 When legacy support is retired, its removal boundary is:
 
 1. delete `src/Runtime/VSCR/legacy/` and `resources/r/VSCR/legacy.R`
@@ -457,12 +461,10 @@ legacy-specific edit.
 
 ### 3.1 Startup Settings From `vscode-R`
 
-R executable selection first reuses vscode-R's resolved help/background R path
-(`helpPanel.rPath`) when it is available. If it is unavailable, R Console
-falls back to its own resolver in this order:
+R Console resolves the R executable in this order:
 
 1. `r.executablePath`
-2. legacy `r.rpath.windows`, `r.rpath.mac`, or `r.rpath.linux`
+2. deprecated `r.rpath.windows`, `r.rpath.mac`, or `r.rpath.linux`
 3. `R` on `PATH`
 4. the Windows R registry entry on Windows
 
@@ -488,13 +490,13 @@ The same selected R executable is used for:
 When `r.sessionWatcher` is enabled, startup chooses one vscode-R session
 integration:
 
-- `sess`: pipe-based architecture exposed by vscode-R's public session API.
-  `vscodeR/sess/integration.ts` calls `session.getConnectionInfo()` to obtain
+- `sess`: vscode-R 3.x architecture exposed by vscode-R's public session API.
+  `src/Runtime/VSCR/sess/integration.ts` calls `session.getConnectionInfo()` to obtain
   the protocol version, IPC endpoint, resolved plot backend, and optional JGD
   socket, starts a console-owned `SessProxy`, and contributes the proxy endpoint
   as `SESS_ENDPOINT` to the embedded R launch.
-- `legacy`: legacy file-based watcher architecture. `R Console` sources vscode-R's
-  `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
+- `legacy`: deprecated pre-3.0 file-based watcher architecture. `R Console`
+  sources vscode-R's `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
 
 In `sess` mode, vscode-R owns the IPC server and package installation/update
 policy. The `sess` R package may be bundled with vscode-R or installed as a
@@ -505,7 +507,7 @@ newline-delimited JSON. R Console does not target the obsolete
 WebSocket/port-token `sess` transport.
 
 The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
-the console-owned proxy pipe, and the proxy connects to vscode-R's real pipe.
+the console-owned proxy endpoint, and the proxy connects to vscode-R's endpoint.
 Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
 Console observes workspace responses and injects its own `workspace` and
 `completion` requests when the console needs session data. It uses only
@@ -593,11 +595,11 @@ expression. Console data-frame bracket completion uses the same runtime
 completion request with the data object expression, because vscode-R 3.0
 workspace summaries do not carry column/member names.
 
-For reconnect in `sess` mode, `R Console` writes the current `{ pipe }` to
-`~/.vscode-R/sessions/{PID}.json`. The R-side bridge can read that file after
-a window reload or terminal detach and reconnect to the replacement vscode-R IPC
-server. The console still persists and restores its own Rust backend session;
-the discovery file is only the metadata bridge.
+For reconnect in `sess` mode, R Console does not create a vscode-R discovery
+file. After a VS Code window reload, it obtains the current endpoint again through
+vscode-R's public session API and reconnects the restored console when it reaches
+an empty main prompt. Detached consoles in the same window reuse their existing
+proxy connection.
 
 ### 3.4 Metadata Consumers
 
@@ -639,9 +641,11 @@ fresh session data are available.
 
 Completion data comes from one shared flow:
 
-- runtime/global-environment symbols come from `SessionWatcher` workspace data
-- `$` and `@` member completion uses the session-server completion endpoint
-  when available
+- runtime/global-environment symbols come from the selected session integration's
+  cached workspace data
+- `$` and `@` member completion uses the selected session integration:
+  `sess` JSON-RPC for vscode-R 3.x or the deprecated legacy session server for
+  pre-3.0 vscode-R
 - data-aware bracket and pipe-placeholder contexts use cached session metadata
   and current input for the first suggestion pass
 - language-server symbols come from the console-owned `languageserver` process
