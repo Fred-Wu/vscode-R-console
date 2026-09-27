@@ -2,7 +2,7 @@
 
 All notable changes to R Console will be documented in this file.
 
-## Unreleased
+## [0.5.1] - 2026-09-27
 
 ### Recent changes
 
@@ -13,7 +13,8 @@ All notable changes to R Console will be documented in this file.
 - Persistent consoles reuse their connections when detached and reattached. After a window reload, they obtain a new connection and reconnect when focused at an empty main prompt, preserving the busy state of sessions that are still running.
 - The older session watcher and the new `sess` integration share common startup and session handling. Local connection sockets on macOS and Linux are accessible only to their owner.
 - Plots can open in R's normal graphics windows, such as Quartz on macOS, when vscode-R's Session Watcher is turned off.
-- R Console now follows vscode-R's selected R installation and supports `r.executablePath`, while retaining older `r.rpath.*` settings. It no longer writes detected paths to global settings or uses an existing `R_HOME` environment variable to select R.
+- R Console now uses `r.executablePath` for the selected R installation while retaining deprecated `r.rpath.*` settings as a fallback. It no longer writes detected paths to global settings or uses an existing `R_HOME` environment variable to select R.
+- R Console now uses `r.consoleArgs` for R startup arguments while retaining deprecated `r.rterm.option` as a fallback.
 
 ### Added
 
