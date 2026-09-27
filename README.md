@@ -91,7 +91,10 @@ R Console also contributes its own settings:
 
 ## Dependency Model
 
-- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary, session bootstrap, session watcher, and supported JSON-RPC session protocol.
+> [!NOTE]
+> Support for vscode-R versions earlier than 3.0 is deprecated and may be removed in a future R Console version.
+
+- [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary and the supported `sess` JSON-RPC 2.0 protocol for vscode-R 3.x, while retaining deprecated compatibility with the pre-3.0 session watcher.
 - R's `languageserver` package is optional at runtime but required for language-server completion.
 - The bundled `R_CONSOLE_HOST` sidecar is required at runtime. If the bundled binary for the current target is missing, the console does not fall back to a separate backend.
 

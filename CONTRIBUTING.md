@@ -2,13 +2,13 @@
 
 This document covers local development, build, packaging, and implementation notes for R Console contributors.
 
-Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), including the current vscode-R integration and R executable resolution.
 
 ## Requirements
 
 - VS Code 1.85.0 or later.
 - Node.js 24.x for the extension build and packaging scripts.
-- A local R installation. R Console first reuses vscode-R's resolved help/background R path when available; otherwise it resolves `r.executablePath`, legacy `r.rpath.*`, `PATH`, then the Windows registry on Windows.
+- A local R installation. R Console resolves `r.executablePath`, then deprecated `r.rpath.*`, then `PATH`, with the Windows registry as the final Windows fallback.
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). R Console declares `REditorSupport.r` in `extensionDependencies` and depends on [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session bootstrap/configuration.
 - The R package `languageserver` for language-server completion during local testing.
 - Rust/Cargo if you are building the sidecar binaries from source.

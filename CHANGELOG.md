@@ -7,23 +7,32 @@ All notable changes to R Console will be documented in this file.
 ### Recent changes
 
 - Added support for vscode-R 3.0's `sess` package, which connects R sessions to VS Code, while retaining the older session watcher for earlier vscode-R versions.
-- Aligned session connections with the latest vscode-R public APIs. R Console now obtains connection details directly from vscode-R and uses stable session IDs to select the focused console, replacing clipboard-based connection discovery and manually generated attach messages.
 - Each console has its own connection bridge to vscode-R, keeping workspace data and `$`, `@`, and data-frame bracket completions tied to the correct R session.
 - Added support for the `jgd` and `httpgd` plot viewers, following vscode-R's resolved plot settings.
 - Persistent consoles reuse their connections when detached and reattached. After a window reload, they obtain a new connection and reconnect when focused at an empty main prompt, preserving the busy state of sessions that are still running.
 - The older session watcher and the new `sess` integration share common startup and session handling. Local connection sockets on macOS and Linux are accessible only to their owner.
 - Plots can open in R's normal graphics windows, such as Quartz on macOS, when vscode-R's Session Watcher is turned off.
+
+### Changes in 0.5.1
+
+#### Added
+
+- Added cross-platform release checks on Linux, Windows, and macOS to improve release reliability.
+
+#### Changed
+
+- Aligned session connections with the latest vscode-R public APIs so the focused R Console is reliably matched to the correct vscode-R session.
 - R Console now uses `r.executablePath` for the selected R installation while retaining deprecated `r.rpath.*` settings as a fallback. It no longer writes detected paths to global settings or uses an existing `R_HOME` environment variable to select R.
 - R Console now uses `r.consoleArgs` for R startup arguments while retaining deprecated `r.rterm.option` as a fallback.
 
-### Added
+#### Fixed
 
-- Added automated checks on Linux, Windows, and macOS for TypeScript, Rust, real R sessions, VS Code activation and commands, and extension packaging. Release packaging now requires these checks to pass.
+- Reduced console language-server startup delays, especially for larger projects.
+- Function-argument suggestions now remember the package selected in the completion picker. Manually typed calls continue to follow R's package search order.
 
-### Fixed
+#### Deprecated
 
-- Reduced console language-server startup delays by giving each console an empty workspace, avoiding a scan of the open project before completion requests can be handled.
-- Function-argument suggestions now remember the package selected in the completion picker, while keeping the displayed and executed code unchanged. Manually typed calls follow R's package search order.
+- Support for vscode-R versions earlier than 3.0 is deprecated and may be removed in a future R Console version.
 
 ## [0.5.0] - 2026-09-04 - vscode-R 3.0 architecture compatibility introduced
 
