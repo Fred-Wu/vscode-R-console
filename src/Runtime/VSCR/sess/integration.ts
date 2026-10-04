@@ -33,7 +33,6 @@ type VscodeRSessionConnection = {
 };
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
-const SUPPORTED_SESS_PROTOCOL_VERSION = 1;
 const SESS_ASYNC_PROMPT_PATTERN = /(\r?\[sess\][^\r\n]*)(?:\r\n|\n){2}> ?/g;
 const SESS_RECONNECT_NOISE_PATTERN =
   /\r?\[sess\] Failed to connect to IPC (?:pipe|endpoint): [^\r\n]*(?:\r\n|\n)?/g;
@@ -70,11 +69,7 @@ async function discoverSessionConnection(): Promise<
 
   try {
     const info = await sessionApi.getConnectionInfo();
-    if (
-      !info ||
-      info.protocolVersion !== SUPPORTED_SESS_PROTOCOL_VERSION ||
-      !info.endpoint
-    ) {
+    if (!info || !info.endpoint) {
       return undefined;
     }
     return {
