@@ -9,6 +9,12 @@ import {
   type VscodeRIntegrationOptions,
 } from "../Runtime/VSCR";
 
+type VscodeRExtensionApi = {
+  getRExecutablePath(resource?: vscode.Uri): Promise<string | undefined>;
+};
+
+const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
+
 export type RTerminalOptions = {
   rPath: string;
   rArgs: string[];
@@ -508,14 +514,31 @@ function configureRRuntimeEnv(
   prependToPath(env, pathEntries);
 }
 
-function resolveRBinaryPath(): string | undefined {
-  const rPath = discoverRBinaryPath();
-  if (rPath) {
-    return rPath;
+async function resolveRBinaryPath(): Promise<string | undefined> {
+  const extension = vscode.extensions.getExtension<VscodeRExtensionApi>(
+    VSCODE_R_EXTENSION_ID
+  );
+  if (!extension) {
+    void vscode.window.showErrorMessage(
+      "Cannot resolve R executable path because vscode-R is unavailable."
+    );
+    return undefined;
+  }
+
+  try {
+    const api = extension.isActive ? extension.exports : await extension.activate();
+    const resource =
+      vscode.window.activeTextEditor?.document.uri ??
+      vscode.workspace.workspaceFolders?.[0]?.uri;
+    const rPath = await api?.getRExecutablePath?.(resource);
+    if (rPath) {
+      return rPath;
+    }
+  } catch {
   }
 
   void vscode.window.showErrorMessage(
-    `Cannot find R. Configure r.executablePath or r.${getPlatformRPathConfigEntry()}, or install R on PATH.`
+    "Cannot resolve R executable path from vscode-R."
   );
   return undefined;
 }
@@ -583,12 +606,12 @@ function buildRuntimeEnv(
   return env;
 }
 
-export function resolveRTerminalOptions(): RTerminalOptions | undefined {
+export async function resolveRTerminalOptions(): Promise<RTerminalOptions | undefined> {
   const config = getRConfig();
   const sessionWatcherConfigured = config.get<boolean>("sessionWatcher") !== false;
   const bracketedPaste = config.get<boolean>("bracketedPaste") !== false;
 
-  const rPath = resolveRBinaryPath();
+  const rPath = await resolveRBinaryPath();
   if (!rPath) {
     return undefined;
   }
