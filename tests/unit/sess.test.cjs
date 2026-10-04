@@ -11,7 +11,7 @@ const loadSource = require("../helpers/load-source.cjs");
 
 const workspace = { search: [".GlobalEnv"], loaded_namespaces: ["base"], globalenv: {} };
 const attach = { jsonrpc: "2.0", method: "attach", params: {
-  protocol_version: 1, session_id: "stable-r-session", host: "test-host",
+  protocol_version: 2, session_id: "stable-r-session", host: "test-host",
   sess_version: "0.1.0", pid: 123, tempdir: "/tmp/R", wd: "/workspace",
 } };
 const send = (socket, message) => socket.write(`${JSON.stringify(message)}\n`);
@@ -124,7 +124,7 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
   ]) {
     await t.test(plotBackend, async (t) => {
       const fixture = integrationFixture(t, {
-        protocolVersion: 1, endpoint: "upstream", plotBackend,
+        protocolVersion: 2, endpoint: "upstream", plotBackend,
         ...(jgd === "TRUE" ? { jgdSocket: "plot-socket" } : {}),
       });
       const integration = fixture.create();
@@ -148,8 +148,8 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
   }
 });
 
-test("sess launch safely declines unavailable APIs and incompatible protocol versions", async (t) => {
-  for (const info of [undefined, { protocolVersion: 2, endpoint: "bad" }, { protocolVersion: 1, endpoint: "" }]) {
+test("sess launch safely declines unavailable APIs and missing endpoints", async (t) => {
+  for (const info of [undefined, { protocolVersion: 2, endpoint: "" }]) {
     const fixture = integrationFixture(t, info);
     const env = { SESS_ENDPOINT: "inherited", SESS_DISCOVERY_FILE: "inherited", R_CONSOLE_SESSION_BOOTSTRAP: "old" };
     await fixture.create().prepareStart(env);
@@ -169,7 +169,7 @@ test("sess launch safely declines unavailable APIs and incompatible protocol ver
 
 test("focus before attach activates the stable identity and a detached UI reuses its live proxy", { timeout: 10000 }, async (t) => {
   const server = await upstream(t);
-  const fixture = integrationFixture(t, { protocolVersion: 1, endpoint: server.endpoint, plotBackend: "standard" });
+  const fixture = integrationFixture(t, { protocolVersion: 2, endpoint: server.endpoint, plotBackend: "standard" });
   const integration = fixture.create();
   const env = {};
   await integration.prepareStart(env);
@@ -196,7 +196,7 @@ test("focus before attach activates the stable identity and a detached UI reuses
 });
 
 test("reload reconnect waits for an empty main prompt and submits endpoint-based sess connect once", async (t) => {
-  const fixture = integrationFixture(t, { protocolVersion: 1, endpoint: "upstream", plotBackend: "jgd", jgdSocket: 'plot\\"socket' });
+  const fixture = integrationFixture(t, { protocolVersion: 2, endpoint: "upstream", plotBackend: "jgd", jgdSocket: 'plot\\"socket' });
   fixture.host.rProcess = { sessionId: randomUUID() };
   fixture.host.inputState.text = "unfinished";
   const integration = fixture.create();
@@ -220,7 +220,7 @@ test("reload reconnect waits for an empty main prompt and submits endpoint-based
 test("activation rejected before upstream attach completes retries on workspace data", { timeout: 10000 }, async (t) => {
   const server = await upstream(t);
   const activations = [];
-  const fixture = integrationFixture(t, { protocolVersion: 1, endpoint: server.endpoint, plotBackend: "standard" }, {
+  const fixture = integrationFixture(t, { protocolVersion: 2, endpoint: server.endpoint, plotBackend: "standard" }, {
     activate: async (id) => { activations.push(id); return activations.length > 1; },
   });
   const integration = fixture.create();
@@ -249,7 +249,7 @@ test("runtime exit cancels pending connection discovery", async (t) => {
   integration.setActive(true);
   await waitFor(() => resolve);
   integration.handleRuntimeExit();
-  resolve({ protocolVersion: 1, endpoint: "upstream", plotBackend: "standard" });
+  resolve({ protocolVersion: 2, endpoint: "upstream", plotBackend: "standard" });
   await delay(20);
   assert.equal(integration.proxy, undefined);
   assert.equal(integration.connection, undefined);
