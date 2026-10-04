@@ -444,7 +444,7 @@ async function createRTerminal(
 
   warnIfBracketedPasteDisabled(true);
 
-  const options = resolveRTerminalOptions();
+  const options = await resolveRTerminalOptions();
   if (!options) {
     return;
   }
@@ -743,7 +743,7 @@ async function attachPersistentSessions(
       continue;
     }
 
-    const currentOptions = resolveRTerminalOptions();
+    const currentOptions = await resolveRTerminalOptions();
     if (!currentOptions) {
       continue;
     }
