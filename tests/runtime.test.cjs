@@ -41,7 +41,12 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   };
   const { resolveRTerminalOptions } = loadSource("src/Terminal/options.ts", {
     vscode: {
-      extensions: { getExtension: () => undefined },
+      extensions: {
+        getExtension: () => ({
+          isActive: true,
+          exports: { getRExecutablePath: async () => rPath },
+        }),
+      },
       workspace: {
         getConfiguration: () => ({ get: (key) => settings[key] }),
         workspaceFolders: [{ uri: { fsPath: dir } }],
@@ -49,7 +54,7 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
       window: { showErrorMessage: (message) => { throw new Error(message); } },
     },
   });
-  const options = resolveRTerminalOptions();
+  const options = await resolveRTerminalOptions();
   assert.ok(options);
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const binary = getBundledRustSidecarPath(root);
