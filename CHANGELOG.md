@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Updated R Console compatibility to reflect upstream vscode-R API changes.
+
 ## [0.5.1] - 2026-09-27
 
 ### Recent changes
