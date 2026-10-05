@@ -361,10 +361,14 @@ export class RTermLang {
             nextContext.triggerCharacter = undefined;
           }
           const nextInputText = lines.join("\n");
-          const refinedSessionData =
-            (await this.options.requestWorkspaceData?.()) ??
-            getWorkspaceData() ??
-            cachedSessionData;
+          let refreshedRefinedSessionData: WorkspaceData | undefined;
+          const refinedWorkspaceDataRequest = this.shouldRequestWorkspaceData(nextContext)
+            ? this.options.requestWorkspaceData?.()
+            : undefined;
+          void refinedWorkspaceDataRequest?.then((data) => {
+            refreshedRefinedSessionData = data ?? getWorkspaceData();
+          }).catch(() => undefined);
+
           const nextNeedsLsp = needsLanguageServerCompletion(nextContext);
           const nextDocumentRequest = nextNeedsLsp
             ? this.getOrOpenCompletionDocument(nextInputText)
@@ -376,6 +380,8 @@ export class RTermLang {
           if (!this.isCurrentCompletionRequest(requestId)) {
             return;
           }
+          const refinedSessionData =
+            refreshedRefinedSessionData ?? getWorkspaceData() ?? cachedSessionData;
           const nextEntries = await collectCompletionEntries(
             nextContext,
             nextDocument,

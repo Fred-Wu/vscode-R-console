@@ -323,3 +323,102 @@ test("member and package completions do not refresh workspace data", async () =>
     });
   }
 });
+
+
+test("F7 refinement starts language-server completion before workspace refresh finishes", async () => {
+  let resolveWorkspace;
+  const workspaceRequest = new Promise((resolve) => {
+    resolveWorkspace = resolve;
+  });
+  let refinedCompletionStarted = false;
+  let changeValue;
+  let hide;
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const quickPick = {
+    items: [],
+    activeItems: [],
+    value: "",
+    onDidChangeValue: (listener) => {
+      changeValue = listener;
+    },
+    onDidAccept: () => {},
+    onDidHide: (listener) => {
+      hide = listener;
+    },
+    show: () => {},
+    hide: () => {
+      hide?.();
+    },
+    dispose: () => {},
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: TestPosition,
+      QuickPickItemKind: { Separator: -1 },
+      window: { createQuickPick: () => quickPick },
+    },
+    "../../Language/completion": {
+      getCompletionContext: (input, cursor) => input.length === 0
+        ? undefined
+        : {
+            kind: "default",
+            prefix: input.slice(0, cursor),
+            replaceStart: 0,
+            snapshotInput: input,
+            snapshotCursor: cursor,
+          },
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (context) => {
+        if (context.prefix === "f") {
+          refinedCompletionStarted = true;
+        }
+        return [];
+      },
+      getCompletionIdentityKey: () => "",
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: () => [],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: () => workspaceRequest,
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  const input = {
+    text: "",
+    currentLine: "",
+    cursorCol: 0,
+    cursorRow: 0,
+    lines: [""],
+    textBeforeCursor: "",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    force: true,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  changeValue("f");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(refinedCompletionStarted, true);
+
+  quickPick.hide();
+  await request;
+  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+});
