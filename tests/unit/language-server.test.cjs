@@ -19,3 +19,21 @@ test("session state sync updates attached packages without eager namespace loadi
   assert.match(handler, /workspace\$update_loaded_packages\(\)/);
   assert.doesNotMatch(handler, /loadedNamespaces|get_namespace|namespaces_to_load/);
 });
+
+
+test("console language server fingerprints cached and referenced packages without package versions", () => {
+  const script = fs.readFileSync(
+    path.join(__dirname, "../../resources/r/console-language-server.R"),
+    "utf8"
+  );
+
+  assert.match(script, /package_fingerprints <- new\.env\(parent = emptyenv\(\)\)/);
+  assert.match(script, /workspace\$startup_packages/);
+  assert.match(script, /workspace\$namespaces\$keys\(\)/);
+  assert.match(script, /normalize_character\(params\$packages\)/);
+  assert.match(script, /file\.info\(files\)/);
+  assert.match(script, /info\$mtime/);
+  assert.match(script, /info\$ctime/);
+  assert.match(script, /"rConsole\/checkPackageChanges"/);
+  assert.doesNotMatch(script, /packageVersion\(/);
+});

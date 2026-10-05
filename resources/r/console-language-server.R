@@ -70,6 +70,64 @@ console_text_document_did_close <- function(self, params) {
     languageserver:::text_document_did_close(self, params)
 }
 
+package_fingerprints <- new.env(parent = emptyenv())
+
+package_fingerprint <- function(pkgname) {
+    package_path <- find.package(pkgname, quiet = TRUE)
+    if (!length(package_path)) {
+        return("<missing>")
+    }
+
+    package_path <- normalizePath(package_path[[1L]], winslash = "/", mustWork = FALSE)
+    pkgbase <- basename(package_path)
+    files <- c(
+        package_path,
+        file.path(package_path, "DESCRIPTION"),
+        file.path(package_path, "NAMESPACE"),
+        file.path(package_path, "Meta", "package.rds"),
+        file.path(package_path, "R", paste0(pkgbase, ".rdb")),
+        file.path(package_path, "R", paste0(pkgbase, ".rdx")),
+        file.path(package_path, "help", paste0(pkgbase, ".rdb")),
+        file.path(package_path, "help", paste0(pkgbase, ".rdx")),
+        file.path(package_path, "libs"),
+        list.files(file.path(package_path, "libs"), full.names = TRUE)
+    )
+    files <- unique(files[file.exists(files)])
+    info <- file.info(files)
+
+    paste(
+        files,
+        info$size,
+        format(info$mtime, "%Y-%m-%dT%H:%M:%OS6", tz = "UTC"),
+        format(info$ctime, "%Y-%m-%dT%H:%M:%OS6", tz = "UTC"),
+        sep = ":",
+        collapse = "|"
+    )
+}
+
+check_package_changes <- function(workspace, packages = character()) {
+    changed <- character()
+    packages <- unique(c(
+        "languageserver",
+        normalize_character(packages),
+        workspace$startup_packages,
+        workspace$namespaces$keys()
+    ))
+
+    for (pkgname in packages) {
+        fingerprint <- package_fingerprint(pkgname)
+        if (exists(pkgname, envir = package_fingerprints, inherits = FALSE)) {
+            if (!identical(get(pkgname, envir = package_fingerprints, inherits = FALSE), fingerprint)) {
+                changed <- c(changed, pkgname)
+            }
+        } else {
+            assign(pkgname, fingerprint, envir = package_fingerprints)
+        }
+    }
+
+    changed
+}
+
 server <- languageserver:::LanguageServer$new(host, port)
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
@@ -80,6 +138,12 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     workspace$update_loaded_packages()
 
     self$deliver(languageserver:::Response$new(id, result = TRUE))
+}
+server$request_handlers[["rConsole/checkPackageChanges"]] <- function(self, id, params) {
+    workspace <- self$get_workspace(self$rootUri)
+    packages <- normalize_character(params$packages)
+    changed_packages <- check_package_changes(workspace, packages)
+    self$deliver(languageserver:::Response$new(id, result = changed_packages))
 }
 server$notification_handlers[["textDocument/didClose"]] <- console_text_document_did_close
 

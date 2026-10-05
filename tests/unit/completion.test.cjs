@@ -151,7 +151,12 @@ test("the LSP client sends qualified input and maps both completion range format
     },
     protocol2CodeConverter: { asCompletionResult: async (result) => result },
     sendNotification: async (method, params) => { if (method !== "close") synced.push(params); },
-    sendRequest: async (_method, params) => {
+    sendRequest: async (method, params) => {
+      if (method === "rConsole/checkPackageChanges") {
+        assert.deepEqual(params.packages, ["stats", "dplyr"]);
+        return [];
+      }
+      assert.equal(method, "completion");
       assert.equal(params.text, "stats::filter() + dplyr::filter(si)");
       assert.deepEqual(params.position, new Position(0, 34));
       const range = new Range(new Position(0, 32), new Position(0, 34));
@@ -176,6 +181,172 @@ test("the LSP client sends qualified input and maps both completion range format
   assert.equal(synced[1].text, "dplyr::filter() + dplyr::filter(si)");
   assert.ok(synced[1].version > synced[0].version);
   assert.equal(doc.getText(), input);
+});
+
+
+test("package change restarts the console language server before completion", async (t) => {
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  class TestVirtualRDocument {
+    project() {
+      return {
+        document: { getText: () => "foo::bar", version: 1 },
+        toServerPosition: (position) => position,
+        toConsolePosition: (position) => position,
+      };
+    }
+    update() {}
+    selectFunction() {}
+  }
+  const vscode = {
+    Position: TestPosition,
+    Range: class Range {},
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "./virtualRDocument": { VirtualRDocument: TestVirtualRDocument },
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({
+    consoleId: "package-refresh-test",
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+  });
+  t.after(() => client.dispose());
+
+  const firstClient = {
+    isRunning: () => true,
+    sendRequest: async (method, params) => {
+      assert.equal(method, "rConsole/checkPackageChanges");
+      assert.deepEqual(params.packages, ["foo"]);
+      return ["foo"];
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  const secondClient = {
+    isRunning: () => true,
+    code2ProtocolConverter: { asCompletionParams: () => ({}) },
+    protocol2CodeConverter: { asCompletionResult: async (result) => result },
+    sendRequest: async (method) => {
+      if (method === "rConsole/checkPackageChanges") {
+        return [];
+      }
+      assert.equal(method, "completion");
+      return [{ label: "new" }];
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  client.client = firstClient;
+  client.syncDocument = async () => {};
+  client.applySessionState = async () => {};
+
+  let stops = 0;
+  let starts = 0;
+  client.stop = async () => {
+    stops += 1;
+    client.client = undefined;
+    return true;
+  };
+  client.start = async () => {
+    starts += 1;
+    client.client = secondClient;
+    client.lastPackageCheckAt = 0;
+  };
+
+  const result = await client.provideCompletionItems(
+    { getText: () => "foo::bar" },
+    new TestPosition(0, 8)
+  );
+  assert.deepEqual(result, [{ label: "new" }]);
+  assert.equal(stops, 1);
+  assert.equal(starts, 1);
+});
+
+
+test("package change checks are throttled across rapid completions", async (t) => {
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  class TestVirtualRDocument {
+    project() {
+      return {
+        document: { getText: () => "foo::bar", version: 1 },
+        toServerPosition: (position) => position,
+        toConsolePosition: (position) => position,
+      };
+    }
+    update() {}
+    selectFunction() {}
+  }
+  const vscode = {
+    Position: TestPosition,
+    Range: class Range {},
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "./virtualRDocument": { VirtualRDocument: TestVirtualRDocument },
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({
+    consoleId: "package-refresh-throttle-test",
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+  });
+  t.after(() => client.dispose());
+  client.syncDocument = async () => {};
+  client.applySessionState = async () => {};
+
+  let checks = 0;
+  let completions = 0;
+  client.client = {
+    isRunning: () => true,
+    code2ProtocolConverter: { asCompletionParams: () => ({}) },
+    protocol2CodeConverter: { asCompletionResult: async (result) => result },
+    sendRequest: async (method) => {
+      if (method === "rConsole/checkPackageChanges") {
+        checks += 1;
+        return [];
+      }
+      completions += 1;
+      return [];
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  const doc = { getText: () => "foo::bar" };
+  await client.provideCompletionItems(doc, new TestPosition(0, 8));
+  await client.provideCompletionItems(doc, new TestPosition(0, 8));
+
+  assert.equal(checks, 1);
+  assert.equal(completions, 2);
 });
 
 

@@ -93,6 +93,9 @@ export class ConsoleLspClient implements CompletionProvider {
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
+  private packageCheckPromise: Promise<boolean> | undefined;
+  private packageRefreshPromise: Promise<void> | undefined;
+  private lastPackageCheckAt = 0;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -242,42 +245,52 @@ export class ConsoleLspClient implements CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string
   ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined> {
-    const client = await this.ensureClient();
-    if (!client) {
-      return undefined;
-    }
-    try {
-      const projection = this.inputDocument.project(doc.getText());
-      await this.syncDocument(client, projection.document);
-      await this.applySessionState(client);
-      const context: vscode.CompletionContext = triggerCharacter
-        ? {
-            triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
-            triggerCharacter,
-          }
-        : {
-            triggerKind: vscode.CompletionTriggerKind.Invoke,
-            triggerCharacter: undefined,
-          };
-      const params = client.code2ProtocolConverter.asCompletionParams(
-        projection.document, projection.toServerPosition(position), context
-      );
-      const result = await client.sendRequest(CompletionRequest.type, params);
-      const completions = await client.protocol2CodeConverter.asCompletionResult(result);
-      const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
-        projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
-      );
-      for (const item of Array.isArray(completions) ? completions : completions?.items ?? []) {
-        if (item.range) {
-          item.range = item.range instanceof vscode.Range
-            ? mapRange(item.range)
-            : { inserting: mapRange(item.range.inserting), replacing: mapRange(item.range.replacing) };
-        }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const client = await this.ensureClient();
+      if (!client) {
+        return undefined;
       }
-      return completions;
-    } catch {
-      return undefined;
+      try {
+        const projection = this.inputDocument.project(doc.getText());
+        await this.syncDocument(client, projection.document);
+        await this.applySessionState(client);
+        if (await this.packageChangesDetected(client, projection.document.getText())) {
+          if (attempt === 0) {
+            await this.restartForPackageChanges(client);
+            continue;
+          }
+          return undefined;
+        }
+        const context: vscode.CompletionContext = triggerCharacter
+          ? {
+              triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
+              triggerCharacter,
+            }
+          : {
+              triggerKind: vscode.CompletionTriggerKind.Invoke,
+              triggerCharacter: undefined,
+            };
+        const params = client.code2ProtocolConverter.asCompletionParams(
+          projection.document, projection.toServerPosition(position), context
+        );
+        const result = await client.sendRequest(CompletionRequest.type, params);
+        const completions = await client.protocol2CodeConverter.asCompletionResult(result);
+        const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
+          projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
+        );
+        for (const item of Array.isArray(completions) ? completions : completions?.items ?? []) {
+          if (item.range) {
+            item.range = item.range instanceof vscode.Range
+              ? mapRange(item.range)
+              : { inserting: mapRange(item.range.inserting), replacing: mapRange(item.range.replacing) };
+          }
+        }
+        return completions;
+      } catch {
+        return undefined;
+      }
     }
+    return undefined;
   }
 
   async prepareDocument(doc: vscode.TextDocument): Promise<void> {
@@ -367,6 +380,67 @@ export class ConsoleLspClient implements CompletionProvider {
     return state.attachedPackages.join("\u0000");
   }
 
+  private async packageChangesDetected(
+    client: ConsoleLanguageClient,
+    content: string
+  ): Promise<boolean> {
+    if (Date.now() - this.lastPackageCheckAt < 1000) {
+      return false;
+    }
+    if (this.packageCheckPromise) {
+      return await this.packageCheckPromise;
+    }
+
+    this.lastPackageCheckAt = Date.now();
+    const packages = [...content.matchAll(/\\b([A-Za-z][A-Za-z0-9._]*)::/g)]
+      .map((match) => match[1]);
+    let checkPromise: Promise<boolean>;
+    checkPromise = client.sendRequest<string[]>(
+      "rConsole/checkPackageChanges",
+      { packages }
+    )
+      .then((changedPackages) =>
+        this.client === client && changedPackages.length > 0
+      )
+      .catch(() => false)
+      .finally(() => {
+        if (this.packageCheckPromise === checkPromise) {
+          this.packageCheckPromise = undefined;
+        }
+      });
+    this.packageCheckPromise = checkPromise;
+    return await checkPromise;
+  }
+
+  private async restartForPackageChanges(client: ConsoleLanguageClient): Promise<void> {
+    if (this.packageRefreshPromise) {
+      await this.packageRefreshPromise;
+      return;
+    }
+    if (this.client !== client) {
+      return;
+    }
+
+    let refreshPromise: Promise<void>;
+    refreshPromise = (async () => {
+      if (this.client !== client) {
+        return;
+      }
+      if (!(await this.stop())) {
+        throw new Error("Cannot restart the console language server after a package change.");
+      }
+      if (!this.disposed) {
+        await this.start();
+      }
+    })().finally(() => {
+      if (this.packageRefreshPromise === refreshPromise) {
+        this.packageRefreshPromise = undefined;
+      }
+    });
+    this.packageRefreshPromise = refreshPromise;
+    await refreshPromise;
+  }
+
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
     if (this.disposed) {
       return undefined;
@@ -435,6 +509,8 @@ export class ConsoleLspClient implements CompletionProvider {
     this.client = client;
     this.syncedSessionStateKey = undefined;
     this.sessionStateSyncPromise = undefined;
+    this.packageCheckPromise = undefined;
+    this.lastPackageCheckAt = 0;
     await client.start();
     await this.disableConsoleDiagnostics(client);
   }
