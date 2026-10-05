@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  type CompletionEntries,
   type CompletionEntry,
   type CompletionProvider,
   type RuntimeMemberCompletionRequester,
@@ -275,7 +276,7 @@ export class RTermLang {
         }
       };
       const showCompletionQuickPick = async (
-        initialEntries: CompletionEntry[],
+        initialEntries: CompletionEntries,
         delayedEntries?: typeof fullEntriesPromise
       ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
         const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
@@ -283,7 +284,9 @@ export class RTermLang {
         let request = 0;
         let blankContextRefined = false;
         let baselineEntries = initialEntries;
+        let baselineIncomplete = initialEntries.isIncomplete === true;
         let sourceEntries = initialEntries;
+        let sourceIncomplete = baselineIncomplete;
         Object.assign(pick, {
           matchOnDescription: false,
           matchOnDetail: false,
@@ -299,7 +302,9 @@ export class RTermLang {
             return;
           }
           baselineEntries = nextEntries;
+          baselineIncomplete = nextEntries.isIncomplete === true;
           sourceEntries = nextEntries;
+          sourceIncomplete = baselineIncomplete;
           setQuickPickItems(pick, sourceEntries, pick.value);
         }).catch(() => undefined);
         pick.onDidChangeValue((value) => void (async () => {
@@ -316,10 +321,23 @@ export class RTermLang {
             return;
           }
 
+          if (context.kind === "package" && value.length === 0) {
+            request += 1;
+            sourceEntries = baselineEntries;
+            sourceIncomplete = baselineIncomplete;
+            setQuickPickItems(pick, sourceEntries, value);
+            return;
+          }
+
           const refinesEmptyContext =
             value.length > 0 &&
             refinesBlankContext;
           setQuickPickItems(pick, sourceEntries, value);
+          if (context.kind === "package" && value.length > 0 && sourceIncomplete) {
+            const currentRequest = ++request;
+            await requestRefinedEntries(value, currentRequest);
+            return;
+          }
           if (refinesEmptyContext) {
             if (blankContextRefined) {
               return;
@@ -396,6 +414,7 @@ export class RTermLang {
             sourceEntries = context.kind === "package"
               ? nextEntries
               : mergeCompletionEntries(baselineEntries, nextEntries);
+            sourceIncomplete = nextEntries.isIncomplete === true;
             setQuickPickItems(pick, sourceEntries, pick.value);
           }
         };

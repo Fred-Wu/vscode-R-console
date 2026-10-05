@@ -681,3 +681,141 @@ test("namespace-only session changes do not resync the language server", () => {
     attachedPackages: ["dplyr", "stats", "base"],
   });
 });
+
+
+test("completion entries preserve incomplete language-server results", async () => {
+  const context = completion.getCompletionContext("stats::", 7);
+  const entries = await completion.collectCompletionEntries(
+    context,
+    { getText: () => "stats::" },
+    { line: 0, character: 7 },
+    undefined,
+    [],
+    [],
+    {
+      provideCompletionItems: async () => ({
+        isIncomplete: true,
+        items: [{
+          label: "filter",
+          insertText: "filter",
+          kind: 2,
+          detail: "{stats}",
+        }],
+      }),
+    }
+  );
+
+  assert.equal(entries.isIncomplete, true);
+  assert.ok(entries.some((entry) => entry.label === "filter"));
+});
+
+test("incomplete package completion re-queries until a complete result arrives", async () => {
+  let completionCalls = 0;
+  let changeValue;
+  let hide;
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const quickPick = {
+    items: [],
+    activeItems: [],
+    value: "",
+    onDidChangeValue: (listener) => {
+      changeValue = listener;
+    },
+    onDidAccept: () => {},
+    onDidHide: (listener) => {
+      hide = listener;
+    },
+    show: () => {},
+    hide: () => {
+      hide?.();
+    },
+    dispose: () => {},
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: TestPosition,
+      QuickPickItemKind: { Separator: -1 },
+      window: { createQuickPick: () => quickPick },
+    },
+    "../../Language/completion": {
+      getCompletionContext: () => ({
+        kind: "package",
+        prefix: "",
+        replaceStart: 7,
+        triggerCharacter: ":",
+        snapshotInput: "stats::",
+        snapshotCursor: 7,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (context) => {
+        completionCalls += 1;
+        const entries = [{
+          label: context.prefix ? "filter" : "median",
+          insertText: context.prefix ? "filter" : "median",
+          source: "lsp",
+        }];
+        if (!context.prefix) {
+          entries.isIncomplete = true;
+        }
+        return entries;
+      },
+      getCompletionIdentityKey: (entry) => entry.label,
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: (entries) => entries,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: async () => {
+      throw new Error("workspace request should not run");
+    },
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  const input = {
+    text: "stats::",
+    currentLine: "stats::",
+    cursorCol: 7,
+    cursorRow: 0,
+    lines: ["stats::"],
+    textBeforeCursor: "stats::",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 1);
+
+  changeValue("f");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 2);
+
+  for (const value of ["fi", "fil", "filt"]) {
+    changeValue(value);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 2);
+
+  changeValue("");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 2);
+
+  quickPick.hide();
+  await request;
+});
