@@ -124,7 +124,7 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
   ]) {
     await t.test(plotBackend, async (t) => {
       const fixture = integrationFixture(t, {
-        protocolVersion: 1, endpoint: "upstream", plotBackend,
+        protocolVersion: 999, endpoint: "upstream", plotBackend,
         ...(jgd === "TRUE" ? { jgdSocket: "plot-socket" } : {}),
       });
       const integration = fixture.create();
@@ -148,8 +148,8 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
   }
 });
 
-test("sess launch safely declines unavailable APIs and incompatible protocol versions", async (t) => {
-  for (const info of [undefined, { protocolVersion: 2, endpoint: "bad" }, { protocolVersion: 1, endpoint: "" }]) {
+test("sess launch safely declines unavailable APIs and missing endpoints", async (t) => {
+  for (const info of [undefined, { protocolVersion: 999, endpoint: "" }]) {
     const fixture = integrationFixture(t, info);
     const env = { SESS_ENDPOINT: "inherited", SESS_DISCOVERY_FILE: "inherited", R_CONSOLE_SESSION_BOOTSTRAP: "old" };
     await fixture.create().prepareStart(env);
