@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [0.5.2] - 2026-10-05
+
+### Changed
+
+- Improved console language-server performance and responsiveness.
+
 ## [0.5.1] - 2026-09-27
 
 ### Recent changes
