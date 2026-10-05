@@ -633,6 +633,105 @@ test("session state sync deduplicates concurrent requests and applies newer stat
 });
 
 
+test("failed session state sync still applies a newer pending state", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({ consoleId: "session-sync-failure-test", env: {} });
+  t.after(() => client.dispose());
+
+  const requests = [];
+  const pending = [];
+  client.client = {
+    isRunning: () => true,
+    sendRequest: (method, params) => {
+      assert.equal(method, "rConsole/syncSessionState");
+      requests.push(params);
+      return new Promise((resolve, reject) => {
+        pending.push({ resolve, reject });
+      });
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  const firstState = {
+    attachedPackages: ["stats"],
+  };
+  const nextState = {
+    attachedPackages: ["dplyr", "stats"],
+  };
+
+  const first = client.syncSessionState(firstState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+
+  const newer = client.syncSessionState(nextState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+
+  pending.shift().reject(new Error("sync failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], nextState);
+
+  pending.shift().resolve(true);
+  await Promise.all([first, newer]);
+
+  await client.syncSessionState(nextState);
+  assert.equal(requests.length, 2);
+});
+
+
+test("failed session state sync does not immediately retry the same state", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({ consoleId: "session-sync-same-failure-test", env: {} });
+  t.after(() => client.dispose());
+
+  let requests = 0;
+  client.client = {
+    isRunning: () => true,
+    sendRequest: async () => {
+      requests += 1;
+      throw new Error("sync failed");
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  await client.syncSessionState({
+    attachedPackages: ["stats"],
+  });
+  assert.equal(requests, 1);
+});
+
+
 test("namespace-only session changes do not resync the language server", () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {},

@@ -47,6 +47,11 @@ type ConsoleLspSessionState = {
   attachedPackages: string[];
 };
 
+type SessionStateSyncResult = {
+  synced: boolean;
+  stateKey: string;
+};
+
 class SilentOutputChannel implements vscode.OutputChannel {
   constructor(public readonly name: string) {}
 
@@ -87,7 +92,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private documentSyncPromise: Promise<void> = Promise.resolve();
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
-  private sessionStateSyncPromise: Promise<boolean> | undefined;
+  private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -314,26 +319,30 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     if (this.sessionStateSyncPromise) {
-      const synced = await this.sessionStateSyncPromise;
-      if (!synced || !this.sessionState || this.client !== client) {
+      const result = await this.sessionStateSyncPromise;
+      if (!this.sessionState || this.client !== client) {
         return;
       }
-      if (this.syncedSessionStateKey !== this.getSessionStateKey(this.sessionState)) {
+      const currentStateKey = this.getSessionStateKey(this.sessionState);
+      if (
+        this.syncedSessionStateKey !== currentStateKey &&
+        (result.synced || result.stateKey !== currentStateKey)
+      ) {
         await this.applySessionState(client);
       }
       return;
     }
 
-    let syncPromise: Promise<boolean>;
+    let syncPromise: Promise<SessionStateSyncResult>;
     syncPromise = client.sendRequest("rConsole/syncSessionState", state)
       .then(() => {
-        if (this.client !== client) {
-          return false;
+        const synced = this.client === client;
+        if (synced) {
+          this.syncedSessionStateKey = stateKey;
         }
-        this.syncedSessionStateKey = stateKey;
-        return true;
+        return { synced, stateKey };
       })
-      .catch(() => false)
+      .catch(() => ({ synced: false, stateKey }))
       .finally(() => {
         if (this.sessionStateSyncPromise === syncPromise) {
           this.sessionStateSyncPromise = undefined;
@@ -341,11 +350,15 @@ export class ConsoleLspClient implements CompletionProvider {
       });
     this.sessionStateSyncPromise = syncPromise;
 
-    const synced = await syncPromise;
-    if (!synced || !this.sessionState || this.client !== client) {
+    const result = await syncPromise;
+    if (!this.sessionState || this.client !== client) {
       return;
     }
-    if (this.syncedSessionStateKey !== this.getSessionStateKey(this.sessionState)) {
+    const currentStateKey = this.getSessionStateKey(this.sessionState);
+    if (
+      this.syncedSessionStateKey !== currentStateKey &&
+      (result.synced || result.stateKey !== currentStateKey)
+    ) {
       await this.applySessionState(client);
     }
   }
