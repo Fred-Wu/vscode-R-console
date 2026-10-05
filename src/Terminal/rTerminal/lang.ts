@@ -124,22 +124,19 @@ export class RTermLang {
         context.kind === "bracket" && !!context.dataObjectName
       );
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
+      let refreshedSessionData: WorkspaceData | undefined;
+      void workspaceDataRequest?.then((data) => {
+        refreshedSessionData = data ?? getWorkspaceData();
+      }).catch(() => undefined);
+
       let completionProvider: CompletionProvider | undefined;
+      const completionProviderRequest = needsLsp
+        ? this.ensureConsoleLspStarted()
+        : Promise.resolve(undefined);
+      const documentRequest = needsLsp
+        ? this.getOrOpenCompletionDocument(latestInput.text)
+        : Promise.resolve(undefined);
       const fullEntriesPromise = (async () => {
-        const sessionData = shouldRequestWorkspaceData
-          ? (await workspaceDataRequest) ?? getWorkspaceData() ?? cachedSessionData
-          : cachedSessionData;
-        if (!this.isCurrentCompletionRequest(requestId)) {
-          return undefined;
-        }
-
-        const completionProviderRequest = needsLsp
-          ? this.ensureConsoleLspStarted()
-          : Promise.resolve(undefined);
-        const documentRequest = needsLsp
-          ? this.getOrOpenCompletionDocument(latestInput.text)
-          : Promise.resolve(undefined);
-
         completionProvider = await completionProviderRequest;
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
@@ -154,6 +151,8 @@ export class RTermLang {
           context.snapshotCursor
         );
         const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
+        const sessionData =
+          refreshedSessionData ?? getWorkspaceData() ?? cachedSessionData;
         return await collectCompletionEntries(
           context,
           document,

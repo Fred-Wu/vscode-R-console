@@ -177,3 +177,84 @@ test("the LSP client sends qualified input and maps both completion range format
   assert.ok(synced[1].version > synced[0].version);
   assert.equal(doc.getText(), input);
 });
+
+
+test("language-server completion starts before a fresh workspace request finishes", async () => {
+  let resolveWorkspace;
+  let lspCompletionStarted = false;
+  const workspaceRequest = new Promise((resolve) => {
+    resolveWorkspace = resolve;
+  });
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position: TestPosition },
+    "../../Language/completion": {
+      getCompletionContext: (input, cursor) => ({
+        kind: "default",
+        prefix: input.slice(0, cursor),
+        replaceStart: 0,
+        snapshotInput: input,
+        snapshotCursor: cursor,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (
+        _context,
+        _document,
+        _position,
+        _sessionData,
+        _linesBefore,
+        _recentEntries,
+        completionProvider
+      ) => {
+        if (completionProvider) {
+          await completionProvider.provideCompletionItems();
+        }
+        return [];
+      },
+      getCompletionIdentityKey: () => "",
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: () => [],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: () => workspaceRequest,
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => {
+      lspCompletionStarted = true;
+      return [];
+    },
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+  const input = {
+    text: "mea",
+    currentLine: "mea",
+    cursorCol: 3,
+    cursorRow: 0,
+    lines: ["mea"],
+    textBeforeCursor: "mea",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    refreshWorkspaceData: () => {},
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lspCompletionStarted, true);
+  await request;
+
+  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+});
