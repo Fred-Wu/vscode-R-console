@@ -521,3 +521,48 @@ test("package completion filters locally without repeated language-server reques
   quickPick.hide();
   await request;
 });
+
+
+test("runtime column completion starts while language-server completion is pending", async () => {
+  let resolveLsp;
+  const lspResult = new Promise((resolve) => {
+    resolveLsp = resolve;
+  });
+  let runtimeStarted = false;
+  const context = {
+    kind: "argument",
+    prefix: "",
+    replaceStart: 7,
+    functionName: "filter",
+    dataObjectName: "df",
+    snapshotInput: "filter(",
+    snapshotCursor: 7,
+  };
+  const workspace = {
+    search: [],
+    loaded_namespaces: [],
+    globalenv: { df: { names: [] } },
+  };
+  const request = completion.collectCompletionEntries(
+    context,
+    { getText: () => "filter(" },
+    { line: 0, character: 7 },
+    workspace,
+    [],
+    [],
+    { provideCompletionItems: () => lspResult },
+    async (expression, operator) => {
+      assert.equal(expression, "df");
+      assert.equal(operator, "$");
+      runtimeStarted = true;
+      return [{ name: "alpha" }];
+    }
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtimeStarted, true);
+
+  resolveLsp([]);
+  const entries = await request;
+  assert.ok(entries.some((entry) => entry.label === "alpha"));
+});

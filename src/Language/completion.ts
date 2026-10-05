@@ -375,22 +375,40 @@ export async function collectCompletionEntries(
   consoleInputText?: string
 ): Promise<CompletionEntry[]> {
   const sessionItems = getSessionCompletions(context, sessionData);
-  const runtimeMemberItems =
+  const runtimeMemberItemsRequest =
     context.kind === "member"
-      ? await getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
-      : [];
+      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
+      : Promise.resolve([]);
   const includeLspItems =
     needsLanguageServerCompletion(context) && !!doc && !!position;
-  const rawLspItems =
+  const rawLspItemsRequest =
     !includeLspItems
-      ? []
-      : await getLanguageServerCompletions(
+      ? Promise.resolve([])
+      : getLanguageServerCompletions(
           context,
           doc,
           position,
           multilineBuffer,
           completionProvider
         );
+  const bufferItems = getConsoleBufferCompletions(
+    context,
+    consoleInputText ?? doc?.getText() ?? "",
+    recentConsoleEntries
+  );
+  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
+  const columnItemsRequest =
+    cachedColumnItems.length > 0
+      ? Promise.resolve(cachedColumnItems)
+      : getRuntimeDataColumnCompletions(
+          context,
+          requestRuntimeMemberCompletions
+        );
+  const [runtimeMemberItems, rawLspItems, columnItems] = await Promise.all([
+    runtimeMemberItemsRequest,
+    rawLspItemsRequest,
+    columnItemsRequest,
+  ]);
   const lspItems =
     isGlobalSymbolContext(context)
       ? filterShadowedWorkspaceEntries(
@@ -399,19 +417,6 @@ export async function collectCompletionEntries(
           context.kind === "argument" ? isArgumentCompletionEntry : undefined
         )
       : rawLspItems;
-  const bufferItems = getConsoleBufferCompletions(
-    context,
-    consoleInputText ?? doc?.getText() ?? "",
-    recentConsoleEntries
-  );
-  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
-  const columnItems =
-    cachedColumnItems.length > 0
-      ? cachedColumnItems
-      : await getRuntimeDataColumnCompletions(
-          context,
-          requestRuntimeMemberCompletions
-        );
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
