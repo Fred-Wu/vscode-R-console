@@ -330,11 +330,6 @@ export class RTermLang {
             await requestRefinedEntries(value[0], currentRequest);
             return;
           }
-          if (context.kind !== "package") {
-            return;
-          }
-          const currentRequest = ++request;
-          await requestRefinedEntries(value, currentRequest);
         })().catch(() => undefined));
         const requestRefinedEntries = async (
           value: string,

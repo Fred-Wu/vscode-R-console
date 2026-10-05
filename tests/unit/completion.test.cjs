@@ -422,3 +422,102 @@ test("F7 refinement starts language-server completion before workspace refresh f
   await request;
   resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
 });
+
+
+test("package completion filters locally without repeated language-server requests", async () => {
+  let completionCalls = 0;
+  let changeValue;
+  let hide;
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const quickPick = {
+    items: [],
+    activeItems: [],
+    value: "",
+    onDidChangeValue: (listener) => {
+      changeValue = listener;
+    },
+    onDidAccept: () => {},
+    onDidHide: (listener) => {
+      hide = listener;
+    },
+    show: () => {},
+    hide: () => {
+      hide?.();
+    },
+    dispose: () => {},
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: TestPosition,
+      QuickPickItemKind: { Separator: -1 },
+      window: { createQuickPick: () => quickPick },
+    },
+    "../../Language/completion": {
+      getCompletionContext: () => ({
+        kind: "package",
+        prefix: "",
+        replaceStart: 7,
+        triggerCharacter: ":",
+        snapshotInput: "stats::",
+        snapshotCursor: 7,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async () => {
+        completionCalls += 1;
+        return [{
+          label: "filter",
+          insertText: "filter",
+          source: "lsp",
+        }];
+      },
+      getCompletionIdentityKey: (entry) => entry.label,
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: (entries) => entries,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: async () => {
+      throw new Error("workspace request should not run");
+    },
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  const input = {
+    text: "stats::",
+    currentLine: "stats::",
+    cursorCol: 7,
+    cursorRow: 0,
+    lines: ["stats::"],
+    textBeforeCursor: "stats::",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 1);
+  for (const value of ["f", "fi", "fil", "filt"]) {
+    changeValue(value);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 1);
+
+  quickPick.hide();
+  await request;
+});
