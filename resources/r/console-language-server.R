@@ -73,17 +73,11 @@ console_text_document_did_close <- function(self, params) {
 server <- languageserver:::LanguageServer$new(host, port)
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
-    loaded_namespaces <- normalize_character(params$loadedNamespaces)
     workspace <- self$get_workspace(self$rootUri)
 
     # languageserver resolves package conflicts from the end of this list.
     workspace$startup_packages <- rev(attached_packages)
     workspace$update_loaded_packages()
-
-    namespaces_to_load <- unique(c(attached_packages, loaded_namespaces))
-    for (pkg in namespaces_to_load) {
-        try(workspace$get_namespace(pkg), silent = TRUE)
-    }
 
     self$deliver(languageserver:::Response$new(id, result = TRUE))
 }
