@@ -392,7 +392,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.lastPackageCheckAt = Date.now();
-    const packages = [...content.matchAll(/\\b([A-Za-z][A-Za-z0-9._]*)::/g)]
+    const packages = [...content.matchAll(/\b([A-Za-z][A-Za-z0-9._]*)::/g)]
       .map((match) => match[1]);
     let checkPromise: Promise<boolean>;
     checkPromise = client.sendRequest<string[]>(

@@ -110,7 +110,6 @@ check_package_changes <- function(workspace, packages = character()) {
     packages <- unique(c(
         "languageserver",
         normalize_character(packages),
-        workspace$startup_packages,
         workspace$namespaces$keys()
     ))
 
