@@ -566,3 +566,70 @@ test("runtime column completion starts while language-server completion is pendi
   const entries = await request;
   assert.ok(entries.some((entry) => entry.label === "alpha"));
 });
+
+
+test("session state sync deduplicates concurrent requests and applies newer state once", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({ consoleId: "session-sync-test", env: {} });
+  t.after(() => client.dispose());
+
+  const requests = [];
+  const resolvers = [];
+  client.client = {
+    isRunning: () => true,
+    sendRequest: (method, params) => {
+      assert.equal(method, "rConsole/syncSessionState");
+      requests.push(params);
+      return new Promise((resolve) => {
+        resolvers.push(resolve);
+      });
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  const firstState = {
+    attachedPackages: ["package:stats"],
+    loadedNamespaces: ["base", "stats"],
+  };
+  const nextState = {
+    attachedPackages: ["package:dplyr", "package:stats"],
+    loadedNamespaces: ["base", "stats", "dplyr"],
+  };
+
+  const first = client.syncSessionState(firstState);
+  const duplicate = client.syncSessionState(firstState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0], firstState);
+
+  const newer = client.syncSessionState(nextState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+
+  resolvers.shift()(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], nextState);
+
+  resolvers.shift()(true);
+  await Promise.all([first, duplicate, newer]);
+  assert.equal(requests.length, 2);
+
+  await client.syncSessionState(nextState);
+  assert.equal(requests.length, 2);
+});

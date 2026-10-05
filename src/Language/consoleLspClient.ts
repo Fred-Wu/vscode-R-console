@@ -88,6 +88,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private documentSyncPromise: Promise<void> = Promise.resolve();
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
+  private sessionStateSyncPromise: Promise<boolean> | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -122,6 +123,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         this.syncedDocuments.clear();
         this.syncedSessionStateKey = undefined;
+        this.sessionStateSyncPromise = undefined;
       }
       if (this.disposed) {
         throw new Error("Cannot start a disposed console language server.");
@@ -176,6 +178,7 @@ export class ConsoleLspClient implements CompletionProvider {
       }
       this.syncedDocuments.clear();
       this.syncedSessionStateKey = undefined;
+      this.sessionStateSyncPromise = undefined;
       return true;
     }
 
@@ -202,6 +205,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return false;
     }
     this.syncedSessionStateKey = undefined;
+    this.sessionStateSyncPromise = undefined;
     return true;
   }
 
@@ -304,15 +308,46 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!this.sessionState) {
       return;
     }
-    const stateKey = this.getSessionStateKey(this.sessionState);
+    const state = this.sessionState;
+    const stateKey = this.getSessionStateKey(state);
     if (this.syncedSessionStateKey === stateKey) {
       return;
     }
 
-    try {
-      await client.sendRequest("rConsole/syncSessionState", this.sessionState);
-      this.syncedSessionStateKey = stateKey;
-    } catch {
+    if (this.sessionStateSyncPromise) {
+      const synced = await this.sessionStateSyncPromise;
+      if (!synced || !this.sessionState || this.client !== client) {
+        return;
+      }
+      if (this.syncedSessionStateKey !== this.getSessionStateKey(this.sessionState)) {
+        await this.applySessionState(client);
+      }
+      return;
+    }
+
+    let syncPromise: Promise<boolean>;
+    syncPromise = client.sendRequest("rConsole/syncSessionState", state)
+      .then(() => {
+        if (this.client !== client) {
+          return false;
+        }
+        this.syncedSessionStateKey = stateKey;
+        return true;
+      })
+      .catch(() => false)
+      .finally(() => {
+        if (this.sessionStateSyncPromise === syncPromise) {
+          this.sessionStateSyncPromise = undefined;
+        }
+      });
+    this.sessionStateSyncPromise = syncPromise;
+
+    const synced = await syncPromise;
+    if (!synced || !this.sessionState || this.client !== client) {
+      return;
+    }
+    if (this.syncedSessionStateKey !== this.getSessionStateKey(this.sessionState)) {
+      await this.applySessionState(client);
     }
   }
 
@@ -390,6 +425,7 @@ export class ConsoleLspClient implements CompletionProvider {
     );
     this.client = client;
     this.syncedSessionStateKey = undefined;
+    this.sessionStateSyncPromise = undefined;
     await client.start();
     await this.disableConsoleDiagnostics(client);
   }
