@@ -37,7 +37,6 @@ type AutocompleteRequest = {
   input: InputSnapshot;
   getCurrentInput: () => InputSnapshot;
   getWorkspaceData: () => WorkspaceData | undefined;
-  refreshWorkspaceData: () => void;
   force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
 };
@@ -76,7 +75,6 @@ export class RTermLang {
     input,
     getCurrentInput,
     getWorkspaceData,
-    refreshWorkspaceData,
     force = false,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
@@ -107,9 +105,6 @@ export class RTermLang {
         ? this.options.requestWorkspaceData?.()
         : undefined;
       const cachedSessionData = getWorkspaceData();
-      if (!shouldRequestWorkspaceData) {
-        refreshWorkspaceData();
-      }
 
       const latestInput = getCurrentInput();
       if (

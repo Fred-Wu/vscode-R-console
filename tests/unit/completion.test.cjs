@@ -248,7 +248,6 @@ test("language-server completion starts before a fresh workspace request finishe
     input,
     getCurrentInput: () => input,
     getWorkspaceData: () => undefined,
-    refreshWorkspaceData: () => {},
     applyCompletion: () => {},
   });
 
@@ -257,4 +256,70 @@ test("language-server completion starts before a fresh workspace request finishe
   await request;
 
   resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+});
+
+
+test("member and package completions do not refresh workspace data", async () => {
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const contexts = new Map([
+    ["obj$", {
+      kind: "member", prefix: "", replaceStart: 4, operator: "$", objectName: "obj",
+      snapshotInput: "obj$", snapshotCursor: 4,
+    }],
+    ["obj@", {
+      kind: "member", prefix: "", replaceStart: 4, operator: "@", objectName: "obj",
+      snapshotInput: "obj@", snapshotCursor: 4,
+    }],
+    ["stats::", {
+      kind: "package", prefix: "", replaceStart: 7, triggerCharacter: ":",
+      snapshotInput: "stats::", snapshotCursor: 7,
+    }],
+  ]);
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position: TestPosition },
+    "../../Language/completion": {
+      getCompletionContext: (input) => contexts.get(input),
+      needsLanguageServerCompletion: (context) => context.kind === "package",
+      collectCompletionEntries: async () => [],
+      getCompletionIdentityKey: () => "",
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: () => [],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: async () => {
+      throw new Error("workspace request should not run");
+    },
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  for (const text of contexts.keys()) {
+    const input = {
+      text,
+      currentLine: text,
+      cursorCol: text.length,
+      cursorRow: 0,
+      lines: [text],
+      textBeforeCursor: text,
+    };
+    await lang.handleAutocomplete({
+      input,
+      getCurrentInput: () => input,
+      getWorkspaceData: () => undefined,
+      applyCompletion: () => {},
+    });
+  }
 });
