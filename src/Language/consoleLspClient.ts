@@ -45,7 +45,6 @@ type ConsoleLspClientOptions = {
 
 type ConsoleLspSessionState = {
   attachedPackages: string[];
-  loadedNamespaces: string[];
 };
 
 class SilentOutputChannel implements vscode.OutputChannel {
@@ -352,10 +351,7 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {
-    return [
-      state.attachedPackages.join("\u0000"),
-      state.loadedNamespaces.join("\u0000"),
-    ].join("\u0001");
+    return state.attachedPackages.join("\u0000");
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {

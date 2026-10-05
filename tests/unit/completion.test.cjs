@@ -604,11 +604,9 @@ test("session state sync deduplicates concurrent requests and applies newer stat
 
   const firstState = {
     attachedPackages: ["package:stats"],
-    loadedNamespaces: ["base", "stats"],
   };
   const nextState = {
     attachedPackages: ["package:dplyr", "package:stats"],
-    loadedNamespaces: ["base", "stats", "dplyr"],
   };
 
   const first = client.syncSessionState(firstState);
@@ -632,4 +630,54 @@ test("session state sync deduplicates concurrent requests and applies newer stat
 
   await client.syncSessionState(nextState);
   assert.equal(requests.length, 2);
+});
+
+
+test("namespace-only session changes do not resync the language server", () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {},
+    "../../Language/completion": {
+      getCompletionContext: () => undefined,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestMemberCompletions: async () => [],
+  });
+  const states = [];
+  lang.consoleLsp = {
+    syncSessionState: (state) => {
+      states.push(state);
+      return Promise.resolve();
+    },
+  };
+
+  assert.equal(lang.updateSessionData({
+    search: [".GlobalEnv", "package:stats", "package:base"],
+    loaded_namespaces: ["base", "stats"],
+    globalenv: {},
+  }), true);
+  assert.deepEqual(states, [{
+    attachedPackages: ["stats", "base"],
+  }]);
+
+  assert.equal(lang.updateSessionData({
+    search: [".GlobalEnv", "package:stats", "package:base"],
+    loaded_namespaces: ["base", "stats", "methods"],
+    globalenv: {},
+  }), false);
+  assert.equal(states.length, 1);
+
+  assert.equal(lang.updateSessionData({
+    search: [".GlobalEnv", "package:dplyr", "package:stats", "package:base"],
+    loaded_namespaces: ["base", "stats", "methods", "dplyr"],
+    globalenv: {},
+  }), true);
+  assert.deepEqual(states[1], {
+    attachedPackages: ["dplyr", "stats", "base"],
+  });
 });
