@@ -24,15 +24,21 @@ local({
             }
 
             plot_backend <- Sys.getenv("SESS_PLOT_BACKEND", "auto")
-            connect_args <- list(
-                endpoint = endpoint,
-                use_rstudioapi = as.logical(Sys.getenv("SESS_RSTUDIOAPI", "TRUE"))
-            )
-            if ("plot_backend" %in% names(formals(connect))) {
+            connect_formals <- names(formals(connect))
+            connect_args <- list(endpoint = endpoint)
+            if ("use_rstudioapi" %in% connect_formals) {
+                connect_args$use_rstudioapi <-
+                    as.logical(Sys.getenv("SESS_RSTUDIOAPI", "TRUE"))
+            }
+            if ("plot_backend" %in% connect_formals) {
                 connect_args$plot_backend <- plot_backend
             } else {
-                connect_args$use_httpgd <- plot_backend %in% c("auto", "httpgd")
-                connect_args$use_jgd <- plot_backend %in% c("auto", "jgd")
+                if ("use_httpgd" %in% connect_formals) {
+                    connect_args$use_httpgd <- plot_backend %in% c("auto", "httpgd")
+                }
+                if ("use_jgd" %in% connect_formals) {
+                    connect_args$use_jgd <- plot_backend %in% c("auto", "jgd")
+                }
             }
             do.call(connect, connect_args)
         },

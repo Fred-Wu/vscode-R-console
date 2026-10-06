@@ -14,6 +14,11 @@ const attach = { jsonrpc: "2.0", method: "attach", params: {
   protocol_version: 1, session_id: "stable-r-session", host: "test-host",
   sess_version: "0.1.0", pid: 123, tempdir: "/tmp/R", wd: "/workspace",
 } };
+const attachV2 = { jsonrpc: "2.0", method: "attach", params: {
+  protocol_version: 2, interactive_token: "opaque-value",
+  session_id: "protocol-2-session", host: "test-host",
+  sess_version: "0.2.0", pid: 456, tempdir: "/tmp/R2", wd: "/workspace",
+} };
 const send = (socket, message) => socket.write(`${JSON.stringify(message)}\n`);
 
 async function waitFor(predicate) {
@@ -168,7 +173,8 @@ test("sess bootstrap feature-detects new and legacy plot APIs", () => {
   );
 
   assert.match(script, /SESS_PLOT_BACKEND/);
-  assert.match(script, /"plot_backend" %in% names\(formals\(connect\)\)/);
+  assert.match(script, /connect_formals <- names\(formals\(connect\)\)/);
+  assert.match(script, /"plot_backend" %in% connect_formals/);
   assert.match(script, /connect_args\$plot_backend <- plot_backend/);
   assert.match(script, /connect_args\$use_httpgd <- plot_backend %in% c\("auto", "httpgd"\)/);
   assert.match(script, /connect_args\$use_jgd <- plot_backend %in% c\("auto", "jgd"\)/);
@@ -294,6 +300,38 @@ test("runtime exit cancels pending connection discovery", async (t) => {
   assert.equal(integration.proxy, undefined);
   assert.equal(integration.connection, undefined);
   assert.deepEqual(fixture.commands, []);
+});
+
+test("proxy forwards protocol 2 attach metadata and keeps workspace and completion capabilities", { timeout: 10000 }, async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+
+  const endpoint = await proxy.start();
+  const r = await connectR(t, endpoint);
+  send(r.socket, attachV2);
+  await waitFor(() =>
+    proxy.getSessionId() === attachV2.params.session_id &&
+    server.messages.some((message) => message.method === "attach") &&
+    proxy.getWorkspaceData()
+  );
+
+  assert.deepEqual(
+    server.messages.find((message) => message.method === "attach"),
+    attachV2
+  );
+  assert.deepEqual(proxy.getWorkspaceData(), workspace);
+
+  const completion = proxy.requestMemberCompletions("x", "$");
+  await waitFor(() => r.messages.some((message) => message.method === "completion"));
+  const request = r.messages.find((message) => message.method === "completion");
+  send(r.socket, {
+    jsonrpc: "2.0",
+    id: request.id,
+    result: [{ name: "member", type: "numeric" }],
+  });
+  assert.deepEqual(await completion, [{ name: "member", type: "numeric" }]);
 });
 
 test("proxy replacement survives old socket close, forwards Unicode, and propagates upstream disconnect", { timeout: 10000 }, async (t) => {

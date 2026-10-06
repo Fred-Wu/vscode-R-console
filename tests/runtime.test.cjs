@@ -7,6 +7,54 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 
+test("sess bootstrap passes only arguments supported by sess::connect", () => {
+  const bootstrap = path.join(__dirname, "../resources/r/VSCR/sess.R")
+    .replaceAll("\\", "/");
+  const rPath = process.env.R_TEST_EXECUTABLE || "R";
+  const cases = [
+    {
+      backend: "jgd",
+      connect: "function(endpoint, use_rstudioapi = TRUE, use_httpgd = TRUE, use_jgd = FALSE) cat(endpoint, use_rstudioapi, use_httpgd, use_jgd, sep='|')",
+      expected: "proxy|FALSE|FALSE|TRUE",
+    },
+    {
+      backend: "future-backend",
+      connect: "function(endpoint, use_rstudioapi = TRUE, plot_backend = 'auto') cat(endpoint, use_rstudioapi, plot_backend, sep='|')",
+      expected: "proxy|FALSE|future-backend",
+    },
+    {
+      backend: "future-backend",
+      connect: "function(endpoint, plot_backend = 'auto') cat(endpoint, plot_backend, sep='|')",
+      expected: "proxy|future-backend",
+    },
+    {
+      backend: "jgd",
+      connect: "function(endpoint, use_jgd = FALSE) cat(endpoint, use_jgd, sep='|')",
+      expected: "proxy|TRUE",
+    },
+    {
+      backend: "future-backend",
+      connect: "function(endpoint) cat(endpoint)",
+      expected: "proxy",
+    },
+  ];
+
+  for (const entry of cases) {
+    const code = [
+      "connect_env <- new.env(parent = emptyenv())",
+      `connect_env$connect <- ${entry.connect}`,
+      "requireNamespace <- function(...) TRUE",
+      "asNamespace <- function(...) connect_env",
+      `Sys.setenv(SESS_ENDPOINT='proxy', SESS_PLOT_BACKEND='${entry.backend}', SESS_RSTUDIOAPI='FALSE')`,
+      `source(${JSON.stringify(bootstrap)}, local = globalenv())`,
+    ].join("; ");
+    const result = execFileSync(rPath, ["--vanilla", "--slave", "-e", code], {
+      encoding: "utf8",
+    });
+    assert.equal(result.trim(), entry.expected);
+  }
+});
+
 test("real R evaluates, handles nested input and interrupts, reconnects, and shuts down", { timeout: 60000 }, async (t) => {
   const root = path.resolve(__dirname, "..");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-smoke-"));
