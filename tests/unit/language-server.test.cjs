@@ -42,3 +42,25 @@ test("console language server fingerprints cached and referenced packages withou
   assert.match(script, /"rConsole\/checkPackageChanges"/);
   assert.doesNotMatch(script, /packageVersion\(/);
 });
+
+
+test("newly cached namespaces are fingerprinted before completion is returned", () => {
+  const script = fs.readFileSync(
+    path.join(__dirname, "../../resources/r/console-language-server.R"),
+    "utf8"
+  );
+  const start = script.indexOf('server$request_handlers[["textDocument/completion"]]');
+  const end = script.indexOf('server$request_handlers[["rConsole/syncSessionState"]]', start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const handler = script.slice(start, end);
+
+  const reply = handler.indexOf("languageserver:::completion_reply");
+  const record = handler.indexOf("record_cached_package_fingerprints(workspace)");
+  const deliver = handler.indexOf("self$deliver(reply)");
+  assert.ok(reply >= 0);
+  assert.ok(record > reply);
+  assert.ok(deliver > record);
+  assert.match(script, /record_package_fingerprints\("languageserver"\)/);
+  assert.match(script, /for \(workspace in server\$workspaces\$values\(\)\)/);
+});

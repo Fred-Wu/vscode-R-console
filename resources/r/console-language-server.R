@@ -105,6 +105,18 @@ package_fingerprint <- function(pkgname) {
     )
 }
 
+record_package_fingerprints <- function(packages) {
+    for (pkgname in normalize_character(packages)) {
+        if (!exists(pkgname, envir = package_fingerprints, inherits = FALSE)) {
+            assign(pkgname, package_fingerprint(pkgname), envir = package_fingerprints)
+        }
+    }
+}
+
+record_cached_package_fingerprints <- function(workspace) {
+    record_package_fingerprints(workspace$namespaces$keys())
+}
+
 check_package_changes <- function(workspace, packages = character()) {
     changed <- character()
     packages <- unique(c(
@@ -127,7 +139,35 @@ check_package_changes <- function(workspace, packages = character()) {
     changed
 }
 
+record_package_fingerprints("languageserver")
+
 server <- languageserver:::LanguageServer$new(host, port)
+for (workspace in server$workspaces$values()) {
+    record_cached_package_fingerprints(workspace)
+}
+
+server$request_handlers[["textDocument/completion"]] <- function(self, id, params) {
+    textDocument <- params$textDocument
+    uri <- languageserver:::uri_escape_unicode(textDocument$uri)
+    workspace <- self$get_workspace(uri)
+    document <- workspace$documents$get(uri)
+    if (is.null(document)) {
+        return(self$deliver(languageserver:::Response$new(id = id, result = NULL)))
+    }
+
+    point <- document$from_lsp_position(params$position)
+    reply <- languageserver:::completion_reply(
+        id,
+        uri,
+        workspace,
+        document,
+        point,
+        self$ClientCapabilities$textDocument$completion
+    )
+    record_cached_package_fingerprints(workspace)
+    self$deliver(reply)
+}
+
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
     workspace <- self$get_workspace(self$rootUri)

@@ -278,6 +278,57 @@ test("package change restarts the console language server before completion", as
 });
 
 
+test("concurrent package change checks share the in-flight request", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({
+    consoleId: "package-refresh-concurrency-test",
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+  });
+  t.after(() => client.dispose());
+
+  let checks = 0;
+  let resolveCheck;
+  const languageClient = {
+    isRunning: () => true,
+    sendRequest: (method, params) => {
+      assert.equal(method, "rConsole/checkPackageChanges");
+      assert.deepEqual(params.packages, ["foo"]);
+      checks += 1;
+      return new Promise((resolve) => {
+        resolveCheck = resolve;
+      });
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  client.client = languageClient;
+
+  const first = client.packageChangesDetected(languageClient, "foo::bar");
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = client.packageChangesDetected(languageClient, "foo::bar");
+
+  assert.equal(checks, 1);
+  resolveCheck(["foo"]);
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+});
+
+
 test("package change checks are throttled across rapid completions", async (t) => {
   class TestPosition {
     constructor(line, character) {

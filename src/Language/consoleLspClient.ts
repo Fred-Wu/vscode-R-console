@@ -384,11 +384,11 @@ export class ConsoleLspClient implements CompletionProvider {
     client: ConsoleLanguageClient,
     content: string
   ): Promise<boolean> {
-    if (Date.now() - this.lastPackageCheckAt < 1000) {
-      return false;
-    }
     if (this.packageCheckPromise) {
       return await this.packageCheckPromise;
+    }
+    if (Date.now() - this.lastPackageCheckAt < 1000) {
+      return false;
     }
 
     this.lastPackageCheckAt = Date.now();
