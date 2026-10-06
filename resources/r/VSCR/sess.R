@@ -22,12 +22,19 @@ local({
             if (is.null(connect) || !nzchar(endpoint)) {
                 return(invisible(NULL))
             }
-            connect(
+
+            plot_backend <- Sys.getenv("SESS_PLOT_BACKEND", "auto")
+            connect_args <- list(
                 endpoint = endpoint,
-                use_rstudioapi = as.logical(Sys.getenv("SESS_RSTUDIOAPI", "TRUE")),
-                use_httpgd = as.logical(Sys.getenv("SESS_USE_HTTPGD", "TRUE")),
-                use_jgd = as.logical(Sys.getenv("SESS_USE_JGD", "FALSE"))
+                use_rstudioapi = as.logical(Sys.getenv("SESS_RSTUDIOAPI", "TRUE"))
             )
+            if ("plot_backend" %in% names(formals(connect))) {
+                connect_args$plot_backend <- plot_backend
+            } else {
+                connect_args$use_httpgd <- plot_backend %in% c("auto", "httpgd")
+                connect_args$use_jgd <- plot_backend %in% c("auto", "jgd")
+            }
+            do.call(connect, connect_args)
         },
         error = function(err) {
             report_bootstrap_failure(conditionMessage(err))

@@ -9,15 +9,15 @@ import type {
 } from "../types";
 import { SessProxy } from "./sessProxy";
 
-type VscodeRPlotBackend = "auto" | "standard" | "httpgd" | "jgd";
+type VscodeRSessionInfo = {
+  endpoint?: unknown;
+  plotBackend?: unknown;
+  jgdSocket?: unknown;
+  [key: string]: unknown;
+};
 
 type VscodeRSessionApi = {
-  getConnectionInfo(): Promise<{
-    protocolVersion: number;
-    endpoint: string;
-    plotBackend: VscodeRPlotBackend;
-    jgdSocket?: string;
-  } | undefined>;
+  getConnectionInfo(): Promise<VscodeRSessionInfo | undefined>;
   activate(sessionId: string): Promise<boolean>;
 };
 
@@ -27,7 +27,7 @@ type VscodeRExtensionApi = {
 
 type VscodeRSessionConnection = {
   pipePath: string;
-  plotBackend: VscodeRPlotBackend;
+  plotBackend: string;
   jgdSocket?: string;
   activateSession(sessionId: string): Promise<boolean>;
 };
@@ -69,13 +69,24 @@ async function discoverSessionConnection(): Promise<
 
   try {
     const info = await sessionApi.getConnectionInfo();
-    if (!info || !info.endpoint) {
+    if (
+      !info ||
+      typeof info.endpoint !== "string" ||
+      info.endpoint.length === 0
+    ) {
       return undefined;
     }
+    const plotBackend =
+      typeof info.plotBackend === "string" && info.plotBackend.length > 0
+        ? info.plotBackend
+        : "auto";
     return {
       pipePath: info.endpoint,
-      plotBackend: info.plotBackend,
-      jgdSocket: info.jgdSocket,
+      plotBackend,
+      jgdSocket:
+        typeof info.jgdSocket === "string" && info.jgdSocket.length > 0
+          ? info.jgdSocket
+          : undefined,
       activateSession: (sessionId: string) => sessionApi.activate(sessionId),
     };
   } catch {
@@ -100,23 +111,23 @@ function quoteRString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function buildConnectCommand(connection: VscodeRSessionConnection): string {
+function buildConnectCommand(
+  connection: VscodeRSessionConnection,
+  bootstrapPath: string
+): string {
   const rConfig = vscode.workspace.getConfiguration("r");
-  const plotBackend = connection.plotBackend;
   const jgdSocketCommand = connection.jgdSocket
     ? `Sys.setenv(JGD_SOCKET=${quoteRString(connection.jgdSocket)});`
     : "Sys.unsetenv(\"JGD_SOCKET\");";
   return [
-    "if (requireNamespace(\"sess\", quietly = TRUE) && \"endpoint\" %in% names(formals(sess::connect))) {",
     `Sys.setenv(SESS_ENDPOINT=${quoteRString(connection.pipePath)});`,
+    `Sys.setenv(SESS_PLOT_BACKEND=${quoteRString(connection.plotBackend)});`,
+    `Sys.setenv(SESS_RSTUDIOAPI=${quoteRString(
+      rConfig.get<boolean>("session.emulateRStudioAPI") === false ? "FALSE" : "TRUE"
+    )});`,
+    "Sys.unsetenv(c(\"SESS_USE_HTTPGD\", \"SESS_USE_JGD\"));",
     jgdSocketCommand,
-    "sess::connect(",
-    `endpoint=${quoteRString(connection.pipePath)},`,
-    `use_rstudioapi=${asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true)},`,
-    `use_httpgd=${asRLogical(plotBackend === "httpgd" || plotBackend === "auto", true)},`,
-    `use_jgd=${asRLogical(plotBackend === "jgd" || plotBackend === "auto", false)}`,
-    ")",
-    "}",
+    `source(${quoteRString(bootstrapPath)}, local=TRUE)`,
   ].join(" ");
 }
 
@@ -181,19 +192,13 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     env.SESS_ENDPOINT = connection.pipePath;
     delete env.SESS_PIPE;
     const rConfig = vscode.workspace.getConfiguration("r");
-    const plotBackend = connection.plotBackend;
     env.SESS_RSTUDIOAPI = asRLogical(
       rConfig.get<boolean>("session.emulateRStudioAPI"),
       true
     );
-    env.SESS_USE_HTTPGD = asRLogical(
-      plotBackend === "httpgd" || plotBackend === "auto",
-      true
-    );
-    env.SESS_USE_JGD = asRLogical(
-      plotBackend === "jgd" || plotBackend === "auto",
-      false
-    );
+    env.SESS_PLOT_BACKEND = connection.plotBackend;
+    delete env.SESS_USE_HTTPGD;
+    delete env.SESS_USE_JGD;
     if (connection.jgdSocket) {
       env.JGD_SOCKET = connection.jgdSocket;
     } else {
@@ -452,9 +457,16 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
         this.flushActivation();
         return;
       }
+      const bootstrapPath = path.join(
+        this.host.extensionPath,
+        "resources",
+        "r",
+        "VSCR",
+        "sess.R"
+      );
       if (
         this.canSubmitHiddenCommand() &&
-        this.submitHiddenCommand(buildConnectCommand(connection))
+        this.submitHiddenCommand(buildConnectCommand(connection, bootstrapPath))
       ) {
         this.reconnectPending = false;
       }

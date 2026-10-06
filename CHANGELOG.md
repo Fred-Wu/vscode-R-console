@@ -6,7 +6,8 @@ All notable changes to R Console will be documented in this file.
 
 ### Changed
 
-- Improved console language-server performance and responsiveness.
+- Refactored console language-server completion and package-state handling to reduce startup and completion overhead, avoid eager namespace loading, preserve incomplete package completions, and safely refresh cached package metadata after package updates.
+- Refactored vscode-R `sess` compatibility around capability detection instead of hard-coded protocol or plot-backend versions. R Console now passes vscode-R's resolved plot backend through and lets its R bootstrap use `plot_backend` when supported or fall back to the released `use_httpgd` / `use_jgd` interface.
 
 ## [0.5.1] - 2026-09-27
 

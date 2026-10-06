@@ -117,18 +117,30 @@ function integrationFixture(t, info, overrides = {}) {
     discoveries: () => discoveries, obsoleteFileAccesses: () => obsoleteFileAccesses };
 }
 
-test("sess launch uses the public protocol API and resolved plot preferences without discovery files", async (t) => {
-  for (const [plotBackend, httpgd, jgd] of [
-    ["auto", "TRUE", "TRUE"], ["standard", "FALSE", "FALSE"],
-    ["httpgd", "TRUE", "FALSE"], ["jgd", "FALSE", "TRUE"],
+test("sess launch passes plot backends through without coupling to protocol versions", async (t) => {
+  for (const [plotBackend, jgdSocket] of [
+    ["auto", "plot-socket"],
+    ["standard", undefined],
+    ["httpgd", undefined],
+    ["jgd", "plot-socket"],
+    ["native", undefined],
+    ["future-backend", undefined],
   ]) {
     await t.test(plotBackend, async (t) => {
       const fixture = integrationFixture(t, {
-        protocolVersion: 999, endpoint: "upstream", plotBackend,
-        ...(jgd === "TRUE" ? { jgdSocket: "plot-socket" } : {}),
+        protocolVersion: 999,
+        endpoint: "upstream",
+        plotBackend,
+        ...(jgdSocket ? { jgdSocket } : {}),
       });
       const integration = fixture.create();
-      const env = { SESS_DISCOVERY_FILE: "inherited", SESS_PIPE: "old", JGD_SOCKET: "old" };
+      const env = {
+        SESS_DISCOVERY_FILE: "inherited",
+        SESS_PIPE: "old",
+        SESS_USE_HTTPGD: "TRUE",
+        SESS_USE_JGD: "TRUE",
+        JGD_SOCKET: "old",
+      };
       await integration.prepareStart(env);
       assert.ok(env.SESS_ENDPOINT);
       assert.notEqual(env.SESS_ENDPOINT, "upstream");
@@ -136,9 +148,10 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
       assert.equal(env.SESS_DISCOVERY_FILE, undefined);
       assert.equal(env.SESS_PIPE, undefined);
       assert.equal(env.SESS_RSTUDIOAPI, "FALSE");
-      assert.equal(env.SESS_USE_HTTPGD, httpgd);
-      assert.equal(env.SESS_USE_JGD, jgd);
-      assert.equal(env.JGD_SOCKET, jgd === "TRUE" ? "plot-socket" : undefined);
+      assert.equal(env.SESS_PLOT_BACKEND, plotBackend);
+      assert.equal(env.SESS_USE_HTTPGD, undefined);
+      assert.equal(env.SESS_USE_JGD, undefined);
+      assert.equal(env.JGD_SOCKET, jgdSocket);
       integration.handleRuntimePid(process.pid);
       integration.handleHostConnected();
       assert.equal(fixture.obsoleteFileAccesses(), 0);
@@ -146,6 +159,20 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
       assert.deepEqual(fixture.warnings, []);
     });
   }
+});
+
+test("sess bootstrap feature-detects new and legacy plot APIs", () => {
+  const script = fs.readFileSync(
+    path.join(__dirname, "../../resources/r/VSCR/sess.R"),
+    "utf8"
+  );
+
+  assert.match(script, /SESS_PLOT_BACKEND/);
+  assert.match(script, /"plot_backend" %in% names\(formals\(connect\)\)/);
+  assert.match(script, /connect_args\$plot_backend <- plot_backend/);
+  assert.match(script, /connect_args\$use_httpgd <- plot_backend %in% c\("auto", "httpgd"\)/);
+  assert.match(script, /connect_args\$use_jgd <- plot_backend %in% c\("auto", "jgd"\)/);
+  assert.match(script, /do\.call\(connect, connect_args\)/);
 });
 
 test("sess launch safely declines unavailable APIs and missing endpoints", async (t) => {
@@ -195,26 +222,39 @@ test("focus before attach activates the stable identity and a detached UI reuses
   assert.deepEqual(fixture.commands, []);
 });
 
-test("reload reconnect waits for an empty main prompt and submits endpoint-based sess connect once", async (t) => {
-  const fixture = integrationFixture(t, { protocolVersion: 1, endpoint: "upstream", plotBackend: "jgd", jgdSocket: 'plot\\"socket' });
-  fixture.host.rProcess = { sessionId: randomUUID() };
-  fixture.host.inputState.text = "unfinished";
-  const integration = fixture.create();
-  integration.setActive(true);
-  integration.handleMainPrompt();
-  await delay(30);
-  assert.deepEqual(fixture.commands, []);
-  fixture.host.inputState.text = "";
-  integration.handleMainPrompt();
-  integration.handleMainPrompt();
-  await waitFor(() => fixture.commands.length === 1);
-  const { code } = fixture.commands[0];
-  assert.match(code, /Sys.setenv\(SESS_ENDPOINT=/);
-  assert.match(code, /sess::connect\( endpoint=/);
-  assert.match(code, /use_httpgd=FALSE, use_jgd=TRUE/);
-  assert.ok(code.includes('Sys.setenv(JGD_SOCKET="plot\\\\\\"socket")'));
-  assert.doesNotMatch(code, /pipe_path|notify_client/);
-  assert.equal(fixture.host.mode, "executing");
+test("reload reconnect reuses the bootstrap and passes the plot backend through", async (t) => {
+  for (const plotBackend of ["jgd", "native", "future-backend"]) {
+    await t.test(plotBackend, async (t) => {
+      const fixture = integrationFixture(t, {
+        protocolVersion: 999,
+        endpoint: "upstream",
+        plotBackend,
+        ...(plotBackend === "jgd" ? { jgdSocket: 'plot\\"socket' } : {}),
+      });
+      fixture.host.rProcess = { sessionId: randomUUID() };
+      fixture.host.inputState.text = "unfinished";
+      const integration = fixture.create();
+      integration.setActive(true);
+      integration.handleMainPrompt();
+      await delay(30);
+      assert.deepEqual(fixture.commands, []);
+      fixture.host.inputState.text = "";
+      integration.handleMainPrompt();
+      integration.handleMainPrompt();
+      await waitFor(() => fixture.commands.length === 1);
+      const { code } = fixture.commands[0];
+      assert.match(code, /Sys\.setenv\(SESS_ENDPOINT=/);
+      assert.ok(code.includes(`Sys.setenv(SESS_PLOT_BACKEND="${plotBackend}")`));
+      assert.match(code, /source\(.+sess\.R.+local=TRUE\)/);
+      assert.doesNotMatch(code, /sess::connect|use_httpgd|use_jgd/);
+      if (plotBackend === "jgd") {
+        assert.ok(code.includes('Sys.setenv(JGD_SOCKET="plot\\\\\\"socket")'));
+      } else {
+        assert.match(code, /Sys\.unsetenv\("JGD_SOCKET"\)/);
+      }
+      assert.equal(fixture.host.mode, "executing");
+    });
+  }
 });
 
 test("activation rejected before upstream attach completes retries on workspace data", { timeout: 10000 }, async (t) => {
