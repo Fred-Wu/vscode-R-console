@@ -53,6 +53,7 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
     delete env.SESS_PORT;
     delete env.SESS_TOKEN;
     delete env.SESS_HOST;
+    delete env.SESS_PLOT_BACKEND;
   }
 
   override primeAttach(): void {
