@@ -18,7 +18,10 @@ type VscodeRSessionInfo = {
 
 type VscodeRSessionApi = {
   getConnectionInfo(): Promise<VscodeRSessionInfo | undefined>;
-  activate(sessionId: string): Promise<boolean>;
+  activate(
+    sessionId: string,
+    options?: { terminal?: vscode.Terminal }
+  ): Promise<boolean>;
 };
 
 type VscodeRExtensionApi = {
@@ -29,7 +32,10 @@ type VscodeRSessionConnection = {
   pipePath: string;
   plotBackend: string;
   jgdSocket?: string;
-  activateSession(sessionId: string): Promise<boolean>;
+  activateSession(
+    sessionId: string,
+    options?: { terminal?: vscode.Terminal }
+  ): Promise<boolean>;
 };
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
@@ -87,7 +93,10 @@ async function discoverSessionConnection(): Promise<
         typeof info.jgdSocket === "string" && info.jgdSocket.length > 0
           ? info.jgdSocket
           : undefined,
-      activateSession: (sessionId: string) => sessionApi.activate(sessionId),
+      activateSession: (
+        sessionId: string,
+        options?: { terminal?: vscode.Terminal }
+      ) => sessionApi.activate(sessionId, options),
     };
   } catch {
     return undefined;
@@ -141,6 +150,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private reconnectPending: boolean;
   private mainPromptObserved: boolean;
   private active = false;
+  private activeTerminal: vscode.Terminal | undefined;
   private activationPending = false;
 
   constructor(host: RuntimeHost) {
@@ -242,8 +252,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.flushActivation();
   }
 
-  override setActive(active: boolean): void {
+  override setActive(active: boolean, terminal?: vscode.Terminal): void {
     this.active = active;
+    if (active && terminal) {
+      this.activeTerminal = terminal;
+    }
     this.activationPending = active;
     if (!active) {
       return;
@@ -290,6 +303,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.clearConnection();
     this.reconnectPending = false;
     this.activationPending = false;
+    this.activeTerminal = undefined;
   }
 
   override disposeUi(): void {
@@ -423,7 +437,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     }
 
     this.activationPending = false;
-    void activateSession(sessionId).then((activated) => {
+    void activateSession(
+      sessionId,
+      this.activeTerminal ? { terminal: this.activeTerminal } : undefined
+    ).then((activated) => {
       if (!activated && this.active) {
         this.activationPending = true;
       }

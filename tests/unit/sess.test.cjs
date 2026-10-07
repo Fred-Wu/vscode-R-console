@@ -78,13 +78,18 @@ async function connectR(t, endpoint, respond = true) {
 
 function integrationFixture(t, info, overrides = {}) {
   const activations = [];
+  const activationOptions = [];
   const warnings = [];
   const commands = [];
   let discoveries = 0;
   let obsoleteFileAccesses = 0;
   const session = {
     getConnectionInfo: async () => { discoveries++; return info; },
-    activate: async (id) => { activations.push(id); return true; },
+    activate: async (id, options) => {
+      activations.push(id);
+      activationOptions.push(options);
+      return true;
+    },
     ...overrides,
   };
   const extension = { isActive: false, activate: async () => ({ session }) };
@@ -118,7 +123,7 @@ function integrationFixture(t, info, overrides = {}) {
     return integration;
   };
   t.after(() => integrations.forEach((integration) => integration.handleRuntimeExit()));
-  return { create, host, extension, activations, warnings, commands,
+  return { create, host, extension, activations, activationOptions, warnings, commands,
     discoveries: () => discoveries, obsoleteFileAccesses: () => obsoleteFileAccesses };
 }
 
@@ -208,22 +213,32 @@ test("focus before attach activates the stable identity and a detached UI reuses
   await integration.prepareStart(env);
   fixture.host.rProcess = { sessionId: randomUUID() };
   integration.afterRuntimeStarted();
-  integration.setActive(true);
+  const firstTerminal = { name: "R Console first" };
+  const activeTerminal = { name: "R Console active" };
+  integration.setActive(true, firstTerminal);
+  integration.setActive(false);
+  integration.setActive(true, activeTerminal);
   integration.handleMainPrompt();
   assert.deepEqual(fixture.activations, []);
   const r = await connectR(t, env.SESS_ENDPOINT);
   send(r.socket, attach);
   await waitFor(() => fixture.activations.length === 1 && server.messages.length > 0);
   assert.deepEqual(fixture.activations, [attach.params.session_id]);
+  assert.deepEqual(fixture.activationOptions, [{ terminal: activeTerminal }]);
   assert.deepEqual(server.messages[0], attach);
   assert.deepEqual(integration.getCachedWorkspaceData(), workspace);
   integration.disposeUi();
   const restored = fixture.create();
   restored.attachRuntime();
-  restored.setActive(true);
+  const reattachedTerminal = { name: "R Console restored" };
+  restored.setActive(true, reattachedTerminal);
   restored.handleMainPrompt();
   await waitFor(() => fixture.activations.length >= 2);
   assert.ok(fixture.activations.every((id) => id === attach.params.session_id));
+  assert.deepEqual(fixture.activationOptions, [
+    { terminal: activeTerminal },
+    { terminal: reattachedTerminal },
+  ]);
   assert.equal(fixture.discoveries(), 1);
   assert.deepEqual(fixture.commands, []);
 });
@@ -261,6 +276,29 @@ test("reload reconnect reuses the bootstrap and passes the plot backend through"
       assert.equal(fixture.host.mode, "executing");
     });
   }
+});
+
+test("restored runtime rebinds its terminal after sess reconnect", { timeout: 10000 }, async (t) => {
+  const server = await upstream(t);
+  const fixture = integrationFixture(t, {
+    protocolVersion: 2,
+    endpoint: server.endpoint,
+    plotBackend: "standard",
+  });
+  fixture.host.rProcess = { sessionId: randomUUID() };
+  const integration = fixture.create();
+  const terminal = { name: "R Console restored" };
+
+  integration.setActive(true, terminal);
+  integration.handleMainPrompt();
+  await waitFor(() => fixture.commands.length === 1 && integration.connection?.pipePath);
+
+  const r = await connectR(t, integration.connection.pipePath);
+  send(r.socket, attachV2);
+  await waitFor(() => fixture.activations.length === 1);
+
+  assert.deepEqual(fixture.activations, [attachV2.params.session_id]);
+  assert.deepEqual(fixture.activationOptions, [{ terminal }]);
 });
 
 test("activation rejected before upstream attach completes retries on workspace data", { timeout: 10000 }, async (t) => {

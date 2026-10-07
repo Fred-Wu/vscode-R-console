@@ -1,3 +1,4 @@
+import type * as vscode from "vscode";
 import type { RuntimeHost } from "../../Terminal/rTerminal/runtime";
 import type {
   SessionMemberCompletionItem,
@@ -14,7 +15,7 @@ export interface VscodeRSessionIntegration {
   handleMainPrompt(): void;
   handleRuntimePid(pid: number): void;
   handleRuntimeExit(): void;
-  setActive(active: boolean): void;
+  setActive(active: boolean, terminal?: vscode.Terminal): void;
 
   getDisplayPid(): number | undefined;
   getCachedWorkspaceData(): WorkspaceData | undefined;
@@ -43,7 +44,7 @@ export abstract class BaseVscodeRSessionIntegration
   handleMainPrompt(): void {}
   handleRuntimePid(_pid: number): void {}
   handleRuntimeExit(): void {}
-  setActive(_active: boolean): void {}
+  setActive(_active: boolean, _terminal?: vscode.Terminal): void {}
 
   getDisplayPid(): number | undefined {
     return undefined;
