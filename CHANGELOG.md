@@ -2,12 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [0.5.2] - 2026-10-05
+## Unreleased
 
 ### Changed
 
-- Improved console completion responsiveness and reliability, including package completions and updates when installed packages change during a session.
-- Improved compatibility with current and upcoming vscode-R releases. Workspace actions such as View, Remove, Clear, Save, and Load now target the correct R Console session, including persistent sessions, while plot integration continues to follow vscode-R's httpgd, JGD, and native backend settings.
+- Further improved console completion responsiveness and reliability, including package completions and updates when installed packages change during a session.
+- Improved compatibility with current and upcoming vscode-R releases.
 
 ## [0.5.1] - 2026-09-27
 
