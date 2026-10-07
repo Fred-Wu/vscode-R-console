@@ -1138,7 +1138,8 @@ async function handleActiveTerminalChange(
 
   const activeRecord = terminal ? resolveRecordFromTerminal(terminal) : undefined;
   for (const record of rTerminalToRecord.values()) {
-    record.rTerminal.setVscodeRSessionActive(record === activeRecord);
+    const active = record === activeRecord;
+    record.rTerminal.setVscodeRSessionActive(active, active ? terminal : undefined);
   }
 }
 

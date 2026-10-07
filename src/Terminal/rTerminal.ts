@@ -55,7 +55,6 @@ import {
   getRuntimeWorkspaceData,
   type RuntimeHost,
   requestRuntimeMemberCompletions,
-  refreshRuntimeWorkspaceData,
   startNextRuntimeSubmission,
   type Submission,
   type TerminalMode,
@@ -1659,7 +1658,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
       getWorkspaceData: () => getCachedRuntimeWorkspaceData(this.runtimeHost()),
-      refreshWorkspaceData: () => refreshRuntimeWorkspaceData(this.runtimeHost()),
       force,
       applyCompletion: (selection) => {
         this.applyCompletion(selection);
@@ -1706,8 +1704,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     finishRuntimeSubmission(this.runtimeHost());
   }
 
-  setVscodeRSessionActive(active: boolean): void {
-    setRuntimeVscodeRSessionActive(this.runtimeHost(), active);
+  setVscodeRSessionActive(active: boolean, terminal?: vscode.Terminal): void {
+    setRuntimeVscodeRSessionActive(this.runtimeHost(), active, terminal);
   }
 
   private async enqueueRSubmission(

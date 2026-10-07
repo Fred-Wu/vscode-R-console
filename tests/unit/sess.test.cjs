@@ -14,6 +14,11 @@ const attach = { jsonrpc: "2.0", method: "attach", params: {
   protocol_version: 1, session_id: "stable-r-session", host: "test-host",
   sess_version: "0.1.0", pid: 123, tempdir: "/tmp/R", wd: "/workspace",
 } };
+const attachV2 = { jsonrpc: "2.0", method: "attach", params: {
+  protocol_version: 2, interactive_token: "opaque-value",
+  session_id: "protocol-2-session", host: "test-host",
+  sess_version: "0.2.0", pid: 456, tempdir: "/tmp/R2", wd: "/workspace",
+} };
 const send = (socket, message) => socket.write(`${JSON.stringify(message)}\n`);
 
 async function waitFor(predicate) {
@@ -73,13 +78,18 @@ async function connectR(t, endpoint, respond = true) {
 
 function integrationFixture(t, info, overrides = {}) {
   const activations = [];
+  const activationOptions = [];
   const warnings = [];
   const commands = [];
   let discoveries = 0;
   let obsoleteFileAccesses = 0;
   const session = {
     getConnectionInfo: async () => { discoveries++; return info; },
-    activate: async (id) => { activations.push(id); return true; },
+    activate: async (id, options) => {
+      activations.push(id);
+      activationOptions.push(options);
+      return true;
+    },
     ...overrides,
   };
   const extension = { isActive: false, activate: async () => ({ session }) };
@@ -113,22 +123,34 @@ function integrationFixture(t, info, overrides = {}) {
     return integration;
   };
   t.after(() => integrations.forEach((integration) => integration.handleRuntimeExit()));
-  return { create, host, extension, activations, warnings, commands,
+  return { create, host, extension, activations, activationOptions, warnings, commands,
     discoveries: () => discoveries, obsoleteFileAccesses: () => obsoleteFileAccesses };
 }
 
-test("sess launch uses the public protocol API and resolved plot preferences without discovery files", async (t) => {
-  for (const [plotBackend, httpgd, jgd] of [
-    ["auto", "TRUE", "TRUE"], ["standard", "FALSE", "FALSE"],
-    ["httpgd", "TRUE", "FALSE"], ["jgd", "FALSE", "TRUE"],
+test("sess launch passes plot backends through without coupling to protocol versions", async (t) => {
+  for (const [plotBackend, jgdSocket] of [
+    ["auto", "plot-socket"],
+    ["standard", undefined],
+    ["httpgd", undefined],
+    ["jgd", "plot-socket"],
+    ["native", undefined],
+    ["future-backend", undefined],
   ]) {
     await t.test(plotBackend, async (t) => {
       const fixture = integrationFixture(t, {
-        protocolVersion: 1, endpoint: "upstream", plotBackend,
-        ...(jgd === "TRUE" ? { jgdSocket: "plot-socket" } : {}),
+        protocolVersion: 999,
+        endpoint: "upstream",
+        plotBackend,
+        ...(jgdSocket ? { jgdSocket } : {}),
       });
       const integration = fixture.create();
-      const env = { SESS_DISCOVERY_FILE: "inherited", SESS_PIPE: "old", JGD_SOCKET: "old" };
+      const env = {
+        SESS_DISCOVERY_FILE: "inherited",
+        SESS_PIPE: "old",
+        SESS_USE_HTTPGD: "TRUE",
+        SESS_USE_JGD: "TRUE",
+        JGD_SOCKET: "old",
+      };
       await integration.prepareStart(env);
       assert.ok(env.SESS_ENDPOINT);
       assert.notEqual(env.SESS_ENDPOINT, "upstream");
@@ -136,9 +158,10 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
       assert.equal(env.SESS_DISCOVERY_FILE, undefined);
       assert.equal(env.SESS_PIPE, undefined);
       assert.equal(env.SESS_RSTUDIOAPI, "FALSE");
-      assert.equal(env.SESS_USE_HTTPGD, httpgd);
-      assert.equal(env.SESS_USE_JGD, jgd);
-      assert.equal(env.JGD_SOCKET, jgd === "TRUE" ? "plot-socket" : undefined);
+      assert.equal(env.SESS_PLOT_BACKEND, plotBackend);
+      assert.equal(env.SESS_USE_HTTPGD, undefined);
+      assert.equal(env.SESS_USE_JGD, undefined);
+      assert.equal(env.JGD_SOCKET, jgdSocket);
       integration.handleRuntimePid(process.pid);
       integration.handleHostConnected();
       assert.equal(fixture.obsoleteFileAccesses(), 0);
@@ -148,8 +171,23 @@ test("sess launch uses the public protocol API and resolved plot preferences wit
   }
 });
 
-test("sess launch safely declines unavailable APIs and incompatible protocol versions", async (t) => {
-  for (const info of [undefined, { protocolVersion: 2, endpoint: "bad" }, { protocolVersion: 1, endpoint: "" }]) {
+test("sess bootstrap feature-detects new and legacy plot APIs", () => {
+  const script = fs.readFileSync(
+    path.join(__dirname, "../../resources/r/VSCR/sess.R"),
+    "utf8"
+  );
+
+  assert.match(script, /SESS_PLOT_BACKEND/);
+  assert.match(script, /connect_formals <- names\(formals\(connect\)\)/);
+  assert.match(script, /"plot_backend" %in% connect_formals/);
+  assert.match(script, /connect_args\$plot_backend <- plot_backend/);
+  assert.match(script, /connect_args\$use_httpgd <- plot_backend %in% c\("auto", "httpgd"\)/);
+  assert.match(script, /connect_args\$use_jgd <- plot_backend %in% c\("auto", "jgd"\)/);
+  assert.match(script, /do\.call\(connect, connect_args\)/);
+});
+
+test("sess launch safely declines unavailable APIs and missing endpoints", async (t) => {
+  for (const info of [undefined, { protocolVersion: 999, endpoint: "" }]) {
     const fixture = integrationFixture(t, info);
     const env = { SESS_ENDPOINT: "inherited", SESS_DISCOVERY_FILE: "inherited", R_CONSOLE_SESSION_BOOTSTRAP: "old" };
     await fixture.create().prepareStart(env);
@@ -175,46 +213,92 @@ test("focus before attach activates the stable identity and a detached UI reuses
   await integration.prepareStart(env);
   fixture.host.rProcess = { sessionId: randomUUID() };
   integration.afterRuntimeStarted();
-  integration.setActive(true);
+  const firstTerminal = { name: "R Console first" };
+  const activeTerminal = { name: "R Console active" };
+  integration.setActive(true, firstTerminal);
+  integration.setActive(false);
+  integration.setActive(true, activeTerminal);
   integration.handleMainPrompt();
   assert.deepEqual(fixture.activations, []);
   const r = await connectR(t, env.SESS_ENDPOINT);
   send(r.socket, attach);
   await waitFor(() => fixture.activations.length === 1 && server.messages.length > 0);
   assert.deepEqual(fixture.activations, [attach.params.session_id]);
+  assert.deepEqual(fixture.activationOptions, [{ terminal: activeTerminal }]);
   assert.deepEqual(server.messages[0], attach);
   assert.deepEqual(integration.getCachedWorkspaceData(), workspace);
   integration.disposeUi();
   const restored = fixture.create();
   restored.attachRuntime();
-  restored.setActive(true);
+  const reattachedTerminal = { name: "R Console restored" };
+  restored.setActive(true, reattachedTerminal);
   restored.handleMainPrompt();
   await waitFor(() => fixture.activations.length >= 2);
   assert.ok(fixture.activations.every((id) => id === attach.params.session_id));
+  assert.deepEqual(fixture.activationOptions, [
+    { terminal: activeTerminal },
+    { terminal: reattachedTerminal },
+  ]);
   assert.equal(fixture.discoveries(), 1);
   assert.deepEqual(fixture.commands, []);
 });
 
-test("reload reconnect waits for an empty main prompt and submits endpoint-based sess connect once", async (t) => {
-  const fixture = integrationFixture(t, { protocolVersion: 1, endpoint: "upstream", plotBackend: "jgd", jgdSocket: 'plot\\"socket' });
+test("reload reconnect reuses the bootstrap and passes the plot backend through", async (t) => {
+  for (const plotBackend of ["jgd", "native", "future-backend"]) {
+    await t.test(plotBackend, async (t) => {
+      const fixture = integrationFixture(t, {
+        protocolVersion: 999,
+        endpoint: "upstream",
+        plotBackend,
+        ...(plotBackend === "jgd" ? { jgdSocket: 'plot\\"socket' } : {}),
+      });
+      fixture.host.rProcess = { sessionId: randomUUID() };
+      fixture.host.inputState.text = "unfinished";
+      const integration = fixture.create();
+      integration.setActive(true);
+      integration.handleMainPrompt();
+      await delay(30);
+      assert.deepEqual(fixture.commands, []);
+      fixture.host.inputState.text = "";
+      integration.handleMainPrompt();
+      integration.handleMainPrompt();
+      await waitFor(() => fixture.commands.length === 1);
+      const { code } = fixture.commands[0];
+      assert.match(code, /Sys\.setenv\(SESS_ENDPOINT=/);
+      assert.ok(code.includes(`Sys.setenv(SESS_PLOT_BACKEND="${plotBackend}")`));
+      assert.match(code, /source\(.+sess\.R.+local=TRUE\)/);
+      assert.doesNotMatch(code, /sess::connect|use_httpgd|use_jgd/);
+      if (plotBackend === "jgd") {
+        assert.ok(code.includes('Sys.setenv(JGD_SOCKET="plot\\\\\\"socket")'));
+      } else {
+        assert.match(code, /Sys\.unsetenv\("JGD_SOCKET"\)/);
+      }
+      assert.equal(fixture.host.mode, "executing");
+    });
+  }
+});
+
+test("restored runtime rebinds its terminal after sess reconnect", { timeout: 10000 }, async (t) => {
+  const server = await upstream(t);
+  const fixture = integrationFixture(t, {
+    protocolVersion: 2,
+    endpoint: server.endpoint,
+    plotBackend: "standard",
+  });
   fixture.host.rProcess = { sessionId: randomUUID() };
-  fixture.host.inputState.text = "unfinished";
   const integration = fixture.create();
-  integration.setActive(true);
+  const terminal = { name: "R Console restored" };
+
+  integration.setActive(true, terminal);
   integration.handleMainPrompt();
-  await delay(30);
-  assert.deepEqual(fixture.commands, []);
-  fixture.host.inputState.text = "";
-  integration.handleMainPrompt();
-  integration.handleMainPrompt();
-  await waitFor(() => fixture.commands.length === 1);
-  const { code } = fixture.commands[0];
-  assert.match(code, /Sys.setenv\(SESS_ENDPOINT=/);
-  assert.match(code, /sess::connect\( endpoint=/);
-  assert.match(code, /use_httpgd=FALSE, use_jgd=TRUE/);
-  assert.ok(code.includes('Sys.setenv(JGD_SOCKET="plot\\\\\\"socket")'));
-  assert.doesNotMatch(code, /pipe_path|notify_client/);
-  assert.equal(fixture.host.mode, "executing");
+  await waitFor(() => fixture.commands.length === 1 && integration.connection?.pipePath);
+
+  const r = await connectR(t, integration.connection.pipePath);
+  send(r.socket, attachV2);
+  await waitFor(() => fixture.activations.length === 1);
+
+  assert.deepEqual(fixture.activations, [attachV2.params.session_id]);
+  assert.deepEqual(fixture.activationOptions, [{ terminal }]);
 });
 
 test("activation rejected before upstream attach completes retries on workspace data", { timeout: 10000 }, async (t) => {
@@ -254,6 +338,38 @@ test("runtime exit cancels pending connection discovery", async (t) => {
   assert.equal(integration.proxy, undefined);
   assert.equal(integration.connection, undefined);
   assert.deepEqual(fixture.commands, []);
+});
+
+test("proxy forwards protocol 2 attach metadata and keeps workspace and completion capabilities", { timeout: 10000 }, async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+
+  const endpoint = await proxy.start();
+  const r = await connectR(t, endpoint);
+  send(r.socket, attachV2);
+  await waitFor(() =>
+    proxy.getSessionId() === attachV2.params.session_id &&
+    server.messages.some((message) => message.method === "attach") &&
+    proxy.getWorkspaceData()
+  );
+
+  assert.deepEqual(
+    server.messages.find((message) => message.method === "attach"),
+    attachV2
+  );
+  assert.deepEqual(proxy.getWorkspaceData(), workspace);
+
+  const completion = proxy.requestMemberCompletions("x", "$");
+  await waitFor(() => r.messages.some((message) => message.method === "completion"));
+  const request = r.messages.find((message) => message.method === "completion");
+  send(r.socket, {
+    jsonrpc: "2.0",
+    id: request.id,
+    result: [{ name: "member", type: "numeric" }],
+  });
+  assert.deepEqual(await completion, [{ name: "member", type: "numeric" }]);
 });
 
 test("proxy replacement survives old socket close, forwards Unicode, and propagates upstream disconnect", { timeout: 10000 }, async (t) => {

@@ -151,7 +151,12 @@ test("the LSP client sends qualified input and maps both completion range format
     },
     protocol2CodeConverter: { asCompletionResult: async (result) => result },
     sendNotification: async (method, params) => { if (method !== "close") synced.push(params); },
-    sendRequest: async (_method, params) => {
+    sendRequest: async (method, params) => {
+      if (method === "rConsole/checkPackageChanges") {
+        assert.deepEqual(params.packages, ["stats", "dplyr"]);
+        return [];
+      }
+      assert.equal(method, "completion");
       assert.equal(params.text, "stats::filter() + dplyr::filter(si)");
       assert.deepEqual(params.position, new Position(0, 34));
       const range = new Range(new Position(0, 32), new Position(0, 34));
@@ -176,4 +181,962 @@ test("the LSP client sends qualified input and maps both completion range format
   assert.equal(synced[1].text, "dplyr::filter() + dplyr::filter(si)");
   assert.ok(synced[1].version > synced[0].version);
   assert.equal(doc.getText(), input);
+});
+
+
+test("package change restarts the console language server before completion", async (t) => {
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  class TestVirtualRDocument {
+    project() {
+      return {
+        document: { getText: () => "foo::bar", version: 1 },
+        toServerPosition: (position) => position,
+        toConsolePosition: (position) => position,
+      };
+    }
+    update() {}
+    selectFunction() {}
+  }
+  const vscode = {
+    Position: TestPosition,
+    Range: class Range {},
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "./virtualRDocument": { VirtualRDocument: TestVirtualRDocument },
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({
+    consoleId: "package-refresh-test",
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+  });
+  t.after(() => client.dispose());
+
+  const firstClient = {
+    isRunning: () => true,
+    sendRequest: async (method, params) => {
+      assert.equal(method, "rConsole/checkPackageChanges");
+      assert.deepEqual(params.packages, ["foo"]);
+      return ["foo"];
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  const secondClient = {
+    isRunning: () => true,
+    code2ProtocolConverter: { asCompletionParams: () => ({}) },
+    protocol2CodeConverter: { asCompletionResult: async (result) => result },
+    sendRequest: async (method) => {
+      if (method === "rConsole/checkPackageChanges") {
+        return [];
+      }
+      assert.equal(method, "completion");
+      return [{ label: "new" }];
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  client.client = firstClient;
+  client.syncDocument = async () => {};
+  client.applySessionState = async () => {};
+
+  let stops = 0;
+  let starts = 0;
+  client.stop = async () => {
+    stops += 1;
+    client.client = undefined;
+    return true;
+  };
+  client.start = async () => {
+    starts += 1;
+    client.client = secondClient;
+    client.lastPackageCheckAt = 0;
+  };
+
+  const result = await client.provideCompletionItems(
+    { getText: () => "foo::bar" },
+    new TestPosition(0, 8)
+  );
+  assert.deepEqual(result, [{ label: "new" }]);
+  assert.equal(stops, 1);
+  assert.equal(starts, 1);
+});
+
+
+test("concurrent package change checks share the in-flight request", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({
+    consoleId: "package-refresh-concurrency-test",
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+  });
+  t.after(() => client.dispose());
+
+  let checks = 0;
+  let resolveCheck;
+  const languageClient = {
+    isRunning: () => true,
+    sendRequest: (method, params) => {
+      assert.equal(method, "rConsole/checkPackageChanges");
+      assert.deepEqual(params.packages, ["foo"]);
+      checks += 1;
+      return new Promise((resolve) => {
+        resolveCheck = resolve;
+      });
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+  client.client = languageClient;
+
+  const first = client.packageChangesDetected(languageClient, "foo::bar");
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = client.packageChangesDetected(languageClient, "foo::bar");
+
+  assert.equal(checks, 1);
+  resolveCheck(["foo"]);
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+});
+
+
+test("package change checks are throttled across rapid completions", async (t) => {
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  class TestVirtualRDocument {
+    project() {
+      return {
+        document: { getText: () => "foo::bar", version: 1 },
+        toServerPosition: (position) => position,
+        toConsolePosition: (position) => position,
+      };
+    }
+    update() {}
+    selectFunction() {}
+  }
+  const vscode = {
+    Position: TestPosition,
+    Range: class Range {},
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "./virtualRDocument": { VirtualRDocument: TestVirtualRDocument },
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({
+    consoleId: "package-refresh-throttle-test",
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+  });
+  t.after(() => client.dispose());
+  client.syncDocument = async () => {};
+  client.applySessionState = async () => {};
+
+  let checks = 0;
+  let completions = 0;
+  client.client = {
+    isRunning: () => true,
+    code2ProtocolConverter: { asCompletionParams: () => ({}) },
+    protocol2CodeConverter: { asCompletionResult: async (result) => result },
+    sendRequest: async (method) => {
+      if (method === "rConsole/checkPackageChanges") {
+        checks += 1;
+        return [];
+      }
+      completions += 1;
+      return [];
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  const doc = { getText: () => "foo::bar" };
+  await client.provideCompletionItems(doc, new TestPosition(0, 8));
+  await client.provideCompletionItems(doc, new TestPosition(0, 8));
+
+  assert.equal(checks, 1);
+  assert.equal(completions, 2);
+});
+
+
+test("language-server completion starts before a fresh workspace request finishes", async () => {
+  let resolveWorkspace;
+  let lspCompletionStarted = false;
+  const workspaceRequest = new Promise((resolve) => {
+    resolveWorkspace = resolve;
+  });
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position: TestPosition },
+    "../../Language/completion": {
+      getCompletionContext: (input, cursor) => ({
+        kind: "default",
+        prefix: input.slice(0, cursor),
+        replaceStart: 0,
+        snapshotInput: input,
+        snapshotCursor: cursor,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (
+        _context,
+        _document,
+        _position,
+        _sessionData,
+        _linesBefore,
+        _recentEntries,
+        completionProvider
+      ) => {
+        if (completionProvider) {
+          await completionProvider.provideCompletionItems();
+        }
+        return [];
+      },
+      getCompletionIdentityKey: () => "",
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: () => [],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: () => workspaceRequest,
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => {
+      lspCompletionStarted = true;
+      return [];
+    },
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+  const input = {
+    text: "mea",
+    currentLine: "mea",
+    cursorCol: 3,
+    cursorRow: 0,
+    lines: ["mea"],
+    textBeforeCursor: "mea",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lspCompletionStarted, true);
+  await request;
+
+  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+});
+
+
+test("member and package completions do not refresh workspace data", async () => {
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const contexts = new Map([
+    ["obj$", {
+      kind: "member", prefix: "", replaceStart: 4, operator: "$", objectName: "obj",
+      snapshotInput: "obj$", snapshotCursor: 4,
+    }],
+    ["obj@", {
+      kind: "member", prefix: "", replaceStart: 4, operator: "@", objectName: "obj",
+      snapshotInput: "obj@", snapshotCursor: 4,
+    }],
+    ["stats::", {
+      kind: "package", prefix: "", replaceStart: 7, triggerCharacter: ":",
+      snapshotInput: "stats::", snapshotCursor: 7,
+    }],
+  ]);
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position: TestPosition },
+    "../../Language/completion": {
+      getCompletionContext: (input) => contexts.get(input),
+      needsLanguageServerCompletion: (context) => context.kind === "package",
+      collectCompletionEntries: async () => [],
+      getCompletionIdentityKey: () => "",
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: () => [],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: async () => {
+      throw new Error("workspace request should not run");
+    },
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  for (const text of contexts.keys()) {
+    const input = {
+      text,
+      currentLine: text,
+      cursorCol: text.length,
+      cursorRow: 0,
+      lines: [text],
+      textBeforeCursor: text,
+    };
+    await lang.handleAutocomplete({
+      input,
+      getCurrentInput: () => input,
+      getWorkspaceData: () => undefined,
+      applyCompletion: () => {},
+    });
+  }
+});
+
+
+test("F7 refinement starts language-server completion before workspace refresh finishes", async () => {
+  let resolveWorkspace;
+  const workspaceRequest = new Promise((resolve) => {
+    resolveWorkspace = resolve;
+  });
+  let refinedCompletionStarted = false;
+  let changeValue;
+  let hide;
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const quickPick = {
+    items: [],
+    activeItems: [],
+    value: "",
+    onDidChangeValue: (listener) => {
+      changeValue = listener;
+    },
+    onDidAccept: () => {},
+    onDidHide: (listener) => {
+      hide = listener;
+    },
+    show: () => {},
+    hide: () => {
+      hide?.();
+    },
+    dispose: () => {},
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: TestPosition,
+      QuickPickItemKind: { Separator: -1 },
+      window: { createQuickPick: () => quickPick },
+    },
+    "../../Language/completion": {
+      getCompletionContext: (input, cursor) => input.length === 0
+        ? undefined
+        : {
+            kind: "default",
+            prefix: input.slice(0, cursor),
+            replaceStart: 0,
+            snapshotInput: input,
+            snapshotCursor: cursor,
+          },
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (context) => {
+        if (context.prefix === "f") {
+          refinedCompletionStarted = true;
+        }
+        return [];
+      },
+      getCompletionIdentityKey: () => "",
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: () => [],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: () => workspaceRequest,
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  const input = {
+    text: "",
+    currentLine: "",
+    cursorCol: 0,
+    cursorRow: 0,
+    lines: [""],
+    textBeforeCursor: "",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    force: true,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  changeValue("f");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(refinedCompletionStarted, true);
+
+  quickPick.hide();
+  await request;
+  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+});
+
+
+test("package completion filters locally without repeated language-server requests", async () => {
+  let completionCalls = 0;
+  let changeValue;
+  let hide;
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const quickPick = {
+    items: [],
+    activeItems: [],
+    value: "",
+    onDidChangeValue: (listener) => {
+      changeValue = listener;
+    },
+    onDidAccept: () => {},
+    onDidHide: (listener) => {
+      hide = listener;
+    },
+    show: () => {},
+    hide: () => {
+      hide?.();
+    },
+    dispose: () => {},
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: TestPosition,
+      QuickPickItemKind: { Separator: -1 },
+      window: { createQuickPick: () => quickPick },
+    },
+    "../../Language/completion": {
+      getCompletionContext: () => ({
+        kind: "package",
+        prefix: "",
+        replaceStart: 7,
+        triggerCharacter: ":",
+        snapshotInput: "stats::",
+        snapshotCursor: 7,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async () => {
+        completionCalls += 1;
+        return [{
+          label: "filter",
+          insertText: "filter",
+          source: "lsp",
+        }];
+      },
+      getCompletionIdentityKey: (entry) => entry.label,
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: (entries) => entries,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: async () => {
+      throw new Error("workspace request should not run");
+    },
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  const input = {
+    text: "stats::",
+    currentLine: "stats::",
+    cursorCol: 7,
+    cursorRow: 0,
+    lines: ["stats::"],
+    textBeforeCursor: "stats::",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 1);
+  for (const value of ["f", "fi", "fil", "filt"]) {
+    changeValue(value);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 1);
+
+  quickPick.hide();
+  await request;
+});
+
+
+test("runtime column completion starts while language-server completion is pending", async () => {
+  let resolveLsp;
+  const lspResult = new Promise((resolve) => {
+    resolveLsp = resolve;
+  });
+  let runtimeStarted = false;
+  const context = {
+    kind: "argument",
+    prefix: "",
+    replaceStart: 7,
+    functionName: "filter",
+    dataObjectName: "df",
+    snapshotInput: "filter(",
+    snapshotCursor: 7,
+  };
+  const workspace = {
+    search: [],
+    loaded_namespaces: [],
+    globalenv: { df: { names: [] } },
+  };
+  const request = completion.collectCompletionEntries(
+    context,
+    { getText: () => "filter(" },
+    { line: 0, character: 7 },
+    workspace,
+    [],
+    [],
+    { provideCompletionItems: () => lspResult },
+    async (expression, operator) => {
+      assert.equal(expression, "df");
+      assert.equal(operator, "$");
+      runtimeStarted = true;
+      return [{ name: "alpha" }];
+    }
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtimeStarted, true);
+
+  resolveLsp([]);
+  const entries = await request;
+  assert.ok(entries.some((entry) => entry.label === "alpha"));
+});
+
+
+test("session state sync deduplicates concurrent requests and applies newer state once", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({ consoleId: "session-sync-test", env: {} });
+  t.after(() => client.dispose());
+
+  const requests = [];
+  const resolvers = [];
+  client.client = {
+    isRunning: () => true,
+    sendRequest: (method, params) => {
+      assert.equal(method, "rConsole/syncSessionState");
+      requests.push(params);
+      return new Promise((resolve) => {
+        resolvers.push(resolve);
+      });
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  const firstState = {
+    attachedPackages: ["package:stats"],
+  };
+  const nextState = {
+    attachedPackages: ["package:dplyr", "package:stats"],
+  };
+
+  const first = client.syncSessionState(firstState);
+  const duplicate = client.syncSessionState(firstState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0], firstState);
+
+  const newer = client.syncSessionState(nextState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+
+  resolvers.shift()(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], nextState);
+
+  resolvers.shift()(true);
+  await Promise.all([first, duplicate, newer]);
+  assert.equal(requests.length, 2);
+
+  await client.syncSessionState(nextState);
+  assert.equal(requests.length, 2);
+});
+
+
+test("failed session state sync still applies a newer pending state", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({ consoleId: "session-sync-failure-test", env: {} });
+  t.after(() => client.dispose());
+
+  const requests = [];
+  const pending = [];
+  client.client = {
+    isRunning: () => true,
+    sendRequest: (method, params) => {
+      assert.equal(method, "rConsole/syncSessionState");
+      requests.push(params);
+      return new Promise((resolve, reject) => {
+        pending.push({ resolve, reject });
+      });
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  const firstState = {
+    attachedPackages: ["stats"],
+  };
+  const nextState = {
+    attachedPackages: ["dplyr", "stats"],
+  };
+
+  const first = client.syncSessionState(firstState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+
+  const newer = client.syncSessionState(nextState);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+
+  pending.shift().reject(new Error("sync failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], nextState);
+
+  pending.shift().resolve(true);
+  await Promise.all([first, newer]);
+
+  await client.syncSessionState(nextState);
+  assert.equal(requests.length, 2);
+});
+
+
+test("failed session state sync does not immediately retry the same state", async (t) => {
+  const vscode = {
+    Position,
+    Uri: { parse: (value) => ({ toString: () => value }) },
+    window: { createOutputChannel: () => ({ dispose() {} }) },
+  };
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode,
+    "vscode-languageclient/node": {
+      LanguageClient: class {},
+      CompletionRequest: { type: "completion" },
+      DidOpenTextDocumentNotification: { type: "open" },
+      DidChangeTextDocumentNotification: { type: "change" },
+      DidCloseTextDocumentNotification: { type: "close" },
+    },
+  });
+  const client = new ConsoleLspClient({ consoleId: "session-sync-same-failure-test", env: {} });
+  t.after(() => client.dispose());
+
+  let requests = 0;
+  client.client = {
+    isRunning: () => true,
+    sendRequest: async () => {
+      requests += 1;
+      throw new Error("sync failed");
+    },
+    stop: async () => {},
+    dispose: async () => {},
+  };
+
+  await client.syncSessionState({
+    attachedPackages: ["stats"],
+  });
+  assert.equal(requests, 1);
+});
+
+
+test("namespace-only session changes do not resync the language server", () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {},
+    "../../Language/completion": {
+      getCompletionContext: () => undefined,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestMemberCompletions: async () => [],
+  });
+  const states = [];
+  lang.consoleLsp = {
+    syncSessionState: (state) => {
+      states.push(state);
+      return Promise.resolve();
+    },
+  };
+
+  assert.equal(lang.updateSessionData({
+    search: [".GlobalEnv", "package:stats", "package:base"],
+    loaded_namespaces: ["base", "stats"],
+    globalenv: {},
+  }), true);
+  assert.deepEqual(states, [{
+    attachedPackages: ["stats", "base"],
+  }]);
+
+  assert.equal(lang.updateSessionData({
+    search: [".GlobalEnv", "package:stats", "package:base"],
+    loaded_namespaces: ["base", "stats", "methods"],
+    globalenv: {},
+  }), false);
+  assert.equal(states.length, 1);
+
+  assert.equal(lang.updateSessionData({
+    search: [".GlobalEnv", "package:dplyr", "package:stats", "package:base"],
+    loaded_namespaces: ["base", "stats", "methods", "dplyr"],
+    globalenv: {},
+  }), true);
+  assert.deepEqual(states[1], {
+    attachedPackages: ["dplyr", "stats", "base"],
+  });
+});
+
+
+test("completion entries preserve incomplete language-server results", async () => {
+  const context = completion.getCompletionContext("stats::", 7);
+  const entries = await completion.collectCompletionEntries(
+    context,
+    { getText: () => "stats::" },
+    { line: 0, character: 7 },
+    undefined,
+    [],
+    [],
+    {
+      provideCompletionItems: async () => ({
+        isIncomplete: true,
+        items: [{
+          label: "filter",
+          insertText: "filter",
+          kind: 2,
+          detail: "{stats}",
+        }],
+      }),
+    }
+  );
+
+  assert.equal(entries.isIncomplete, true);
+  assert.ok(entries.some((entry) => entry.label === "filter"));
+});
+
+test("incomplete package completion re-queries until a complete result arrives", async () => {
+  let completionCalls = 0;
+  let changeValue;
+  let hide;
+  class TestPosition {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }
+  const quickPick = {
+    items: [],
+    activeItems: [],
+    value: "",
+    onDidChangeValue: (listener) => {
+      changeValue = listener;
+    },
+    onDidAccept: () => {},
+    onDidHide: (listener) => {
+      hide = listener;
+    },
+    show: () => {},
+    hide: () => {
+      hide?.();
+    },
+    dispose: () => {},
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: TestPosition,
+      QuickPickItemKind: { Separator: -1 },
+      window: { createQuickPick: () => quickPick },
+    },
+    "../../Language/completion": {
+      getCompletionContext: () => ({
+        kind: "package",
+        prefix: "",
+        replaceStart: 7,
+        triggerCharacter: ":",
+        snapshotInput: "stats::",
+        snapshotCursor: 7,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (context) => {
+        completionCalls += 1;
+        const entries = [{
+          label: context.prefix ? "filter" : "median",
+          insertText: context.prefix ? "filter" : "median",
+          source: "lsp",
+        }];
+        if (!context.prefix) {
+          entries.isIncomplete = true;
+        }
+        return entries;
+      },
+      getCompletionIdentityKey: (entry) => entry.label,
+      isCompletionPickItem: () => false,
+      toCompletionQuickPickItems: (entries) => entries,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "",
+    rPath: "R",
+    env: {},
+    requestWorkspaceData: async () => {
+      throw new Error("workspace request should not run");
+    },
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({
+    provideCompletionItems: async () => [],
+  });
+  lang.getOrOpenCompletionDocument = async () => ({});
+
+  const input = {
+    text: "stats::",
+    currentLine: "stats::",
+    cursorCol: 7,
+    cursorRow: 0,
+    lines: ["stats::"],
+    textBeforeCursor: "stats::",
+  };
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => undefined,
+    applyCompletion: () => {},
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 1);
+
+  changeValue("f");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 2);
+
+  for (const value of ["fi", "fil", "filt"]) {
+    changeValue(value);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 2);
+
+  changeValue("");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 2);
+
+  quickPick.hide();
+  await request;
 });

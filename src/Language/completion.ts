@@ -26,6 +26,10 @@ export type CompletionEntry = {
   packageName?: string;
 };
 
+export type CompletionEntries = CompletionEntry[] & {
+  isIncomplete?: boolean;
+};
+
 const DEFAULT_COMPLETION_GROUP_ORDER = [
   "Runtime Variables",
   "Runtime Functions",
@@ -373,24 +377,43 @@ export async function collectCompletionEntries(
   completionProvider?: CompletionProvider,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string
-): Promise<CompletionEntry[]> {
+): Promise<CompletionEntries> {
   const sessionItems = getSessionCompletions(context, sessionData);
-  const runtimeMemberItems =
+  const runtimeMemberItemsRequest =
     context.kind === "member"
-      ? await getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
-      : [];
+      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
+      : Promise.resolve([]);
   const includeLspItems =
     needsLanguageServerCompletion(context) && !!doc && !!position;
-  const rawLspItems =
+  const rawLspItemsRequest =
     !includeLspItems
-      ? []
-      : await getLanguageServerCompletions(
+      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false })
+      : getLanguageServerCompletions(
           context,
           doc,
           position,
           multilineBuffer,
           completionProvider
         );
+  const bufferItems = getConsoleBufferCompletions(
+    context,
+    consoleInputText ?? doc?.getText() ?? "",
+    recentConsoleEntries
+  );
+  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
+  const columnItemsRequest =
+    cachedColumnItems.length > 0
+      ? Promise.resolve(cachedColumnItems)
+      : getRuntimeDataColumnCompletions(
+          context,
+          requestRuntimeMemberCompletions
+        );
+  const [runtimeMemberItems, rawLspResult, columnItems] = await Promise.all([
+    runtimeMemberItemsRequest,
+    rawLspItemsRequest,
+    columnItemsRequest,
+  ]);
+  const rawLspItems = rawLspResult.entries;
   const lspItems =
     isGlobalSymbolContext(context)
       ? filterShadowedWorkspaceEntries(
@@ -399,19 +422,6 @@ export async function collectCompletionEntries(
           context.kind === "argument" ? isArgumentCompletionEntry : undefined
         )
       : rawLspItems;
-  const bufferItems = getConsoleBufferCompletions(
-    context,
-    consoleInputText ?? doc?.getText() ?? "",
-    recentConsoleEntries
-  );
-  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
-  const columnItems =
-    cachedColumnItems.length > 0
-      ? cachedColumnItems
-      : await getRuntimeDataColumnCompletions(
-          context,
-          requestRuntimeMemberCompletions
-        );
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
@@ -424,12 +434,12 @@ export async function collectCompletionEntries(
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
-    return dedupeCompletionEntries([
+    return asCompletionEntries(dedupeCompletionEntries([
       ...columnFiltered,
       ...lspFiltered,
       ...sessionFiltered,
       ...bufferFiltered,
-    ]);
+    ]), rawLspResult.isIncomplete);
   }
 
   if (context.kind === "argument") {
@@ -438,12 +448,12 @@ export async function collectCompletionEntries(
     const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
-    return dedupeCompletionEntries([
+    return asCompletionEntries(dedupeCompletionEntries([
       ...columnFiltered,
       ...lspFiltered,
       ...sessionFiltered,
       ...bufferFiltered,
-    ]);
+    ]), rawLspResult.isIncomplete);
   }
 
   if (context.kind === "member") {
@@ -451,17 +461,26 @@ export async function collectCompletionEntries(
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     if (context.chainedBracket && bufferFiltered.length > 0) {
-      return dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]);
+      return asCompletionEntries(
+        dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]),
+        rawLspResult.isIncomplete
+      );
     }
     if (runtimeFiltered.length > 0) {
-      return dedupeCompletionEntries(runtimeFiltered);
+      return asCompletionEntries(
+        dedupeCompletionEntries(runtimeFiltered),
+        rawLspResult.isIncomplete
+      );
     }
-    return dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]);
+    return asCompletionEntries(
+      dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]),
+      rawLspResult.isIncomplete
+    );
   }
 
   const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
 
-  return dedupeCompletionEntries(filterCompletionEntries(
+  return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(
     [
       ...defaultColumnFiltered,
       ...lspItems,
@@ -469,7 +488,7 @@ export async function collectCompletionEntries(
       ...fallbackBufferItems,
     ],
     context.prefix
-  ));
+  )), rawLspResult.isIncomplete);
 }
 
 export function needsLanguageServerCompletion(context: CompletionContext): boolean {
@@ -886,9 +905,9 @@ async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider
-): Promise<CompletionEntry[]> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean }> {
   if (!completionProvider) {
-    return [];
+    return { entries: [], isIncomplete: false };
   }
   try {
     const result = await completionProvider.provideCompletionItems(
@@ -903,18 +922,32 @@ async function getLanguageServerCompletions(
       isLanguageServerCompletionItem(context, item)
     );
     
-    return filteredItems.map((item) => ({
-      label: stripSnippetSyntax(getCompletionLabel(item)),
-      insertText: getCompletionInsertText(item),
-      kind: item.kind,
-      detail: item.detail,
-      source: "lsp",
-      replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
-      packageName: getCompletionPackage(item),
-    }));
+    return {
+      entries: filteredItems.map((item) => ({
+        label: stripSnippetSyntax(getCompletionLabel(item)),
+        insertText: getCompletionInsertText(item),
+        kind: item.kind,
+        detail: item.detail,
+        source: "lsp",
+        replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
+        packageName: getCompletionPackage(item),
+      })),
+      isIncomplete: !Array.isArray(result) && result?.isIncomplete === true,
+    };
   } catch {
-    return [];
+    return { entries: [], isIncomplete: false };
   }
+}
+
+function asCompletionEntries(
+  entries: CompletionEntry[],
+  isIncomplete: boolean
+): CompletionEntries {
+  const result = entries as CompletionEntries;
+  if (isIncomplete) {
+    result.isIncomplete = true;
+  }
+  return result;
 }
 
 function getCompletionPackage(item: vscode.CompletionItem): string | undefined {

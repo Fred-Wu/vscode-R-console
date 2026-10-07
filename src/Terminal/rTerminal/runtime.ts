@@ -151,8 +151,12 @@ function vscodeRIntegration(host: RuntimeHost): VscodeRSessionIntegration {
   return getVscodeRIntegration(host);
 }
 
-export function setRuntimeVscodeRSessionActive(host: RuntimeHost, active: boolean): void {
-  vscodeRIntegration(host).setActive(active);
+export function setRuntimeVscodeRSessionActive(
+  host: RuntimeHost,
+  active: boolean,
+  terminal?: vscode.Terminal
+): void {
+  vscodeRIntegration(host).setActive(active, terminal);
 }
 
 export function getCachedRuntimeWorkspaceData(

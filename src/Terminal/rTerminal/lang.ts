@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  type CompletionEntries,
   type CompletionEntry,
   type CompletionProvider,
   type RuntimeMemberCompletionRequester,
@@ -37,14 +38,12 @@ type AutocompleteRequest = {
   input: InputSnapshot;
   getCurrentInput: () => InputSnapshot;
   getWorkspaceData: () => WorkspaceData | undefined;
-  refreshWorkspaceData: () => void;
   force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
 };
 
 type ConsoleSessionState = {
   attachedPackages: string[];
-  loadedNamespaces: string[];
 };
 
 export class RTermLang {
@@ -76,7 +75,6 @@ export class RTermLang {
     input,
     getCurrentInput,
     getWorkspaceData,
-    refreshWorkspaceData,
     force = false,
     applyCompletion,
   }: AutocompleteRequest): Promise<void> {
@@ -107,9 +105,6 @@ export class RTermLang {
         ? this.options.requestWorkspaceData?.()
         : undefined;
       const cachedSessionData = getWorkspaceData();
-      if (!shouldRequestWorkspaceData) {
-        refreshWorkspaceData();
-      }
 
       const latestInput = getCurrentInput();
       if (
@@ -124,22 +119,19 @@ export class RTermLang {
         context.kind === "bracket" && !!context.dataObjectName
       );
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
+      let refreshedSessionData: WorkspaceData | undefined;
+      void workspaceDataRequest?.then((data) => {
+        refreshedSessionData = data ?? getWorkspaceData();
+      }).catch(() => undefined);
+
       let completionProvider: CompletionProvider | undefined;
+      const completionProviderRequest = needsLsp
+        ? this.ensureConsoleLspStarted()
+        : Promise.resolve(undefined);
+      const documentRequest = needsLsp
+        ? this.getOrOpenCompletionDocument(latestInput.text)
+        : Promise.resolve(undefined);
       const fullEntriesPromise = (async () => {
-        const sessionData = shouldRequestWorkspaceData
-          ? (await workspaceDataRequest) ?? getWorkspaceData() ?? cachedSessionData
-          : cachedSessionData;
-        if (!this.isCurrentCompletionRequest(requestId)) {
-          return undefined;
-        }
-
-        const completionProviderRequest = needsLsp
-          ? this.ensureConsoleLspStarted()
-          : Promise.resolve(undefined);
-        const documentRequest = needsLsp
-          ? this.getOrOpenCompletionDocument(latestInput.text)
-          : Promise.resolve(undefined);
-
         completionProvider = await completionProviderRequest;
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
@@ -154,6 +146,8 @@ export class RTermLang {
           context.snapshotCursor
         );
         const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
+        const sessionData =
+          refreshedSessionData ?? getWorkspaceData() ?? cachedSessionData;
         return await collectCompletionEntries(
           context,
           document,
@@ -282,7 +276,7 @@ export class RTermLang {
         }
       };
       const showCompletionQuickPick = async (
-        initialEntries: CompletionEntry[],
+        initialEntries: CompletionEntries,
         delayedEntries?: typeof fullEntriesPromise
       ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
         const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
@@ -290,7 +284,9 @@ export class RTermLang {
         let request = 0;
         let blankContextRefined = false;
         let baselineEntries = initialEntries;
+        let baselineIncomplete = initialEntries.isIncomplete === true;
         let sourceEntries = initialEntries;
+        let sourceIncomplete = baselineIncomplete;
         Object.assign(pick, {
           matchOnDescription: false,
           matchOnDetail: false,
@@ -306,7 +302,9 @@ export class RTermLang {
             return;
           }
           baselineEntries = nextEntries;
+          baselineIncomplete = nextEntries.isIncomplete === true;
           sourceEntries = nextEntries;
+          sourceIncomplete = baselineIncomplete;
           setQuickPickItems(pick, sourceEntries, pick.value);
         }).catch(() => undefined);
         pick.onDidChangeValue((value) => void (async () => {
@@ -323,10 +321,23 @@ export class RTermLang {
             return;
           }
 
+          if (context.kind === "package" && value.length === 0) {
+            request += 1;
+            sourceEntries = baselineEntries;
+            sourceIncomplete = baselineIncomplete;
+            setQuickPickItems(pick, sourceEntries, value);
+            return;
+          }
+
           const refinesEmptyContext =
             value.length > 0 &&
             refinesBlankContext;
           setQuickPickItems(pick, sourceEntries, value);
+          if (context.kind === "package" && value.length > 0 && sourceIncomplete) {
+            const currentRequest = ++request;
+            await requestRefinedEntries(value, currentRequest);
+            return;
+          }
           if (refinesEmptyContext) {
             if (blankContextRefined) {
               return;
@@ -336,11 +347,6 @@ export class RTermLang {
             await requestRefinedEntries(value[0], currentRequest);
             return;
           }
-          if (context.kind !== "package") {
-            return;
-          }
-          const currentRequest = ++request;
-          await requestRefinedEntries(value, currentRequest);
         })().catch(() => undefined));
         const requestRefinedEntries = async (
           value: string,
@@ -367,10 +373,14 @@ export class RTermLang {
             nextContext.triggerCharacter = undefined;
           }
           const nextInputText = lines.join("\n");
-          const refinedSessionData =
-            (await this.options.requestWorkspaceData?.()) ??
-            getWorkspaceData() ??
-            cachedSessionData;
+          let refreshedRefinedSessionData: WorkspaceData | undefined;
+          const refinedWorkspaceDataRequest = this.shouldRequestWorkspaceData(nextContext)
+            ? this.options.requestWorkspaceData?.()
+            : undefined;
+          void refinedWorkspaceDataRequest?.then((data) => {
+            refreshedRefinedSessionData = data ?? getWorkspaceData();
+          }).catch(() => undefined);
+
           const nextNeedsLsp = needsLanguageServerCompletion(nextContext);
           const nextDocumentRequest = nextNeedsLsp
             ? this.getOrOpenCompletionDocument(nextInputText)
@@ -382,6 +392,8 @@ export class RTermLang {
           if (!this.isCurrentCompletionRequest(requestId)) {
             return;
           }
+          const refinedSessionData =
+            refreshedRefinedSessionData ?? getWorkspaceData() ?? cachedSessionData;
           const nextEntries = await collectCompletionEntries(
             nextContext,
             nextDocument,
@@ -402,6 +414,7 @@ export class RTermLang {
             sourceEntries = context.kind === "package"
               ? nextEntries
               : mergeCompletionEntries(baselineEntries, nextEntries);
+            sourceIncomplete = nextEntries.isIncomplete === true;
             setQuickPickItems(pick, sourceEntries, pick.value);
           }
         };
@@ -504,8 +517,7 @@ export class RTermLang {
     const nextState = this.toSessionState(data);
     if (
       this.sessionState &&
-      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages) &&
-      this.arraysEqual(nextState.loadedNamespaces, this.sessionState.loadedNamespaces)
+      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages)
     ) {
       return false;
     }
@@ -611,7 +623,6 @@ export class RTermLang {
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))
         .map((value) => value.slice(8)),
-      loadedNamespaces: [...data.loaded_namespaces],
     };
   }
 

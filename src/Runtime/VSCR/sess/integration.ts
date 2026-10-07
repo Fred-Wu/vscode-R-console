@@ -9,16 +9,19 @@ import type {
 } from "../types";
 import { SessProxy } from "./sessProxy";
 
-type VscodeRPlotBackend = "auto" | "standard" | "httpgd" | "jgd";
+type VscodeRSessionInfo = {
+  endpoint?: unknown;
+  plotBackend?: unknown;
+  jgdSocket?: unknown;
+  [key: string]: unknown;
+};
 
 type VscodeRSessionApi = {
-  getConnectionInfo(): Promise<{
-    protocolVersion: number;
-    endpoint: string;
-    plotBackend: VscodeRPlotBackend;
-    jgdSocket?: string;
-  } | undefined>;
-  activate(sessionId: string): Promise<boolean>;
+  getConnectionInfo(): Promise<VscodeRSessionInfo | undefined>;
+  activate(
+    sessionId: string,
+    options?: { terminal?: vscode.Terminal }
+  ): Promise<boolean>;
 };
 
 type VscodeRExtensionApi = {
@@ -27,13 +30,15 @@ type VscodeRExtensionApi = {
 
 type VscodeRSessionConnection = {
   pipePath: string;
-  plotBackend: VscodeRPlotBackend;
+  plotBackend: string;
   jgdSocket?: string;
-  activateSession(sessionId: string): Promise<boolean>;
+  activateSession(
+    sessionId: string,
+    options?: { terminal?: vscode.Terminal }
+  ): Promise<boolean>;
 };
 
 const VSCODE_R_EXTENSION_ID = "REditorSupport.r";
-const SUPPORTED_SESS_PROTOCOL_VERSION = 1;
 const SESS_ASYNC_PROMPT_PATTERN = /(\r?\[sess\][^\r\n]*)(?:\r\n|\n){2}> ?/g;
 const SESS_RECONNECT_NOISE_PATTERN =
   /\r?\[sess\] Failed to connect to IPC (?:pipe|endpoint): [^\r\n]*(?:\r\n|\n)?/g;
@@ -72,16 +77,26 @@ async function discoverSessionConnection(): Promise<
     const info = await sessionApi.getConnectionInfo();
     if (
       !info ||
-      info.protocolVersion !== SUPPORTED_SESS_PROTOCOL_VERSION ||
-      !info.endpoint
+      typeof info.endpoint !== "string" ||
+      info.endpoint.length === 0
     ) {
       return undefined;
     }
+    const plotBackend =
+      typeof info.plotBackend === "string" && info.plotBackend.length > 0
+        ? info.plotBackend
+        : "auto";
     return {
       pipePath: info.endpoint,
-      plotBackend: info.plotBackend,
-      jgdSocket: info.jgdSocket,
-      activateSession: (sessionId: string) => sessionApi.activate(sessionId),
+      plotBackend,
+      jgdSocket:
+        typeof info.jgdSocket === "string" && info.jgdSocket.length > 0
+          ? info.jgdSocket
+          : undefined,
+      activateSession: (
+        sessionId: string,
+        options?: { terminal?: vscode.Terminal }
+      ) => sessionApi.activate(sessionId, options),
     };
   } catch {
     return undefined;
@@ -105,23 +120,23 @@ function quoteRString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function buildConnectCommand(connection: VscodeRSessionConnection): string {
+function buildConnectCommand(
+  connection: VscodeRSessionConnection,
+  bootstrapPath: string
+): string {
   const rConfig = vscode.workspace.getConfiguration("r");
-  const plotBackend = connection.plotBackend;
   const jgdSocketCommand = connection.jgdSocket
     ? `Sys.setenv(JGD_SOCKET=${quoteRString(connection.jgdSocket)});`
     : "Sys.unsetenv(\"JGD_SOCKET\");";
   return [
-    "if (requireNamespace(\"sess\", quietly = TRUE) && \"endpoint\" %in% names(formals(sess::connect))) {",
     `Sys.setenv(SESS_ENDPOINT=${quoteRString(connection.pipePath)});`,
+    `Sys.setenv(SESS_PLOT_BACKEND=${quoteRString(connection.plotBackend)});`,
+    `Sys.setenv(SESS_RSTUDIOAPI=${quoteRString(
+      rConfig.get<boolean>("session.emulateRStudioAPI") === false ? "FALSE" : "TRUE"
+    )});`,
+    "Sys.unsetenv(c(\"SESS_USE_HTTPGD\", \"SESS_USE_JGD\"));",
     jgdSocketCommand,
-    "sess::connect(",
-    `endpoint=${quoteRString(connection.pipePath)},`,
-    `use_rstudioapi=${asRLogical(rConfig.get<boolean>("session.emulateRStudioAPI"), true)},`,
-    `use_httpgd=${asRLogical(plotBackend === "httpgd" || plotBackend === "auto", true)},`,
-    `use_jgd=${asRLogical(plotBackend === "jgd" || plotBackend === "auto", false)}`,
-    ")",
-    "}",
+    `source(${quoteRString(bootstrapPath)}, local=TRUE)`,
   ].join(" ");
 }
 
@@ -135,6 +150,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private reconnectPending: boolean;
   private mainPromptObserved: boolean;
   private active = false;
+  private activeTerminal: vscode.Terminal | undefined;
   private activationPending = false;
 
   constructor(host: RuntimeHost) {
@@ -186,19 +202,13 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     env.SESS_ENDPOINT = connection.pipePath;
     delete env.SESS_PIPE;
     const rConfig = vscode.workspace.getConfiguration("r");
-    const plotBackend = connection.plotBackend;
     env.SESS_RSTUDIOAPI = asRLogical(
       rConfig.get<boolean>("session.emulateRStudioAPI"),
       true
     );
-    env.SESS_USE_HTTPGD = asRLogical(
-      plotBackend === "httpgd" || plotBackend === "auto",
-      true
-    );
-    env.SESS_USE_JGD = asRLogical(
-      plotBackend === "jgd" || plotBackend === "auto",
-      false
-    );
+    env.SESS_PLOT_BACKEND = connection.plotBackend;
+    delete env.SESS_USE_HTTPGD;
+    delete env.SESS_USE_JGD;
     if (connection.jgdSocket) {
       env.JGD_SOCKET = connection.jgdSocket;
     } else {
@@ -242,8 +252,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.flushActivation();
   }
 
-  override setActive(active: boolean): void {
+  override setActive(active: boolean, terminal?: vscode.Terminal): void {
     this.active = active;
+    if (active && terminal) {
+      this.activeTerminal = terminal;
+    }
     this.activationPending = active;
     if (!active) {
       return;
@@ -290,6 +303,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.clearConnection();
     this.reconnectPending = false;
     this.activationPending = false;
+    this.activeTerminal = undefined;
   }
 
   override disposeUi(): void {
@@ -423,7 +437,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     }
 
     this.activationPending = false;
-    void activateSession(sessionId).then((activated) => {
+    void activateSession(
+      sessionId,
+      this.activeTerminal ? { terminal: this.activeTerminal } : undefined
+    ).then((activated) => {
       if (!activated && this.active) {
         this.activationPending = true;
       }
@@ -457,9 +474,16 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
         this.flushActivation();
         return;
       }
+      const bootstrapPath = path.join(
+        this.host.extensionPath,
+        "resources",
+        "r",
+        "VSCR",
+        "sess.R"
+      );
       if (
         this.canSubmitHiddenCommand() &&
-        this.submitHiddenCommand(buildConnectCommand(connection))
+        this.submitHiddenCommand(buildConnectCommand(connection, bootstrapPath))
       ) {
         this.reconnectPending = false;
       }
