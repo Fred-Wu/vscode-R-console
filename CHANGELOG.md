@@ -2,12 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
-## Unreleased
+## [0.5.2] - 2026-10-08
 
 ### Changed
 
 - Further improved console completion responsiveness and reliability, including package completions and updates when installed packages change during a session.
-- Improved compatibility with current and upcoming vscode-R releases.
+- Improved compatibility with current and upcoming vscode-R releases, including the updated `sess::connect()` API and terminal binding for workspace actions.
 
 ## [0.5.1] - 2026-09-27
 
