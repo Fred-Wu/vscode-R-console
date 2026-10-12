@@ -1,6 +1,4 @@
 import * as vscode from "vscode";
-import * as fs from "fs";
-import * as path from "path";
 import type { RuntimeHost } from "../../../Terminal/rTerminal/runtime";
 import { BaseVscodeRSessionIntegration } from "../integration";
 import type {
@@ -16,7 +14,15 @@ type VscodeRSessionInfo = {
   [key: string]: unknown;
 };
 
+type VscodeRPreparation = vscode.Disposable & {
+  readonly scriptPath: string;
+  readonly command: string;
+};
+
 type VscodeRSessionApi = {
+  prepareAttachment(options: {
+    connection: { transport: "sess"; endpoint: string };
+  }): Promise<VscodeRPreparation | undefined>;
   getConnectionInfo(): Promise<VscodeRSessionInfo | undefined>;
   activate(
     sessionId: string,
@@ -31,7 +37,7 @@ type VscodeRExtensionApi = {
 type VscodeRSessionConnection = {
   pipePath: string;
   plotBackend: string;
-  jgdSocket?: string;
+  prepareAttachment(endpoint: string): Promise<VscodeRPreparation | undefined>;
   activateSession(
     sessionId: string,
     options?: { terminal?: vscode.Terminal }
@@ -46,6 +52,7 @@ const SESS_RECONNECT_NOISE_PATTERN =
 let connectionDiscovery: Promise<VscodeRSessionConnection | undefined> | undefined;
 const proxiesByRuntimeSession = new Map<string, SessProxy>();
 const connectionsByProxy = new WeakMap<SessProxy, VscodeRSessionConnection>();
+const preparationsByRuntimeSession = new Map<string, VscodeRPreparation>();
 
 async function discoverSessionConnection(): Promise<
   VscodeRSessionConnection | undefined
@@ -68,6 +75,7 @@ async function discoverSessionConnection(): Promise<
   if (
     !sessionApi ||
     typeof sessionApi.getConnectionInfo !== "function" ||
+    typeof sessionApi.prepareAttachment !== "function" ||
     typeof sessionApi.activate !== "function"
   ) {
     return undefined;
@@ -93,6 +101,9 @@ async function discoverSessionConnection(): Promise<
         typeof info.jgdSocket === "string" && info.jgdSocket.length > 0
           ? info.jgdSocket
           : undefined,
+      prepareAttachment: (endpoint: string) => sessionApi.prepareAttachment({
+        connection: { transport: "sess", endpoint },
+      }),
       activateSession: (
         sessionId: string,
         options?: { terminal?: vscode.Terminal }
@@ -112,34 +123,6 @@ function getSessionConnection(): Promise<VscodeRSessionConnection | undefined> {
   return connectionDiscovery;
 }
 
-function asRLogical(value: boolean | undefined, defaultValue: boolean): string {
-  return (value ?? defaultValue) ? "TRUE" : "FALSE";
-}
-
-function quoteRString(value: string): string {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
-
-function buildConnectCommand(
-  connection: VscodeRSessionConnection,
-  bootstrapPath: string
-): string {
-  const rConfig = vscode.workspace.getConfiguration("r");
-  const jgdSocketCommand = connection.jgdSocket
-    ? `Sys.setenv(JGD_SOCKET=${quoteRString(connection.jgdSocket)});`
-    : "Sys.unsetenv(\"JGD_SOCKET\");";
-  return [
-    `Sys.setenv(SESS_ENDPOINT=${quoteRString(connection.pipePath)});`,
-    `Sys.setenv(SESS_PLOT_BACKEND=${quoteRString(connection.plotBackend)});`,
-    `Sys.setenv(SESS_RSTUDIOAPI=${quoteRString(
-      rConfig.get<boolean>("session.emulateRStudioAPI") === false ? "FALSE" : "TRUE"
-    )});`,
-    "Sys.unsetenv(c(\"SESS_USE_HTTPGD\", \"SESS_USE_JGD\"));",
-    jgdSocketCommand,
-    `source(${quoteRString(bootstrapPath)}, local=TRUE)`,
-  ].join(" ");
-}
-
 export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private connection: VscodeRSessionConnection | undefined;
   private connectionRefresh: Promise<VscodeRSessionConnection | undefined> | undefined;
@@ -152,6 +135,14 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private active = false;
   private activeTerminal: vscode.Terminal | undefined;
   private activationPending = false;
+  private preparation: VscodeRPreparation | undefined;
+  private initialBootstrapPending = false;
+  private reconnectCommandRunning = false;
+  private reconnectRetryBlocked = false;
+  private needsProxyReplacement = false;
+  private activationInFlight = false;
+  private activationTriggeredWhileInFlight = false;
+  private disposed = false;
 
   constructor(host: RuntimeHost) {
     super(host);
@@ -163,67 +154,88 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     const proxy = proxiesByRuntimeSession.get(sessionId);
     proxiesByRuntimeSession.delete(sessionId);
     proxy?.dispose();
+    const preparation = preparationsByRuntimeSession.get(sessionId);
+    preparationsByRuntimeSession.delete(sessionId);
+    preparation?.dispose();
   }
 
   override resetForStart(): void {
+    this.disposed = false;
     this.clearConnection();
+    this.releasePreparation();
     this.reconnectPending = false;
     this.mainPromptObserved = true;
+    this.initialBootstrapPending = false;
+    this.reconnectCommandRunning = false;
+    this.reconnectRetryBlocked = false;
+    this.needsProxyReplacement = false;
     this.activationPending = false;
+    this.activationInFlight = false;
+    this.activationTriggeredWhileInFlight = false;
     this.reconnectInFlight = false;
     this.reconnectNoiseUntil = 0;
   }
 
   override async prepareStart(env: NodeJS.ProcessEnv): Promise<void> {
-    const bootstrapPath = path.join(
-      this.host.extensionPath,
-      "resources",
-      "r",
-      "VSCR",
-      "sess.R"
-    );
-    if (!fs.existsSync(bootstrapPath)) {
-      throw new Error(`vscode-R sess bootstrap script not found at ${bootstrapPath}`);
-    }
-
+    // The vscode-R API owns package installation, consent, and sess setup.
+    // The console owns only its private IPC proxy and the script's lifetime.
+    delete env.R_CONSOLE_SESSION_BOOTSTRAP;
     delete env.SESS_DISCOVERY_FILE;
-    const connection = await this.createProxiedConnection();
-    if (!connection) {
-      delete env.R_CONSOLE_SESSION_BOOTSTRAP;
-      delete env.SESS_ENDPOINT;
-      void vscode.window.showWarningMessage(
-        "R Console could not obtain vscode-R session connection info. The console will start without vscode-R session attachment."
-      );
-      return;
-    }
-
-    this.connection = connection;
-    env.R_CONSOLE_SESSION_BOOTSTRAP = bootstrapPath;
-    env.SESS_ENDPOINT = connection.pipePath;
+    delete env.SESS_ENDPOINT;
     delete env.SESS_PIPE;
-    const rConfig = vscode.workspace.getConfiguration("r");
-    env.SESS_RSTUDIOAPI = asRLogical(
-      rConfig.get<boolean>("session.emulateRStudioAPI"),
-      true
-    );
-    env.SESS_PLOT_BACKEND = connection.plotBackend;
+    delete env.SESS_RSTUDIOAPI;
+    delete env.SESS_PLOT_BACKEND;
     delete env.SESS_USE_HTTPGD;
     delete env.SESS_USE_JGD;
-    if (connection.jgdSocket) {
-      env.JGD_SOCKET = connection.jgdSocket;
-    } else {
-      delete env.JGD_SOCKET;
-    }
+    delete env.JGD_SOCKET;
     delete env.VSCODE_INIT_R;
     delete env.VSCODE_WATCHER_DIR;
     delete env.SESS_PORT;
     delete env.SESS_TOKEN;
     delete env.SESS_HOST;
+
+    const connection = await this.createProxiedConnection();
+    if (!connection) {
+      this.reconnectPending = true;
+      this.reconnectRetryBlocked = true;
+      void vscode.window.showWarningMessage(
+        "R Console requires a compatible vscode-R installation to attach its session. The console will start without session integration."
+      );
+      return;
+    }
+    try {
+      const preparation = await connection.prepareAttachment(connection.pipePath);
+      if (!preparation || this.disposed || this.connection !== connection) {
+        preparation?.dispose();
+        if (!this.disposed && !preparation) {
+          this.reconnectPending = true;
+          this.reconnectRetryBlocked = true;
+          void vscode.window.showWarningMessage("R Console could not prepare its vscode-R session attachment.");
+        }
+        return;
+      }
+      this.releasePreparation();
+      this.preparation = preparation;
+      this.initialBootstrapPending = true;
+      env.R_CONSOLE_SESSION_BOOTSTRAP = preparation.scriptPath;
+    } catch (error) {
+      this.reconnectPending = true;
+      this.reconnectRetryBlocked = true;
+      void vscode.window.showWarningMessage(
+        `R Console could not prepare its vscode-R connection: ${String(error)}`
+      );
+    }
   }
 
   override afterRuntimeStarted(): void {
     if (this.proxy && this.host.rProcess) {
       proxiesByRuntimeSession.set(this.host.rProcess.sessionId, this.proxy);
+    }
+    if (this.preparation && this.host.rProcess) {
+      const sessionId = this.host.rProcess.sessionId;
+      const previous = preparationsByRuntimeSession.get(sessionId);
+      if (previous !== this.preparation) { previous?.dispose(); }
+      preparationsByRuntimeSession.set(sessionId, this.preparation);
     }
   }
 
@@ -243,8 +255,28 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
 
   override handleMainPrompt(): void {
     this.mainPromptObserved = true;
+    if (this.initialBootstrapPending) {
+      this.initialBootstrapPending = false;
+      this.releasePreparation();
+      // If initial setup was declined or failed, do not prompt repeatedly.
+      if (!this.proxy?.getSessionId()) {
+        this.reconnectPending = true;
+        this.reconnectRetryBlocked = true;
+      }
+    }
+    if (this.reconnectCommandRunning) {
+      this.reconnectCommandRunning = false;
+      this.releasePreparation();
+      if (this.reconnectPending) {
+        // One attempt per focus transition, not an endless install/reconnect loop.
+        this.reconnectRetryBlocked = true;
+      } else {
+        this.flushActivation();
+      }
+      return;
+    }
     if (this.reconnectPending) {
-      if (this.active) {
+      if (this.active && !this.reconnectRetryBlocked) {
         void this.reconnectRestoredRuntime();
       }
       return;
@@ -253,7 +285,11 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override setActive(active: boolean, terminal?: vscode.Terminal): void {
+    const becameActive = active && !this.active;
     this.active = active;
+    if (becameActive) {
+      this.reconnectRetryBlocked = false;
+    }
     if (active && terminal) {
       this.activeTerminal = terminal;
     }
@@ -262,6 +298,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       return;
     }
     if (this.reconnectPending) {
+      if (this.reconnectRetryBlocked) { return; }
       if (!this.mainPromptObserved || !this.canSubmitHiddenCommand()) {
         void this.resolveCurrentConnection();
       } else {
@@ -300,15 +337,34 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   override handleRuntimeExit(): void {
+    this.disposed = true;
     this.clearConnection();
+    this.releasePreparation();
     this.reconnectPending = false;
     this.activationPending = false;
     this.activeTerminal = undefined;
+    const sessionId = this.host.rProcess?.sessionId;
+    if (sessionId) {
+      const remaining = preparationsByRuntimeSession.get(sessionId);
+      preparationsByRuntimeSession.delete(sessionId);
+      remaining?.dispose();
+    }
   }
 
   override disposeUi(): void {
     this.setActive(false);
     this.proxy?.setWorkspaceDataListener(undefined);
+    this.proxy?.setConnectionListener(undefined);
+  }
+
+  private releasePreparation(): void {
+    const preparation = this.preparation;
+    this.preparation = undefined;
+    const sessionId = this.host.rProcess?.sessionId;
+    if (sessionId && preparationsByRuntimeSession.get(sessionId) === preparation) {
+      preparationsByRuntimeSession.delete(sessionId);
+    }
+    preparation?.dispose();
   }
 
   private clearConnection(): void {
@@ -323,6 +379,27 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     proxy?.dispose();
   }
 
+  private bindProxyListeners(proxy: SessProxy): void {
+    proxy.setWorkspaceDataListener((data) => this.handleWorkspaceData(data));
+    proxy.setConnectionListener((state) => {
+      if (this.proxy !== proxy || this.disposed) { return; }
+      if (state === "attached") {
+        this.reconnectPending = false;
+        this.reconnectRetryBlocked = false;
+        this.activationPending = this.active;
+        this.flushActivation();
+      } else {
+        this.needsProxyReplacement = true;
+        this.reconnectPending = true;
+        this.activationPending = this.active;
+        this.reconnectRetryBlocked = false;
+        if (this.active && this.canSubmitHiddenCommand()) {
+          void this.reconnectRestoredRuntime();
+        }
+      }
+    });
+  }
+
   private async createProxiedConnection(): Promise<
     VscodeRSessionConnection | undefined
   > {
@@ -334,7 +411,6 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
 
     const proxy = new SessProxy({
       upstreamPipePath: upstreamConnection.pipePath,
-      onWorkspaceData: (data) => this.handleWorkspaceData(data),
     });
     try {
       const pipePath = await proxy.start();
@@ -345,6 +421,8 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       connectionsByProxy.set(proxy, upstreamConnection);
       this.clearConnection();
       this.proxy = proxy;
+      this.needsProxyReplacement = false;
+      this.bindProxyListeners(proxy);
       const sessionId = this.host.rProcess?.sessionId;
       if (sessionId) {
         proxiesByRuntimeSession.set(sessionId, proxy);
@@ -360,7 +438,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private async resolveCurrentConnection(): Promise<
     VscodeRSessionConnection | undefined
   > {
-    if (this.connection) {
+    if (this.connection && this.proxy && !this.needsProxyReplacement) {
       return this.connection;
     }
 
@@ -368,10 +446,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     const proxy = sessionId ? proxiesByRuntimeSession.get(sessionId) : undefined;
     const pipePath = proxy?.getPipePath();
     const upstreamConnection = proxy ? connectionsByProxy.get(proxy) : undefined;
-    if (proxy?.isConnected() && pipePath && upstreamConnection) {
+    if (proxy?.isConnected() && proxy.getSessionId() && pipePath && upstreamConnection) {
       this.proxy = proxy;
       this.connection = { ...upstreamConnection, pipePath };
-      proxy.setWorkspaceDataListener((data) => this.handleWorkspaceData(data));
+      this.bindProxyListeners(proxy);
       return this.connection;
     }
     if (proxy && sessionId) {
@@ -390,6 +468,9 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
 
   private handleWorkspaceData(data: WorkspaceData): void {
     this.host.onSessionDataChanged(data);
+    if (this.reconnectPending && this.proxy?.getSessionId()) {
+      this.reconnectPending = false;
+    }
     this.flushActivation();
   }
 
@@ -427,34 +508,48 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   }
 
   private flushActivation(): void {
-    if (!this.activationPending) {
+    if (!this.active || !this.activationPending) {
       return;
     }
-    const sessionId = this.proxy?.getSessionId();
+    if (this.activationInFlight) {
+      this.activationTriggeredWhileInFlight = true;
+      return;
+    }
+    const proxy = this.proxy;
+    const sessionId = proxy?.getSessionId();
     const activateSession = this.connection?.activateSession;
-    if (!sessionId || !activateSession) {
+    if (!proxy?.isConnected() || !sessionId || !activateSession) {
       return;
     }
-
+    const terminal = this.activeTerminal;
     this.activationPending = false;
-    void activateSession(
-      sessionId,
-      this.activeTerminal ? { terminal: this.activeTerminal } : undefined
-    ).then((activated) => {
-      if (!activated && this.active) {
+    this.activationInFlight = true;
+    void activateSession(sessionId, terminal ? { terminal } : undefined).then((activated) => {
+      if (this.disposed || this.proxy !== proxy || !this.active) { return; }
+      if (!activated || this.activeTerminal !== terminal) {
         this.activationPending = true;
       }
     }).catch(() => {
-      if (this.active) {
+      if (!this.disposed && this.proxy === proxy && this.active) {
         this.activationPending = true;
+      }
+    }).finally(() => {
+      this.activationInFlight = false;
+      if (this.activationTriggeredWhileInFlight) {
+        this.activationTriggeredWhileInFlight = false;
+        this.flushActivation();
       }
     });
   }
 
   private async reconnectRestoredRuntime(): Promise<void> {
     if (
+      this.disposed ||
       !this.reconnectPending ||
       this.reconnectInFlight ||
+      this.reconnectCommandRunning ||
+      this.reconnectRetryBlocked ||
+      !this.active ||
       !this.mainPromptObserved ||
       !this.canSubmitHiddenCommand()
     ) {
@@ -465,27 +560,41 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.reconnectInFlight = true;
     try {
       const connection = await this.resolveCurrentConnection();
-      if (!connection || !this.active || !this.reconnectPending) {
+      if (!connection || !this.active || !this.reconnectPending || this.disposed) {
         return;
       }
-
-      if (this.proxy?.isConnected()) {
+      if (this.proxy?.isConnected() && this.proxy.getSessionId()) {
         this.reconnectPending = false;
+        this.activationPending = true;
         this.flushActivation();
         return;
       }
-      const bootstrapPath = path.join(
-        this.host.extensionPath,
-        "resources",
-        "r",
-        "VSCR",
-        "sess.R"
-      );
-      if (
-        this.canSubmitHiddenCommand() &&
-        this.submitHiddenCommand(buildConnectCommand(connection, bootstrapPath))
-      ) {
-        this.reconnectPending = false;
+      const preparation = await connection.prepareAttachment(connection.pipePath);
+      if (!preparation) { return; }
+      if (this.disposed || !this.active || this.connection !== connection ||
+          !this.canSubmitHiddenCommand() || !this.reconnectPending) {
+        preparation.dispose();
+        return;
+      }
+      this.releasePreparation();
+      this.preparation = preparation;
+      const runtimeSessionId = this.host.rProcess?.sessionId;
+      if (runtimeSessionId) {
+        const previous = preparationsByRuntimeSession.get(runtimeSessionId);
+        if (previous !== preparation) { previous?.dispose(); }
+        preparationsByRuntimeSession.set(runtimeSessionId, preparation);
+      }
+      if (this.submitHiddenCommand(preparation.command)) {
+        this.reconnectCommandRunning = true;
+      } else {
+        this.releasePreparation();
+      }
+    } catch (error) {
+      if (!this.disposed && this.active) {
+        this.reconnectRetryBlocked = true;
+        void vscode.window.showWarningMessage(
+          `R Console could not reconnect to vscode-R: ${String(error)}`
+        );
       }
     } finally {
       this.reconnectInFlight = false;

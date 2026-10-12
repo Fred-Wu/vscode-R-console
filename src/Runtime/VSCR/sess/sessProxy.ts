@@ -40,6 +40,7 @@ export class SessProxy {
   private workspaceData: WorkspaceData | undefined;
   private sessionId: string | undefined;
   private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
+  private onConnectionChange: ((state: "attached" | "disconnected") => void) | undefined;
 
   constructor(private readonly options: SessProxyOptions) {
     this.onWorkspaceData = options.onWorkspaceData;
@@ -129,6 +130,10 @@ export class SessProxy {
     }
   }
 
+  setConnectionListener(listener: ((state: "attached" | "disconnected") => void) | undefined): void {
+    this.onConnectionChange = listener;
+  }
+
   getPipePath(): string | undefined {
     return this.proxyPipePath;
   }
@@ -170,6 +175,8 @@ export class SessProxy {
     this.upstreamSocket?.destroy();
     this.resolvePendingRequests();
     this.forwardedRequests.clear();
+    // An incoming R socket may replace an old one during sess recovery.
+    // Do not start a competing bootstrap before it can send its attach message.
     this.sessionId = undefined;
     this.workspaceData = undefined;
     this.rSocket = socket;
@@ -212,8 +219,10 @@ export class SessProxy {
       this.upstreamSocket = undefined;
       socket.destroy();
       upstream.destroy();
+      const wasAttached = Boolean(this.sessionId);
       this.sessionId = undefined;
       this.workspaceData = undefined;
+      if (wasAttached) { this.onConnectionChange?.("disconnected"); }
       this.forwardedRequests.clear();
       this.resolveRSocketWaiters(undefined);
       this.resolvePendingRequests();
@@ -277,6 +286,7 @@ export class SessProxy {
         const sessionId = (params as Record<string, unknown>).session_id;
         if (typeof sessionId === "string" && sessionId.length > 0) {
           this.sessionId = sessionId;
+          this.onConnectionChange?.("attached");
         }
       }
       void this.requestWorkspace();

@@ -81,10 +81,22 @@ function integrationFixture(t, info, overrides = {}) {
   const activationOptions = [];
   const warnings = [];
   const commands = [];
+  const preparations = [];
   let discoveries = 0;
   let obsoleteFileAccesses = 0;
   const session = {
     getConnectionInfo: async () => { discoveries++; return info; },
+    prepareAttachment: async ({ connection }) => {
+      const preparation = {
+        scriptPath: `/prepared/${preparations.length + 1}.R`,
+        command: `source("/prepared/${preparations.length + 1}.R")`,
+        endpoint: connection.endpoint,
+        disposed: false,
+        dispose() { this.disposed = true; },
+      };
+      preparations.push(preparation);
+      return preparation;
+    },
     activate: async (id, options) => {
       activations.push(id);
       activationOptions.push(options);
@@ -123,78 +135,45 @@ function integrationFixture(t, info, overrides = {}) {
     return integration;
   };
   t.after(() => integrations.forEach((integration) => integration.handleRuntimeExit()));
-  return { create, host, extension, activations, activationOptions, warnings, commands,
+  return { create, host, extension, activations, activationOptions, warnings, commands, preparations,
     discoveries: () => discoveries, obsoleteFileAccesses: () => obsoleteFileAccesses };
 }
 
-test("sess launch passes plot backends through without coupling to protocol versions", async (t) => {
-  for (const [plotBackend, jgdSocket] of [
-    ["auto", "plot-socket"],
-    ["standard", undefined],
-    ["httpgd", undefined],
-    ["jgd", "plot-socket"],
-    ["native", undefined],
-    ["future-backend", undefined],
-  ]) {
+test("sess startup uses opaque upstream attachment preparation per proxy", async (t) => {
+  for (const plotBackend of ["auto", "standard", "httpgd", "jgd", "native"]) {
     await t.test(plotBackend, async (t) => {
       const fixture = integrationFixture(t, {
-        protocolVersion: 999,
-        endpoint: "upstream",
-        plotBackend,
-        ...(jgdSocket ? { jgdSocket } : {}),
+        protocolVersion: 2, endpoint: "upstream", plotBackend,
       });
       const integration = fixture.create();
-      const env = {
-        SESS_DISCOVERY_FILE: "inherited",
-        SESS_PIPE: "old",
-        SESS_USE_HTTPGD: "TRUE",
-        SESS_USE_JGD: "TRUE",
-        JGD_SOCKET: "old",
-      };
+      const env = { SESS_DISCOVERY_FILE: "inherited", SESS_ENDPOINT: "inherited", JGD_SOCKET: "old" };
       await integration.prepareStart(env);
-      assert.ok(env.SESS_ENDPOINT);
-      assert.notEqual(env.SESS_ENDPOINT, "upstream");
-      assert.ok(env.R_CONSOLE_SESSION_BOOTSTRAP.endsWith("sess.R"));
+      assert.equal(fixture.preparations.length, 1);
+      assert.equal(fixture.preparations[0].endpoint, integration.connection.pipePath);
+      assert.equal(env.R_CONSOLE_SESSION_BOOTSTRAP, fixture.preparations[0].scriptPath);
+      assert.equal(env.SESS_ENDPOINT, undefined);
       assert.equal(env.SESS_DISCOVERY_FILE, undefined);
-      assert.equal(env.SESS_PIPE, undefined);
-      assert.equal(env.SESS_RSTUDIOAPI, "FALSE");
-      assert.equal(env.SESS_PLOT_BACKEND, plotBackend);
-      assert.equal(env.SESS_USE_HTTPGD, undefined);
-      assert.equal(env.SESS_USE_JGD, undefined);
-      assert.equal(env.JGD_SOCKET, jgdSocket);
-      integration.handleRuntimePid(process.pid);
-      integration.handleHostConnected();
-      assert.equal(fixture.obsoleteFileAccesses(), 0);
+      assert.equal(env.JGD_SOCKET, undefined);
       assert.equal(fixture.discoveries(), 1);
       assert.deepEqual(fixture.warnings, []);
+      fixture.host.rProcess = { sessionId: randomUUID() };
+      integration.afterRuntimeStarted();
+      assert.equal(fixture.preparations[0].disposed, false);
+      integration.handleMainPrompt();
+      assert.equal(fixture.preparations[0].disposed, true);
     });
   }
 });
 
-test("sess bootstrap feature-detects new and legacy plot APIs", () => {
-  const script = fs.readFileSync(
-    path.join(__dirname, "../../resources/r/VSCR/sess.R"),
-    "utf8"
-  );
-
-  assert.match(script, /SESS_PLOT_BACKEND/);
-  assert.match(script, /connect_formals <- names\(formals\(connect\)\)/);
-  assert.match(script, /"plot_backend" %in% connect_formals/);
-  assert.match(script, /connect_args\$plot_backend <- plot_backend/);
-  assert.match(script, /connect_args\$use_httpgd <- plot_backend %in% c\("auto", "httpgd"\)/);
-  assert.match(script, /connect_args\$use_jgd <- plot_backend %in% c\("auto", "jgd"\)/);
-  assert.match(script, /do\.call\(connect, connect_args\)/);
-});
-
-test("sess launch safely declines unavailable APIs and missing endpoints", async (t) => {
-  for (const info of [undefined, { protocolVersion: 999, endpoint: "" }]) {
+test("sess launch safely declines missing or unsupported upstream APIs", async (t) => {
+  for (const info of [undefined, { protocolVersion: 2, endpoint: "" }]) {
     const fixture = integrationFixture(t, info);
     const env = { SESS_ENDPOINT: "inherited", SESS_DISCOVERY_FILE: "inherited", R_CONSOLE_SESSION_BOOTSTRAP: "old" };
     await fixture.create().prepareStart(env);
     assert.deepEqual(env, {});
     assert.equal(fixture.warnings.length, 1);
   }
-  for (const api of [{}, { session: { getConnectionInfo: async () => { throw Error("unavailable"); }, activate: async () => false } }]) {
+  for (const api of [{}, { session: { getConnectionInfo: async () => ({ endpoint: "upstream" }), activate: async () => false } }]) {
     const fixture = integrationFixture(t);
     fixture.extension.isActive = true;
     fixture.extension.exports = api;
@@ -243,39 +222,37 @@ test("focus before attach activates the stable identity and a detached UI reuses
   assert.deepEqual(fixture.commands, []);
 });
 
-test("reload reconnect reuses the bootstrap and passes the plot backend through", async (t) => {
-  for (const plotBackend of ["jgd", "native", "future-backend"]) {
-    await t.test(plotBackend, async (t) => {
-      const fixture = integrationFixture(t, {
-        protocolVersion: 999,
-        endpoint: "upstream",
-        plotBackend,
-        ...(plotBackend === "jgd" ? { jgdSocket: 'plot\\"socket' } : {}),
-      });
-      fixture.host.rProcess = { sessionId: randomUUID() };
-      fixture.host.inputState.text = "unfinished";
-      const integration = fixture.create();
-      integration.setActive(true);
-      integration.handleMainPrompt();
-      await delay(30);
-      assert.deepEqual(fixture.commands, []);
-      fixture.host.inputState.text = "";
-      integration.handleMainPrompt();
-      integration.handleMainPrompt();
-      await waitFor(() => fixture.commands.length === 1);
-      const { code } = fixture.commands[0];
-      assert.match(code, /Sys\.setenv\(SESS_ENDPOINT=/);
-      assert.ok(code.includes(`Sys.setenv(SESS_PLOT_BACKEND="${plotBackend}")`));
-      assert.match(code, /source\(.+sess\.R.+local=TRUE\)/);
-      assert.doesNotMatch(code, /sess::connect|use_httpgd|use_jgd/);
-      if (plotBackend === "jgd") {
-        assert.ok(code.includes('Sys.setenv(JGD_SOCKET="plot\\\\\\"socket")'));
-      } else {
-        assert.match(code, /Sys\.unsetenv\("JGD_SOCKET"\)/);
-      }
-      assert.equal(fixture.host.mode, "executing");
-    });
-  }
+test("restored runtime uses new preparation and waits for confirmed attach", async (t) => {
+  const fixture = integrationFixture(t, {
+    protocolVersion: 2, endpoint: "upstream", plotBackend: "jgd",
+  });
+  fixture.host.rProcess = { sessionId: randomUUID() };
+  fixture.host.inputState.text = "unfinished";
+  const integration = fixture.create();
+  integration.setActive(true, { name: "R Console" });
+  integration.handleMainPrompt();
+  await delay(20);
+  assert.deepEqual(fixture.commands, []);
+  fixture.host.inputState.text = "";
+  await waitFor(() => integration.connection?.pipePath);
+  const waitingEndpoint = integration.connection.pipePath;
+  integration.handleMainPrompt();
+  integration.handleMainPrompt();
+  await waitFor(() => fixture.commands.length === 1);
+  assert.equal(integration.connection.pipePath, waitingEndpoint);
+  assert.equal(fixture.commands[0].code, fixture.preparations[0].command);
+  assert.equal(fixture.preparations[0].endpoint, integration.connection.pipePath);
+  assert.equal(integration.reconnectPending, true);
+  fixture.host.mode = "ready";
+  integration.handleMainPrompt();
+  assert.equal(fixture.preparations[0].disposed, true);
+  assert.equal(integration.reconnectPending, true);
+  assert.equal(integration.reconnectRetryBlocked, true);
+  assert.equal(fixture.commands.length, 1);
+  integration.setActive(false);
+  integration.setActive(true);
+  await waitFor(() => fixture.commands.length === 2);
+  assert.equal(fixture.preparations.length, 2);
 });
 
 test("restored runtime rebinds its terminal after sess reconnect", { timeout: 10000 }, async (t) => {
@@ -338,6 +315,42 @@ test("runtime exit cancels pending connection discovery", async (t) => {
   assert.equal(integration.proxy, undefined);
   assert.equal(integration.connection, undefined);
   assert.deepEqual(fixture.commands, []);
+});
+
+test("disconnect invalidates cached connection and reconnects through a new proxy", { timeout: 10000 }, async (t) => {
+  const server = await upstream(t);
+  const fixture = integrationFixture(t, { protocolVersion: 2, endpoint: server.endpoint });
+  const integration = fixture.create();
+  const env = {};
+  await integration.prepareStart(env);
+  fixture.host.rProcess = { sessionId: randomUUID() };
+  integration.afterRuntimeStarted();
+  integration.setActive(true, { name: "R Console" });
+  const r = await connectR(t, integration.connection.pipePath);
+  send(r.socket, attachV2);
+  await waitFor(() => fixture.activations.length === 1);
+  integration.handleMainPrompt();
+  const original = integration.connection.pipePath;
+  r.socket.destroy();
+  await waitFor(() => integration.reconnectPending);
+  integration.handleMainPrompt();
+  await waitFor(() => fixture.commands.length === 1);
+  assert.notEqual(integration.connection.pipePath, original);
+  assert.equal(fixture.preparations[1].endpoint, integration.connection.pipePath);
+  assert.equal(integration.reconnectPending, true);
+  const newR = await connectR(t, integration.connection.pipePath);
+  send(newR.socket, attachV2);
+  await waitFor(() => fixture.activations.length >= 2);
+  assert.equal(integration.reconnectPending, false);
+});
+
+test("runtime exit releases unused prepared attachment", async (t) => {
+  const fixture = integrationFixture(t, { endpoint: "upstream" });
+  const integration = fixture.create();
+  await integration.prepareStart({});
+  assert.equal(fixture.preparations[0].disposed, false);
+  integration.handleRuntimeExit();
+  assert.equal(fixture.preparations[0].disposed, true);
 });
 
 test("proxy forwards protocol 2 attach metadata and keeps workspace and completion capabilities", { timeout: 10000 }, async (t) => {
