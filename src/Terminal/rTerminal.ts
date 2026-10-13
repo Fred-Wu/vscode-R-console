@@ -1664,43 +1664,21 @@ export class RTerminal implements vscode.Pseudoterminal {
     picker.placeholder = "Type to search previous R commands";
     const preferenceKey = "historyPicker.collapseDuplicates";
     const state = this.historyStorage!.state;
-    // VS Code 1.109+ supports native checked Quick Input buttons. Keep the
-    // older toolbar button for VS Code versions supported by this extension.
-    const inputButtonLocation = (vscode as unknown as {
-      QuickInputButtonLocation?: { Input: number };
-    }).QuickInputButtonLocation?.Input;
-    type CollapseButton = {
-      iconPath: vscode.ThemeIcon;
-      tooltip: string;
-      location?: number;
-      toggle?: { checked: boolean };
-    };
     let collapseDuplicates = state.get<boolean>(preferenceKey, false);
-    const collapseButton: CollapseButton = {
-      iconPath: new vscode.ThemeIcon(
-        inputButtonLocation !== undefined ? "collapse-all-compact" : "collapse-all"
-      ),
-      tooltip: "Collapse duplicate commands",
+    const collapseButton = {
+      iconPath: new vscode.ThemeIcon(collapseDuplicates ? "expand-all" : "collapse-all"),
+      tooltip: collapseDuplicates ? "Expand duplicate commands" : "Collapse duplicate commands",
     };
-    if (inputButtonLocation !== undefined) {
-      collapseButton.location = inputButtonLocation;
-      collapseButton.toggle = { checked: collapseDuplicates };
-    }
     picker.buttons = [collapseButton];
     const setCollapseButton = (): void => {
+      collapseButton.iconPath = new vscode.ThemeIcon(
+        collapseDuplicates ? "expand-all" : "collapse-all"
+      );
       collapseButton.tooltip = collapseDuplicates
-        ? "Collapse duplicate commands (on)"
-        : "Collapse duplicate commands (off)";
-      if (!collapseButton.toggle) {
-        // Older VS Code versions lack the checked-state styling. Change the
-        // icon instead, so they still provide an obvious visual indicator.
-        collapseButton.iconPath = new vscode.ThemeIcon(
-          collapseDuplicates ? "check-all" : "collapse-all"
-        );
-        picker.buttons = [collapseButton];
-      }
+        ? "Expand duplicate commands"
+        : "Collapse duplicate commands";
+      picker.buttons = [collapseButton];
     };
-    setCollapseButton();
 
     const updateItems = (): void => {
       picker.items = getHistoryPickerEntries(entries, collapseDuplicates)
@@ -1713,9 +1691,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       selectedCode = await new Promise<string | undefined>((resolve) => {
         picker.onDidTriggerButton(async (button) => {
           if (button !== collapseButton) return;
-          collapseDuplicates = collapseButton.toggle
-            ? collapseButton.toggle.checked
-            : !collapseDuplicates;
+          collapseDuplicates = !collapseDuplicates;
           setCollapseButton();
           updateItems();
           try {
