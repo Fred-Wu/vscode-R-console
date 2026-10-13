@@ -193,6 +193,7 @@ Then test:
 - type `alpha_test` at the R prompt, then press `Ctrl+R` once to recall the previous matching entry
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
+- use `Ctrl+R` repeatedly to reach an older match, then press `Ctrl+L` to clear the console; verify Up recalls the latest command and entering a prefix followed by `Ctrl+R` finds the latest matching command without first executing anything
 
 Expected:
 
@@ -201,6 +202,7 @@ Expected:
 - `Ctrl+R` with a typed prefix searches backward and recalls the matching command directly into the input buffer
 - reverse search does not corrupt the current buffer
 - recalled command can be edited normally
+- clearing the console resets history navigation and search position without clearing the saved history
 
 ## 6. Nested Input: `readline()`, `menu()`, `browser()`
 

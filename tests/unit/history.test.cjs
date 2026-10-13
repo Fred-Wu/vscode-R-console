@@ -113,3 +113,34 @@ test("history refuses an incomplete encrypted record without overwriting it", ()
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("resetting history navigation after clear restores Up and prefix Ctrl+R", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-reset-"));
+  try {
+    const file = getHistoryFile(root, "global");
+    const history = new HistoryManager(file, new EncryptedStorage(randomBytes(32)));
+    history.load();
+    history.push("alpha <- 1");
+    history.push("beta <- 2");
+    history.push("alpha <- 3");
+
+    // Repeated reverse searches reach the oldest match and exhaust the cursor.
+    assert.equal(history.searchBackward("alpha"), "alpha <- 3");
+    assert.equal(history.searchBackward("alpha"), "alpha <- 1");
+    assert.equal(history.searchBackward("alpha"), null);
+    assert.equal(history.navigate(-1), undefined);
+
+    // Ctrl+L / a new search sequence restores access without R executing.
+    history.resetIndex();
+    assert.equal(history.navigate(-1), "alpha <- 3");
+    history.resetIndex();
+    assert.equal(history.searchBackward("alpha"), "alpha <- 3");
+    assert.equal(history.searchBackward("alpha"), "alpha <- 1");
+
+    // A new typed prefix is a new search sequence, not an old exhausted cursor.
+    history.resetIndex();
+    assert.equal(history.searchBackward("beta"), "beta <- 2");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

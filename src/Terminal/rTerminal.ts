@@ -1204,6 +1204,14 @@ export class RTerminal implements vscode.Pseudoterminal {
         void this.reverseSearch();
         return;
       case "ctrl_l":
+        // A visual clear starts a fresh history-navigation/search sequence.
+        // Otherwise Up and Ctrl+R can remain stuck at an exhausted index
+        // until the next command submission resets it.
+        this.rHistory.resetIndex();
+        this.historyBrowsing = false;
+        this.historyCollapsed = true;
+        this.lastSearchTerm = "";
+        this.escPendingClear = false;
         if (this.promptVisible) {
           this.clearInputRender();
           this.promptVisible = false;
@@ -1624,10 +1632,13 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     // Keep the established prefix-based Ctrl+R behaviour when input is present.
     const prefix = this.inputState.currentLine.trim();
-    const term = this.historyBrowsing && this.historyCollapsed && this.lastSearchTerm
-      ? this.lastSearchTerm
-      : prefix;
+    const continuingSearch =
+      this.historyBrowsing && this.historyCollapsed && Boolean(this.lastSearchTerm);
+    const term = continuingSearch ? this.lastSearchTerm : prefix;
     if (term) {
+      if (!continuingSearch) {
+        this.rHistory.resetIndex();
+      }
       const match = this.rHistory.searchBackward(term);
       if (match !== null) {
         this.lastSearchTerm = term;
@@ -1671,6 +1682,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private navigateHistory(direction: number): void {
+    if (direction < 0 && !this.historyBrowsing) {
+      this.rHistory.resetIndex();
+    }
     const entry = this.rHistory.navigate(direction);
     if (entry === undefined) {
       return;
