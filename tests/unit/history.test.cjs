@@ -8,7 +8,7 @@ const loadSource = require("../helpers/load-source.cjs");
 
 const { EncryptedStorage, StorageEncryptionError, encryptSessionUi, decryptSessionUi, loadEncryptedStorage } =
   loadSource("src/Runtime/encryptedStorage.ts");
-const { HistoryManager, getHistoryFile } = loadSource("src/Terminal/history.ts");
+const { HistoryManager, getHistoryFile, getHistoryPickerEntries } = loadSource("src/Terminal/history.ts");
 
 test("encrypted history isolates workspaces and shares global fallback", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-"));
@@ -140,6 +140,56 @@ test("resetting history navigation after clear restores Up and prefix Ctrl+R", (
     // A new typed prefix is a new search sequence, not an old exhausted cursor.
     history.resetIndex();
     assert.equal(history.searchBackward("beta"), "beta <- 2");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("picker collapses exact repeats only in its displayed list, newest first", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-picker-"));
+  try {
+    const file = getHistoryFile(root, "global");
+    const history = new HistoryManager(file, new EncryptedStorage(randomBytes(32)));
+    history.load();
+    const indented = "result <- x |>" + "\n  head(1)";
+    const unindented = "result <- x |> head(1)";
+    const stored = ["a <- 1", "a <- 1", "b <- 2", indented, unindented, "a <- 1"];
+    stored.forEach((entry) => history.push(entry));
+
+    assert.deepEqual(getHistoryPickerEntries(history.getEntries(), false), [...stored].reverse());
+    assert.deepEqual(getHistoryPickerEntries(history.getEntries(), true), [
+      "a <- 1", unindented, indented, "b <- 2",
+    ]);
+    // No truncation or rewriting of the encrypted history journal.
+    assert.equal(history.getEntries().length, stored.length);
+    assert.equal(fs.readFileSync(file, "utf8").trimEnd().split("\n").length, stored.length);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Up and Down skip consecutive identical commands in both directions", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-navigation-"));
+  try {
+    const history = new HistoryManager(getHistoryFile(root, "global"), new EncryptedStorage(randomBytes(32)));
+    history.load();
+    ["a", "a", "b", "a", "a", "c"].forEach((entry) => history.push(entry));
+    history.setSearchNoDuplicates(true);
+
+    assert.equal(history.navigate(-1), "c");
+    assert.equal(history.navigate(-1), "a");
+    assert.equal(history.navigate(-1), "b");
+    assert.equal(history.navigate(-1), "a");
+    assert.equal(history.navigate(-1), undefined);
+    assert.equal(history.navigate(1), "b");
+    assert.equal(history.navigate(1), "a");
+    assert.equal(history.navigate(1), "c");
+    assert.equal(history.navigate(1), null);
+    assert.equal(history.navigate(1), undefined);
+    history.resetIndex();
+    assert.equal(history.searchBackward("a"), "a");
+    assert.equal(history.searchBackward("a"), "a");
+    assert.deepEqual(history.getEntries(), ["a", "a", "b", "a", "a", "c"]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -190,6 +190,9 @@ Then test:
 
 - Up / Down history navigation
 - press `Ctrl+R` at an empty prompt, type `alpha_test` into the history picker, then select the matching entry
+- execute identical commands several times (both consecutively and separated by other commands); check that the picker initially displays every occurrence
+- select the `☐ Collapse duplicates` checkbox-style row in the picker; verify it changes to `☑ Collapse duplicates`, identical entries appear only once, and the search text is preserved; uncheck to show all occurrences again
+- verify Up and Down skip consecutive identical commands in both directions while separated repeats remain available
 - type `alpha_test` at the R prompt, then press `Ctrl+R` once to recall the previous matching entry
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
@@ -199,6 +202,7 @@ Expected:
 
 - multiline history entries are restored intact
 - `Ctrl+R` opens a searchable history picker when the input is empty
+- the picker checkbox collapses exact duplicates for the current picker only; it does not rewrite the encrypted history or change Up/Down navigation
 - `Ctrl+R` with a typed prefix searches backward and recalls the matching command directly into the input buffer
 - reverse search does not corrupt the current buffer
 - recalled command can be edited normally

@@ -8,7 +8,7 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager, getHistoryFile, type HistoryScope } from "./history";
+import { HistoryManager, getHistoryFile, getHistoryPickerEntries, type HistoryScope } from "./history";
 import { EncryptedStorage } from "../Runtime/encryptedStorage";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
@@ -1653,22 +1653,59 @@ export class RTerminal implements vscode.Pseudoterminal {
       void vscode.window.showInformationMessage("R Console history is empty for this workspace.");
       return;
     }
-    const choices = entries.reverse().map((code) => ({
-      label: code.replace(/\s*\r?\n\s*/g, " ↵ ").slice(0, 240),
-      detail: code.includes("\n") ? code : undefined,
-      code,
-    }));
-    const selected = await vscode.window.showQuickPick(choices, {
-      title: "R Console: Reverse History Search",
-      placeHolder: "Type to search previous R commands",
-      matchOnDetail: true,
-    });
-    if (!selected || this.mode !== "ready" || !this.promptReady) {
+    type HistoryPickItem = vscode.QuickPickItem & {
+      code?: string;
+      isCollapseToggle?: boolean;
+    };
+    const picker = vscode.window.createQuickPick<HistoryPickItem>();
+    picker.title = "R Console: Reverse History Search";
+    picker.placeholder = "Type to search previous R commands";
+    picker.matchOnDetail = true;
+    let collapseDuplicates = false;
+
+    const updateItems = (): void => {
+      const toggle: HistoryPickItem = {
+        label: collapseDuplicates ? "☑ Collapse duplicates" : "☐ Collapse duplicates",
+        alwaysShow: true,
+        isCollapseToggle: true,
+      };
+      const choices: HistoryPickItem[] = getHistoryPickerEntries(entries, collapseDuplicates)
+        .map((code) => ({
+          label: code.replace(/\s*\r?\n\s*/g, " ↵ ").slice(0, 240),
+          detail: code.includes("\n") ? code : undefined,
+          code,
+        }));
+      picker.items = [toggle, ...choices];
+    };
+    updateItems();
+
+    let selectedCode: string | undefined;
+    try {
+      selectedCode = await new Promise<string | undefined>((resolve) => {
+        picker.onDidAccept(() => {
+          const selected = picker.selectedItems[0] ?? picker.activeItems[0];
+          if (selected?.isCollapseToggle) {
+            collapseDuplicates = !collapseDuplicates;
+            updateItems();
+            return;
+          }
+          if (selected?.code !== undefined) {
+            resolve(selected.code);
+            picker.hide();
+          }
+        });
+        picker.onDidHide(() => resolve(undefined));
+        picker.show();
+      });
+    } finally {
+      picker.dispose();
+    }
+    if (selectedCode === undefined || this.mode !== "ready" || !this.promptReady) {
       return;
     }
     this.lastSearchTerm = "";
-    this.rHistory.selectEntry(selected.code);
-    this.applyHistorySearchResult(selected.code);
+    this.rHistory.selectEntry(selectedCode);
+    this.applyHistorySearchResult(selectedCode);
   }
 
   private applyHistorySearchResult(entry: string): void {

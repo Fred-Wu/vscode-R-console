@@ -5,6 +5,26 @@ import { EncryptedStorage, StorageEncryptionError } from "../Runtime/encryptedSt
 
 export type HistoryScope = "workspace" | "global";
 
+// The history picker lists newest commands first. Collapsing is an optional
+// view-only projection: exact command text is the key and the latest wins.
+export function getHistoryPickerEntries(
+  entries: readonly string[],
+  collapseDuplicates: boolean
+): string[] {
+  const newestFirst = [...entries].reverse();
+  if (!collapseDuplicates) {
+    return newestFirst;
+  }
+  const seen = new Set<string>();
+  return newestFirst.filter((entry) => {
+    if (seen.has(entry)) {
+      return false;
+    }
+    seen.add(entry);
+    return true;
+  });
+}
+
 export function getHistoryFile(storageFolder: string, scope: HistoryScope, workspaceFolder?: string): string {
   if (scope === "global" || !workspaceFolder) {
     return path.join(storageFolder, "history", "global.enc");
@@ -130,24 +150,21 @@ export class HistoryManager {
     this.refreshFromDisk();
     if (this.historyBuffer.length === 0) return undefined;
 
-    const newIndex = this.historyIndex + direction;
-    if (newIndex < 0 || newIndex > this.historyBuffer.length) return undefined;
-    this.historyIndex = newIndex;
-    if (newIndex === this.historyBuffer.length) {
-      return null;
+    const length = this.historyBuffer.length;
+    let nextIndex = this.historyIndex + direction;
+    if (this.searchNoDuplicates && direction !== 0 && this.historyIndex < length) {
+      const current = this.historyBuffer[this.historyIndex];
+      // Skip commands identical to the currently displayed entry in either
+      // direction. Comparing with the destination incorrectly visits the same
+      // run again when navigating forward.
+      while (nextIndex >= 0 && nextIndex < length &&
+        this.historyBuffer[nextIndex] === current) {
+        nextIndex += direction;
+      }
     }
-    if (!this.searchNoDuplicates) {
-      return this.historyBuffer[newIndex];
-    }
-    const current = this.historyBuffer[newIndex];
-    let idx = newIndex;
-    if (direction < 0) {
-      while (idx > 0 && this.historyBuffer[idx - 1] === current) idx -= 1;
-    } else {
-      while (idx < this.historyBuffer.length - 1 && this.historyBuffer[idx + 1] === current) idx += 1;
-    }
-    this.historyIndex = idx;
-    return this.historyBuffer[idx];
+    if (nextIndex < 0 || nextIndex > length) return undefined;
+    this.historyIndex = nextIndex;
+    return nextIndex === length ? null : this.historyBuffer[nextIndex];
   }
 
   searchBackward(term: string, fromIndex?: number): string | null {
