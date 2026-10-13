@@ -11,8 +11,9 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
-- Multiline editing with Up/Down history navigation that skips consecutive identical commands, `Ctrl+R` reverse search (picker with optional duplicate collapse or typed-prefix recall), and long-input rendering.
-- **Workspace-aware encrypted history:**
+- ~~Multiline editing with local history navigation, reverse search, and long-input rendering.~~
+- Multiline editing with`Ctrl+R` reverse search from a history picker ()with optional duplicate collapse) or typed-prefix recall, and long-input rendering.
+- Workspace-aware encrypted history:
   - **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; consoles without a workspace automatically use global history.
   - **Encryption:** Command history and persistent terminal replay are encrypted in VS Code extension storage using a key held in SecretStorage. The legacy `~/.r_console_history` file remains unchanged.
 - Auto-matching brackets and quotes.
@@ -70,17 +71,17 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 
 R Console reads several settings from [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r):
 
-| Setting | Purpose |
-| --- | --- |
-| `r.executablePath` | Vanilla R executable path |
-| `r.consoleArgs` | Extra arguments passed to R |
-| `r.rpath.<platform>` | Deprecated. Use `r.executablePath` instead |
-| `r.rterm.option` | Deprecated. Use `r.consoleArgs` instead |
-| `r.sessionWatcher` | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher or console-scoped JSON-RPC bridge |
-| `r.bracketedPaste` | Enables bracketed paste mode |
-| `r.lsp.args` | Extra arguments passed when starting `languageserver` |
-| `r.lsp.use_stdio` | Uses stdio instead of a loopback socket for the console LSP client when supported |
-| `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused |
+| Setting                       | Purpose                                                                                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `r.executablePath`          | Vanilla R executable path                                                                                                                    |
+| `r.consoleArgs`             | Extra arguments passed to R                                                                                                                  |
+| `r.rpath.<platform>`        | Deprecated. Use`r.executablePath` instead                                                                                                  |
+| `r.rterm.option`            | Deprecated. Use`r.consoleArgs` instead                                                                                                     |
+| `r.sessionWatcher`          | Enables the[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher or console-scoped JSON-RPC bridge |
+| `r.bracketedPaste`          | Enables bracketed paste mode                                                                                                                 |
+| `r.lsp.args`                | Extra arguments passed when starting`languageserver`                                                                                       |
+| `r.lsp.use_stdio`           | Uses stdio instead of a loopback socket for the console LSP client when supported                                                            |
+| `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused                                                                                      |
 
 The executable fallback order is `r.executablePath`, deprecated `r.rpath.*`, `PATH`, then the Windows registry on Windows. For console arguments, `r.consoleArgs` takes precedence over deprecated `r.rterm.option`.
 
@@ -88,10 +89,10 @@ R Console also contributes its own settings:
 
 | Setting                    | Default       | Purpose                                                                                                                       |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `r.console.historyScope` | `workspace` | Shared command history per workspace folder or across all workspaces (`global`) |
+| `r.console.historyScope` | `workspace` | Shared command history per workspace folder or across all workspaces (`global`)                                             |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
-| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
+| `r.console.pipeOperator` | <code></code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code></code> and `%>%` |
 
 ## Dependency Model
 
@@ -124,4 +125,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, build, packaging, and ma
 ## License
 
 MIT
-

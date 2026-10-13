@@ -9,7 +9,7 @@ All notable changes to R Console will be documented in this file.
 - Workspace-aware encrypted console history:
   - Command history is shared between consoles in the same workspace folder and retained across console restarts. `r.console.historyScope` defaults to `workspace`, with an option to use a single `global` history. Consoles outside a workspace automatically use global history.
   - Command history and persistent terminal replay are encrypted on disk, with the encryption key stored in VS Code SecretStorage. Existing `~/.r_console_history` files remain untouched.
-  - `Ctrl+R` opens a searchable history picker at an empty prompt while retaining prefix-based history recall when text is already entered. A checkbox-style option collapses exact duplicate entries in the picker without deleting stored commands; Up/Down navigation continues to skip consecutive duplicates.
+  - `Ctrl+R` opens a searchable history picker at an empty prompt while retaining prefix-based history recall when text is already entered. A checkbox-style option collapses exact duplicate entries in the picker without deleting stored commands; 
 
 ### Changed
 
