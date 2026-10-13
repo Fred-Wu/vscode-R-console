@@ -259,6 +259,8 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       env.R_CONSOLE_SESSION_BOOTSTRAP = preparation.scriptPath;
       // Preserve the R-visible backend preference; vscode-R owns device setup.
       env.SESS_PLOT_BACKEND = connection.plotBackend;
+      env.SESS_RSTUDIOAPI = vscode.workspace.getConfiguration("r").get<boolean>("session.emulateRStudioAPI") === false
+        ? "FALSE" : "TRUE";
     } catch (error) {
       this.reconnectPending = true;
       this.reconnectRetryBlocked = true;
