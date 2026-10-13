@@ -4,6 +4,21 @@ import * as path from "path";
 
 export type HistoryScope = "workspace" | "global";
 
+export const historyPickerText = {
+  title: "R Console: Command History",
+  placeholder: "Type to filter command history",
+  emptyMessage: "R Console command history is empty.",
+} as const;
+
+export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean): {
+  icon: "collapse-all" | "expand-all";
+  tooltip: string;
+} {
+  return collapseDuplicates
+    ? { icon: "expand-all", tooltip: "Expand duplicate commands" }
+    : { icon: "collapse-all", tooltip: "Collapse duplicate commands" };
+}
+
 // The history picker lists newest commands first. Collapsing is an optional
 // view-only projection: exact command text is the key and the latest wins.
 export function getHistoryPickerEntries(
