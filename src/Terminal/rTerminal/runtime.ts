@@ -151,6 +151,13 @@ function vscodeRIntegration(host: RuntimeHost): VscodeRSessionIntegration {
   return getVscodeRIntegration(host);
 }
 
+export function setRuntimeVscodeRTerminal(
+  host: RuntimeHost,
+  terminal: vscode.Terminal | undefined
+): void {
+  vscodeRIntegration(host).setTerminal(terminal);
+}
+
 export function setRuntimeVscodeRSessionActive(
   host: RuntimeHost,
   active: boolean,

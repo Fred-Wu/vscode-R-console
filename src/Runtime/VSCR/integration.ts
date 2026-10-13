@@ -16,6 +16,7 @@ export interface VscodeRSessionIntegration {
   handleRuntimePid(pid: number): void;
   handleRuntimeExit(): void;
   setActive(active: boolean, terminal?: vscode.Terminal): void;
+  setTerminal(terminal: vscode.Terminal | undefined): void;
 
   getDisplayPid(): number | undefined;
   getCachedWorkspaceData(): WorkspaceData | undefined;
@@ -45,6 +46,7 @@ export abstract class BaseVscodeRSessionIntegration
   handleRuntimePid(_pid: number): void {}
   handleRuntimeExit(): void {}
   setActive(_active: boolean, _terminal?: vscode.Terminal): void {}
+  setTerminal(_terminal: vscode.Terminal | undefined): void {}
 
   getDisplayPid(): number | undefined {
     return undefined;

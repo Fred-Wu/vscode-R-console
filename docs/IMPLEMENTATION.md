@@ -437,7 +437,6 @@ Implementation files:
 - [`src/Runtime/VSCR/sess/sessProxy.ts`](../src/Runtime/VSCR/sess/sessProxy.ts)
 - [`resources/r/console-profile.R`](../resources/r/console-profile.R)
 - [`resources/r/VSCR/legacy.R`](../resources/r/VSCR/legacy.R)
-- [`resources/r/VSCR/sess.R`](../resources/r/VSCR/sess.R)
 
 The terminal and shared runtime depend only on `VscodeRSessionIntegration`.
 `src/Runtime/VSCR/index.ts` is the factory boundary that selects the disabled,
@@ -491,10 +490,11 @@ When `r.sessionWatcher` is enabled, startup chooses one vscode-R session
 integration:
 
 - `sess`: vscode-R 3.x architecture exposed by vscode-R's public session API.
-  `src/Runtime/VSCR/sess/integration.ts` calls `session.getConnectionInfo()` to obtain
-  the protocol version, IPC endpoint, resolved plot backend, and optional JGD
-  socket, starts a console-owned `SessProxy`, and contributes the proxy endpoint
-  as `SESS_ENDPOINT` to the embedded R launch.
+  `src/Runtime/VSCR/sess/integration.ts` obtains the IPC endpoint through
+  `session.getConnectionInfo()`, starts a console-owned `SessProxy`, then calls
+  `session.prepareAttachment()` with the proxy endpoint. The resulting managed
+  bootstrap script is sourced by the embedded R launch; vscode-R owns `sess`
+  installation, plot-backend configuration, and attachment preparation.
 - `legacy`: deprecated pre-3.0 file-based watcher architecture. `R Console`
   sources vscode-R's `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
 
@@ -510,24 +510,31 @@ The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
 the console-owned proxy endpoint, and the proxy connects to vscode-R's endpoint.
 Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
 Console observes workspace responses and injects its own `workspace` and
-`completion` requests when the console needs session data. It uses only
-vscode-R's public session API for connection discovery and session activation,
-and does not use VS Code's global completion command for runtime completion.
+`completion` requests when the console needs session data. It uses vscode-R's
+public API for connection discovery, attachment preparation, terminal
+registration, connection references, and session activation; it does not use
+VS Code's global completion command for runtime completion.
 
 The proxy is scoped to the embedded backend runtime session and is indexed by
-the backend session id while connected. Startup uses
-`sess::connect(endpoint = ...)` against the proxy endpoint; the `sess` package
-performs the normal versioned attach handshake, which is forwarded to vscode-R.
-The proxy records the stable sess `session_id`. When a console terminal gains
-focus, R Console calls vscode-R's public `session.activate(sessionId)` API
-instead of synthesizing another attach notification; VS Code custom
-pseudoterminals do not provide a real terminal process id for vscode-R's
-terminal-focus switcher.
+the backend session id while connected. The managed bootstrap connects `sess`
+through the proxy endpoint and forwards the versioned attach handshake to
+vscode-R. R Console validates attachment and connection references before
+binding the corresponding pseudoterminal. Background consoles are bound
+without changing the active R session; terminal focus selects the matching
+session through vscode-R's public `session.activate()` API. No native shell
+PID is required for the pseudoterminal.
 
-The console passes its endpoint directly and does not create discovery files.
-It clears inherited `SESS_DISCOVERY_FILE` values so a console cannot attach
-through another terminal's settings. After a window reload, it obtains a new
-endpoint and reconnects when the restored console reaches an empty main prompt.
+The console passes its proxy endpoint to `prepareAttachment()`, not through
+the launch environment, and does not create discovery files. It retains
+`SESS_PLOT_BACKEND` and `SESS_RSTUDIOAPI` in the R environment for compatibility
+with code that reads these settings. The values reflect vscode-R's resolved
+plot-backend preference and `r.session.emulateRStudioAPI` setting, respectively;
+vscode-R's managed bootstrap independently configures the actual sess options.
+Reconnection refreshes both variables from the current configuration before
+sourcing the newly prepared managed bootstrap.
+It clears inherited `SESS_DISCOVERY_FILE` values so a console cannot attach through
+another terminal's settings. After a window reload, it obtains a new endpoint
+and reconnects when the restored console reaches an empty main prompt.
 Detached consoles in the same window reuse their existing proxy connection.
 
 The backend launch environment includes:
@@ -538,7 +545,8 @@ The backend launch environment includes:
 Depending on the selected session integration, it also includes:
 
 - `R_CONSOLE_SESSION_BOOTSTRAP`
-- `SESS_ENDPOINT`
+- `SESS_PLOT_BACKEND` (managed sess mode)
+- `SESS_RSTUDIOAPI` (managed sess mode)
 - `VSCODE_WATCHER_DIR`
 - `VSCODE_INIT_R`
 
@@ -558,9 +566,9 @@ At launch time, `rTerminal/runtime.ts` also sets:
 3. installs the console pager
 4. locks the prompt options used by the embedded console contract
 
-The selected bootstrap is physically isolated: `resources/r/VSCR/sess.R`
-connects through `sess`, while `resources/r/VSCR/legacy.R` runs vscode-R's
-legacy `init.R`.
+The `sess` bootstrap is prepared by vscode-R and is not bundled with R Console.
+The legacy implementation still sources `resources/r/VSCR/legacy.R`, which
+runs vscode-R's legacy `init.R`.
 
 ### 3.3 Session Metadata
 
