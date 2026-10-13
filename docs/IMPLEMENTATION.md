@@ -525,10 +525,13 @@ session through vscode-R's public `session.activate()` API. No native shell
 PID is required for the pseudoterminal.
 
 The console passes its proxy endpoint to `prepareAttachment()`, not through
-the launch environment, and does not create discovery files. It retains the
-resolved `SESS_PLOT_BACKEND` environment variable for R code that reads it,
-but vscode-R's managed bootstrap configures the actual graphics backend.
-Reconnection refreshes this variable before sourcing the managed bootstrap.
+the launch environment, and does not create discovery files. It retains
+`SESS_PLOT_BACKEND` and `SESS_RSTUDIOAPI` in the R environment for compatibility
+with code that reads these settings. The values reflect vscode-R's resolved
+plot-backend preference and `r.session.emulateRStudioAPI` setting, respectively;
+vscode-R's managed bootstrap independently configures the actual sess options.
+Reconnection refreshes both variables from the current configuration before
+sourcing the newly prepared managed bootstrap.
 It clears inherited `SESS_DISCOVERY_FILE` values so a console cannot attach through
 another terminal's settings. After a window reload, it obtains a new endpoint
 and reconnects when the restored console reaches an empty main prompt.
@@ -543,6 +546,7 @@ Depending on the selected session integration, it also includes:
 
 - `R_CONSOLE_SESSION_BOOTSTRAP`
 - `SESS_PLOT_BACKEND` (managed sess mode)
+- `SESS_RSTUDIOAPI` (managed sess mode)
 - `VSCODE_WATCHER_DIR`
 - `VSCODE_INIT_R`
 

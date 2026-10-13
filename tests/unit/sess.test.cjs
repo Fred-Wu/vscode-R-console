@@ -84,6 +84,7 @@ function integrationFixture(t, info, overrides = {}) {
   const terminalIntegrations = new Map();
   const connectionListeners = new Set();
   let discoveries = 0;
+  const settings = { emulateRStudioAPI: false };
   const session = {
     getConnectionInfo: async () => { discoveries++; return info; },
     prepareAttachment: async ({ connection, autoActivate }) => {
@@ -123,7 +124,8 @@ function integrationFixture(t, info, overrides = {}) {
   const { SessVscodeRIntegration } = loadSource("src/Runtime/VSCR/sess/integration.ts", {
     vscode: {
       extensions: { getExtension: () => extension },
-      workspace: { getConfiguration: () => ({ get: () => false }) },
+      workspace: { getConfiguration: () => ({ get: (key) =>
+        key === "session.emulateRStudioAPI" ? settings.emulateRStudioAPI : false }) },
       window: { showWarningMessage: (message) => warnings.push(message) },
     },
   });
@@ -146,7 +148,7 @@ function integrationFixture(t, info, overrides = {}) {
     return integration;
   };
   t.after(() => integrations.forEach((integration) => integration.handleRuntimeExit()));
-  return { create, host, extension, activations, activationOptions, warnings, commands, preparations,
+  return { create, host, extension, settings, activations, activationOptions, warnings, commands, preparations,
     terminalIntegrations,
     emitConnection: (change) => { for (const listener of connectionListeners) listener(change); },
     discoveries: () => discoveries };
@@ -166,6 +168,7 @@ test("sess startup uses opaque upstream attachment preparation per proxy", async
       assert.equal(fixture.preparations[0].attachmentId, "prep-1");
       assert.equal(env.R_CONSOLE_SESSION_BOOTSTRAP, fixture.preparations[0].scriptPath);
       assert.equal(env.SESS_PLOT_BACKEND, plotBackend);
+      assert.equal(env.SESS_RSTUDIOAPI, "FALSE");
       assert.equal(env.SESS_ENDPOINT, undefined);
       assert.equal(env.SESS_DISCOVERY_FILE, undefined);
       assert.equal(env.JGD_SOCKET, undefined);
@@ -187,6 +190,18 @@ test("missing plot backend preference falls back to auto in the R launch environ
   await integration.prepareStart(env);
   assert.equal(env.SESS_PLOT_BACKEND, "auto");
   assert.equal(fixture.preparations.length, 1);
+});
+
+test("sess launch follows the current RStudio API emulation setting", async (t) => {
+  for (const enabled of [false, true]) {
+    await t.test(String(enabled), async (t) => {
+      const fixture = integrationFixture(t, { endpoint: "upstream" });
+      fixture.settings.emulateRStudioAPI = enabled;
+      const env = {};
+      await fixture.create().prepareStart(env);
+      assert.equal(env.SESS_RSTUDIOAPI, enabled ? "TRUE" : "FALSE");
+    });
+  }
 });
 
 test("sess launch safely declines missing or unsupported upstream APIs", async (t) => {
@@ -267,7 +282,7 @@ test("restored runtime uses new preparation and waits for confirmed attach", asy
   await waitFor(() => fixture.commands.length === 1);
   assert.equal(integration.connection.pipePath, waitingEndpoint);
   assert.equal(fixture.commands[0].code,
-    `Sys.setenv(SESS_PLOT_BACKEND = "jgd"); ${fixture.preparations[0].command}`);
+    `Sys.setenv(SESS_PLOT_BACKEND = "jgd", SESS_RSTUDIOAPI = "FALSE"); ${fixture.preparations[0].command}`);
   assert.equal(fixture.preparations[0].endpoint, integration.connection.pipePath);
   assert.equal(integration.reconnectPending, true);
   fixture.host.mode = "ready";
@@ -277,8 +292,11 @@ test("restored runtime uses new preparation and waits for confirmed attach", asy
   assert.equal(integration.reconnectRetryBlocked, true);
   assert.equal(fixture.commands.length, 1);
   integration.setActive(false);
+  fixture.settings.emulateRStudioAPI = true;
   integration.setActive(true);
   await waitFor(() => fixture.commands.length === 2);
+  assert.equal(fixture.commands[1].code,
+    `Sys.setenv(SESS_PLOT_BACKEND = "jgd", SESS_RSTUDIOAPI = "TRUE"); ${fixture.preparations[1].command}`);
   assert.equal(fixture.preparations.length, 2);
 });
 
@@ -437,7 +455,7 @@ test("manual attach delegates through the same sess proxy and explicitly binds b
   const pending = hook.attach({ isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
   await waitFor(() => fixture.commands.length === 1);
   assert.equal(fixture.commands[0].code,
-    `Sys.setenv(SESS_PLOT_BACKEND = "auto"); ${fixture.preparations[1].command}`);
+    `Sys.setenv(SESS_PLOT_BACKEND = "auto", SESS_RSTUDIOAPI = "FALSE"); ${fixture.preparations[1].command}`);
   assert.equal(fixture.preparations[1].endpoint, integration.connection.pipePath);
   const r = await connectR(t, integration.connection.pipePath);
   send(r.socket, attachV2);

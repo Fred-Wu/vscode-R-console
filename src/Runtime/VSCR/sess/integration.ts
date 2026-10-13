@@ -149,6 +149,11 @@ function getSessionConnection(): Promise<VscodeRSessionConnection | undefined> {
   return connectionDiscovery;
 }
 
+function getRStudioApiEnvValue(): "TRUE" | "FALSE" {
+  return vscode.workspace.getConfiguration("r").get<boolean>("session.emulateRStudioAPI") === false
+    ? "FALSE" : "TRUE";
+}
+
 export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
   private connection: VscodeRSessionConnection | undefined;
   private connectionRefresh: Promise<VscodeRSessionConnection | undefined> | undefined;
@@ -257,8 +262,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       env.R_CONSOLE_SESSION_BOOTSTRAP = preparation.scriptPath;
       // Preserve the R-visible backend preference; vscode-R owns device setup.
       env.SESS_PLOT_BACKEND = connection.plotBackend;
-      env.SESS_RSTUDIOAPI = vscode.workspace.getConfiguration("r").get<boolean>("session.emulateRStudioAPI") === false
-        ? "FALSE" : "TRUE";
+      env.SESS_RSTUDIOAPI = getRStudioApiEnvValue();
     } catch (error) {
       this.reconnectPending = true;
       this.reconnectRetryBlocked = true;
@@ -742,9 +746,9 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
         if (previous !== preparation) { previous?.dispose(); }
         preparationsByRuntimeSession.set(runtimeSessionId, preparation);
       }
-      // Refresh the legacy environment value without replacing the managed
-      // bootstrap or constructing our own sess::connect() call.
-      const command = `Sys.setenv(SESS_PLOT_BACKEND = ${JSON.stringify(connection.plotBackend)}); ${preparation.command}`;
+      // Refresh R-visible settings before the managed attachment executes.
+      // vscode-R's generated command still configures the actual sess options.
+      const command = `Sys.setenv(SESS_PLOT_BACKEND = ${JSON.stringify(connection.plotBackend)}, SESS_RSTUDIOAPI = ${JSON.stringify(getRStudioApiEnvValue())}); ${preparation.command}`;
       if (this.submitHiddenCommand(command)) {
         this.reconnectCommandRunning = true;
       } else {
