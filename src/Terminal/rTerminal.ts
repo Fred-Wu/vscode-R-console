@@ -61,6 +61,7 @@ import {
   sendRuntimeReply,
   startRuntime,
   setRuntimeVscodeRSessionActive,
+  setRuntimeVscodeRTerminal,
   disposeRuntimeVscodeRIntegrationUi,
 } from "./rTerminal/runtime";
 
@@ -2476,6 +2477,10 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   requiresCloseConfirmation(): boolean {
     return this.isRunning();
+  }
+
+  setVscodeRSessionTerminal(terminal: vscode.Terminal | undefined): void {
+    setRuntimeVscodeRTerminal(this.runtimeHost(), terminal);
   }
 
   getPid(): number | undefined {

@@ -413,6 +413,7 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   }
 
   record.terminalName = closedTerminal.name;
+  record.rTerminal.setVscodeRSessionTerminal(undefined);
   record.rTerminal.preserveTerminalName(closedTerminal.name);
   detachTerminalFromRecord(record, closedTerminal);
   setRConsoleActiveContext(vscode.window.activeTerminal, closedTerminal);
@@ -998,6 +999,7 @@ function disposeConsoleRecord(record: ConsoleRecord): void {
   }
   record.pid = undefined;
   record.pidSubscription.dispose();
+  record.rTerminal.setVscodeRSessionTerminal(undefined);
   rTerminalToRecord.delete(record.rTerminal);
 
   for (const [terminal, mappedRecord] of terminalToRecord) {
@@ -1107,6 +1109,7 @@ function attachTerminal(
   }
   record.terminal = terminal;
   terminalToRecord.set(terminal, record);
+  record.rTerminal.setVscodeRSessionTerminal(terminal);
 
   const alwaysUseActive = vscode.workspace.getConfiguration("r").get<boolean>("alwaysUseActiveTerminal");
   const preserveFocus =
@@ -1118,6 +1121,12 @@ function attachTerminal(
 
 function handleTerminalOpen(terminal: vscode.Terminal): void {
   syncTerminalRecord(terminal);
+  const record = resolveRecordFromTerminal(terminal);
+  if (record?.terminal === terminal) {
+    // Register once VS Code has actually opened the terminal. Upstream rejects
+    // registrations for terminals not yet present in window.terminals.
+    record.rTerminal.setVscodeRSessionTerminal(terminal);
+  }
   setRConsoleActiveContext(vscode.window.activeTerminal);
 }
 
@@ -1129,9 +1138,7 @@ async function handleActiveTerminalChange(
   }
   setRConsoleActiveContext(terminal);
 
-  if (terminal) {
-    await terminal.processId;
-  }
+  // An extension-owned pseudoterminal need not have a native shell PID.
   if (vscode.window.activeTerminal !== terminal) {
     return;
   }
