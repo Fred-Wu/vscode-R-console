@@ -165,6 +165,7 @@ test("sess startup uses opaque upstream attachment preparation per proxy", async
       assert.equal(fixture.preparations[0].endpoint, integration.connection.pipePath);
       assert.equal(fixture.preparations[0].attachmentId, "prep-1");
       assert.equal(env.R_CONSOLE_SESSION_BOOTSTRAP, fixture.preparations[0].scriptPath);
+      assert.equal(env.SESS_PLOT_BACKEND, plotBackend);
       assert.equal(env.SESS_ENDPOINT, undefined);
       assert.equal(env.SESS_DISCOVERY_FILE, undefined);
       assert.equal(env.JGD_SOCKET, undefined);
@@ -177,6 +178,15 @@ test("sess startup uses opaque upstream attachment preparation per proxy", async
       assert.equal(fixture.preparations[0].disposed, true);
     });
   }
+});
+
+test("missing plot backend preference falls back to auto in the R launch environment", async (t) => {
+  const fixture = integrationFixture(t, { endpoint: "upstream" });
+  const integration = fixture.create();
+  const env = { SESS_PLOT_BACKEND: "inherited" };
+  await integration.prepareStart(env);
+  assert.equal(env.SESS_PLOT_BACKEND, "auto");
+  assert.equal(fixture.preparations.length, 1);
 });
 
 test("sess launch safely declines missing or unsupported upstream APIs", async (t) => {
@@ -256,7 +266,8 @@ test("restored runtime uses new preparation and waits for confirmed attach", asy
   integration.handleMainPrompt();
   await waitFor(() => fixture.commands.length === 1);
   assert.equal(integration.connection.pipePath, waitingEndpoint);
-  assert.equal(fixture.commands[0].code, fixture.preparations[0].command);
+  assert.equal(fixture.commands[0].code,
+    `Sys.setenv(SESS_PLOT_BACKEND = "jgd"); ${fixture.preparations[0].command}`);
   assert.equal(fixture.preparations[0].endpoint, integration.connection.pipePath);
   assert.equal(integration.reconnectPending, true);
   fixture.host.mode = "ready";
@@ -425,7 +436,8 @@ test("manual attach delegates through the same sess proxy and explicitly binds b
   integration.handleMainPrompt();
   const pending = hook.attach({ isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
   await waitFor(() => fixture.commands.length === 1);
-  assert.equal(fixture.commands[0].code, fixture.preparations[1].command);
+  assert.equal(fixture.commands[0].code,
+    `Sys.setenv(SESS_PLOT_BACKEND = "auto"); ${fixture.preparations[1].command}`);
   assert.equal(fixture.preparations[1].endpoint, integration.connection.pipePath);
   const r = await connectR(t, integration.connection.pipePath);
   send(r.socket, attachV2);

@@ -9,6 +9,7 @@ import { SessProxy } from "./sessProxy";
 
 type VscodeRSessionInfo = {
   endpoint?: unknown;
+  plotBackend?: unknown;
   [key: string]: unknown;
 };
 
@@ -52,6 +53,7 @@ type VscodeRExtensionApi = {
 
 type VscodeRSessionConnection = {
   pipePath: string;
+  plotBackend: string;
   prepareAttachment(endpoint: string): Promise<VscodeRPreparation | undefined>;
   getSessionReference(sessionId: string): VscodeRSessionReference | undefined;
   onDidChangeSessionConnection: vscode.Event<VscodeRSessionConnectionChange>;
@@ -111,8 +113,13 @@ async function discoverSessionConnection(): Promise<
     ) {
       return undefined;
     }
+    const plotBackend =
+      typeof info.plotBackend === "string" && info.plotBackend.length > 0
+        ? info.plotBackend
+        : "auto";
     return {
       pipePath: info.endpoint,
+      plotBackend,
       prepareAttachment: (endpoint: string) => sessionApi.prepareAttachment({
         connection: { transport: "sess", endpoint },
         autoActivate: false,
@@ -250,6 +257,8 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
       this.expectedAttachmentId = preparation.attachmentId;
       this.initialBootstrapPending = true;
       env.R_CONSOLE_SESSION_BOOTSTRAP = preparation.scriptPath;
+      // Preserve the R-visible backend preference; vscode-R owns device setup.
+      env.SESS_PLOT_BACKEND = connection.plotBackend;
     } catch (error) {
       this.reconnectPending = true;
       this.reconnectRetryBlocked = true;
@@ -733,7 +742,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
         if (previous !== preparation) { previous?.dispose(); }
         preparationsByRuntimeSession.set(runtimeSessionId, preparation);
       }
-      if (this.submitHiddenCommand(preparation.command)) {
+      // Refresh the legacy environment value without replacing the managed
+      // bootstrap or constructing our own sess::connect() call.
+      const command = `Sys.setenv(SESS_PLOT_BACKEND = ${JSON.stringify(connection.plotBackend)}); ${preparation.command}`;
+      if (this.submitHiddenCommand(command)) {
         this.reconnectCommandRunning = true;
       } else {
         this.releasePreparation();
