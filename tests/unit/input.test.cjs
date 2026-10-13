@@ -112,3 +112,27 @@ test("plaintext history with an incomplete tail preserves completed entries", (t
   restored.load();
   assert.deepEqual(restored.getEntries(), ["finished <- 1"]);
 });
+
+test("history caps existing files and appends at 20000 commands", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-bounded-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  fs.writeFileSync(file, Array.from({ length: 20005 }, (_, i) =>
+    "\\n# time: 2026-10-14 00:00 UTC\\n+command-" + i + "\\n"
+  ).join("").replaceAll("\\n", "\n"));
+  const first = new HistoryManager(file);
+  first.load();
+  assert.equal(first.getEntries().length, 20000);
+  assert.equal(first.getEntries()[0], "command-5");
+  assert.equal((fs.readFileSync(file, "utf8").match(/^# time:/gm) || []).length, 20000);
+  const second = new HistoryManager(file);
+  second.load();
+  first.push("new <- 1");
+  second.push("second <- 2");
+  const restored = new HistoryManager(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries().slice(-2), ["new <- 1", "second <- 2"]);
+  assert.ok(restored.getEntries().length <= 20000);
+  assert.ok((fs.readFileSync(file, "utf8").match(/^# time:/gm) || []).length <= 20000);
+  assert.equal(restored.getEntries().includes("command-5"), false);
+});

@@ -196,6 +196,7 @@ Then test:
 - press `Ctrl+L` and verify Up and Ctrl+R search from the latest entry again
 - create two consoles in one workspace and a third in another; verify `workspace` history sharing and isolation, then select `global` and verify sharing between workspaces
 - create a new console after an interrupted/incomplete history write and verify history recovery does not prevent R from launching
+- verify history exceeding 20,000 commands is trimmed when a console starts, and further submissions keep the history file and picker within that limit
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
 

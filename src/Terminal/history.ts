@@ -46,10 +46,13 @@ export class HistoryManager {
   private sessionEntries: string[] = [];
   private historyIndex = 0;
   private searchNoDuplicates = false;
-  private readonly maxHistorySize = 10000;
+  private readonly maxHistorySize = 20000;
+  // Reclaim headroom in batches instead of rewriting 20,000 commands on every submit.
+  private readonly compactToSize = 19000;
   private diskStamp: string | undefined;
   private lastEntryCount = 0;
   private diskOffset = 0;
+  private diskFileId: string | undefined;
 
   constructor(
     private readonly historyFile: string
@@ -71,16 +74,18 @@ export class HistoryManager {
         this.diskStamp = "missing";
         this.diskOffset = 0;
         this.lastEntryCount = 0;
-        this.incompleteTail = "";
+        this.diskFileId = undefined;
       }
       return;
     }
     const stamp = stat.size + ":" + stat.mtimeMs;
-    if (!force && stamp === this.diskStamp) return;
+    const fileId = stat.dev + ":" + stat.ino;
+    if (!force && stamp === this.diskStamp && fileId === this.diskFileId) return;
     // Only parse newly appended lines. New records always start with a
     // blank separator, so a trailing incomplete command is never committed.
     const reload = force || stat.size < this.diskOffset || this.diskStamp === "missing" ||
-      (stat.size === this.diskOffset && this.diskStamp !== stamp);
+      (stat.size === this.diskOffset && this.diskStamp !== stamp) ||
+      (this.diskFileId !== undefined && fileId !== this.diskFileId);
     const offset = reload ? 0 : this.diskOffset;
     let fd: number;
     try {
@@ -141,44 +146,145 @@ export class HistoryManager {
       : Math.max(0, Math.min(this.historyBuffer.length, oldStart + oldIndex - newStart));
     this.diskOffset = offset + Buffer.byteLength(complete);
     this.diskStamp = stamp;
-
+    this.diskFileId = fileId;
   }
 
   load(): void {
     this.refreshFromDisk(true);
     this.sessionEntries = [];
+    // Cap pre-existing history files when this console starts, not on extension activation.
+    if (this.lastEntryCount > this.maxHistorySize) {
+      try {
+        this.withFileLock(() => {
+          this.refreshFromDisk(true);
+          if (this.lastEntryCount > this.maxHistorySize) {
+            this.compactHistory(this.maxHistorySize);
+          }
+        });
+      } catch {
+        // Storage issues must not prevent the R console from starting.
+      }
+    }
   }
 
   save(): void {}
 
+  // Coordinate compaction and appends across consoles and VS Code windows.
+  // Lock files from an interrupted writer may be reclaimed after its process exits.
+  private withFileLock<T>(action: () => T): T {
+    fs.mkdirSync(path.dirname(this.historyFile), { recursive: true });
+    const lockPath = this.historyFile + ".lock";
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    for (let attempt = 0; attempt < 100; attempt++) {
+      let fd: number;
+      try {
+        fd = fs.openSync(lockPath, "wx", 0o600);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        try {
+          const owner = Number(fs.readFileSync(lockPath, "utf8").trim());
+          const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+          let dead = false;
+          if (Number.isSafeInteger(owner) && owner > 0 && owner !== process.pid) {
+            try {
+              process.kill(owner, 0);
+            } catch (processError) {
+              dead = (processError as NodeJS.ErrnoException).code === "ESRCH";
+            }
+          }
+          if (dead || age > 120000) {
+            fs.rmSync(lockPath, { force: true });
+          }
+        } catch {
+          // Another window may have released the lock.
+        }
+        Atomics.wait(pause, 0, 0, 10);
+        continue;
+      }
+      try {
+        fs.writeSync(fd, String(process.pid));
+        return action();
+      } finally {
+        fs.closeSync(fd);
+        fs.rmSync(lockPath, { force: true });
+      }
+    }
+    throw new Error("R Console history is busy.");
+  }
+
+  private compactHistory(keep: number): void {
+    // Keep original timestamps and multiline records when the file uses the
+    // regular console format; older irregular files can be reserialized.
+    const raw = fs.readFileSync(this.historyFile, "utf8");
+    const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
+      .map((match) => match.index!);
+    const entries = this.historyBuffer.slice(-keep);
+    const completeEnd = raw.lastIndexOf("\n") + 1;
+    const content = boundaries.length === this.lastEntryCount &&
+      boundaries.length >= entries.length
+      ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
+      : entries.map((entry) => this.serializeEntry(entry)).join("");
+    const temporary = this.historyFile + "." + process.pid + "." +
+      Math.random().toString(16).slice(2) + ".tmp";
+    try {
+      fs.writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      fs.renameSync(temporary, this.historyFile);
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+    const originalLength = this.historyBuffer.length;
+    const originalIndex = this.historyIndex;
+    this.historyBuffer = entries;
+    this.historyIndex = originalIndex === originalLength
+      ? entries.length
+      : Math.max(0, originalIndex - (originalLength - entries.length));
+    this.lastEntryCount = entries.length;
+    const stat = fs.statSync(this.historyFile);
+    this.diskStamp = stat.size + ":" + stat.mtimeMs;
+    this.diskOffset = stat.size;
+    this.diskFileId = stat.dev + ":" + stat.ino;
+  }
+
+  private serializeEntry(entry: string): string {
+    const now = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+    return "\n# time: " + now + "\n" +
+      entry.split("\n").map((line) => "+" + line + "\n").join("");
+  }
+
   push(entry: string): void {
     if (!entry.trim()) return;
-    this.refreshFromDisk();
-    const now = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
-    const record = "\n# time: " + now + "\n" +
-      entry.split("\n").map((line) => "+" + line + "\n").join("");
     try {
-      fs.mkdirSync(path.dirname(this.historyFile), { recursive: true });
-      fs.appendFileSync(this.historyFile, record);
+      this.withFileLock(() => {
+        this.refreshFromDisk();
+        // A crashed append can leave an unfinished line. Discard that tail
+        // before starting a new, well-formed command record.
+        const stat = fs.existsSync(this.historyFile) ? fs.statSync(this.historyFile) : undefined;
+        if (stat && stat.size > this.diskOffset) {
+          fs.truncateSync(this.historyFile, this.diskOffset);
+          this.refreshFromDisk(true);
+        }
+        if (this.lastEntryCount >= this.maxHistorySize) {
+          this.compactHistory(this.compactToSize);
+        }
+        fs.appendFileSync(this.historyFile, this.serializeEntry(entry));
+        this.historyBuffer.push(entry);
+        this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
+        this.sessionEntries.push(entry);
+        this.sessionEntries = this.sessionEntries.slice(-this.maxHistorySize);
+        this.historyIndex = this.historyBuffer.length;
+        const updated = fs.statSync(this.historyFile);
+        this.diskStamp = updated.size + ":" + updated.mtimeMs;
+        this.diskOffset = updated.size;
+        this.diskFileId = updated.dev + ":" + updated.ino;
+        this.lastEntryCount++;
+      });
     } catch {
-      // Keep the command available in this session when disk history fails.
+      // Keep the command in session history when disk storage is unavailable.
       this.historyBuffer.push(entry);
       this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
       this.sessionEntries.push(entry);
+      this.sessionEntries = this.sessionEntries.slice(-this.maxHistorySize);
       this.historyIndex = this.historyBuffer.length;
-      return;
-    }
-    this.historyBuffer.push(entry);
-    this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
-    this.sessionEntries.push(entry);
-    this.historyIndex = this.historyBuffer.length;
-    try {
-      const stat = fs.statSync(this.historyFile);
-      this.diskStamp = stat.size + ":" + stat.mtimeMs;
-      this.diskOffset = stat.size;
-      this.lastEntryCount += 1;
-    } catch {
-      this.diskStamp = undefined;
     }
   }
 
