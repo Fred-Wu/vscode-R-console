@@ -10,6 +10,7 @@ export type KeyAction =
   | { type: "tab" }
   | { type: "backtab" }
   | { type: "completion" }
+  | { type: "history" }
   | { type: "escape" }
   | { type: "ctrl_c" }
   | { type: "ctrl_d" }
@@ -32,6 +33,7 @@ const CSI_6: Map<string, KeyAction> = new Map([
 
 const CSI_5: Map<string, KeyAction> = new Map([
   ["\x1b[18~", { type: "completion" }],
+  ["\x1b[19~", { type: "history" }],
 ]);
 
 const CSI_4: Map<string, KeyAction> = new Map([

@@ -12,10 +12,11 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
 - ~~Multiline editing with local history navigation, reverse search, and long-input rendering.~~
-- Multiline editing with`Ctrl+R` reverse search from a history picker ()with optional duplicate collapse) or typed-prefix recall, and long-input rendering.
+- Multiline editing and long-input rendering. `Ctrl+R` performs reverse history search with a typed prefix. `F8` opens a searchable history picker with a toggle to collapse duplicate commands. The picker remembers your choice across consoles and VS Code restarts.
 - Workspace-aware encrypted history:
   - **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; consoles without a workspace automatically use global history.
-  - **Encryption:** Command history and persistent terminal replay are encrypted in VS Code extension storage using a key held in SecretStorage. The legacy `~/.r_console_history` file remains unchanged.
+  - **Encryption:** Command history stored on disk is encrypted. For persistent sessions, saved terminal output, prompt text, and unfinished input are also encrypted. The encryption key is kept in VS Code's secure storage (SecretStorage).
+  - **Existing history:** The old `~/.r_console_history` file is left unchanged and is no longer used. Its commands are not imported into the new history.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
 
@@ -26,6 +27,8 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 ## Using R Console
 
 ### Setup
+
+R Console requires VS Code 1.109 or later.
 
 1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
 2. Configure `r.executablePath`. The deprecated `r.rpath.<platform>` setting is still supported for compatibility. If neither setting is set, R Console looks for R on `PATH` and, on Windows, falls back to the R installation recorded in the Windows registry.
@@ -75,11 +78,11 @@ R Console reads several settings from [vscode-R](https://marketplace.visualstudi
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `r.executablePath`          | Vanilla R executable path                                                                                                                    |
 | `r.consoleArgs`             | Extra arguments passed to R                                                                                                                  |
-| `r.rpath.<platform>`        | Deprecated. Use`r.executablePath` instead                                                                                                  |
-| `r.rterm.option`            | Deprecated. Use`r.consoleArgs` instead                                                                                                     |
-| `r.sessionWatcher`          | Enables the[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher or console-scoped JSON-RPC bridge |
+| `r.rpath.<platform>`        | Deprecated. Use `r.executablePath` instead                                                                                                  |
+| `r.rterm.option`            | Deprecated. Use `r.consoleArgs` instead                                                                                                     |
+| `r.sessionWatcher`          | Enables the [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session watcher or console-scoped JSON-RPC bridge |
 | `r.bracketedPaste`          | Enables bracketed paste mode                                                                                                                 |
-| `r.lsp.args`                | Extra arguments passed when starting`languageserver`                                                                                       |
+| `r.lsp.args`                | Extra arguments passed when starting `languageserver`                                                                                       |
 | `r.lsp.use_stdio`           | Uses stdio instead of a loopback socket for the console LSP client when supported                                                            |
 | `r.alwaysUseActiveTerminal` | Controls whether the new console is immediately focused                                                                                      |
 
@@ -89,10 +92,10 @@ R Console also contributes its own settings:
 
 | Setting                    | Default       | Purpose                                                                                                                       |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `r.console.historyScope` | `workspace` | Shared command history per workspace folder or across all workspaces (`global`)                                             |
+| `r.console.historyScope` | `workspace` | Shared command history per workspace folder or across all workspaces (`global`). Changes apply when a console is created or reattached. |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
-| `r.console.pipeOperator` | <code></code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code></code> and `%>%` |
+| `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by `R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
 
 ## Dependency Model
 

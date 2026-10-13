@@ -176,7 +176,7 @@ Expected:
 - paste does not add doubled brackets / quotes
 - Enter after a bracketed paste should not accidentally submit twice
 
-## 5. History And Reverse Search
+## 5. History Picker And Reverse History Search
 
 Run:
 
@@ -186,12 +186,24 @@ beta_test <- 2
 gamma_test <- alpha_test + beta_test
 ```
 
+```{r history-multiline}
+test <- function(){
+       print(10)
+   }
+```
+
 Then test:
 
 - Up / Down history navigation
-- press `Ctrl+R` at an empty prompt, type `alpha_test` into the history picker, then select the matching entry
-- execute identical commands several times (both consecutively and separated by other commands); check that the picker initially displays every occurrence
-- select the `☐ Collapse duplicates` checkbox-style row in the picker; verify it changes to `☑ Collapse duplicates`, identical entries appear only once, and the search text is preserved; uncheck to show all occurrences again
+- press `F8` at an empty prompt, type `alpha_test` into the history picker, then select the matching entry
+- find the `test` function in the picker; verify its code appears once, without a second summary or preview, and selecting it restores the original indentation
+- for a command longer than 240 characters, search for text near its end and verify the full command is recalled
+- press `F8` with text already entered at the prompt; verify it still opens the picker and cancelling keeps the entered text
+- enable `terminal.integrated.sendKeybindingsToShell`, verify `F8` still opens the picker, then restore the setting
+- focus a source editor and press `F8`; verify it keeps VS Code's next-problem action instead of opening console history
+- execute identical commands several times (both consecutively and separated by other commands); with duplicate collapsing off, check that the picker displays every occurrence
+- hover over the collapse icon and verify the tooltip is "Collapse duplicate commands"; click it and verify it highlights when enabled, identical entries appear only once, and the search text is preserved; turn it off to show all occurrences again
+- turn duplicate collapsing on, dismiss the picker, and reopen it; verify the toggle remains enabled and duplicates stay collapsed, including in another console and after restarting VS Code
 - verify Up and Down skip consecutive identical commands in both directions while separated repeats remain available
 - type `alpha_test` at the R prompt, then press `Ctrl+R` once to recall the previous matching entry
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
@@ -201,12 +213,20 @@ Then test:
 Expected:
 
 - multiline history entries are restored intact
-- `Ctrl+R` opens a searchable history picker when the input is empty
-- the picker checkbox collapses exact duplicates for the current picker only; it does not rewrite the encrypted history or change Up/Down navigation
-- `Ctrl+R` with a typed prefix searches backward and recalls the matching command directly into the input buffer
+- `F8` opens a searchable history picker while the R Console is focused
+- the search-box toggle collapses exact duplicates and remembers its state across consoles and VS Code restarts; it does not rewrite the encrypted history or change Up/Down navigation
+- `Ctrl+R` performs reverse history search with a typed prefix, recalling the matching command directly in the console
 - reverse search does not corrupt the current buffer
 - recalled command can be edited normally
 - clearing the console resets history navigation and search position without clearing the saved history
+
+Also check history storage:
+
+- with `r.console.historyScope` set to `workspace`, create two consoles in the same workspace folder and verify they share submitted commands; create a console in another workspace folder and verify its history is separate
+- set `r.console.historyScope` to `global`, create new consoles in different workspace folders, and verify they share history; a console outside a workspace should use the same global history
+- check the saved history files described in [the implementation notes](IMPLEMENTATION.md#encrypted-history-and-persisted-terminal-ui); submitted commands should not appear as readable text, and the old `~/.r_console_history` file should remain unchanged
+- leave unfinished input at the prompt, detach the persistent session, and reattach it; verify output, prompt text, and input are restored, and none of that content appears as readable text in `persistent-sessions.json`; connection details remain readable
+- restore `r.console.historyScope` to its original value and recreate or reattach consoles after changing it
 
 ## 6. Nested Input: `readline()`, `menu()`, `browser()`
 
@@ -823,6 +843,7 @@ Expected:
 
 - outputs and completions stay scoped to the correct console / session
 - watcher / LSP state from one console does not bleed into the other
+- consoles in the same workspace folder share command history by default; this does not share their R objects or output
 
 With vscode-R's public session API available, also check:
 

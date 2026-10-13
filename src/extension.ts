@@ -71,7 +71,7 @@ const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_HEARTBEAT_MS = 5000;
 let extensionBaseUri: vscode.Uri | undefined;
 let persistentSessionFilePath: string | undefined;
-let historyStorage: { folder: string; encryption: EncryptedStorage } | undefined;
+let historyStorage: { folder: string; encryption: EncryptedStorage; state: vscode.Memento } | undefined;
 let persistDebounceTimer: NodeJS.Timeout | undefined;
 let persistHeartbeatTimer: NodeJS.Timeout | undefined;
 let extensionHostDeactivating = false;
@@ -112,6 +112,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await fs.promises.mkdir(context.globalStorageUri.fsPath, { recursive: true });
   historyStorage = {
     folder: context.globalStorageUri.fsPath,
+    state: context.globalState,
     encryption: await loadEncryptedStorage(
       context.secrets, context.globalStorageUri.fsPath, persistentSessionFilePath
     ),
@@ -134,8 +135,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.triggerCompletion", () =>
       getActiveRTerminal()?.triggerCompletion()
     ),
-    vscode.commands.registerCommand("r-console.reverseSearch", () =>
-      getActiveRTerminal()?.reverseSearch()
+    vscode.commands.registerCommand("r-console.searchHistory", () =>
+      getActiveRTerminal()?.showHistoryPicker()
     ),
     vscode.commands.registerCommand("r-console.restoreDefaultName", (target?: unknown) => {
       restoreDefaultConsoleName(target);

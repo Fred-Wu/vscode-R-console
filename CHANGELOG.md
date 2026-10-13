@@ -7,12 +7,13 @@ All notable changes to R Console will be documented in this file.
 ### Added
 
 - Workspace-aware encrypted console history:
-  - Command history is shared between consoles in the same workspace folder and retained across console restarts. `r.console.historyScope` defaults to `workspace`, with an option to use a single `global` history. Consoles outside a workspace automatically use global history.
-  - Command history and persistent terminal replay are encrypted on disk, with the encryption key stored in VS Code SecretStorage. Existing `~/.r_console_history` files remain untouched.
-  - `Ctrl+R` opens a searchable history picker at an empty prompt while retaining prefix-based history recall when text is already entered. A checkbox-style option collapses exact duplicate entries in the picker without deleting stored commands; 
+  - Command history is now kept separately for each workspace folder and shared between its consoles. `r.console.historyScope` defaults to `workspace`, with an option to use a single `global` history. Consoles outside a workspace automatically use global history.
+  - Command history stored on disk is now encrypted. For persistent sessions, saved terminal output, prompt text, and unfinished input are also encrypted. The encryption key is kept in VS Code's secure storage (SecretStorage).
+  - A new `F8` shortcut to open a searchable history picker. A toggle collapses exact duplicate entries without deleting stored commands and remembers your choice across consoles and VS Code restarts.
 
 ### Changed
 
+- R Console now requires VS Code 1.109 or later.
 - Expanded compatibility with recent vscode-R releases, thanks to [@eitsupi](https://github.com/eitsupi) and the vscode-R contributors:
   - [#1837](https://github.com/REditorSupport/vscode-R/pull/1837): Workspace actions can execute in the correct R Console pseudoterminal without requiring a native terminal PID.
   - [#1868](https://github.com/REditorSupport/vscode-R/pull/1868): R Console can use vscode-R's managed `sess` preparation and installation process, including dependency handling and installation consent.

@@ -19,7 +19,7 @@
   },
   "homepage": "https://github.com/Fred-Wu/vscode-R-console#readme",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.109.0"
   },
   "categories": [
     "Programming Languages"
@@ -87,7 +87,7 @@
         "category": "R Console"
       },
       {
-        "command": "r-console.reverseSearch",
+        "command": "r-console.searchHistory",
         "title": "Search Command History",
         "category": "R Console"
       },
@@ -135,15 +135,15 @@
         "when": "terminalFocus && rConsole.consoleActive"
       },
       {
-        "command": "r-console.reverseSearch",
-        "key": "ctrl+r",
+        "command": "r-console.searchHistory",
+        "key": "f8",
         "when": "terminalFocus && rConsole.consoleActive"
       }
     ],
     "configurationDefaults": {
       "terminal.integrated.commandsToSkipShell": [
         "r-console.insertPipeOperator",
-        "r-console.reverseSearch"
+        "r-console.searchHistory"
       ]
     },
     "configuration": {
@@ -197,7 +197,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.12.2",
-    "@types/vscode": "1.85.0",
+    "@types/vscode": "1.109.0",
     "@vscode/vsce": "^3.7.1",
     "esbuild": "^0.27.7",
     "typescript": "^5.3.0",

@@ -6,7 +6,7 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 
 ## Requirements
 
-- VS Code 1.85.0 or later.
+- VS Code 1.109 or later.
 - Node.js 24.x for the extension build and packaging scripts.
 - A local R installation. R Console resolves `r.executablePath`, then deprecated `r.rpath.*`, then `PATH`, with the Windows registry as the final Windows fallback.
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). R Console declares `REditorSupport.r` in `extensionDependencies` and depends on [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session bootstrap/configuration.
@@ -34,7 +34,7 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vsc-r-console-0.3.0-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, named `vsc-r-console-<version>-<platform>.vsix`.
 
 `vscode:prepublish` prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 

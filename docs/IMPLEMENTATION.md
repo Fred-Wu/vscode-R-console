@@ -730,18 +730,24 @@ The file is stored under extension storage:
 Each record contains:
 
 - runtime reconnect info: session id, port, pid
-- persisted terminal options: R path, R args, watcher settings, bracketed paste,
+- persisted terminal options: R path, R args, bracketed paste,
   cwd
-- UI replay state: replay buffer, dimensions, mode, prompt state, input text,
+- encrypted UI state: replay buffer, dimensions, mode, prompt state, input text,
   cursor position, backend pid
 - terminal location: panel or editor column
 
 The persisted data belongs to R Console. It is not a `vscode-R` session
 snapshot.
 
+The UI state is saved as `encryptedUi`; connection details and terminal options
+remain unencrypted. The key is held in VS Code SecretStorage.
+
 ### 4.3 Registry Loading And Pruning
 
-On activation, `extension.ts` loads `persistent-sessions.json`.
+On activation, `extension.ts` loads `persistent-sessions.json` and decrypts
+each record's UI state before validating it. Older unencrypted UI records are
+also accepted. Records for running sessions are then rewritten with encrypted
+UI state in the same file; they are not moved to another location.
 
 Records are validated before use. A record is kept only when:
 
@@ -774,7 +780,8 @@ Attaching a detached console follows this implementation path:
 1. the session manager reads the persisted record
 2. `buildPersistentTerminalOptions(...)` combines current resolved options with
    persisted options
-3. `new RTerminal(options, extensionPath, persistedState)` rebuilds the frontend
+3. `new RTerminal(options, extensionPath, persistedState, terminalName, historyStorage)`
+   rebuilds the frontend using the shared encrypted history storage
 4. the persisted runtime reconnect info is passed to `runtimeBackend.reconnect`
 5. TypeScript connects to the existing backend socket
 6. the terminal replay state is used to rebuild the visible terminal
@@ -834,9 +841,46 @@ not persisted.
 16. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 17. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 18. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+19. [`src/Terminal/history.ts`](../src/Terminal/history.ts)
+20. [`src/Runtime/encryptedStorage.ts`](../src/Runtime/encryptedStorage.ts)
 
 ## Encrypted history and persisted terminal UI
 
-R Console selects `r.console.historyScope` (`workspace` by default or `global`) at terminal construction. The workspace scope is the folder selected for that console's initial working directory; with no folder, it falls back to global history. History stores append-only AES-256-GCM encrypted command records under `context.globalStorageUri/history/`, using a SHA-256 workspace-path identifier in the filename. Independent R consoles share history by reading new records from the same append-only journal; their browsing cursors remain separate. Up/Down navigation skips adjacent identical commands in either direction. The Ctrl+R picker initially lists all entries, with a checkbox-style row that toggles exact-text deduplication for that picker only (keeping the newest occurrence); neither operation removes stored records. The legacy home-directory `.r_console_history` file is no longer modified. On-disk journals are append-only and currently have no automatic disk compaction; the in-memory navigation list retains the newest 10,000 entries.
+R Console selects `r.console.historyScope` (`workspace` by default or `global`)
+when creating a console. Workspace history uses the folder selected for that
+console's initial working directory. Consoles without a workspace folder use
+global history. Changing the setting applies to newly created or reattached
+consoles.
 
-The encryption key is generated once and stored using `context.secrets`. Missing or damaged encryption keys must not cause silent replacement of stored ciphertext. The on-disk `persistent-sessions.json` contains `encryptedUi` instead of `ui`, encrypting terminal replay, prompt and current-input text, while retaining connection metadata needed for reconnection. Older plaintext records can be read and are migrated when next saved. Encryption protects local stored content at rest, not the live terminal, memory, or pre-existing backups. The whole history journal is not cleared when a console closes because histories are workspace/global scoped, rather than session scoped.
+Command history is saved as AES-256-GCM encrypted records under
+`context.globalStorageUri/history/`. Workspace filenames use a SHA-256 hash of
+the folder path. Commands are appended as they are submitted, and consoles
+sharing the same history read updates from that file while keeping separate
+navigation positions. Files are not automatically shortened; navigation keeps
+the newest 10,000 entries in memory. The old `~/.r_console_history` file is
+neither read nor modified, and its commands are not imported.
+
+`Ctrl+R` performs reverse history search with a typed prefix directly in the
+console. `F8` opens the history picker while an R Console is focused, through
+`r-console.searchHistory`. If VS Code forwards F8 to the terminal, `KeyProcessor`
+maps the xterm `ESC [ 19 ~` sequence to the same picker. Each item uses the full
+command as its label, without a second code preview or a 240-character limit.
+Selecting it recalls the original command, including its indentation.
+
+The picker uses the `collapse-all-compact` Codicon with the tooltip
+"Collapse duplicate commands". Its native toggle highlights when enabled.
+Collapsing exact duplicates keeps the newest occurrence in the picker without
+removing stored commands. It is off by default. The choice is saved in
+`context.globalState` under `historyPicker.collapseDuplicates`, so it applies
+across consoles and survives VS Code restarts. Up/Down navigation separately
+skips consecutive identical commands in either direction.
+
+The encryption key is generated once and stored using `context.secrets`
+(VS Code SecretStorage). Command history and the complete saved UI state for
+persistent sessions use this key. That UI state includes terminal output,
+prompt text, and unfinished input. `persistent-sessions.json` stores it as
+`encryptedUi` instead of `ui`; connection details remain unencrypted. Existing
+unencrypted UI records for running sessions are read and rewritten encrypted
+at startup in the same file. Missing or damaged encryption keys do not cause
+the existing encrypted files to be replaced. Encryption applies to saved data
+on disk, not live terminal output, memory, or pre-existing backups.

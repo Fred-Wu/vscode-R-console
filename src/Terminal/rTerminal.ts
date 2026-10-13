@@ -227,7 +227,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     private extensionPath: string = "",
     restoreState?: PersistedRTerminalState,
     terminalName?: string,
-    historyStorage?: { folder: string; encryption: EncryptedStorage }
+    private readonly historyStorage?: { folder: string; encryption: EncryptedStorage; state: vscode.Memento }
   ) {
     if (terminalName && !isDefaultRuntimeTerminalName(terminalName)) {
       this.customTerminalName = terminalName;
@@ -1201,7 +1201,10 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       case "ctrl_r":
-        void this.reverseSearch();
+        this.reverseSearch();
+        return;
+      case "history":
+        void this.showHistoryPicker();
         return;
       case "ctrl_l":
         // A visual clear starts a fresh history-navigation/search sequence.
@@ -1625,12 +1628,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.recordSubmissionHistory(blocks);
   }
 
-  public async reverseSearch(): Promise<void> {
+  private reverseSearch(): void {
     if (this.mode !== "ready" || !this.promptReady) {
       return;
     }
 
-    // Keep the established prefix-based Ctrl+R behaviour when input is present.
     const prefix = this.inputState.currentLine.trim();
     const continuingSearch =
       this.historyBrowsing && this.historyCollapsed && Boolean(this.lastSearchTerm);
@@ -1644,51 +1646,54 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.lastSearchTerm = term;
         this.applyHistorySearchResult(match);
       }
+    }
+  }
+
+  public async showHistoryPicker(): Promise<void> {
+    if (this.mode !== "ready" || !this.promptReady) {
       return;
     }
-
-    // At an empty prompt, make Ctrl+R useful without requiring a prefix first.
     const entries = this.rHistory.getEntries();
     if (entries.length === 0) {
       void vscode.window.showInformationMessage("R Console history is empty for this workspace.");
       return;
     }
     type HistoryPickItem = vscode.QuickPickItem & {
-      code?: string;
-      isCollapseToggle?: boolean;
+      code: string;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
     picker.title = "R Console: Reverse History Search";
     picker.placeholder = "Type to search previous R commands";
-    picker.matchOnDetail = true;
-    let collapseDuplicates = false;
+    const preferenceKey = "historyPicker.collapseDuplicates";
+    const state = this.historyStorage!.state;
+    const collapseButton = {
+      iconPath: new vscode.ThemeIcon("collapse-all-compact"),
+      tooltip: "Collapse duplicate commands",
+      location: vscode.QuickInputButtonLocation.Input,
+      toggle: { checked: state.get<boolean>(preferenceKey, false) },
+    };
+    picker.buttons = [collapseButton];
 
     const updateItems = (): void => {
-      const toggle: HistoryPickItem = {
-        label: collapseDuplicates ? "☑ Collapse duplicates" : "☐ Collapse duplicates",
-        alwaysShow: true,
-        isCollapseToggle: true,
-      };
-      const choices: HistoryPickItem[] = getHistoryPickerEntries(entries, collapseDuplicates)
-        .map((code) => ({
-          label: code.replace(/\s*\r?\n\s*/g, " ↵ ").slice(0, 240),
-          detail: code.includes("\n") ? code : undefined,
-          code,
-        }));
-      picker.items = [toggle, ...choices];
+      picker.items = getHistoryPickerEntries(entries, collapseButton.toggle.checked)
+        .map((code) => ({ label: code, code }));
     };
     updateItems();
 
     let selectedCode: string | undefined;
     try {
       selectedCode = await new Promise<string | undefined>((resolve) => {
+        picker.onDidTriggerButton(async (button) => {
+          if (button !== collapseButton) return;
+          updateItems();
+          try {
+            await state.update(preferenceKey, collapseButton.toggle.checked);
+          } catch {
+            void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
+          }
+        });
         picker.onDidAccept(() => {
           const selected = picker.selectedItems[0] ?? picker.activeItems[0];
-          if (selected?.isCollapseToggle) {
-            collapseDuplicates = !collapseDuplicates;
-            updateItems();
-            return;
-          }
           if (selected?.code !== undefined) {
             resolve(selected.code);
             picker.hide();
