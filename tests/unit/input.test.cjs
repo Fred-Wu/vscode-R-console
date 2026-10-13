@@ -422,6 +422,84 @@ test("failed history appends keep queued commands visible until retry", (t) => {
   }
 });
 
+test("partial multi-command append rolls back and retries without duplicates", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-partial-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const seed = new HistoryManager(file);
+  seed.load();
+  seed.push("existing()");
+  let attempts = 0;
+  const simulatedFs = {
+    ...fs,
+    appendFileSync(...args) {
+      if (args[0] === file && attempts++ === 0) {
+        throw new Error("initial append unavailable");
+      }
+      if (args[0] === file && attempts === 2) {
+        const batch = String(args[1]);
+        const second = batch.indexOf("\n# time:", 2);
+        assert.ok(second > 0, "retry batch should contain multiple commands");
+        fs.appendFileSync(file, batch.slice(0, second + 12));
+        throw new Error("partial append after a completed record");
+      }
+      return fs.appendFileSync(...args);
+    },
+  };
+  const { HistoryManager: PartialHistory } = loadSource(
+    "src/Terminal/history.ts", { fs: simulatedFs }
+  );
+  const history = new PartialHistory(file);
+  history.load();
+  history.push("first()");
+  history.push("second()");
+  history.save();
+  history.save();
+  const restored = new HistoryManager(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["existing()", "first()", "second()"]);
+});
+
+test("failed partial-append rollback is recovered before retry", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-rollback-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const seed = new HistoryManager(file);
+  seed.load();
+  seed.push("existing()");
+  let failedAppend = false;
+  let failedRollback = false;
+  const simulatedFs = {
+    ...fs,
+    appendFileSync(...args) {
+      if (args[0] === file && !failedAppend) {
+        failedAppend = true;
+        fs.appendFileSync(file, String(args[1]).slice(0, 15));
+        throw new Error("partial write");
+      }
+      return fs.appendFileSync(...args);
+    },
+    truncateSync(...args) {
+      if (args[0] === file && !failedRollback) {
+        failedRollback = true;
+        throw new Error("rollback failed");
+      }
+      return fs.truncateSync(...args);
+    },
+  };
+  const { HistoryManager: PartialHistory } = loadSource(
+    "src/Terminal/history.ts", { fs: simulatedFs }
+  );
+  const history = new PartialHistory(file);
+  history.load();
+  history.push("queued()");
+  history.save();
+  history.save();
+  const restored = new HistoryManager(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["existing()", "queued()"]);
+});
+
 test("save on disposal flushes pending history after a write failure, exactly once", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-save-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

@@ -70,6 +70,9 @@ export class HistoryManager {
   private diskOffset = 0;
   private diskFileId: string | undefined;
   private pendingEntries: string[] = [];
+  // A failed append whose rollback also failed must be resolved before retrying,
+  // or already written records could be appended a second time.
+  private unresolvedAppend?: { offset: number; fileId: string; bytes: Buffer };
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private retryDelay = 50;
 
@@ -325,6 +328,35 @@ export class HistoryManager {
     this.retryDelay = Math.min(this.retryDelay * 2, 5000);
   }
 
+  private recoverUnresolvedAppend(): void {
+    const failed = this.unresolvedAppend;
+    if (!failed) return;
+    const stat = fs.statSync(this.historyFile);
+    const fileId = stat.dev + ":" + stat.ino;
+    const length = stat.size - failed.offset;
+    // Never truncate a replaced file, or another writer's completed append.
+    if (fileId !== failed.fileId || length < 0 || length > failed.bytes.length) {
+      throw new Error("Cannot safely recover a partially written R Console history batch.");
+    }
+    const actual = Buffer.alloc(length);
+    const fd = fs.openSync(this.historyFile, "r");
+    try {
+      let position = 0;
+      while (position < length) {
+        const count = fs.readSync(fd, actual, position, length - position, failed.offset + position);
+        if (!count) throw new Error("Could not verify partial R Console history append.");
+        position += count;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (!actual.equals(failed.bytes.subarray(0, length))) {
+      throw new Error("R Console history changed after a failed append.");
+    }
+    if (length > 0) fs.truncateSync(this.historyFile, failed.offset);
+    this.unresolvedAppend = undefined;
+  }
+
   private flushPending(): void {
     if (!this.pendingEntries.length) return;
     // Reconciliation replaces the in-memory buffer with the disk snapshot.
@@ -333,6 +365,8 @@ export class HistoryManager {
     const visibleIndex = this.historyIndex;
     try {
       this.withFileLock(() => {
+        // Resolve an earlier failed rollback before reading or appending anything.
+        this.recoverUnresolvedAppend();
         // The in-memory tail also contains pending submissions. Temporarily
         // remove it so incremental disk reconciliation cannot duplicate them.
         // The catch block restores the original view if persistence fails.
@@ -357,12 +391,41 @@ export class HistoryManager {
           ));
           this.compactHistory(keep);
         }
-        fs.appendFileSync(
-          this.historyFile,
-          queued.map((entry) => this.serializeEntry(entry)).join(""),
-          // mode applies on creation only; do not change existing file permissions.
-          process.platform === "win32" ? undefined : { mode: 0o600 }
-        );
+        const batch = queued.map((entry) => this.serializeEntry(entry)).join("");
+        // Remember the exact pre-append boundary *after* any compaction.
+        // A failed append may have written one or more complete records.
+        const beforeAppend = fs.existsSync(this.historyFile)
+          ? fs.statSync(this.historyFile) : undefined;
+        try {
+          fs.appendFileSync(
+            this.historyFile,
+            batch,
+            // mode applies on creation only; do not change existing file permissions.
+            process.platform === "win32" ? undefined : { mode: 0o600 }
+          );
+        } catch (error) {
+          try {
+            const current = fs.statSync(this.historyFile);
+            if (beforeAppend && (current.dev !== beforeAppend.dev ||
+              current.ino !== beforeAppend.ino)) {
+              throw new Error("History file was replaced during a failed append.");
+            }
+            // Undo all bytes from this attempt while still holding the lock.
+            fs.truncateSync(this.historyFile, beforeAppend?.size ?? 0);
+          } catch (rollbackError) {
+            // A nonexistent file cannot contain a partial append. Otherwise,
+            // retain enough information to verify a safe rollback on retry.
+            if ((rollbackError as NodeJS.ErrnoException).code !== "ENOENT") {
+              const current = fs.statSync(this.historyFile);
+              this.unresolvedAppend = {
+                offset: beforeAppend?.size ?? 0,
+                fileId: (beforeAppend ?? current).dev + ":" + (beforeAppend ?? current).ino,
+                bytes: Buffer.from(batch, "utf8"),
+              };
+            }
+          }
+          throw error;
+        }
         // No retry if subsequent metadata access fails after the append.
         this.pendingEntries = [];
         this.historyBuffer.push(...queued);

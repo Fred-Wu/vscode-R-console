@@ -832,7 +832,11 @@ consoles maintain stable navigation positions even across duplicate commands.
 Normal appends reconcile only bytes added since the last known disk offset
 under the per-file lock; file replacement or compaction triggers a full
 reload. Pending local commands are excluded during reconciliation and
-restored if persistence fails, avoiding duplicated submissions.
+restored if persistence fails. Partial append failures roll back the attempted
+batch to its pre-append byte boundary while the file lock is held. If rollback
+fails, the next retry first verifies and removes only the exact attempted
+suffix; uncertain changes are left untouched rather than risking duplicate
+records or truncating another writer's data.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
 path calls `HistoryManager.save()` to retry pending submissions synchronously
