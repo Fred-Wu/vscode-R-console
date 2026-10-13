@@ -1,7 +1,6 @@
 const assert = require("node:assert/strict");
 const { randomUUID } = require("node:crypto");
 const { once } = require("node:events");
-const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -85,7 +84,6 @@ function integrationFixture(t, info, overrides = {}) {
   const terminalIntegrations = new Map();
   const connectionListeners = new Set();
   let discoveries = 0;
-  let obsoleteFileAccesses = 0;
   const session = {
     getConnectionInfo: async () => { discoveries++; return info; },
     prepareAttachment: async ({ connection, autoActivate }) => {
@@ -123,10 +121,6 @@ function integrationFixture(t, info, overrides = {}) {
   };
   const extension = { isActive: false, activate: async () => ({ session }) };
   const { SessVscodeRIntegration } = loadSource("src/Runtime/VSCR/sess/integration.ts", {
-    fs: { ...fs, promises: { ...fs.promises,
-      readdir: async () => { obsoleteFileAccesses++; return []; },
-      writeFile: async () => { obsoleteFileAccesses++; },
-    } },
     vscode: {
       extensions: { getExtension: () => extension },
       workspace: { getConfiguration: () => ({ get: () => false }) },
@@ -155,7 +149,7 @@ function integrationFixture(t, info, overrides = {}) {
   return { create, host, extension, activations, activationOptions, warnings, commands, preparations,
     terminalIntegrations,
     emitConnection: (change) => { for (const listener of connectionListeners) listener(change); },
-    discoveries: () => discoveries, obsoleteFileAccesses: () => obsoleteFileAccesses };
+    discoveries: () => discoveries };
 }
 
 test("sess startup uses opaque upstream attachment preparation per proxy", async (t) => {

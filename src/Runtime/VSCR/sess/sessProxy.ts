@@ -14,7 +14,6 @@ type PendingRequest = {
 
 type SessProxyOptions = {
   upstreamPipePath: string;
-  onWorkspaceData?: (data: WorkspaceData) => void;
 };
 
 const REQUEST_TIMEOUT_MS = 2000;
@@ -42,9 +41,7 @@ export class SessProxy {
   private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
   private onConnectionChange: ((state: "attached" | "disconnected") => void) | undefined;
 
-  constructor(private readonly options: SessProxyOptions) {
-    this.onWorkspaceData = options.onWorkspaceData;
-  }
+  constructor(private readonly options: SessProxyOptions) {}
 
   async start(): Promise<string> {
     this.dispose();

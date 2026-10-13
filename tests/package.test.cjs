@@ -27,9 +27,11 @@ test("VSIX contains the extension, R scripts, and exactly the staged runtime", a
   });
   for (const name of ["dist/extension.js", "package.json", "package.nls.json", "changelog.md",
     "resources/r/console-profile.R", "resources/r/console-language-server.R",
-    "resources/r/VSCR/legacy.R", "resources/r/VSCR/sess.R"]) {
+    "resources/r/VSCR/legacy.R"]) {
     assert.ok(entries.get(`extension/${name}`)?.uncompressedSize > 0, name);
   }
+  assert.equal(entries.has("extension/resources/r/VSCR/sess.R"), false,
+    "the superseded sess bootstrap must not be packaged");
   const runtimeEntries = [...entries.keys()].filter((name) => name.startsWith("extension/bundled/bin/") && !name.endsWith("/"));
   assert.deepEqual(runtimeEntries, [`extension/bundled/bin/${binary}`]);
   const runtime = entries.get(runtimeEntries[0]);

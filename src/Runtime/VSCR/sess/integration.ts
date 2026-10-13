@@ -9,8 +9,6 @@ import { SessProxy } from "./sessProxy";
 
 type VscodeRSessionInfo = {
   endpoint?: unknown;
-  plotBackend?: unknown;
-  jgdSocket?: unknown;
   [key: string]: unknown;
 };
 
@@ -54,8 +52,6 @@ type VscodeRExtensionApi = {
 
 type VscodeRSessionConnection = {
   pipePath: string;
-  plotBackend: string;
-  jgdSocket?: string;
   prepareAttachment(endpoint: string): Promise<VscodeRPreparation | undefined>;
   getSessionReference(sessionId: string): VscodeRSessionReference | undefined;
   onDidChangeSessionConnection: vscode.Event<VscodeRSessionConnectionChange>;
@@ -115,17 +111,8 @@ async function discoverSessionConnection(): Promise<
     ) {
       return undefined;
     }
-    const plotBackend =
-      typeof info.plotBackend === "string" && info.plotBackend.length > 0
-        ? info.plotBackend
-        : "auto";
     return {
       pipePath: info.endpoint,
-      plotBackend,
-      jgdSocket:
-        typeof info.jgdSocket === "string" && info.jgdSocket.length > 0
-          ? info.jgdSocket
-          : undefined,
       prepareAttachment: (endpoint: string) => sessionApi.prepareAttachment({
         connection: { transport: "sess", endpoint },
         autoActivate: false,
@@ -207,14 +194,12 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     this.finishManualAttach(false);
     this.clearConnection();
     this.releasePreparation();
-    this.expectedAttachmentId = undefined;
     this.reconnectPending = false;
     this.mainPromptObserved = true;
     this.initialBootstrapPending = false;
     this.reconnectCommandRunning = false;
     this.reconnectRetryBlocked = false;
     this.needsProxyReplacement = false;
-    this.proxyWasAttached = false;
     this.activationPending = false;
     this.activationInFlight = false;
     this.activationTriggeredWhileInFlight = false;
