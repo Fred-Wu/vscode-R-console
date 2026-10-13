@@ -1669,7 +1669,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     const inputButtonLocation = (vscode as unknown as {
       QuickInputButtonLocation?: { Input: number };
     }).QuickInputButtonLocation?.Input;
-    type CollapseButton = vscode.QuickInputButton & {
+    type CollapseButton = {
+      iconPath: vscode.ThemeIcon;
+      tooltip: string;
       location?: number;
       toggle?: { checked: boolean };
     };
