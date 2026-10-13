@@ -88,7 +88,7 @@
       },
       {
         "command": "r-console.searchHistory",
-        "title": "Search Command History",
+        "title": "Show Command History",
         "category": "R Console"
       },
       {
@@ -175,7 +175,7 @@
             "global"
           ],
           "default": "workspace",
-          "description": "Use shared command history per workspace folder, or one global command history. Outside a workspace, history is global."
+          "description": "Share command history within each workspace folder, or across workspaces with global scope. Consoles outside a workspace use global history. Changes apply to new or reattached consoles."
         }
       }
     }
