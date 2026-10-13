@@ -189,7 +189,13 @@ gamma_test <- alpha_test + beta_test
 Then test:
 
 - Up / Down history navigation
-- type `alpha_test`, then press `Ctrl+R` once to recall the previous matching entry
+- press `F8` to open the history picker; select a multiline command and check that its original indentation and entire code are restored
+- toggle the `collapse-all` icon to collapse exact duplicate entries in the picker; verify it does not remove commands from stored history and the choice persists after reopening the picker and restarting VS Code
+- verify Up and Down skip consecutive duplicate commands in both directions, while nonconsecutive repeats remain available
+- type `alpha_test`, then press `Ctrl+R` repeatedly to recall successively older partially matching entries
+- press `Ctrl+L` and verify Up and Ctrl+R search from the latest entry again
+- create two consoles in one workspace and a third in another; verify `workspace` history sharing and isolation, then select `global` and verify sharing between workspaces
+- create a new console after an interrupted/incomplete history write and verify history recovery does not prevent R from launching
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
 

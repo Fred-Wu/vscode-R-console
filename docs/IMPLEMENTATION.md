@@ -834,3 +834,9 @@ not persisted.
 16. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 17. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 18. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+
+## Workspace-aware command history
+
+Every R Console selects `r.console.historyScope` (`workspace` by default, or `global`) when created or reattached, not during extension activation. Workspace history is selected by the initial workspace working directory. Consoles without a workspace use global history. Plaintext history files are stored under extension global storage using the original line-oriented history format. The existing `~/.r_console_history` is not read or modified. Commands are appended on submission, with the newest 10,000 available for in-memory navigation.
+
+`F8` opens a searchable history picker. Its `collapse-all` Codicon toggle hides exact duplicates in the picker while keeping the most recent, without changing stored commands. The preference is retained across consoles and restarts. Up/Down separately skip consecutive identical commands. `Ctrl+R` searches older entries by substring (partial) matching and repeated presses continue searching; `Ctrl+L` resets the history navigation/search position without deleting stored history.

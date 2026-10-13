@@ -87,6 +87,11 @@
         "category": "R Console"
       },
       {
+        "command": "r-console.searchHistory",
+        "title": "Search Command History",
+        "category": "R Console"
+      },
+      {
         "command": "r-console.restoreDefaultName",
         "title": "Restore Default Name",
         "category": "R Console"
@@ -128,11 +133,17 @@
         "command": "r-console.insertPipeOperator",
         "key": "ctrl+alt+m",
         "when": "terminalFocus && rConsole.consoleActive"
+      },
+      {
+        "command": "r-console.searchHistory",
+        "key": "f8",
+        "when": "terminalFocus && rConsole.consoleActive"
       }
     ],
     "configurationDefaults": {
       "terminal.integrated.commandsToSkipShell": [
-        "r-console.insertPipeOperator"
+        "r-console.insertPipeOperator",
+        "r-console.searchHistory"
       ]
     },
     "configuration": {
@@ -156,6 +167,15 @@
           ],
           "default": "|>",
           "description": "Pipe operator to insert for chain operations. The default keybinding is Ctrl+Alt+M."
+        },
+        "r.console.historyScope": {
+          "type": "string",
+          "enum": [
+            "workspace",
+            "global"
+          ],
+          "default": "workspace",
+          "description": "Use shared command history per workspace folder, or one global command history. Outside a workspace, history is global."
         }
       }
     }

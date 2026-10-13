@@ -11,7 +11,8 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
-- Multiline editing with local history navigation, reverse search, and long-input rendering.
+- Multiline editing and long-input rendering. `Ctrl+R` searches earlier commands by partial match, with repeated presses finding older matches. `F8` opens a searchable history picker with a `collapse-all` toggle for exact duplicate commands, remembered across consoles and VS Code restarts.
+- Workspace-aware command history: `r.console.historyScope` defaults to `workspace` (shared by consoles in the same workspace folder). Set it to `global` for one shared history; consoles outside a workspace also use global history. The original `~/.r_console_history` is left unchanged.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
 
@@ -85,6 +86,7 @@ R Console also contributes its own settings:
 
 | Setting                    | Default       | Purpose                                                                                                                       |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `r.console.historyScope` | `workspace` | Share history by workspace folder or use `global`. Applies when a console is created or reattached. |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
 | `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
