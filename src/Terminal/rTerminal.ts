@@ -1667,13 +1667,19 @@ export class RTerminal implements vscode.Pseudoterminal {
     const collapseButton = {
       iconPath: new vscode.ThemeIcon("collapse-all"),
       tooltip: "Collapse duplicate commands",
-      location: vscode.QuickInputButtonLocation.Input,
-      toggle: { checked: state.get<boolean>(preferenceKey, false) },
+
     };
-    picker.buttons = [collapseButton];
+    let collapseDuplicates = state.get<boolean>(preferenceKey, false);
+    const setCollapseButton = (): void => {
+      collapseButton.tooltip = collapseDuplicates
+        ? "Collapse duplicate commands (on)"
+        : "Collapse duplicate commands (off)";
+      picker.buttons = [collapseButton];
+    };
+    setCollapseButton();
 
     const updateItems = (): void => {
-      picker.items = getHistoryPickerEntries(entries, collapseButton.toggle.checked)
+      picker.items = getHistoryPickerEntries(entries, collapseDuplicates)
         .map((code) => ({ label: code, code }));
     };
     updateItems();
@@ -1683,9 +1689,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       selectedCode = await new Promise<string | undefined>((resolve) => {
         picker.onDidTriggerButton(async (button) => {
           if (button !== collapseButton) return;
+          collapseDuplicates = !collapseDuplicates;
+          setCollapseButton();
           updateItems();
           try {
-            await state.update(preferenceKey, collapseButton.toggle.checked);
+            await state.update(preferenceKey, collapseDuplicates);
           } catch {
             void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
           }

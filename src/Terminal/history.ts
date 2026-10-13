@@ -48,6 +48,8 @@ export class HistoryManager {
   private searchNoDuplicates = false;
   private readonly maxHistorySize = 10000;
   private diskStamp: string | undefined;
+  private lastEntryCount = 0;
+  private diskOffset = 0;
 
   constructor(
     private readonly historyFile: string
@@ -67,40 +69,70 @@ export class HistoryManager {
         this.historyBuffer = [];
         this.historyIndex = 0;
         this.diskStamp = "missing";
+        this.diskOffset = 0;
+        this.lastEntryCount = 0;
+        this.incompleteTail = "";
       }
       return;
     }
     const stamp = stat.size + ":" + stat.mtimeMs;
     if (!force && stamp === this.diskStamp) return;
-    const text = fs.readFileSync(this.historyFile, "utf8");
-    const lines = text.split(/\r?\n/);
-    let pending: string[] = [];
+    // Only parse newly appended lines. New records always start with a
+    // blank separator, so a trailing incomplete command is never committed.
+    const reload = force || stat.size < this.diskOffset || this.diskStamp === "missing" ||
+      (stat.size === this.diskOffset && this.diskStamp !== stamp);
+    const offset = reload ? 0 : this.diskOffset;
+    const fd = fs.openSync(this.historyFile, "r");
+    let content: string;
+    try {
+      const bytes = Buffer.alloc(stat.size - offset);
+      let position = 0;
+      while (position < bytes.length) {
+        const count = fs.readSync(fd, bytes, position, bytes.length - position, offset + position);
+        if (!count) break;
+        position += count;
+      }
+      content = bytes.subarray(0, position).toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+    // Preserve an incomplete last line until a subsequent refresh. If the
+    // writer terminated unexpectedly, a later append starts a new record.
+    const lastNewline = content.lastIndexOf("\n");
+    if (lastNewline < 0) return;
+    const complete = content.slice(0, lastNewline + 1);
+    const lines = complete.split(/\r?\n/);
+    let current: string[] = [];
     const entries: string[] = [];
     const flush = () => {
-      if (!pending.length) return;
-      const command = pending.join("\n");
-      if (command.trim()) entries.push(command);
-      pending = [];
+      if (current.length) {
+        const value = current.join("\n");
+        if (value.trim()) entries.push(value);
+        current = [];
+      }
     };
+    // Metadata lines mark a new record. We only publish a completed entry
+    // once its next separator is visible.
     for (const line of lines) {
-      if (line.startsWith("+")) pending.push(line.slice(1));
-      else if (line.trim() === "") flush();
+      if (line.startsWith("+")) current.push(line.slice(1));
+      else if (line.startsWith("#") || !line.trim()) flush();
     }
     flush();
-    const oldEntries = this.historyBuffer;
-    const oldLength = oldEntries.length;
+    const oldLength = this.historyBuffer.length;
     const oldIndex = this.historyIndex;
-    this.historyBuffer = entries.slice(-this.maxHistorySize);
-    // Entries removed from the front shift the absolute navigation cursor.
-    // Locate the previous current entry in the updated history when possible.
-    if (oldIndex === oldLength) {
-      this.historyIndex = this.historyBuffer.length;
-    } else {
-      const previous = oldEntries[oldIndex];
-      this.historyIndex = previous === undefined ? this.historyBuffer.length :
-        Math.max(0, this.historyBuffer.lastIndexOf(previous));
-    }
+    const previousCount = reload ? 0 : this.lastEntryCount;
+    const oldTotal = this.lastEntryCount;
+    const oldStart = Math.max(0, oldTotal - oldLength);
+    const combined = reload ? entries : [...this.historyBuffer, ...entries];
+    this.historyBuffer = combined.slice(-this.maxHistorySize);
+    this.lastEntryCount = previousCount + entries.length;
+    const newStart = Math.max(0, this.lastEntryCount - this.historyBuffer.length);
+    this.historyIndex = oldIndex === oldLength
+      ? this.historyBuffer.length
+      : Math.max(0, Math.min(this.historyBuffer.length, oldStart + oldIndex - newStart));
+    this.diskOffset = offset + Buffer.byteLength(complete);
     this.diskStamp = stamp;
+
   }
 
   load(): void {
@@ -124,6 +156,8 @@ export class HistoryManager {
     this.historyIndex = this.historyBuffer.length;
     const stat = fs.statSync(this.historyFile);
     this.diskStamp = stat.size + ":" + stat.mtimeMs;
+    this.diskOffset = stat.size;
+    this.lastEntryCount += 1;
   }
 
   getEntries(): string[] {
