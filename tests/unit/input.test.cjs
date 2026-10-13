@@ -422,6 +422,86 @@ test("failed history appends keep queued commands visible until retry", (t) => {
   }
 });
 
+test("save on disposal flushes pending history after a write failure, exactly once", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-save-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const initial = new HistoryManager(file);
+  initial.load();
+  initial.push("stored()");
+
+  let writable = false;
+  let appendCount = 0;
+  const simulatedFs = {
+    ...fs,
+    appendFileSync(...args) {
+      if (args[0] === file && !writable) {
+        const error = new Error("simulated history write failure");
+        error.code = "EACCES";
+        throw error;
+      }
+      if (args[0] === file) appendCount++;
+      return fs.appendFileSync(...args);
+    },
+  };
+  const { HistoryManager: SimulatedHistory } = loadSource(
+    "src/Terminal/history.ts", { fs: simulatedFs }
+  );
+  const history = new SimulatedHistory(file);
+  history.load();
+
+  try {
+    history.push("queued-first()");
+    history.push("queued-second()");
+    // A close while the file remains inaccessible must not drop the queue.
+    history.save();
+    assert.deepEqual(history.getEntries(), [
+      "stored()", "queued-first()", "queued-second()",
+    ]);
+    const before = new HistoryManager(file);
+    before.load();
+    assert.deepEqual(before.getEntries(), ["stored()"]);
+
+    // Storage recovers just before disposal's final save attempt.
+    writable = true;
+    history.save();
+    history.save(); // repeated cleanup must be idempotent
+    assert.equal(appendCount, 1);
+
+    const reopened = new HistoryManager(file);
+    reopened.load();
+    assert.deepEqual(reopened.getEntries(), [
+      "stored()", "queued-first()", "queued-second()",
+    ]);
+  } finally {
+    writable = true;
+    history.save();
+  }
+});
+
+test("save on disposal retries queued entries after a history-file lock is released", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-save-lock-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const history = new HistoryManager(file);
+  history.load();
+  const lock = file + ".lock";
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(lock, String(process.pid));
+  try {
+    history.push("queued-while-locked()");
+  } finally {
+    fs.unlinkSync(lock);
+  }
+
+  // The retry timer has not run yet; a synchronous shutdown flush persists it.
+  history.save();
+  history.save();
+  const reopened = new HistoryManager(file);
+  reopened.load();
+  assert.deepEqual(reopened.getEntries(), ["queued-while-locked()"]);
+});
+
 test("new history directories and files are owner-only on Unix", (t) => {
   if (process.platform === "win32") return;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-permissions-"));

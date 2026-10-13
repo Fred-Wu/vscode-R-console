@@ -834,7 +834,11 @@ under the per-file lock; file replacement or compaction triggers a full
 reload. Pending local commands are excluded during reconciliation and
 restored if persistence fails, avoiding duplicated submissions.
 Readers and writers coordinate through a per-file lock; queued submissions
-are retried after lock contention or write failures. If a write fails after
+are retried after lock contention or write failures. The terminal disposal
+path calls `HistoryManager.save()` to retry pending submissions synchronously
+through the same lock, avoiding duplicate writes on repeated disposal. If
+storage remains unavailable when VS Code exits, persistence cannot be
+guaranteed. If a write fails after
 synchronizing the disk snapshot, the console restores its in-memory history
 and navigation cursor so unsaved commands remain available in F8 and Up/Down
 until a subsequent retry succeeds. Newly created history directories and

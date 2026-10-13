@@ -215,7 +215,12 @@ export class HistoryManager {
     }
   }
 
-  save(): void {}
+  save(): void {
+    // Disposal gets one final synchronous attempt to persist submissions that
+    // were queued after a write failure. Use the normal lock and retry path;
+    // never rewrite commands already appended successfully.
+    this.flushPending();
+  }
 
   // Coordinate compaction and appends across consoles and VS Code windows.
   // Lock files from an interrupted writer may be reclaimed after its process exits.
