@@ -830,7 +830,10 @@ Each history file is limited to 20,000 commands; compaction retains the newest
 The `# r-console-history-base:` marker tracks removed entries so concurrent
 consoles maintain stable navigation positions even across duplicate commands.
 Readers and writers coordinate through a per-file lock; queued submissions
-are retried after lock contention. Newly created history directories and
+are retried after lock contention or write failures. If a write fails after
+synchronizing the disk snapshot, the console restores its in-memory history
+and navigation cursor so unsaved commands remain available in F8 and Up/Down
+until a subsequent retry succeeds. Newly created history directories and
 files request Unix permissions `0700` and `0600`; existing permissions
 remain unchanged, and Windows relies on inherited filesystem permissions.
 

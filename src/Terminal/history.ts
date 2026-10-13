@@ -322,6 +322,10 @@ export class HistoryManager {
 
   private flushPending(): void {
     if (!this.pendingEntries.length) return;
+    // Reconciliation replaces the in-memory buffer with the disk snapshot.
+    // Preserve the visible entries and cursor if the append subsequently fails.
+    const visibleHistory = this.historyBuffer;
+    const visibleIndex = this.historyIndex;
     try {
       this.withFileLock(() => {
         // Reconcile external appends first, then write this console's queued
@@ -364,6 +368,10 @@ export class HistoryManager {
         this.retryTimer = undefined;
       }
     } catch {
+      if (this.pendingEntries.length) {
+        this.historyBuffer = visibleHistory;
+        this.historyIndex = visibleIndex;
+      }
       // Keep submissions locally and retry without blocking the R session.
       // This also covers contention from a different VS Code window.
       this.scheduleRetry();

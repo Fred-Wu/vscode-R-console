@@ -320,6 +320,70 @@ test("contended history submissions are retried when the lock is released", asyn
   assert.ok(persisted, "queued history submission should eventually persist");
 });
 
+test("failed history appends keep queued commands visible until retry", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-append-failure-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const seeded = new HistoryManager(file);
+  seeded.load();
+  seeded.push("persisted()");
+
+  let rejectAppend = true;
+  const failingFs = {
+    ...fs,
+    appendFileSync(...args) {
+      if (rejectAppend && args[0] === file) {
+        const error = new Error("simulated append failure");
+        error.code = "EACCES";
+        throw error;
+      }
+      return fs.appendFileSync(...args);
+    },
+  };
+  const { HistoryManager: FailingHistory, getHistoryPickerEntries } = loadSource(
+    "src/Terminal/history.ts", { fs: failingFs }
+  );
+  const history = new FailingHistory(file);
+  history.load();
+  history.setSearchNoDuplicates(true);
+  try {
+    history.push("queued-one()");
+    assert.deepEqual(history.getEntries(), ["persisted()", "queued-one()"]);
+    assert.equal(history.navigate(-1), "queued-one()");
+
+    history.push("queued-two()");
+    assert.deepEqual(history.getEntries(), [
+      "persisted()", "queued-one()", "queued-two()",
+    ]);
+    assert.deepEqual(getHistoryPickerEntries(history.getEntries(), false)
+      .map((entry) => entry.code), ["queued-two()", "queued-one()", "persisted()"]);
+    history.resetIndex();
+    assert.equal(history.navigate(-1), "queued-two()");
+    assert.equal(history.navigate(-1), "queued-one()");
+    history.resetIndex();
+    assert.equal(history.searchBackward("queued"), "queued-two()");
+    assert.equal(history.searchBackward("queued"), "queued-one()");
+    assert.deepEqual(history.getRecentSessionEntries(), ["queued-one()", "queued-two()"]);
+
+    const diskOnly = new HistoryManager(file);
+    diskOnly.load();
+    assert.deepEqual(diskOnly.getEntries(), ["persisted()"]);
+
+    rejectAppend = false;
+    assert.deepEqual(history.getEntries(), [
+      "persisted()", "queued-one()", "queued-two()",
+    ]);
+    const restored = new HistoryManager(file);
+    restored.load();
+    assert.deepEqual(restored.getEntries(), [
+      "persisted()", "queued-one()", "queued-two()",
+    ]);
+  } finally {
+    rejectAppend = false;
+    history.getEntries();
+  }
+});
+
 test("new history directories and files are owner-only on Unix", (t) => {
   if (process.platform === "win32") return;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-permissions-"));
