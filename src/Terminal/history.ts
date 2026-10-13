@@ -208,7 +208,10 @@ export class HistoryManager {
   // Coordinate compaction and appends across consoles and VS Code windows.
   // Lock files from an interrupted writer may be reclaimed after its process exits.
   private withFileLock<T>(action: () => T, maxAttempts = 100): T {
-    fs.mkdirSync(path.dirname(this.historyFile), { recursive: true });
+    fs.mkdirSync(path.dirname(this.historyFile), {
+      recursive: true,
+      mode: process.platform === "win32" ? undefined : 0o700,
+    });
     const lockPath = this.historyFile + ".lock";
     const pause = new Int32Array(new SharedArrayBuffer(4));
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -325,9 +328,12 @@ export class HistoryManager {
           ));
           this.compactHistory(keep);
         }
-        fs.appendFileSync(this.historyFile, queued.map((entry) =>
-          this.serializeEntry(entry)
-        ).join(""));
+        fs.appendFileSync(
+          this.historyFile,
+          queued.map((entry) => this.serializeEntry(entry)).join(""),
+          // mode applies on creation only; do not change existing file permissions.
+          process.platform === "win32" ? undefined : { mode: 0o600 }
+        );
         // No retry if subsequent metadata access fails after the append.
         this.pendingEntries = [];
         this.historyBuffer.push(...queued);

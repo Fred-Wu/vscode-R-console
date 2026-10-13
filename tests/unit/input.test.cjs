@@ -255,3 +255,27 @@ test("contended history submissions are retried when the lock is released", asyn
   }
   assert.ok(persisted, "queued history submission should eventually persist");
 });
+
+test("new history directories and files are owner-only on Unix", (t) => {
+  if (process.platform === "win32") return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-permissions-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const historyDir = path.join(root, "history");
+  const file = path.join(historyDir, "workspace.history");
+  const history = new HistoryManager(file);
+  history.load();
+  history.push("first <- 1");
+
+  assert.equal(fs.statSync(historyDir).mode & 0o077, 0,
+    "new history directory must exclude group and other users");
+  assert.equal(fs.statSync(file).mode & 0o177, 0,
+    "new history file must exclude group, other, and execute permissions");
+
+  // Appending to a pre-existing file should not silently chmod it.
+  fs.chmodSync(historyDir, 0o755);
+  fs.chmodSync(file, 0o644);
+  history.push("second <- 2");
+  assert.equal(fs.statSync(historyDir).mode & 0o777, 0o755);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o644);
+  assert.deepEqual(history.getEntries(), ["first <- 1", "second <- 2"]);
+});

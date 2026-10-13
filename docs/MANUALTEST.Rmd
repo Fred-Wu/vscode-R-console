@@ -200,6 +200,7 @@ Then test:
 - run concurrent command submissions from different VS Code windows using the same history scope and confirm that all completed commands are available from either console
 - while one console is writing a large history entry, check history navigation or F8 from another; only complete entries should appear, and submissions delayed by a locked history file should eventually be shared
 - verify history exceeding 20,000 commands is trimmed when a console starts, and further submissions keep the history file and picker within that limit
+- on Linux/macOS, verify newly created history directories permit owner-only access (`0700`) and newly created history files permit owner-only read/write (`0600`); appending does not change permissions of existing files
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
 
