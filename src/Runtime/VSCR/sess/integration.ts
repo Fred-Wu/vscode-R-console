@@ -223,8 +223,6 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     delete env.SESS_PIPE;
     delete env.SESS_RSTUDIOAPI;
     delete env.SESS_PLOT_BACKEND;
-    delete env.SESS_USE_HTTPGD;
-    delete env.SESS_USE_JGD;
     delete env.JGD_SOCKET;
     delete env.VSCODE_INIT_R;
     delete env.VSCODE_WATCHER_DIR;
