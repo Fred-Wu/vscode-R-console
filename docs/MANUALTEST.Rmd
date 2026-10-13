@@ -176,7 +176,7 @@ Expected:
 - paste does not add doubled brackets / quotes
 - Enter after a bracketed paste should not accidentally submit twice
 
-## 5. History And Reverse Search
+## 5. Command History, Navigation, And Ctrl+R Search
 
 Run:
 
@@ -189,10 +189,11 @@ gamma_test <- alpha_test + beta_test
 Then test:
 
 - Up / Down history navigation
-- press `F8` to open the history picker; select a multiline command and check that its original indentation and entire code are restored
-- toggle the `collapse-all` icon to collapse exact duplicate entries in the picker; verify it does not remove commands from stored history and the choice persists after reopening the picker and restarting VS Code
+- press `F8` or run `R Console: Show Command History`; verify the title is `R Console: Command History` and the placeholder is `Type to filter command history`; filter and select a multiline command and check that its original indentation and complete code are restored
+- click `collapse-all` (`Collapse duplicate commands`) to hide exact duplicate entries in the picker; verify it changes to `expand-all` (`Expand duplicate commands`) to restore them, without removing stored commands; the choice persists after reopening the picker and restarting VS Code
+- in a console without history, verify the message is `R Console command history is empty.` for either history scope
 - verify Up and Down skip consecutive duplicate commands in both directions, while nonconsecutive repeats remain available
-- type `alpha_test`, then press `Ctrl+R` repeatedly to recall successively older partially matching entries
+- type `alpha_test`, then press `Ctrl+R` repeatedly to recall successively older commands containing that text, including matches where it occurs after the beginning of the command
 - press `Ctrl+L` and verify Up and Ctrl+R search from the latest entry again
 - create two consoles in one workspace and a third in another; verify `workspace` history sharing and isolation, then select `global` and verify sharing between workspaces
 - create a new console after an interrupted/incomplete history write and verify history recovery does not prevent R from launching
@@ -207,7 +208,7 @@ Then test:
 Expected:
 
 - multiline history entries are restored intact
-- `Ctrl+R` uses the current line text as the search term and recalls a matching history entry directly into the input buffer
+- `Ctrl+R` searches for the trimmed current line as a substring, reusing the original search text on repeated presses, and recalls a matching entry into the input buffer
 - there is no separate incremental reverse-search prompt that accepts a second search string
 - reverse search does not corrupt the current buffer
 - recalled command can be edited normally
