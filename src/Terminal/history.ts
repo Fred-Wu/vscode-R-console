@@ -57,6 +57,9 @@ export class HistoryManager {
   private diskEntryBase = 0;
   private diskOffset = 0;
   private diskFileId: string | undefined;
+  private pendingEntries: string[] = [];
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private retryDelay = 50;
 
   constructor(
     private readonly historyFile: string
@@ -67,11 +70,36 @@ export class HistoryManager {
   }
 
   private refreshFromDisk(force = false): void {
+    if (this.pendingEntries.length) {
+      this.flushPending();
+      if (this.pendingEntries.length) return;
+    }
+    // No file lock or disk read is needed when nothing has changed.
+    if (!force) {
+      try {
+        const stat = fs.statSync(this.historyFile);
+        const stamp = stat.size + ":" + stat.mtimeMs;
+        if (stamp === this.diskStamp &&
+          stat.dev + ":" + stat.ino === this.diskFileId) return;
+      } catch {
+        // A missing/replaced file is handled under the lock below.
+      }
+    }
+    try {
+      // A contended read retains its last complete snapshot until the next
+      // history operation, instead of inspecting an in-progress append.
+      this.withFileLock(() => this.readHistoryFromDisk(force), 25);
+    } catch {
+      // History storage is optional and must never block starting R.
+    }
+  }
+
+  private readHistoryFromDisk(force = false): void {
     let stat: fs.Stats;
     try {
       stat = fs.statSync(this.historyFile);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       if (force || this.diskStamp !== "missing") {
         this.historyBuffer = [];
         this.historyIndex = 0;
@@ -92,13 +120,7 @@ export class HistoryManager {
       (stat.size === this.diskOffset && this.diskStamp !== stamp) ||
       (this.diskFileId !== undefined && fileId !== this.diskFileId);
     const offset = reload ? 0 : this.diskOffset;
-    let fd: number;
-    try {
-      fd = fs.openSync(this.historyFile, "r");
-    } catch {
-      // A history read failure must not stop the R console from opening.
-      return;
-    }
+    const fd = fs.openSync(this.historyFile, "r");
     let content: string;
     try {
       const bytes = Buffer.alloc(stat.size - offset);
@@ -109,9 +131,6 @@ export class HistoryManager {
         position += count;
       }
       content = bytes.subarray(0, position).toString("utf8");
-    } catch {
-      // Leave the cached history intact if the shared file is inaccessible.
-      return;
     } finally {
       fs.closeSync(fd);
     }
@@ -173,7 +192,7 @@ export class HistoryManager {
     if (this.lastEntryCount > this.maxHistorySize) {
       try {
         this.withFileLock(() => {
-          this.refreshFromDisk(true);
+          this.readHistoryFromDisk(true);
           if (this.lastEntryCount > this.maxHistorySize) {
             this.compactHistory(this.maxHistorySize);
           }
@@ -188,11 +207,11 @@ export class HistoryManager {
 
   // Coordinate compaction and appends across consoles and VS Code windows.
   // Lock files from an interrupted writer may be reclaimed after its process exits.
-  private withFileLock<T>(action: () => T): T {
+  private withFileLock<T>(action: () => T, maxAttempts = 100): T {
     fs.mkdirSync(path.dirname(this.historyFile), { recursive: true });
     const lockPath = this.historyFile + ".lock";
     const pause = new Int32Array(new SharedArrayBuffer(4));
-    for (let attempt = 0; attempt < 100; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let fd: number;
       try {
         fd = fs.openSync(lockPath, "wx", 0o600);
@@ -209,7 +228,7 @@ export class HistoryManager {
               dead = (processError as NodeJS.ErrnoException).code === "ESRCH";
             }
           }
-          if (dead || age > 120000) {
+          if (dead || (age > 120000 && !Number.isSafeInteger(owner))) {
             fs.rmSync(lockPath, { force: true });
           }
         } catch {
@@ -223,7 +242,11 @@ export class HistoryManager {
         return action();
       } finally {
         fs.closeSync(fd);
-        fs.rmSync(lockPath, { force: true });
+        try {
+          fs.rmSync(lockPath, { force: true });
+        } catch {
+          // Avoid replaying a completed append because cleanup failed.
+        }
       }
     }
     throw new Error("R Console history is busy.");
@@ -235,10 +258,10 @@ export class HistoryManager {
     const raw = fs.readFileSync(this.historyFile, "utf8");
     const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
       .map((match) => match.index!);
-    const entries = this.historyBuffer.slice(-keep);
+    const entries = keep > 0 ? this.historyBuffer.slice(-keep) : [];
     const nextBase = this.diskEntryBase + (this.lastEntryCount - entries.length);
     const completeEnd = raw.lastIndexOf("\n") + 1;
-    const records = boundaries.length === this.lastEntryCount &&
+    const records = entries.length > 0 && boundaries.length === this.lastEntryCount &&
       boundaries.length >= entries.length
       ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
       : entries.map((entry) => this.serializeEntry(entry)).join("");
@@ -271,41 +294,73 @@ export class HistoryManager {
       entry.split("\n").map((line) => "+" + line + "\n").join("");
   }
 
-  push(entry: string): void {
-    if (!entry.trim()) return;
+  private scheduleRetry(): void {
+    if (this.retryTimer !== undefined) return;
+    const retry = () => {
+      this.retryTimer = undefined;
+      this.flushPending();
+    };
+    this.retryTimer = setTimeout(retry, this.retryDelay);
+    this.retryTimer.unref();
+    this.retryDelay = Math.min(this.retryDelay * 2, 5000);
+  }
+
+  private flushPending(): void {
+    if (!this.pendingEntries.length) return;
     try {
       this.withFileLock(() => {
-        this.refreshFromDisk();
-        // A crashed append can leave an unfinished line. Discard that tail
-        // before starting a new, well-formed command record.
-        const stat = fs.existsSync(this.historyFile) ? fs.statSync(this.historyFile) : undefined;
+        // Reconcile external appends first, then write this console's queued
+        // commands in submission order. The file lock protects the whole batch.
+        this.readHistoryFromDisk(true);
+        const stat = fs.existsSync(this.historyFile)
+          ? fs.statSync(this.historyFile) : undefined;
         if (stat && stat.size > this.diskOffset) {
           fs.truncateSync(this.historyFile, this.diskOffset);
-          this.refreshFromDisk(true);
+          this.readHistoryFromDisk(true);
         }
-        if (this.lastEntryCount >= this.maxHistorySize) {
-          this.compactHistory(this.compactToSize);
+        const queued = this.pendingEntries.slice(-this.maxHistorySize);
+        if (this.lastEntryCount + queued.length > this.maxHistorySize) {
+          const keep = Math.max(0, Math.min(
+            this.compactToSize, this.maxHistorySize - queued.length
+          ));
+          this.compactHistory(keep);
         }
-        fs.appendFileSync(this.historyFile, this.serializeEntry(entry));
-        this.historyBuffer.push(entry);
+        fs.appendFileSync(this.historyFile, queued.map((entry) =>
+          this.serializeEntry(entry)
+        ).join(""));
+        // No retry if subsequent metadata access fails after the append.
+        this.pendingEntries = [];
+        this.historyBuffer.push(...queued);
         this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
-        this.sessionEntries.push(entry);
-        this.sessionEntries = this.sessionEntries.slice(-this.maxHistorySize);
         this.historyIndex = this.historyBuffer.length;
+        this.lastEntryCount += queued.length;
+        this.diskStamp = undefined;
         const updated = fs.statSync(this.historyFile);
         this.diskStamp = updated.size + ":" + updated.mtimeMs;
         this.diskOffset = updated.size;
         this.diskFileId = updated.dev + ":" + updated.ino;
-        this.lastEntryCount++;
       });
+      this.retryDelay = 50;
+      if (this.retryTimer !== undefined) {
+        clearTimeout(this.retryTimer);
+        this.retryTimer = undefined;
+      }
     } catch {
-      // Keep the command in session history when disk storage is unavailable.
-      this.historyBuffer.push(entry);
-      this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
-      this.sessionEntries.push(entry);
-      this.sessionEntries = this.sessionEntries.slice(-this.maxHistorySize);
-      this.historyIndex = this.historyBuffer.length;
+      // Keep submissions locally and retry without blocking the R session.
+      // This also covers contention from a different VS Code window.
+      this.scheduleRetry();
     }
+  }
+
+  push(entry: string): void {
+    if (!entry.trim()) return;
+    this.pendingEntries.push(entry);
+    this.historyBuffer.push(entry);
+    this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
+    this.sessionEntries.push(entry);
+    this.sessionEntries = this.sessionEntries.slice(-this.maxHistorySize);
+    this.historyIndex = this.historyBuffer.length;
+    this.flushPending();
   }
 
   getEntries(): string[] {

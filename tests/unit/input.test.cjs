@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
@@ -174,4 +175,83 @@ test("another console's compaction preserves an older history cursor", (t) => {
   assert.equal(restored.getEntries().length, 19001);
   assert.equal(restored.getEntries()[0], "command-1000");
   assert.match(fs.readFileSync(file, "utf8"), /^# r-console-history-base: 1000\n/);
+});
+
+test("separate node processes append to the same history without lost commands", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-processes-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const loader = path.resolve(__dirname, "../helpers/load-source.cjs");
+  const source = path.resolve(__dirname, "../../src/Terminal/history.ts");
+  const code = `
+    const HistoryManager = require(process.argv[1])(process.argv[2]).HistoryManager;
+    const history = new HistoryManager(process.argv[3]);
+    history.load();
+    for (let i = 0; i < 30; i++) history.push(process.argv[4] + "-" + i);
+  `;
+  await Promise.all(["A", "B", "C"].map((prefix) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", code, loader, source, file, prefix], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let errors = "";
+    child.stderr.on("data", (data) => { errors += data; });
+    child.on("error", reject);
+    child.on("exit", (status) => status === 0 ? resolve() :
+      reject(new Error("Writer exited " + status + ": " + errors)));
+  })));
+  const restored = new HistoryManager(file);
+  restored.load();
+  assert.equal(restored.getEntries().length, 90);
+  for (const prefix of ["A", "B", "C"]) {
+    for (let i = 0; i < 30; i++) {
+      assert.ok(restored.getEntries().includes(prefix + "-" + i));
+    }
+  }
+});
+
+test("reads use the shared write lock rather than consuming partially written commands", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-locked-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const writer = new HistoryManager(file);
+  const reader = new HistoryManager(file);
+  writer.load();
+  reader.load();
+  writer.push("complete()");
+  assert.deepEqual(reader.getEntries(), ["complete()"]);
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, String(process.pid));
+  try {
+    fs.appendFileSync(file, "\n# time: 2026-10-14 00:00 UTC\n+under-construction()\n");
+    assert.deepEqual(reader.getEntries(), ["complete()"]);
+  } finally {
+    fs.unlinkSync(lock);
+  }
+  assert.deepEqual(reader.getEntries(), ["complete()", "under-construction()"]);
+});
+
+test("contended history submissions are retried when the lock is released", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-retry-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const writer = new HistoryManager(file);
+  writer.load();
+  const lock = file + ".lock";
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(lock, String(process.pid));
+  try {
+    writer.push("eventual()");
+    assert.ok(writer.getEntries().includes("eventual()"));
+  } finally {
+    fs.unlinkSync(lock);
+  }
+  const deadline = Date.now() + 2000;
+  let persisted = false;
+  while (Date.now() < deadline && !persisted) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const reader = new HistoryManager(file);
+    reader.load();
+    persisted = reader.getEntries().includes("eventual()");
+  }
+  assert.ok(persisted, "queued history submission should eventually persist");
 });
