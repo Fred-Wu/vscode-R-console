@@ -8,7 +8,8 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager, getHistoryFile, getHistoryPickerEntries, type HistoryScope } from "./history";
+import { HistoryManager, getHistoryFile, getHistoryPickerEntries,
+  getHistoryPickerTogglePresentation, historyPickerText, type HistoryScope } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
@@ -1653,30 +1654,28 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     const entries = this.rHistory.getEntries();
     if (entries.length === 0) {
-      void vscode.window.showInformationMessage("R Console history is empty for this workspace.");
+      void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
       return;
     }
     type HistoryPickItem = vscode.QuickPickItem & {
       code: string;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
-    picker.title = "R Console: Reverse History Search";
-    picker.placeholder = "Type to search previous R commands";
+    picker.title = historyPickerText.title;
+    picker.placeholder = historyPickerText.placeholder;
     const preferenceKey = "historyPicker.collapseDuplicates";
     const state = this.historyStorage!.state;
     let collapseDuplicates = state.get<boolean>(preferenceKey, false);
+    const initialToggle = getHistoryPickerTogglePresentation(collapseDuplicates);
     const collapseButton = {
-      iconPath: new vscode.ThemeIcon(collapseDuplicates ? "expand-all" : "collapse-all"),
-      tooltip: collapseDuplicates ? "Expand duplicate commands" : "Collapse duplicate commands",
+      iconPath: new vscode.ThemeIcon(initialToggle.icon),
+      tooltip: initialToggle.tooltip,
     };
     picker.buttons = [collapseButton];
     const setCollapseButton = (): void => {
-      collapseButton.iconPath = new vscode.ThemeIcon(
-        collapseDuplicates ? "expand-all" : "collapse-all"
-      );
-      collapseButton.tooltip = collapseDuplicates
-        ? "Expand duplicate commands"
-        : "Collapse duplicate commands";
+      const toggle = getHistoryPickerTogglePresentation(collapseDuplicates);
+      collapseButton.iconPath = new vscode.ThemeIcon(toggle.icon);
+      collapseButton.tooltip = toggle.tooltip;
       picker.buttons = [collapseButton];
     };
 
