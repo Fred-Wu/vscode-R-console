@@ -4,9 +4,20 @@ All notable changes to R Console will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Workspace-aware encrypted console history:
+  - Command history is shared between consoles in the same workspace folder and retained across console restarts. `r.console.historyScope` defaults to `workspace`, with an option to use a single `global` history. Consoles outside a workspace automatically use global history.
+  - Command history and persistent terminal replay are encrypted on disk, with the encryption key stored in VS Code SecretStorage. Existing `~/.r_console_history` files remain untouched.
+  - `Ctrl+R` opens a searchable history picker at an empty prompt while retaining prefix-based history recall when text is already entered.
+
 ### Changed
 
-- Updated compatibility with recent vscode-R releases.
+- Expanded compatibility with recent vscode-R releases, thanks to [@eitsupi](https://github.com/eitsupi) and the vscode-R contributors:
+  - [#1837](https://github.com/REditorSupport/vscode-R/pull/1837): Workspace actions can execute in the correct R Console pseudoterminal without requiring a native terminal PID.
+  - [#1868](https://github.com/REditorSupport/vscode-R/pull/1868): R Console can use vscode-R's managed `sess` preparation and installation process, including dependency handling and installation consent.
+  - [#1870](https://github.com/REditorSupport/vscode-R/pull/1870): Concurrent and persistent R Console sessions can maintain correct connection ownership across attachment and reconnection without unexpectedly changing the active session.
+  - [#1871](https://github.com/REditorSupport/vscode-R/pull/1871): vscode-R's manual session attachment can recover R Console sessions through their existing IPC proxy without disrupting their connections.
 
 ## [0.5.2] - 2026-10-08
 

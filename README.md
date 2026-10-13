@@ -12,13 +12,11 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
 - Multiline editing with local history navigation, `Ctrl+R` reverse search (search picker or typed-prefix recall), and long-input rendering.
+- **Workspace-aware encrypted history:**
+  - **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; consoles without a workspace automatically use global history.
+  - **Encryption:** Command history and persistent terminal replay are encrypted in VS Code extension storage using a key held in SecretStorage. The legacy `~/.r_console_history` file remains unchanged.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
-
-### Workspace-aware encrypted history
-
-- **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; windows without a workspace automatically use global history.
-- **Encryption:** Command history and persistent terminal replay are encrypted in VS Code extension storage using a key held in SecretStorage. The legacy `~/.r_console_history` file is left unchanged.
 
 https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
 
