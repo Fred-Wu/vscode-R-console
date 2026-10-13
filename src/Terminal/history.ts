@@ -64,7 +64,7 @@ export class HistoryManager {
     try {
       stat = fs.statSync(this.historyFile);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
       if (force || this.diskStamp !== "missing") {
         this.historyBuffer = [];
         this.historyIndex = 0;
@@ -82,7 +82,13 @@ export class HistoryManager {
     const reload = force || stat.size < this.diskOffset || this.diskStamp === "missing" ||
       (stat.size === this.diskOffset && this.diskStamp !== stamp);
     const offset = reload ? 0 : this.diskOffset;
-    const fd = fs.openSync(this.historyFile, "r");
+    let fd: number;
+    try {
+      fd = fs.openSync(this.historyFile, "r");
+    } catch {
+      // A history read failure must not stop the R console from opening.
+      return;
+    }
     let content: string;
     try {
       const bytes = Buffer.alloc(stat.size - offset);
@@ -93,6 +99,9 @@ export class HistoryManager {
         position += count;
       }
       content = bytes.subarray(0, position).toString("utf8");
+    } catch {
+      // Leave the cached history intact if the shared file is inaccessible.
+      return;
     } finally {
       fs.closeSync(fd);
     }
@@ -145,19 +154,32 @@ export class HistoryManager {
   push(entry: string): void {
     if (!entry.trim()) return;
     this.refreshFromDisk();
-    fs.mkdirSync(path.dirname(this.historyFile), { recursive: true });
     const now = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
     const record = "\n# time: " + now + "\n" +
       entry.split("\n").map((line) => "+" + line + "\n").join("");
-    fs.appendFileSync(this.historyFile, record);
+    try {
+      fs.mkdirSync(path.dirname(this.historyFile), { recursive: true });
+      fs.appendFileSync(this.historyFile, record);
+    } catch {
+      // Keep the command available in this session when disk history fails.
+      this.historyBuffer.push(entry);
+      this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
+      this.sessionEntries.push(entry);
+      this.historyIndex = this.historyBuffer.length;
+      return;
+    }
     this.historyBuffer.push(entry);
     this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
     this.sessionEntries.push(entry);
     this.historyIndex = this.historyBuffer.length;
-    const stat = fs.statSync(this.historyFile);
-    this.diskStamp = stat.size + ":" + stat.mtimeMs;
-    this.diskOffset = stat.size;
-    this.lastEntryCount += 1;
+    try {
+      const stat = fs.statSync(this.historyFile);
+      this.diskStamp = stat.size + ":" + stat.mtimeMs;
+      this.diskOffset = stat.size;
+      this.lastEntryCount += 1;
+    } catch {
+      this.diskStamp = undefined;
+    }
   }
 
   getEntries(): string[] {
