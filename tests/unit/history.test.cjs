@@ -74,13 +74,14 @@ test("persisted UI encrypts replay and preserves reconnect metadata", () => {
   }, crypto), StorageEncryptionError);
 });
 
-test("missing SecretStorage key does not overwrite encrypted history", async () => {
+test("unusable keys and envelopes do not overwrite encrypted history", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-key-"));
   try {
     const values = new Map();
     const secrets = {
       get: async (key) => values.get(key),
       store: async (key, value) => { values.set(key, value); },
+      delete: async (key) => { values.delete(key); },
     };
     const persisted = path.join(root, "persistent-sessions.json");
     const key = await loadEncryptedStorage(secrets, root, persisted);
@@ -88,9 +89,234 @@ test("missing SecretStorage key does not overwrite encrypted history", async () 
     const history = new HistoryManager(file, key);
     history.load();
     history.push("sensitive");
-    values.clear();
+    const saved = fs.readFileSync(file, "utf8");
+    const envelopeFile = path.join(root, "encrypted-storage-keys.json");
+    const envelope = fs.readFileSync(envelopeFile, "utf8");
+    for (const name of values.keys()) values.set(name, "invalid key");
     await assert.rejects(loadEncryptedStorage(secrets, root, persisted), StorageEncryptionError);
-    assert.ok(fs.readFileSync(file, "utf8").length > 0);
+    values.clear();
+    let now = Date.now();
+    t.mock.method(Date, "now", () => { now += 60000; return now; });
+    await assert.rejects(loadEncryptedStorage(secrets, root, persisted), StorageEncryptionError);
+    assert.equal(fs.readFileSync(file, "utf8"), saved);
+    assert.equal(fs.readFileSync(envelopeFile, "utf8"), envelope);
+    fs.writeFileSync(envelopeFile, "{damaged");
+    await assert.rejects(loadEncryptedStorage(secrets, root, persisted), /Invalid stored R Console data-key envelope/);
+    assert.equal(fs.readFileSync(file, "utf8"), saved);
+    assert.equal(fs.readFileSync(envelopeFile, "utf8"), "{damaged");
+    assert.equal(values.size, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("simultaneous initialization retains one envelope for history and persisted UI", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-key-race-"));
+  try {
+    const values = new Map();
+    const secrets = {
+      get: async (key) => values.get(key),
+      store: async (key, value) => { values.set(key, value); },
+      delete: async (key) => { values.delete(key); },
+    };
+    const keys = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+      loadEncryptedStorage(secrets, root, path.join(root, "session-" + i + ".json"))
+    ));
+    assert.equal(values.size, 5);
+    assert.deepEqual(fs.readdirSync(root), ["encrypted-storage-keys.json"]);
+    const history = new HistoryManager(getHistoryFile(root, "global"), keys[0]);
+    history.load();
+    history.push("sensitive command");
+    const terminal = {
+      runtime: { sessionId: "session-a" },
+      ui: { replay: { lines: ["sensitive output"] }, inputText: "unfinished <-" },
+    };
+    const saved = encryptSessionUi(terminal, keys[0]);
+    for (const key of keys) {
+      const restored = new HistoryManager(getHistoryFile(root, "global"), key);
+      restored.load();
+      assert.deepEqual(restored.getEntries(), ["sensitive command"]);
+      assert.deepEqual(decryptSessionUi(saved, key), terminal);
+    }
+    const reopened = await loadEncryptedStorage(secrets, root, path.join(root, "reopened.json"));
+    assert.deepEqual(decryptSessionUi(saved, reopened), terminal);
+    const envelope = fs.readFileSync(path.join(root, "encrypted-storage-keys.json"), "utf8");
+    for (const slot of JSON.parse(envelope).keys) {
+      assert.ok(values.has(slot.name));
+      assert.ok(!envelope.includes(values.get(slot.name)));
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("published key waits for another window's SecretStorage update", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-key-update-"));
+  try {
+    const values = new Map();
+    const secrets = {
+      get: async (key) => values.get(key),
+      store: async (key, value) => { values.set(key, value); },
+      delete: async (key) => { values.delete(key); },
+    };
+    const persisted = path.join(root, "persistent-sessions.json");
+    const first = await loadEncryptedStorage(secrets, root, persisted);
+    let reads = 0;
+    const delayedSecrets = {
+      ...secrets,
+      get: async (key) => ++reads <= 5 ? undefined : values.get(key),
+      store: async () => { assert.fail("Must not replace the published key"); },
+    };
+    const second = await loadEncryptedStorage(delayedSecrets, root, persisted);
+    assert.equal(second.decrypt(first.encrypt("sensitive", "history:a"), "history:a"), "sensitive");
+    assert.equal(values.size, 5);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const namedKey of [false, true]) test(`an existing ${namedKey ? "named" : "fixed"} key is wrapped without replacing saved data`, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-existing-key-"));
+  try {
+    const bytes = randomBytes(32);
+    const crypto = new EncryptedStorage(bytes);
+    const history = new HistoryManager(getHistoryFile(root, "global"), crypto);
+    history.load();
+    history.push("previously saved command");
+    const file = getHistoryFile(root, "global");
+    const saved = fs.readFileSync(file, "utf8");
+    const name = "r-console.encrypted-storage-key.v1" + (namedKey ? "." + "a".repeat(32) : "");
+    const values = new Map([[name, bytes.toString("base64")]]);
+    if (namedKey) fs.writeFileSync(path.join(root, "encrypted-storage-key-id"), name);
+    const secrets = {
+      get: async (key) => values.get(key),
+      store: async (key, value) => { values.set(key, value); },
+      delete: async (key) => { values.delete(key); },
+    };
+    const restoredKey = await loadEncryptedStorage(secrets, root, path.join(root, "persistent-sessions.json"));
+    const restored = new HistoryManager(getHistoryFile(root, "global"), restoredKey);
+    restored.load();
+    assert.deepEqual(restored.getEntries(), ["previously saved command"]);
+    assert.equal(fs.readFileSync(file, "utf8"), saved);
+    assert.equal(values.size, namedKey ? 5 : 6);
+    assert.equal(values.has(name), !namedKey);
+    assert.ok(!fs.existsSync(path.join(root, "encrypted-storage-key-id")));
+    if (!namedKey) {
+      const otherRoot = path.join(root, "other-storage");
+      const other = new HistoryManager(getHistoryFile(otherRoot, "global"), crypto);
+      other.load();
+      other.push("other existing history");
+      const recovered = await loadEncryptedStorage(secrets, otherRoot, path.join(otherRoot, "sessions.json"));
+      const reopened = new HistoryManager(getHistoryFile(otherRoot, "global"), recovered);
+      reopened.load();
+      assert.deepEqual(reopened.getEntries(), ["other existing history"]);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("any one of five keys recovers the same history and persisted UI", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-recovery-"));
+  try {
+    const values = new Map();
+    const secrets = {
+      get: async (key) => values.get(key),
+      store: async (key, value) => { values.set(key, value); },
+      delete: async (key) => { values.delete(key); },
+    };
+    const persisted = path.join(root, "persistent-sessions.json");
+    const first = await loadEncryptedStorage(secrets, root, persisted);
+    const historyFiles = [getHistoryFile(root, "global"), getHistoryFile(root, "workspace", root)];
+    for (const file of historyFiles) {
+      const history = new HistoryManager(file, first);
+      history.load();
+      history.push("sensitive command");
+    }
+    const terminal = {
+      runtime: { sessionId: "session-a" },
+      ui: { replay: { lines: ["sensitive output"] }, inputText: "unfinished <-" },
+    };
+    const saved = encryptSessionUi(terminal, first);
+    for (const [name, value] of values) {
+      const recovered = await loadEncryptedStorage({
+        ...secrets,
+        get: async (key) => key === name ? value : undefined,
+        store: async () => { assert.fail("Must not replace surviving recovery keys"); },
+      }, root, persisted);
+      for (const file of historyFiles) {
+        const history = new HistoryManager(file, recovered);
+        history.load();
+        assert.deepEqual(history.getEntries(), ["sensitive command"]);
+      }
+      assert.deepEqual(decryptSessionUi(saved, recovered), terminal);
+    }
+    assert.equal(fs.readdirSync(path.join(root, "history")).length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("each console load randomly selects its first recovery key with fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-random-key-"));
+  try {
+    let choice = 0;
+    const crypto = require("node:crypto");
+    const loader = loadSource("src/Runtime/encryptedStorage.ts", {
+      crypto: { ...crypto, randomInt: (count) => choice++ % count },
+    }).loadEncryptedStorage;
+    const values = new Map();
+    const reads = [];
+    const secrets = {
+      get: async (key) => { reads.push(key); return values.get(key); },
+      store: async (key, value) => { values.set(key, value); },
+      delete: async (key) => { values.delete(key); },
+    };
+    const persisted = path.join(root, "persistent-sessions.json");
+    const first = await loader(secrets, root, persisted);
+    const envelopeFile = path.join(root, "encrypted-storage-keys.json");
+    const envelope = JSON.parse(fs.readFileSync(envelopeFile, "utf8"));
+    for (let i = 0; i < 5; i++) {
+      reads.length = 0;
+      const recovered = await loader(secrets, root, persisted);
+      assert.deepEqual(reads, [envelope.keys[i].name]);
+      assert.equal(recovered.decrypt(first.encrypt("secret", "history:a"), "history:a"), "secret");
+    }
+    values.delete(envelope.keys[0].name);
+    values.set(envelope.keys[1].name, "invalid key");
+    envelope.keys[2].encryptedKey = "damaged envelope";
+    fs.writeFileSync(envelopeFile, JSON.stringify(envelope));
+    reads.length = 0;
+    const recovered = await loader({
+      ...secrets,
+      get: async (name) => {
+        if (name === envelope.keys[3].name) { reads.push(name); throw new Error("Unreadable secret"); }
+        return secrets.get(name);
+      },
+    }, root, persisted);
+    assert.deepEqual(reads, envelope.keys.map((slot) => slot.name));
+    assert.equal(recovered.decrypt(first.encrypt("secret", "history:a"), "history:a"), "secret");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("failed recovery-key creation removes only its unpublished candidates", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-key-failure-"));
+  try {
+    const values = new Map();
+    let writes = 0;
+    const secrets = {
+      get: async (key) => values.get(key),
+      store: async (key, value) => {
+        values.set(key, value);
+        if (++writes === 3) throw new Error("Storage failed");
+      },
+      delete: async (key) => { values.delete(key); },
+    };
+    await assert.rejects(loadEncryptedStorage(secrets, root, path.join(root, "sessions.json")), /Storage failed/);
+    assert.equal(values.size, 0);
+    assert.deepEqual(fs.readdirSync(root), []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

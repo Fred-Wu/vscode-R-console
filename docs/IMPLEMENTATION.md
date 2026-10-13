@@ -875,8 +875,16 @@ removing stored commands. It is off by default. The choice is saved in
 across consoles and survives VS Code restarts. Up/Down navigation separately
 skips consecutive identical commands in either direction.
 
-The encryption key is generated once and stored using `context.secrets`
-(VS Code SecretStorage). Command history and the complete saved UI state for
+The encryption key is stored using `context.secrets` (VS Code SecretStorage).
+When no key exists, each starting window stores a candidate under a unique
+SecretStorage name. A hard link atomically publishes one complete name as
+`context.globalStorageUri/encrypted-storage-key-id`; the file contains the name,
+not the encryption key. Other candidates are deleted from SecretStorage.
+Windows wait briefly for the selected entry to become visible in SecretStorage,
+and never replace it when it is unavailable. Existing keys saved under the
+original SecretStorage name are reused without rewriting them.
+
+Command history and the complete saved UI state for
 persistent sessions use this key. That UI state includes terminal output,
 prompt text, and unfinished input. `persistent-sessions.json` stores it as
 `encryptedUi` instead of `ui`; connection details remain unencrypted. Existing

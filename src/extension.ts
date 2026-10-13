@@ -120,12 +120,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
   context.subscriptions.push(
-    vscode.commands.registerCommand("r-console.createTerminal", () => {
-      void createRTerminal(context);
-    }),
-    vscode.commands.registerCommand("r-console.createTerminalSide", () => {
-      void createRTerminal(context, true);
-    }),
+    vscode.commands.registerCommand("r-console.createTerminal", () => createRTerminal(context)),
+    vscode.commands.registerCommand("r-console.createTerminalSide", () => createRTerminal(context, true)),
     vscode.commands.registerCommand("r-console.managePersistentSessions", () => {
       void managePersistentSessions(context);
     }),
@@ -480,7 +476,9 @@ async function createRTerminal(
     return;
   }
 
-  const rTerminal = new RTerminal(options, context.extensionPath, undefined, undefined, historyStorage);
+  const rTerminal = new RTerminal(
+    options, context.extensionPath, undefined, undefined, await getConsoleHistoryStorage(context)
+  );
   const record = createConsoleRecord(
     rTerminal,
     inSideEditor
@@ -495,6 +493,18 @@ async function createRTerminal(
 function getActiveRTerminal(): RTerminal | undefined {
   const terminal = vscode.window.activeTerminal;
   return terminal ? resolveRecordFromTerminal(terminal)?.rTerminal : undefined;
+}
+
+async function getConsoleHistoryStorage(context: vscode.ExtensionContext): Promise<typeof historyStorage> {
+  if (!historyStorage || !persistentSessionFilePath) {
+    throw new StorageEncryptionError("R Console encryption is not initialized.");
+  }
+  return {
+    ...historyStorage,
+    encryption: await loadEncryptedStorage(
+      context.secrets, historyStorage.folder, persistentSessionFilePath
+    ),
+  };
 }
 
 function restoreDefaultConsoleName(target?: unknown): void {
@@ -818,7 +828,7 @@ async function attachPersistentSessions(
       context.extensionPath,
       session.entry.terminal,
       terminalName,
-      historyStorage
+      await getConsoleHistoryStorage(context)
     );
     const record = createConsoleRecord(rTerminal, session.entry.location);
     record.terminalName = terminalName;
