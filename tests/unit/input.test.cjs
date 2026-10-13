@@ -7,7 +7,8 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
 const { InputState } = loadSource("src/Terminal/inputState.ts");
-const { HistoryManager } = loadSource("src/Terminal/history.ts");
+const { HistoryManager, getHistoryPickerTogglePresentation, historyPickerText } =
+  loadSource("src/Terminal/history.ts");
 
 test("keyboard decoding buffers partial CSI sequences and preserves pasted newlines", () => {
   const keys = new KeyProcessor();
@@ -278,4 +279,23 @@ test("new history directories and files are owner-only on Unix", (t) => {
   assert.equal(fs.statSync(historyDir).mode & 0o777, 0o755);
   assert.equal(fs.statSync(file).mode & 0o777, 0o644);
   assert.deepEqual(history.getEntries(), ["first <- 1", "second <- 2"]);
+});
+
+test("F8 history picker wording, icons, and command label remain consistent", () => {
+  assert.equal(historyPickerText.title, "R Console: Command History");
+  assert.equal(historyPickerText.placeholder, "Type to filter command history");
+  assert.equal(historyPickerText.emptyMessage, "R Console command history is empty.");
+  assert.deepEqual(getHistoryPickerTogglePresentation(false), {
+    icon: "collapse-all", tooltip: "Collapse duplicate commands",
+  });
+  assert.deepEqual(getHistoryPickerTogglePresentation(true), {
+    icon: "expand-all", tooltip: "Expand duplicate commands",
+  });
+  const manifest = require("../../package.json");
+  assert.equal(manifest.contributes.commands.find(
+    (command) => command.command === "r-console.searchHistory"
+  ).title, "Show Command History");
+  assert.ok(manifest.contributes.keybindings.some(
+    (binding) => binding.key === "f8" && binding.command === "r-console.searchHistory"
+  ));
 });
