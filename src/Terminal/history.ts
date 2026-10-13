@@ -51,6 +51,10 @@ export class HistoryManager {
   private readonly compactToSize = 19000;
   private diskStamp: string | undefined;
   private lastEntryCount = 0;
+  // Number of entries pruned from the front of this history file. A stable
+  // ordinal preserves cursor position across another console's compaction,
+  // including when identical commands occur at several positions.
+  private diskEntryBase = 0;
   private diskOffset = 0;
   private diskFileId: string | undefined;
 
@@ -74,6 +78,7 @@ export class HistoryManager {
         this.diskStamp = "missing";
         this.diskOffset = 0;
         this.lastEntryCount = 0;
+        this.diskEntryBase = 0;
         this.diskFileId = undefined;
       }
       return;
@@ -135,12 +140,24 @@ export class HistoryManager {
     const oldLength = this.historyBuffer.length;
     const oldIndex = this.historyIndex;
     const previousCount = reload ? 0 : this.lastEntryCount;
-    const oldTotal = this.lastEntryCount;
-    const oldStart = Math.max(0, oldTotal - oldLength);
+    const oldStart = this.diskEntryBase +
+      Math.max(0, this.lastEntryCount - oldLength);
+    // The marker is written only during compaction, so existing plaintext
+    // histories without it naturally start at ordinal zero.
+    const baseMatch = reload
+      ? /^# r-console-history-base: (\d+)\r?\n/.exec(content)
+      : null;
+    const parsedBase = baseMatch ? Number(baseMatch[1]) : 0;
+    if (reload) {
+      this.diskEntryBase = Number.isSafeInteger(parsedBase) ? parsedBase : 0;
+    }
     const combined = reload ? entries : [...this.historyBuffer, ...entries];
     this.historyBuffer = combined.slice(-this.maxHistorySize);
     this.lastEntryCount = previousCount + entries.length;
-    const newStart = Math.max(0, this.lastEntryCount - this.historyBuffer.length);
+    const newStart = this.diskEntryBase +
+      Math.max(0, this.lastEntryCount - this.historyBuffer.length);
+    // Keep the same logical entry if it survived; otherwise clamp to the
+    // earliest retained entry. End-of-history remains at the new end.
     this.historyIndex = oldIndex === oldLength
       ? this.historyBuffer.length
       : Math.max(0, Math.min(this.historyBuffer.length, oldStart + oldIndex - newStart));
@@ -219,11 +236,13 @@ export class HistoryManager {
     const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
       .map((match) => match.index!);
     const entries = this.historyBuffer.slice(-keep);
+    const nextBase = this.diskEntryBase + (this.lastEntryCount - entries.length);
     const completeEnd = raw.lastIndexOf("\n") + 1;
-    const content = boundaries.length === this.lastEntryCount &&
+    const records = boundaries.length === this.lastEntryCount &&
       boundaries.length >= entries.length
       ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
       : entries.map((entry) => this.serializeEntry(entry)).join("");
+    const content = "# r-console-history-base: " + nextBase + "\n" + records;
     const temporary = this.historyFile + "." + process.pid + "." +
       Math.random().toString(16).slice(2) + ".tmp";
     try {
@@ -239,6 +258,7 @@ export class HistoryManager {
       ? entries.length
       : Math.max(0, originalIndex - (originalLength - entries.length));
     this.lastEntryCount = entries.length;
+    this.diskEntryBase = nextBase;
     const stat = fs.statSync(this.historyFile);
     this.diskStamp = stat.size + ":" + stat.mtimeMs;
     this.diskOffset = stat.size;

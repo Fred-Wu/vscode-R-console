@@ -136,3 +136,42 @@ test("history caps existing files and appends at 20000 commands", (t) => {
   assert.ok((fs.readFileSync(file, "utf8").match(/^# time:/gm) || []).length <= 20000);
   assert.equal(restored.getEntries().includes("command-5"), false);
 });
+
+test("another console's compaction preserves an older history cursor", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-cursor-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  // A duplicate near the cursor ensures we preserve the entry's position,
+  // rather than simply searching for matching command text after compaction.
+  fs.writeFileSync(file, Array.from({ length: 20000 }, (_, i) =>
+    "\n# time: 2026-10-14 00:00 UTC\n+" +
+    (i === 5001 || i === 15001 ? "repeat()" : "command-" + i) + "\n"
+  ).join(""));
+  const browsing = new HistoryManager(file);
+  const trimmed = new HistoryManager(file);
+  const writer = new HistoryManager(file);
+  browsing.load();
+  trimmed.load();
+  writer.load();
+
+  browsing.selectEntry("command-5000");
+  assert.equal(browsing.navigate(1), "repeat()");
+  trimmed.selectEntry("command-100");
+
+  // The writer removes the oldest 1000 entries and appends another.
+  writer.push("latest()");
+  assert.equal(browsing.navigate(0), "repeat()");
+  assert.equal(browsing.navigate(1), "command-5002");
+  assert.equal(browsing.navigate(-1), "repeat()");
+
+  // An entry that was actually pruned clamps to the oldest retained entry.
+  assert.equal(trimmed.navigate(0), "command-1000");
+  assert.equal(trimmed.navigate(-1), undefined);
+
+  // Reopen the history to verify that the compaction marker is persistent.
+  const restored = new HistoryManager(file);
+  restored.load();
+  assert.equal(restored.getEntries().length, 19001);
+  assert.equal(restored.getEntries()[0], "command-1000");
+  assert.match(fs.readFileSync(file, "utf8"), /^# r-console-history-base: 1000\n/);
+});
