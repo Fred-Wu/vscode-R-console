@@ -248,7 +248,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = createRuntimeBackend(this.extensionPath);
     if (!historyStorage) {
-      throw new Error("R Console encrypted history storage is unavailable.");
+      throw new Error("R Console history storage is unavailable.");
     }
     const configuredScope = vscode.workspace.getConfiguration("r.console")
       .get<string>("historyScope", "workspace");
