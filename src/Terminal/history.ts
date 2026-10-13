@@ -19,24 +19,21 @@ export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean):
     : { icon: "collapse-all", tooltip: "Collapse duplicate commands" };
 }
 
-// The history picker lists newest commands first. Collapsing is an optional
-// view-only projection: exact command text is the key and the latest wins.
+// The history picker lists newest commands first. Preserve each occurrence's
+// original index so selecting an older duplicate navigates from that position.
 export function getHistoryPickerEntries(
   entries: readonly string[],
   collapseDuplicates: boolean
-): string[] {
-  const newestFirst = [...entries].reverse();
-  if (!collapseDuplicates) {
-    return newestFirst;
-  }
+): { code: string; historyIndex: number }[] {
+  const items: { code: string; historyIndex: number }[] = [];
   const seen = new Set<string>();
-  return newestFirst.filter((entry) => {
-    if (seen.has(entry)) {
-      return false;
-    }
-    seen.add(entry);
-    return true;
-  });
+  for (let historyIndex = entries.length - 1; historyIndex >= 0; historyIndex--) {
+    const code = entries[historyIndex];
+    if (collapseDuplicates && seen.has(code)) continue;
+    seen.add(code);
+    items.push({ code, historyIndex });
+  }
+  return items;
 }
 
 export function getHistoryFile(storageFolder: string, scope: HistoryScope, workspaceFolder?: string): string {
@@ -395,6 +392,16 @@ export class HistoryManager {
     if (index >= 0) {
       this.historyIndex = index;
     }
+  }
+
+  selectEntryAt(index: number): void {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length) {
+      return;
+    }
+    // The picker holds a snapshot of this buffer. Set the original position
+    // before refreshing, so a concurrent compaction remaps the same occurrence.
+    this.historyIndex = index;
+    this.refreshFromDisk();
   }
 
   getRecentSessionEntries(limit = 200): string[] {

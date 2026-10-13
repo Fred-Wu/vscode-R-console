@@ -68,8 +68,71 @@ test("workspace scope shares within a folder and isolates different folders", (t
   second.push("b <- 2");
   assert.deepEqual(first.getEntries(), ["a <- 1", "b <- 2"]);
   assert.deepEqual(other.getEntries(), []);
-  assert.deepEqual(getHistoryPickerEntries(["x", "y", "x"], true), ["x", "y"]);
-  assert.deepEqual(getHistoryPickerEntries(["x", "y", "x"], false), ["x", "y", "x"]);
+  assert.deepEqual(getHistoryPickerEntries(["x", "y", "x"], true), [
+    { code: "x", historyIndex: 2 }, { code: "y", historyIndex: 1 },
+  ]);
+  assert.deepEqual(getHistoryPickerEntries(["x", "y", "x"], false), [
+    { code: "x", historyIndex: 2 }, { code: "y", historyIndex: 1 },
+    { code: "x", historyIndex: 0 },
+  ]);
+});
+
+
+test("F8 selection of an older repeated command keeps its original navigation position", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-index-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const history = new HistoryManager(path.join(root, "history"));
+  const { getHistoryPickerEntries } = loadSource("src/Terminal/history.ts");
+  history.load();
+  history.setSearchNoDuplicates(true);
+  for (const code of ["a()", "repeat()", "b()", "repeat()", "c()"]) history.push(code);
+
+  const picker = getHistoryPickerEntries(history.getEntries(), false);
+  const duplicates = picker.filter((item) => item.code === "repeat()");
+  assert.deepEqual(duplicates.map((item) => item.historyIndex), [3, 1]);
+
+  history.selectEntryAt(duplicates[1].historyIndex);
+  assert.equal(history.navigate(-1), "a()");
+  assert.equal(history.navigate(1), "repeat()");
+  assert.equal(history.navigate(1), "b()");
+
+  history.selectEntryAt(duplicates[0].historyIndex);
+  assert.equal(history.navigate(-1), "b()");
+  assert.equal(history.navigate(1), "repeat()");
+  assert.equal(history.navigate(1), "c()");
+
+  const collapsed = getHistoryPickerEntries(history.getEntries(), true);
+  assert.deepEqual(collapsed.filter((item) => item.code === "repeat()"), [
+    { code: "repeat()", historyIndex: 3 },
+  ]);
+  assert.equal(history.getEntries().length, 5);
+});
+
+test("F8 selection keeps an older duplicate through another console's compaction", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-compact-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  fs.writeFileSync(file, Array.from({ length: 20000 }, (_, i) =>
+    "\n# time: 2026-10-14 00:00 UTC\n+" +
+    (i === 5001 || i === 15001 ? "repeat()" : "command-" + i) + "\n"
+  ).join(""));
+  const browsing = new HistoryManager(file);
+  const writer = new HistoryManager(file);
+  const { getHistoryPickerEntries } = loadSource("src/Terminal/history.ts");
+  browsing.load();
+  writer.load();
+
+  const picker = getHistoryPickerEntries(browsing.getEntries(), false);
+  const duplicateIndices = picker.filter((item) => item.code === "repeat()")
+    .map((item) => item.historyIndex);
+  assert.deepEqual(duplicateIndices, [15001, 5001]);
+
+  // The picker stays open in console A while console B compacts the shared file.
+  writer.push("latest()");
+  browsing.selectEntryAt(duplicateIndices[1]);
+  assert.equal(browsing.navigate(-1), "command-5000");
+  assert.equal(browsing.navigate(1), "repeat()");
+  assert.equal(browsing.navigate(1), "command-5002");
 });
 
 test("history navigation skips consecutive duplicates in both directions", (t) => {

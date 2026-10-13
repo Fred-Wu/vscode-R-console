@@ -843,7 +843,10 @@ a Quick Pick of saved commands in newest-first order. Text input filters this
 snapshot. The `collapse-all` button hides exact duplicate entries in this
 picker only; when enabled, it switches to `expand-all` to show all entries.
 The preference is retained in `context.globalState` across consoles and
-VS Code restarts. Selecting an entry restores its code without executing it.
+VS Code restarts. Each picker item keeps its original history index, so
+selecting an older duplicate preserves its navigation position, including
+when another console compacts shared history while the picker is open.
+Selecting an entry restores its code without executing it.
 The picker title, placeholder, and button presentation are defined in
 `src/Terminal/history.ts` and checked in unit tests.
 

@@ -1659,6 +1659,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     type HistoryPickItem = vscode.QuickPickItem & {
       code: string;
+      historyIndex: number;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
     picker.title = historyPickerText.title;
@@ -1681,13 +1682,13 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const updateItems = (): void => {
       picker.items = getHistoryPickerEntries(entries, collapseDuplicates)
-        .map((code) => ({ label: code, code }));
+        .map(({ code, historyIndex }) => ({ label: code, code, historyIndex }));
     };
     updateItems();
 
-    let selectedCode: string | undefined;
+    let selectedItem: HistoryPickItem | undefined;
     try {
-      selectedCode = await new Promise<string | undefined>((resolve) => {
+      selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
         picker.onDidTriggerButton(async (button) => {
           if (button !== collapseButton) return;
           collapseDuplicates = !collapseDuplicates;
@@ -1701,8 +1702,8 @@ export class RTerminal implements vscode.Pseudoterminal {
         });
         picker.onDidAccept(() => {
           const selected = picker.selectedItems[0] ?? picker.activeItems[0];
-          if (selected?.code !== undefined) {
-            resolve(selected.code);
+          if (selected) {
+            resolve(selected);
             picker.hide();
           }
         });
@@ -1712,12 +1713,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     } finally {
       picker.dispose();
     }
-    if (selectedCode === undefined || this.mode !== "ready" || !this.promptReady) {
+    if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
       return;
     }
     this.lastSearchTerm = "";
-    this.rHistory.selectEntry(selectedCode);
-    this.applyHistorySearchResult(selectedCode);
+    this.rHistory.selectEntryAt(selectedItem.historyIndex);
+    this.applyHistorySearchResult(selectedItem.code);
   }
 
   private applyHistorySearchResult(entry: string): void {

@@ -193,6 +193,8 @@ Then test:
 - click `collapse-all` (`Collapse duplicate commands`) to hide exact duplicate entries in the picker; verify it changes to `expand-all` (`Expand duplicate commands`) to restore them, without removing stored commands; the choice persists after reopening the picker and restarting VS Code
 - in a console without history, verify the message is `R Console command history is empty.` for either history scope
 - verify Up and Down skip consecutive duplicate commands in both directions, while nonconsecutive repeats remain available
+- with duplicate collapsing off, select the older of two nonconsecutive identical commands in F8; verify Up/Down navigate around that occurrence, not the newest one
+- repeat the older-duplicate F8 selection after another console compacts shared history while the picker is open; verify the selected position is retained when the entry survives
 - type `alpha_test`, then press `Ctrl+R` repeatedly to recall successively older commands containing that text, including matches where it occurs after the beginning of the command
 - press `Ctrl+L` and verify Up and Ctrl+R search from the latest entry again
 - create two consoles in one workspace and a third in another; verify `workspace` history sharing and isolation, then select `global` and verify sharing between workspaces
