@@ -829,6 +829,10 @@ Each history file is limited to 20,000 commands; compaction retains the newest
 19,000 before subsequent appends. Entries preserve multiline text and timestamps.
 The `# r-console-history-base:` marker tracks removed entries so concurrent
 consoles maintain stable navigation positions even across duplicate commands.
+Normal appends reconcile only bytes added since the last known disk offset
+under the per-file lock; file replacement or compaction triggers a full
+reload. Pending local commands are excluded during reconciliation and
+restored if persistence fails, avoiding duplicated submissions.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. If a write fails after
 synchronizing the disk snapshot, the console restores its in-memory history

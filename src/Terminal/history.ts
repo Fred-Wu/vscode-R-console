@@ -328,14 +328,22 @@ export class HistoryManager {
     const visibleIndex = this.historyIndex;
     try {
       this.withFileLock(() => {
-        // Reconcile external appends first, then write this console's queued
-        // commands in submission order. The file lock protects the whole batch.
-        this.readHistoryFromDisk(true);
+        // The in-memory tail also contains pending submissions. Temporarily
+        // remove it so incremental disk reconciliation cannot duplicate them.
+        // The catch block restores the original view if persistence fails.
+        const diskLength = Math.max(0, this.historyBuffer.length - this.pendingEntries.length);
+        const needsReload = this.pendingEntries.length >= this.historyBuffer.length &&
+          this.lastEntryCount > 0;
+        this.historyBuffer = this.historyBuffer.slice(0, diskLength);
+        this.historyIndex = Math.min(this.historyIndex, diskLength);
+        // Reconcile only new bytes under the lock. Reload from the beginning
+        // on replacement/compaction or when the pending tail filled the buffer.
+        this.readHistoryFromDisk(needsReload);
         const stat = fs.existsSync(this.historyFile)
           ? fs.statSync(this.historyFile) : undefined;
         if (stat && stat.size > this.diskOffset) {
           fs.truncateSync(this.historyFile, this.diskOffset);
-          this.readHistoryFromDisk(true);
+          this.readHistoryFromDisk(false);
         }
         const queued = this.pendingEntries.slice(-this.maxHistorySize);
         if (this.lastEntryCount + queued.length > this.maxHistorySize) {

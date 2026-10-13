@@ -320,6 +320,44 @@ test("contended history submissions are retried when the lock is released", asyn
   assert.ok(persisted, "queued history submission should eventually persist");
 });
 
+test("successful history appends reconcile incrementally without rereading saved commands", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-incremental-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const seed = new HistoryManager(file);
+  seed.load();
+  for (let i = 0; i < 300; i++) seed.push("previous-" + i);
+
+  let bytesRead = 0;
+  const countingFs = {
+    ...fs,
+    readSync(...args) {
+      const count = fs.readSync(...args);
+      bytesRead += count;
+      return count;
+    },
+  };
+  const { HistoryManager: CountingHistory } = loadSource(
+    "src/Terminal/history.ts", { fs: countingFs }
+  );
+  const history = new CountingHistory(file);
+  history.load();
+  bytesRead = 0;
+  for (let i = 0; i < 20; i++) history.push("new-" + i);
+  assert.equal(bytesRead, 0, "ordinary submissions must not reparse the disk history");
+
+  const external = new HistoryManager(file);
+  external.load();
+  external.push("external()");
+  bytesRead = 0;
+  history.push("after-external()");
+  assert.ok(bytesRead > 0, "external submissions must be read");
+  assert.ok(bytesRead < 500, "external submissions must only read appended bytes");
+  assert.deepEqual(history.getEntries().slice(-3), [
+    "new-19", "external()", "after-external()",
+  ]);
+});
+
 test("failed history appends keep queued commands visible until retry", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-append-failure-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
