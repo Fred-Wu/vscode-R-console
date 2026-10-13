@@ -11,9 +11,14 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
-- Multiline editing with local history navigation, reverse search, and long-input rendering.
+- Multiline editing with local history navigation, `Ctrl+R` reverse search (search picker or typed-prefix recall), and long-input rendering.
 - Auto-matching brackets and quotes.
 - Bracketed paste handling.
+
+### Workspace-aware encrypted history
+
+- **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; windows without a workspace automatically use global history.
+- **Encryption:** Command history and persistent terminal replay are encrypted in VS Code extension storage using a key held in SecretStorage. The legacy `~/.r_console_history` file is left unchanged.
 
 https://github.com/user-attachments/assets/a1b7390e-eb33-4b9d-8915-85ae51c3039d
 
@@ -85,6 +90,7 @@ R Console also contributes its own settings:
 
 | Setting                    | Default       | Purpose                                                                                                                       |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `r.console.historyScope` | `workspace` | Shared command history per workspace folder or across all workspaces (`global`) |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
 | `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
@@ -120,3 +126,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, build, packaging, and ma
 ## License
 
 MIT
+

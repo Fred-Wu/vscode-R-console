@@ -834,3 +834,9 @@ not persisted.
 16. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 17. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 18. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+
+## Encrypted history and persisted terminal UI
+
+R Console selects `r.console.historyScope` (`workspace` by default or `global`) at terminal construction. The workspace scope is the folder selected for that console's initial working directory; with no folder, it falls back to global history. History stores append-only AES-256-GCM encrypted command records under `context.globalStorageUri/history/`, using a SHA-256 workspace-path identifier in the filename. Independent R consoles share history by reading new records from the same append-only journal; their browsing cursors remain separate. The legacy home-directory `.r_console_history` file is no longer modified. On-disk journals are append-only and currently have no automatic disk compaction; the in-memory navigation list retains the newest 10,000 entries.
+
+The encryption key is generated once and stored using `context.secrets`. Missing or damaged encryption keys must not cause silent replacement of stored ciphertext. The on-disk `persistent-sessions.json` contains `encryptedUi` instead of `ui`, encrypting terminal replay, prompt and current-input text, while retaining connection metadata needed for reconnection. Older plaintext records can be read and are migrated when next saved. Encryption protects local stored content at rest, not the live terminal, memory, or pre-existing backups. The whole history journal is not cleared when a console closes because histories are workspace/global scoped, rather than session scoped.

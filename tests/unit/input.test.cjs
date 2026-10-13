@@ -7,6 +7,8 @@ const loadSource = require("../helpers/load-source.cjs");
 const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
 const { InputState } = loadSource("src/Terminal/inputState.ts");
 const { HistoryManager } = loadSource("src/Terminal/history.ts");
+const { EncryptedStorage } = loadSource("src/Runtime/encryptedStorage.ts");
+const { randomBytes } = require("node:crypto");
 
 test("keyboard decoding buffers partial CSI sequences and preserves pasted newlines", () => {
   const keys = new KeyProcessor();
@@ -14,6 +16,7 @@ test("keyboard decoding buffers partial CSI sequences and preserves pasted newli
   assert.deepEqual(keys.parseInputChunk("A\x1b[18~\r\n\x03"), [
     { type: "arrow", dir: "up" }, { type: "completion" }, { type: "enter" }, { type: "ctrl_c" },
   ]);
+  assert.deepEqual(keys.parseInputChunk("\x12"), [{ type: "ctrl_r" }]);
   const actions = keys.parseInputChunk("\x1b[200~x\ny\x1b[201~");
   assert.equal(actions[0].type, "paste-start");
   assert.equal(actions.at(-1).type, "paste-end");
@@ -37,11 +40,12 @@ test("history persists multiline entries and searches without losing their conte
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, "history");
-  const history = new HistoryManager(file);
+  const encryption = new EncryptedStorage(randomBytes(32));
+  const history = new HistoryManager(file, encryption);
   history.load();
   history.push("x <- 1");
   history.push("{\n  y <- 2\n}");
-  const restored = new HistoryManager(file);
+  const restored = new HistoryManager(file, encryption);
   restored.load();
   assert.equal(restored.navigate(-1), "{\n  y <- 2\n}");
   assert.equal(restored.searchBackward("x"), "x <- 1");

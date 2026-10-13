@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
+import { EncryptedStorage, StorageEncryptionError, loadEncryptedStorage, encryptSessionUi, decryptSessionUi } from "./Runtime/encryptedStorage";
 import { disposeConsoleLspOutputChannel } from "./Language/consoleLspClient";
 import {
   RTerminal,
@@ -70,6 +71,7 @@ const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_HEARTBEAT_MS = 5000;
 let extensionBaseUri: vscode.Uri | undefined;
 let persistentSessionFilePath: string | undefined;
+let historyStorage: { folder: string; encryption: EncryptedStorage } | undefined;
 let persistDebounceTimer: NodeJS.Timeout | undefined;
 let persistHeartbeatTimer: NodeJS.Timeout | undefined;
 let extensionHostDeactivating = false;
@@ -106,7 +108,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     sessionStorageUri,
     "persistent-sessions.json"
   ).fsPath;
-  void fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true }).catch(() => {});
+  await fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true });
+  await fs.promises.mkdir(context.globalStorageUri.fsPath, { recursive: true });
+  historyStorage = {
+    folder: context.globalStorageUri.fsPath,
+    encryption: await loadEncryptedStorage(
+      context.secrets, context.globalStorageUri.fsPath, persistentSessionFilePath
+    ),
+  };
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
   context.subscriptions.push(
@@ -124,6 +133,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
     vscode.commands.registerCommand("r-console.triggerCompletion", () =>
       getActiveRTerminal()?.triggerCompletion()
+    ),
+    vscode.commands.registerCommand("r-console.reverseSearch", () =>
+      getActiveRTerminal()?.reverseSearch()
     ),
     vscode.commands.registerCommand("r-console.restoreDefaultName", (target?: unknown) => {
       restoreDefaultConsoleName(target);
@@ -181,10 +193,27 @@ async function loadPersistentSessionsFromDisk(): Promise<PersistedConsoleRecord[
 async function readPersistentSessionFile(filePath: string): Promise<PersistedConsoleRecord[]> {
   try {
     const raw = await fs.promises.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    const sessions = parsePersistentSessionState(parsed);
-    return sessions ? sessions.filter(hasLivePersistedRuntime) : [];
-  } catch {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isObjectRecord(parsed) || !Array.isArray(parsed.sessions)) {
+      return [];
+    }
+    const encryption = historyStorage?.encryption;
+    if (!encryption) {
+      throw new StorageEncryptionError("R Console encryption is not initialized.");
+    }
+    const restored = parsed.sessions.map((entry: unknown) => {
+      if (!isObjectRecord(entry) || !isObjectRecord(entry.terminal)) return entry;
+      return { ...entry, terminal: decryptSessionUi(entry.terminal, encryption) };
+    });
+    const sessions = parsePersistentSessionState({ sessions: restored });
+    if (!sessions) {
+      throw new StorageEncryptionError(
+        "R Console saved session records failed validation. The file has been preserved."
+      );
+    }
+    return sessions.filter(hasLivePersistedRuntime);
+  } catch (error) {
+    if (error instanceof StorageEncryptionError) throw error;
     return [];
   }
 }
@@ -450,7 +479,7 @@ async function createRTerminal(
     return;
   }
 
-  const rTerminal = new RTerminal(options, context.extensionPath);
+  const rTerminal = new RTerminal(options, context.extensionPath, undefined, undefined, historyStorage);
   const record = createConsoleRecord(
     rTerminal,
     inSideEditor
@@ -787,7 +816,8 @@ async function attachPersistentSessions(
       options,
       context.extensionPath,
       session.entry.terminal,
-      terminalName
+      terminalName,
+      historyStorage
     );
     const record = createConsoleRecord(rTerminal, session.entry.location);
     record.terminalName = terminalName;
@@ -1442,10 +1472,18 @@ function persistPersistentSessions(): void {
     fs.mkdirSync(path.dirname(persistentSessionFilePath), {
       recursive: true,
     });
-    const sessionState: PersistentSessionState = {
-      sessions: persisted,
-    };
-    fs.writeFileSync(persistentSessionFilePath, JSON.stringify(sessionState), "utf8");
+    const encryption = historyStorage?.encryption;
+    if (!encryption) {
+      throw new StorageEncryptionError("R Console encryption is not initialized.");
+    }
+    const sessions = persisted.map((entry) => ({
+      ...entry,
+      terminal: encryptSessionUi(entry.terminal, encryption),
+    }));
+    const temporary = persistentSessionFilePath + ".tmp";
+    fs.writeFileSync(temporary, JSON.stringify({ sessions }), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(temporary, persistentSessionFilePath);
   } catch {
+    // Keep the previous persisted file rather than replacing it with plaintext.
   }
 }

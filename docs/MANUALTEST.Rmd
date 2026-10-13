@@ -189,15 +189,16 @@ gamma_test <- alpha_test + beta_test
 Then test:
 
 - Up / Down history navigation
-- type `alpha_test`, then press `Ctrl+R` once to recall the previous matching entry
+- press `Ctrl+R` at an empty prompt, type `alpha_test` into the history picker, then select the matching entry
+- type `alpha_test` at the R prompt, then press `Ctrl+R` once to recall the previous matching entry
 - after recall, use Up / Down or `Ctrl+P` / `Ctrl+N` to move through older or newer history entries
 - edit the recalled command before submitting
 
 Expected:
 
 - multiline history entries are restored intact
-- `Ctrl+R` uses the current line text as the search term and recalls a matching history entry directly into the input buffer
-- there is no separate incremental reverse-search prompt that accepts a second search string
+- `Ctrl+R` opens a searchable history picker when the input is empty
+- `Ctrl+R` with a typed prefix searches backward and recalls the matching command directly into the input buffer
 - reverse search does not corrupt the current buffer
 - recalled command can be edited normally
 

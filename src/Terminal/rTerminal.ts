@@ -1,8 +1,6 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import * as path from "path";
-import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
 import { setNativeParseCallback } from "../Language/parser";
 import {
@@ -10,7 +8,8 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager } from "./history";
+import { HistoryManager, getHistoryFile, type HistoryScope } from "./history";
+import { EncryptedStorage } from "../Runtime/encryptedStorage";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
@@ -227,7 +226,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     private options: RTerminalOptions,
     private extensionPath: string = "",
     restoreState?: PersistedRTerminalState,
-    terminalName?: string
+    terminalName?: string,
+    historyStorage?: { folder: string; encryption: EncryptedStorage }
   ) {
     if (terminalName && !isDefaultRuntimeTerminalName(terminalName)) {
       this.customTerminalName = terminalName;
@@ -248,7 +248,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = createRuntimeBackend(this.extensionPath);
-    this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
+    if (!historyStorage) {
+      throw new Error("R Console encrypted history storage is unavailable.");
+    }
+    const configuredScope = vscode.workspace.getConfiguration("r.console")
+      .get<string>("historyScope", "workspace");
+    const historyScope: HistoryScope = configuredScope === "global" ? "global" : "workspace";
+    this.rHistory = new HistoryManager(
+      getHistoryFile(historyStorage.folder, historyScope, this.options.cwd),
+      historyStorage.encryption
+    );
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
     this.lang = new RTermLang({
@@ -1191,21 +1200,9 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
-      case "ctrl_r": {
-        const term = this.inputState.currentLine.trim() || this.lastSearchTerm;
-        if (!term) {
-          return;
-        }
-        const found = this.rHistory.searchBackward(term);
-        if (found !== null) {
-          this.lastSearchTerm = term;
-          this.historyBrowsing = true;
-          this.historyCollapsed = true;
-          this.inputState.applyHistoryEntry(found);
-          this.renderInput();
-        }
+      case "ctrl_r":
+        void this.reverseSearch();
         return;
-      }
       case "ctrl_l":
         if (this.promptVisible) {
           this.clearInputRender();
@@ -1618,6 +1615,59 @@ export class RTerminal implements vscode.Pseudoterminal {
       !/[\r\n]/.test(sanitized)
     );
     this.recordSubmissionHistory(blocks);
+  }
+
+  public async reverseSearch(): Promise<void> {
+    if (this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+
+    // Keep the established prefix-based Ctrl+R behaviour when input is present.
+    const prefix = this.inputState.currentLine.trim();
+    const term = this.historyBrowsing && this.historyCollapsed && this.lastSearchTerm
+      ? this.lastSearchTerm
+      : prefix;
+    if (term) {
+      const match = this.rHistory.searchBackward(term);
+      if (match !== null) {
+        this.lastSearchTerm = term;
+        this.applyHistorySearchResult(match);
+      }
+      return;
+    }
+
+    // At an empty prompt, make Ctrl+R useful without requiring a prefix first.
+    const entries = this.rHistory.getEntries();
+    if (entries.length === 0) {
+      void vscode.window.showInformationMessage("R Console history is empty for this workspace.");
+      return;
+    }
+    const choices = entries.reverse().map((code) => ({
+      label: code.replace(/\s*\r?\n\s*/g, " ↵ ").slice(0, 240),
+      detail: code.includes("\n") ? code : undefined,
+      code,
+    }));
+    const selected = await vscode.window.showQuickPick(choices, {
+      title: "R Console: Reverse History Search",
+      placeHolder: "Type to search previous R commands",
+      matchOnDetail: true,
+    });
+    if (!selected || this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+    this.lastSearchTerm = "";
+    this.rHistory.selectEntry(selected.code);
+    this.applyHistorySearchResult(selected.code);
+  }
+
+  private applyHistorySearchResult(entry: string): void {
+    this.ensureReadyPromptVisibleForInput();
+    this.clearInputRender();
+    this.historyBrowsing = true;
+    this.historyCollapsed = true;
+    this.lang.updateInput("");
+    this.inputState.applyHistoryEntry(entry);
+    this.renderInput();
   }
 
   private navigateHistory(direction: number): void {
