@@ -814,6 +814,39 @@ The extension persists console records:
 UI state. If the runtime backend cannot provide reconnect info, the terminal is
 not persisted.
 
+### 4.8 Command History
+
+`src/Terminal/history.ts` manages plaintext command history separately
+from persistent terminal replay. Each console selects its scope at creation or
+reattachment using `r.console.historyScope`: the default `workspace` scope
+shares commands between consoles whose initial working directory belongs to the
+same workspace folder, while `global` (and consoles without a workspace
+folder) uses one shared history. Files are stored under
+`context.globalStorageUri/history/`, named `global.history` or
+`workspace-<SHA256>.history`. The old `~/.r_console_history` is not used.
+
+Each history file is limited to 20,000 commands; compaction retains the newest
+19,000 before subsequent appends. Entries preserve multiline text and timestamps.
+The `# r-console-history-base:` marker tracks removed entries so concurrent
+consoles maintain stable navigation positions even across duplicate commands.
+Readers and writers coordinate through a per-file lock; queued submissions
+are retried after lock contention. Newly created history directories and
+files request Unix permissions `0700` and `0600`; existing permissions
+remain unchanged, and Windows relies on inherited filesystem permissions.
+
+Up/Down and Ctrl+P/Ctrl+N skip consecutive identical entries without removing
+them. Ctrl+R searches backward for the current line's trimmed text anywhere
+in a saved command; repeated Ctrl+R uses the original term to find older
+matches. F8 (`r-console.searchHistory`, displayed as
+**R Console: Show Command History**) opens **R Console: Command History**,
+a Quick Pick of saved commands in newest-first order. Text input filters this
+snapshot. The `collapse-all` button hides exact duplicate entries in this
+picker only; when enabled, it switches to `expand-all` to show all entries.
+The preference is retained in `context.globalState` across consoles and
+VS Code restarts. Selecting an entry restores its code without executing it.
+The picker title, placeholder, and button presentation are defined in
+`src/Terminal/history.ts` and checked in unit tests.
+
 ## 5. Files To Read First
 
 1. [`src/extension.ts`](../src/extension.ts)
