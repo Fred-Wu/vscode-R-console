@@ -579,3 +579,118 @@ test("Up and Down load older history incrementally without replacing the entire 
   history.resetIndex();
   assert.equal(history.navigate(-1), "command-649");
 });
+
+
+test("a stale pending write in another store cannot resurrect deleted history", (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const first = new HistoryStore(file);
+  const second = new HistoryStore(file);
+  first.load(); second.load();
+  first.push("old()");
+  const before = performance.timeOrigin + performance.now();
+  first.deleteEntries({ all: true, before });
+  second.pushEntries([{ id: "stale-id", code: "old()", createdAt: before - 1 }]);
+  assert.deepEqual(second.getEntries(), []);
+  second.pushEntries([{ id: "fresh-id", code: "old()", createdAt: before + 1 }]);
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["old()"]);
+  assert.deepEqual(restored.getPersistedIds(["stale-id", "fresh-id"]),
+    ["fresh-id"], "only a new submission should be stored on disk");
+});
+
+test("failed deletion keeps pending commands for a later successful append", (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const store = new HistoryStore(file);
+  store.load();
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, String(process.pid));
+  try {
+    store.push("queued()");
+    assert.deepEqual(store.getEntries(), ["queued()"]);
+    assert.throws(() => store.deleteEntries({ all: true }), /pending|busy/i);
+    assert.equal(store.hasPendingWrites, true);
+  } finally {
+    fs.unlinkSync(lock);
+  }
+  store.save();
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["queued()"]);
+});
+
+test("deleting one duplicate retains unrelated identical session completion entries", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("same()");
+  history.push("same()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const occurrence = history.getPickerEntries("same()", false)[0];
+  await history.deleteEntries([occurrence], false);
+  assert.deepEqual(history.getRecentSessionEntries(), ["same()"]);
+  assert.deepEqual(history.getEntries(), ["same()"]);
+});
+
+test("collapsed duplicate deletion includes matches outside the loaded foreground window", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 600 }, (_, i) =>
+    "\n# time: old\n+" + (i === 2 || i === 500 ? "duplicate()" : "item-" + i) + "\n").join(""));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  const group = (await history.getPage("duplicate()", true)).entries;
+  assert.equal(group.length, 1);
+  await history.deleteEntries(group, true);
+  assert.deepEqual((await history.getPage("duplicate()", false)).entries, []);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const reopened = new HistoryStore(file);
+  reopened.load();
+  assert.equal(reopened.getEntries().filter((code) => code === "duplicate()").length, 0);
+});
+
+test("F8 Enter restores the highlighted command rather than deleting it", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("restore()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidTriggerItemButton(cb) { handlers.item = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {},
+      ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const restored = [];
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+    applyHistorySearchResult: (code) => restored.push(code),
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length > 0);
+  assert.equal(picker.canSelectMany, false);
+  assert.equal(picker.items[0].label, "☐ restore()");
+  assert.equal(picker.items[0].buttons.length, 1);
+  picker.activeItems = [picker.items[0]];
+  handlers.accept();
+  await opened;
+  assert.deepEqual(restored, ["restore()"]);
+  assert.deepEqual(history.getEntries(), ["restore()"]);
+});

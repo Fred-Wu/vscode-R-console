@@ -1709,6 +1709,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       picker.items = [
         ...pageItems.map((item) => ({
           ...item,
+          label: (checked.has(itemKey(item)) ? "☑ " : "☐ ") + item.code,
           buttons: [checked.has(itemKey(item)) ? checkedButton : uncheckedButton],
         })),
         ...(hasMore ? [{
