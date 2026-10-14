@@ -233,7 +233,7 @@ export class HistoryManager extends HistoryBuffer {
         : [...this.stored.slice(update.remove), ...update.entries];
       this.storedStart = update.start;
       if (!wasStored) nextIndex += this.stored.length;
-      const combined = [...this.stored, ...this.pending];
+      const combined = [...this.stored, ...this.pending.map((entry) => entry.code)];
       const trim = Math.max(0, combined.length - this.maxHistorySize);
       this.historyBuffer = combined.slice(trim);
       this.historyIndex = oldIndex === oldLength ? this.historyBuffer.length
