@@ -171,7 +171,7 @@ export class HistoryManager extends HistoryBuffer {
   private unconfirmed: HistoryWrite[] = [];
   private sentClosing = false;
   private deletionQueue: { ids?: string[]; codes?: string[]; all?: boolean }[] = [];
-  private deleting: ((value: void) => void)[] = [];
+  private deleting: { resolve: () => void; reject: (error: Error) => void }[] = [];
   private stored: string[] = [];
   private storedIds: string[] = [];
   private historyIds: string[] = [];
@@ -216,9 +216,9 @@ export class HistoryManager extends HistoryBuffer {
 
   private requestDeletion(selection: { ids?: string[]; codes?: string[]; all?: boolean }): Promise<void> {
     if (this.disabled || this.closing) return Promise.reject(new Error("History storage is unavailable."));
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       this.deletionQueue.push(selection);
-      this.deleting.push(resolve);
+      this.deleting.push({ resolve, reject });
       this.save();
     });
   }
@@ -354,16 +354,29 @@ export class HistoryManager extends HistoryBuffer {
 
   receive(update: HistoryUpdate): void {
     if (this.disabled) return;
-    if (update.deletionComplete) {
-      const resolve = this.deleting.shift();
-      resolve?.();
+    if (update.deletionComplete !== undefined) {
+      const operation = this.deleting.shift();
+      if (update.deletionComplete) {
+        const removed = new Set(update.deleted ?? []);
+        const removedCodes = new Set(this.historyIds.flatMap((id, index) =>
+          removed.has(id) ? [this.historyBuffer[index]] : []));
+        this.pending = this.pending.filter((entry) => !removed.has(entry.id));
+        this.unconfirmed = this.unconfirmed.filter((entry) => !removed.has(entry.id));
+        this.sessionEntries = this.sessionEntries.filter((code) => !removedCodes.has(code));
+        // A deletion overrides the picker freeze: the authoritative snapshot
+        // has already been published by the worker before this confirmation.
+        this.reconcileHistory();
+        operation?.resolve();
+      } else {
+        operation?.reject(new Error(update.error ?? "History deletion failed."));
+      }
+      return;
     }
-    if (update.deleted?.length) {
-      const removed = new Set(update.deleted);
-      this.pending = this.pending.filter((entry) => !removed.has(entry.id));
-      this.unconfirmed = this.unconfirmed.filter((entry) => !removed.has(entry.id));
-      this.sessionEntries = this.sessionEntries.filter((entry) => !update.deleted?.some((id) =>
-        this.historyIds.some((known, index) => known === id && this.historyBuffer[index] === entry)));
+    if (this.suspended && !this.closing && update.deleted?.length) {
+      this.applyStoredUpdate(update);
+      this.reconcileHistory();
+      this.acknowledge(update);
+      return;
     }
     if (this.suspended && !this.closing) {
       // Update worker state and release the next queued write immediately,
@@ -403,5 +416,8 @@ export class HistoryManager extends HistoryBuffer {
     this.sent = undefined;
     this.pending = [];
     this.deferredHistory = undefined;
+    for (const operation of this.deleting) operation.reject(new Error("History storage stopped."));
+    this.deleting = [];
+    this.deletionQueue = [];
   }
 }

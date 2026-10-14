@@ -1682,8 +1682,19 @@ export class RTerminal implements vscode.Pseudoterminal {
       iconPath: new vscode.ThemeIcon(initialToggle.icon),
       tooltip: initialToggle.tooltip,
     };
-    const deleteButton = { iconPath: new vscode.ThemeIcon("trash"), tooltip: "Delete selected history entries" };
-    picker.canSelectMany = true;
+    // QuickPick.canSelectMany adds a global select-all checkbox to the search
+    // field and changes Enter into selection acceptance. Keep normal Enter
+    // behaviour and use a per-entry check button for bulk deletion instead.
+    picker.canSelectMany = false;
+    const deleteButton = { iconPath: new vscode.ThemeIcon("trash"),
+      tooltip: "Delete checked entries, or the highlighted entry" };
+    const checkButton = { iconPath: new vscode.ThemeIcon("check"),
+      tooltip: "Check or uncheck this entry for deletion" };
+    const deleteItemButton = { iconPath: new vscode.ThemeIcon("trash"),
+      tooltip: "Delete this entry" };
+    const checked = new Map<string, HistoryPickItem>();
+    const itemKey = (entry: HistoryPickItem): string =>
+      entry.id ?? String(entry.historyIndex) + ":" + entry.code;
     picker.buttons = [collapseButton, deleteButton];
     const setCollapseButton = (): void => {
       const toggle = getHistoryPickerTogglePresentation(collapseDuplicates);
@@ -1694,7 +1705,27 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const updateItems = (): void => {
       picker.items = this.rHistory.getPickerEntries(picker.value, collapseDuplicates)
-        .map(({ code, historyIndex, id }) => ({ label: code, code, historyIndex, id }));
+        .map(({ code, historyIndex, id }) => {
+          const entry: HistoryPickItem = {
+            label: code, code, historyIndex, id,
+            buttons: [checkButton, deleteItemButton],
+          };
+          if (checked.has(itemKey(entry))) entry.description = "✓ Selected for deletion";
+          return entry;
+        });
+    };
+    const deleteEntries = async (entries: HistoryPickItem[]): Promise<void> => {
+      if (!entries.length) return;
+      try {
+        await this.rHistory.deleteEntries(entries, collapseDuplicates);
+        for (const entry of entries) checked.delete(itemKey(entry));
+        updateItems();
+      } catch (error) {
+        void vscode.window.showErrorMessage(
+          "Could not delete R Console history: " +
+          (error instanceof Error ? error.message : String(error))
+        );
+      }
     };
     updateItems();
 
@@ -1704,20 +1735,29 @@ export class RTerminal implements vscode.Pseudoterminal {
         picker.onDidChangeValue(updateItems);
         picker.onDidTriggerButton(async (button) => {
           if (button === deleteButton) {
-            const selected = [...picker.selectedItems];
-            if (!selected.length) return;
-            await this.rHistory.deleteEntries(selected, collapseDuplicates);
-            updateItems();
+            await deleteEntries(checked.size
+              ? [...checked.values()] : [...picker.activeItems].slice(0, 1));
             return;
           }
           if (button !== collapseButton) return;
           collapseDuplicates = !collapseDuplicates;
+          checked.clear();
           setCollapseButton();
           updateItems();
           try {
             await state.update(preferenceKey, collapseDuplicates);
           } catch {
             void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
+          }
+        });
+        picker.onDidTriggerItemButton(({ item, button }) => {
+          if (button === deleteItemButton) {
+            void deleteEntries([item]);
+          } else if (button === checkButton) {
+            const key = itemKey(item);
+            if (checked.has(key)) checked.delete(key);
+            else checked.set(key, item);
+            updateItems();
           }
         });
         picker.onDidAccept(() => {

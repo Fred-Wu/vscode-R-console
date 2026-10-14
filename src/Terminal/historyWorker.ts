@@ -72,20 +72,21 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
   record.store.pushEntries(request.entries);
   let deleted: string[] | undefined;
   let deletionComplete = false;
+  let deletionError: string | undefined;
   if (request.delete) {
     try {
       deleted = record.store.deleteEntries(request.delete);
       for (const id of deleted) record.unconfirmed.delete(id);
       deletionComplete = true;
-    } catch {
-      // Retain the worker and existing history on an unsuccessful rewrite.
+    } catch (error) {
+      deletionError = error instanceof Error ? error.message : String(error);
     }
   }
   record.closed = request.close;
   publish(request.id, record);
   if (request.delete) {
     port.postMessage({ id: request.id, start: record.previous.start, reset: false,
-      remove: 0, entries: [], deleted, deletionComplete });
+      remove: 0, entries: [], deleted, deletionComplete, error: deletionError });
   }
   releaseClosedStores();
 });
