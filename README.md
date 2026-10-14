@@ -9,9 +9,10 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 
 - Custom R console hosted in the VS Code terminal area.
 - Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
-- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the completion window at the cursor, including empty positions where Tab is used for indentation.
+- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the **R console completions** picker at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
-- Multiline editing and long-input rendering. `Ctrl+R` searches backward for commands containing the entered text; repeated presses find older matches. Up/Down skips consecutive duplicate commands. `F8` opens **Command History**, a searchable picker where you can collapse or expand exact duplicate entries. The picker remembers your choice across consoles and VS Code restarts.
+- Multiline editing and long-input rendering.
+- Reverse search on entered text using `Ctrl+R`; repeated presses find older matches. `F8` opens **Command History**, a searchable picker where you can collapse or expand exact duplicate entries.
 - Workspace-aware history:
   - **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; consoles without a workspace automatically use global history.
   - **History retention:** The latest 20,000 commands are retained per scope.

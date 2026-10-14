@@ -4,9 +4,15 @@ All notable changes to R Console will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Workspace-aware console history:
+  - Command history is now kept separately for each workspace folder and shared between its consoles. `r.console.historyScope` defaults to `workspace`, with an option to use a single `global` history. Consoles outside a workspace automatically use global history.
+  - `F8` opens **Command History**, a searchable history picker. A toggle collapses exact duplicate entries without deleting stored commands and remembers your choice across consoles and VS Code restarts.
+
 ### Changed
 
-- Updated compatibility with recent vscode-R releases.
+- Adapted to the latest vscode-R APIs for workspace commands, session attachment, concurrent sessions, and persistent reconnection ([#1837](https://github.com/REditorSupport/vscode-R/pull/1837), [#1868](https://github.com/REditorSupport/vscode-R/pull/1868), [#1870](https://github.com/REditorSupport/vscode-R/pull/1870), [#1871](https://github.com/REditorSupport/vscode-R/pull/1871)), thanks to [@eitsupi](https://github.com/eitsupi) and the vscode-R contributors.
 
 ## [0.5.2] - 2026-10-08
 
