@@ -9,7 +9,7 @@ type RecordState = {
   unconfirmed: Set<string>;
   closed: boolean;
   initialized: boolean;
-  previousDeletions: number;
+  previousDeletions: string[];
   pendingDeletions: NonNullable<HistoryRequest["delete"]>[];
 };
 const stores = new Map<number, RecordState>();
@@ -27,8 +27,12 @@ function publish(id: number, record: RecordState): void {
     retained > snapshot.entries.length ||
     previous.ids.slice(remove).some((id, index) => id !== snapshot.ids[index]);
   const deletions = record.store.getDeletionRules();
-  const deletedRules = deletions.slice(record.previousDeletions);
-  record.previousDeletions = deletions.length;
+  const identifiers = deletions.map((rule) => JSON.stringify(rule));
+  const hasPrefix = record.previousDeletions.every(
+    (previous, index) => identifiers[index] === previous);
+  const deletedRules = hasPrefix
+    ? deletions.slice(record.previousDeletions.length) : deletions;
+  record.previousDeletions = identifiers;
   const persisted = record.store.getPersistedIds([...record.unconfirmed]);
   for (const entry of persisted) record.unconfirmed.delete(entry);
   port.postMessage({
@@ -98,7 +102,7 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
     store.load();
     record = { store, previous: { entries: [], ids: [], start: 0 },
       unconfirmed: new Set<string>(), closed: false, initialized: false,
-      previousDeletions: 0, pendingDeletions: [] };
+      previousDeletions: [], pendingDeletions: [] };
     stores.set(request.id, record);
   }
   if (request.page) {
@@ -113,7 +117,12 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
     if (beforeId !== undefined || afterId !== undefined || aroundId !== undefined) {
       const target = beforeId ?? afterId ?? aroundId;
       const index = all.findIndex((entry) => entry.id === target);
-      const anchor = index < 0 ? all.length : index;
+      if (index < 0) {
+        port.postMessage({ id: request.id, pageResult: { requestId,
+          entries: [], hasMore: false } });
+        return;
+      }
+      const anchor = index;
       const from = aroundId !== undefined ? Math.max(0, anchor - Math.floor(count / 2))
         : afterId !== undefined ? Math.max(0, anchor + 1) : Math.max(0, anchor - count);
       const to = aroundId !== undefined ? Math.min(all.length, from + count)

@@ -192,15 +192,10 @@ export class HistoryManager extends HistoryBuffer {
   private disabled = false;
   private suspended = 0;
   private deferredHistory: {
-    storedStart: number;
-    storedLength: number;
-    unmerged: number;
-    pushed: number;
     updated: boolean;
   } | undefined;
   // Only local pushes can evict cached entries while F8 defers worker updates.
   // Monotonic positions keep each displayed occurrence stable without a snapshot.
-  private pickerFrontEvictions = 0;
 
   constructor(
     private readonly location: HistoryLocation,
@@ -328,18 +323,13 @@ export class HistoryManager extends HistoryBuffer {
 
   getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
     return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query)
-      .map(({ code, historyIndex }) => ({
-        code, historyIndex: historyIndex + this.pickerFrontEvictions,
-        id: this.historyIds[historyIndex],
-      }));
+      .map(({ code, historyIndex }) => ({ code, historyIndex, id: this.historyIds[historyIndex] }));
   }
 
   // F8 items carry a position from when they were displayed, not a live
   // array index. Return false if local submissions evicted the occurrence.
   selectPickerEntry(entry: HistoryPickerEntry): boolean {
-    const index = entry.id === undefined
-      ? entry.historyIndex - this.pickerFrontEvictions
-      : this.historyIds.indexOf(entry.id);
+    const index = entry.id ? this.historyIds.indexOf(entry.id) : -1;
     if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length ||
       this.historyBuffer[index] !== entry.code) {
       return false;
@@ -354,8 +344,6 @@ export class HistoryManager extends HistoryBuffer {
       this.browsingOlder = false;
       this.reconcileHistory();
     }
-    if (this.historyBuffer.length >= this.maxHistorySize) this.pickerFrontEvictions++;
-    if (this.deferredHistory) this.deferredHistory.pushed++;
     const write = { id: randomUUID(), code: entry, createdAt: performance.timeOrigin + performance.now() };
     super.push(entry);
     this.sessionIds.push(write.id);
@@ -403,13 +391,7 @@ export class HistoryManager extends HistoryBuffer {
   // snapshots, write acknowledgements, and new submissions keep flowing.
   suspendUpdates(): () => void {
     if (!this.suspended) {
-      this.deferredHistory = {
-        storedStart: this.storedStart,
-        storedLength: this.stored.length,
-        unmerged: (this.sent?.length ?? 0) + this.pending.length,
-        pushed: 0,
-        updated: false,
-      };
+      this.deferredHistory = { updated: false };
     }
     this.suspended++;
     return () => {

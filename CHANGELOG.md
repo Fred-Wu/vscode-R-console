@@ -2,6 +2,11 @@
 
 All notable changes to R Console will be documented in this file.
 
+## Unreleased
+
+- Added scoped deletion of command-history occurrences and full history via the Command Palette.
+- Added paged history search and Up/Down navigation, native checkbox multi-selection in F8, and durable deletion recovery.
+
 ## [0.5.3] - 2026-10-14
 
 ### Added

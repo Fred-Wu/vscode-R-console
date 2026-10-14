@@ -288,8 +288,24 @@ export class HistoryStore extends HistoryBuffer {
     }
   }
 
-  private deletionHeader(): string {
-    return this.deletions.map((value) => "# r-console-deletion: " + JSON.stringify(value) + "\n").join("");
+  private deletionHeader(next?: HistoryDeletion): string {
+    // A later matching rule with an equal or newer cutoff subsumes an
+    // earlier rule. Never discard a rule merely because it is old: another
+    // VS Code window may still replay an unacknowledged write.
+    const rules = next ? [...this.deletions, next] : this.deletions;
+    const retained: HistoryDeletion[] = [];
+    for (let index = rules.length - 1; index >= 0; index--) {
+      const rule = rules[index];
+      const covered = retained.some((later) =>
+        later.before >= rule.before && (
+          later.all ||
+          (!rule.all && !later.all &&
+            (rule.ids ?? []).every((id) => later.ids?.includes(id)) &&
+            (rule.codeHashes ?? []).every((hash) => later.codeHashes?.includes(hash)))
+        ));
+      if (!covered) retained.unshift(rule);
+    }
+    return retained.map((value) => "# r-console-deletion: " + JSON.stringify(value) + "\n").join("");
   }
 
   private isDeleted(entry: HistoryWrite): boolean {
@@ -632,7 +648,7 @@ export class HistoryStore extends HistoryBuffer {
         records.push(record);
       }
       const content = "# r-console-history-base: " + this.diskEntryBase + "\n" +
-        this.deletionHeader() + "# r-console-deletion: " + JSON.stringify(deletion) + "\n" +
+        this.deletionHeader(deletion) +
         records.join("");
       const temporary = this.historyFile + "." + process.pid + "." + randomUUID() + ".tmp";
       try {

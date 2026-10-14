@@ -201,6 +201,10 @@ Then test:
 - create a new console after an interrupted/incomplete history write and verify history recovery does not prevent R from launching
 - with two consoles sharing a nearly full history, browse an older command in one while the other triggers compaction; verify Up/Down still select the same retained command, or the oldest retained command when the selected one was discarded
 - run concurrent command submissions from different VS Code windows using the same history scope and confirm that all completed commands are available from either console
+- In F8, use native row checkboxes and the Select All box beside search. Confirm Select All checks only loaded results; the toolbar trash deletes the checked rows and Enter restores the highlighted command.
+- Load older matching rows using the toolbar; after deleting one or more selected entries, verify the current search and loaded page range remain intact.
+- Navigate beyond 200 entries with Up/Down, including rapid repeated keys at a page boundary. Test stale page anchors after deletion from another window.
+- Use Command Palette **R Console: Delete All Command History** and confirm it clears unloaded records without changing independent history scopes.
 - while one console is writing a large history entry, check history navigation or F8 from another; only complete entries should appear, and submissions delayed by a locked history file should eventually be shared
 - verify history exceeding 20,000 commands is trimmed when a console starts, and further submissions keep the history file and picker within that limit
 - on Linux/macOS, verify newly created history directories permit owner-only access (`0700`) and newly created history files permit owner-only read/write (`0600`); appending does not change permissions of existing files
@@ -855,7 +859,4 @@ readline("still alive? ")
 If these simple commands fail only after the heavy tests, the console likely has
 a state-management bug rather than a basic startup problem.
 
-- F8: verify no select-all checkbox before the search box. Use row selection controls and the shared trash action. Enter restores the highlighted command.
-- Delete several checked entries and confirm the search stays intact and the rows disappear immediately. Delete a collapsed duplicate and confirm every occurrence in the scope is removed.
-- With more than 200 commands, navigate Up beyond the initial window and Down back to recent entries. In the picker, load additional result pages beyond the first 50.
-- Delete all history from the Command Palette and reopen the console; verify another independent history scope is intact.
+

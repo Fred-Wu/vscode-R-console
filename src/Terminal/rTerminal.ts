@@ -177,6 +177,8 @@ export class RTerminal implements vscode.Pseudoterminal {
   private historyBrowsing = false;
   private historyCollapsed = true;
   private savedHistoryInput: { text: string; cursor: number } | undefined;
+  private historyNavigationLoading = false;
+  private historyNavigationQueue: number[] = [];
   private escPendingClear = false;
 
   private lang: RTermLang;
@@ -1672,10 +1674,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode !== "ready" || !this.promptReady) {
       return;
     }
-    if (!this.rHistory.hasEntries()) {
-      void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
-      return;
-    }
     type HistoryPickItem = vscode.QuickPickItem & {
       code: string;
       historyIndex: number;
@@ -1693,72 +1691,85 @@ export class RTerminal implements vscode.Pseudoterminal {
       iconPath: new vscode.ThemeIcon(initialToggle.icon),
       tooltip: initialToggle.tooltip,
     };
-    // VS Code's built-in multi-select inserts an unwanted checkbox before
-    // the search field. Render selection checkboxes only on history rows.
-    picker.canSelectMany = false;
+    // Native QuickPick selection supplies the row checkboxes and Select All.
+    // Only loaded rows can be selected; Delete All remains a separate command.
+    picker.canSelectMany = true;
     const deleteButton = { iconPath: new vscode.ThemeIcon("trash"),
-      tooltip: "Delete checked history entries" };
-    const uncheckedButton = { iconPath: new vscode.ThemeIcon("checklist"),
-      tooltip: "Select entry for deletion" };
-    const checkedButton = { iconPath: new vscode.ThemeIcon("check"),
-      tooltip: "Deselect entry" };
+      tooltip: "Delete selected history entries" };
+    const loadMoreButton = { iconPath: new vscode.ThemeIcon("arrow-down"),
+      tooltip: "Load more matching history entries" };
     const checked = new Map<string, HistoryPickItem>();
-    const itemKey = (entry: HistoryPickItem): string =>
-      entry.id ?? String(entry.historyIndex) + ":" + entry.code;
-    picker.buttons = [collapseButton, deleteButton];
-    const setCollapseButton = (): void => {
-      const toggle = getHistoryPickerTogglePresentation(collapseDuplicates);
-      collapseButton.iconPath = new vscode.ThemeIcon(toggle.icon);
-      collapseButton.tooltip = toggle.tooltip;
-      picker.buttons = [collapseButton, deleteButton];
-    };
+    const itemKey = (item: HistoryPickItem): string =>
+      item.id ?? String(item.historyIndex) + ":" + item.code;
     let disposed = false;
     let pageOffset = 0;
     let pageItems: HistoryPickItem[] = [];
     let hasMore = false;
     let generation = 0;
-    const renderItems = (): void => {
-      picker.items = [
-        ...pageItems.map((item) => ({
-          ...item,
-          label: (checked.has(itemKey(item)) ? "☑ " : "☐ ") + item.code,
-          buttons: [checked.has(itemKey(item)) ? checkedButton : uncheckedButton],
-        })),
-        ...(hasMore ? [{
-          label: "Load older history entries…", code: "", historyIndex: -1,
-          detail: "Show more matching commands",
-          alwaysShow: true,
-        } as HistoryPickItem] : []),
-      ];
+    let settingSelection = false;
+    const updateToolbar = (): void => {
+      picker.buttons = [collapseButton, ...(hasMore ? [loadMoreButton] : []), deleteButton];
     };
-    const updateItems = async (append = false): Promise<void> => {
+    const renderItems = (): void => {
       if (disposed) return;
-      const version = ++generation;
-      const query = picker.value;
-      const nextOffset = append ? pageOffset : 0;
+      const activeId = picker.activeItems[0]?.id;
+      settingSelection = true;
       try {
-        const page = await this.rHistory.getPage(query, collapseDuplicates, nextOffset);
-        if (disposed || version !== generation) return;
-        const items = page.entries.map(({ code, historyIndex, id }) => ({
-          label: code, code, historyIndex, id,
-        }));
-        pageItems = append ? [...pageItems, ...items] : items;
-        pageOffset = nextOffset + items.length;
-        hasMore = page.hasMore;
+        picker.items = pageItems;
+        picker.selectedItems = pageItems.filter((item) => checked.has(itemKey(item)));
+        const active = pageItems.find((item) => item.id === activeId);
+        if (active) picker.activeItems = [active];
+      } finally {
+        settingSelection = false;
+      }
+      updateToolbar();
+    };
+    picker.onDidChangeSelection((selection) => {
+      if (settingSelection || disposed) return;
+      for (const item of pageItems) checked.delete(itemKey(item));
+      for (const item of selection) checked.set(itemKey(item), item);
+    });
+    const updateItems = async (append = false, retainPages = false): Promise<void> => {
+      if (disposed) return;
+      const currentGeneration = ++generation;
+      const query = picker.value;
+      const targetCount = retainPages ? Math.max(50, pageOffset) : 50;
+      const start = append ? pageOffset : 0;
+      const fetched: HistoryPickItem[] = [];
+      let more = false;
+      try {
+        do {
+          const page = await this.rHistory.getPage(query, collapseDuplicates,
+            start + fetched.length, Math.min(200, targetCount - fetched.length));
+          if (disposed || generation !== currentGeneration) return;
+          fetched.push(...page.entries.map(({ code, historyIndex, id }) => ({
+            label: code, code, historyIndex, id,
+          })));
+          more = page.hasMore;
+          if (!page.entries.length) break;
+        } while (more && fetched.length < targetCount);
+        pageItems = append ? [...pageItems, ...fetched] : fetched;
+        pageOffset = pageItems.length;
+        hasMore = more;
         renderItems();
+        if (!append && !query && !pageItems.length) {
+          void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
+          picker.hide();
+        }
       } catch (error) {
-        if (!disposed && version === generation) {
+        if (!disposed && generation === currentGeneration) {
           void vscode.window.showErrorMessage("Could not load R Console history: " +
             (error instanceof Error ? error.message : String(error)));
         }
       }
     };
-    const deleteEntries = async (entries: HistoryPickItem[]): Promise<void> => {
+    const deleteEntries = async (): Promise<void> => {
+      const entries = [...checked.values()];
       if (!entries.length) return;
       try {
         await this.rHistory.deleteEntries(entries, collapseDuplicates);
         for (const entry of entries) checked.delete(itemKey(entry));
-        if (!disposed) await updateItems();
+        if (!disposed) await updateItems(false, true);
       } catch (error) {
         void vscode.window.showErrorMessage(
           "Could not delete R Console history: " +
@@ -1766,6 +1777,13 @@ export class RTerminal implements vscode.Pseudoterminal {
         );
       }
     };
+    const setCollapseButton = (): void => {
+      const toggle = getHistoryPickerTogglePresentation(collapseDuplicates);
+      collapseButton.iconPath = new vscode.ThemeIcon(toggle.icon);
+      collapseButton.tooltip = toggle.tooltip;
+      updateToolbar();
+    };
+    updateToolbar();
     void updateItems();
 
     let selectedItem: HistoryPickItem | undefined;
@@ -1774,7 +1792,11 @@ export class RTerminal implements vscode.Pseudoterminal {
         picker.onDidChangeValue(() => { void updateItems(); });
         picker.onDidTriggerButton(async (button) => {
           if (button === deleteButton) {
-            await deleteEntries([...checked.values()]);
+            await deleteEntries();
+            return;
+          }
+          if (button === loadMoreButton) {
+            await updateItems(true);
             return;
           }
           if (button !== collapseButton) return;
@@ -1788,19 +1810,9 @@ export class RTerminal implements vscode.Pseudoterminal {
             void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
           }
         });
-        picker.onDidTriggerItemButton(({ item, button }) => {
-          const key = itemKey(item);
-          if (button === uncheckedButton) checked.set(key, item);
-          else if (button === checkedButton) checked.delete(key);
-          renderItems();
-        });
         picker.onDidAccept(() => {
           const selected = picker.activeItems[0] ?? picker.selectedItems[0];
           if (!selected) return;
-          if (selected.historyIndex === -1) {
-            void updateItems(true);
-            return;
-          }
           resolve(selected);
           picker.hide();
         });
@@ -1840,7 +1852,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private navigateHistory(direction: number): void {
-    if (direction < 0 && !this.historyBrowsing) {
+    if (this.historyNavigationLoading) {
+      this.historyNavigationQueue.push(direction);
+      return;
+    }
+    if (direction < 0 && !this.historyBrowsing && !this.savedHistoryInput) {
       this.savedHistoryInput = {
         text: this.inputState.text, cursor: this.inputState.cursorPosition,
       };
@@ -1848,21 +1864,33 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     const entry = this.rHistory.navigate(direction);
     if (entry === undefined) {
+      if (direction > 0 && !this.historyBrowsing) return;
+      const inputAtRequest = this.inputState.text;
       const load = direction < 0
         ? this.rHistory.loadOlderNavigation()
         : this.rHistory.loadNewerNavigation();
-      const inputAtRequest = this.inputState.text;
+      this.historyNavigationLoading = true;
       void load.then((loaded) => {
-        if (loaded && this.mode === "ready" && this.promptReady &&
-          this.inputState.text === inputAtRequest) {
-          this.navigateHistory(direction);
+        this.historyNavigationLoading = false;
+        if (!loaded || this.mode !== "ready" || !this.promptReady ||
+          this.inputState.text !== inputAtRequest) {
+          this.historyNavigationQueue = [];
+          if (!this.historyBrowsing) this.savedHistoryInput = undefined;
+          return;
         }
-      }).catch(() => {});
-
+        this.navigateHistory(direction);
+        while (!this.historyNavigationLoading && this.historyNavigationQueue.length) {
+          this.navigateHistory(this.historyNavigationQueue.shift()!);
+        }
+      }).catch(() => {
+        this.historyNavigationLoading = false;
+        this.historyNavigationQueue = [];
+        if (!this.historyBrowsing) this.savedHistoryInput = undefined;
+      });
       return;
     }
-    this.lang.updateInput("");
     if (entry === null) {
+      this.lang.updateInput("");
       this.clearInputRender();
       this.historyBrowsing = false;
       this.historyCollapsed = true;
@@ -1878,6 +1906,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.promptVisible = true;
       return;
     }
+    this.lang.updateInput("");
     this.historyBrowsing = true;
     this.historyCollapsed = true;
     this.clearInputRender();

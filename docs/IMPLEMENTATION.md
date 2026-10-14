@@ -894,31 +894,21 @@ remain unchanged, and Windows relies on inherited filesystem permissions.
 Up/Down and Ctrl+P/Ctrl+N skip consecutive identical entries without removing
 them. Ctrl+R searches backward for the current line's trimmed text anywhere
 in a saved command; repeated Ctrl+R uses the original term to find older
-matches. F8 (`r-console.searchHistory`, displayed as
-**R Console: Show Command History**) opens **R Console: Command History**,
-a Quick Pick initially showing the newest 50 cached commands. Typing searches
-the entire console history cache (case-insensitive fuzzy subsequence matching),
-then updates the Quick Pick with at most the newest 50 matching commands.
-Only displayed matches are constructed as Quick Pick items; the full history
-is neither copied for F8 nor read again from disk. The `collapse-all` button
-hides exact duplicate entries among all matching commands; when enabled, it
-switches to `expand-all` to show repeated occurrences.
-The preference is retained in `context.globalState` across consoles and
-VS Code restarts. Each picker item carries a stable occurrence ID as well as its cached index.
-New records retain the UUID from the persisted history marker; legacy records
-without an ID receive a deterministic ID derived from their absolute file
-ordinal. Worker snapshots propagate these IDs, allowing F8 and Up/Down to
-retain the exact selected occurrence through shared-file synchronization,
-retries and compaction, even when two consoles submit identical command text.
-The shared file's append order remains authoritative; history is not
-timestamp-sorted.
-Local submissions can continue while F8 is open. Picker item positions account
-for history entries evicted from the front of the cache; when the selected
-occurrence was evicted, F8 still restores its code but resets history navigation
-to avoid pointing to a different command. Selecting an entry never executes it.
-The picker title, placeholder, button presentation, limited-result matching,
-and duplicate handling are defined in `src/Terminal/history.ts` and checked
-in unit tests.
+matches. F8 (`r-console.searchHistory`) uses native VS Code Quick Pick
+multiple-selection checkboxes and the built-in Select All control. The
+toolbar trash action deletes checked entries currently loaded into the
+picker. The separate **Delete All Command History** command clears the
+entire history scope, including entries not yet loaded. Enter restores
+the highlighted command into the console input without executing it.
+The initial picker page contains the newest 50 matching records; a toolbar
+Load More action retrieves further pages without adding a selectable
+pseudo-entry. Searches are handled by the background worker across the
+retained history, with exact-duplicate collapse governed by the persisted
+global-state preference. Each entry has a stable occurrence ID.
+After deletion the picker refreshes its existing loaded range without
+discarding the search query. Older selections fetch their surrounding
+history window on demand, preserving navigation from that occurrence.
+New submissions continue to be persisted while the picker is open.
 
 ## 5. Files To Read First
 
