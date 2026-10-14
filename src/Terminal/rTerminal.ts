@@ -1666,7 +1666,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     const resumeHistoryUpdates = this.rHistory.suspendUpdates();
     picker.title = historyPickerText.title;
     picker.placeholder = historyPickerText.placeholder;
-    picker.sortByLabel = false;
     const preferenceKey = "historyPicker.collapseDuplicates";
     const state = this.historyStorage!.state;
     let collapseDuplicates = state.get<boolean>(preferenceKey, false);
