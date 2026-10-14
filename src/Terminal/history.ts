@@ -73,6 +73,7 @@ export type HistoryRequest = {
   location: HistoryLocation;
   entries: HistoryWrite[];
   close: boolean;
+  delete?: { ids?: string[]; codes?: string[]; all?: boolean };
 };
 
 export type HistoryUpdate = {
@@ -83,6 +84,9 @@ export type HistoryUpdate = {
   entries: string[];
   ids?: string[];
   persisted?: string[];
+  deleted?: string[];
+  deletionComplete?: boolean;
+  error?: string;
 };
 
 let worker: Worker | undefined;
@@ -166,6 +170,8 @@ export class HistoryManager extends HistoryBuffer {
   private sent: HistoryWrite[] | undefined;
   private unconfirmed: HistoryWrite[] = [];
   private sentClosing = false;
+  private deletionQueue: { ids?: string[]; codes?: string[]; all?: boolean }[] = [];
+  private deleting: ((value: void) => void)[] = [];
   private stored: string[] = [];
   private storedIds: string[] = [];
   private historyIds: string[] = [];
@@ -195,6 +201,26 @@ export class HistoryManager extends HistoryBuffer {
 
   load(): void {
     this.save();
+  }
+
+  deleteEntries(entries: readonly HistoryPickerEntry[], collapseDuplicates: boolean): Promise<void> {
+    const selection = collapseDuplicates
+      ? { codes: [...new Set(entries.map((entry) => entry.code))] }
+      : { ids: entries.map((entry) => entry.id).filter((id): id is string => !!id) };
+    return this.requestDeletion(selection);
+  }
+
+  clearHistory(): Promise<void> {
+    return this.requestDeletion({ all: true });
+  }
+
+  private requestDeletion(selection: { ids?: string[]; codes?: string[]; all?: boolean }): Promise<void> {
+    if (this.disabled || this.closing) return Promise.reject(new Error("History storage is unavailable."));
+    return new Promise<void>((resolve) => {
+      this.deletionQueue.push(selection);
+      this.deleting.push(resolve);
+      this.save();
+    });
   }
 
   getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
@@ -246,11 +272,12 @@ export class HistoryManager extends HistoryBuffer {
       this.scheduled = undefined;
       if (this.disabled) return;
       this.sent = this.pending;
+      const deletion = this.deletionQueue.shift();
       this.sentClosing = this.closing;
       this.pending = [];
       try {
         getWorker(this.workerPath).postMessage({
-          id: this.id, location: this.location, entries: this.sent, close: this.closing,
+          id: this.id, location: this.location, entries: this.sent, close: this.closing, delete: deletion,
         } satisfies HistoryRequest);
       } catch {
         this.disableStorage();
@@ -296,7 +323,7 @@ export class HistoryManager extends HistoryBuffer {
     if (this.closing) {
       if (!this.sentClosing || this.pending.length || this.unconfirmed.length) this.save();
       else histories.delete(this.id);
-    } else if (this.pending.length) {
+    } else if (this.pending.length || this.deletionQueue.length) {
       this.save();
     }
   }
@@ -327,6 +354,17 @@ export class HistoryManager extends HistoryBuffer {
 
   receive(update: HistoryUpdate): void {
     if (this.disabled) return;
+    if (update.deletionComplete) {
+      const resolve = this.deleting.shift();
+      resolve?.();
+    }
+    if (update.deleted?.length) {
+      const removed = new Set(update.deleted);
+      this.pending = this.pending.filter((entry) => !removed.has(entry.id));
+      this.unconfirmed = this.unconfirmed.filter((entry) => !removed.has(entry.id));
+      this.sessionEntries = this.sessionEntries.filter((entry) => !update.deleted?.some((id) =>
+        this.historyIds.some((known, index) => known === id && this.historyBuffer[index] === entry)));
+    }
     if (this.suspended && !this.closing) {
       // Update worker state and release the next queued write immediately,
       // without changing the cached entries that F8 is displaying.

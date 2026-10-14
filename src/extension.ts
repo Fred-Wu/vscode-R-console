@@ -129,6 +129,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.searchHistory", () =>
       getActiveRTerminal()?.showHistoryPicker()
     ),
+    vscode.commands.registerCommand("r-console.clearHistory", () =>
+      getActiveRTerminal()?.clearCommandHistory()
+    ),
     vscode.commands.registerCommand("r-console.restoreDefaultName", (target?: unknown) => {
       restoreDefaultConsoleName(target);
     }),

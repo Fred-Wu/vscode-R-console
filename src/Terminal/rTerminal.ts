@@ -1650,6 +1650,13 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
   }
 
+  public async clearCommandHistory(): Promise<void> {
+    const confirmation = await vscode.window.showWarningMessage(
+      "Delete all command history in this console's history scope?", { modal: true }, "Delete History"
+    );
+    if (confirmation === "Delete History") await this.rHistory.clearHistory();
+  }
+
   public async showHistoryPicker(): Promise<void> {
     if (this.mode !== "ready" || !this.promptReady) {
       return;
@@ -1675,12 +1682,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       iconPath: new vscode.ThemeIcon(initialToggle.icon),
       tooltip: initialToggle.tooltip,
     };
-    picker.buttons = [collapseButton];
+    const deleteButton = { iconPath: new vscode.ThemeIcon("trash"), tooltip: "Delete selected history entries" };
+    picker.canSelectMany = true;
+    picker.buttons = [collapseButton, deleteButton];
     const setCollapseButton = (): void => {
       const toggle = getHistoryPickerTogglePresentation(collapseDuplicates);
       collapseButton.iconPath = new vscode.ThemeIcon(toggle.icon);
       collapseButton.tooltip = toggle.tooltip;
-      picker.buttons = [collapseButton];
+      picker.buttons = [collapseButton, deleteButton];
     };
 
     const updateItems = (): void => {
@@ -1694,6 +1703,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
         picker.onDidChangeValue(updateItems);
         picker.onDidTriggerButton(async (button) => {
+          if (button === deleteButton) {
+            const selected = [...picker.selectedItems];
+            if (!selected.length) return;
+            await this.rHistory.deleteEntries(selected, collapseDuplicates);
+            updateItems();
+            return;
+          }
           if (button !== collapseButton) return;
           collapseDuplicates = !collapseDuplicates;
           setCollapseButton();
@@ -1705,7 +1721,7 @@ export class RTerminal implements vscode.Pseudoterminal {
           }
         });
         picker.onDidAccept(() => {
-          const selected = picker.selectedItems[0] ?? picker.activeItems[0];
+          const selected = picker.activeItems[0] ?? picker.selectedItems[0];
           if (selected) {
             resolve(selected);
             picker.hide();

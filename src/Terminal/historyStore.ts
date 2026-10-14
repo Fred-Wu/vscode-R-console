@@ -536,6 +536,65 @@ export class HistoryStore extends HistoryBuffer {
     };
   }
 
+  // Delete under the same cross-process lock used for appends and compaction.
+  // Retained legacy records acquire explicit IDs so removing a middle record
+  // never changes the identity of the occurrences after it.
+  deleteEntries(selection: { ids?: readonly string[]; codes?: readonly string[]; all?: boolean }): string[] {
+    const ids = new Set(selection.ids ?? []);
+    const codes = new Set(selection.codes ?? []);
+    const matches = (entry: HistoryWrite): boolean =>
+      !!selection.all || ids.has(entry.id) || codes.has(entry.code);
+    const removed = this.pendingEntries.filter(matches).map((entry) => entry.id);
+    this.pendingEntries = this.pendingEntries.filter((entry) => !matches(entry));
+    if (this.pendingEntries.length) {
+      this.flushPending();
+      if (this.pendingEntries.length) {
+        throw new Error("History writes are pending; deletion will be retried.");
+      }
+    }
+
+    this.withFileLock(() => {
+      if (this.needsRecovery) this.recoverInterruptedRecords();
+      this.readHistoryFromDisk(true);
+      const existing = this.historyIds.map((id, index) => ({
+        id, code: this.historyBuffer[index],
+      }));
+      const retained = existing.filter((entry) => !matches(entry));
+      removed.push(...existing.filter(matches).map((entry) => entry.id));
+      if (retained.length === existing.length) return;
+
+      const raw = fs.readFileSync(this.historyFile, "utf8");
+      const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
+        .map((match) => match.index!);
+      const end = raw.lastIndexOf("\n") + 1;
+      const preserve = boundaries.length === existing.length;
+      const records = retained.map((entry) => {
+        const index = existing.findIndex((old) => old.id === entry.id);
+        if (!preserve) return this.serializeEntry(entry);
+        let record = raw.slice(boundaries[index],
+          index + 1 < boundaries.length ? boundaries[index + 1] : end);
+        // Legacy records had no ID and no completion marker. Both are needed
+        // so their identities and interruption recovery remain correct.
+        record = record.replace(/(# time:[^\n]*)(\r?\n)/, (line, header: string, newline: string) =>
+          (header.includes("history-id: ") ? header : header + " history-id: " + entry.id) + newline);
+        if (!record.includes("# history-complete: " + entry.id + "\n")) {
+          record = record.replace(/\s*$/, "") + "\n# history-complete: " + entry.id + "\n";
+        }
+        return record;
+      }).join("");
+      const content = "# r-console-history-base: " + this.diskEntryBase + "\n" + records;
+      const temporary = this.historyFile + "." + process.pid + "." + randomUUID() + ".tmp";
+      try {
+        fs.writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        fs.renameSync(temporary, this.historyFile);
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
+      this.readHistoryFromDisk(true);
+    });
+    return removed;
+  }
+
   getPersistedIds(ids: readonly string[]): string[] {
     return ids.filter((id) => this.savedIds.has(id));
   }
