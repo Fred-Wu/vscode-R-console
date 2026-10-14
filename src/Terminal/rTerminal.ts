@@ -1,8 +1,6 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import * as path from "path";
-import * as os from "os";
 import { CompletionPickItem } from "../Language/completion";
 import { setNativeParseCallback } from "../Language/parser";
 import {
@@ -10,7 +8,8 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager } from "./history";
+import { HistoryManager, getHistoryFile, getHistoryPickerEntries,
+  getHistoryPickerTogglePresentation, historyPickerText, type HistoryScope } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
@@ -227,7 +226,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     private options: RTerminalOptions,
     private extensionPath: string = "",
     restoreState?: PersistedRTerminalState,
-    terminalName?: string
+    terminalName?: string,
+    private readonly historyStorage?: { folder: string; state: vscode.Memento }
   ) {
     if (terminalName && !isDefaultRuntimeTerminalName(terminalName)) {
       this.customTerminalName = terminalName;
@@ -248,7 +248,15 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.terminalState = this.createReplayTerminal();
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = createRuntimeBackend(this.extensionPath);
-    this.rHistory = new HistoryManager(path.join(os.homedir(), ".r_console_history"));
+    if (!historyStorage) {
+      throw new Error("R Console history storage is unavailable.");
+    }
+    const configuredScope = vscode.workspace.getConfiguration("r.console")
+      .get<string>("historyScope", "workspace");
+    const historyScope: HistoryScope = configuredScope === "global" ? "global" : "workspace";
+    this.rHistory = new HistoryManager(
+      getHistoryFile(historyStorage.folder, historyScope, this.options.cwd)
+    );
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
     this.lang = new RTermLang({
@@ -1191,22 +1199,21 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       }
-      case "ctrl_r": {
-        const term = this.inputState.currentLine.trim() || this.lastSearchTerm;
-        if (!term) {
-          return;
-        }
-        const found = this.rHistory.searchBackward(term);
-        if (found !== null) {
-          this.lastSearchTerm = term;
-          this.historyBrowsing = true;
-          this.historyCollapsed = true;
-          this.inputState.applyHistoryEntry(found);
-          this.renderInput();
-        }
+      case "ctrl_r":
+        this.reverseSearch();
         return;
-      }
+      case "history":
+        void this.showHistoryPicker();
+        return;
       case "ctrl_l":
+        // A visual clear starts a fresh history-navigation/search sequence.
+        // Otherwise Up and Ctrl+R can remain stuck at an exhausted index
+        // until the next command submission resets it.
+        this.rHistory.resetIndex();
+        this.historyBrowsing = false;
+        this.historyCollapsed = true;
+        this.lastSearchTerm = "";
+        this.escPendingClear = false;
         if (this.promptVisible) {
           this.clearInputRender();
           this.promptVisible = false;
@@ -1620,7 +1627,114 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.recordSubmissionHistory(blocks);
   }
 
+  private reverseSearch(): void {
+    if (this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+
+    const prefix = this.inputState.currentLine.trim();
+    const continuingSearch =
+      this.historyBrowsing && this.historyCollapsed && Boolean(this.lastSearchTerm);
+    const term = continuingSearch ? this.lastSearchTerm : prefix;
+    if (term) {
+      if (!continuingSearch) {
+        this.rHistory.resetIndex();
+      }
+      const match = this.rHistory.searchBackward(term);
+      if (match !== null) {
+        this.lastSearchTerm = term;
+        this.applyHistorySearchResult(match);
+      }
+    }
+  }
+
+  public async showHistoryPicker(): Promise<void> {
+    if (this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+    const entries = this.rHistory.getEntries();
+    if (entries.length === 0) {
+      void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
+      return;
+    }
+    type HistoryPickItem = vscode.QuickPickItem & {
+      code: string;
+      historyIndex: number;
+    };
+    const picker = vscode.window.createQuickPick<HistoryPickItem>();
+    picker.title = historyPickerText.title;
+    picker.placeholder = historyPickerText.placeholder;
+    const preferenceKey = "historyPicker.collapseDuplicates";
+    const state = this.historyStorage!.state;
+    let collapseDuplicates = state.get<boolean>(preferenceKey, false);
+    const initialToggle = getHistoryPickerTogglePresentation(collapseDuplicates);
+    const collapseButton = {
+      iconPath: new vscode.ThemeIcon(initialToggle.icon),
+      tooltip: initialToggle.tooltip,
+    };
+    picker.buttons = [collapseButton];
+    const setCollapseButton = (): void => {
+      const toggle = getHistoryPickerTogglePresentation(collapseDuplicates);
+      collapseButton.iconPath = new vscode.ThemeIcon(toggle.icon);
+      collapseButton.tooltip = toggle.tooltip;
+      picker.buttons = [collapseButton];
+    };
+
+    const updateItems = (): void => {
+      picker.items = getHistoryPickerEntries(entries, collapseDuplicates)
+        .map(({ code, historyIndex }) => ({ label: code, code, historyIndex }));
+    };
+    updateItems();
+
+    let selectedItem: HistoryPickItem | undefined;
+    try {
+      selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
+        picker.onDidTriggerButton(async (button) => {
+          if (button !== collapseButton) return;
+          collapseDuplicates = !collapseDuplicates;
+          setCollapseButton();
+          updateItems();
+          try {
+            await state.update(preferenceKey, collapseDuplicates);
+          } catch {
+            void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
+          }
+        });
+        picker.onDidAccept(() => {
+          const selected = picker.selectedItems[0] ?? picker.activeItems[0];
+          if (selected) {
+            resolve(selected);
+            picker.hide();
+          }
+        });
+        picker.onDidHide(() => resolve(undefined));
+        picker.show();
+      });
+    } finally {
+      picker.dispose();
+    }
+    if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
+      return;
+    }
+    this.lastSearchTerm = "";
+    this.rHistory.selectEntryAt(selectedItem.historyIndex);
+    this.applyHistorySearchResult(selectedItem.code);
+  }
+
+  private applyHistorySearchResult(entry: string): void {
+    this.ensureReadyPromptVisibleForInput();
+    this.clearInputRender();
+    this.historyBrowsing = true;
+    this.historyCollapsed = true;
+    this.lang.updateInput("");
+    this.inputState.applyHistoryEntry(entry);
+    this.renderInput();
+  }
+
   private navigateHistory(direction: number): void {
+    if (direction < 0 && !this.historyBrowsing) {
+      this.rHistory.resetIndex();
+    }
     const entry = this.rHistory.navigate(direction);
     if (entry === undefined) {
       return;

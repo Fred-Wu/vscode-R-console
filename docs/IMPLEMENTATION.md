@@ -814,6 +814,57 @@ The extension persists console records:
 UI state. If the runtime backend cannot provide reconnect info, the terminal is
 not persisted.
 
+### 4.8 Command History
+
+`src/Terminal/history.ts` manages plaintext command history separately
+from persistent terminal replay. Each console selects its scope at creation or
+reattachment using `r.console.historyScope`: the default `workspace` scope
+shares commands between consoles whose initial working directory belongs to the
+same workspace folder, while `global` (and consoles without a workspace
+folder) uses one shared history. Files are stored under
+`context.globalStorageUri/history/`, named `global.history` or
+`workspace-<SHA256>.history`. The old `~/.r_console_history` is not used.
+
+Each history file is limited to 20,000 commands; compaction retains the newest
+19,000 before subsequent appends. Entries preserve multiline text and timestamps.
+The `# r-console-history-base:` marker tracks removed entries so concurrent
+consoles maintain stable navigation positions even across duplicate commands.
+Normal appends reconcile only bytes added since the last known disk offset
+under the per-file lock; file replacement or compaction triggers a full
+reload. Pending local commands are excluded during reconciliation and
+restored if persistence fails. Partial append failures roll back the attempted
+batch to its pre-append byte boundary while the file lock is held. If rollback
+fails, the next retry first verifies and removes only the exact attempted
+suffix; uncertain changes are left untouched rather than risking duplicate
+records or truncating another writer's data. If compaction completes but a subsequent append fails, the\nin-memory view retains the compacted commands plus still-pending submissions,\nnot commands already discarded from disk. When a non-compacting write fails after reading another console's\nappends, the previous disk cursor and entry-count metadata are restored with\nthe in-memory buffer so the next retry incrementally rereads those entries. Invalid or empty PID lock files\nare reclaimed after the stale-lock timeout; recent locks remain protected.
+Readers and writers coordinate through a per-file lock; queued submissions
+are retried after lock contention or write failures. The terminal disposal
+path calls `HistoryManager.save()` to retry pending submissions synchronously
+through the same lock, avoiding duplicate writes on repeated disposal. If
+storage remains unavailable when VS Code exits, persistence cannot be
+guaranteed. If a write fails after
+synchronizing the disk snapshot, the console restores its in-memory history
+and navigation cursor so unsaved commands remain available in F8 and Up/Down
+until a subsequent retry succeeds. Newly created history directories and
+files request Unix permissions `0700` and `0600`; existing permissions
+remain unchanged, and Windows relies on inherited filesystem permissions.
+
+Up/Down and Ctrl+P/Ctrl+N skip consecutive identical entries without removing
+them. Ctrl+R searches backward for the current line's trimmed text anywhere
+in a saved command; repeated Ctrl+R uses the original term to find older
+matches. F8 (`r-console.searchHistory`, displayed as
+**R Console: Show Command History**) opens **R Console: Command History**,
+a Quick Pick of saved commands in newest-first order. Text input filters this
+snapshot. The `collapse-all` button hides exact duplicate entries in this
+picker only; when enabled, it switches to `expand-all` to show all entries.
+The preference is retained in `context.globalState` across consoles and
+VS Code restarts. Each picker item keeps its original history index, so
+selecting an older duplicate preserves its navigation position, including
+when another console compacts shared history while the picker is open.
+Selecting an entry restores its code without executing it.
+The picker title, placeholder, and button presentation are defined in
+`src/Terminal/history.ts` and checked in unit tests.
+
 ## 5. Files To Read First
 
 1. [`src/extension.ts`](../src/extension.ts)

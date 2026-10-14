@@ -125,6 +125,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("r-console.triggerCompletion", () =>
       getActiveRTerminal()?.triggerCompletion()
     ),
+    vscode.commands.registerCommand("r-console.searchHistory", () =>
+      getActiveRTerminal()?.showHistoryPicker()
+    ),
     vscode.commands.registerCommand("r-console.restoreDefaultName", (target?: unknown) => {
       restoreDefaultConsoleName(target);
     }),
@@ -450,7 +453,10 @@ async function createRTerminal(
     return;
   }
 
-  const rTerminal = new RTerminal(options, context.extensionPath);
+  const rTerminal = new RTerminal(options, context.extensionPath, undefined, undefined, {
+    folder: context.globalStorageUri.fsPath,
+    state: context.globalState,
+  });
   const record = createConsoleRecord(
     rTerminal,
     inSideEditor
@@ -787,7 +793,8 @@ async function attachPersistentSessions(
       options,
       context.extensionPath,
       session.entry.terminal,
-      terminalName
+      terminalName,
+      { folder: context.globalStorageUri.fsPath, state: context.globalState }
     );
     const record = createConsoleRecord(rTerminal, session.entry.location);
     record.terminalName = terminalName;
