@@ -816,7 +816,15 @@ not persisted.
 
 ### 4.8 Command History
 
-`src/Terminal/history.ts` manages plaintext command history separately
+`src/Terminal/history.ts` keeps command history in memory for console input,
+search, and navigation. One shared background worker handles file access,
+workspace-path resolution, parsing, and compaction through `historyStore.ts`.
+Console startup and command submission do not wait for history storage.
+New commands are available locally immediately; saved commands and changes
+from other consoles arrive in the background. Updates carry only changed
+entries when possible, and picker selections keep a stable snapshot.
+
+The worker manages plaintext command history separately
 from persistent terminal replay. Each console selects its scope at creation or
 reattachment using `r.console.historyScope`: the default `workspace` scope
 shares commands between consoles whose initial working directory belongs to the
@@ -839,8 +847,9 @@ suffix; uncertain changes are left untouched rather than risking duplicate
 records or truncating another writer's data. If compaction completes but a subsequent append fails, the\nin-memory view retains the compacted commands plus still-pending submissions,\nnot commands already discarded from disk. When a non-compacting write fails after reading another console's\nappends, the previous disk cursor and entry-count metadata are restored with\nthe in-memory buffer so the next retry incrementally rereads those entries. Invalid or empty PID lock files\nare reclaimed after the stale-lock timeout; recent locks remain protected.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
-path calls `HistoryManager.save()` to retry pending submissions synchronously
-through the same lock, avoiding duplicate writes on repeated disposal. If
+path queues remaining writes and releases the console immediately. The worker
+finishes pending writes after the console closes. Extension shutdown allows
+a bounded asynchronous drain before stopping the worker. If
 storage remains unavailable when VS Code exits, persistence cannot be
 guaranteed. If a write fails after
 synchronizing the disk snapshot, the console restores its in-memory history

@@ -1,0 +1,193 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { Worker } = require("node:worker_threads");
+const { setTimeout: delay } = require("node:timers/promises");
+const { test } = require("node:test");
+const { buildSync } = require("esbuild");
+const loadSource = require("../helpers/load-source.cjs");
+
+async function waitFor(predicate) {
+  const deadline = Date.now() + 5000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, "Timed out waiting for history worker");
+    await delay(5);
+  }
+}
+
+function fixture(t, banner = "") {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-worker-"));
+  const workerPath = path.join(dir, "historyWorker.js");
+  buildSync({
+    entryPoints: [path.resolve(__dirname, "../../src/Terminal/historyWorker.ts")],
+    bundle: true, platform: "node", format: "cjs", outfile: workerPath,
+    banner: { js: banner },
+  });
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  const workers = [];
+  const messages = [];
+  const api = loadSource("src/Terminal/history.ts", {
+    fs: new Proxy({}, { get: () => () => assert.fail("History used filesystem on the console thread") }),
+    worker_threads: {
+      Worker: class extends Worker {
+        constructor(file) {
+          super(file, { workerData: { gate: gate.buffer } });
+          workers.push(this);
+          this.on("message", (message) => messages.push(message));
+        }
+      },
+    },
+  });
+  const release = () => { Atomics.store(gate, 0, 1); Atomics.notify(gate, 0); };
+  t.after(async () => {
+    release();
+    await api.disposeHistoryWorker();
+    await Promise.all(workers.map((worker) => worker.terminate()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return {
+    dir, gate, messages, workers, release, ...api,
+    create: (location = path.join(dir, "history")) => new api.HistoryManager(location, workerPath),
+  };
+}
+
+test("console input and submission continue while history reads, compacts, and writes are stalled", async (t) => {
+  const f = fixture(t, `
+    const testFs = require("node:fs");
+    const testThreads = require("node:worker_threads");
+    const testGate = new Int32Array(testThreads.workerData.gate);
+    for (const operation of ["readSync", "renameSync", "appendFileSync"]) {
+      const original = testFs[operation];
+      let first = true;
+      testFs[operation] = (...args) => {
+        if (first) {
+          first = false;
+          Atomics.store(testGate, 0, 0);
+          testThreads.parentPort.postMessage({ blocked: operation });
+          Atomics.wait(testGate, 0, 0);
+        }
+        return original(...args);
+      };
+    }
+  `);
+  fs.writeFileSync(path.join(f.dir, "history"), Array.from({ length: 20000 }, (_, i) =>
+    "\n# time: original\n+command-" + i + "\n").join(""));
+  const history = f.create();
+  history.load();
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const sent = [];
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptVisible: false, rHistory: history,
+    inputState: new InputState(), lang: { updateInput() {} },
+    ensureReadyPromptVisibleForInput() {}, renderInput() {},
+  });
+  const host = {
+    mode: "ready", promptReady: false, activeSubmission: null, submissionQueue: [],
+    inputState: terminal.inputState, promptKind: "main", clearPromptRenderTimer() {},
+    lang: { refreshCompletionContextDocument() {} },
+    runtimeBackend: { sendSessionCommand(_session, command) { sent.push(command.code); return true; } },
+  };
+  terminal.runtimeHost = () => host;
+  for (const operation of ["readSync", "renameSync", "appendFileSync"]) {
+    await waitFor(() => f.messages.some((message) => message.blocked === operation));
+    host.mode = "ready";
+    host.activeSubmission = null;
+    const code = `print("${operation}")`;
+    terminal.applyKeyAction({ type: "text", text: code });
+    assert.equal(terminal.inputState.text, code);
+    await terminal.handleEnterKey();
+    assert.equal(sent.at(-1), code, "submission must reach the runtime before releasing storage");
+    assert.ok(history.getEntries().includes(code));
+    await delay(10);
+    assert.equal(Atomics.load(f.gate, 0), 0, "storage is still stalled while the event loop runs");
+    f.release();
+  }
+  await waitFor(() => !history.sent && !history.pending.length);
+  assert.equal(f.workers.length, 1);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const stored = new HistoryStore(path.join(f.dir, "history"));
+  stored.load();
+  for (const code of sent) assert.equal(stored.getEntries().filter((entry) => entry === code).length, 1);
+});
+
+test("one history worker shares a scope and keeps other scopes separate", async (t) => {
+  const f = fixture(t);
+  const location = { storageFolder: f.dir, scope: "workspace", workspaceFolder: f.dir };
+  const first = f.create(location);
+  const second = f.create(location);
+  const other = f.create({ storageFolder: f.dir, scope: "global" });
+  first.load(); second.load(); other.load();
+  first.push("first()"); second.push("second()");
+  await waitFor(() => first.getEntries().length === 2 && second.getEntries().length === 2);
+  assert.equal(f.workers.length, 1);
+  assert.deepEqual(other.getEntries(), []);
+  assert.deepEqual(new Set(first.getEntries()), new Set(["first()", "second()"]));
+  assert.deepEqual(first.getRecentSessionEntries(), ["first()"]);
+});
+
+test("background compaction preserves the selected duplicate and picker snapshot", async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.dir, "history"), Array.from({ length: 20000 }, (_, i) =>
+    "\n# time: original\n+" + (i === 5001 || i === 15001 ? "repeat()" : "command-" + i) + "\n").join(""));
+  const browsing = f.create();
+  const writer = f.create();
+  browsing.load(); writer.load();
+  await waitFor(() => browsing.getEntries().length === 20000 && writer.getEntries().length === 20000);
+  const resume = browsing.suspendUpdates();
+  const snapshot = browsing.getEntries();
+  writer.push("latest()");
+  await waitFor(() => writer.stored.length === 19001);
+  browsing.save();
+  await waitFor(() => browsing.deferredUpdate);
+  assert.deepEqual(browsing.getEntries(), snapshot);
+  browsing.selectEntryAt(5001);
+  resume();
+  await waitFor(() => {
+    browsing.save();
+    return browsing.storedStart === 1000;
+  });
+  assert.equal(browsing.navigate(-1), "command-5000");
+  assert.equal(browsing.navigate(1), "repeat()");
+  assert.equal(browsing.navigate(1), "command-5002");
+});
+
+test("closing a console drains queued writes after a contended lock is released", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, String(process.pid));
+  const history = f.create();
+  history.load();
+  history.push("retained-on-close()");
+  history.dispose();
+  await waitFor(() => f.messages.some((message) => message.id !== undefined));
+  fs.unlinkSync(lock);
+  await f.disposeHistoryWorker();
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["retained-on-close()"]);
+});
+
+test("history worker failure leaves local input history usable", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("before()");
+  const resume = history.suspendUpdates();
+  await waitFor(() => history.deferredUpdate);
+  history.push("during-picker()");
+  await f.workers[0].terminate();
+  await waitFor(() => history.disabled);
+  resume();
+  history.push("after()");
+  history.resetIndex();
+  assert.equal(history.navigate(-1), "after()");
+  assert.equal(history.navigate(-1), "during-picker()");
+  assert.equal(history.navigate(-1), "before()");
+});

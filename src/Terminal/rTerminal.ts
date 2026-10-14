@@ -8,7 +8,7 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager, getHistoryFile, getHistoryPickerEntries,
+import { HistoryManager, getHistoryPickerEntries,
   getHistoryPickerTogglePresentation, historyPickerText, type HistoryScope } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
@@ -254,9 +254,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     const configuredScope = vscode.workspace.getConfiguration("r.console")
       .get<string>("historyScope", "workspace");
     const historyScope: HistoryScope = configuredScope === "global" ? "global" : "workspace";
-    this.rHistory = new HistoryManager(
-      getHistoryFile(historyStorage.folder, historyScope, this.options.cwd)
-    );
+    this.rHistory = new HistoryManager({
+      storageFolder: historyStorage.folder,
+      scope: historyScope,
+      workspaceFolder: this.options.cwd,
+    });
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
     this.lang = new RTermLang({
@@ -1662,6 +1664,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       historyIndex: number;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
+    const resumeHistoryUpdates = this.rHistory.suspendUpdates();
     picker.title = historyPickerText.title;
     picker.placeholder = historyPickerText.placeholder;
     const preferenceKey = "historyPicker.collapseDuplicates";
@@ -1710,15 +1713,16 @@ export class RTerminal implements vscode.Pseudoterminal {
         picker.onDidHide(() => resolve(undefined));
         picker.show();
       });
+      if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
+        return;
+      }
+      this.lastSearchTerm = "";
+      this.rHistory.selectEntryAt(selectedItem.historyIndex);
+      this.applyHistorySearchResult(selectedItem.code);
     } finally {
       picker.dispose();
+      resumeHistoryUpdates();
     }
-    if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
-      return;
-    }
-    this.lastSearchTerm = "";
-    this.rHistory.selectEntryAt(selectedItem.historyIndex);
-    this.applyHistorySearchResult(selectedItem.code);
   }
 
   private applyHistorySearchResult(entry: string): void {
@@ -2395,10 +2399,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.syntax.setSource(this.inputState.lines);
   }
 
-  private saveHistory(): void {
-    this.rHistory.save();
-  }
-
   private clearPendingInputFlushTimer(): void {
     if (this.pendingInputFlushTimer) {
       clearTimeout(this.pendingInputFlushTimer);
@@ -2505,7 +2505,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.extensionResourcesDisposePromise) {
       return this.extensionResourcesDisposePromise;
     }
-    this.saveHistory();
+    this.rHistory.dispose();
     disposeRuntimeVscodeRIntegrationUi(this.runtimeHost());
     this.syntax.dispose();
     this.clearPendingInputFlushTimer();

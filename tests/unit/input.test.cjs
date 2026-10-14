@@ -5,10 +5,15 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
+function loadHistoryStore(mocks = {}) {
+  const { HistoryStore, ...storage } = loadSource("src/Terminal/historyStore.ts", mocks);
+  return { ...loadSource("src/Terminal/history.ts"), ...storage, HistoryManager: HistoryStore };
+}
+
 const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
 const { InputState } = loadSource("src/Terminal/inputState.ts");
 const { HistoryManager, getHistoryPickerTogglePresentation, historyPickerText } =
-  loadSource("src/Terminal/history.ts");
+  loadHistoryStore();
 
 test("keyboard decoding buffers partial CSI sequences and preserves pasted newlines", () => {
   const keys = new KeyProcessor();
@@ -53,7 +58,7 @@ test("history persists multiline entries and searches without losing their conte
 test("workspace scope shares within a folder and isolates different folders", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-scopes-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const { getHistoryFile, getHistoryPickerEntries } = loadSource("src/Terminal/history.ts");
+  const { getHistoryFile, getHistoryPickerEntries } = loadHistoryStore();
   const a = getHistoryFile(root, "workspace", path.join(root, "a"));
   const b = getHistoryFile(root, "workspace", path.join(root, "b"));
   assert.notEqual(a, b);
@@ -82,7 +87,7 @@ test("F8 selection of an older repeated command keeps its original navigation po
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-index-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const history = new HistoryManager(path.join(root, "history"));
-  const { getHistoryPickerEntries } = loadSource("src/Terminal/history.ts");
+  const { getHistoryPickerEntries } = loadHistoryStore();
   history.load();
   history.setSearchNoDuplicates(true);
   for (const code of ["a()", "repeat()", "b()", "repeat()", "c()"]) history.push(code);
@@ -118,7 +123,7 @@ test("F8 selection keeps an older duplicate through another console's compaction
   ).join(""));
   const browsing = new HistoryManager(file);
   const writer = new HistoryManager(file);
-  const { getHistoryPickerEntries } = loadSource("src/Terminal/history.ts");
+  const { getHistoryPickerEntries } = loadHistoryStore();
   browsing.load();
   writer.load();
 
@@ -220,9 +225,7 @@ test("failed append after compaction does not restore pruned in-memory history",
       return fs.appendFileSync(...args);
     },
   };
-  const { HistoryManager: FailingHistory } = loadSource(
-    "src/Terminal/history.ts", { fs: simulatedFs }
-  );
+  const { HistoryManager: FailingHistory } = loadHistoryStore({ fs: simulatedFs });
   const history = new FailingHistory(file);
   history.load();
   history.push("queued()");
@@ -310,12 +313,18 @@ test("separate node processes append to the same history without lost commands",
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const file = path.join(root, "history");
   const loader = path.resolve(__dirname, "../helpers/load-source.cjs");
-  const source = path.resolve(__dirname, "../../src/Terminal/history.ts");
+  const source = path.resolve(__dirname, "../../src/Terminal/historyStore.ts");
   const code = `
-    const HistoryManager = require(process.argv[1])(process.argv[2]).HistoryManager;
+    const HistoryManager = require(process.argv[1])(process.argv[2]).HistoryStore;
     const history = new HistoryManager(process.argv[3]);
     history.load();
     for (let i = 0; i < 30; i++) history.push(process.argv[4] + "-" + i);
+    // Keep the writer alive while contended appends retry asynchronously.
+    const deadline = Date.now() + 5000;
+    const waiting = setInterval(() => {
+      if (!history.pendingEntries.length) clearInterval(waiting);
+      else if (Date.now() >= deadline) throw new Error("History writes did not finish");
+    }, 10);
   `;
   await Promise.all(["A", "B", "C"].map((prefix) => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["-e", code, loader, source, file, prefix], {
@@ -401,9 +410,7 @@ test("successful history appends reconcile incrementally without rereading saved
       return count;
     },
   };
-  const { HistoryManager: CountingHistory } = loadSource(
-    "src/Terminal/history.ts", { fs: countingFs }
-  );
+  const { HistoryManager: CountingHistory } = loadHistoryStore({ fs: countingFs });
   const history = new CountingHistory(file);
   history.load();
   bytesRead = 0;
@@ -442,9 +449,7 @@ test("failed history appends keep queued commands visible until retry", (t) => {
       return fs.appendFileSync(...args);
     },
   };
-  const { HistoryManager: FailingHistory, getHistoryPickerEntries } = loadSource(
-    "src/Terminal/history.ts", { fs: failingFs }
-  );
+  const { HistoryManager: FailingHistory, getHistoryPickerEntries } = loadHistoryStore({ fs: failingFs });
   const history = new FailingHistory(file);
   history.load();
   history.setSearchNoDuplicates(true);
@@ -508,9 +513,7 @@ test("failed retry after another console appends preserves external commands", (
       return fs.appendFileSync(...args);
     },
   };
-  const { HistoryManager: FailingHistory } = loadSource(
-    "src/Terminal/history.ts", { fs: simulatedFs }
-  );
+  const { HistoryManager: FailingHistory } = loadHistoryStore({ fs: simulatedFs });
   const writer = new HistoryManager(file);
   writer.load();
   writer.push("a()");
@@ -562,9 +565,7 @@ test("partial multi-command append rolls back and retries without duplicates", (
       return fs.appendFileSync(...args);
     },
   };
-  const { HistoryManager: PartialHistory } = loadSource(
-    "src/Terminal/history.ts", { fs: simulatedFs }
-  );
+  const { HistoryManager: PartialHistory } = loadHistoryStore({ fs: simulatedFs });
   const history = new PartialHistory(file);
   history.load();
   history.push("first()");
@@ -603,9 +604,7 @@ test("failed partial-append rollback is recovered before retry", (t) => {
       return fs.truncateSync(...args);
     },
   };
-  const { HistoryManager: PartialHistory } = loadSource(
-    "src/Terminal/history.ts", { fs: simulatedFs }
-  );
+  const { HistoryManager: PartialHistory } = loadHistoryStore({ fs: simulatedFs });
   const history = new PartialHistory(file);
   history.load();
   history.push("queued()");
@@ -638,9 +637,7 @@ test("save on disposal flushes pending history after a write failure, exactly on
       return fs.appendFileSync(...args);
     },
   };
-  const { HistoryManager: SimulatedHistory } = loadSource(
-    "src/Terminal/history.ts", { fs: simulatedFs }
-  );
+  const { HistoryManager: SimulatedHistory } = loadHistoryStore({ fs: simulatedFs });
   const history = new SimulatedHistory(file);
   history.load();
 
