@@ -139,13 +139,14 @@ test("F8 retains stable selection positions across local history evictions", (t)
   // Simulate a full foreground cache to test cumulative front evictions.
   history.historyBuffer = Array.from({ length: 20000 }, (_, i) => `command-${i}`);
   history.historyIndex = history.historyBuffer.length;
+  history.historyIds = Array.from({ length: 20000 }, (_, i) => `occurrence-${i}`);
   history.historyBuffer[5999] = "OLDER_TAG";
   history.historyBuffer[0] = "EVICTED_TAG";
 
   const [latest] = history.getPickerEntries("command-19999", false);
   const [older] = history.getPickerEntries("OLDER_TAG", false);
   const [evicted] = history.getPickerEntries("EVICTED_TAG", false);
-  assert.deepEqual(older, { code: "OLDER_TAG", historyIndex: 5999 });
+  assert.deepEqual(older, { code: "OLDER_TAG", historyIndex: 5999, id: "occurrence-5999" });
 
   history.push("new-a");
   history.push("new-b");
@@ -159,7 +160,9 @@ test("F8 retains stable selection positions across local history evictions", (t)
 
   // Newly generated results use the same stable coordinate system.
   const [updated] = history.getPickerEntries("new-b", false);
-  assert.deepEqual(updated, { code: "new-b", historyIndex: 20001 });
+  assert.equal(updated.code, "new-b");
+  assert.equal(updated.historyIndex, 20001);
+  assert.ok(updated.id);
   history.push("new-c");
   assert.equal(history.selectPickerEntry(updated), true);
   assert.equal(history.navigate(-1), "new-a");
@@ -167,6 +170,7 @@ test("F8 retains stable selection positions across local history evictions", (t)
   // A duplicate at an older occurrence retains its exact position.
   history.historyBuffer = Array.from({ length: 20000 }, (_, i) =>
     i === 2 || i === 15000 ? "repeat()" : `command-${i}`);
+  history.historyIds = Array.from({ length: 20000 }, (_, i) => `duplicate-occurrence-${i}`);
   history.pickerFrontEvictions = 0;
   const duplicates = history.getPickerEntries("repeat()", false);
   assert.deepEqual(duplicates.map((item) => item.historyIndex), [15000, 2]);
