@@ -300,8 +300,10 @@ export class HistoryManager extends HistoryBuffer {
   }
 
   override resetIndex(): void {
-    this.browsingOlder = false;
-    this.reconcileHistory();
+    if (this.browsingOlder) {
+      this.browsingOlder = false;
+      this.reconcileHistory();
+    }
     super.resetIndex();
   }
 

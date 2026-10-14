@@ -175,7 +175,7 @@ test("F8 retains stable selection positions across local history evictions", (t)
   const duplicates = history.getPickerEntries("repeat()", false);
   assert.deepEqual(duplicates.map((item) => item.historyIndex), [15000, 2]);
   history.push("new-d");
-  assert.equal(await history.selectPickerEntryOnDemand(duplicates[1]), true);
+  assert.equal(history.selectPickerEntry(duplicates[1]), true);
   assert.equal(history.navigate(0), "repeat()");
 });
 
@@ -222,7 +222,7 @@ test("legacy duplicate records retain distinct IDs after compaction and reload",
   assert.equal(duplicates.length, 2);
   assert.ok(duplicates[0].id);
   assert.notEqual(duplicates[0].id, duplicates[1].id);
-  assert.equal(history.selectPickerEntry(duplicates[1]), true);
+  assert.equal(await history.selectPickerEntryOnDemand(duplicates[1]), true);
   assert.equal(history.navigate(0), "repeat()");
 });
 
