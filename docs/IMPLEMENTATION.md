@@ -863,9 +863,11 @@ writes correctly. Invalid or empty lock owners are reclaimed after the
 stale-lock timeout, while recent locks stay protected. A replacement worker
 can also reclaim a lock identified as belonging to a terminated worker.
 F8 keeps the current in-memory history positions stable while the picker is
-open by deferring foreground updates. All incremental updates and persistence
-acknowledgements are replayed in order after it closes. Background worker
-file access is never suspended.
+open by deferring visible foreground cache updates. Worker snapshots and
+persistence acknowledgements are processed immediately, so additional
+submissions can be sent to disk even while the picker remains open. The
+visible cache is reconciled when the picker closes, preserving navigation
+positions. Background worker file access is never suspended.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
 path queues remaining writes and releases the console immediately. The worker

@@ -171,7 +171,13 @@ export class HistoryManager extends HistoryBuffer {
   private closing = false;
   private disabled = false;
   private suspended = 0;
-  private deferredUpdates: HistoryUpdate[] = [];
+  private deferredHistory: {
+    storedStart: number;
+    storedLength: number;
+    unmerged: number;
+    pushed: number;
+    updated: boolean;
+  } | undefined;
   // Only local pushes can evict cached entries while F8 defers worker updates.
   // Monotonic positions keep each displayed occurrence stable without a snapshot.
   private pickerFrontEvictions = 0;
@@ -210,6 +216,7 @@ export class HistoryManager extends HistoryBuffer {
   override push(entry: string): void {
     if (!entry.trim() || this.closing) return;
     if (this.historyBuffer.length >= this.maxHistorySize) this.pickerFrontEvictions++;
+    if (this.deferredHistory) this.deferredHistory.pushed++;
     super.push(entry);
     if (!this.disabled) {
       const write = { id: randomUUID(), code: entry };
@@ -243,52 +250,35 @@ export class HistoryManager extends HistoryBuffer {
     });
   }
 
-  // Keep the picker's occurrence indices stable until its selection is applied.
+  // Freeze only the cache and navigation positions used by F8. Worker
+  // snapshots, write acknowledgements, and new submissions keep flowing.
   suspendUpdates(): () => void {
+    if (!this.suspended) {
+      this.deferredHistory = {
+        storedStart: this.storedStart,
+        storedLength: this.stored.length,
+        unmerged: (this.sent?.length ?? 0) + this.pending.length,
+        pushed: 0,
+        updated: false,
+      };
+    }
     this.suspended++;
     return () => {
       this.suspended--;
-      if (!this.suspended) this.applyDeferredUpdates();
+      if (!this.suspended) this.applyDeferredHistory();
     };
   }
 
-  private applyDeferredUpdates(): void {
-    // Worker deltas are relative to the last *sent* update. Skipping one
-    // loses entries and acknowledgements even if later deltas are applied.
-    const updates = this.deferredUpdates;
-    this.deferredUpdates = [];
-    for (const update of updates) this.receive(update);
+  private applyStoredUpdate(update: HistoryUpdate): void {
+    this.stored = update.reset ? update.entries
+      : [...this.stored.slice(update.remove), ...update.entries];
+    this.storedStart = update.start;
   }
 
-  receive(update: HistoryUpdate): void {
-    if (this.disabled) return;
-    if (this.suspended && !this.closing) {
-      this.deferredUpdates.push(update);
-      return;
-    }
+  private acknowledge(update: HistoryUpdate): void {
     if (update.persisted?.length) {
       const saved = new Set(update.persisted);
       this.unconfirmed = this.unconfirmed.filter((entry) => !saved.has(entry.id));
-    }
-    const sentLength = this.sent?.length ?? 0;
-    if (update.reset || update.remove || update.entries.length || sentLength) {
-      const oldLength = this.historyBuffer.length;
-      const oldIndex = this.historyIndex;
-      const oldTrim = Math.max(0, this.stored.length + sentLength + this.pending.length - oldLength);
-      const originalIndex = oldIndex + oldTrim;
-      let nextIndex = originalIndex < this.stored.length
-        ? this.storedStart + originalIndex - update.start
-        : originalIndex - this.stored.length - sentLength;
-      const wasStored = originalIndex < this.stored.length;
-      this.stored = update.reset ? update.entries
-        : [...this.stored.slice(update.remove), ...update.entries];
-      this.storedStart = update.start;
-      if (!wasStored) nextIndex += this.stored.length;
-      const combined = [...this.stored, ...this.pending.map((entry) => entry.code)];
-      const trim = Math.max(0, combined.length - this.maxHistorySize);
-      this.historyBuffer = combined.slice(trim);
-      this.historyIndex = oldIndex === oldLength ? this.historyBuffer.length
-        : Math.max(0, Math.min(this.historyBuffer.length, nextIndex - trim));
     }
     this.sent = undefined;
     if (this.closing) {
@@ -299,10 +289,70 @@ export class HistoryManager extends HistoryBuffer {
     }
   }
 
+  private applyDeferredHistory(): void {
+    const base = this.deferredHistory;
+    this.deferredHistory = undefined;
+    if (!base?.updated) return;
+
+    const oldLength = this.historyBuffer.length;
+    const oldIndex = this.historyIndex;
+    const oldTrim = Math.max(0, base.storedLength + base.unmerged + base.pushed - oldLength);
+    const originalIndex = oldIndex + oldTrim;
+    const stillUnmerged = (this.sent?.length ?? 0) + this.pending.length;
+    const processed = base.unmerged + base.pushed - stillUnmerged;
+    const nextIndex = originalIndex < base.storedLength
+      ? base.storedStart + originalIndex - this.storedStart
+      : this.stored.length + originalIndex - base.storedLength - processed;
+
+    // A sent request has not been reflected in the last received worker
+    // snapshot yet. Keep it visible along with new unsent submissions.
+    const combined = [...this.stored,
+      ...(this.sent ?? []).map((entry) => entry.code),
+      ...this.pending.map((entry) => entry.code)];
+    const trim = Math.max(0, combined.length - this.maxHistorySize);
+    this.historyBuffer = combined.slice(trim);
+    this.historyIndex = oldIndex === oldLength ? this.historyBuffer.length
+      : Math.max(0, Math.min(this.historyBuffer.length, nextIndex - trim));
+  }
+
+  receive(update: HistoryUpdate): void {
+    if (this.disabled) return;
+    if (this.suspended && !this.closing) {
+      // Update worker state and release the next queued write immediately,
+      // without changing the cached entries that F8 is displaying.
+      this.applyStoredUpdate(update);
+      if (this.deferredHistory) this.deferredHistory.updated = true;
+      this.acknowledge(update);
+      return;
+    }
+
+    const oldLength = this.historyBuffer.length;
+    const oldIndex = this.historyIndex;
+    const sentLength = this.sent?.length ?? 0;
+    if (update.reset || update.remove || update.entries.length || sentLength) {
+      const oldTrim = Math.max(0, this.stored.length + sentLength + this.pending.length - oldLength);
+      const originalIndex = oldIndex + oldTrim;
+      let nextIndex = originalIndex < this.stored.length
+        ? this.storedStart + originalIndex - update.start
+        : originalIndex - this.stored.length - sentLength;
+      const wasStored = originalIndex < this.stored.length;
+      this.applyStoredUpdate(update);
+      if (!wasStored) nextIndex += this.stored.length;
+      const combined = [...this.stored, ...this.pending.map((entry) => entry.code)];
+      const trim = Math.max(0, combined.length - this.maxHistorySize);
+      this.historyBuffer = combined.slice(trim);
+      this.historyIndex = oldIndex === oldLength ? this.historyBuffer.length
+        : Math.max(0, Math.min(this.historyBuffer.length, nextIndex - trim));
+    } else {
+      this.applyStoredUpdate(update);
+    }
+    this.acknowledge(update);
+  }
+
   dispose(): void {
     if (this.closing) return;
     this.closing = true;
-    this.applyDeferredUpdates();
+    this.applyDeferredHistory();
     this.save();
   }
 
@@ -322,6 +372,6 @@ export class HistoryManager extends HistoryBuffer {
     this.scheduled = undefined;
     this.sent = undefined;
     this.pending = [];
-    this.deferredUpdates = [];
+    this.deferredHistory = undefined;
   }
 }

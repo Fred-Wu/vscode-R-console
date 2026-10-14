@@ -188,7 +188,7 @@ test("background compaction preserves the selected duplicate while F8 defers upd
   writer.push("latest()");
   await waitFor(() => writer.stored.length === 19001);
   browsing.save();
-  await waitFor(() => browsing.deferredUpdates.length > 0);
+  await waitFor(() => browsing.deferredHistory?.updated);
   assert.deepEqual(browsing.getEntries(), snapshot);
   browsing.selectEntryAt(5001);
   resume();
@@ -217,11 +217,32 @@ test("F8 keeps the foreground cache stable and replays deferred deltas and ackno
   history.receive({ id: history.id, start: 0, reset: false, remove: 0,
     entries: ["second()"], persisted: [pending.id] });
   assert.deepEqual(history.getEntries(), ["original()", "local()"]);
-  assert.equal(history.unconfirmed.length, 1);
+  assert.equal(history.unconfirmed.length, 0, "acknowledgements are processed during F8");
   resume();
   assert.deepEqual(history.getEntries(), ["original()", "first()", "second()", "local()"]);
   assert.deepEqual(history.unconfirmed, []);
-  assert.equal(history.deferredUpdates.length, 0);
+  assert.equal(history.deferredHistory, undefined);
+});
+
+test("F8 does not block sequential history writes while the picker is open", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  await waitFor(() => history.sent === undefined && history.stored.length === 0);
+  const resume = history.suspendUpdates();
+  history.push("first()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  assert.deepEqual(history.getEntries(), ["first()"]);
+  history.push("second()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  // Both requests have reached storage even though F8 still defers UI updates.
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const persisted = new HistoryStore(path.join(f.dir, "history"));
+  persisted.load();
+  assert.deepEqual(persisted.getEntries(), ["first()", "second()"]);
+  assert.deepEqual(history.getEntries(), ["first()", "second()"]);
+  resume();
+  assert.deepEqual(history.getEntries(), ["first()", "second()"]);
 });
 
 test("closing a console drains queued writes after a contended lock is released", async (t) => {
