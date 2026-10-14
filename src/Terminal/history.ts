@@ -241,17 +241,19 @@ export class HistoryManager {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         try {
-          const owner = Number(fs.readFileSync(lockPath, "utf8").trim());
+          const ownerText = fs.readFileSync(lockPath, "utf8").trim();
+          const owner = /^\d+$/.test(ownerText) ? Number(ownerText) : NaN;
+          const validOwner = Number.isSafeInteger(owner) && owner > 0;
           const age = Date.now() - fs.statSync(lockPath).mtimeMs;
           let dead = false;
-          if (Number.isSafeInteger(owner) && owner > 0 && owner !== process.pid) {
+          if (validOwner && owner !== process.pid) {
             try {
               process.kill(owner, 0);
             } catch (processError) {
               dead = (processError as NodeJS.ErrnoException).code === "ESRCH";
             }
           }
-          if (dead || (age > 120000 && !Number.isSafeInteger(owner))) {
+          if (dead || (age > 120000 && !validOwner)) {
             fs.rmSync(lockPath, { force: true });
           }
         } catch {
@@ -363,6 +365,8 @@ export class HistoryManager {
     // Preserve the visible entries and cursor if the append subsequently fails.
     const visibleHistory = this.historyBuffer;
     const visibleIndex = this.historyIndex;
+    let compactedHistory: string[] | undefined;
+    let compactedIndex = 0;
     try {
       this.withFileLock(() => {
         // Resolve an earlier failed rollback before reading or appending anything.
@@ -390,6 +394,11 @@ export class HistoryManager {
             this.compactToSize, this.maxHistorySize - queued.length
           ));
           this.compactHistory(keep);
+          // Compaction commits a new disk snapshot before the append. If the
+          // append fails, restore pending commands onto this snapshot rather
+          // than reviving the commands already pruned from disk.
+          compactedHistory = this.historyBuffer;
+          compactedIndex = this.historyIndex;
         }
         const batch = queued.map((entry) => this.serializeEntry(entry)).join("");
         // Remember the exact pre-append boundary *after* any compaction.
@@ -445,8 +454,17 @@ export class HistoryManager {
       }
     } catch {
       if (this.pendingEntries.length) {
-        this.historyBuffer = visibleHistory;
-        this.historyIndex = visibleIndex;
+        if (compactedHistory) {
+          const combined = [...compactedHistory, ...this.pendingEntries];
+          const removed = Math.max(0, combined.length - this.maxHistorySize);
+          this.historyBuffer = combined.slice(removed);
+          this.historyIndex = compactedIndex === compactedHistory.length
+            ? this.historyBuffer.length
+            : Math.max(0, compactedIndex - removed);
+        } else {
+          this.historyBuffer = visibleHistory;
+          this.historyIndex = visibleIndex;
+        }
       }
       // Keep submissions locally and retry without blocking the R session.
       // This also covers contention from a different VS Code window.

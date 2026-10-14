@@ -202,6 +202,70 @@ test("history caps existing files and appends at 20000 commands", (t) => {
   assert.equal(restored.getEntries().includes("command-5"), false);
 });
 
+test("failed append after compaction does not restore pruned in-memory history", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-compact-failed-append-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  fs.writeFileSync(file, Array.from({ length: 20000 }, (_, i) =>
+    "\n# time: 2026-10-14 00:00 UTC\n+command-" + i + "\n"
+  ).join(""));
+  let fail = true;
+  const simulatedFs = {
+    ...fs,
+    appendFileSync(...args) {
+      if (args[0] === file && fail) {
+        fail = false;
+        throw new Error("simulated failure after compaction");
+      }
+      return fs.appendFileSync(...args);
+    },
+  };
+  const { HistoryManager: FailingHistory } = loadSource(
+    "src/Terminal/history.ts", { fs: simulatedFs }
+  );
+  const history = new FailingHistory(file);
+  history.load();
+  history.push("queued()");
+  // The compacted disk contains 19,000 commands; pending history remains visible.
+  assert.equal(history.getEntries().length, 19001);
+  assert.equal(history.getEntries()[0], "command-1000");
+  assert.equal(history.getEntries().at(-1), "queued()");
+  const diskOnly = new HistoryManager(file);
+  diskOnly.load();
+  assert.equal(diskOnly.getEntries().length, 19001);
+  assert.equal(diskOnly.getEntries()[0], "command-1000");
+  assert.equal(diskOnly.getEntries().at(-1), "queued()");
+  assert.equal(history.getEntries().includes("command-0"), false);
+  history.save();
+  assert.deepEqual(history.getEntries(), diskOnly.getEntries());
+});
+
+test("stale invalid PID locks are reclaimed but recent locks are respected", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-invalid-lock-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const owner of ["", "0", "-1", "not-a-pid", "1.5"]) {
+    const file = path.join(root, "history-" + owner.replace(/[^a-z0-9]/gi, "x"));
+    const lock = file + ".lock";
+    fs.writeFileSync(lock, owner);
+    const stale = new Date(Date.now() - 150000);
+    fs.utimesSync(lock, stale, stale);
+    const history = new HistoryManager(file);
+    history.load();
+    history.push("record()");
+    assert.deepEqual(history.getEntries(), ["record()"]);
+    assert.equal(fs.existsSync(lock), false);
+  }
+  const file = path.join(root, "recent");
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, "");
+  const history = new HistoryManager(file);
+  history.load();
+  assert.equal(fs.existsSync(lock), true);
+  fs.unlinkSync(lock);
+  history.push("after()");
+  assert.deepEqual(history.getEntries(), ["after()"]);
+});
+
 test("another console's compaction preserves an older history cursor", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-cursor-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
