@@ -786,12 +786,12 @@ test("worker restart replays an in-flight deletion and settles its request", asy
 
 test("irrecoverable deletion rewrite error rejects without corrupting saved history", async (t) => {
   const f = fixture(t,
-    "const fs = require('node:fs');" +
-    "const rename = fs.renameSync;" +
+    "const testFs = require('node:fs');" +
+    "const testRename = testFs.renameSync;" +
     "let fail = true;" +
-    "fs.renameSync = (...args) => {" +
+    "testFs.renameSync = (...args) => {" +
     " if (fail) { fail = false; throw new Error('simulated inaccessible destination'); }" +
-    " return rename(...args); };"
+    " return testRename(...args); };"
   );
   const history = f.create();
   history.load();

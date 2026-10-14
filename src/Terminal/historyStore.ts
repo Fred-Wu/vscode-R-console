@@ -611,7 +611,7 @@ export class HistoryStore extends HistoryBuffer {
       const oldRecords = existing.map((entry, index) =>
         preserve ? raw.slice(boundaries[index], index + 1 < boundaries.length ? boundaries[index + 1] : end) : "");
       const removed = existing.filter((entry, index) => {
-        const timestamp = /submitted-at: ([0-9.]+)/.exec(oldRecords[index]);
+        const timestamp = /^# time:[^\n]*submitted-at: ([0-9.]+)/m.exec(oldRecords[index]);
         return matches(entry, timestamp ? Number(timestamp[1]) : 0);
       }).map((entry) => entry.id);
       const removedIds = new Set(removed);
