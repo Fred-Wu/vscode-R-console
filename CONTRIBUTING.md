@@ -22,7 +22,7 @@ npm run build:sidecar
 npm run stage:sidecar
 ```
 
-`compile` type-checks the extension and bundles the extension host entrypoint into `dist/extension.js`.
+`compile` type-checks the extension and bundles the extension host and background history worker into `dist/extension.js` and `dist/historyWorker.js`.
 
 `stage:sidecar` copies the current platform's `R_CONSOLE_HOST` into `bundled/bin/`.
 
@@ -34,7 +34,7 @@ npm run stage:sidecar
 npm run package
 ```
 
-This produces a target-specific VSIX for the current host platform, for example `vsc-r-console-0.3.0-win32-x64.vsix`.
+This produces a target-specific VSIX for the current host platform, for example `vsc-r-console-<version>-win32-x64.vsix`.
 
 `vscode:prepublish` prepares the production bundle and stages the current platform binary into `bundled/bin/`.
 
