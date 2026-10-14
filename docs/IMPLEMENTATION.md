@@ -846,11 +846,23 @@ consoles maintain stable navigation positions even across duplicate commands.
 Normal appends reconcile only bytes added since the last known disk offset
 under the per-file lock; file replacement or compaction triggers a full
 reload. Pending local commands are excluded during reconciliation and
-restored if persistence fails. Partial append failures roll back the attempted
-batch to its pre-append byte boundary while the file lock is held. If rollback
-fails, the next retry first verifies and removes only the exact attempted
-suffix; uncertain changes are left untouched rather than risking duplicate
-records or truncating another writer's data. If compaction completes but a subsequent append fails, the\nin-memory view retains the compacted commands plus still-pending submissions,\nnot commands already discarded from disk. When a non-compacting write fails after reading another console's\nappends, the previous disk cursor and entry-count metadata are restored with\nthe in-memory buffer so the next retry incrementally rereads those entries. Invalid or empty PID lock files\nare reclaimed after the stale-lock timeout; recent locks remain protected.
+restored if persistence fails. Each new record carries a stable command ID
+and completion marker; the worker acknowledges only saved IDs. On a failed
+partial append, rollback removes bytes written by that attempt when safe.
+If rollback fails, recovery discards incomplete tagged records using an
+atomic rewrite under the per-file lock while preserving other consoles'
+completed records. Unacknowledged entries are replayed using their stable
+IDs so repeated identical commands remain distinct without duplicating
+retries. If compaction succeeds but a subsequent append fails, the in-memory
+view retains the compacted entries alongside pending commands instead of
+reviving entries already pruned from disk. A failed non-compacting append
+restores its previous disk cursor and count so retries reread concurrent
+writes correctly. Invalid or empty lock owners are reclaimed after the
+stale-lock timeout, while recent locks stay protected. A replacement worker
+can also reclaim a lock identified as belonging to a terminated worker.
+F8 freezes the picker snapshot and defers foreground history updates; all
+incremental updates and persistence acknowledgements are replayed in order
+after the picker closes. Background worker file access is never suspended.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
 path queues remaining writes and releases the console immediately. The worker

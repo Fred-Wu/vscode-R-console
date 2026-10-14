@@ -143,7 +143,7 @@ test("background compaction preserves the selected duplicate and picker snapshot
   writer.push("latest()");
   await waitFor(() => writer.stored.length === 19001);
   browsing.save();
-  await waitFor(() => browsing.deferredUpdate);
+  await waitFor(() => browsing.deferredUpdates.length > 0);
   assert.deepEqual(browsing.getEntries(), snapshot);
   browsing.selectEntryAt(5001);
   resume();
@@ -154,6 +154,29 @@ test("background compaction preserves the selected duplicate and picker snapshot
   assert.equal(browsing.navigate(-1), "command-5000");
   assert.equal(browsing.navigate(1), "repeat()");
   assert.equal(browsing.navigate(1), "command-5002");
+});
+
+test("F8 keeps a fixed snapshot and replays every deferred worker delta and acknowledgement", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  const initial = { id: history.id, start: 0, reset: true, remove: 0, entries: ["original()"] };
+  history.receive(initial);
+  const resume = history.suspendUpdates();
+  history.selectEntryAt(0);
+  history.push("local()");
+  const [pending] = history.pending;
+  // Simulate successive worker deltas and durable acknowledgements received
+  // while the picker holds its immutable snapshot.
+  history.receive({ id: history.id, start: 0, reset: false, remove: 0,
+    entries: ["first()"], persisted: [] });
+  history.receive({ id: history.id, start: 0, reset: false, remove: 0,
+    entries: ["second()"], persisted: [pending.id] });
+  assert.deepEqual(history.getEntries(), ["original()", "local()"]);
+  assert.equal(history.unconfirmed.length, 1);
+  resume();
+  assert.deepEqual(history.getEntries(), ["original()", "first()", "second()", "local()"]);
+  assert.deepEqual(history.unconfirmed, []);
+  assert.equal(history.deferredUpdates.length, 0);
 });
 
 test("closing a console drains queued writes after a contended lock is released", async (t) => {

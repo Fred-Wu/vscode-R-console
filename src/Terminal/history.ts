@@ -147,7 +147,7 @@ export class HistoryManager extends HistoryBuffer {
   private closing = false;
   private disabled = false;
   private suspended = 0;
-  private deferredUpdate: HistoryUpdate | undefined;
+  private deferredUpdates: HistoryUpdate[] = [];
 
   constructor(
     private readonly location: HistoryLocation,
@@ -201,18 +201,22 @@ export class HistoryManager extends HistoryBuffer {
     this.suspended++;
     return () => {
       this.suspended--;
-      if (!this.suspended && this.deferredUpdate) {
-        const update = this.deferredUpdate;
-        this.deferredUpdate = undefined;
-        this.receive(update);
-      }
+      if (!this.suspended) this.applyDeferredUpdates();
     };
+  }
+
+  private applyDeferredUpdates(): void {
+    // Worker deltas are relative to the last *sent* update. Skipping one
+    // loses entries and acknowledgements even if later deltas are applied.
+    const updates = this.deferredUpdates;
+    this.deferredUpdates = [];
+    for (const update of updates) this.receive(update);
   }
 
   receive(update: HistoryUpdate): void {
     if (this.disabled) return;
     if (this.suspended && !this.closing) {
-      this.deferredUpdate = update;
+      this.deferredUpdates.push(update);
       return;
     }
     if (update.persisted?.length) {
@@ -251,11 +255,7 @@ export class HistoryManager extends HistoryBuffer {
   dispose(): void {
     if (this.closing) return;
     this.closing = true;
-    if (this.deferredUpdate) {
-      const update = this.deferredUpdate;
-      this.deferredUpdate = undefined;
-      this.receive(update);
-    }
+    this.applyDeferredUpdates();
     this.save();
   }
 
@@ -275,6 +275,6 @@ export class HistoryManager extends HistoryBuffer {
     this.scheduled = undefined;
     this.sent = undefined;
     this.pending = [];
-    this.deferredUpdate = undefined;
+    this.deferredUpdates = [];
   }
 }
