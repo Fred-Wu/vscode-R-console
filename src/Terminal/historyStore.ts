@@ -544,45 +544,44 @@ export class HistoryStore extends HistoryBuffer {
     const codes = new Set(selection.codes ?? []);
     const matches = (entry: HistoryWrite): boolean =>
       !!selection.all || ids.has(entry.id) || codes.has(entry.code);
-    const removed = this.pendingEntries.filter(matches).map((entry) => entry.id);
-    this.pendingEntries = this.pendingEntries.filter((entry) => !matches(entry));
-    if (this.pendingEntries.length) {
-      this.flushPending();
-      if (this.pendingEntries.length) {
-        throw new Error("History writes are pending; deletion will be retried.");
-      }
-    }
 
-    this.withFileLock(() => {
+    // Commit queued commands first. A contended append must leave them
+    // untouched rather than removing them before a rewrite can acquire its lock.
+    if (this.pendingEntries.length) this.flushPending();
+    if (this.pendingEntries.length) {
+      throw new Error("History writes are pending; deletion was not applied.");
+    }
+    return this.withFileLock(() => {
       if (this.needsRecovery) this.recoverInterruptedRecords();
       this.readHistoryFromDisk(true);
       const existing = this.historyIds.map((id, index) => ({
         id, code: this.historyBuffer[index],
       }));
-      const retained = existing.filter((entry) => !matches(entry));
-      removed.push(...existing.filter(matches).map((entry) => entry.id));
-      if (retained.length === existing.length) return;
-
+      const removed = existing.filter(matches).map((entry) => entry.id);
+      if (!removed.length) return removed;
       const raw = fs.readFileSync(this.historyFile, "utf8");
       const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
         .map((match) => match.index!);
       const end = raw.lastIndexOf("\n") + 1;
       const preserve = boundaries.length === existing.length;
-      const records = retained.map((entry) => {
-        const index = existing.findIndex((old) => old.id === entry.id);
-        if (!preserve) return this.serializeEntry(entry);
+      const records: string[] = [];
+      for (let index = 0; index < existing.length; index++) {
+        const entry = existing[index];
+        if (matches(entry)) continue;
+        if (!preserve) {
+          records.push(this.serializeEntry(entry));
+          continue;
+        }
         let record = raw.slice(boundaries[index],
           index + 1 < boundaries.length ? boundaries[index + 1] : end);
-        // Legacy records had no ID and no completion marker. Both are needed
-        // so their identities and interruption recovery remain correct.
-        record = record.replace(/(# time:[^\n]*)(\r?\n)/, (line, header: string, newline: string) =>
+        record = record.replace(/(# time:[^\n]*)(\r?\n)/, (_line, header: string, newline: string) =>
           (header.includes("history-id: ") ? header : header + " history-id: " + entry.id) + newline);
         if (!record.includes("# history-complete: " + entry.id + "\n")) {
           record = record.replace(/\s*$/, "") + "\n# history-complete: " + entry.id + "\n";
         }
-        return record;
-      }).join("");
-      const content = "# r-console-history-base: " + this.diskEntryBase + "\n" + records;
+        records.push(record);
+      }
+      const content = "# r-console-history-base: " + this.diskEntryBase + "\n" + records.join("");
       const temporary = this.historyFile + "." + process.pid + "." + randomUUID() + ".tmp";
       try {
         fs.writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -591,8 +590,8 @@ export class HistoryStore extends HistoryBuffer {
         fs.rmSync(temporary, { force: true });
       }
       this.readHistoryFromDisk(true);
+      return removed;
     });
-    return removed;
   }
 
   getPersistedIds(ids: readonly string[]): string[] {

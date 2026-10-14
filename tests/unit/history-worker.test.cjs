@@ -175,7 +175,7 @@ test("F8 retains stable selection positions across local history evictions", (t)
   const duplicates = history.getPickerEntries("repeat()", false);
   assert.deepEqual(duplicates.map((item) => item.historyIndex), [15000, 2]);
   history.push("new-d");
-  assert.equal(history.selectPickerEntry(duplicates[1]), true);
+  assert.equal(await history.selectPickerEntryOnDemand(duplicates[1]), true);
   assert.equal(history.navigate(0), "repeat()");
 });
 
@@ -217,8 +217,8 @@ test("legacy duplicate records retain distinct IDs after compaction and reload",
     .replaceAll("\\n", "\n"));
   const history = f.create();
   history.load();
-  await waitFor(() => history.getEntries().length === 20000);
-  const duplicates = history.getPickerEntries("repeat()", false);
+  await waitFor(() => history.getEntries().length === 200);
+  const duplicates = (await history.getPage("repeat()", false)).entries;
   assert.equal(duplicates.length, 2);
   assert.ok(duplicates[0].id);
   assert.notEqual(duplicates[0].id, duplicates[1].id);
@@ -233,19 +233,21 @@ test("background compaction preserves the selected duplicate while F8 defers upd
   const browsing = f.create();
   const writer = f.create();
   browsing.load(); writer.load();
-  await waitFor(() => browsing.getEntries().length === 20000 && writer.getEntries().length === 20000);
+  await waitFor(() => browsing.getEntries().length === 200 && writer.getEntries().length === 200);
   const resume = browsing.suspendUpdates();
   const snapshot = browsing.getEntries();
   writer.push("latest()");
-  await waitFor(() => writer.stored.length === 19001);
+  await waitFor(() => writer.stored.length === 200 && writer.storedStart > 19000);
   browsing.save();
   await waitFor(() => browsing.deferredHistory?.updated);
   assert.deepEqual(browsing.getEntries(), snapshot);
-  browsing.selectEntryAt(5001);
+  const older = (await browsing.getPage("repeat()", false)).entries.at(-1);
+  assert.ok(older);
+  assert.equal(await browsing.selectPickerEntryOnDemand(older), true);
   resume();
   await waitFor(() => {
     browsing.save();
-    return browsing.storedStart === 1000;
+    return browsing.storedStart > 19000;
   });
   assert.equal(browsing.navigate(-1), "command-5000");
   assert.equal(browsing.navigate(1), "repeat()");
@@ -486,11 +488,13 @@ test("F8 starts without the search-bar checkbox and refreshes after deletion", a
     historyStorage: { state: { get: () => false, update: async () => {} } },
   });
   const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.some((item) => item.code === "remove()"));
   assert.equal(picker.canSelectMany, false);
-  assert.deepEqual(picker.items.map((item) => item.code), ["remove()"]);
+  assert.deepEqual(picker.items.filter((item) => item.code).map((item) => item.code), ["remove()"]);
   const initialQuery = picker.value;
   const item = picker.items[0];
-  handlers.itemButton({ item, button: item.buttons[1] });
+  handlers.itemButton({ item, button: item.buttons[0] });
+  await handlers.button(picker.buttons[1]);
   await waitFor(() => picker.items.length === 0);
   assert.equal(picker.value, initialQuery);
   assert.deepEqual(history.getEntries(), ["retain()"]);
@@ -527,14 +531,51 @@ test("F8 check buttons support selecting multiple commands without changing Ente
     historyStorage: { state: { get: () => false, update: async () => {} } },
   });
   const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.filter((item) => item.code).length === 3);
   assert.equal(picker.canSelectMany, false);
   for (const code of ["first()", "third()"]) {
     const item = picker.items.find((entry) => entry.code === code);
     handlers.item({ item, button: item.buttons[0] });
   }
   await handlers.button(picker.buttons[1]);
-  assert.deepEqual(picker.items.map((item) => item.code), ["second()"]);
+  assert.deepEqual(picker.items.filter((item) => item.code).map((item) => item.code), ["second()"]);
   assert.deepEqual(history.getEntries(), ["second()"]);
   handlers.hide();
   await opened;
+});
+
+test("on-demand picker pages filter without loading the full history into the console", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 1000 }, (_, i) =>
+    "\\n# time: old\\n+command-" + i + "\\n").join("").replaceAll("\\n", "\n"));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  assert.equal(history.getEntries()[0], "command-800");
+  const first = await history.getPage("command-", false, 0, 50);
+  const second = await history.getPage("command-", false, 50, 50);
+  assert.equal(first.entries.length, 50);
+  assert.equal(first.hasMore, true);
+  assert.equal(second.entries[0].code, "command-949");
+  assert.equal(first.entries.at(-1).code, "command-950");
+  assert.equal((await history.getPage("command-25", false)).entries.at(-1).code, "command-25");
+  assert.equal(history.getEntries().length, 200);
+});
+
+test("Up and Down load older history incrementally without replacing the entire cache", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 650 }, (_, i) =>
+    "\\n# time: old\\n+command-" + i + "\\n").join("").replaceAll("\\n", "\n"));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  history.selectEntryAt(0);
+  assert.equal(history.navigate(-1), undefined);
+  assert.equal(await history.loadOlderNavigation(), true);
+  assert.equal(history.navigate(-1), "command-449");
+  assert.equal(history.getEntries().length, 400);
+  history.resetIndex();
+  assert.equal(history.navigate(-1), "command-649");
 });

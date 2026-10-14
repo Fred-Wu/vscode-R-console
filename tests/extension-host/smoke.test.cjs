@@ -20,6 +20,7 @@ suite("Extension Host Smoke Test", () => {
       "r-console.insertPipeOperator",
       "r-console.triggerCompletion",
       "r-console.searchHistory",
+      "r-console.clearHistory",
       "r-console.restoreDefaultName",
     ]) {
       assert.ok(commands.includes(command), `${command} was not registered`);

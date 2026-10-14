@@ -828,9 +828,15 @@ without treating other live workers as stale. Partial tagged records can be
 removed atomically while preserving completed records appended by other consoles.
 New commands are available locally immediately; saved commands and changes
 from other consoles arrive in the background. Updates carry only changed
-entries when possible. F8 searches the console's existing in-memory history
-directly rather than making a second complete history snapshot. It supplies
-only the newest 50 matching commands to the Quick Pick at a time.
+entries when possible. The foreground retains a recent history window, while the background worker
+keeps the bounded durable history store. F8 searches and fetches results through
+paged worker requests, initially returning up to 50 matches and loading further
+matches on demand. Up/Down navigation requests older/newer windows when reaching
+a loaded boundary. An older picker selection loads its surrounding commands
+before restoring the navigation cursor. Deleting individual or checked entries
+operates on persisted occurrence IDs; collapsed duplicates are matched within
+the chosen history scope. Deletion rewrites under the history file lock. The
+Command Palette exposes Delete All Command History for the active scope.
 
 The worker manages plaintext command history separately
 from persistent terminal replay. Each console selects its scope at creation or

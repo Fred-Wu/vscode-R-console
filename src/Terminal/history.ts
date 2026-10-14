@@ -74,6 +74,8 @@ export type HistoryRequest = {
   entries: HistoryWrite[];
   close: boolean;
   delete?: { ids?: string[]; codes?: string[]; all?: boolean };
+  page?: { requestId: number; limit: number; query?: string; collapse?: boolean;
+    offset?: number; beforeId?: string; afterId?: string; aroundId?: string };
 };
 
 export type HistoryUpdate = {
@@ -87,6 +89,7 @@ export type HistoryUpdate = {
   deleted?: string[];
   deletionComplete?: boolean;
   error?: string;
+  pageResult?: { requestId: number; entries: HistoryPickerEntry[]; hasMore: boolean };
 };
 
 let worker: Worker | undefined;
@@ -172,10 +175,15 @@ export class HistoryManager extends HistoryBuffer {
   private sentClosing = false;
   private deletionQueue: { ids?: string[]; codes?: string[]; all?: boolean }[] = [];
   private deleting: { resolve: () => void; reject: (error: Error) => void }[] = [];
+  private inFlightDeletion: { ids?: string[]; codes?: string[]; all?: boolean } | undefined;
+  private pageSequence = 0;
+  private pageRequests = new Map<number, { resolve: (page: { entries: HistoryPickerEntry[]; hasMore: boolean }) => void;
+    reject: (reason: Error) => void }>();
   private stored: string[] = [];
   private storedIds: string[] = [];
   private historyIds: string[] = [];
   private storedStart = 0;
+  private browsingOlder = false;
   private scheduled: ReturnType<typeof setImmediate> | undefined;
   private closing = false;
   private disabled = false;
@@ -223,6 +231,86 @@ export class HistoryManager extends HistoryBuffer {
     });
   }
 
+  getPage(query: string, collapse: boolean, offset = 0, limit = 50): Promise<{
+    entries: HistoryPickerEntry[]; hasMore: boolean
+  }> {
+    return this.requestPage({ query, collapse, offset, limit });
+  }
+
+  private requestPage(page: Omit<NonNullable<HistoryRequest["page"]>, "requestId">): Promise<{
+    entries: HistoryPickerEntry[]; hasMore: boolean
+  }> {
+    const requestId = ++this.pageSequence;
+    return new Promise((resolve, reject) => {
+      if (this.disabled || this.closing) return reject(new Error("History storage is unavailable."));
+      this.pageRequests.set(requestId, { resolve, reject });
+      try {
+        getWorker(this.workerPath).postMessage({
+          id: this.id, location: this.location, entries: [], close: false,
+          page: { ...page, requestId },
+        } satisfies HistoryRequest);
+      } catch (error) {
+        this.pageRequests.delete(requestId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  async loadOlderNavigation(): Promise<boolean> {
+    const first = this.historyIds[0];
+    if (!first || this.disabled) return false;
+    const page = await this.requestPage({ beforeId: first, limit: 200 });
+    if (!page.entries.length) return false;
+    // Ignore an obsolete response if another operation replaced the cache.
+    if (this.historyIds[0] !== first) return false;
+    this.historyBuffer.unshift(...page.entries.map((entry) => entry.code));
+    this.historyIds.unshift(...page.entries.map((entry) => entry.id!));
+    this.historyIndex += page.entries.length;
+    this.browsingOlder = true;
+    return true;
+  }
+
+  async selectPickerEntryOnDemand(entry: HistoryPickerEntry): Promise<boolean> {
+    if (this.selectPickerEntry(entry)) return true;
+    if (!entry.id) return false;
+    const page = await this.requestPage({ aroundId: entry.id, limit: 200 });
+    if (!page.entries.some((candidate) => candidate.id === entry.id)) return false;
+    this.historyBuffer = page.entries.map((candidate) => candidate.code);
+    this.historyIds = page.entries.map((candidate) => candidate.id!);
+    this.browsingOlder = true;
+    const index = this.historyIds.indexOf(entry.id);
+    this.selectEntryAt(index);
+    return true;
+  }
+
+  async loadNewerNavigation(): Promise<boolean> {
+    const last = this.historyIds[this.historyIds.length - 1];
+    if (!last || this.disabled || !this.browsingOlder) return false;
+    const page = await this.requestPage({ afterId: last, limit: 200 });
+    if (!page.entries.length || this.historyIds[this.historyIds.length - 1] !== last) {
+      if (!page.entries.length) {
+        this.browsingOlder = false;
+        this.reconcileHistory();
+      }
+      return false;
+    }
+    this.historyBuffer.push(...page.entries.map((entry) => entry.code));
+    this.historyIds.push(...page.entries.map((entry) => entry.id!));
+    return true;
+  }
+
+  override resetIndex(): void {
+    this.browsingOlder = false;
+    this.reconcileHistory();
+    super.resetIndex();
+  }
+
+  override navigate(direction: number): string | null | undefined {
+    if (this.browsingOlder && direction > 0 &&
+      this.historyIndex + direction >= this.historyBuffer.length) return undefined;
+    return super.navigate(direction);
+  }
+
   getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
     return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query)
       .map(({ code, historyIndex }) => ({
@@ -247,6 +335,10 @@ export class HistoryManager extends HistoryBuffer {
 
   override push(entry: string): void {
     if (!entry.trim() || this.closing) return;
+    if (this.browsingOlder) {
+      this.browsingOlder = false;
+      this.reconcileHistory();
+    }
     if (this.historyBuffer.length >= this.maxHistorySize) this.pickerFrontEvictions++;
     if (this.deferredHistory) this.deferredHistory.pushed++;
     const write = { id: randomUUID(), code: entry };
@@ -273,6 +365,7 @@ export class HistoryManager extends HistoryBuffer {
       if (this.disabled) return;
       this.sent = this.pending;
       const deletion = this.deletionQueue.shift();
+      if (deletion) this.inFlightDeletion = deletion;
       this.sentClosing = this.closing;
       this.pending = [];
       try {
@@ -321,7 +414,7 @@ export class HistoryManager extends HistoryBuffer {
     }
     this.sent = undefined;
     if (this.closing) {
-      if (!this.sentClosing || this.pending.length || this.unconfirmed.length) this.save();
+      if (!this.sentClosing || this.pending.length || this.unconfirmed.length || this.deleting.length) this.save();
       else histories.delete(this.id);
     } else if (this.pending.length || this.deletionQueue.length) {
       this.save();
@@ -336,6 +429,7 @@ export class HistoryManager extends HistoryBuffer {
   }
 
   private reconcileHistory(includeSent = false): void {
+    if (this.browsingOlder) return;
     const selected = this.historyIndex < this.historyBuffer.length
       ? this.historyIds[this.historyIndex] : undefined;
     const atEnd = this.historyIndex === this.historyBuffer.length;
@@ -354,8 +448,17 @@ export class HistoryManager extends HistoryBuffer {
 
   receive(update: HistoryUpdate): void {
     if (this.disabled) return;
+    if (update.pageResult) {
+      const request = this.pageRequests.get(update.pageResult.requestId);
+      if (request) {
+        this.pageRequests.delete(update.pageResult.requestId);
+        request.resolve(update.pageResult);
+      }
+      return;
+    }
     if (update.deletionComplete !== undefined) {
       const operation = this.deleting.shift();
+      this.inFlightDeletion = undefined;
       if (update.deletionComplete) {
         const removed = new Set(update.deleted ?? []);
         const removedCodes = new Set(this.historyIds.flatMap((id, index) =>
@@ -363,6 +466,7 @@ export class HistoryManager extends HistoryBuffer {
         this.pending = this.pending.filter((entry) => !removed.has(entry.id));
         this.unconfirmed = this.unconfirmed.filter((entry) => !removed.has(entry.id));
         this.sessionEntries = this.sessionEntries.filter((code) => !removedCodes.has(code));
+        this.browsingOlder = false;
         // A deletion overrides the picker freeze: the authoritative snapshot
         // has already been published by the worker before this confirmation.
         this.reconcileHistory();
@@ -403,6 +507,12 @@ export class HistoryManager extends HistoryBuffer {
     if (this.disabled) return;
     this.sent = undefined;
     this.sentClosing = false;
+    if (this.inFlightDeletion) {
+      this.deletionQueue.unshift(this.inFlightDeletion);
+      this.inFlightDeletion = undefined;
+    }
+    for (const request of this.pageRequests.values()) request.reject(new Error("History worker restarted."));
+    this.pageRequests.clear();
     this.pending = [...this.unconfirmed];
     if (this.scheduled) clearImmediate(this.scheduled);
     this.scheduled = undefined;
@@ -416,6 +526,8 @@ export class HistoryManager extends HistoryBuffer {
     this.sent = undefined;
     this.pending = [];
     this.deferredHistory = undefined;
+    for (const request of this.pageRequests.values()) request.reject(new Error("History storage stopped."));
+    this.pageRequests.clear();
     for (const operation of this.deleting) operation.reject(new Error("History storage stopped."));
     this.deleting = [];
     this.deletionQueue = [];

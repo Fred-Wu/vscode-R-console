@@ -14,7 +14,10 @@ const stores = new Map<number, RecordState>();
 let shuttingDown = false;
 
 function publish(id: number, record: RecordState): void {
-  const snapshot = record.store.getSnapshot();
+  const full = record.store.getSnapshot();
+  const offset = Math.max(0, full.entries.length - 200);
+  const snapshot = { entries: full.entries.slice(offset), ids: full.ids.slice(offset),
+    start: full.start + offset };
   const previous = record.previous;
   const remove = snapshot.start - previous.start;
   const retained = previous.entries.length - remove;
@@ -67,6 +70,50 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
     record = { store, previous: { entries: [], ids: [], start: 0 },
       unconfirmed: new Set<string>(), closed: false, initialized: false };
     stores.set(request.id, record);
+  }
+  if (request.page) {
+    const source = record.store.getSnapshot();
+    const { requestId, limit, query, collapse, offset, beforeId, afterId, aroundId } = request.page;
+    const count = Math.max(1, Math.min(200, limit));
+    const all = source.entries.map((code, index) => ({
+      code, id: source.ids[index], historyIndex: source.start + index,
+    }));
+    let page: typeof all;
+    let next = false;
+    if (beforeId !== undefined || afterId !== undefined || aroundId !== undefined) {
+      const target = beforeId ?? afterId ?? aroundId;
+      const index = all.findIndex((entry) => entry.id === target);
+      const anchor = index < 0 ? all.length : index;
+      const from = aroundId !== undefined ? Math.max(0, anchor - Math.floor(count / 2))
+        : afterId !== undefined ? Math.max(0, anchor + 1) : Math.max(0, anchor - count);
+      const to = aroundId !== undefined ? Math.min(all.length, from + count)
+        : afterId !== undefined ? Math.min(all.length, from + count) : anchor;
+      page = all.slice(from, to);
+      next = beforeId !== undefined ? from > 0 : to < all.length;
+    } else {
+      const lowerQuery = (query ?? "").toLowerCase();
+      const matched: typeof all = [];
+      const seen = new Set<string>();
+      for (let index = all.length - 1; index >= 0; index--) {
+        const entry = all[index];
+        let position = 0;
+        let found = true;
+        for (const char of lowerQuery) {
+          const nextIndex = entry.code.toLowerCase().indexOf(char, position);
+          if (nextIndex < 0) { found = false; break; }
+          position = nextIndex + 1;
+        }
+        if (!found || (collapse && seen.has(entry.code))) continue;
+        seen.add(entry.code);
+        matched.push(entry);
+      }
+      const start = Math.max(0, offset ?? 0);
+      page = matched.slice(start, start + count);
+      next = start + count < matched.length;
+    }
+    port.postMessage({ id: request.id, pageResult: { requestId, entries: page,
+      hasMore: next } });
+    return;
   }
   for (const entry of request.entries) record.unconfirmed.add(entry.id);
   record.store.pushEntries(request.entries);

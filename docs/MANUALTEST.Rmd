@@ -854,3 +854,8 @@ readline("still alive? ")
 
 If these simple commands fail only after the heavy tests, the console likely has
 a state-management bug rather than a basic startup problem.
+
+- F8: verify no select-all checkbox before the search box. Use row selection controls and the shared trash action. Enter restores the highlighted command.
+- Delete several checked entries and confirm the search stays intact and the rows disappear immediately. Delete a collapsed duplicate and confirm every occurrence in the scope is removed.
+- With more than 200 commands, navigate Up beyond the initial window and Down back to recent entries. In the picker, load additional result pages beyond the first 50.
+- Delete all history from the Command Palette and reopen the console; verify another independent history scope is intact.
