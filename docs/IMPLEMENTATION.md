@@ -816,7 +816,23 @@ not persisted.
 
 ### 4.8 Command History
 
-`src/Terminal/history.ts` manages plaintext command history separately
+`src/Terminal/history.ts` keeps command history in memory for console input,
+search, and navigation. One shared background worker handles file access,
+workspace-path resolution, parsing, and compaction through `historyStore.ts`.
+Console startup and command submission do not wait for history storage.
+Each submitted command has a stable record ID and an explicit completion marker;
+the foreground retains unconfirmed submissions until a durable acknowledgement.
+If the worker fails, it is restarted and replays unconfirmed records idempotently.
+Worker-instance lock tokens allow the replacement to reclaim an orphaned lock
+without treating other live workers as stale. Partial tagged records can be
+removed atomically while preserving completed records appended by other consoles.
+New commands are available locally immediately; saved commands and changes
+from other consoles arrive in the background. Updates carry only changed
+entries when possible. F8 searches the console's existing in-memory history
+directly rather than making a second complete history snapshot. It supplies
+only the newest 50 matching commands to the Quick Pick at a time.
+
+The worker manages plaintext command history separately
 from persistent terminal replay. Each console selects its scope at creation or
 reattachment using `r.console.historyScope`: the default `workspace` scope
 shares commands between consoles whose initial working directory belongs to the
@@ -832,15 +848,31 @@ consoles maintain stable navigation positions even across duplicate commands.
 Normal appends reconcile only bytes added since the last known disk offset
 under the per-file lock; file replacement or compaction triggers a full
 reload. Pending local commands are excluded during reconciliation and
-restored if persistence fails. Partial append failures roll back the attempted
-batch to its pre-append byte boundary while the file lock is held. If rollback
-fails, the next retry first verifies and removes only the exact attempted
-suffix; uncertain changes are left untouched rather than risking duplicate
-records or truncating another writer's data. If compaction completes but a subsequent append fails, the\nin-memory view retains the compacted commands plus still-pending submissions,\nnot commands already discarded from disk. When a non-compacting write fails after reading another console's\nappends, the previous disk cursor and entry-count metadata are restored with\nthe in-memory buffer so the next retry incrementally rereads those entries. Invalid or empty PID lock files\nare reclaimed after the stale-lock timeout; recent locks remain protected.
+restored if persistence fails. Each new record carries a stable command ID
+and completion marker; the worker acknowledges only saved IDs. On a failed
+partial append, rollback removes bytes written by that attempt when safe.
+If rollback fails, recovery discards incomplete tagged records using an
+atomic rewrite under the per-file lock while preserving other consoles'
+completed records. Unacknowledged entries are replayed using their stable
+IDs so repeated identical commands remain distinct without duplicating
+retries. If compaction succeeds but a subsequent append fails, the in-memory
+view retains the compacted entries alongside pending commands instead of
+reviving entries already pruned from disk. A failed non-compacting append
+restores its previous disk cursor and count so retries reread concurrent
+writes correctly. Invalid or empty lock owners are reclaimed after the
+stale-lock timeout, while recent locks stay protected. A replacement worker
+can also reclaim a lock identified as belonging to a terminated worker.
+F8 keeps the current in-memory history positions stable while the picker is
+open by deferring visible foreground cache updates. Worker snapshots and
+persistence acknowledgements are processed immediately, so additional
+submissions can be sent to disk even while the picker remains open. The
+visible cache is reconciled when the picker closes, preserving navigation
+positions. Background worker file access is never suspended.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
-path calls `HistoryManager.save()` to retry pending submissions synchronously
-through the same lock, avoiding duplicate writes on repeated disposal. If
+path queues remaining writes and releases the console immediately. The worker
+finishes pending writes after the console closes. Extension shutdown allows
+a bounded asynchronous drain before stopping the worker. If
 storage remains unavailable when VS Code exits, persistence cannot be
 guaranteed. If a write fails after
 synchronizing the disk snapshot, the console restores its in-memory history
@@ -854,16 +886,29 @@ them. Ctrl+R searches backward for the current line's trimmed text anywhere
 in a saved command; repeated Ctrl+R uses the original term to find older
 matches. F8 (`r-console.searchHistory`, displayed as
 **R Console: Show Command History**) opens **R Console: Command History**,
-a Quick Pick of saved commands in newest-first order. Text input filters this
-snapshot. The `collapse-all` button hides exact duplicate entries in this
-picker only; when enabled, it switches to `expand-all` to show all entries.
+a Quick Pick initially showing the newest 50 cached commands. Typing searches
+the entire console history cache (case-insensitive fuzzy subsequence matching),
+then updates the Quick Pick with at most the newest 50 matching commands.
+Only displayed matches are constructed as Quick Pick items; the full history
+is neither copied for F8 nor read again from disk. The `collapse-all` button
+hides exact duplicate entries among all matching commands; when enabled, it
+switches to `expand-all` to show repeated occurrences.
 The preference is retained in `context.globalState` across consoles and
-VS Code restarts. Each picker item keeps its original history index, so
-selecting an older duplicate preserves its navigation position, including
-when another console compacts shared history while the picker is open.
-Selecting an entry restores its code without executing it.
-The picker title, placeholder, and button presentation are defined in
-`src/Terminal/history.ts` and checked in unit tests.
+VS Code restarts. Each picker item carries a stable occurrence ID as well as its cached index.
+New records retain the UUID from the persisted history marker; legacy records
+without an ID receive a deterministic ID derived from their absolute file
+ordinal. Worker snapshots propagate these IDs, allowing F8 and Up/Down to
+retain the exact selected occurrence through shared-file synchronization,
+retries and compaction, even when two consoles submit identical command text.
+The shared file's append order remains authoritative; history is not
+timestamp-sorted.
+Local submissions can continue while F8 is open. Picker item positions account
+for history entries evicted from the front of the cache; when the selected
+occurrence was evicted, F8 still restores its code but resets history navigation
+to avoid pointing to a different command. Selecting an entry never executes it.
+The picker title, placeholder, button presentation, limited-result matching,
+and duplicate handling are defined in `src/Terminal/history.ts` and checked
+in unit tests.
 
 ## 5. Files To Read First
 

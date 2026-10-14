@@ -1,6 +1,8 @@
-import { createHash } from "crypto";
-import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "crypto";
+import type { HistoryWrite } from "./historyStore";
+import { Worker } from "worker_threads";
+import { HistoryBuffer } from "./historyBuffer";
 
 export type HistoryScope = "workspace" | "global";
 
@@ -19,554 +21,349 @@ export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean):
     : { icon: "collapse-all", tooltip: "Collapse duplicate commands" };
 }
 
-// The history picker lists newest commands first. Preserve each occurrence's
-// original index so selecting an older duplicate navigates from that position.
+export const HISTORY_PICKER_LIMIT = 50;
+
+export type HistoryPickerEntry = { code: string; historyIndex: number; id?: string };
+
+// Search the existing console history buffer without copying it. Quick Pick
+// only needs a small newest-first set; matching runs over the full cache.
+// A subsequence match preserves Quick Pick's fuzzy-search behavior.
 export function getHistoryPickerEntries(
   entries: readonly string[],
-  collapseDuplicates: boolean
-): { code: string; historyIndex: number }[] {
-  const items: { code: string; historyIndex: number }[] = [];
-  const seen = new Set<string>();
+  collapseDuplicates: boolean,
+  query = "",
+  limit = HISTORY_PICKER_LIMIT
+): HistoryPickerEntry[] {
+  const items: HistoryPickerEntry[] = [];
+  if (!Number.isSafeInteger(limit) || limit <= 0) return items;
+  const term = query.toLowerCase();
+  const seen = collapseDuplicates ? new Set<string>() : undefined;
   for (let historyIndex = entries.length - 1; historyIndex >= 0; historyIndex--) {
     const code = entries[historyIndex];
-    if (collapseDuplicates && seen.has(code)) continue;
-    seen.add(code);
+    if (term) {
+      const lowerCode = code.toLowerCase();
+      let position = 0;
+      let matched = true;
+      for (const char of term) {
+        position = lowerCode.indexOf(char, position);
+        if (position < 0) {
+          matched = false;
+          break;
+        }
+        position++;
+      }
+      if (!matched) continue;
+    }
+    if (seen?.has(code)) continue;
+    seen?.add(code);
     items.push({ code, historyIndex });
+    if (items.length === limit) break;
   }
   return items;
 }
 
-export function getHistoryFile(storageFolder: string, scope: HistoryScope, workspaceFolder?: string): string {
-  if (scope === "global" || !workspaceFolder) {
-    return path.join(storageFolder, "history", "global.history");
-  }
-  let canonical = path.resolve(workspaceFolder);
-  try {
-    canonical = fs.realpathSync.native(canonical);
-  } catch {
-    // A workspace may be temporarily unavailable while restoring a session.
-  }
-  if (process.platform === "win32") {
-    canonical = canonical.toLowerCase();
-  }
-  const id = createHash("sha256").update(canonical).digest("hex");
-  return path.join(storageFolder, "history", "workspace-" + id + ".history");
-}
+export type HistoryLocation = string | {
+  storageFolder: string;
+  scope: HistoryScope;
+  workspaceFolder?: string;
+};
 
-export class HistoryManager {
-  private historyBuffer: string[] = [];
-  private sessionEntries: string[] = [];
-  private historyIndex = 0;
-  private searchNoDuplicates = false;
-  private readonly maxHistorySize = 20000;
-  // Reclaim headroom in batches instead of rewriting 20,000 commands on every submit.
-  private readonly compactToSize = 19000;
-  private diskStamp: string | undefined;
-  private lastEntryCount = 0;
-  // Number of entries pruned from the front of this history file. A stable
-  // ordinal preserves cursor position across another console's compaction,
-  // including when identical commands occur at several positions.
-  private diskEntryBase = 0;
-  private diskOffset = 0;
-  private diskFileId: string | undefined;
-  private pendingEntries: string[] = [];
-  // A failed append whose rollback also failed must be resolved before retrying,
-  // or already written records could be appended a second time.
-  private unresolvedAppend?: { offset: number; fileId: string; bytes: Buffer };
-  private retryTimer: ReturnType<typeof setTimeout> | undefined;
-  private retryDelay = 50;
+export type HistoryRequest = {
+  id: number;
+  location: HistoryLocation;
+  entries: HistoryWrite[];
+  close: boolean;
+};
 
-  constructor(
-    private readonly historyFile: string
-  ) {}
+export type HistoryUpdate = {
+  id: number;
+  start: number;
+  reset: boolean;
+  remove: number;
+  entries: string[];
+  ids?: string[];
+  persisted?: string[];
+};
 
-  setSearchNoDuplicates(value: boolean): void {
-    this.searchNoDuplicates = value;
-  }
+let worker: Worker | undefined;
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
+let nextId = 0;
+const deadOwners = new Set<string>();
+const histories = new Map<number, HistoryManager>();
 
-  private refreshFromDisk(force = false): void {
-    if (this.pendingEntries.length) {
-      this.flushPending();
-      if (this.pendingEntries.length) return;
-    }
-    // No file lock or disk read is needed when nothing has changed.
-    if (!force) {
-      try {
-        const stat = fs.statSync(this.historyFile);
-        const stamp = stat.size + ":" + stat.mtimeMs;
-        if (stamp === this.diskStamp &&
-          stat.dev + ":" + stat.ino === this.diskFileId) return;
-      } catch {
-        // A missing/replaced file is handled under the lock below.
-      }
-    }
-    try {
-      // A contended read retains its last complete snapshot until the next
-      // history operation, instead of inspecting an in-progress append.
-      this.withFileLock(() => this.readHistoryFromDisk(force), 25);
-    } catch {
-      // History storage is optional and must never block starting R.
-    }
-  }
-
-  private readHistoryFromDisk(force = false): void {
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(this.historyFile);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      if (force || this.diskStamp !== "missing") {
-        this.historyBuffer = [];
-        this.historyIndex = 0;
-        this.diskStamp = "missing";
-        this.diskOffset = 0;
-        this.lastEntryCount = 0;
-        this.diskEntryBase = 0;
-        this.diskFileId = undefined;
-      }
-      return;
-    }
-    const stamp = stat.size + ":" + stat.mtimeMs;
-    const fileId = stat.dev + ":" + stat.ino;
-    if (!force && stamp === this.diskStamp && fileId === this.diskFileId) return;
-    // Only parse newly appended lines. New records always start with a
-    // blank separator, so a trailing incomplete command is never committed.
-    const reload = force || stat.size < this.diskOffset || this.diskStamp === "missing" ||
-      (stat.size === this.diskOffset && this.diskStamp !== stamp) ||
-      (this.diskFileId !== undefined && fileId !== this.diskFileId);
-    const offset = reload ? 0 : this.diskOffset;
-    const fd = fs.openSync(this.historyFile, "r");
-    let content: string;
-    try {
-      const bytes = Buffer.alloc(stat.size - offset);
-      let position = 0;
-      while (position < bytes.length) {
-        const count = fs.readSync(fd, bytes, position, bytes.length - position, offset + position);
-        if (!count) break;
-        position += count;
-      }
-      content = bytes.subarray(0, position).toString("utf8");
-    } finally {
-      fs.closeSync(fd);
-    }
-    // Preserve an incomplete last line until a subsequent refresh. If the
-    // writer terminated unexpectedly, a later append starts a new record.
-    const lastNewline = content.lastIndexOf("\n");
-    if (lastNewline < 0) return;
-    const complete = content.slice(0, lastNewline + 1);
-    const lines = complete.split(/\r?\n/);
-    let current: string[] = [];
-    const entries: string[] = [];
-    const flush = () => {
-      if (current.length) {
-        const value = current.join("\n");
-        if (value.trim()) entries.push(value);
-        current = [];
+function getWorker(workerPath: string): Worker {
+  if (!worker) {
+    const owner = process.pid + ":" + randomUUID();
+    const created = new Worker(workerPath, {
+      workerData: { historyOwner: owner.split(":")[1], orphanOwners: [...deadOwners] },
+    });
+    worker = created;
+    created.on("message", (update: HistoryUpdate) => histories.get(update.id)?.receive(update));
+    const failed = () => {
+      if (worker !== created) return;
+      worker = undefined;
+      deadOwners.add(owner);
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = undefined;
+      for (const history of histories.values()) history.restartStorage();
+      if (histories.size) {
+        // Reopen on the next event-loop turn; never retry worker startup in
+        // a tight failure loop on the extension-host thread.
+        setTimeout(() => {
+          for (const history of histories.values()) history.save();
+        }, 100).unref();
       }
     };
-    // Metadata lines mark a new record. We only publish a completed entry
-    // once its next separator is visible.
-    for (const line of lines) {
-      if (line.startsWith("+")) current.push(line.slice(1));
-      else if (line.startsWith("#") || !line.trim()) flush();
-    }
-    flush();
-    const oldLength = this.historyBuffer.length;
-    const oldIndex = this.historyIndex;
-    const previousCount = reload ? 0 : this.lastEntryCount;
-    const oldStart = this.diskEntryBase +
-      Math.max(0, this.lastEntryCount - oldLength);
-    // The marker is written only during compaction, so existing plaintext
-    // histories without it naturally start at ordinal zero.
-    const baseMatch = reload
-      ? /^# r-console-history-base: (\d+)\r?\n/.exec(content)
-      : null;
-    const parsedBase = baseMatch ? Number(baseMatch[1]) : 0;
-    if (reload) {
-      this.diskEntryBase = Number.isSafeInteger(parsedBase) ? parsedBase : 0;
-    }
-    const combined = reload ? entries : [...this.historyBuffer, ...entries];
-    this.historyBuffer = combined.slice(-this.maxHistorySize);
-    this.lastEntryCount = previousCount + entries.length;
-    const newStart = this.diskEntryBase +
-      Math.max(0, this.lastEntryCount - this.historyBuffer.length);
-    // Keep the same logical entry if it survived; otherwise clamp to the
-    // earliest retained entry. End-of-history remains at the new end.
-    this.historyIndex = oldIndex === oldLength
-      ? this.historyBuffer.length
-      : Math.max(0, Math.min(this.historyBuffer.length, oldStart + oldIndex - newStart));
-    this.diskOffset = offset + Buffer.byteLength(complete);
-    this.diskStamp = stamp;
-    this.diskFileId = fileId;
+    created.on("error", failed);
+    created.on("exit", failed);
+    created.unref();
+    refreshTimer = setInterval(() => {
+      for (const history of histories.values()) history.save();
+    }, 1000);
+    refreshTimer.unref();
+  }
+  return worker;
+}
+
+export async function disposeHistoryWorker(): Promise<void> {
+  for (const history of histories.values()) history.dispose();
+  // Let queued close requests reach the worker before asking it to stop.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const current = worker;
+  if (!current) return;
+  await new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timeout);
+      clearInterval(drain);
+      current.off("message", onMessage);
+      current.off("exit", finish);
+      resolve();
+    };
+    const onMessage = (message: { stopped?: boolean }) => {
+      if (message.stopped) finish();
+    };
+    const timeout = setTimeout(finish, 1500);
+    const drain = setInterval(() => {
+      if (histories.size === 0) {
+        clearInterval(drain);
+        current.postMessage({ shutdown: true });
+      }
+    }, 10);
+    current.on("message", onMessage);
+    current.once("exit", finish);
+  });
+  worker = undefined;
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = undefined;
+  for (const history of histories.values()) history.disableStorage();
+  histories.clear();
+  void current.terminate().catch(() => {});
+}
+
+export class HistoryManager extends HistoryBuffer {
+  private readonly id = ++nextId;
+  private pending: HistoryWrite[] = [];
+  private sent: HistoryWrite[] | undefined;
+  private unconfirmed: HistoryWrite[] = [];
+  private sentClosing = false;
+  private stored: string[] = [];
+  private storedIds: string[] = [];
+  private historyIds: string[] = [];
+  private storedStart = 0;
+  private scheduled: ReturnType<typeof setImmediate> | undefined;
+  private closing = false;
+  private disabled = false;
+  private suspended = 0;
+  private deferredHistory: {
+    storedStart: number;
+    storedLength: number;
+    unmerged: number;
+    pushed: number;
+    updated: boolean;
+  } | undefined;
+  // Only local pushes can evict cached entries while F8 defers worker updates.
+  // Monotonic positions keep each displayed occurrence stable without a snapshot.
+  private pickerFrontEvictions = 0;
+
+  constructor(
+    private readonly location: HistoryLocation,
+    private readonly workerPath = path.join(__dirname, "historyWorker.js")
+  ) {
+    super();
+    histories.set(this.id, this);
   }
 
   load(): void {
-    this.refreshFromDisk(true);
-    this.sessionEntries = [];
-    // Cap pre-existing history files when this console starts, not on extension activation.
-    if (this.lastEntryCount > this.maxHistorySize) {
-      try {
-        this.withFileLock(() => {
-          this.readHistoryFromDisk(true);
-          if (this.lastEntryCount > this.maxHistorySize) {
-            this.compactHistory(this.maxHistorySize);
-          }
-        });
-      } catch {
-        // Storage issues must not prevent the R console from starting.
-      }
+    this.save();
+  }
+
+  getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
+    return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query)
+      .map(({ code, historyIndex }) => ({
+        code, historyIndex: historyIndex + this.pickerFrontEvictions,
+        id: this.historyIds[historyIndex],
+      }));
+  }
+
+  // F8 items carry a position from when they were displayed, not a live
+  // array index. Return false if local submissions evicted the occurrence.
+  selectPickerEntry(entry: HistoryPickerEntry): boolean {
+    const index = entry.id === undefined
+      ? entry.historyIndex - this.pickerFrontEvictions
+      : this.historyIds.indexOf(entry.id);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length ||
+      this.historyBuffer[index] !== entry.code) {
+      return false;
     }
+    this.selectEntryAt(index);
+    return true;
+  }
+
+  override push(entry: string): void {
+    if (!entry.trim() || this.closing) return;
+    if (this.historyBuffer.length >= this.maxHistorySize) this.pickerFrontEvictions++;
+    if (this.deferredHistory) this.deferredHistory.pushed++;
+    const write = { id: randomUUID(), code: entry };
+    super.push(entry);
+    this.historyIds.push(write.id);
+    if (this.historyIds.length > this.maxHistorySize) this.historyIds.shift();
+    if (!this.disabled) {
+      this.pending.push(write);
+      this.unconfirmed.push(write);
+      if (this.pending.length > this.maxHistorySize) this.pending.shift();
+      if (this.unconfirmed.length > this.maxHistorySize) this.unconfirmed.shift();
+    }
+    this.save();
+  }
+
+  protected override refreshFromDisk(): void {
+    this.save();
   }
 
   save(): void {
-    // Disposal gets one final synchronous attempt to persist submissions that
-    // were queued after a write failure. Use the normal lock and retry path;
-    // never rewrite commands already appended successfully.
-    this.flushPending();
-  }
-
-  // Coordinate compaction and appends across consoles and VS Code windows.
-  // Lock files from an interrupted writer may be reclaimed after its process exits.
-  private withFileLock<T>(action: () => T, maxAttempts = 100): T {
-    fs.mkdirSync(path.dirname(this.historyFile), {
-      recursive: true,
-      mode: process.platform === "win32" ? undefined : 0o700,
+    if (this.disabled || this.scheduled || this.sent) return;
+    this.scheduled = setImmediate(() => {
+      this.scheduled = undefined;
+      if (this.disabled) return;
+      this.sent = this.pending;
+      this.sentClosing = this.closing;
+      this.pending = [];
+      try {
+        getWorker(this.workerPath).postMessage({
+          id: this.id, location: this.location, entries: this.sent, close: this.closing,
+        } satisfies HistoryRequest);
+      } catch {
+        this.disableStorage();
+      }
     });
-    const lockPath = this.historyFile + ".lock";
-    const pause = new Int32Array(new SharedArrayBuffer(4));
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      let fd: number;
-      try {
-        fd = fs.openSync(lockPath, "wx", 0o600);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        try {
-          const ownerText = fs.readFileSync(lockPath, "utf8").trim();
-          const owner = /^\d+$/.test(ownerText) ? Number(ownerText) : NaN;
-          const validOwner = Number.isSafeInteger(owner) && owner > 0;
-          const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-          let dead = false;
-          if (validOwner && owner !== process.pid) {
-            try {
-              process.kill(owner, 0);
-            } catch (processError) {
-              dead = (processError as NodeJS.ErrnoException).code === "ESRCH";
-            }
-          }
-          if (dead || (age > 120000 && !validOwner)) {
-            fs.rmSync(lockPath, { force: true });
-          }
-        } catch {
-          // Another window may have released the lock.
-        }
-        Atomics.wait(pause, 0, 0, 10);
-        continue;
-      }
-      try {
-        fs.writeSync(fd, String(process.pid));
-        return action();
-      } finally {
-        fs.closeSync(fd);
-        try {
-          fs.rmSync(lockPath, { force: true });
-        } catch {
-          // Avoid replaying a completed append because cleanup failed.
-        }
-      }
+  }
+
+  // Freeze only the cache and navigation positions used by F8. Worker
+  // snapshots, write acknowledgements, and new submissions keep flowing.
+  suspendUpdates(): () => void {
+    if (!this.suspended) {
+      this.deferredHistory = {
+        storedStart: this.storedStart,
+        storedLength: this.stored.length,
+        unmerged: (this.sent?.length ?? 0) + this.pending.length,
+        pushed: 0,
+        updated: false,
+      };
     }
-    throw new Error("R Console history is busy.");
-  }
-
-  private compactHistory(keep: number): void {
-    // Keep original timestamps and multiline records when the file uses the
-    // regular console format; older irregular files can be reserialized.
-    const raw = fs.readFileSync(this.historyFile, "utf8");
-    const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
-      .map((match) => match.index!);
-    const entries = keep > 0 ? this.historyBuffer.slice(-keep) : [];
-    const nextBase = this.diskEntryBase + (this.lastEntryCount - entries.length);
-    const completeEnd = raw.lastIndexOf("\n") + 1;
-    const records = entries.length > 0 && boundaries.length === this.lastEntryCount &&
-      boundaries.length >= entries.length
-      ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
-      : entries.map((entry) => this.serializeEntry(entry)).join("");
-    const content = "# r-console-history-base: " + nextBase + "\n" + records;
-    const temporary = this.historyFile + "." + process.pid + "." +
-      Math.random().toString(16).slice(2) + ".tmp";
-    try {
-      fs.writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      fs.renameSync(temporary, this.historyFile);
-    } finally {
-      fs.rmSync(temporary, { force: true });
-    }
-    const originalLength = this.historyBuffer.length;
-    const originalIndex = this.historyIndex;
-    this.historyBuffer = entries;
-    this.historyIndex = originalIndex === originalLength
-      ? entries.length
-      : Math.max(0, originalIndex - (originalLength - entries.length));
-    this.lastEntryCount = entries.length;
-    this.diskEntryBase = nextBase;
-    const stat = fs.statSync(this.historyFile);
-    this.diskStamp = stat.size + ":" + stat.mtimeMs;
-    this.diskOffset = stat.size;
-    this.diskFileId = stat.dev + ":" + stat.ino;
-  }
-
-  private serializeEntry(entry: string): string {
-    const now = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
-    return "\n# time: " + now + "\n" +
-      entry.split("\n").map((line) => "+" + line + "\n").join("");
-  }
-
-  private scheduleRetry(): void {
-    if (this.retryTimer !== undefined) return;
-    const retry = () => {
-      this.retryTimer = undefined;
-      this.flushPending();
+    this.suspended++;
+    return () => {
+      this.suspended--;
+      if (!this.suspended) this.applyDeferredHistory();
     };
-    this.retryTimer = setTimeout(retry, this.retryDelay);
-    this.retryTimer.unref();
-    this.retryDelay = Math.min(this.retryDelay * 2, 5000);
   }
 
-  private recoverUnresolvedAppend(): void {
-    const failed = this.unresolvedAppend;
-    if (!failed) return;
-    const stat = fs.statSync(this.historyFile);
-    const fileId = stat.dev + ":" + stat.ino;
-    const length = stat.size - failed.offset;
-    // Never truncate a replaced file, or another writer's completed append.
-    if (fileId !== failed.fileId || length < 0 || length > failed.bytes.length) {
-      throw new Error("Cannot safely recover a partially written R Console history batch.");
-    }
-    const actual = Buffer.alloc(length);
-    const fd = fs.openSync(this.historyFile, "r");
-    try {
-      let position = 0;
-      while (position < length) {
-        const count = fs.readSync(fd, actual, position, length - position, failed.offset + position);
-        if (!count) throw new Error("Could not verify partial R Console history append.");
-        position += count;
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-    if (!actual.equals(failed.bytes.subarray(0, length))) {
-      throw new Error("R Console history changed after a failed append.");
-    }
-    if (length > 0) fs.truncateSync(this.historyFile, failed.offset);
-    this.unresolvedAppend = undefined;
+  private applyStoredUpdate(update: HistoryUpdate): void {
+    this.stored = update.reset ? update.entries
+      : [...this.stored.slice(update.remove), ...update.entries];
+    const ids = update.ids ?? update.entries.map((_, index) =>
+      "legacy-test:" + (update.start + (update.reset ? 0 : this.storedIds.length - update.remove) + index));
+    this.storedIds = update.reset ? ids
+      : [...this.storedIds.slice(update.remove), ...ids];
+    this.storedStart = update.start;
   }
 
-  private flushPending(): void {
-    if (!this.pendingEntries.length) return;
-    // Reconciliation replaces the in-memory buffer with the disk snapshot.
-    // Preserve the visible entries and cursor if the append subsequently fails.
-    const visibleHistory = this.historyBuffer;
-    const visibleIndex = this.historyIndex;
-    // A failed append restores this buffer; the disk cursor and entry count
-    // must be restored with it or subsequent incremental reads skip entries
-    // another console appended during the failed attempt.
-    const diskState = {
-      stamp: this.diskStamp,
-      offset: this.diskOffset,
-      fileId: this.diskFileId,
-      entryCount: this.lastEntryCount,
-      entryBase: this.diskEntryBase,
-    };
-    let compactedHistory: string[] | undefined;
-    let compactedIndex = 0;
-    try {
-      this.withFileLock(() => {
-        // Resolve an earlier failed rollback before reading or appending anything.
-        this.recoverUnresolvedAppend();
-        // The in-memory tail also contains pending submissions. Temporarily
-        // remove it so incremental disk reconciliation cannot duplicate them.
-        // The catch block restores the original view if persistence fails.
-        const diskLength = Math.max(0, this.historyBuffer.length - this.pendingEntries.length);
-        const needsReload = this.pendingEntries.length >= this.historyBuffer.length &&
-          this.lastEntryCount > 0;
-        this.historyBuffer = this.historyBuffer.slice(0, diskLength);
-        this.historyIndex = Math.min(this.historyIndex, diskLength);
-        // Reconcile only new bytes under the lock. Reload from the beginning
-        // on replacement/compaction or when the pending tail filled the buffer.
-        this.readHistoryFromDisk(needsReload);
-        const stat = fs.existsSync(this.historyFile)
-          ? fs.statSync(this.historyFile) : undefined;
-        if (stat && stat.size > this.diskOffset) {
-          fs.truncateSync(this.historyFile, this.diskOffset);
-          this.readHistoryFromDisk(false);
-        }
-        const queued = this.pendingEntries.slice(-this.maxHistorySize);
-        if (this.lastEntryCount + queued.length > this.maxHistorySize) {
-          const keep = Math.max(0, Math.min(
-            this.compactToSize, this.maxHistorySize - queued.length
-          ));
-          this.compactHistory(keep);
-          // Compaction commits a new disk snapshot before the append. If the
-          // append fails, restore pending commands onto this snapshot rather
-          // than reviving the commands already pruned from disk.
-          compactedHistory = this.historyBuffer;
-          compactedIndex = this.historyIndex;
-        }
-        const batch = queued.map((entry) => this.serializeEntry(entry)).join("");
-        // Remember the exact pre-append boundary *after* any compaction.
-        // A failed append may have written one or more complete records.
-        const beforeAppend = fs.existsSync(this.historyFile)
-          ? fs.statSync(this.historyFile) : undefined;
-        try {
-          fs.appendFileSync(
-            this.historyFile,
-            batch,
-            // mode applies on creation only; do not change existing file permissions.
-            process.platform === "win32" ? undefined : { mode: 0o600 }
-          );
-        } catch (error) {
-          try {
-            const current = fs.statSync(this.historyFile);
-            if (beforeAppend && (current.dev !== beforeAppend.dev ||
-              current.ino !== beforeAppend.ino)) {
-              throw new Error("History file was replaced during a failed append.");
-            }
-            // Undo only bytes written by this attempt. A no-op truncate
-            // changes mtime and needlessly forces a full history reload.
-            if (current.size < (beforeAppend?.size ?? 0)) {
-              throw new Error("History file shrank during a failed append.");
-            }
-            if (current.size > (beforeAppend?.size ?? 0)) {
-              fs.truncateSync(this.historyFile, beforeAppend?.size ?? 0);
-            }
-          } catch (rollbackError) {
-            // A nonexistent file cannot contain a partial append. Otherwise,
-            // retain enough information to verify a safe rollback on retry.
-            if ((rollbackError as NodeJS.ErrnoException).code !== "ENOENT") {
-              const current = fs.statSync(this.historyFile);
-              this.unresolvedAppend = {
-                offset: beforeAppend?.size ?? 0,
-                fileId: (beforeAppend ?? current).dev + ":" + (beforeAppend ?? current).ino,
-                bytes: Buffer.from(batch, "utf8"),
-              };
-            }
-          }
-          throw error;
-        }
-        // No retry if subsequent metadata access fails after the append.
-        this.pendingEntries = [];
-        this.historyBuffer.push(...queued);
-        this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
-        this.historyIndex = this.historyBuffer.length;
-        this.lastEntryCount += queued.length;
-        this.diskStamp = undefined;
-        const updated = fs.statSync(this.historyFile);
-        this.diskStamp = updated.size + ":" + updated.mtimeMs;
-        this.diskOffset = updated.size;
-        this.diskFileId = updated.dev + ":" + updated.ino;
-      });
-      this.retryDelay = 50;
-      if (this.retryTimer !== undefined) {
-        clearTimeout(this.retryTimer);
-        this.retryTimer = undefined;
-      }
-    } catch {
-      if (this.pendingEntries.length) {
-        if (compactedHistory) {
-          const combined = [...compactedHistory, ...this.pendingEntries];
-          const removed = Math.max(0, combined.length - this.maxHistorySize);
-          this.historyBuffer = combined.slice(removed);
-          this.historyIndex = compactedIndex === compactedHistory.length
-            ? this.historyBuffer.length
-            : Math.max(0, compactedIndex - removed);
-        } else {
-          this.historyBuffer = visibleHistory;
-          this.historyIndex = visibleIndex;
-          this.diskStamp = diskState.stamp;
-          this.diskOffset = diskState.offset;
-          this.diskFileId = diskState.fileId;
-          this.lastEntryCount = diskState.entryCount;
-          this.diskEntryBase = diskState.entryBase;
-        }
-      }
-      // Keep submissions locally and retry without blocking the R session.
-      // This also covers contention from a different VS Code window.
-      this.scheduleRetry();
+  private acknowledge(update: HistoryUpdate): void {
+    if (update.persisted?.length) {
+      const saved = new Set(update.persisted);
+      this.unconfirmed = this.unconfirmed.filter((entry) => !saved.has(entry.id));
+    }
+    this.sent = undefined;
+    if (this.closing) {
+      if (!this.sentClosing || this.pending.length || this.unconfirmed.length) this.save();
+      else histories.delete(this.id);
+    } else if (this.pending.length) {
+      this.save();
     }
   }
 
-  push(entry: string): void {
-    if (!entry.trim()) return;
-    this.pendingEntries.push(entry);
-    this.historyBuffer.push(entry);
-    this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
-    this.sessionEntries.push(entry);
-    this.sessionEntries = this.sessionEntries.slice(-this.maxHistorySize);
-    this.historyIndex = this.historyBuffer.length;
-    this.flushPending();
+  private applyDeferredHistory(): void {
+    const base = this.deferredHistory;
+    this.deferredHistory = undefined;
+    if (!base?.updated) return;
+    this.reconcileHistory(true);
   }
 
-  getEntries(): string[] {
-    this.refreshFromDisk();
-    return [...this.historyBuffer];
+  private reconcileHistory(includeSent = false): void {
+    const selected = this.historyIndex < this.historyBuffer.length
+      ? this.historyIds[this.historyIndex] : undefined;
+    const atEnd = this.historyIndex === this.historyBuffer.length;
+    const sent = includeSent ? (this.sent ?? []) : [];
+    const combined = [...this.stored, ...sent.map((entry) => entry.code),
+      ...this.pending.map((entry) => entry.code)];
+    const ids = [...this.storedIds, ...sent.map((entry) => entry.id),
+      ...this.pending.map((entry) => entry.id)];
+    const trim = Math.max(0, combined.length - this.maxHistorySize);
+    this.historyBuffer = combined.slice(trim);
+    this.historyIds = ids.slice(trim);
+    const position = selected === undefined ? -1 : this.historyIds.indexOf(selected);
+    this.historyIndex = atEnd ? this.historyBuffer.length
+      : position >= 0 ? position : 0;
   }
 
-  selectEntry(entry: string): void {
-    this.refreshFromDisk();
-    const index = this.historyBuffer.lastIndexOf(entry);
-    if (index >= 0) {
-      this.historyIndex = index;
-    }
-  }
-
-  selectEntryAt(index: number): void {
-    if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length) {
+  receive(update: HistoryUpdate): void {
+    if (this.disabled) return;
+    if (this.suspended && !this.closing) {
+      // Update worker state and release the next queued write immediately,
+      // without changing the cached entries that F8 is displaying.
+      this.applyStoredUpdate(update);
+      if (this.deferredHistory) this.deferredHistory.updated = true;
+      this.acknowledge(update);
       return;
     }
-    // The picker holds a snapshot of this buffer. Set the original position
-    // before refreshing, so a concurrent compaction remaps the same occurrence.
-    this.historyIndex = index;
-    this.refreshFromDisk();
+
+    this.applyStoredUpdate(update);
+    this.reconcileHistory();
+    this.acknowledge(update);
   }
 
-  getRecentSessionEntries(limit = 200): string[] {
-    return limit > 0 ? this.sessionEntries.slice(-limit) : [];
+  dispose(): void {
+    if (this.closing) return;
+    this.closing = true;
+    this.applyDeferredHistory();
+    this.save();
   }
 
-  resetIndex(): void {
-    this.refreshFromDisk();
-    this.historyIndex = this.historyBuffer.length;
+  restartStorage(): void {
+    if (this.disabled) return;
+    this.sent = undefined;
+    this.sentClosing = false;
+    this.pending = [...this.unconfirmed];
+    if (this.scheduled) clearImmediate(this.scheduled);
+    this.scheduled = undefined;
   }
 
-  navigate(direction: number): string | null | undefined {
-    this.refreshFromDisk();
-    if (this.historyBuffer.length === 0) return undefined;
-
-    const length = this.historyBuffer.length;
-    let nextIndex = this.historyIndex + direction;
-    if (this.searchNoDuplicates && direction !== 0 && this.historyIndex < length) {
-      const current = this.historyBuffer[this.historyIndex];
-      // Skip commands identical to the currently displayed entry in either
-      // direction. Comparing with the destination incorrectly visits the same
-      // run again when navigating forward.
-      while (nextIndex >= 0 && nextIndex < length &&
-        this.historyBuffer[nextIndex] === current) {
-        nextIndex += direction;
-      }
-    }
-    if (nextIndex < 0 || nextIndex > length) return undefined;
-    this.historyIndex = nextIndex;
-    return nextIndex === length ? null : this.historyBuffer[nextIndex];
-  }
-
-  searchBackward(term: string, fromIndex?: number): string | null {
-    this.refreshFromDisk();
-    if (!term) return null;
-    const start = fromIndex === undefined ? this.historyIndex - 1 : fromIndex;
-    for (let i = start; i >= 0; i--) {
-      if (this.historyBuffer[i].includes(term)) {
-        this.historyIndex = i;
-        return this.historyBuffer[i];
-      }
-    }
-    return null;
+  disableStorage(): void {
+    this.disabled = true;
+    histories.delete(this.id);
+    if (this.scheduled) clearImmediate(this.scheduled);
+    this.scheduled = undefined;
+    this.sent = undefined;
+    this.pending = [];
+    this.deferredHistory = undefined;
   }
 }

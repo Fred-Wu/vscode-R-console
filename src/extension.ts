@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import { disposeConsoleLspOutputChannel } from "./Language/consoleLspClient";
+import { disposeHistoryWorker } from "./Terminal/history";
 import {
   RTerminal,
   type PersistedRTerminalState,
@@ -1367,6 +1368,7 @@ export async function deactivate(): Promise<void> {
   pidToRecord.clear();
   editorTabToRecord.clear();
   await Promise.allSettled([...pendingTerminalCleanups]);
+  await disposeHistoryWorker();
   disposeConsoleLspOutputChannel();
 }
 

@@ -8,8 +8,8 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager, getHistoryFile, getHistoryPickerEntries,
-  getHistoryPickerTogglePresentation, historyPickerText, type HistoryScope } from "./history";
+import { HistoryManager, getHistoryPickerTogglePresentation,
+  historyPickerText, type HistoryScope } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
@@ -254,9 +254,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     const configuredScope = vscode.workspace.getConfiguration("r.console")
       .get<string>("historyScope", "workspace");
     const historyScope: HistoryScope = configuredScope === "global" ? "global" : "workspace";
-    this.rHistory = new HistoryManager(
-      getHistoryFile(historyStorage.folder, historyScope, this.options.cwd)
-    );
+    this.rHistory = new HistoryManager({
+      storageFolder: historyStorage.folder,
+      scope: historyScope,
+      workspaceFolder: this.options.cwd,
+    });
     this.rHistory.load();
     this.rHistory.setSearchNoDuplicates(true);
     this.lang = new RTermLang({
@@ -1652,16 +1654,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode !== "ready" || !this.promptReady) {
       return;
     }
-    const entries = this.rHistory.getEntries();
-    if (entries.length === 0) {
+    if (!this.rHistory.hasEntries()) {
       void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
       return;
     }
     type HistoryPickItem = vscode.QuickPickItem & {
       code: string;
       historyIndex: number;
+      id?: string;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
+    const resumeHistoryUpdates = this.rHistory.suspendUpdates();
     picker.title = historyPickerText.title;
     picker.placeholder = historyPickerText.placeholder;
     const preferenceKey = "historyPicker.collapseDuplicates";
@@ -1681,14 +1684,15 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
 
     const updateItems = (): void => {
-      picker.items = getHistoryPickerEntries(entries, collapseDuplicates)
-        .map(({ code, historyIndex }) => ({ label: code, code, historyIndex }));
+      picker.items = this.rHistory.getPickerEntries(picker.value, collapseDuplicates)
+        .map(({ code, historyIndex, id }) => ({ label: code, code, historyIndex, id }));
     };
     updateItems();
 
     let selectedItem: HistoryPickItem | undefined;
     try {
       selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
+        picker.onDidChangeValue(updateItems);
         picker.onDidTriggerButton(async (button) => {
           if (button !== collapseButton) return;
           collapseDuplicates = !collapseDuplicates;
@@ -1710,15 +1714,20 @@ export class RTerminal implements vscode.Pseudoterminal {
         picker.onDidHide(() => resolve(undefined));
         picker.show();
       });
+      if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
+        return;
+      }
+      this.lastSearchTerm = "";
+      if (!this.rHistory.selectPickerEntry(selectedItem)) {
+        // The entry was evicted while F8 was open. Preserve its text, but
+        // do not leave navigation pointing at a different occurrence.
+        this.rHistory.resetIndex();
+      }
+      this.applyHistorySearchResult(selectedItem.code);
     } finally {
       picker.dispose();
+      resumeHistoryUpdates();
     }
-    if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
-      return;
-    }
-    this.lastSearchTerm = "";
-    this.rHistory.selectEntryAt(selectedItem.historyIndex);
-    this.applyHistorySearchResult(selectedItem.code);
   }
 
   private applyHistorySearchResult(entry: string): void {
@@ -2395,10 +2404,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.syntax.setSource(this.inputState.lines);
   }
 
-  private saveHistory(): void {
-    this.rHistory.save();
-  }
-
   private clearPendingInputFlushTimer(): void {
     if (this.pendingInputFlushTimer) {
       clearTimeout(this.pendingInputFlushTimer);
@@ -2505,7 +2510,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.extensionResourcesDisposePromise) {
       return this.extensionResourcesDisposePromise;
     }
-    this.saveHistory();
+    this.rHistory.dispose();
     disposeRuntimeVscodeRIntegrationUi(this.runtimeHost());
     this.syntax.dispose();
     this.clearPendingInputFlushTimer();

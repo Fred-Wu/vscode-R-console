@@ -64,6 +64,7 @@ function createStage(root, stageDir, bundledSidecar, sidecarName) {
   copyFile(path.join(root, "LICENSE"), path.join(stageDir, "LICENSE"));
   copyFile(path.join(root, "images", "Rlogo.png"), path.join(stageDir, "images", "Rlogo.png"));
   copyFile(path.join(root, "dist", "extension.js"), path.join(stageDir, "dist", "extension.js"));
+  copyFile(path.join(root, "dist", "historyWorker.js"), path.join(stageDir, "dist", "historyWorker.js"));
   copyDirectory(path.join(root, "resources", "r"), path.join(stageDir, "resources", "r"));
   copyFile(bundledSidecar, path.join(stageDir, "bundled", "bin", sidecarName));
 
