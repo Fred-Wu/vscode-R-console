@@ -58,8 +58,8 @@ function applyDeletion(id: number, record: RecordState): boolean {
   record.pendingDeletions.shift();
   publish(id, record);
   port.postMessage({ id, start: record.previous.start, reset: false,
-    remove: 0, entries: [], deleted, deletionComplete: !errorText, error: errorText }
-    satisfies HistoryUpdate);
+    remove: 0, entries: [], deleted, deletionComplete: !errorText,
+    error: errorText } satisfies HistoryUpdate);
   return true;
 }
 

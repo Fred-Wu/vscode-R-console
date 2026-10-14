@@ -802,3 +802,34 @@ test("irrecoverable deletion rewrite error rejects without corrupting saved hist
   await history.clearHistory();
   assert.deepEqual(history.getEntries(), []);
 });
+
+
+test("Ctrl+R searches older pages and repeated presses advance to older matches", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 650 }, (_, i) =>
+    "\n# time: old\n+" + (i === 10 ? "needle-earlier()" :
+      i === 550 ? "needle-recent()" : "other-" + i) + "\n").join(""));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  inputState.insertText("needle");
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptVisible: true,
+    rHistory: history, inputState, historyBrowsing: false, historyCollapsed: true,
+    lastSearchTerm: "", lang: { updateInput() {} },
+    ensureReadyPromptVisibleForInput() {}, clearInputRender() {}, renderInput() {},
+  });
+  terminal.reverseSearch();
+  await terminal.reverseSearchQueue;
+  assert.equal(inputState.text, "needle-recent()");
+  terminal.reverseSearch();
+  await terminal.reverseSearchQueue;
+  assert.equal(inputState.text, "needle-earlier()");
+});

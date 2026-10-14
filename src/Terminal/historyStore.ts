@@ -103,6 +103,9 @@ export class HistoryStore extends HistoryBuffer {
         this.lastEntryCount = 0;
         this.diskEntryBase = 0;
         this.diskFileId = undefined;
+        this.savedIds.clear();
+        this.deletedIds.clear();
+        this.deletions = [];
       }
       return;
     }

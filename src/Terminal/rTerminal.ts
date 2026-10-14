@@ -222,6 +222,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private tabSize = 2;
   private pipeOperator: "|>" | "%>%" = "|>";
   private lastSearchTerm = "";
+  private reverseSearchQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private options: RTerminalOptions,
@@ -964,6 +965,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     this.historyBrowsing = false;
+    this.savedHistoryInput = undefined;
     this.historyCollapsed = true;
     this.escPendingClear = false;
     this.rHistory.resetIndex();
@@ -1039,6 +1041,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private sendNestedReplyLine(line: string): void {
     this.historyBrowsing = false;
+    this.savedHistoryInput = undefined;
     this.historyCollapsed = true;
     this.escPendingClear = false;
     this.rHistory.resetIndex();
@@ -1214,6 +1217,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         // until the next command submission resets it.
         this.rHistory.resetIndex();
         this.historyBrowsing = false;
+        this.savedHistoryInput = undefined;
         this.historyCollapsed = true;
         this.lastSearchTerm = "";
         this.escPendingClear = false;
@@ -1249,6 +1253,7 @@ export class RTerminal implements vscode.Pseudoterminal {
             if (this.escPendingClear) {
               this.clearInputRender();
               this.historyBrowsing = false;
+              this.savedHistoryInput = undefined;
               this.historyCollapsed = true;
               this.inputState.reset();
               this.rHistory.resetIndex();
@@ -1259,6 +1264,7 @@ export class RTerminal implements vscode.Pseudoterminal {
             }
           } else {
             this.historyBrowsing = false;
+            this.savedHistoryInput = undefined;
             this.historyCollapsed = true;
             this.rHistory.resetIndex();
             this.escPendingClear = false;
@@ -1279,6 +1285,7 @@ export class RTerminal implements vscode.Pseudoterminal {
           this.clearInputRender();
           this.inputState.reset();
           this.historyBrowsing = false;
+          this.savedHistoryInput = undefined;
           this.historyCollapsed = true;
           this.rHistory.resetIndex();
           this.renderInput();
@@ -1467,6 +1474,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (submission) {
         this.inputState.reset();
         this.historyBrowsing = false;
+        this.savedHistoryInput = undefined;
         this.historyCollapsed = true;
         this.rHistory.resetIndex();
         const blocks = await this.enqueueRSubmission(submission, !/[\r\n]/.test(submission));
@@ -1632,24 +1640,25 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private reverseSearch(): void {
-    if (this.mode !== "ready" || !this.promptReady) {
-      return;
-    }
-
-    const prefix = this.inputState.currentLine.trim();
-    const continuingSearch =
-      this.historyBrowsing && this.historyCollapsed && Boolean(this.lastSearchTerm);
-    const term = continuingSearch ? this.lastSearchTerm : prefix;
-    if (term) {
-      if (!continuingSearch) {
-        this.rHistory.resetIndex();
-      }
-      const match = this.rHistory.searchBackward(term);
-      if (match !== null) {
+    // Queue repeated Ctrl+R presses so asynchronous older-page requests
+    // preserve the original newest-to-oldest search order.
+    const previous = this.reverseSearchQueue ?? Promise.resolve();
+    this.reverseSearchQueue = previous.then(async () => {
+      if (this.mode !== "ready" || !this.promptReady) return;
+      const prefix = this.inputState.currentLine.trim();
+      const continuingSearch = this.historyBrowsing && this.historyCollapsed &&
+        Boolean(this.lastSearchTerm);
+      const term = continuingSearch ? this.lastSearchTerm : prefix;
+      if (!term) return;
+      if (!continuingSearch) this.rHistory.resetIndex();
+      const inputAtSearch = this.inputState.text;
+      const match = await this.rHistory.searchBackwardOnDemand(term);
+      if (match !== null && this.mode === "ready" && this.promptReady &&
+        this.inputState.text === inputAtSearch) {
         this.lastSearchTerm = term;
         this.applyHistorySearchResult(match);
       }
-    }
+    }).catch(() => {});
   }
 
   public async clearCommandHistory(): Promise<void> {
