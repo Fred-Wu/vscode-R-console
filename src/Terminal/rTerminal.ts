@@ -1717,7 +1717,11 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       this.lastSearchTerm = "";
-      this.rHistory.selectEntryAt(selectedItem.historyIndex);
+      if (!this.rHistory.selectPickerEntry(selectedItem)) {
+        // The entry was evicted while F8 was open. Preserve its text, but
+        // do not leave navigation pointing at a different occurrence.
+        this.rHistory.resetIndex();
+      }
       this.applyHistorySearchResult(selectedItem.code);
     } finally {
       picker.dispose();

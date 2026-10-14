@@ -895,7 +895,10 @@ The preference is retained in `context.globalState` across consoles and
 VS Code restarts. Each picker item keeps its original history index, so
 selecting an older duplicate preserves its navigation position, including
 when another console compacts shared history while the picker is open.
-Selecting an entry restores its code without executing it.
+Local submissions can continue while F8 is open. Picker item positions account
+for history entries evicted from the front of the cache; when the selected
+occurrence was evicted, F8 still restores its code but resets history navigation
+to avoid pointing to a different command. Selecting an entry never executes it.
 The picker title, placeholder, button presentation, limited-result matching,
 and duplicate handling are defined in `src/Terminal/history.ts` and checked
 in unit tests.

@@ -30,20 +30,12 @@ export class HistoryBuffer {
     return [...this.historyBuffer];
   }
 
-  selectEntry(entry: string): void {
-    this.refreshFromDisk();
-    const index = this.historyBuffer.lastIndexOf(entry);
-    if (index >= 0) {
-      this.historyIndex = index;
-    }
-  }
-
   selectEntryAt(index: number): void {
     if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length) {
       return;
     }
-    // The picker holds a snapshot of this buffer. Set the original position
-    // before refreshing, so a concurrent compaction remaps the same occurrence.
+    // Record the selected occurrence before the next asynchronous refresh,
+    // so subsequent worker compaction remaps this navigation cursor.
     this.historyIndex = index;
     this.refreshFromDisk();
   }

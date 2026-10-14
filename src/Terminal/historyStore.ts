@@ -479,10 +479,8 @@ export class HistoryStore extends HistoryBuffer {
     this.pushEntries([{ id: randomUUID(), code: entry }]);
   }
 
-  pushEntries(entries: readonly (HistoryWrite | string)[]): void {
-    for (const value of entries) {
-      const entry = typeof value === "string"
-        ? { id: randomUUID(), code: value } : value;
+  pushEntries(entries: readonly HistoryWrite[]): void {
+    for (const entry of entries) {
       if (!entry.code.trim() || this.savedIds.has(entry.id) ||
         this.pendingEntries.some((pending) => pending.id === entry.id)) continue;
       this.pendingEntries.push(entry);

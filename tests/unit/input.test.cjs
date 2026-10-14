@@ -111,6 +111,51 @@ test("F8 searches the full history cache but limits visible results", () => {
   assert.deepEqual(getHistoryPickerEntries(entries, false, "", 0), []);
 });
 
+test("F8 retains stable selection positions across local history evictions", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-evict-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const history = new HistoryManager(path.join(root, "history"));
+  history.setSearchNoDuplicates(true);
+  // Fill without triggering worker I/O: the focused test concerns the
+  // foreground picker cache and the cumulative front-eviction counter.
+  history.historyBuffer = Array.from({ length: 20000 }, (_, i) => `command-${i}`);
+  history.historyIndex = history.historyBuffer.length;
+  history.historyBuffer[5999] = "OLDER_TAG";
+  history.historyBuffer[0] = "EVICTED_TAG";
+
+  const [latest] = history.getPickerEntries("command-19999", false);
+  const [older] = history.getPickerEntries("OLDER_TAG", false);
+  const [evicted] = history.getPickerEntries("EVICTED_TAG", false);
+  assert.deepEqual(older, { code: "OLDER_TAG", historyIndex: 5999 });
+
+  history.push("new-a");
+  history.push("new-b");
+  assert.equal(history.selectPickerEntry(latest), true);
+  assert.equal(history.navigate(-1), "command-19998");
+
+  assert.equal(history.selectPickerEntry(older), true);
+  assert.equal(history.navigate(-1), "command-5998");
+  assert.equal(history.selectPickerEntry(evicted), false);
+  history.resetIndex();
+
+  // Newly generated results use the same stable coordinate system.
+  const [updated] = history.getPickerEntries("new-b", false);
+  assert.deepEqual(updated, { code: "new-b", historyIndex: 20001 });
+  history.push("new-c");
+  assert.equal(history.selectPickerEntry(updated), true);
+  assert.equal(history.navigate(-1), "new-a");
+
+  // A duplicate at an older occurrence retains its exact position.
+  history.historyBuffer = Array.from({ length: 20000 }, (_, i) =>
+    i === 2 || i === 15000 ? "repeat()" : `command-${i}`);
+  history.pickerFrontEvictions = 0;
+  const duplicates = history.getPickerEntries("repeat()", false);
+  assert.deepEqual(duplicates.map((item) => item.historyIndex), [15000, 2]);
+  history.push("new-d");
+  assert.equal(history.selectPickerEntry(duplicates[1]), true);
+  assert.equal(history.navigate(0), "repeat()");
+});
+
 test("F8 selection of an older repeated command keeps its original navigation position", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-index-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -314,9 +359,9 @@ test("another console's compaction preserves an older history cursor", (t) => {
   trimmed.load();
   writer.load();
 
-  browsing.selectEntry("command-5000");
+  browsing.selectEntryAt(5000);
   assert.equal(browsing.navigate(1), "repeat()");
-  trimmed.selectEntry("command-100");
+  trimmed.selectEntryAt(100);
 
   // The writer removes the oldest 1000 entries and appends another.
   writer.push("latest()");

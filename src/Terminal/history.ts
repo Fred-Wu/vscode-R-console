@@ -172,6 +172,9 @@ export class HistoryManager extends HistoryBuffer {
   private disabled = false;
   private suspended = 0;
   private deferredUpdates: HistoryUpdate[] = [];
+  // Only local pushes can evict cached entries while F8 defers worker updates.
+  // Monotonic positions keep each displayed occurrence stable without a snapshot.
+  private pickerFrontEvictions = 0;
 
   constructor(
     private readonly location: HistoryLocation,
@@ -186,11 +189,27 @@ export class HistoryManager extends HistoryBuffer {
   }
 
   getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
-    return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query);
+    return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query)
+      .map(({ code, historyIndex }) => ({
+        code, historyIndex: historyIndex + this.pickerFrontEvictions,
+      }));
+  }
+
+  // F8 items carry a position from when they were displayed, not a live
+  // array index. Return false if local submissions evicted the occurrence.
+  selectPickerEntry(entry: HistoryPickerEntry): boolean {
+    const index = entry.historyIndex - this.pickerFrontEvictions;
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length ||
+      this.historyBuffer[index] !== entry.code) {
+      return false;
+    }
+    this.selectEntryAt(index);
+    return true;
   }
 
   override push(entry: string): void {
     if (!entry.trim() || this.closing) return;
+    if (this.historyBuffer.length >= this.maxHistorySize) this.pickerFrontEvictions++;
     super.push(entry);
     if (!this.disabled) {
       const write = { id: randomUUID(), code: entry };

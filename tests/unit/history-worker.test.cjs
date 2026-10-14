@@ -31,8 +31,8 @@ function fixture(t, banner = "") {
     fs: new Proxy({}, { get: () => () => assert.fail("History used filesystem on the console thread") }),
     worker_threads: {
       Worker: class extends Worker {
-        constructor(file) {
-          super(file, { workerData: { gate: gate.buffer } });
+        constructor(file, options) {
+          super(file, { ...options, workerData: { ...options?.workerData, gate: gate.buffer } });
           workers.push(this);
           this.on("message", (message) => messages.push(message));
         }
@@ -130,7 +130,7 @@ test("one history worker shares a scope and keeps other scopes separate", async 
   assert.deepEqual(first.getRecentSessionEntries(), ["first()"]);
 });
 
-test("background compaction preserves the selected duplicate and picker snapshot", async (t) => {
+test("background compaction preserves the selected duplicate while F8 defers updates", async (t) => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.dir, "history"), Array.from({ length: 20000 }, (_, i) =>
     "\n# time: original\n+" + (i === 5001 || i === 15001 ? "repeat()" : "command-" + i) + "\n").join(""));
@@ -156,7 +156,7 @@ test("background compaction preserves the selected duplicate and picker snapshot
   assert.equal(browsing.navigate(1), "command-5002");
 });
 
-test("F8 keeps a fixed snapshot and replays every deferred worker delta and acknowledgement", async (t) => {
+test("F8 keeps the foreground cache stable and replays deferred deltas and acknowledgements", async (t) => {
   const f = fixture(t);
   const history = f.create();
   const initial = { id: history.id, start: 0, reset: true, remove: 0, entries: ["original()"] };
@@ -166,7 +166,7 @@ test("F8 keeps a fixed snapshot and replays every deferred worker delta and ackn
   history.push("local()");
   const [pending] = history.pending;
   // Simulate successive worker deltas and durable acknowledgements received
-  // while the picker holds its immutable snapshot.
+  // while the picker is open and foreground worker updates are deferred.
   history.receive({ id: history.id, start: 0, reset: false, remove: 0,
     entries: ["first()"], persisted: [] });
   history.receive({ id: history.id, start: 0, reset: false, remove: 0,
