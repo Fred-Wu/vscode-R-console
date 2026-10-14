@@ -23,7 +23,10 @@ export function getHistoryFile(storageFolder: string, scope: HistoryScope, works
 }
 
 export type HistoryWrite = { id: string; code: string; createdAt?: number };
-type HistoryDeletion = { before: number; ids?: string[]; codes?: string[]; all?: boolean };
+export type HistoryDeletion = { before: number; ids?: string[]; codeHashes?: string[]; all?: boolean };
+function hashHistoryCode(code: string): string {
+  return createHash("sha256").update(code).digest("hex");
+}
 
 // Legacy history records lack an ID. Their absolute file ordinal survives
 // front compaction, so use it to derive a stable ID for each occurrence.
@@ -178,7 +181,11 @@ export class HistoryStore extends HistoryBuffer {
       this.deletions = [...complete.matchAll(/^# r-console-deletion: (.+)\r?$/gm)]
         .flatMap((match) => {
           try {
-            const value = JSON.parse(match[1]) as HistoryDeletion;
+            const value = JSON.parse(match[1]) as HistoryDeletion & { codes?: string[] };
+            if (Array.isArray(value.codes)) {
+              value.codeHashes = [...(value.codeHashes ?? []), ...value.codes.map(hashHistoryCode)];
+              delete value.codes;
+            }
             return typeof value.before === "number" && Number.isFinite(value.before) ? [value] : [];
           } catch { return []; }
         });
@@ -284,7 +291,8 @@ export class HistoryStore extends HistoryBuffer {
 
   private isDeleted(entry: HistoryWrite): boolean {
     return this.deletions.some((deletion) => (entry.createdAt ?? 0) <= deletion.before &&
-      (deletion.all || deletion.ids?.includes(entry.id) || deletion.codes?.includes(entry.code)));
+      (deletion.all || deletion.ids?.includes(entry.id) ||
+        deletion.codeHashes?.includes(hashHistoryCode(entry.code))));
   }
 
   private compactHistory(keep: number): void {
@@ -572,13 +580,13 @@ export class HistoryStore extends HistoryBuffer {
       before: selection.before ?? performance.timeOrigin + performance.now(),
       ...(selection.all ? { all: true } : {}),
       ...(selection.ids?.length ? { ids: [...selection.ids] } : {}),
-      ...(selection.codes?.length ? { codes: [...selection.codes] } : {}),
+      ...(selection.codes?.length ? { codeHashes: selection.codes.map(hashHistoryCode) } : {}),
     };
     const ids = new Set(deletion.ids ?? []);
-    const codes = new Set(deletion.codes ?? []);
+    const hashes = new Set(deletion.codeHashes ?? []);
     const matches = (entry: HistoryWrite, createdAt = 0): boolean =>
       createdAt <= deletion.before &&
-      (!!deletion.all || ids.has(entry.id) || codes.has(entry.code));
+      (!!deletion.all || ids.has(entry.id) || hashes.has(hashHistoryCode(entry.code)));
 
     // Never remove queued writes before the operation commits. If append is
     // blocked, deletion fails and the pending commands remain available.
@@ -633,6 +641,11 @@ export class HistoryStore extends HistoryBuffer {
       this.readHistoryFromDisk(true);
       return removed;
     });
+  }
+
+  getDeletionRules(): readonly HistoryDeletion[] {
+    this.refreshFromDisk();
+    return this.deletions;
   }
 
   getPersistedIds(ids: readonly string[]): string[] {

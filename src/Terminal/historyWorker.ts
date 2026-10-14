@@ -9,6 +9,7 @@ type RecordState = {
   unconfirmed: Set<string>;
   closed: boolean;
   initialized: boolean;
+  previousDeletions: number;
 };
 const stores = new Map<number, RecordState>();
 let shuttingDown = false;
@@ -24,13 +25,16 @@ function publish(id: number, record: RecordState): void {
   const reset = !record.initialized || remove < 0 || retained < 0 ||
     retained > snapshot.entries.length ||
     previous.ids.slice(remove).some((id, index) => id !== snapshot.ids[index]);
+  const deletions = record.store.getDeletionRules();
+  const deletedRules = deletions.slice(record.previousDeletions);
+  record.previousDeletions = deletions.length;
   const persisted = record.store.getPersistedIds([...record.unconfirmed]);
   for (const entry of persisted) record.unconfirmed.delete(entry);
   port.postMessage({
     id, start: snapshot.start, reset, remove,
     entries: reset ? snapshot.entries : snapshot.entries.slice(retained),
     ids: reset ? snapshot.ids : snapshot.ids.slice(retained),
-    persisted,
+    persisted, deletedRules,
   } satisfies HistoryUpdate);
   record.previous = snapshot;
   record.initialized = true;
@@ -68,7 +72,8 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
     const store = new HistoryStore(file);
     store.load();
     record = { store, previous: { entries: [], ids: [], start: 0 },
-      unconfirmed: new Set<string>(), closed: false, initialized: false };
+      unconfirmed: new Set<string>(), closed: false, initialized: false,
+      previousDeletions: 0 };
     stores.set(request.id, record);
   }
   if (request.page) {

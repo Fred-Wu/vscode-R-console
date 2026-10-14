@@ -835,8 +835,12 @@ matches on demand. Up/Down navigation requests older/newer windows when reaching
 a loaded boundary. An older picker selection loads its surrounding commands
 before restoring the navigation cursor. Deleting individual or checked entries
 operates on persisted occurrence IDs; collapsed duplicates are matched within
-the chosen history scope. Deletion rewrites under the history file lock. The
-Command Palette exposes Delete All Command History for the active scope.
+the chosen history scope. Deletion rewrites under the history file lock. Durable deletion metadata
+records occurrence IDs or hashes of deleted command text, never the deleted
+plaintext, together with a submission-time boundary. This prevents stale
+pending writes in another window or restarted worker from recreating deleted
+records while allowing genuinely new submissions after deletion.
+The Command Palette exposes Delete All Command History for the active scope.
 
 The worker manages plaintext command history separately
 from persistent terminal replay. Each console selects its scope at creation or

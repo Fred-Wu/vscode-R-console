@@ -590,15 +590,17 @@ test("a stale pending write in another store cannot resurrect deleted history", 
   first.load(); second.load();
   first.push("old()");
   const before = performance.timeOrigin + performance.now();
+  const staleId = require("node:crypto").randomUUID();
+  const freshId = require("node:crypto").randomUUID();
   first.deleteEntries({ all: true, before });
-  second.pushEntries([{ id: "stale-id", code: "old()", createdAt: before - 1 }]);
+  second.pushEntries([{ id: staleId, code: "old()", createdAt: before - 1 }]);
   assert.deepEqual(second.getEntries(), []);
-  second.pushEntries([{ id: "fresh-id", code: "old()", createdAt: before + 1 }]);
+  second.pushEntries([{ id: freshId, code: "old()", createdAt: before + 1 }]);
   const restored = new HistoryStore(file);
   restored.load();
   assert.deepEqual(restored.getEntries(), ["old()"]);
-  assert.deepEqual(restored.getPersistedIds(["stale-id", "fresh-id"]),
-    ["fresh-id"], "only a new submission should be stored on disk");
+  assert.deepEqual(restored.getPersistedIds([staleId, freshId]),
+    [freshId], "only a new submission should be stored on disk");
 });
 
 test("failed deletion keeps pending commands for a later successful append", (t) => {
@@ -693,4 +695,66 @@ test("F8 Enter restores the highlighted command rather than deleting it", async 
   await opened;
   assert.deepEqual(restored, ["restore()"]);
   assert.deepEqual(history.getEntries(), ["restore()"]);
+});
+
+
+test("collapsed deletion does not retain removed plaintext in history metadata", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create(file);
+  history.load();
+  const secret = "sensitive_command_with_secret_token()";
+  history.push(secret);
+  history.push(secret);
+  history.push("retained()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const collapsed = history.getPickerEntries(secret, true);
+  await history.deleteEntries(collapsed, true);
+  const onDisk = fs.readFileSync(file, "utf8");
+  assert.ok(!onDisk.includes(secret), "deleted command text must not survive in tombstones");
+  assert.match(onDisk, /# r-console-deletion:/);
+  assert.ok(onDisk.includes("retained()"));
+});
+
+test("remote deletion refresh removes matching local history caches", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const a = f.create(file);
+  const b = f.create(file);
+  a.load(); b.load();
+  a.push("from-A()");
+  b.push("from-B()");
+  await waitFor(() => a.unconfirmed.length === 0 && b.unconfirmed.length === 0);
+  await a.clearHistory();
+  b.save();
+  await waitFor(() => b.getEntries().length === 0);
+  assert.deepEqual(b.getRecentSessionEntries(), []);
+  assert.deepEqual(b.getPickerEntries("", false), []);
+});
+
+
+test("Up and Down preserve the unfinished input and cursor while browsing history", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("stored()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  inputState.insertText("draft command");
+  inputState.cursorPosition = 5;
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptVisible: true,
+    rHistory: history, inputState, historyBrowsing: false, historyCollapsed: true,
+    lang: { updateInput() {} }, clearInputRender() {}, renderInput() {},
+  });
+  terminal.navigateHistory(-1);
+  assert.equal(inputState.text, "stored()");
+  terminal.navigateHistory(1);
+  assert.equal(inputState.text, "draft command");
+  assert.equal(inputState.cursorPosition, 5);
 });

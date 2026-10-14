@@ -1,6 +1,6 @@
 import * as path from "path";
-import { randomUUID } from "crypto";
-import type { HistoryWrite } from "./historyStore";
+import { createHash, randomUUID } from "crypto";
+import type { HistoryWrite, HistoryDeletion } from "./historyStore";
 import { Worker } from "worker_threads";
 import { HistoryBuffer } from "./historyBuffer";
 
@@ -89,6 +89,7 @@ export type HistoryUpdate = {
   deleted?: string[];
   deletionComplete?: boolean;
   error?: string;
+  deletedRules?: readonly HistoryDeletion[];
   pageResult?: { requestId: number; entries: HistoryPickerEntry[]; hasMore: boolean };
 };
 
@@ -183,6 +184,7 @@ export class HistoryManager extends HistoryBuffer {
   private storedIds: string[] = [];
   private historyIds: string[] = [];
   private sessionIds: string[] = [];
+  private sessionTimestamps: number[] = [];
   private storedStart = 0;
   private browsingOlder = false;
   private scheduled: ReturnType<typeof setImmediate> | undefined;
@@ -257,6 +259,14 @@ export class HistoryManager extends HistoryBuffer {
     });
   }
 
+  async searchBackwardOnDemand(term: string): Promise<string | null> {
+    let found = this.searchBackward(term);
+    while (found === null && await this.loadOlderNavigation()) {
+      found = this.searchBackward(term);
+    }
+    return found;
+  }
+
   async loadOlderNavigation(): Promise<boolean> {
     const first = this.historyIds[0];
     if (!first || this.disabled) return false;
@@ -292,6 +302,8 @@ export class HistoryManager extends HistoryBuffer {
       if (!page.entries.length) {
         this.browsingOlder = false;
         this.reconcileHistory();
+        // The next Down press should restore the editable input immediately.
+        return true;
       }
       return false;
     }
@@ -347,7 +359,11 @@ export class HistoryManager extends HistoryBuffer {
     const write = { id: randomUUID(), code: entry, createdAt: performance.timeOrigin + performance.now() };
     super.push(entry);
     this.sessionIds.push(write.id);
-    if (this.sessionIds.length > this.maxHistorySize) this.sessionIds.shift();
+    this.sessionTimestamps.push(write.createdAt);
+    if (this.sessionIds.length > this.maxHistorySize) {
+      this.sessionIds.shift();
+      this.sessionTimestamps.shift();
+    }
     this.historyIds.push(write.id);
     if (this.historyIds.length > this.maxHistorySize) this.historyIds.shift();
     if (!this.disabled) {
@@ -461,6 +477,23 @@ export class HistoryManager extends HistoryBuffer {
       }
       return;
     }
+    if (update.deletedRules?.length) {
+      this.browsingOlder = false;
+      const shouldRemove = (entry: HistoryWrite): boolean =>
+        update.deletedRules!.some((rule) =>
+          (entry.createdAt ?? 0) <= rule.before &&
+          (rule.all || rule.ids?.includes(entry.id) ||
+            rule.codeHashes?.includes(createHash("sha256").update(entry.code).digest("hex"))));
+      this.pending = this.pending.filter((entry) => !shouldRemove(entry));
+      this.unconfirmed = this.unconfirmed.filter((entry) => !shouldRemove(entry));
+      if (this.sent) this.sent = this.sent.filter((entry) => !shouldRemove(entry));
+      const kept = this.sessionIds.map((id, index) => ({
+        id, code: this.sessionEntries[index], createdAt: this.sessionTimestamps[index],
+      })).filter((entry) => !shouldRemove(entry));
+      this.sessionIds = kept.map((entry) => entry.id);
+      this.sessionEntries = kept.map((entry) => entry.code);
+      this.sessionTimestamps = kept.map((entry) => entry.createdAt!);
+    }
     if (update.deletionComplete !== undefined) {
       const operation = this.deleting.shift();
       this.inFlightDeletion = undefined;
@@ -469,6 +502,8 @@ export class HistoryManager extends HistoryBuffer {
         this.pending = this.pending.filter((entry) => !removed.has(entry.id));
         this.unconfirmed = this.unconfirmed.filter((entry) => !removed.has(entry.id));
         this.sessionEntries = this.sessionEntries.filter((_code, index) =>
+          !removed.has(this.sessionIds[index]));
+        this.sessionTimestamps = this.sessionTimestamps.filter((_timestamp, index) =>
           !removed.has(this.sessionIds[index]));
         this.sessionIds = this.sessionIds.filter((id) => !removed.has(id));
         this.browsingOlder = false;
@@ -481,7 +516,8 @@ export class HistoryManager extends HistoryBuffer {
       }
       return;
     }
-    if (this.suspended && !this.closing && update.deleted?.length) {
+    if (this.suspended && !this.closing &&
+      (update.deleted?.length || update.deletedRules?.length)) {
       this.applyStoredUpdate(update);
       this.reconcileHistory();
       this.acknowledge(update);

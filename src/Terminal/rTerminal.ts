@@ -176,6 +176,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private rHistory: HistoryManager;
   private historyBrowsing = false;
   private historyCollapsed = true;
+  private savedHistoryInput: { text: string; cursor: number } | undefined;
   private escPendingClear = false;
 
   private lang: RTermLang;
@@ -1614,6 +1615,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.inputState.reset();
     this.historyBrowsing = false;
     this.historyCollapsed = true;
+    this.savedHistoryInput = undefined;
     this.rHistory.resetIndex();
     this.lang.updateInput("");
 
@@ -1701,6 +1703,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       collapseButton.tooltip = toggle.tooltip;
       picker.buttons = [collapseButton, deleteButton];
     };
+    let disposed = false;
     let pageOffset = 0;
     let pageItems: HistoryPickItem[] = [];
     let hasMore = false;
@@ -1720,12 +1723,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       ];
     };
     const updateItems = async (append = false): Promise<void> => {
+      if (disposed) return;
       const version = ++generation;
       const query = picker.value;
       const nextOffset = append ? pageOffset : 0;
       try {
         const page = await this.rHistory.getPage(query, collapseDuplicates, nextOffset);
-        if (version !== generation) return;
+        if (disposed || version !== generation) return;
         const items = page.entries.map(({ code, historyIndex, id }) => ({
           label: code, code, historyIndex, id,
         }));
@@ -1734,7 +1738,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         hasMore = page.hasMore;
         renderItems();
       } catch (error) {
-        if (version === generation) {
+        if (!disposed && version === generation) {
           void vscode.window.showErrorMessage("Could not load R Console history: " +
             (error instanceof Error ? error.message : String(error)));
         }
@@ -1745,7 +1749,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       try {
         await this.rHistory.deleteEntries(entries, collapseDuplicates);
         for (const entry of entries) checked.delete(itemKey(entry));
-        await updateItems();
+        if (!disposed) await updateItems();
       } catch (error) {
         void vscode.window.showErrorMessage(
           "Could not delete R Console history: " +
@@ -1804,6 +1808,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       }
       this.applyHistorySearchResult(selectedItem.code);
     } finally {
+      disposed = true;
       generation++;
       picker.dispose();
       resumeHistoryUpdates();
@@ -1811,6 +1816,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private applyHistorySearchResult(entry: string): void {
+    if (!this.historyBrowsing && !this.savedHistoryInput) {
+      this.savedHistoryInput = {
+        text: this.inputState.text, cursor: this.inputState.cursorPosition,
+      };
+    }
     this.ensureReadyPromptVisibleForInput();
     this.clearInputRender();
     this.historyBrowsing = true;
@@ -1822,6 +1832,9 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private navigateHistory(direction: number): void {
     if (direction < 0 && !this.historyBrowsing) {
+      this.savedHistoryInput = {
+        text: this.inputState.text, cursor: this.inputState.cursorPosition,
+      };
       this.rHistory.resetIndex();
     }
     const entry = this.rHistory.navigate(direction);
@@ -1829,8 +1842,12 @@ export class RTerminal implements vscode.Pseudoterminal {
       const load = direction < 0
         ? this.rHistory.loadOlderNavigation()
         : this.rHistory.loadNewerNavigation();
+      const inputAtRequest = this.inputState.text;
       void load.then((loaded) => {
-        if (loaded && this.mode === "ready" && this.promptReady) this.navigateHistory(direction);
+        if (loaded && this.mode === "ready" && this.promptReady &&
+          this.inputState.text === inputAtRequest) {
+          this.navigateHistory(direction);
+        }
       }).catch(() => {});
 
       return;
@@ -1840,7 +1857,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.clearInputRender();
       this.historyBrowsing = false;
       this.historyCollapsed = true;
+      const draft = this.savedHistoryInput;
+      this.savedHistoryInput = undefined;
       this.inputState.reset();
+      if (draft) {
+        this.inputState.insertText(draft.text);
+        this.inputState.cursorPosition = draft.cursor;
+      }
       this.promptVisible = false;
       this.renderInput();
       this.promptVisible = true;
