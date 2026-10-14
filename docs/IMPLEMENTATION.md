@@ -836,7 +836,7 @@ restored if persistence fails. Partial append failures roll back the attempted
 batch to its pre-append byte boundary while the file lock is held. If rollback
 fails, the next retry first verifies and removes only the exact attempted
 suffix; uncertain changes are left untouched rather than risking duplicate
-records or truncating another writer's data. If compaction completes but a subsequent append fails, the\nin-memory view retains the compacted commands plus still-pending submissions,\nnot commands already discarded from disk. Invalid or empty PID lock files\nare reclaimed after the stale-lock timeout; recent locks remain protected.
+records or truncating another writer's data. If compaction completes but a subsequent append fails, the\nin-memory view retains the compacted commands plus still-pending submissions,\nnot commands already discarded from disk. When a non-compacting write fails after reading another console's\nappends, the previous disk cursor and entry-count metadata are restored with\nthe in-memory buffer so the next retry incrementally rereads those entries. Invalid or empty PID lock files\nare reclaimed after the stale-lock timeout; recent locks remain protected.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
 path calls `HistoryManager.save()` to retry pending submissions synchronously

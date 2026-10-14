@@ -486,6 +486,58 @@ test("failed history appends keep queued commands visible until retry", (t) => {
   }
 });
 
+test("failed retry after another console appends preserves external commands", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-retry-external-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  let writesFail = true;
+  let bytesRead = 0;
+  const simulatedFs = {
+    ...fs,
+    readSync(...args) {
+      const count = fs.readSync(...args);
+      bytesRead += count;
+      return count;
+    },
+    appendFileSync(...args) {
+      if (args[0] === file && writesFail) {
+        const error = new Error("simulated append failure");
+        error.code = "EACCES";
+        throw error;
+      }
+      return fs.appendFileSync(...args);
+    },
+  };
+  const { HistoryManager: FailingHistory } = loadSource(
+    "src/Terminal/history.ts", { fs: simulatedFs }
+  );
+  const writer = new HistoryManager(file);
+  writer.load();
+  writer.push("a()");
+  const history = new FailingHistory(file);
+  history.load();
+  try {
+    history.push("x()");
+    assert.deepEqual(history.getEntries(), ["a()", "x()"]);
+    writer.push("b()");
+    // Retry reads b() before its append fails again.
+    history.save();
+    assert.deepEqual(history.getEntries(), ["a()", "x()"]);
+    writesFail = false;
+    bytesRead = 0;
+    history.save();
+    assert.ok(bytesRead > 0, "retry must reread unseen external commands");
+    assert.ok(bytesRead < 500, "retry should read only new bytes");
+    assert.deepEqual(history.getEntries(), ["a()", "b()", "x()"]);
+    const restored = new HistoryManager(file);
+    restored.load();
+    assert.deepEqual(restored.getEntries(), ["a()", "b()", "x()"]);
+  } finally {
+    writesFail = false;
+    history.save();
+  }
+});
+
 test("partial multi-command append rolls back and retries without duplicates", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-partial-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

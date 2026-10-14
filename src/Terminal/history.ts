@@ -365,6 +365,16 @@ export class HistoryManager {
     // Preserve the visible entries and cursor if the append subsequently fails.
     const visibleHistory = this.historyBuffer;
     const visibleIndex = this.historyIndex;
+    // A failed append restores this buffer; the disk cursor and entry count
+    // must be restored with it or subsequent incremental reads skip entries
+    // another console appended during the failed attempt.
+    const diskState = {
+      stamp: this.diskStamp,
+      offset: this.diskOffset,
+      fileId: this.diskFileId,
+      entryCount: this.lastEntryCount,
+      entryBase: this.diskEntryBase,
+    };
     let compactedHistory: string[] | undefined;
     let compactedIndex = 0;
     try {
@@ -419,8 +429,14 @@ export class HistoryManager {
               current.ino !== beforeAppend.ino)) {
               throw new Error("History file was replaced during a failed append.");
             }
-            // Undo all bytes from this attempt while still holding the lock.
-            fs.truncateSync(this.historyFile, beforeAppend?.size ?? 0);
+            // Undo only bytes written by this attempt. A no-op truncate
+            // changes mtime and needlessly forces a full history reload.
+            if (current.size < (beforeAppend?.size ?? 0)) {
+              throw new Error("History file shrank during a failed append.");
+            }
+            if (current.size > (beforeAppend?.size ?? 0)) {
+              fs.truncateSync(this.historyFile, beforeAppend?.size ?? 0);
+            }
           } catch (rollbackError) {
             // A nonexistent file cannot contain a partial append. Otherwise,
             // retain enough information to verify a safe rollback on retry.
@@ -464,6 +480,11 @@ export class HistoryManager {
         } else {
           this.historyBuffer = visibleHistory;
           this.historyIndex = visibleIndex;
+          this.diskStamp = diskState.stamp;
+          this.diskOffset = diskState.offset;
+          this.diskFileId = diskState.fileId;
+          this.lastEntryCount = diskState.entryCount;
+          this.diskEntryBase = diskState.entryBase;
         }
       }
       // Keep submissions locally and retry without blocking the R session.
