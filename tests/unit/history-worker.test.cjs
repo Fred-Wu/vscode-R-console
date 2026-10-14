@@ -439,7 +439,7 @@ test("delete all clears worker storage, picker and navigation without clearing o
   assert.deepEqual(restored.getEntries(), []);
 });
 
-test("history deletion failure rejects rather than reporting success", async (t) => {
+test("history deletion retries a contended file lock without reporting premature success", async (t) => {
   const f = fixture(t);
   const file = path.join(f.dir, "history");
   const history = f.create(file);
@@ -448,13 +448,16 @@ test("history deletion failure rejects rather than reporting success", async (t)
   await waitFor(() => history.unconfirmed.length === 0);
   const lock = file + ".lock";
   fs.writeFileSync(lock, String(process.pid));
+  let completed = false;
+  const deleting = history.clearHistory().then(() => { completed = true; });
   try {
-    await assert.rejects(history.clearHistory(), /busy|failed/i);
+    await delay(50);
+    assert.equal(completed, false, "deletion must wait for the contended file lock");
     assert.deepEqual(history.getEntries(), ["keep()"]);
   } finally {
     fs.unlinkSync(lock);
   }
-  await history.clearHistory();
+  await deleting;
   assert.deepEqual(history.getEntries(), []);
 });
 
@@ -576,6 +579,10 @@ test("Up and Down load older history incrementally without replacing the entire 
   assert.equal(await history.loadOlderNavigation(), true);
   assert.equal(history.navigate(-1), "command-449");
   assert.equal(history.getEntries().length, 400);
+  history.selectEntryAt(history.getEntries().length - 1);
+  assert.equal(history.navigate(1), undefined);
+  assert.equal(await history.loadNewerNavigation(), true);
+  assert.equal(history.navigate(1), null);
   history.resetIndex();
   assert.equal(history.navigate(-1), "command-649");
 });
@@ -757,4 +764,41 @@ test("Up and Down preserve the unfinished input and cursor while browsing histor
   terminal.navigateHistory(1);
   assert.equal(inputState.text, "draft command");
   assert.equal(inputState.cursorPosition, 5);
+});
+
+
+test("worker restart replays an in-flight deletion and settles its request", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create(file);
+  history.load();
+  history.push("delete-across-restart()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const request = history.clearHistory();
+  await f.workers[0].terminate();
+  await request;
+  assert.deepEqual(history.getEntries(), []);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), []);
+});
+
+test("irrecoverable deletion rewrite error rejects without corrupting saved history", async (t) => {
+  const f = fixture(t,
+    "const fs = require('node:fs');" +
+    "const rename = fs.renameSync;" +
+    "let fail = true;" +
+    "fs.renameSync = (...args) => {" +
+    " if (fail) { fail = false; throw new Error('simulated inaccessible destination'); }" +
+    " return rename(...args); };"
+  );
+  const history = f.create();
+  history.load();
+  history.push("retained()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  await assert.rejects(history.clearHistory(), /inaccessible destination/);
+  assert.deepEqual(history.getEntries(), ["retained()"]);
+  await history.clearHistory();
+  assert.deepEqual(history.getEntries(), []);
 });

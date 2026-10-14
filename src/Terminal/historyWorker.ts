@@ -10,6 +10,7 @@ type RecordState = {
   closed: boolean;
   initialized: boolean;
   previousDeletions: number;
+  pendingDeletions: NonNullable<HistoryRequest["delete"]>[];
 };
 const stores = new Map<number, RecordState>();
 let shuttingDown = false;
@@ -40,10 +41,34 @@ function publish(id: number, record: RecordState): void {
   record.initialized = true;
 }
 
+function applyDeletion(id: number, record: RecordState): boolean {
+  const deletion = record.pendingDeletions[0];
+  if (!deletion) return true;
+  let deleted: string[] | undefined;
+  let errorText: string | undefined;
+  try {
+    deleted = record.store.deleteEntries(deletion);
+    for (const removed of deleted) record.unconfirmed.delete(removed);
+  } catch (error) {
+    errorText = error instanceof Error ? error.message : String(error);
+    // File locks and queued appends are transient. Retain the deletion request
+    // and retry after the other writer completes; never silently drop it.
+    if (/history is busy|history writes are pending/i.test(errorText)) return false;
+  }
+  record.pendingDeletions.shift();
+  publish(id, record);
+  port.postMessage({ id, start: record.previous.start, reset: false,
+    remove: 0, entries: [], deleted, deletionComplete: !errorText, error: errorText }
+    satisfies HistoryUpdate);
+  return true;
+}
+
 function releaseClosedStores(): void {
   for (const [id, record] of stores) {
+    while (record.pendingDeletions.length && applyDeletion(id, record)) { /* drain */ }
     if (record.unconfirmed.size) publish(id, record);
-    if (record.closed && !record.store.hasPendingWrites && record.unconfirmed.size === 0) {
+    if (record.closed && !record.pendingDeletions.length &&
+      !record.store.hasPendingWrites && record.unconfirmed.size === 0) {
       record.store.dispose();
       stores.delete(id);
     }
@@ -73,7 +98,7 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
     store.load();
     record = { store, previous: { entries: [], ids: [], start: 0 },
       unconfirmed: new Set<string>(), closed: false, initialized: false,
-      previousDeletions: 0 };
+      previousDeletions: 0, pendingDeletions: [] };
     stores.set(request.id, record);
   }
   if (request.page) {
@@ -122,23 +147,8 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
   }
   for (const entry of request.entries) record.unconfirmed.add(entry.id);
   record.store.pushEntries(request.entries);
-  let deleted: string[] | undefined;
-  let deletionComplete = false;
-  let deletionError: string | undefined;
-  if (request.delete) {
-    try {
-      deleted = record.store.deleteEntries(request.delete);
-      for (const id of deleted) record.unconfirmed.delete(id);
-      deletionComplete = true;
-    } catch (error) {
-      deletionError = error instanceof Error ? error.message : String(error);
-    }
-  }
   record.closed = request.close;
-  publish(request.id, record);
-  if (request.delete) {
-    port.postMessage({ id: request.id, start: record.previous.start, reset: false,
-      remove: 0, entries: [], deleted, deletionComplete, error: deletionError });
-  }
+  if (request.delete) record.pendingDeletions.push(request.delete);
+  if (!request.delete) publish(request.id, record);
   releaseClosedStores();
 });
