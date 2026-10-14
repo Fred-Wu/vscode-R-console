@@ -3,16 +3,39 @@ import { getHistoryFile, HistoryStore } from "./historyStore";
 import type { HistoryRequest, HistoryUpdate } from "./history";
 
 const port = parentPort!;
-const stores = new Map<number, {
+type RecordState = {
   store: HistoryStore;
   previous: { entries: string[]; start: number };
+  unconfirmed: Set<string>;
   closed: boolean;
-}>();
+  initialized: boolean;
+};
+const stores = new Map<number, RecordState>();
 let shuttingDown = false;
+
+function publish(id: number, record: RecordState): void {
+  const snapshot = record.store.getSnapshot();
+  const previous = record.previous;
+  const remove = snapshot.start - previous.start;
+  const retained = previous.entries.length - remove;
+  const reset = !record.initialized || remove < 0 || retained < 0 ||
+    retained > snapshot.entries.length ||
+    previous.entries.slice(remove).some((entry, index) => entry !== snapshot.entries[index]);
+  const persisted = record.store.getPersistedIds([...record.unconfirmed]);
+  for (const entry of persisted) record.unconfirmed.delete(entry);
+  port.postMessage({
+    id, start: snapshot.start, reset, remove,
+    entries: reset ? snapshot.entries : snapshot.entries.slice(retained),
+    persisted,
+  } satisfies HistoryUpdate);
+  record.previous = snapshot;
+  record.initialized = true;
+}
 
 function releaseClosedStores(): void {
   for (const [id, record] of stores) {
-    if (record.closed && !record.store.hasPendingWrites) {
+    if (record.unconfirmed.size) publish(id, record);
+    if (record.closed && !record.store.hasPendingWrites && record.unconfirmed.size === 0) {
       record.store.dispose();
       stores.delete(id);
     }
@@ -40,24 +63,13 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       : getHistoryFile(location.storageFolder, location.scope, location.workspaceFolder);
     const store = new HistoryStore(file);
     store.load();
-    record = { store, previous: { entries: [], start: 0 }, closed: false };
+    record = { store, previous: { entries: [], start: 0 },
+      unconfirmed: new Set<string>(), closed: false, initialized: false };
     stores.set(request.id, record);
   }
+  for (const entry of request.entries) record.unconfirmed.add(entry.id);
   record.store.pushEntries(request.entries);
-  const snapshot = record.store.getSnapshot();
-  const previous = record.previous;
-  const remove = snapshot.start - previous.start;
-  const retained = previous.entries.length - remove;
-  const reset = remove < 0 || retained < 0 || retained > snapshot.entries.length ||
-    previous.entries.slice(remove).some((entry, index) => entry !== snapshot.entries[index]);
-  port.postMessage({
-    id: request.id,
-    start: snapshot.start,
-    reset,
-    remove,
-    entries: reset ? snapshot.entries : snapshot.entries.slice(retained),
-  } satisfies HistoryUpdate);
-  record.previous = snapshot;
   record.closed = request.close;
+  publish(request.id, record);
   releaseClosedStores();
 });

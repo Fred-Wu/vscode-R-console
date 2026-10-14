@@ -1,4 +1,6 @@
 import * as path from "path";
+import { randomUUID } from "crypto";
+import type { HistoryWrite } from "./historyStore";
 import { Worker } from "worker_threads";
 import { HistoryBuffer } from "./historyBuffer";
 
@@ -45,7 +47,7 @@ export type HistoryLocation = string | {
 export type HistoryRequest = {
   id: number;
   location: HistoryLocation;
-  entries: string[];
+  entries: HistoryWrite[];
   close: boolean;
 };
 
@@ -55,25 +57,37 @@ export type HistoryUpdate = {
   reset: boolean;
   remove: number;
   entries: string[];
+  persisted?: string[];
 };
 
 let worker: Worker | undefined;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let nextId = 0;
+const deadOwners = new Set<string>();
 const histories = new Map<number, HistoryManager>();
 
 function getWorker(workerPath: string): Worker {
   if (!worker) {
-    const created = new Worker(workerPath);
+    const owner = process.pid + ":" + randomUUID();
+    const created = new Worker(workerPath, {
+      workerData: { historyOwner: owner.split(":")[1], orphanOwners: [...deadOwners] },
+    });
     worker = created;
     created.on("message", (update: HistoryUpdate) => histories.get(update.id)?.receive(update));
     const failed = () => {
       if (worker !== created) return;
       worker = undefined;
+      deadOwners.add(owner);
       if (refreshTimer) clearInterval(refreshTimer);
       refreshTimer = undefined;
-      for (const history of histories.values()) history.disableStorage();
-      histories.clear();
+      for (const history of histories.values()) history.restartStorage();
+      if (histories.size) {
+        // Reopen on the next event-loop turn; never retry worker startup in
+        // a tight failure loop on the extension-host thread.
+        setTimeout(() => {
+          for (const history of histories.values()) history.save();
+        }, 100).unref();
+      }
     };
     created.on("error", failed);
     created.on("exit", failed);
@@ -123,8 +137,9 @@ export async function disposeHistoryWorker(): Promise<void> {
 
 export class HistoryManager extends HistoryBuffer {
   private readonly id = ++nextId;
-  private pending: string[] = [];
-  private sent: string[] | undefined;
+  private pending: HistoryWrite[] = [];
+  private sent: HistoryWrite[] | undefined;
+  private unconfirmed: HistoryWrite[] = [];
   private sentClosing = false;
   private stored: string[] = [];
   private storedStart = 0;
@@ -150,8 +165,11 @@ export class HistoryManager extends HistoryBuffer {
     if (!entry.trim() || this.closing) return;
     super.push(entry);
     if (!this.disabled) {
-      this.pending.push(entry);
+      const write = { id: randomUUID(), code: entry };
+      this.pending.push(write);
+      this.unconfirmed.push(write);
       if (this.pending.length > this.maxHistorySize) this.pending.shift();
+      if (this.unconfirmed.length > this.maxHistorySize) this.unconfirmed.shift();
     }
     this.save();
   }
@@ -197,6 +215,10 @@ export class HistoryManager extends HistoryBuffer {
       this.deferredUpdate = update;
       return;
     }
+    if (update.persisted?.length) {
+      const saved = new Set(update.persisted);
+      this.unconfirmed = this.unconfirmed.filter((entry) => !saved.has(entry.id));
+    }
     const sentLength = this.sent?.length ?? 0;
     if (update.reset || update.remove || update.entries.length || sentLength) {
       const oldLength = this.historyBuffer.length;
@@ -219,7 +241,7 @@ export class HistoryManager extends HistoryBuffer {
     }
     this.sent = undefined;
     if (this.closing) {
-      if (!this.sentClosing || this.pending.length) this.save();
+      if (!this.sentClosing || this.pending.length || this.unconfirmed.length) this.save();
       else histories.delete(this.id);
     } else if (this.pending.length) {
       this.save();
@@ -235,6 +257,15 @@ export class HistoryManager extends HistoryBuffer {
       this.receive(update);
     }
     this.save();
+  }
+
+  restartStorage(): void {
+    if (this.disabled) return;
+    this.sent = undefined;
+    this.sentClosing = false;
+    this.pending = [...this.unconfirmed];
+    if (this.scheduled) clearImmediate(this.scheduled);
+    this.scheduled = undefined;
   }
 
   disableStorage(): void {

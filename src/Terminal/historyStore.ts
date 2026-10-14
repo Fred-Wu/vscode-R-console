@@ -1,4 +1,5 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
+import { workerData } from "worker_threads";
 import * as fs from "fs";
 import * as path from "path";
 import { HistoryBuffer } from "./historyBuffer";
@@ -21,6 +22,8 @@ export function getHistoryFile(storageFolder: string, scope: HistoryScope, works
   return path.join(storageFolder, "history", "workspace-" + id + ".history");
 }
 
+export type HistoryWrite = { id: string; code: string };
+
 export class HistoryStore extends HistoryBuffer {
   // Reclaim headroom in batches instead of rewriting 20,000 commands on every submit.
   private readonly compactToSize = 19000;
@@ -32,10 +35,12 @@ export class HistoryStore extends HistoryBuffer {
   private diskEntryBase = 0;
   private diskOffset = 0;
   private diskFileId: string | undefined;
-  private pendingEntries: string[] = [];
-  // A failed append whose rollback also failed must be resolved before retrying,
-  // or already written records could be appended a second time.
-  private unresolvedAppend?: { offset: number; fileId: string; bytes: Buffer };
+  private pendingEntries: HistoryWrite[] = [];
+  private savedIds = new Set<string>();
+  private needsRecovery = false;
+  private readonly lockOwner = process.pid + ":" +
+    (workerData?.historyOwner || randomUUID());
+  private readonly orphanOwners = new Set<string>(workerData?.orphanOwners ?? []);
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private retryDelay = 50;
 
@@ -144,6 +149,10 @@ export class HistoryStore extends HistoryBuffer {
     if (reload) {
       this.diskEntryBase = Number.isSafeInteger(parsedBase) ? parsedBase : 0;
     }
+    if (reload) this.savedIds.clear();
+    for (const match of complete.matchAll(/^# history-complete: ([0-9a-f-]{36})\r?$/gm)) {
+      this.savedIds.add(match[1]);
+    }
     const combined = reload ? entries : [...this.historyBuffer, ...entries];
     this.historyBuffer = combined.slice(-this.maxHistorySize);
     this.lastEntryCount = previousCount + entries.length;
@@ -160,21 +169,18 @@ export class HistoryStore extends HistoryBuffer {
   }
 
   load(): void {
-    this.refreshFromDisk(true);
-    this.sessionEntries = [];
-    // Cap pre-existing history files when this console starts, not on extension activation.
-    if (this.lastEntryCount > this.maxHistorySize) {
-      try {
-        this.withFileLock(() => {
-          this.readHistoryFromDisk(true);
-          if (this.lastEntryCount > this.maxHistorySize) {
-            this.compactHistory(this.maxHistorySize);
-          }
-        });
-      } catch {
-        // Storage issues must not prevent the R console from starting.
-      }
+    try {
+      this.withFileLock(() => {
+        this.recoverInterruptedRecords();
+        this.readHistoryFromDisk(true);
+        if (this.lastEntryCount > this.maxHistorySize) {
+          this.compactHistory(this.maxHistorySize);
+        }
+      });
+    } catch {
+      // Storage issues must not prevent the R console from starting.
     }
+    this.sessionEntries = [];
   }
 
   save(): void {
@@ -198,7 +204,8 @@ export class HistoryStore extends HistoryBuffer {
       let reclaimed = false;
       try {
         const ownerText = fs.readFileSync(lockPath, "utf8").trim();
-        const owner = /^\d+$/.test(ownerText) ? Number(ownerText) : NaN;
+        const ownerPid = /^(\d+)(?::[0-9a-f-]+)?$/.exec(ownerText);
+        const owner = ownerPid ? Number(ownerPid[1]) : NaN;
         const validOwner = Number.isSafeInteger(owner) && owner > 0;
         const age = Date.now() - fs.statSync(lockPath).mtimeMs;
         let dead = false;
@@ -209,7 +216,8 @@ export class HistoryStore extends HistoryBuffer {
             dead = (processError as NodeJS.ErrnoException).code === "ESRCH";
           }
         }
-        if (dead || (age > 120000 && !validOwner)) {
+        if (this.orphanOwners.has(ownerText) || dead ||
+          (age > 120000 && !validOwner)) {
           fs.rmSync(lockPath, { force: true });
           reclaimed = true;
         }
@@ -221,7 +229,7 @@ export class HistoryStore extends HistoryBuffer {
       fd = fs.openSync(lockPath, "wx", 0o600);
     }
     try {
-      fs.writeSync(fd, String(process.pid));
+      fs.writeSync(fd, this.lockOwner);
       return action();
     } finally {
       fs.closeSync(fd);
@@ -245,7 +253,7 @@ export class HistoryStore extends HistoryBuffer {
     const records = entries.length > 0 && boundaries.length === this.lastEntryCount &&
       boundaries.length >= entries.length
       ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
-      : entries.map((entry) => this.serializeEntry(entry)).join("");
+      : entries.map((code) => this.serializeEntry({ id: randomUUID(), code })).join("");
     const content = "# r-console-history-base: " + nextBase + "\n" + records;
     const temporary = this.historyFile + "." + process.pid + "." +
       Math.random().toString(16).slice(2) + ".tmp";
@@ -267,12 +275,57 @@ export class HistoryStore extends HistoryBuffer {
     this.diskStamp = stat.size + ":" + stat.mtimeMs;
     this.diskOffset = stat.size;
     this.diskFileId = stat.dev + ":" + stat.ino;
+    this.savedIds = new Set(
+      [...content.matchAll(/^# history-complete: ([0-9a-f-]{36})\r?$/gm)].map((match) => match[1])
+    );
   }
 
-  private serializeEntry(entry: string): string {
+  private serializeEntry(entry: HistoryWrite): string {
     const now = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
-    return "\n# time: " + now + "\n" +
-      entry.split("\n").map((line) => "+" + line + "\n").join("");
+    return "\n# time: " + now + " history-id: " + entry.id + "\n" +
+      entry.code.split("\n").map((line) => "+" + line + "\n").join("") +
+      "# history-complete: " + entry.id + "\n";
+  }
+
+  private recoverInterruptedRecords(): void {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.historyFile, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n/g)];
+    let rebuilt = "";
+    let offset = 0;
+    let changed = false;
+    for (let i = 0; i < boundaries.length; i++) {
+      const begin = boundaries[i].index!;
+      const end = i + 1 < boundaries.length ? boundaries[i + 1].index! : raw.length;
+      const record = raw.slice(begin, end);
+      const tag = /history-id: ([0-9a-f-]{36})\r?\n/.exec(record);
+      if (tag && !record.includes("# history-complete: " + tag[1] + "\n")) {
+        rebuilt += raw.slice(offset, begin);
+        offset = end;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      this.needsRecovery = false;
+      return;
+    }
+    rebuilt += raw.slice(offset);
+    const stat = fs.statSync(this.historyFile);
+    const temporary = this.historyFile + "." + process.pid + "." + randomUUID() + ".tmp";
+    try {
+      fs.writeFileSync(temporary, rebuilt, {
+        encoding: "utf8", flag: "wx", mode: stat.mode & 0o777,
+      });
+      fs.renameSync(temporary, this.historyFile);
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+    this.needsRecovery = false;
   }
 
   private scheduleRetry(): void {
@@ -284,35 +337,6 @@ export class HistoryStore extends HistoryBuffer {
     this.retryTimer = setTimeout(retry, this.retryDelay);
     this.retryTimer.unref();
     this.retryDelay = Math.min(this.retryDelay * 2, 5000);
-  }
-
-  private recoverUnresolvedAppend(): void {
-    const failed = this.unresolvedAppend;
-    if (!failed) return;
-    const stat = fs.statSync(this.historyFile);
-    const fileId = stat.dev + ":" + stat.ino;
-    const length = stat.size - failed.offset;
-    // Never truncate a replaced file, or another writer's completed append.
-    if (fileId !== failed.fileId || length < 0 || length > failed.bytes.length) {
-      throw new Error("Cannot safely recover a partially written R Console history batch.");
-    }
-    const actual = Buffer.alloc(length);
-    const fd = fs.openSync(this.historyFile, "r");
-    try {
-      let position = 0;
-      while (position < length) {
-        const count = fs.readSync(fd, actual, position, length - position, failed.offset + position);
-        if (!count) throw new Error("Could not verify partial R Console history append.");
-        position += count;
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-    if (!actual.equals(failed.bytes.subarray(0, length))) {
-      throw new Error("R Console history changed after a failed append.");
-    }
-    if (length > 0) fs.truncateSync(this.historyFile, failed.offset);
-    this.unresolvedAppend = undefined;
   }
 
   private flushPending(): void {
@@ -336,7 +360,7 @@ export class HistoryStore extends HistoryBuffer {
     try {
       this.withFileLock(() => {
         // Resolve an earlier failed rollback before reading or appending anything.
-        this.recoverUnresolvedAppend();
+        if (this.needsRecovery) this.recoverInterruptedRecords();
         // The in-memory tail also contains pending submissions. Temporarily
         // remove it so incremental disk reconciliation cannot duplicate them.
         // The catch block restores the original view if persistence fails.
@@ -354,7 +378,12 @@ export class HistoryStore extends HistoryBuffer {
           fs.truncateSync(this.historyFile, this.diskOffset);
           this.readHistoryFromDisk(false);
         }
-        const queued = this.pendingEntries.slice(-this.maxHistorySize);
+        const queued = this.pendingEntries.filter((entry) => !this.savedIds.has(entry.id))
+          .slice(-this.maxHistorySize);
+        if (!queued.length) {
+          this.pendingEntries = [];
+          return;
+        }
         if (this.lastEntryCount + queued.length > this.maxHistorySize) {
           const keep = Math.max(0, Math.min(
             this.compactToSize, this.maxHistorySize - queued.length
@@ -398,18 +427,15 @@ export class HistoryStore extends HistoryBuffer {
             // retain enough information to verify a safe rollback on retry.
             if ((rollbackError as NodeJS.ErrnoException).code !== "ENOENT") {
               const current = fs.statSync(this.historyFile);
-              this.unresolvedAppend = {
-                offset: beforeAppend?.size ?? 0,
-                fileId: (beforeAppend ?? current).dev + ":" + (beforeAppend ?? current).ino,
-                bytes: Buffer.from(batch, "utf8"),
-              };
+              this.needsRecovery = true;
             }
           }
           throw error;
         }
         // No retry if subsequent metadata access fails after the append.
         this.pendingEntries = [];
-        this.historyBuffer.push(...queued);
+        for (const entry of queued) this.savedIds.add(entry.id);
+        this.historyBuffer.push(...queued.map((entry) => entry.code));
         this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
         this.historyIndex = this.historyBuffer.length;
         this.lastEntryCount += queued.length;
@@ -427,7 +453,7 @@ export class HistoryStore extends HistoryBuffer {
     } catch {
       if (this.pendingEntries.length) {
         if (compactedHistory) {
-          const combined = [...compactedHistory, ...this.pendingEntries];
+          const combined = [...compactedHistory, ...this.pendingEntries.map((entry) => entry.code)];
           const removed = Math.max(0, combined.length - this.maxHistorySize);
           this.historyBuffer = combined.slice(removed);
           this.historyIndex = compactedIndex === compactedHistory.length
@@ -450,14 +476,17 @@ export class HistoryStore extends HistoryBuffer {
   }
 
   override push(entry: string): void {
-    this.pushEntries([entry]);
+    this.pushEntries([{ id: randomUUID(), code: entry }]);
   }
 
-  pushEntries(entries: string[]): void {
-    for (const entry of entries) {
-      if (!entry.trim()) continue;
+  pushEntries(entries: readonly (HistoryWrite | string)[]): void {
+    for (const value of entries) {
+      const entry = typeof value === "string"
+        ? { id: randomUUID(), code: value } : value;
+      if (!entry.code.trim() || this.savedIds.has(entry.id) ||
+        this.pendingEntries.some((pending) => pending.id === entry.id)) continue;
       this.pendingEntries.push(entry);
-      super.push(entry);
+      super.push(entry.code);
     }
     this.flushPending();
   }
@@ -469,6 +498,10 @@ export class HistoryStore extends HistoryBuffer {
       start: this.diskEntryBase + Math.max(0,
         this.lastEntryCount + this.pendingEntries.length - entries.length),
     };
+  }
+
+  getPersistedIds(ids: readonly string[]): string[] {
+    return ids.filter((id) => this.savedIds.has(id));
   }
 
   get hasPendingWrites(): boolean {

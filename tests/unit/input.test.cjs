@@ -577,6 +577,52 @@ test("partial multi-command append rolls back and retries without duplicates", (
   assert.deepEqual(restored.getEntries(), ["existing()", "first()", "second()"]);
 });
 
+test("incomplete append is removed without losing another writer's entries", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-interleaved-recovery-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "history");
+  const writerB = new HistoryManager(file);
+  writerB.load();
+  writerB.push("before()");
+  let failAppend = true;
+  let failRollback = true;
+  const simulatedFs = {
+    ...fs,
+    appendFileSync(...args) {
+      if (args[0] === file && failAppend) {
+        failAppend = false;
+        // Keep the full tagged header but truncate the completion marker.
+        fs.appendFileSync(file, String(args[1]).slice(0, 120));
+        throw new Error("partial append");
+      }
+      return fs.appendFileSync(...args);
+    },
+    truncateSync(...args) {
+      if (args[0] === file && failRollback) {
+        failRollback = false;
+        throw new Error("rollback unavailable");
+      }
+      return fs.truncateSync(...args);
+    },
+  };
+  const { HistoryManager: FailingHistory } = loadHistoryStore({ fs: simulatedFs });
+  const writerA = new FailingHistory(file);
+  writerA.load();
+  try {
+    writerA.push("from-A()");
+    writerB.push("from-B()");
+    writerA.save();
+    const reopened = new HistoryManager(file);
+    reopened.load();
+    assert.deepEqual(reopened.getEntries(), ["before()", "from-B()", "from-A()"]);
+    writerA.save();
+    reopened.load();
+    assert.deepEqual(reopened.getEntries(), ["before()", "from-B()", "from-A()"]);
+  } finally {
+    writerA.dispose();
+  }
+});
+
 test("failed partial-append rollback is recovered before retry", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-rollback-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

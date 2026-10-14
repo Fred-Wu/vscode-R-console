@@ -174,20 +174,72 @@ test("closing a console drains queued writes after a contended lock is released"
   assert.deepEqual(restored.getEntries(), ["retained-on-close()"]);
 });
 
-test("history worker failure leaves local input history usable", async (t) => {
+test("worker restart replays unacknowledged commands without duplicates", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create();
+  history.load();
+  history.push("before()");
+  await waitFor(() => f.workers.length === 1);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, String(process.pid));
+  history.push("during-lock()");
+  await waitFor(() => history.sent === undefined);
+  await f.workers[0].terminate();
+  await waitFor(() => f.workers.length === 2);
+  fs.unlinkSync(lock);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["before()", "during-lock()"]);
+  history.push("after()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["before()", "during-lock()", "after()"]);
+});
+
+test("dead worker's lock token can be reclaimed by its replacement", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create();
+  history.load();
+  await waitFor(() => f.workers.length === 1);
+  // Observe the worker's lock identity by blocking its first append.
+  const token = String(process.pid) + ":orphan-worker-token";
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, token);
+  // The token belongs to a previously crashed worker, not the live worker.
+  // Here test the store directly using its explicit dead-worker ownership list.
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts", {
+    worker_threads: { workerData: {
+      historyOwner: "replacement-worker-token",
+      orphanOwners: [token],
+    } },
+  });
+  const store = new HistoryStore(file);
+  store.load();
+  store.push("recovered()");
+  assert.deepEqual(store.getEntries(), ["recovered()"]);
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test("worker failure retains history and resumes persistence", async (t) => {
   const f = fixture(t);
   const history = f.create();
   history.load();
   history.push("before()");
-  const resume = history.suspendUpdates();
-  await waitFor(() => history.deferredUpdate);
-  history.push("during-picker()");
+  await waitFor(() => history.unconfirmed.length === 0);
   await f.workers[0].terminate();
-  await waitFor(() => history.disabled);
-  resume();
-  history.push("after()");
+  history.push("during-restart()");
+  await waitFor(() => f.workers.length === 2);
+  await waitFor(() => history.unconfirmed.length === 0);
   history.resetIndex();
-  assert.equal(history.navigate(-1), "after()");
-  assert.equal(history.navigate(-1), "during-picker()");
+  assert.equal(history.navigate(-1), "during-restart()");
   assert.equal(history.navigate(-1), "before()");
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const store = new HistoryStore(path.join(f.dir, "history"));
+  store.load();
+  assert.deepEqual(store.getEntries(), ["before()", "during-restart()"]);
 });

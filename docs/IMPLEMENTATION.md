@@ -820,6 +820,12 @@ not persisted.
 search, and navigation. One shared background worker handles file access,
 workspace-path resolution, parsing, and compaction through `historyStore.ts`.
 Console startup and command submission do not wait for history storage.
+Each submitted command has a stable record ID and an explicit completion marker;
+the foreground retains unconfirmed submissions until a durable acknowledgement.
+If the worker fails, it is restarted and replays unconfirmed records idempotently.
+Worker-instance lock tokens allow the replacement to reclaim an orphaned lock
+without treating other live workers as stale. Partial tagged records can be
+removed atomically while preserving completed records appended by other consoles.
 New commands are available locally immediately; saved commands and changes
 from other consoles arrive in the background. Updates carry only changed
 entries when possible, and picker selections keep a stable snapshot.
