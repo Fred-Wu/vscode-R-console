@@ -21,19 +21,43 @@ export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean):
     : { icon: "collapse-all", tooltip: "Collapse duplicate commands" };
 }
 
-// The history picker lists newest commands first. Preserve each occurrence's
-// original index so selecting an older duplicate navigates from that position.
+export const HISTORY_PICKER_LIMIT = 50;
+
+export type HistoryPickerEntry = { code: string; historyIndex: number };
+
+// Search the existing console history buffer without copying it. Quick Pick
+// only needs a small newest-first set; matching runs over the full cache.
+// A subsequence match preserves Quick Pick's fuzzy-search behavior.
 export function getHistoryPickerEntries(
   entries: readonly string[],
-  collapseDuplicates: boolean
-): { code: string; historyIndex: number }[] {
-  const items: { code: string; historyIndex: number }[] = [];
-  const seen = new Set<string>();
+  collapseDuplicates: boolean,
+  query = "",
+  limit = HISTORY_PICKER_LIMIT
+): HistoryPickerEntry[] {
+  const items: HistoryPickerEntry[] = [];
+  if (!Number.isSafeInteger(limit) || limit <= 0) return items;
+  const term = query.toLowerCase();
+  const seen = collapseDuplicates ? new Set<string>() : undefined;
   for (let historyIndex = entries.length - 1; historyIndex >= 0; historyIndex--) {
     const code = entries[historyIndex];
-    if (collapseDuplicates && seen.has(code)) continue;
-    seen.add(code);
+    if (term) {
+      const lowerCode = code.toLowerCase();
+      let position = 0;
+      let matched = true;
+      for (const char of term) {
+        position = lowerCode.indexOf(char, position);
+        if (position < 0) {
+          matched = false;
+          break;
+        }
+        position++;
+      }
+      if (!matched) continue;
+    }
+    if (seen?.has(code)) continue;
+    seen?.add(code);
     items.push({ code, historyIndex });
+    if (items.length === limit) break;
   }
   return items;
 }
@@ -159,6 +183,10 @@ export class HistoryManager extends HistoryBuffer {
 
   load(): void {
     this.save();
+  }
+
+  getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
+    return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query);
   }
 
   override push(entry: string): void {

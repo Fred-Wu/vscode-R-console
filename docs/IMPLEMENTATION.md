@@ -828,7 +828,9 @@ without treating other live workers as stale. Partial tagged records can be
 removed atomically while preserving completed records appended by other consoles.
 New commands are available locally immediately; saved commands and changes
 from other consoles arrive in the background. Updates carry only changed
-entries when possible, and picker selections keep a stable snapshot.
+entries when possible. F8 searches the console's existing in-memory history
+directly rather than making a second complete history snapshot. It supplies
+only the newest 50 matching commands to the Quick Pick at a time.
 
 The worker manages plaintext command history separately
 from persistent terminal replay. Each console selects its scope at creation or
@@ -860,9 +862,10 @@ restores its previous disk cursor and count so retries reread concurrent
 writes correctly. Invalid or empty lock owners are reclaimed after the
 stale-lock timeout, while recent locks stay protected. A replacement worker
 can also reclaim a lock identified as belonging to a terminated worker.
-F8 freezes the picker snapshot and defers foreground history updates; all
-incremental updates and persistence acknowledgements are replayed in order
-after the picker closes. Background worker file access is never suspended.
+F8 keeps the current in-memory history positions stable while the picker is
+open by deferring foreground updates. All incremental updates and persistence
+acknowledgements are replayed in order after it closes. Background worker
+file access is never suspended.
 Readers and writers coordinate through a per-file lock; queued submissions
 are retried after lock contention or write failures. The terminal disposal
 path queues remaining writes and releases the console immediately. The worker
@@ -881,16 +884,21 @@ them. Ctrl+R searches backward for the current line's trimmed text anywhere
 in a saved command; repeated Ctrl+R uses the original term to find older
 matches. F8 (`r-console.searchHistory`, displayed as
 **R Console: Show Command History**) opens **R Console: Command History**,
-a Quick Pick of saved commands in newest-first order. Text input filters this
-snapshot. The `collapse-all` button hides exact duplicate entries in this
-picker only; when enabled, it switches to `expand-all` to show all entries.
+a Quick Pick initially showing the newest 50 cached commands. Typing searches
+the entire console history cache (case-insensitive fuzzy subsequence matching),
+then updates the Quick Pick with at most the newest 50 matching commands.
+Only displayed matches are constructed as Quick Pick items; the full history
+is neither copied for F8 nor read again from disk. The `collapse-all` button
+hides exact duplicate entries among all matching commands; when enabled, it
+switches to `expand-all` to show repeated occurrences.
 The preference is retained in `context.globalState` across consoles and
 VS Code restarts. Each picker item keeps its original history index, so
 selecting an older duplicate preserves its navigation position, including
 when another console compacts shared history while the picker is open.
 Selecting an entry restores its code without executing it.
-The picker title, placeholder, and button presentation are defined in
-`src/Terminal/history.ts` and checked in unit tests.
+The picker title, placeholder, button presentation, limited-result matching,
+and duplicate handling are defined in `src/Terminal/history.ts` and checked
+in unit tests.
 
 ## 5. Files To Read First
 

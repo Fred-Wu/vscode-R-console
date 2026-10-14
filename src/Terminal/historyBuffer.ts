@@ -20,6 +20,11 @@ export class HistoryBuffer {
     this.historyIndex = this.historyBuffer.length;
   }
 
+  hasEntries(): boolean {
+    this.refreshFromDisk();
+    return this.historyBuffer.length > 0;
+  }
+
   getEntries(): string[] {
     this.refreshFromDisk();
     return [...this.historyBuffer];

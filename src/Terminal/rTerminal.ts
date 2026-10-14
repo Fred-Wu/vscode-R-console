@@ -8,8 +8,8 @@ import {
   stripBracketedPasteMarkers,
 } from "./ansi";
 import { ConsoleSyntax } from "./consoleSyntax";
-import { HistoryManager, getHistoryPickerEntries,
-  getHistoryPickerTogglePresentation, historyPickerText, type HistoryScope } from "./history";
+import { HistoryManager, getHistoryPickerTogglePresentation,
+  historyPickerText, type HistoryScope } from "./history";
 import { InputState } from "./inputState";
 import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
@@ -1654,8 +1654,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.mode !== "ready" || !this.promptReady) {
       return;
     }
-    const entries = this.rHistory.getEntries();
-    if (entries.length === 0) {
+    if (!this.rHistory.hasEntries()) {
       void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
       return;
     }
@@ -1667,6 +1666,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const resumeHistoryUpdates = this.rHistory.suspendUpdates();
     picker.title = historyPickerText.title;
     picker.placeholder = historyPickerText.placeholder;
+    picker.sortByLabel = false;
     const preferenceKey = "historyPicker.collapseDuplicates";
     const state = this.historyStorage!.state;
     let collapseDuplicates = state.get<boolean>(preferenceKey, false);
@@ -1684,7 +1684,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
 
     const updateItems = (): void => {
-      picker.items = getHistoryPickerEntries(entries, collapseDuplicates)
+      picker.items = this.rHistory.getPickerEntries(picker.value, collapseDuplicates)
         .map(({ code, historyIndex }) => ({ label: code, code, historyIndex }));
     };
     updateItems();
@@ -1692,6 +1692,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     let selectedItem: HistoryPickItem | undefined;
     try {
       selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
+        picker.onDidChangeValue(updateItems);
         picker.onDidTriggerButton(async (button) => {
           if (button !== collapseButton) return;
           collapseDuplicates = !collapseDuplicates;

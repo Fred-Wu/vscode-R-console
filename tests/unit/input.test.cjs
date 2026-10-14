@@ -83,6 +83,34 @@ test("workspace scope shares within a folder and isolates different folders", (t
 });
 
 
+test("F8 searches the full history cache but limits visible results", () => {
+  const { getHistoryPickerEntries, HISTORY_PICKER_LIMIT } = loadHistoryStore();
+  const entries = Array.from({ length: 20000 }, (_, i) => `command-${i}`);
+  entries[15] = "MatchInThePast()";
+  entries[19995] = "MatchAgain()";
+  assert.equal(HISTORY_PICKER_LIMIT, 50);
+  const initial = getHistoryPickerEntries(entries, false);
+  assert.equal(initial.length, 50);
+  assert.deepEqual(initial[0], { code: "command-19999", historyIndex: 19999 });
+  assert.deepEqual(initial.at(-1), { code: "command-19950", historyIndex: 19950 });
+  assert.deepEqual(getHistoryPickerEntries(entries, false, "match"), [
+    { code: "MatchAgain()", historyIndex: 19995 },
+    { code: "MatchInThePast()", historyIndex: 15 },
+  ]);
+  assert.deepEqual(getHistoryPickerEntries(entries, false, "MATp"), [
+    { code: "MatchInThePast()", historyIndex: 15 },
+  ]);
+  assert.deepEqual(getHistoryPickerEntries(["same()", "other()", "same()"], true, "same"), [
+    { code: "same()", historyIndex: 2 },
+  ]);
+  assert.deepEqual(getHistoryPickerEntries(["same()", "other()", "same()"], false, "same"), [
+    { code: "same()", historyIndex: 2 },
+    { code: "same()", historyIndex: 0 },
+  ]);
+  assert.deepEqual(getHistoryPickerEntries(entries, false, "missing-needle"), []);
+  assert.deepEqual(getHistoryPickerEntries(entries, false, "", 0), []);
+});
+
 test("F8 selection of an older repeated command keeps its original navigation position", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-index-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -127,7 +155,7 @@ test("F8 selection keeps an older duplicate through another console's compaction
   browsing.load();
   writer.load();
 
-  const picker = getHistoryPickerEntries(browsing.getEntries(), false);
+  const picker = getHistoryPickerEntries(browsing.getEntries(), false, "repeat()");
   const duplicateIndices = picker.filter((item) => item.code === "repeat()")
     .map((item) => item.historyIndex);
   assert.deepEqual(duplicateIndices, [15001, 5001]);
