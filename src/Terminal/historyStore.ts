@@ -24,6 +24,14 @@ export function getHistoryFile(storageFolder: string, scope: HistoryScope, works
 
 export type HistoryWrite = { id: string; code: string };
 
+// Legacy history records lack an ID. Their absolute file ordinal survives
+// front compaction, so use it to derive a stable ID for each occurrence.
+function legacyHistoryId(ordinal: number): string {
+  const hash = createHash("sha256").update("r-console-legacy:" + ordinal).digest("hex");
+  return [hash.slice(0, 8), hash.slice(8, 12), hash.slice(12, 16),
+    hash.slice(16, 20), hash.slice(20, 32)].join("-");
+}
+
 export class HistoryStore extends HistoryBuffer {
   // Reclaim headroom in batches instead of rewriting 20,000 commands on every submit.
   private readonly compactToSize = 19000;
@@ -36,6 +44,7 @@ export class HistoryStore extends HistoryBuffer {
   private diskOffset = 0;
   private diskFileId: string | undefined;
   private pendingEntries: HistoryWrite[] = [];
+  private historyIds: string[] = [];
   private savedIds = new Set<string>();
   private needsRecovery = false;
   private readonly lockOwner = process.pid + ":" +
@@ -81,6 +90,7 @@ export class HistoryStore extends HistoryBuffer {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       if (force || this.diskStamp !== "missing") {
         this.historyBuffer = [];
+        this.historyIds = [];
         this.historyIndex = 0;
         this.diskStamp = "missing";
         this.diskOffset = 0;
@@ -121,18 +131,29 @@ export class HistoryStore extends HistoryBuffer {
     const lines = complete.split(/\r?\n/);
     let current: string[] = [];
     const entries: string[] = [];
+    const parsedIds: (string | undefined)[] = [];
+    let currentId: string | undefined;
     const flush = () => {
       if (current.length) {
         const value = current.join("\n");
-        if (value.trim()) entries.push(value);
+        if (value.trim()) {
+          entries.push(value);
+          parsedIds.push(currentId);
+        }
         current = [];
       }
     };
-    // Metadata lines mark a new record. We only publish a completed entry
-    // once its next separator is visible.
+    // The original history format already has # time metadata. Newer
+    // records also carry history-id; retain it rather than collapsing every
+    // occurrence of the same command into an indistinguishable string.
     for (const line of lines) {
-      if (line.startsWith("+")) current.push(line.slice(1));
-      else if (line.startsWith("#") || !line.trim()) flush();
+      if (line.startsWith("+")) {
+        current.push(line.slice(1));
+      } else if (line.startsWith("#") || !line.trim()) {
+        flush();
+        currentId = line.startsWith("# time:")
+          ? /history-id: ([0-9a-f-]{36})/.exec(line)?.[1] : undefined;
+      }
     }
     flush();
     const oldLength = this.historyBuffer.length;
@@ -153,8 +174,12 @@ export class HistoryStore extends HistoryBuffer {
     for (const match of complete.matchAll(/^# history-complete: ([0-9a-f-]{36})\r?$/gm)) {
       this.savedIds.add(match[1]);
     }
+    const newIds = parsedIds.map((id, index) =>
+      id ?? legacyHistoryId(this.diskEntryBase + previousCount + index));
     const combined = reload ? entries : [...this.historyBuffer, ...entries];
+    const combinedIds = reload ? newIds : [...this.historyIds, ...newIds];
     this.historyBuffer = combined.slice(-this.maxHistorySize);
+    this.historyIds = combinedIds.slice(-this.maxHistorySize);
     this.lastEntryCount = previousCount + entries.length;
     const newStart = this.diskEntryBase +
       Math.max(0, this.lastEntryCount - this.historyBuffer.length);
@@ -248,12 +273,13 @@ export class HistoryStore extends HistoryBuffer {
     const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
       .map((match) => match.index!);
     const entries = keep > 0 ? this.historyBuffer.slice(-keep) : [];
+    const ids = keep > 0 ? this.historyIds.slice(-keep) : [];
     const nextBase = this.diskEntryBase + (this.lastEntryCount - entries.length);
     const completeEnd = raw.lastIndexOf("\n") + 1;
     const records = entries.length > 0 && boundaries.length === this.lastEntryCount &&
       boundaries.length >= entries.length
       ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
-      : entries.map((code) => this.serializeEntry({ id: randomUUID(), code })).join("");
+      : entries.map((code, index) => this.serializeEntry({ id: ids[index], code })).join("");
     const content = "# r-console-history-base: " + nextBase + "\n" + records;
     const temporary = this.historyFile + "." + process.pid + "." +
       Math.random().toString(16).slice(2) + ".tmp";
@@ -266,6 +292,7 @@ export class HistoryStore extends HistoryBuffer {
     const originalLength = this.historyBuffer.length;
     const originalIndex = this.historyIndex;
     this.historyBuffer = entries;
+    this.historyIds = ids;
     this.historyIndex = originalIndex === originalLength
       ? entries.length
       : Math.max(0, originalIndex - (originalLength - entries.length));
@@ -344,6 +371,7 @@ export class HistoryStore extends HistoryBuffer {
     // Reconciliation replaces the in-memory buffer with the disk snapshot.
     // Preserve the visible entries and cursor if the append subsequently fails.
     const visibleHistory = this.historyBuffer;
+    const visibleIds = this.historyIds;
     const visibleIndex = this.historyIndex;
     // A failed append restores this buffer; the disk cursor and entry count
     // must be restored with it or subsequent incremental reads skip entries
@@ -356,6 +384,7 @@ export class HistoryStore extends HistoryBuffer {
       entryBase: this.diskEntryBase,
     };
     let compactedHistory: string[] | undefined;
+    let compactedIds: string[] | undefined;
     let compactedIndex = 0;
     try {
       this.withFileLock(() => {
@@ -368,6 +397,7 @@ export class HistoryStore extends HistoryBuffer {
         const needsReload = this.pendingEntries.length >= this.historyBuffer.length &&
           this.lastEntryCount > 0;
         this.historyBuffer = this.historyBuffer.slice(0, diskLength);
+        this.historyIds = this.historyIds.slice(0, diskLength);
         this.historyIndex = Math.min(this.historyIndex, diskLength);
         // Reconcile only new bytes under the lock. Reload from the beginning
         // on replacement/compaction or when the pending tail filled the buffer.
@@ -393,6 +423,7 @@ export class HistoryStore extends HistoryBuffer {
           // append fails, restore pending commands onto this snapshot rather
           // than reviving the commands already pruned from disk.
           compactedHistory = this.historyBuffer;
+          compactedIds = this.historyIds;
           compactedIndex = this.historyIndex;
         }
         const batch = queued.map((entry) => this.serializeEntry(entry)).join("");
@@ -436,7 +467,9 @@ export class HistoryStore extends HistoryBuffer {
         this.pendingEntries = [];
         for (const entry of queued) this.savedIds.add(entry.id);
         this.historyBuffer.push(...queued.map((entry) => entry.code));
+        this.historyIds.push(...queued.map((entry) => entry.id));
         this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
+        this.historyIds = this.historyIds.slice(-this.maxHistorySize);
         this.historyIndex = this.historyBuffer.length;
         this.lastEntryCount += queued.length;
         this.diskStamp = undefined;
@@ -456,11 +489,13 @@ export class HistoryStore extends HistoryBuffer {
           const combined = [...compactedHistory, ...this.pendingEntries.map((entry) => entry.code)];
           const removed = Math.max(0, combined.length - this.maxHistorySize);
           this.historyBuffer = combined.slice(removed);
+          this.historyIds = [...compactedIds!, ...this.pendingEntries.map((entry) => entry.id)].slice(removed);
           this.historyIndex = compactedIndex === compactedHistory.length
             ? this.historyBuffer.length
             : Math.max(0, compactedIndex - removed);
         } else {
           this.historyBuffer = visibleHistory;
+          this.historyIds = visibleIds;
           this.historyIndex = visibleIndex;
           this.diskStamp = diskState.stamp;
           this.diskOffset = diskState.offset;
@@ -485,14 +520,17 @@ export class HistoryStore extends HistoryBuffer {
         this.pendingEntries.some((pending) => pending.id === entry.id)) continue;
       this.pendingEntries.push(entry);
       super.push(entry.code);
+      this.historyIds.push(entry.id);
+      if (this.historyIds.length > this.maxHistorySize) this.historyIds.shift();
     }
     this.flushPending();
   }
 
-  getSnapshot(): { entries: string[]; start: number } {
+  getSnapshot(): { entries: string[]; ids: string[]; start: number } {
     const entries = this.getEntries();
     return {
       entries,
+      ids: [...this.historyIds],
       start: this.diskEntryBase + Math.max(0,
         this.lastEntryCount + this.pendingEntries.length - entries.length),
     };

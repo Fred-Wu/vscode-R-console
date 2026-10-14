@@ -23,7 +23,7 @@ export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean):
 
 export const HISTORY_PICKER_LIMIT = 50;
 
-export type HistoryPickerEntry = { code: string; historyIndex: number };
+export type HistoryPickerEntry = { code: string; historyIndex: number; id?: string };
 
 // Search the existing console history buffer without copying it. Quick Pick
 // only needs a small newest-first set; matching runs over the full cache.
@@ -81,6 +81,7 @@ export type HistoryUpdate = {
   reset: boolean;
   remove: number;
   entries: string[];
+  ids?: string[];
   persisted?: string[];
 };
 
@@ -166,6 +167,8 @@ export class HistoryManager extends HistoryBuffer {
   private unconfirmed: HistoryWrite[] = [];
   private sentClosing = false;
   private stored: string[] = [];
+  private storedIds: string[] = [];
+  private historyIds: string[] = [];
   private storedStart = 0;
   private scheduled: ReturnType<typeof setImmediate> | undefined;
   private closing = false;
@@ -198,13 +201,16 @@ export class HistoryManager extends HistoryBuffer {
     return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query)
       .map(({ code, historyIndex }) => ({
         code, historyIndex: historyIndex + this.pickerFrontEvictions,
+        id: this.historyIds[historyIndex],
       }));
   }
 
   // F8 items carry a position from when they were displayed, not a live
   // array index. Return false if local submissions evicted the occurrence.
   selectPickerEntry(entry: HistoryPickerEntry): boolean {
-    const index = entry.historyIndex - this.pickerFrontEvictions;
+    const index = entry.id === undefined
+      ? entry.historyIndex - this.pickerFrontEvictions
+      : this.historyIds.indexOf(entry.id);
     if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length ||
       this.historyBuffer[index] !== entry.code) {
       return false;
@@ -217,9 +223,11 @@ export class HistoryManager extends HistoryBuffer {
     if (!entry.trim() || this.closing) return;
     if (this.historyBuffer.length >= this.maxHistorySize) this.pickerFrontEvictions++;
     if (this.deferredHistory) this.deferredHistory.pushed++;
+    const write = { id: randomUUID(), code: entry };
     super.push(entry);
+    this.historyIds.push(write.id);
+    if (this.historyIds.length > this.maxHistorySize) this.historyIds.shift();
     if (!this.disabled) {
-      const write = { id: randomUUID(), code: entry };
       this.pending.push(write);
       this.unconfirmed.push(write);
       if (this.pending.length > this.maxHistorySize) this.pending.shift();
@@ -272,6 +280,10 @@ export class HistoryManager extends HistoryBuffer {
   private applyStoredUpdate(update: HistoryUpdate): void {
     this.stored = update.reset ? update.entries
       : [...this.stored.slice(update.remove), ...update.entries];
+    const ids = update.ids ?? update.entries.map((_, index) =>
+      "legacy-test:" + (update.start + (update.reset ? 0 : this.storedIds.length - update.remove) + index));
+    this.storedIds = update.reset ? ids
+      : [...this.storedIds.slice(update.remove), ...ids];
     this.storedStart = update.start;
   }
 
@@ -293,26 +305,24 @@ export class HistoryManager extends HistoryBuffer {
     const base = this.deferredHistory;
     this.deferredHistory = undefined;
     if (!base?.updated) return;
+    this.reconcileHistory(true);
+  }
 
-    const oldLength = this.historyBuffer.length;
-    const oldIndex = this.historyIndex;
-    const oldTrim = Math.max(0, base.storedLength + base.unmerged + base.pushed - oldLength);
-    const originalIndex = oldIndex + oldTrim;
-    const stillUnmerged = (this.sent?.length ?? 0) + this.pending.length;
-    const processed = base.unmerged + base.pushed - stillUnmerged;
-    const nextIndex = originalIndex < base.storedLength
-      ? base.storedStart + originalIndex - this.storedStart
-      : this.stored.length + originalIndex - base.storedLength - processed;
-
-    // A sent request has not been reflected in the last received worker
-    // snapshot yet. Keep it visible along with new unsent submissions.
-    const combined = [...this.stored,
-      ...(this.sent ?? []).map((entry) => entry.code),
+  private reconcileHistory(includeSent = false): void {
+    const selected = this.historyIndex < this.historyBuffer.length
+      ? this.historyIds[this.historyIndex] : undefined;
+    const atEnd = this.historyIndex === this.historyBuffer.length;
+    const sent = includeSent ? (this.sent ?? []) : [];
+    const combined = [...this.stored, ...sent.map((entry) => entry.code),
       ...this.pending.map((entry) => entry.code)];
+    const ids = [...this.storedIds, ...sent.map((entry) => entry.id),
+      ...this.pending.map((entry) => entry.id)];
     const trim = Math.max(0, combined.length - this.maxHistorySize);
     this.historyBuffer = combined.slice(trim);
-    this.historyIndex = oldIndex === oldLength ? this.historyBuffer.length
-      : Math.max(0, Math.min(this.historyBuffer.length, nextIndex - trim));
+    this.historyIds = ids.slice(trim);
+    const position = selected === undefined ? -1 : this.historyIds.indexOf(selected);
+    this.historyIndex = atEnd ? this.historyBuffer.length
+      : position >= 0 ? position : 0;
   }
 
   receive(update: HistoryUpdate): void {
@@ -326,26 +336,8 @@ export class HistoryManager extends HistoryBuffer {
       return;
     }
 
-    const oldLength = this.historyBuffer.length;
-    const oldIndex = this.historyIndex;
-    const sentLength = this.sent?.length ?? 0;
-    if (update.reset || update.remove || update.entries.length || sentLength) {
-      const oldTrim = Math.max(0, this.stored.length + sentLength + this.pending.length - oldLength);
-      const originalIndex = oldIndex + oldTrim;
-      let nextIndex = originalIndex < this.stored.length
-        ? this.storedStart + originalIndex - update.start
-        : originalIndex - this.stored.length - sentLength;
-      const wasStored = originalIndex < this.stored.length;
-      this.applyStoredUpdate(update);
-      if (!wasStored) nextIndex += this.stored.length;
-      const combined = [...this.stored, ...this.pending.map((entry) => entry.code)];
-      const trim = Math.max(0, combined.length - this.maxHistorySize);
-      this.historyBuffer = combined.slice(trim);
-      this.historyIndex = oldIndex === oldLength ? this.historyBuffer.length
-        : Math.max(0, Math.min(this.historyBuffer.length, nextIndex - trim));
-    } else {
-      this.applyStoredUpdate(update);
-    }
+    this.applyStoredUpdate(update);
+    this.reconcileHistory();
     this.acknowledge(update);
   }
 

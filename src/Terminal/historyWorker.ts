@@ -5,7 +5,7 @@ import type { HistoryRequest, HistoryUpdate } from "./history";
 const port = parentPort!;
 type RecordState = {
   store: HistoryStore;
-  previous: { entries: string[]; start: number };
+  previous: { entries: string[]; ids: string[]; start: number };
   unconfirmed: Set<string>;
   closed: boolean;
   initialized: boolean;
@@ -20,12 +20,13 @@ function publish(id: number, record: RecordState): void {
   const retained = previous.entries.length - remove;
   const reset = !record.initialized || remove < 0 || retained < 0 ||
     retained > snapshot.entries.length ||
-    previous.entries.slice(remove).some((entry, index) => entry !== snapshot.entries[index]);
+    previous.ids.slice(remove).some((id, index) => id !== snapshot.ids[index]);
   const persisted = record.store.getPersistedIds([...record.unconfirmed]);
   for (const entry of persisted) record.unconfirmed.delete(entry);
   port.postMessage({
     id, start: snapshot.start, reset, remove,
     entries: reset ? snapshot.entries : snapshot.entries.slice(retained),
+    ids: reset ? snapshot.ids : snapshot.ids.slice(retained),
     persisted,
   } satisfies HistoryUpdate);
   record.previous = snapshot;
@@ -63,7 +64,7 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       : getHistoryFile(location.storageFolder, location.scope, location.workspaceFolder);
     const store = new HistoryStore(file);
     store.load();
-    record = { store, previous: { entries: [], start: 0 },
+    record = { store, previous: { entries: [], ids: [], start: 0 },
       unconfirmed: new Set<string>(), closed: false, initialized: false };
     stores.set(request.id, record);
   }

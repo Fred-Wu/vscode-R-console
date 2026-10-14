@@ -894,9 +894,14 @@ is neither copied for F8 nor read again from disk. The `collapse-all` button
 hides exact duplicate entries among all matching commands; when enabled, it
 switches to `expand-all` to show repeated occurrences.
 The preference is retained in `context.globalState` across consoles and
-VS Code restarts. Each picker item keeps its original history index, so
-selecting an older duplicate preserves its navigation position, including
-when another console compacts shared history while the picker is open.
+VS Code restarts. Each picker item carries a stable occurrence ID as well as its cached index.
+New records retain the UUID from the persisted history marker; legacy records
+without an ID receive a deterministic ID derived from their absolute file
+ordinal. Worker snapshots propagate these IDs, allowing F8 and Up/Down to
+retain the exact selected occurrence through shared-file synchronization,
+retries and compaction, even when two consoles submit identical command text.
+The shared file's append order remains authoritative; history is not
+timestamp-sorted.
 Local submissions can continue while F8 is open. Picker item positions account
 for history entries evicted from the front of the cache; when the selected
 occurrence was evicted, F8 still restores its code but resets history navigation

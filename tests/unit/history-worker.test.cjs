@@ -175,6 +175,53 @@ test("F8 retains stable selection positions across local history evictions", (t)
   assert.equal(history.navigate(0), "repeat()");
 });
 
+test("two consoles preserve exact F8 occurrence across shared-file reconciliation", async (t) => {
+  const f = fixture(t);
+  const a = f.create();
+  const b = f.create();
+  a.load(); b.load();
+  a.push("repeat()");
+  await waitFor(() => a.unconfirmed.length === 0);
+  b.save();
+  await waitFor(() => b.getEntries().length === 1);
+  const resume = a.suspendUpdates();
+  a.push("repeat()");
+  const [selected] = a.getPickerEntries("repeat()", false);
+  assert.equal(selected.historyIndex, 1);
+  await waitFor(() => a.unconfirmed.length === 0);
+  b.push("remote()");
+  await waitFor(() => b.unconfirmed.length === 0);
+  a.save();
+  await waitFor(() => a.stored.includes("remote()"));
+  assert.deepEqual(a.getEntries(), ["repeat()", "repeat()"]);
+  assert.equal(a.selectPickerEntry(selected), true);
+  resume();
+  assert.deepEqual(a.getEntries(), ["repeat()", "repeat()", "remote()"]);
+  assert.equal(a.navigate(-1), "repeat()");
+  assert.equal(a.navigate(1), "repeat()");
+  assert.equal(a.navigate(1), "remote()");
+  b.save();
+  await waitFor(() => b.getEntries().length === 3);
+  assert.deepEqual(b.getEntries(), a.getEntries());
+});
+
+test("legacy duplicate records retain distinct IDs after compaction and reload", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 20001 }, (_, i) =>
+    "\\n# time: original\\n+" + (i === 1001 || i === 15001 ? "repeat()" : "item-" + i) + "\\n").join("")
+    .replaceAll("\\n", "\n"));
+  const history = f.create();
+  history.load();
+  await waitFor(() => history.getEntries().length === 20000);
+  const duplicates = history.getPickerEntries("repeat()", false);
+  assert.equal(duplicates.length, 2);
+  assert.ok(duplicates[0].id);
+  assert.notEqual(duplicates[0].id, duplicates[1].id);
+  assert.equal(history.selectPickerEntry(duplicates[1]), true);
+  assert.equal(history.navigate(0), "repeat()");
+});
+
 test("background compaction preserves the selected duplicate while F8 defers updates", async (t) => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.dir, "history"), Array.from({ length: 20000 }, (_, i) =>

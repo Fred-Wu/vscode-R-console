@@ -1661,6 +1661,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     type HistoryPickItem = vscode.QuickPickItem & {
       code: string;
       historyIndex: number;
+      id?: string;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
     const resumeHistoryUpdates = this.rHistory.suspendUpdates();
@@ -1684,7 +1685,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const updateItems = (): void => {
       picker.items = this.rHistory.getPickerEntries(picker.value, collapseDuplicates)
-        .map(({ code, historyIndex }) => ({ label: code, code, historyIndex }));
+        .map(({ code, historyIndex, id }) => ({ label: code, code, historyIndex, id }));
     };
     updateItems();
 
