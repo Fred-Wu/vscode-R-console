@@ -20,9 +20,11 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 - Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the **R console completions** picker at the cursor, including empty positions where Tab is used for indentation.
 - Syntax highlighting that follows the active VS Code color theme.
 - Multiline editing and long-input rendering.
-- Reverse search on entered text using `Ctrl+R`; repeated presses find older matches. `F8` opens **Command History**, a searchable picker where you can collapse or expand exact duplicate entries.
+- Reverse search on entered text using `Ctrl+R`; repeated presses find older matches. `F8` opens **Command History**, a searchable picker with on-demand loading, native multi-selection checkboxes, Select All, and a toggle to collapse or expand exact duplicate entries. Selected entries can be restored as a single editable input without execution, or deleted using the picker toolbar.
 - Workspace-aware history:
   - **History scope:** `r.console.historyScope` defaults to `"workspace"`, sharing history between consoles in the same workspace folder. Set it to `"global"` for one shared history; consoles without a workspace automatically use global history.
+  - **On-demand loading:** The history picker loads matching commands in pages, while console Up/Down navigation fetches older history from the on-disk file as needed.
+  - **History deletion:** Delete individual or multiple entries using the history picker. When duplicates are collapsed, deleting a selected entry removes all its matching occurrences.
   - **History retention:** The latest 20,000 commands are retained per scope.
   - **Existing history:** The old `~/.r_console_history` file is left unchanged and is no longer used. Its commands are not imported into the new history.
 - Auto-matching brackets and quotes.
@@ -59,6 +61,8 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 
 `R Console` resolves `r.executablePath`, then deprecated `r.rpath.*`, then `PATH`, with the Windows registry as the final Windows fallback. Ambient `R_HOME` is not used to select the executable; it is derived from the selected R executable instead.
 
+## R Console Commands
+
 ### Launch R Console
 
 Launch R Console from the Command Palette:
@@ -75,6 +79,12 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 - Detach and reattach a console to pick up startup-related setting changes.
 - Close a session and stop its R process.
 - Restore a dropped console UI after workspace folder changes or an extension host reload.
+
+### Delete All Command History
+
+Use `R Console: Delete All Command History` from the Command Palette to delete all saved command history in the active R Console's history scope, including the on-disk history file.
+
+The command requires confirmation and affects all consoles sharing that history scope. To delete individual or multiple history entries instead, open the history picker using `F8` and use the selection checkboxes and toolbar trash button.
 
 ## Configuration
 
@@ -135,4 +145,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, build, packaging, and ma
 
 MIT
 
-History deletion is available in the F8 history picker using per-row selection and one toolbar deletion action. The picker loads matching results in pages, and Up/Down navigation fetches older commands on demand. The Command Palette includes **R Console: Delete All Command History** for the active history scope.
