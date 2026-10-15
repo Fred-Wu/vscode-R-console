@@ -92,6 +92,11 @@
         "category": "R Console"
       },
       {
+        "command": "r-console.clearHistory",
+        "title": "Delete All Command History",
+        "category": "R Console"
+      },
+      {
         "command": "r-console.restoreDefaultName",
         "title": "Restore Default Name",
         "category": "R Console"

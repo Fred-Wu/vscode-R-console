@@ -22,7 +22,11 @@ export function getHistoryFile(storageFolder: string, scope: HistoryScope, works
   return path.join(storageFolder, "history", "workspace-" + id + ".history");
 }
 
-export type HistoryWrite = { id: string; code: string };
+export type HistoryWrite = { id: string; code: string; createdAt?: number };
+export type HistoryDeletion = { before: number; ids?: string[]; codeHashes?: string[]; all?: boolean };
+function hashHistoryCode(code: string): string {
+  return createHash("sha256").update(code).digest("hex");
+}
 
 // Legacy history records lack an ID. Their absolute file ordinal survives
 // front compaction, so use it to derive a stable ID for each occurrence.
@@ -45,7 +49,12 @@ export class HistoryStore extends HistoryBuffer {
   private diskFileId: string | undefined;
   private pendingEntries: HistoryWrite[] = [];
   private historyIds: string[] = [];
+  // Persistent monotonic order survives deletions that renumber array indices.
+  private historyOrders: number[] = [];
+  private nextOrder = 0;
   private savedIds = new Set<string>();
+  private deletedIds = new Set<string>();
+  private deletions: HistoryDeletion[] = [];
   private needsRecovery = false;
   private readonly lockOwner = process.pid + ":" +
     (workerData?.historyOwner || randomUUID());
@@ -91,12 +100,17 @@ export class HistoryStore extends HistoryBuffer {
       if (force || this.diskStamp !== "missing") {
         this.historyBuffer = [];
         this.historyIds = [];
+        this.historyOrders = [];
+        this.nextOrder = 0;
         this.historyIndex = 0;
         this.diskStamp = "missing";
         this.diskOffset = 0;
         this.lastEntryCount = 0;
         this.diskEntryBase = 0;
         this.diskFileId = undefined;
+        this.savedIds.clear();
+        this.deletedIds.clear();
+        this.deletions = [];
       }
       return;
     }
@@ -132,13 +146,16 @@ export class HistoryStore extends HistoryBuffer {
     let current: string[] = [];
     const entries: string[] = [];
     const parsedIds: (string | undefined)[] = [];
+    const parsedOrders: (number | undefined)[] = [];
     let currentId: string | undefined;
+    let currentOrder: number | undefined;
     const flush = () => {
       if (current.length) {
         const value = current.join("\n");
         if (value.trim()) {
           entries.push(value);
           parsedIds.push(currentId);
+          parsedOrders.push(currentOrder);
         }
         current = [];
       }
@@ -153,6 +170,9 @@ export class HistoryStore extends HistoryBuffer {
         flush();
         currentId = line.startsWith("# time:")
           ? /history-id: ([0-9a-f-]{36})/.exec(line)?.[1] : undefined;
+        currentOrder = line.startsWith("# time:")
+          ? Number(/history-order: (\d+)/.exec(line)?.[1]) : undefined;
+        if (!Number.isSafeInteger(currentOrder)) currentOrder = undefined;
       }
     }
     flush();
@@ -169,17 +189,44 @@ export class HistoryStore extends HistoryBuffer {
     const parsedBase = baseMatch ? Number(baseMatch[1]) : 0;
     if (reload) {
       this.diskEntryBase = Number.isSafeInteger(parsedBase) ? parsedBase : 0;
+      const nextMatch = /^# r-console-history-next: (\d+)\r?$/m.exec(complete);
+      const next = nextMatch ? Number(nextMatch[1]) : 0;
+      this.nextOrder = Number.isSafeInteger(next) ? next : 0;
     }
-    if (reload) this.savedIds.clear();
+    if (reload) {
+      this.savedIds.clear();
+      this.deletions = [...complete.matchAll(/^# r-console-deletion: (.+)\r?$/gm)]
+        .flatMap((match) => {
+          try {
+            const value = JSON.parse(match[1]) as HistoryDeletion & { codes?: string[] };
+            if (Array.isArray(value.codes)) {
+              value.codeHashes = [...(value.codeHashes ?? []), ...value.codes.map(hashHistoryCode)];
+              delete value.codes;
+            }
+            return typeof value.before === "number" && Number.isFinite(value.before) ? [value] : [];
+          } catch { return []; }
+        });
+    }
     for (const match of complete.matchAll(/^# history-complete: ([0-9a-f-]{36})\r?$/gm)) {
       this.savedIds.add(match[1]);
     }
     const newIds = parsedIds.map((id, index) =>
       id ?? legacyHistoryId(this.diskEntryBase + previousCount + index));
+    // Legacy records without history-order use their original file ordinal.
+    // After a deletion rewrite, every surviving record has an explicit order.
+    let nextOrder = Math.max(this.nextOrder, this.diskEntryBase + previousCount);
+    const newOrders = parsedOrders.map((stored) => {
+      const order = stored !== undefined && stored >= 0 ? stored : nextOrder;
+      nextOrder = Math.max(nextOrder, order + 1);
+      return order;
+    });
+    this.nextOrder = nextOrder;
     const combined = reload ? entries : [...this.historyBuffer, ...entries];
     const combinedIds = reload ? newIds : [...this.historyIds, ...newIds];
+    const combinedOrders = reload ? newOrders : [...this.historyOrders, ...newOrders];
     this.historyBuffer = combined.slice(-this.maxHistorySize);
     this.historyIds = combinedIds.slice(-this.maxHistorySize);
+    this.historyOrders = combinedOrders.slice(-this.maxHistorySize);
     this.lastEntryCount = previousCount + entries.length;
     const newStart = this.diskEntryBase +
       Math.max(0, this.lastEntryCount - this.historyBuffer.length);
@@ -266,6 +313,32 @@ export class HistoryStore extends HistoryBuffer {
     }
   }
 
+  private deletionHeader(next?: HistoryDeletion): string {
+    // A later matching rule with an equal or newer cutoff subsumes an
+    // earlier rule. Never discard a rule merely because it is old: another
+    // VS Code window may still replay an unacknowledged write.
+    const rules = next ? [...this.deletions, next] : this.deletions;
+    const retained: HistoryDeletion[] = [];
+    for (let index = rules.length - 1; index >= 0; index--) {
+      const rule = rules[index];
+      const covered = retained.some((later) =>
+        later.before >= rule.before && (
+          later.all ||
+          (!rule.all && !later.all &&
+            (rule.ids ?? []).every((id) => later.ids?.includes(id)) &&
+            (rule.codeHashes ?? []).every((hash) => later.codeHashes?.includes(hash)))
+        ));
+      if (!covered) retained.unshift(rule);
+    }
+    return retained.map((value) => "# r-console-deletion: " + JSON.stringify(value) + "\n").join("");
+  }
+
+  private isDeleted(entry: HistoryWrite): boolean {
+    return this.deletions.some((deletion) => (entry.createdAt ?? 0) <= deletion.before &&
+      (deletion.all || deletion.ids?.includes(entry.id) ||
+        deletion.codeHashes?.includes(hashHistoryCode(entry.code))));
+  }
+
   private compactHistory(keep: number): void {
     // Keep original timestamps and multiline records when the file uses the
     // regular console format; older irregular files can be reserialized.
@@ -274,13 +347,18 @@ export class HistoryStore extends HistoryBuffer {
       .map((match) => match.index!);
     const entries = keep > 0 ? this.historyBuffer.slice(-keep) : [];
     const ids = keep > 0 ? this.historyIds.slice(-keep) : [];
+    const orders = keep > 0 ? this.historyOrders.slice(-keep) : [];
     const nextBase = this.diskEntryBase + (this.lastEntryCount - entries.length);
     const completeEnd = raw.lastIndexOf("\n") + 1;
     const records = entries.length > 0 && boundaries.length === this.lastEntryCount &&
-      boundaries.length >= entries.length
+      boundaries.length >= entries.length && entries.every((_entry, index) =>
+        /history-order: \d+/.test(raw.slice(boundaries[boundaries.length - entries.length + index],
+          index + 1 < entries.length ? boundaries[boundaries.length - entries.length + index + 1] : completeEnd)))
       ? raw.slice(boundaries[boundaries.length - entries.length], completeEnd)
-      : entries.map((code, index) => this.serializeEntry({ id: ids[index], code })).join("");
-    const content = "# r-console-history-base: " + nextBase + "\n" + records;
+      : entries.map((code, index) => this.serializeEntry({ id: ids[index], code }, orders[index])).join("");
+    const content = "# r-console-history-base: " + nextBase + "\n" +
+      "# r-console-history-next: " + this.nextOrder + "\n" +
+      this.deletionHeader() + records;
     const temporary = this.historyFile + "." + process.pid + "." +
       Math.random().toString(16).slice(2) + ".tmp";
     try {
@@ -293,6 +371,7 @@ export class HistoryStore extends HistoryBuffer {
     const originalIndex = this.historyIndex;
     this.historyBuffer = entries;
     this.historyIds = ids;
+    this.historyOrders = orders;
     this.historyIndex = originalIndex === originalLength
       ? entries.length
       : Math.max(0, originalIndex - (originalLength - entries.length));
@@ -307,9 +386,11 @@ export class HistoryStore extends HistoryBuffer {
     );
   }
 
-  private serializeEntry(entry: HistoryWrite): string {
+  private serializeEntry(entry: HistoryWrite, order = this.nextOrder): string {
     const now = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
-    return "\n# time: " + now + " history-id: " + entry.id + "\n" +
+    return "\n# time: " + now + " history-id: " + entry.id +
+      " submitted-at: " + (entry.createdAt ?? 0) +
+      " history-order: " + order + "\n" +
       entry.code.split("\n").map((line) => "+" + line + "\n").join("") +
       "# history-complete: " + entry.id + "\n";
   }
@@ -330,8 +411,8 @@ export class HistoryStore extends HistoryBuffer {
       const begin = boundaries[i].index!;
       const end = i + 1 < boundaries.length ? boundaries[i + 1].index! : raw.length;
       const record = raw.slice(begin, end);
-      const tag = /history-id: ([0-9a-f-]{36})\r?\n/.exec(record);
-      if (tag && !record.includes("# history-complete: " + tag[1] + "\n")) {
+      const tag = /^# time:[^\n]*\bhistory-id: ([0-9a-f-]{36})(?=\s|$)/m.exec(record);
+      if (tag && !new RegExp("^# history-complete: " + tag[1] + "\\r?$", "m").test(record)) {
         rebuilt += raw.slice(offset, begin);
         offset = end;
         changed = true;
@@ -372,6 +453,7 @@ export class HistoryStore extends HistoryBuffer {
     // Preserve the visible entries and cursor if the append subsequently fails.
     const visibleHistory = this.historyBuffer;
     const visibleIds = this.historyIds;
+    const visibleOrders = this.historyOrders;
     const visibleIndex = this.historyIndex;
     // A failed append restores this buffer; the disk cursor and entry count
     // must be restored with it or subsequent incremental reads skip entries
@@ -382,9 +464,11 @@ export class HistoryStore extends HistoryBuffer {
       fileId: this.diskFileId,
       entryCount: this.lastEntryCount,
       entryBase: this.diskEntryBase,
+      nextOrder: this.nextOrder,
     };
     let compactedHistory: string[] | undefined;
     let compactedIds: string[] | undefined;
+    let compactedOrders: number[] | undefined;
     let compactedIndex = 0;
     try {
       this.withFileLock(() => {
@@ -398,6 +482,7 @@ export class HistoryStore extends HistoryBuffer {
           this.lastEntryCount > 0;
         this.historyBuffer = this.historyBuffer.slice(0, diskLength);
         this.historyIds = this.historyIds.slice(0, diskLength);
+        this.historyOrders = this.historyOrders.slice(0, diskLength);
         this.historyIndex = Math.min(this.historyIndex, diskLength);
         // Reconcile only new bytes under the lock. Reload from the beginning
         // on replacement/compaction or when the pending tail filled the buffer.
@@ -408,8 +493,10 @@ export class HistoryStore extends HistoryBuffer {
           fs.truncateSync(this.historyFile, this.diskOffset);
           this.readHistoryFromDisk(false);
         }
-        const queued = this.pendingEntries.filter((entry) => !this.savedIds.has(entry.id))
-          .slice(-this.maxHistorySize);
+        const blocked = this.pendingEntries.filter((entry) => this.isDeleted(entry));
+        for (const entry of blocked) this.deletedIds.add(entry.id);
+        const queued = this.pendingEntries.filter((entry) =>
+          !this.savedIds.has(entry.id) && !this.isDeleted(entry)).slice(-this.maxHistorySize);
         if (!queued.length) {
           this.pendingEntries = [];
           return;
@@ -424,9 +511,12 @@ export class HistoryStore extends HistoryBuffer {
           // than reviving the commands already pruned from disk.
           compactedHistory = this.historyBuffer;
           compactedIds = this.historyIds;
+          compactedOrders = this.historyOrders;
           compactedIndex = this.historyIndex;
         }
-        const batch = queued.map((entry) => this.serializeEntry(entry)).join("");
+        const firstOrder = this.nextOrder;
+        const batch = queued.map((entry, index) =>
+          this.serializeEntry(entry, firstOrder + index)).join("");
         // Remember the exact pre-append boundary *after* any compaction.
         // A failed append may have written one or more complete records.
         const beforeAppend = fs.existsSync(this.historyFile)
@@ -468,8 +558,11 @@ export class HistoryStore extends HistoryBuffer {
         for (const entry of queued) this.savedIds.add(entry.id);
         this.historyBuffer.push(...queued.map((entry) => entry.code));
         this.historyIds.push(...queued.map((entry) => entry.id));
+        this.historyOrders.push(...queued.map((_entry, index) => firstOrder + index));
+        this.nextOrder += queued.length;
         this.historyBuffer = this.historyBuffer.slice(-this.maxHistorySize);
         this.historyIds = this.historyIds.slice(-this.maxHistorySize);
+        this.historyOrders = this.historyOrders.slice(-this.maxHistorySize);
         this.historyIndex = this.historyBuffer.length;
         this.lastEntryCount += queued.length;
         this.diskStamp = undefined;
@@ -490,18 +583,22 @@ export class HistoryStore extends HistoryBuffer {
           const removed = Math.max(0, combined.length - this.maxHistorySize);
           this.historyBuffer = combined.slice(removed);
           this.historyIds = [...compactedIds!, ...this.pendingEntries.map((entry) => entry.id)].slice(removed);
+          this.historyOrders = [...compactedOrders!, ...this.pendingEntries.map((_entry, index) =>
+            this.nextOrder + index)].slice(removed);
           this.historyIndex = compactedIndex === compactedHistory.length
             ? this.historyBuffer.length
             : Math.max(0, compactedIndex - removed);
         } else {
           this.historyBuffer = visibleHistory;
           this.historyIds = visibleIds;
+          this.historyOrders = visibleOrders;
           this.historyIndex = visibleIndex;
           this.diskStamp = diskState.stamp;
           this.diskOffset = diskState.offset;
           this.diskFileId = diskState.fileId;
           this.lastEntryCount = diskState.entryCount;
           this.diskEntryBase = diskState.entryBase;
+          this.nextOrder = diskState.nextOrder;
         }
       }
       // Keep submissions locally and retry without blocking the R session.
@@ -511,33 +608,120 @@ export class HistoryStore extends HistoryBuffer {
   }
 
   override push(entry: string): void {
-    this.pushEntries([{ id: randomUUID(), code: entry }]);
+    this.pushEntries([{ id: randomUUID(), code: entry, createdAt: performance.timeOrigin + performance.now() }]);
   }
 
   pushEntries(entries: readonly HistoryWrite[]): void {
     for (const entry of entries) {
       if (!entry.code.trim() || this.savedIds.has(entry.id) ||
         this.pendingEntries.some((pending) => pending.id === entry.id)) continue;
-      this.pendingEntries.push(entry);
-      super.push(entry.code);
-      this.historyIds.push(entry.id);
+      const submitted = { ...entry,
+        createdAt: entry.createdAt ?? performance.timeOrigin + performance.now() };
+      this.pendingEntries.push(submitted);
+      super.push(submitted.code);
+      this.historyIds.push(submitted.id);
+      this.historyOrders.push(this.nextOrder + this.pendingEntries.length - 1);
       if (this.historyIds.length > this.maxHistorySize) this.historyIds.shift();
+      if (this.historyOrders.length > this.maxHistorySize) this.historyOrders.shift();
     }
     this.flushPending();
   }
 
-  getSnapshot(): { entries: string[]; ids: string[]; start: number } {
+  getSnapshot(): { entries: string[]; ids: string[]; orders: number[]; start: number } {
     const entries = this.getEntries();
     return {
       entries,
       ids: [...this.historyIds],
+      orders: [...this.historyOrders],
       start: this.diskEntryBase + Math.max(0,
         this.lastEntryCount + this.pendingEntries.length - entries.length),
     };
   }
 
+  // Delete under the same cross-process lock used for appends and compaction.
+  // Retained legacy records acquire explicit IDs so removing a middle record
+  // never changes the identity of the occurrences after it.
+  deleteEntries(selection: { ids?: readonly string[]; codes?: readonly string[];
+    all?: boolean; before?: number }): string[] {
+    const deletion: HistoryDeletion = {
+      before: selection.before ?? performance.timeOrigin + performance.now(),
+      ...(selection.all ? { all: true } : {}),
+      ...(selection.ids?.length ? { ids: [...selection.ids] } : {}),
+      ...(selection.codes?.length ? { codeHashes: selection.codes.map(hashHistoryCode) } : {}),
+    };
+    const ids = new Set(deletion.ids ?? []);
+    const hashes = new Set(deletion.codeHashes ?? []);
+    const matches = (entry: HistoryWrite, createdAt = 0): boolean =>
+      createdAt <= deletion.before &&
+      (!!deletion.all || ids.has(entry.id) || hashes.has(hashHistoryCode(entry.code)));
+
+    // Never remove queued writes before the operation commits. If append is
+    // blocked, deletion fails and the pending commands remain available.
+    if (this.pendingEntries.length) this.flushPending();
+    if (this.pendingEntries.length) {
+      throw new Error("History writes are pending; deletion was not applied.");
+    }
+    return this.withFileLock(() => {
+      if (this.needsRecovery) this.recoverInterruptedRecords();
+      this.readHistoryFromDisk(true);
+      const existing = this.historyIds.map((id, index) => ({
+        id, code: this.historyBuffer[index],
+      }));
+      const raw = fs.existsSync(this.historyFile) ? fs.readFileSync(this.historyFile, "utf8") : "";
+      const boundaries = [...raw.matchAll(/(?:^|\n)# time:[^\n]*\n(?=\+)/g)]
+        .map((match) => match.index!);
+      const end = raw.lastIndexOf("\n") + 1;
+      const preserve = boundaries.length === existing.length;
+      const oldRecords = existing.map((entry, index) =>
+        preserve ? raw.slice(boundaries[index], index + 1 < boundaries.length ? boundaries[index + 1] : end) : "");
+      const removed = existing.filter((entry, index) => {
+        const timestamp = /^# time:[^\n]*submitted-at: ([0-9.]+)/m.exec(oldRecords[index]);
+        return matches(entry, timestamp ? Number(timestamp[1]) : 0);
+      }).map((entry) => entry.id);
+      const removedIds = new Set(removed);
+      const records: string[] = [];
+      for (let index = 0; index < existing.length; index++) {
+        const entry = existing[index];
+        if (removedIds.has(entry.id)) continue;
+        if (!preserve) {
+          records.push(this.serializeEntry(entry, this.historyOrders[index]));
+          continue;
+        }
+        let record = oldRecords[index];
+        record = record.replace(/(# time:[^\n]*)(\r?\n)/, (_line, header: string, newline: string) => {
+          const withId = header.includes("history-id: ")
+            ? header : header + " history-id: " + entry.id;
+          return (withId.includes("history-order: ") ? withId
+            : withId + " history-order: " + this.historyOrders[index]) + newline;
+        });
+        if (!new RegExp("^# history-complete: " + entry.id + "\\r?$", "m").test(record)) {
+          record = record.replace(/\s*$/, "") + "\n# history-complete: " + entry.id + "\n";
+        }
+        records.push(record);
+      }
+      const content = "# r-console-history-base: " + this.diskEntryBase + "\n" +
+        "# r-console-history-next: " + this.nextOrder + "\n" +
+        this.deletionHeader(deletion) +
+        records.join("");
+      const temporary = this.historyFile + "." + process.pid + "." + randomUUID() + ".tmp";
+      try {
+        fs.writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        fs.renameSync(temporary, this.historyFile);
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
+      this.readHistoryFromDisk(true);
+      return removed;
+    });
+  }
+
+  getDeletionRules(): readonly HistoryDeletion[] {
+    this.refreshFromDisk();
+    return this.deletions;
+  }
+
   getPersistedIds(ids: readonly string[]): string[] {
-    return ids.filter((id) => this.savedIds.has(id));
+    return ids.filter((id) => this.savedIds.has(id) || this.deletedIds.has(id));
   }
 
   get hasPendingWrites(): boolean {

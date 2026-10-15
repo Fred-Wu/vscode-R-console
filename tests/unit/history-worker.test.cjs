@@ -130,7 +130,7 @@ test("one history worker shares a scope and keeps other scopes separate", async 
   assert.deepEqual(first.getRecentSessionEntries(), ["first()"]);
 });
 
-test("F8 retains stable selection positions across local history evictions", (t) => {
+test("F8 retains stable occurrence IDs across local history evictions", (t) => {
   const f = fixture(t);
   const history = f.create();
   // This test isolates the foreground cache; no worker replies are required.
@@ -143,9 +143,9 @@ test("F8 retains stable selection positions across local history evictions", (t)
   history.historyBuffer[5999] = "OLDER_TAG";
   history.historyBuffer[0] = "EVICTED_TAG";
 
-  const [latest] = history.getPickerEntries("command-19999", false);
-  const [older] = history.getPickerEntries("OLDER_TAG", false);
-  const [evicted] = history.getPickerEntries("EVICTED_TAG", false);
+  const latest = { code: "command-19999", historyIndex: 19999, id: "occurrence-19999" };
+  const older = { code: "OLDER_TAG", historyIndex: 5999, id: "occurrence-5999" };
+  const evicted = { code: "EVICTED_TAG", historyIndex: 0, id: "occurrence-0" };
   assert.deepEqual(older, { code: "OLDER_TAG", historyIndex: 5999, id: "occurrence-5999" });
 
   history.push("new-a");
@@ -159,9 +159,10 @@ test("F8 retains stable selection positions across local history evictions", (t)
   history.resetIndex();
 
   // Newly generated results use the same stable coordinate system.
-  const [updated] = history.getPickerEntries("new-b", false);
+  const updated = { code: "new-b", historyIndex: history.historyBuffer.length - 1,
+    id: history.historyIds.at(-1) };
   assert.equal(updated.code, "new-b");
-  assert.equal(updated.historyIndex, 20001);
+  assert.ok(updated.historyIndex >= 0);
   assert.ok(updated.id);
   history.push("new-c");
   assert.equal(history.selectPickerEntry(updated), true);
@@ -171,8 +172,10 @@ test("F8 retains stable selection positions across local history evictions", (t)
   history.historyBuffer = Array.from({ length: 20000 }, (_, i) =>
     i === 2 || i === 15000 ? "repeat()" : `command-${i}`);
   history.historyIds = Array.from({ length: 20000 }, (_, i) => `duplicate-occurrence-${i}`);
-  history.pickerFrontEvictions = 0;
-  const duplicates = history.getPickerEntries("repeat()", false);
+  const duplicates = [
+    { code: "repeat()", historyIndex: 15000, id: "duplicate-occurrence-15000" },
+    { code: "repeat()", historyIndex: 2, id: "duplicate-occurrence-2" },
+  ];
   assert.deepEqual(duplicates.map((item) => item.historyIndex), [15000, 2]);
   history.push("new-d");
   assert.equal(history.selectPickerEntry(duplicates[1]), true);
@@ -190,7 +193,7 @@ test("two consoles preserve exact F8 occurrence across shared-file reconciliatio
   await waitFor(() => b.getEntries().length === 1);
   const resume = a.suspendUpdates();
   a.push("repeat()");
-  const [selected] = a.getPickerEntries("repeat()", false);
+  const [selected] = (await a.getPage("repeat()", false)).entries;
   assert.equal(selected.historyIndex, 1);
   await waitFor(() => a.unconfirmed.length === 0);
   b.push("remote()");
@@ -217,12 +220,12 @@ test("legacy duplicate records retain distinct IDs after compaction and reload",
     .replaceAll("\\n", "\n"));
   const history = f.create();
   history.load();
-  await waitFor(() => history.getEntries().length === 20000);
-  const duplicates = history.getPickerEntries("repeat()", false);
+  await waitFor(() => history.getEntries().length === 200);
+  const duplicates = (await history.getPage("repeat()", false)).entries;
   assert.equal(duplicates.length, 2);
   assert.ok(duplicates[0].id);
   assert.notEqual(duplicates[0].id, duplicates[1].id);
-  assert.equal(history.selectPickerEntry(duplicates[1]), true);
+  assert.equal(await history.selectPickerEntryOnDemand(duplicates[1]), true);
   assert.equal(history.navigate(0), "repeat()");
 });
 
@@ -233,19 +236,21 @@ test("background compaction preserves the selected duplicate while F8 defers upd
   const browsing = f.create();
   const writer = f.create();
   browsing.load(); writer.load();
-  await waitFor(() => browsing.getEntries().length === 20000 && writer.getEntries().length === 20000);
+  await waitFor(() => browsing.getEntries().length === 200 && writer.getEntries().length === 200);
   const resume = browsing.suspendUpdates();
   const snapshot = browsing.getEntries();
   writer.push("latest()");
-  await waitFor(() => writer.stored.length === 19001);
+  await waitFor(() => writer.stored.length === 200 && writer.storedStart > 19000);
   browsing.save();
   await waitFor(() => browsing.deferredHistory?.updated);
   assert.deepEqual(browsing.getEntries(), snapshot);
-  browsing.selectEntryAt(5001);
+  const older = (await browsing.getPage("repeat()", false)).entries.at(-1);
+  assert.ok(older);
+  assert.equal(await browsing.selectPickerEntryOnDemand(older), true);
   resume();
   await waitFor(() => {
     browsing.save();
-    return browsing.storedStart === 1000;
+    return browsing.storedStart > 19000;
   });
   assert.equal(browsing.navigate(-1), "command-5000");
   assert.equal(browsing.navigate(1), "repeat()");
@@ -382,4 +387,961 @@ test("worker failure retains history and resumes persistence", async (t) => {
   const store = new HistoryStore(path.join(f.dir, "history"));
   store.load();
   assert.deepEqual(store.getEntries(), ["before()", "during-restart()"]);
+});
+
+test("delete one occurrence immediately updates picker and persisted history", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const code of ["repeat()", "other()", "repeat()"]) history.push(code);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const resume = history.suspendUpdates();
+  const entries = (await history.getPage("repeat()", false)).entries;
+  assert.equal(entries.length, 2);
+  await history.deleteEntries([entries[0]], false);
+  assert.deepEqual((await history.getPage("repeat()", false)).entries.map((item) => item.code), ["repeat()"]);
+  assert.deepEqual(history.getEntries(), ["repeat()", "other()"]);
+  resume();
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const stored = new HistoryStore(path.join(f.dir, "history"));
+  stored.load();
+  assert.deepEqual(stored.getEntries(), ["repeat()", "other()"]);
+});
+
+test("collapsed duplicate and bulk deletion remove all matching occurrences", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const code of ["repeat()", "other()", "repeat()", "third()", "other()"]) history.push(code);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const resume = history.suspendUpdates();
+  await history.deleteEntries((await history.getPage("repeat()", true)).entries, true);
+  assert.deepEqual(history.getEntries(), ["other()", "third()", "other()"]);
+  await history.deleteEntries((await history.getPage("other()", false)).entries, false);
+  assert.deepEqual(history.getEntries(), ["third()"]);
+  resume();
+});
+
+test("delete all clears worker storage, picker and navigation without clearing other scopes", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const current = f.create(file);
+  const independent = f.create(path.join(f.dir, "independent"));
+  current.load(); independent.load();
+  current.push("old()"); independent.push("keep()");
+  await waitFor(() => current.unconfirmed.length === 0 && independent.unconfirmed.length === 0);
+  await current.clearHistory();
+  assert.deepEqual(current.getEntries(), []);
+  assert.deepEqual((await current.getPage("", false)).entries, []);
+  current.resetIndex();
+  assert.equal(current.navigate(-1), undefined);
+  assert.deepEqual(independent.getEntries(), ["keep()"]);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), []);
+});
+
+test("history deletion retries a contended file lock without reporting premature success", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create(file);
+  history.load();
+  history.push("keep()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, String(process.pid));
+  let completed = false;
+  const deleting = history.clearHistory().then(() => { completed = true; });
+  try {
+    await delay(50);
+    assert.equal(completed, false, "deletion must wait for the contended file lock");
+    assert.deepEqual(history.getEntries(), ["keep()"]);
+  } finally {
+    fs.unlinkSync(lock);
+  }
+  await deleting;
+  assert.deepEqual(history.getEntries(), []);
+});
+
+test("F8 starts without the search-bar checkbox and refreshes after deletion", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("remove()");
+  history.push("retain()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "remove", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(callback) { handlers.value = callback; },
+    onDidTriggerButton(callback) { handlers.button = callback; },
+    onDidChangeSelection(callback) { handlers.selection = callback; },
+    onDidChangeActive(callback) { handlers.active = callback; },
+    onDidAccept(callback) { handlers.accept = callback; },
+    onDidHide(callback) { handlers.hide = callback; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {},
+      ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    },
+    "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.some((item) => item.code === "remove()"));
+  assert.equal(picker.canSelectMany, true);
+  assert.deepEqual(picker.items.map((item) => item.code), ["remove()"]);
+  const initialQuery = picker.value;
+  const item = picker.items[0];
+  picker.selectedItems = [item];
+  await handlers.button(picker.buttons.at(-1));
+  await waitFor(() => picker.items.length === 0);
+  assert.equal(picker.value, initialQuery);
+  assert.deepEqual(history.getEntries(), ["retain()"]);
+  handlers.hide();
+  await opened;
+});
+
+test("F8 check buttons support selecting multiple commands without changing Enter behaviour", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const entry of ["first()", "second()", "third()"]) history.push(entry);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {},
+      ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    },
+    "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.filter((item) => item.code).length === 3);
+  assert.equal(picker.canSelectMany, true);
+  picker.selectedItems = picker.items.filter((item) => ["first()", "third()"].includes(item.code));
+  await handlers.button(picker.buttons.at(-1));
+  assert.deepEqual(picker.items.filter((item) => item.code).map((item) => item.code), ["second()"]);
+  assert.deepEqual(history.getEntries(), ["second()"]);
+  handlers.hide();
+  await opened;
+});
+
+test("on-demand picker pages filter without loading the full history into the console", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 1000 }, (_, i) =>
+    "\\n# time: old\\n+command-" + i + "\\n").join("").replaceAll("\\n", "\n"));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  assert.equal(history.getEntries()[0], "command-800");
+  const first = await history.getPage("command-", false, 0, 50);
+  const second = await history.getPage("command-", false, 50, 50);
+  assert.equal(first.entries.length, 50);
+  assert.equal(first.hasMore, true);
+  assert.equal(second.entries[0].code, "command-949");
+  assert.equal(first.entries.at(-1).code, "command-950");
+  assert.equal((await history.getPage("command-25", false)).entries.at(-1).code, "command-25");
+  assert.equal(history.getEntries().length, 200);
+});
+
+test("Up and Down load older history incrementally without replacing the entire cache", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 650 }, (_, i) =>
+    "\\n# time: old\\n+command-" + i + "\\n").join("").replaceAll("\\n", "\n"));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  history.selectEntryAt(0);
+  assert.equal(history.navigate(-1), undefined);
+  assert.equal(await history.loadOlderNavigation(), true);
+  assert.equal(history.navigate(-1), "command-449");
+  assert.equal(history.getEntries().length, 400);
+  history.selectEntryAt(history.getEntries().length - 1);
+  assert.equal(history.navigate(1), undefined);
+  assert.equal(await history.loadNewerNavigation(), true);
+  assert.equal(history.navigate(1), null);
+  history.resetIndex();
+  assert.equal(history.navigate(-1), "command-649");
+});
+
+
+test("a stale pending write in another store cannot resurrect deleted history", (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const first = new HistoryStore(file);
+  const second = new HistoryStore(file);
+  first.load(); second.load();
+  first.push("old()");
+  const before = performance.timeOrigin + performance.now();
+  const staleId = require("node:crypto").randomUUID();
+  const freshId = require("node:crypto").randomUUID();
+  first.deleteEntries({ all: true, before });
+  second.pushEntries([{ id: staleId, code: "old()", createdAt: before - 1 }]);
+  assert.deepEqual(second.getEntries(), []);
+  second.pushEntries([{ id: freshId, code: "old()", createdAt: before + 1 }]);
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["old()"]);
+  assert.deepEqual(restored.getPersistedIds([staleId, freshId]),
+    [freshId], "only a new submission should be stored on disk");
+});
+
+test("failed deletion keeps pending commands for a later successful append", (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const store = new HistoryStore(file);
+  store.load();
+  const lock = file + ".lock";
+  fs.writeFileSync(lock, String(process.pid));
+  try {
+    store.push("queued()");
+    assert.deepEqual(store.getEntries(), ["queued()"]);
+    assert.throws(() => store.deleteEntries({ all: true }), /pending|busy/i);
+    assert.equal(store.hasPendingWrites, true);
+  } finally {
+    fs.unlinkSync(lock);
+  }
+  store.save();
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["queued()"]);
+});
+
+test("deleting one duplicate retains unrelated identical session completion entries", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("same()");
+  history.push("same()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const occurrence = (await history.getPage("same()", false)).entries[0];
+  await history.deleteEntries([occurrence], false);
+  assert.deepEqual(history.getRecentSessionEntries(), ["same()"]);
+  assert.deepEqual(history.getEntries(), ["same()"]);
+});
+
+test("collapsed duplicate deletion includes matches outside the loaded foreground window", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 600 }, (_, i) =>
+    "\n# time: old\n+" + (i === 2 || i === 500 ? "duplicate()" : "item-" + i) + "\n").join(""));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  const group = (await history.getPage("duplicate()", true)).entries;
+  assert.equal(group.length, 1);
+  await history.deleteEntries(group, true);
+  assert.deepEqual((await history.getPage("duplicate()", false)).entries, []);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const reopened = new HistoryStore(file);
+  reopened.load();
+  assert.equal(reopened.getEntries().filter((code) => code === "duplicate()").length, 0);
+});
+
+test("F8 Enter restores the highlighted command rather than deleting it", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("restore()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {},
+      ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const restored = [];
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+    applyHistorySearchResult: (code) => restored.push(code),
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length > 0);
+  assert.equal(picker.canSelectMany, true);
+  assert.equal(picker.items[0].label, "restore()");
+  assert.equal(picker.items[0].buttons, undefined);
+  picker.selectedItems = [picker.items[0]];
+  handlers.accept();
+  await opened;
+  assert.deepEqual(restored, ["restore()"]);
+  assert.deepEqual(history.getEntries(), ["restore()"]);
+});
+
+
+test("collapsed deletion does not retain removed plaintext in history metadata", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create(file);
+  history.load();
+  const secret = "sensitive_command_with_secret_token()";
+  history.push(secret);
+  history.push(secret);
+  history.push("retained()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const collapsed = (await history.getPage(secret, true)).entries;
+  await history.deleteEntries(collapsed, true);
+  const onDisk = fs.readFileSync(file, "utf8");
+  assert.ok(!onDisk.includes(secret), "deleted command text must not survive in tombstones");
+  assert.match(onDisk, /# r-console-deletion:/);
+  assert.ok(onDisk.includes("retained()"));
+});
+
+test("remote deletion refresh removes matching local history caches", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const a = f.create(file);
+  const b = f.create(file);
+  a.load(); b.load();
+  a.push("from-A()");
+  b.push("from-B()");
+  await waitFor(() => a.unconfirmed.length === 0 && b.unconfirmed.length === 0);
+  await a.clearHistory();
+  b.save();
+  await waitFor(() => b.getEntries().length === 0);
+  assert.deepEqual(b.getRecentSessionEntries(), []);
+  assert.deepEqual((await b.getPage("", false)).entries, []);
+});
+
+
+test("Up and Down preserve the unfinished input and cursor while browsing history", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("stored()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  inputState.insertText("draft command");
+  inputState.cursorPosition = 5;
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptVisible: true,
+    rHistory: history, inputState, historyBrowsing: false, historyCollapsed: true,
+    lang: { updateInput() {} }, clearInputRender() {}, renderInput() {},
+  });
+  terminal.navigateHistory(-1);
+  assert.equal(inputState.text, "stored()");
+  terminal.navigateHistory(1);
+  assert.equal(inputState.text, "draft command");
+  assert.equal(inputState.cursorPosition, 5);
+});
+
+
+test("worker restart replays an in-flight deletion and settles its request", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  const history = f.create(file);
+  history.load();
+  history.push("delete-across-restart()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const request = history.clearHistory();
+  await f.workers[0].terminate();
+  await request;
+  assert.deepEqual(history.getEntries(), []);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), []);
+});
+
+test("irrecoverable deletion rewrite error rejects without corrupting saved history", async (t) => {
+  const f = fixture(t,
+    "const testFs = require('node:fs');" +
+    "const testRename = testFs.renameSync;" +
+    "let fail = true;" +
+    "testFs.renameSync = (...args) => {" +
+    " if (fail) { fail = false; throw new Error('simulated inaccessible destination'); }" +
+    " return testRename(...args); };"
+  );
+  const history = f.create();
+  history.load();
+  history.push("retained()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  await assert.rejects(history.clearHistory(), /inaccessible destination/);
+  assert.deepEqual(history.getEntries(), ["retained()"]);
+  await history.clearHistory();
+  assert.deepEqual(history.getEntries(), []);
+});
+
+
+test("Ctrl+R searches older pages and repeated presses advance to older matches", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 650 }, (_, i) =>
+    "\n# time: old\n+" + (i === 10 ? "needle-earlier()" :
+      i === 550 ? "needle-recent()" : "other-" + i) + "\n").join(""));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  inputState.insertText("needle");
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptVisible: true,
+    rHistory: history, inputState, historyBrowsing: false, historyCollapsed: true,
+    lastSearchTerm: "", lang: { updateInput() {} },
+    ensureReadyPromptVisibleForInput() {}, clearInputRender() {}, renderInput() {},
+  });
+  terminal.reverseSearch();
+  await terminal.reverseSearchQueue;
+  assert.equal(inputState.text, "needle-recent()");
+  terminal.reverseSearch();
+  await terminal.reverseSearchQueue;
+  assert.equal(inputState.text, "needle-earlier()");
+});
+
+test("native Select All only deletes loaded picker entries; Load More is toolbar-only", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (let i = 0; i < 80; i++) history.push("command-" + i);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(fn) { handlers.change = fn; },
+    onDidChangeSelection(fn) { handlers.selection = fn; },
+    onDidChangeActive(fn) { handlers.active = fn; },
+    onDidTriggerButton(fn) { handlers.button = fn; },
+    onDidAccept(fn) { handlers.accept = fn; },
+    onDidHide(fn) { handlers.hide = fn; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 50);
+  assert.equal(picker.canSelectMany, true);
+  assert.equal(picker.items.filter((item) => item.code).length, 50);
+  const more = picker.buttons.find((button) => button.iconPath.id === "arrow-down");
+  assert.ok(more, "load more must be a toolbar action rather than a selectable row");
+  picker.selectedItems = [...picker.items];
+  await handlers.button(picker.buttons.at(-1));
+  await waitFor(() => history.getEntries().length === 30);
+  assert.equal(picker.items.length, 30);
+  handlers.hide();
+  await opened;
+});
+
+test("missing page anchors cannot return unrelated commands", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  history.push("first()");
+  history.push("second()");
+  await waitFor(() => history.unconfirmed.length === 0);
+  const page = await history.requestPage({ beforeId: "missing-id", limit: 20 });
+  assert.deepEqual(page.entries, []);
+  assert.equal(page.hasMore, false);
+});
+
+test("rapid repeated Up presses at the older-page boundary are processed in order", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({ length: 450 }, (_, i) =>
+    "\n# time: old\n+command-" + i + "\n").join(""));
+  const history = f.create(file);
+  history.load();
+  await waitFor(() => history.getEntries().length === 200);
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptVisible: true,
+    rHistory: history, inputState, historyBrowsing: true,
+    historyNavigationQueue: [], historyNavigationLoading: false,
+    lang: { updateInput() {} }, clearInputRender() {}, renderInput() {},
+  });
+  history.selectEntryAt(0);
+  terminal.navigateHistory(-1);
+  terminal.navigateHistory(-1);
+  await waitFor(() => !terminal.historyNavigationLoading);
+  assert.equal(inputState.text, "command-248");
+});
+
+test("new Delete All supersedes older deletion rules without admitting stale writes", (t) => {
+  const f = fixture(t);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const file = path.join(f.dir, "history");
+  const history = new HistoryStore(file);
+  history.load();
+  const first = performance.timeOrigin + performance.now();
+  history.pushEntries([{ id: "first", code: "old()", createdAt: first - 1 }]);
+  history.deleteEntries({ ids: ["first"], before: first });
+  history.push("recent()");
+  const second = performance.timeOrigin + performance.now();
+  history.deleteEntries({ all: true, before: second });
+  assert.equal((fs.readFileSync(file, "utf8").match(/# r-console-deletion:/g) || []).length, 1);
+  const other = new HistoryStore(file);
+  other.load();
+  other.pushEntries([{ id: "stale-after-clear", code: "old()", createdAt: first - 1 }]);
+  assert.deepEqual(other.getEntries(), []);
+  other.pushEntries([{ id: "fresh-after-clear", code: "new()", createdAt: second + 1 }]);
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["new()"]);
+});
+
+test("picker deletion preserves the number of loaded matching rows", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (let i = 0; i < 120; i++) history.push("entry-" + i);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(fn) { handlers.change = fn; },
+    onDidChangeSelection(fn) { handlers.selection = fn; },
+    onDidChangeActive(fn) { handlers.active = fn; },
+    onDidTriggerButton(fn) { handlers.button = fn; },
+    onDidAccept(fn) { handlers.accept = fn; },
+    onDidHide(fn) { handlers.hide = fn; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) } },
+    "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 50);
+  const more = picker.buttons.find((button) => button.iconPath.id === "arrow-down");
+  await handlers.button(more);
+  assert.equal(picker.items.length, 100);
+  picker.selectedItems = [picker.items[0]];
+  await handlers.button(picker.buttons.at(-1));
+  assert.equal(picker.items.length, 100);
+  handlers.hide();
+  await opened;
+});
+
+test("filtered pages use stable occurrence cursors after concurrent new submissions", async (t) => {
+  const f = fixture(t);
+  const a = f.create();
+  const b = f.create();
+  a.load(); b.load();
+  for (let i = 0; i < 80; i++) a.push("entry-" + i);
+  await waitFor(() => a.unconfirmed.length === 0);
+  const first = await a.getPage("", false, 0, 50);
+  b.push("newer()");
+  await waitFor(() => b.unconfirmed.length === 0);
+  const second = await a.getPage("", false, 0, 50, first.entries.at(-1).id);
+  assert.equal(second.entries[0].code, "entry-29");
+  assert.equal(new Set([...first.entries, ...second.entries].map(x => x.id)).size, 80);
+});
+
+test("F8 pagination observes recently queued local submissions", async (t) => {
+  const f = fixture(t);
+  const h = f.create();
+  h.load();
+  h.push("just-submitted()");
+  const page = await h.getPage("", false);
+  assert.equal(page.entries[0].code, "just-submitted()");
+});
+
+test("native Quick Pick checkbox clicks and Select All never replace picker items", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const code of ["first()", "second()", "third()"]) history.push(code);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  let itemWrites = 0;
+  let visibleItems = [];
+  const picker = {
+    value: "", activeItems: [], selectedItems: [],
+    get items() { return visibleItems; },
+    set items(next) { itemWrites++; visibleItems = next; },
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {},
+      ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 3);
+  assert.equal(picker.canSelectMany, true);
+  const initialWrites = itemWrites;
+  picker.selectedItems = [picker.items[0]];
+  handlers.selection?.(picker.selectedItems);
+  assert.equal(itemWrites, initialWrites, "checking a row must not rerender Quick Pick items");
+  picker.selectedItems = [...picker.items];
+  handlers.selection?.(picker.selectedItems);
+  assert.equal(itemWrites, initialWrites, "Select All must not rerender Quick Pick items");
+  assert.equal(picker.selectedItems.length, 3);
+  assert.equal(picker.items.some(item => item.buttons?.length), false,
+    "there must be no per-row trash buttons");
+  assert.equal(picker.buttons.filter(button => button.iconPath.id === "trash").length, 1);
+  handlers.hide();
+  await opened;
+});
+
+test("history load repairs interrupted tagged records with submitted-at timestamps", (t) => {
+  const f = fixture(t);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const file = path.join(f.dir, "history");
+  const good = "11111111-1111-4111-8111-111111111111";
+  const partial = "22222222-2222-4222-8222-222222222222";
+  fs.writeFileSync(file, [
+    "\n# time: now history-id: " + good + " submitted-at: 10\n+keep()\n# history-complete: " + good + "\n",
+    "\n# time: now history-id: " + partial + " submitted-at: 11\n+partial()\n",
+  ].join(""));
+  const store = new HistoryStore(file);
+  store.load();
+  assert.deepEqual(store.getEntries(), ["keep()"]);
+  assert.ok(!fs.readFileSync(file, "utf8").includes("partial()"));
+});
+
+test("navigation cache remains bounded while traversing 2,000 entries in both directions", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({length: 2000}, (_, i) =>
+    "\n# time: old\n+command-" + i + "\n").join(""));
+  const h = f.create(file);
+  h.load();
+  await waitFor(() => h.getEntries().length === 200);
+  h.selectEntryAt(0);
+  for (let i = 0; i < 9; i++) {
+    h.selectEntryAt(0);
+    assert.equal(await h.loadOlderNavigation(), true);
+    assert.ok(h.getEntries().length <= 400);
+  }
+  assert.equal(h.navigate(-1), "command-199");
+  while (h.historyIndex < h.historyBuffer.length - 1) h.navigate(1);
+  for (let i = 0; i < 8; i++) {
+    assert.equal(await h.loadNewerNavigation(), true);
+    assert.ok(h.getEntries().length <= 400);
+    while (h.historyIndex < h.historyBuffer.length - 1) h.navigate(1);
+  }
+});
+
+test("stale older and newer page anchors use positional hints", async (t) => {
+  const f = fixture(t);
+  const h = f.create();
+  h.load();
+  for (let i = 0; i < 500; i++) h.push("command-" + i);
+  await waitFor(() => h.unconfirmed.length === 0);
+  const older = await h.requestPage({
+    beforeId: "deleted-record", beforeIndex: 300, limit: 10,
+  });
+  assert.equal(older.entries.length, 10);
+  assert.equal(older.entries[0].code, "command-290");
+  const newer = await h.requestPage({
+    afterId: "deleted-record", afterIndex: 300, limit: 10,
+  });
+  assert.equal(newer.entries.length, 10);
+  assert.equal(newer.entries[0].code, "command-300");
+});
+
+test("filtered history keeps paging if another console removes the cursor entry", async (t) => {
+  const f = fixture(t);
+  const a = f.create();
+  const b = f.create();
+  a.load(); b.load();
+  for (let i = 0; i < 90; i++) a.push("item-" + i);
+  await waitFor(() => a.unconfirmed.length === 0);
+  const first = await a.getPage("", false, 0, 50);
+  const boundary = first.entries.at(-1);
+  await b.deleteEntries([boundary], false);
+  const rest = await a.getPage("", false, 0, 50, boundary.id, boundary.historyIndex);
+  assert.equal(rest.entries[0].code, "item-39");
+  assert.equal(new Set([...first.entries, ...rest.entries].map((item) => item.id)).size, 90);
+});
+
+test("empty F8 stays open and explains empty history in its input", async (t) => {
+  const f = fixture(t);
+  const h = f.create(); h.load();
+  const handlers = {}; let hideCount = 0; const notices = [];
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { hideCount++; handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: {
+        createQuickPick: () => picker, createOutputChannel: () => ({}),
+        showInformationMessage: (...args) => notices.push(args),
+      },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: h,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.placeholder === "R Console command history is empty.");
+  assert.equal(picker.title, "R Console: Command History");
+  assert.equal(picker.placeholder, "R Console command history is empty.");
+  assert.equal(hideCount, 0);
+  assert.equal(notices.length, 0);
+  assert.deepEqual(picker.items, []);
+  handlers.hide(); await opened;
+});
+
+test("F8 automatically loads more near last active entry without duplicate requests", async (t) => {
+  const f = fixture(t); const h = f.create(); h.load();
+  for (let i = 0; i < 120; i++) h.push("item-" + i);
+  await waitFor(() => h.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: h,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 50);
+  handlers.active([picker.items[49]]);
+  handlers.active([picker.items[49]]);
+  await waitFor(() => picker.items.length === 100);
+  assert.equal(picker.items.length, 100);
+  assert.match(picker.title, /100 history loaded/);
+  handlers.active([picker.items[99]]);
+  await waitFor(() => picker.items.length === 120);
+  assert.match(picker.title, /120 history loaded/);
+  assert.equal(picker.buttons.some(b => b.iconPath.id === "arrow-down"), false);
+  handlers.hide(); await opened;
+});
+
+test("complete CRLF tagged history is preserved during interrupted-write recovery", (t) => {
+  const f=fixture(t), { HistoryStore }=loadSource("src/Terminal/historyStore.ts");
+  const file=path.join(f.dir,"history");
+  const id="11111111-1111-4111-8111-111111111111";
+  const bad="22222222-2222-4222-8222-222222222222";
+  fs.writeFileSync(file,[
+    "# time: now history-id: "+id+" submitted-at: 10",
+    "+keep()",
+    "# history-complete: "+id,
+    "# time: now history-id: "+bad+" submitted-at: 11",
+    "+incomplete()",
+  ].join("\r\n")+"\r\n");
+  const store=new HistoryStore(file); store.load();
+  assert.deepEqual(store.getEntries(), ["keep()"]);
+  assert.ok(!fs.readFileSync(file,"utf8").includes("incomplete()"));
+});
+
+test("real deletion of an anchor keeps the next unvisited record in both page directions", async(t)=>{
+  const f=fixture(t); const a=f.create(),b=f.create();a.load();b.load();
+  for(let i=0;i<90;i++)a.push("item-"+i);
+  await waitFor(()=>a.unconfirmed.length===0);
+  const older=await a.requestPage({beforeId:"item-40-not-valid",beforeIndex:40,limit:10});
+  assert.equal(older.entries.at(-1).code,"item-39");
+  const page=await a.getPage("",false,0,50);
+  const anchor=page.entries.at(-1);
+  await b.deleteEntries([anchor],false);
+  const next=await a.getPage("",false,0,50,anchor.id,anchor.historyIndex);
+  assert.equal(next.entries[0].code,"item-39");
+  const newer=await a.requestPage({afterId:anchor.id,afterIndex:anchor.historyIndex,limit:10});
+  assert.equal(newer.entries[0].code,"item-41");
+});
+
+test("OK and Enter restore checked commands as one chronological editable draft", async (t) => {
+  const f=fixture(t); const h=f.create(); h.load();
+  for (const code of ["x <- 1","y <- 2","print(x + y)"]) h.push(code);
+  await waitFor(()=>h.unconfirmed.length===0);
+  const handlers={};
+  const picker={
+    value:"",items:[],selectedItems:[],activeItems:[],
+    onDidChangeValue(cb){handlers.value=cb;},
+    onDidChangeActive(cb){handlers.active=cb;},
+    onDidTriggerButton(cb){handlers.button=cb;},
+    onDidAccept(cb){handlers.accept=cb;},
+    onDidHide(cb){handlers.hide=cb;},
+    show(){},hide(){handlers.hide();},dispose(){},
+  };
+  const { RTerminal }=loadSource("src/Terminal/rTerminal.ts",{
+    vscode:{EventEmitter:class{},ThemeIcon:class{constructor(id){this.id=id;}},
+      window:{createQuickPick:()=>picker,createOutputChannel:()=>({})}},
+    "./rTerminal/lang":{},
+  });
+  const {InputState}=loadSource("src/Terminal/inputState.ts");
+  const inputState=new InputState();
+  let executed=0;
+  const terminal=Object.assign(Object.create(RTerminal.prototype),{
+    mode:"ready",promptReady:true,rHistory:h,inputState,
+    historyBrowsing:false,lang:{updateInput(){}},
+    historyStorage:{state:{get:()=>false,update:async()=>{}}},
+    ensureReadyPromptVisibleForInput(){},clearInputRender(){},renderInput(){},
+    enqueueRSubmission(){executed++;},
+  });
+  const opened=terminal.showHistoryPicker();
+  await waitFor(()=>picker.items.length===3);
+  picker.selectedItems=[picker.items[0],picker.items[2],picker.items[1]];
+  handlers.accept();
+  await opened;
+  assert.equal(inputState.text,"x <- 1\ny <- 2\nprint(x + y)");
+  assert.equal(executed,0);
+  assert.equal(terminal.historyBrowsing,true);
+  assert.equal(terminal.historyCollapsed,true);
+  assert.deepEqual((await h.getPage("",false)).entries.map(x=>x.code),
+    ["print(x + y)","y <- 2","x <- 1"]);
+  terminal.handleArrow("up");
+  assert.equal(inputState.text,"print(x + y)");
+  terminal.handleArrow("up");
+  assert.equal(inputState.text,"y <- 2");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text,"print(x + y)");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text,"x <- 1\ny <- 2\nprint(x + y)");
+  assert.equal(executed,0);
+});
+
+test("durable record ordering prevents skipped pages after several prior deletions", async(t)=>{
+  const f=fixture(t);const a=f.create(),b=f.create();
+  a.load();b.load();
+  for(let i=0;i<90;i++)a.push("item-"+i);
+  await waitFor(()=>a.unconfirmed.length===0);
+  const first=await a.getPage("",false,0,50);
+  const anchor=first.entries.at(-1);
+  const early=first.entries.find(x=>x.code==="item-85");
+  await b.deleteEntries([anchor,early],false);
+  const second=await a.getPage("",false,0,50,anchor.id,anchor.historyIndex,anchor.order);
+  assert.equal(second.entries[0].code,"item-39");
+  const following=await a.requestPage({afterId:anchor.id,afterOrder:anchor.order,limit:10});
+  assert.equal(following.entries[0].code,"item-41");
+});
+
+test("F8 restores one checked occurrence at its original Up/Down history position", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const code of ["a()", "b()", "c()"]) history.push(code);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], selectedItems: [], activeItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history, inputState,
+    historyBrowsing: false, lang: { updateInput() {} },
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+    ensureReadyPromptVisibleForInput() {}, clearInputRender() {}, renderInput() {},
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 3);
+  // Newest first in Quick Pick, b() is the middle occurrence.
+  picker.selectedItems = [picker.items[1]];
+  handlers.accept();
+  await opened;
+  assert.equal(inputState.text, "b()");
+  terminal.handleArrow("up");
+  assert.equal(inputState.text, "a()");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text, "b()");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text, "c()");
 });

@@ -828,9 +828,19 @@ without treating other live workers as stale. Partial tagged records can be
 removed atomically while preserving completed records appended by other consoles.
 New commands are available locally immediately; saved commands and changes
 from other consoles arrive in the background. Updates carry only changed
-entries when possible. F8 searches the console's existing in-memory history
-directly rather than making a second complete history snapshot. It supplies
-only the newest 50 matching commands to the Quick Pick at a time.
+entries when possible. The foreground retains a recent history window, while the background worker
+keeps the bounded durable history store. F8 searches and fetches results through
+paged worker requests, initially returning up to 50 matches and loading further
+matches on demand. Up/Down navigation requests older/newer windows when reaching
+a loaded boundary. An older picker selection loads its surrounding commands
+before restoring the navigation cursor. Deleting individual or checked entries
+operates on persisted occurrence IDs; collapsed duplicates are matched within
+the chosen history scope. Deletion rewrites under the history file lock. Durable deletion metadata
+records occurrence IDs or hashes of deleted command text, never the deleted
+plaintext, together with a submission-time boundary. This prevents stale
+pending writes in another window or restarted worker from recreating deleted
+records while allowing genuinely new submissions after deletion.
+The Command Palette exposes Delete All Command History for the active scope.
 
 The worker manages plaintext command history separately
 from persistent terminal replay. Each console selects its scope at creation or
@@ -884,31 +894,33 @@ remain unchanged, and Windows relies on inherited filesystem permissions.
 Up/Down and Ctrl+P/Ctrl+N skip consecutive identical entries without removing
 them. Ctrl+R searches backward for the current line's trimmed text anywhere
 in a saved command; repeated Ctrl+R uses the original term to find older
-matches. F8 (`r-console.searchHistory`, displayed as
-**R Console: Show Command History**) opens **R Console: Command History**,
-a Quick Pick initially showing the newest 50 cached commands. Typing searches
-the entire console history cache (case-insensitive fuzzy subsequence matching),
-then updates the Quick Pick with at most the newest 50 matching commands.
-Only displayed matches are constructed as Quick Pick items; the full history
-is neither copied for F8 nor read again from disk. The `collapse-all` button
-hides exact duplicate entries among all matching commands; when enabled, it
-switches to `expand-all` to show repeated occurrences.
-The preference is retained in `context.globalState` across consoles and
-VS Code restarts. Each picker item carries a stable occurrence ID as well as its cached index.
-New records retain the UUID from the persisted history marker; legacy records
-without an ID receive a deterministic ID derived from their absolute file
-ordinal. Worker snapshots propagate these IDs, allowing F8 and Up/Down to
-retain the exact selected occurrence through shared-file synchronization,
-retries and compaction, even when two consoles submit identical command text.
-The shared file's append order remains authoritative; history is not
-timestamp-sorted.
-Local submissions can continue while F8 is open. Picker item positions account
-for history entries evicted from the front of the cache; when the selected
-occurrence was evicted, F8 still restores its code but resets history navigation
-to avoid pointing to a different command. Selecting an entry never executes it.
-The picker title, placeholder, button presentation, limited-result matching,
-and duplicate handling are defined in `src/Terminal/history.ts` and checked
-in unit tests.
+matches. F8 (`r-console.searchHistory`) uses native VS Code Quick Pick
+multiple-selection checkboxes and the built-in Select All control.
+Selection uses VS Code's native checked state without rerendering items on checkbox changes; the public Quick Pick API does not permit custom row backgrounds.
+Search changes clear selections to avoid deleting hidden commands. An empty history leaves F8 open with the empty-history hint in the search box only, not in the title or a notification. The title shows the number of loaded history entries when nonempty. The
+toolbar trash action deletes checked entries currently loaded into the
+picker. The separate **Delete All Command History** command clears the
+entire history scope, including entries not yet loaded. Accept restores the checked commands in chronological order into one editable multiline console input without executing them. Neither an unchecked highlighted command nor an empty selection is accepted. VS Code's Quick Pick API does not expose separate Enter and OK events.
+The initial picker page contains the newest 50 matching records; approaching the last active row automatically fetches another page (the toolbar
+Load More action remains available for mouse-wheel scrolling, which the public Quick Pick API cannot observe). Pages follow stable occurrence IDs with recovery for deleted cursors without adding a selectable
+pseudo-entry. Searches are handled by the background worker across the
+retained history, with exact-duplicate collapse governed by the persisted
+global-state preference. Each entry has a stable occurrence ID.
+After deletion the picker refreshes its existing loaded range without
+discarding the search query. A single checked entry restores its exact
+historical navigation position, fetching the surrounding history on demand
+if needed. Multiple checked entries create a combined draft without a
+history position: Up starts from the newest saved command and Down past
+that entry restores the combined draft without executing it. Editing
+the combined input expands the collapsed history-navigation mode.
+Up/Down navigation keeps at most 400 rows in a sliding foreground window,
+fetching adjacent 200-row batches with worker-side location hints if a boundary
+occurrence was deleted in another VS Code window. The worker remains the source
+of all retained history records.
+New submissions continue to be persisted while the picker is open.
+Deletion tombstones cannot be discarded on a time-only basis: independent
+windows can replay delayed submissions with their original timestamps, so
+metadata must remain until a newer rule provably subsumes it.
 
 ## 5. Files To Read First
 
@@ -930,3 +942,4 @@ in unit tests.
 16. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 17. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 18. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+

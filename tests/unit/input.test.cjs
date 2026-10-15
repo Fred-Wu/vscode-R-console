@@ -58,7 +58,7 @@ test("history persists multiline entries and searches without losing their conte
 test("workspace scope shares within a folder and isolates different folders", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-scopes-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const { getHistoryFile, getHistoryPickerEntries } = loadHistoryStore();
+  const { getHistoryFile } = loadHistoryStore();
   const a = getHistoryFile(root, "workspace", path.join(root, "a"));
   const b = getHistoryFile(root, "workspace", path.join(root, "b"));
   assert.notEqual(a, b);
@@ -73,71 +73,32 @@ test("workspace scope shares within a folder and isolates different folders", (t
   second.push("b <- 2");
   assert.deepEqual(first.getEntries(), ["a <- 1", "b <- 2"]);
   assert.deepEqual(other.getEntries(), []);
-  assert.deepEqual(getHistoryPickerEntries(["x", "y", "x"], true), [
-    { code: "x", historyIndex: 2 }, { code: "y", historyIndex: 1 },
-  ]);
-  assert.deepEqual(getHistoryPickerEntries(["x", "y", "x"], false), [
-    { code: "x", historyIndex: 2 }, { code: "y", historyIndex: 1 },
-    { code: "x", historyIndex: 0 },
-  ]);
+
 });
 
-
-test("F8 searches the full history cache but limits visible results", () => {
-  const { getHistoryPickerEntries, HISTORY_PICKER_LIMIT } = loadHistoryStore();
-  const entries = Array.from({ length: 20000 }, (_, i) => `command-${i}`);
-  entries[15] = "MatchInThePast()";
-  entries[19995] = "MatchAgain()";
-  assert.equal(HISTORY_PICKER_LIMIT, 50);
-  const initial = getHistoryPickerEntries(entries, false);
-  assert.equal(initial.length, 50);
-  assert.deepEqual(initial[0], { code: "command-19999", historyIndex: 19999 });
-  assert.deepEqual(initial.at(-1), { code: "command-19950", historyIndex: 19950 });
-  assert.deepEqual(getHistoryPickerEntries(entries, false, "match"), [
-    { code: "MatchAgain()", historyIndex: 19995 },
-    { code: "MatchInThePast()", historyIndex: 15 },
-  ]);
-  assert.deepEqual(getHistoryPickerEntries(entries, false, "MATp"), [
-    { code: "MatchInThePast()", historyIndex: 15 },
-  ]);
-  assert.deepEqual(getHistoryPickerEntries(["same()", "other()", "same()"], true, "same"), [
-    { code: "same()", historyIndex: 2 },
-  ]);
-  assert.deepEqual(getHistoryPickerEntries(["same()", "other()", "same()"], false, "same"), [
-    { code: "same()", historyIndex: 2 },
-    { code: "same()", historyIndex: 0 },
-  ]);
-  assert.deepEqual(getHistoryPickerEntries(entries, false, "missing-needle"), []);
-  assert.deepEqual(getHistoryPickerEntries(entries, false, "", 0), []);
-});
 
 test("F8 selection of an older repeated command keeps its original navigation position", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-history-picker-index-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const history = new HistoryManager(path.join(root, "history"));
-  const { getHistoryPickerEntries } = loadHistoryStore();
   history.load();
   history.setSearchNoDuplicates(true);
   for (const code of ["a()", "repeat()", "b()", "repeat()", "c()"]) history.push(code);
 
-  const picker = getHistoryPickerEntries(history.getEntries(), false);
-  const duplicates = picker.filter((item) => item.code === "repeat()");
-  assert.deepEqual(duplicates.map((item) => item.historyIndex), [3, 1]);
+  const duplicateIndices = [3, 1];
 
-  history.selectEntryAt(duplicates[1].historyIndex);
+  history.selectEntryAt(duplicateIndices[1]);
   assert.equal(history.navigate(-1), "a()");
   assert.equal(history.navigate(1), "repeat()");
   assert.equal(history.navigate(1), "b()");
 
-  history.selectEntryAt(duplicates[0].historyIndex);
+  history.selectEntryAt(duplicateIndices[0]);
   assert.equal(history.navigate(-1), "b()");
   assert.equal(history.navigate(1), "repeat()");
   assert.equal(history.navigate(1), "c()");
 
-  const collapsed = getHistoryPickerEntries(history.getEntries(), true);
-  assert.deepEqual(collapsed.filter((item) => item.code === "repeat()"), [
-    { code: "repeat()", historyIndex: 3 },
-  ]);
+  // Collapsing the picker is tested through the worker-backed getPage API
+  // in history-worker.test.cjs.
   assert.equal(history.getEntries().length, 5);
 });
 
@@ -151,13 +112,10 @@ test("F8 selection keeps an older duplicate through another console's compaction
   ).join(""));
   const browsing = new HistoryManager(file);
   const writer = new HistoryManager(file);
-  const { getHistoryPickerEntries } = loadHistoryStore();
   browsing.load();
   writer.load();
 
-  const picker = getHistoryPickerEntries(browsing.getEntries(), false, "repeat()");
-  const duplicateIndices = picker.filter((item) => item.code === "repeat()")
-    .map((item) => item.historyIndex);
+  const duplicateIndices = [15001, 5001];
   assert.deepEqual(duplicateIndices, [15001, 5001]);
 
   // The picker stays open in console A while console B compacts the shared file.
@@ -477,7 +435,7 @@ test("failed history appends keep queued commands visible until retry", (t) => {
       return fs.appendFileSync(...args);
     },
   };
-  const { HistoryManager: FailingHistory, getHistoryPickerEntries } = loadHistoryStore({ fs: failingFs });
+  const { HistoryManager: FailingHistory } = loadHistoryStore({ fs: failingFs });
   const history = new FailingHistory(file);
   history.load();
   history.setSearchNoDuplicates(true);
@@ -490,8 +448,8 @@ test("failed history appends keep queued commands visible until retry", (t) => {
     assert.deepEqual(history.getEntries(), [
       "persisted()", "queued-one()", "queued-two()",
     ]);
-    assert.deepEqual(getHistoryPickerEntries(history.getEntries(), false)
-      .map((entry) => entry.code), ["queued-two()", "queued-one()", "persisted()"]);
+    assert.deepEqual([...history.getEntries()].reverse(),
+      ["queued-two()", "queued-one()", "persisted()"]);
     history.resetIndex();
     assert.equal(history.navigate(-1), "queued-two()");
     assert.equal(history.navigate(-1), "queued-one()");

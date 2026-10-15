@@ -134,3 +134,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, build, packaging, and ma
 ## License
 
 MIT
+
+History deletion is available in the F8 history picker using per-row selection and one toolbar deletion action. The picker loads matching results in pages, and Up/Down navigation fetches older commands on demand. The Command Palette includes **R Console: Delete All Command History** for the active history scope.
