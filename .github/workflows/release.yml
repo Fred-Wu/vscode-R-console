@@ -207,7 +207,7 @@ jobs:
   publish-development:
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev')
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     needs: package
     runs-on: ubuntu-latest
     permissions:
@@ -218,20 +218,32 @@ jobs:
       - name: Extract development release notes
         id: development-notes
         run: |
+          # Prefer Unreleased; otherwise use the most recent versioned section.
+          # Exclude section headings so the pre-release notes have no version or date.
           awk '
-            /^## Unreleased$/ { in_section = 1; next }
-            /^## / && in_section { exit }
-            in_section { print }
-          ' CHANGELOG.md > unreleased-notes.md
-          if ! grep -q '[^[:space:]]' unreleased-notes.md; then
-            echo "Skipping development release: no non-empty Unreleased section in CHANGELOG.md."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            /^## / {
+              if (found) exit
+              if ($0 == "## Unreleased") {
+                found = 1
+                next
+              }
+              next
+            }
+            found { print }
+          ' CHANGELOG.md > development-release-notes.md
+          if ! grep -q '[^[:space:]]' development-release-notes.md; then
+            awk '
+              /^## / {
+                if (found) exit
+                found = 1
+                next
+              }
+              found { print }
+            ' CHANGELOG.md > development-release-notes.md
           fi
-          {
-            printf 'Development build from %s.\n\n' "$GITHUB_REF_NAME"
-            cat unreleased-notes.md
-          } > development-release-notes.md
+          if ! grep -q '[^[:space:]]' development-release-notes.md; then
+            printf 'Development build from main.\n' > development-release-notes.md
+          fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Download VSIX artifacts
