@@ -14,6 +14,7 @@ All notable changes to R Console will be documented in this file.
 
 ### Changed
 
+- Updated vscode-R compatibility requirements: R Console v0.5.3 requires vscode-R v3.2.0 or later. For vscode-R v3.0.1 or earlier, use R Console v0.5.2.
 - History is now loaded on demand from the on-disk history file, both in the paginated history picker and during console Up/Down navigation.
 - Multiple checked history entries can be restored together as one editable multiline input without executing them.
 - Adapted to the latest vscode-R APIs for workspace commands, session attachment, concurrent sessions, and persistent reconnection ([#1837](https://github.com/REditorSupport/vscode-R/pull/1837), [#1868](https://github.com/REditorSupport/vscode-R/pull/1868), [#1870](https://github.com/REditorSupport/vscode-R/pull/1870), [#1871](https://github.com/REditorSupport/vscode-R/pull/1871)), thanks to [@eitsupi](https://github.com/eitsupi) and the vscode-R contributors.
