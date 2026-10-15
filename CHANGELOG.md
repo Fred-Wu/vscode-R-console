@@ -2,21 +2,20 @@
 
 All notable changes to R Console will be documented in this file.
 
-## Unreleased
-
-- Added scoped deletion of command-history occurrences and full history via the Command Palette.
-- Added paged history search and Up/Down navigation, native checkbox multi-selection in F8, and durable deletion recovery.
-
-## [0.5.3] - 2026-10-14
+## [0.5.3] - 2026-10-15
 
 ### Added
 
 - Workspace-aware console history:
   - Command history is now kept separately for each workspace folder and shared between its consoles. `r.console.historyScope` defaults to `workspace`, with an option to use a single `global` history. Consoles outside a workspace automatically use global history.
   - `F8` opens **Command History**, a searchable history picker. A toggle collapses exact duplicate entries without deleting stored commands and remembers your choice across consoles and VS Code restarts.
+- Added native checkbox multi-selection and Select All in the history picker, with toolbar controls for deleting selected entries and loading more history. Deleting a collapsed duplicate entry removes all matching occurrences.
+- Added `R Console: Delete All Command History` to delete all saved history in the active console's history scope, with confirmation.
 
 ### Changed
 
+- History is now loaded on demand from the on-disk history file, both in the paginated history picker and during console Up/Down navigation.
+- Multiple checked history entries can be restored together as one editable multiline input without executing them.
 - Adapted to the latest vscode-R APIs for workspace commands, session attachment, concurrent sessions, and persistent reconnection ([#1837](https://github.com/REditorSupport/vscode-R/pull/1837), [#1868](https://github.com/REditorSupport/vscode-R/pull/1868), [#1870](https://github.com/REditorSupport/vscode-R/pull/1870), [#1871](https://github.com/REditorSupport/vscode-R/pull/1871)), thanks to [@eitsupi](https://github.com/eitsupi) and the vscode-R contributors.
 
 ## [0.5.2] - 2026-10-08
