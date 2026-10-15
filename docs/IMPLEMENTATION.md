@@ -900,15 +900,19 @@ Selection uses VS Code's native checked state without rerendering items on check
 Search changes clear selections to avoid deleting hidden commands. An empty history leaves F8 open with the empty-history hint in the search box only, not in the title or a notification. The title shows the number of loaded history entries when nonempty. The
 toolbar trash action deletes checked entries currently loaded into the
 picker. The separate **Delete All Command History** command clears the
-entire history scope, including entries not yet loaded. OK and Enter both restore the checked commands in chronological order into one editable multiline console input without executing it. Neither accepts an unchecked highlighted command.
+entire history scope, including entries not yet loaded. Accept restores the checked commands in chronological order into one editable multiline console input without executing them. Neither an unchecked highlighted command nor an empty selection is accepted. VS Code's Quick Pick API does not expose separate Enter and OK events.
 The initial picker page contains the newest 50 matching records; approaching the last active row automatically fetches another page (the toolbar
 Load More action remains available for mouse-wheel scrolling, which the public Quick Pick API cannot observe). Pages follow stable occurrence IDs with recovery for deleted cursors without adding a selectable
 pseudo-entry. Searches are handled by the background worker across the
 retained history, with exact-duplicate collapse governed by the persisted
 global-state preference. Each entry has a stable occurrence ID.
 After deletion the picker refreshes its existing loaded range without
-discarding the search query. Older selections fetch their surrounding
-history window on demand, preserving navigation from that occurrence.
+discarding the search query. A single checked entry restores its exact
+historical navigation position, fetching the surrounding history on demand
+if needed. Multiple checked entries create a combined draft without a
+history position: Up starts from the newest saved command and Down past
+that entry restores the combined draft without executing it. Editing
+the combined input expands the collapsed history-navigation mode.
 Up/Down navigation keeps at most 400 rows in a sliding foreground window,
 fetching adjacent 200-row batches with worker-side location hints if a boundary
 occurrence was deleted in another VS Code window. The worker remains the source

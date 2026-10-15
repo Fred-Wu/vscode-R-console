@@ -1271,8 +1271,19 @@ test("OK and Enter restore checked commands as one chronological editable draft"
   await opened;
   assert.equal(inputState.text,"x <- 1\ny <- 2\nprint(x + y)");
   assert.equal(executed,0);
+  assert.equal(terminal.historyBrowsing,true);
+  assert.equal(terminal.historyCollapsed,true);
   assert.deepEqual((await h.getPage("",false)).entries.map(x=>x.code),
     ["print(x + y)","y <- 2","x <- 1"]);
+  terminal.handleArrow("up");
+  assert.equal(inputState.text,"print(x + y)");
+  terminal.handleArrow("up");
+  assert.equal(inputState.text,"y <- 2");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text,"print(x + y)");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text,"x <- 1\ny <- 2\nprint(x + y)");
+  assert.equal(executed,0);
 });
 
 test("durable record ordering prevents skipped pages after several prior deletions", async(t)=>{
@@ -1288,4 +1299,49 @@ test("durable record ordering prevents skipped pages after several prior deletio
   assert.equal(second.entries[0].code,"item-39");
   const following=await a.requestPage({afterId:anchor.id,afterOrder:anchor.order,limit:10});
   assert.equal(following.entries[0].code,"item-41");
+});
+
+test("F8 restores one checked occurrence at its original Up/Down history position", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const code of ["a()", "b()", "c()"]) history.push(code);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], selectedItems: [], activeItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const inputState = new InputState();
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history, inputState,
+    historyBrowsing: false, lang: { updateInput() {} },
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+    ensureReadyPromptVisibleForInput() {}, clearInputRender() {}, renderInput() {},
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 3);
+  // Newest first in Quick Pick, b() is the middle occurrence.
+  picker.selectedItems = [picker.items[1]];
+  handlers.accept();
+  await opened;
+  assert.equal(inputState.text, "b()");
+  terminal.handleArrow("up");
+  assert.equal(inputState.text, "a()");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text, "b()");
+  terminal.handleArrow("down");
+  assert.equal(inputState.text, "c()");
 });

@@ -1841,8 +1841,8 @@ export class RTerminal implements vscode.Pseudoterminal {
             void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
           }
         });
-        // Native Quick Pick OK and Enter share onDidAccept. Both restore the
-        // checked entries as one editable input; neither executes the code.
+        // The Quick Pick accept action restores checked entries; it does not
+        // execute or delete them. VS Code exposes no separate Enter event.
         picker.onDidAccept(() => {
           const checked = [...picker.selectedItems];
           if (!checked.length) return;
@@ -1855,11 +1855,21 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (!selectedItems.length || this.mode !== "ready" || !this.promptReady) return;
       // Selection order is arbitrary. Use durable chronology, not display order.
       selectedItems.sort((a, b) => (a.order ?? a.historyIndex) - (b.order ?? b.historyIndex));
-      // The selected entries are an editable draft, not a history operation.
-      // Do not execute or delete them when accepting the picker.
+      const singleEntry = selectedItems.length === 1;
+      if (singleEntry && !await this.rHistory.selectPickerEntryOnDemand(selectedItems[0])) {
+        // Do not substitute a different occurrence if the selected one vanished.
+        return;
+      }
       this.lastSearchTerm = "";
       const code = selectedItems.map((item) => item.code).join("\n");
       this.applyHistorySearchResult(code);
+      if (!singleEntry) {
+        // The combined, unsubmitted input has no historical occurrence.
+        // Keep it collapsed so Up navigates history rather than its lines.
+        // Down past the newest command restores this exact editable draft.
+        this.rHistory.resetIndex();
+        this.savedHistoryInput = { text: code, cursor: code.length };
+      }
     } finally {
       disposed = true;
       generation++;
