@@ -1705,9 +1705,22 @@ export class RTerminal implements vscode.Pseudoterminal {
     let pageItems: HistoryPickItem[] = [];
     let hasMore = false;
     let generation = 0;
+    let renderingItems = false;
+    let loadingMore = false;
+    let refreshing = false;
     picker.keepScrollPosition = true;
     const updateToolbar = (): void => {
+      // A changing button is ambiguous without showing why it is present.
+      // VS Code exposes active-row changes, not a scroll-to-bottom event.
       picker.buttons = [collapseButton, ...(hasMore ? [loadMoreButton] : []), deleteButton];
+      const status = pageItems.length === 0
+        ? (picker.value ? "No matching commands." : historyPickerText.emptyMessage)
+        : hasMore
+          ? `Showing ${pageItems.length} commands. Move to the last entry to load more, or use the toolbar arrow.`
+          : `All ${pageItems.length} matching commands are loaded.`;
+      picker.title = historyPickerText.title + " — " + status;
+      picker.placeholder = pageItems.length === 0 && !picker.value
+        ? historyPickerText.emptyMessage : historyPickerText.placeholder;
     };
     const renderItems = (): void => {
       if (disposed) return;
@@ -1716,15 +1729,23 @@ export class RTerminal implements vscode.Pseudoterminal {
       // Capture selections only when paging/deletion actually changes the list.
       const selected = new Set(picker.selectedItems.map(itemKey));
       const activeId = picker.activeItems[0]?.id;
-      picker.items = pageItems;
-      picker.selectedItems = pageItems.filter((item) => selected.has(itemKey(item)));
-      const active = pageItems.find((item) => item.id === activeId);
-      if (active) picker.activeItems = [active];
+      renderingItems = true;
+      try {
+        picker.items = pageItems;
+        picker.selectedItems = pageItems.filter((item) => selected.has(itemKey(item)));
+        const active = pageItems.find((item) => item.id === activeId);
+        if (active) picker.activeItems = [active];
+      } finally {
+        renderingItems = false;
+      }
       updateToolbar();
     };
     const updateItems = async (append = false, retainPages = false): Promise<void> => {
-      if (disposed) return;
+      if (disposed || (append && (!hasMore || loadingMore || refreshing))) return;
+      if (append) loadingMore = true;
+      else refreshing = true;
       const currentGeneration = ++generation;
+      picker.busy = true;
       const query = picker.value;
       const targetCount = retainPages ? Math.max(50, pageOffset) : 50;
       const start = append ? pageOffset : 0;
@@ -1749,16 +1770,26 @@ export class RTerminal implements vscode.Pseudoterminal {
         pageOffset = pageItems.length;
         hasMore = more;
         renderItems();
-        if (!append && !query && !pageItems.length) {
-          void vscode.window.showInformationMessage(historyPickerText.emptyMessage);
-          picker.hide();
-        }
       } catch (error) {
         if (!disposed && generation === currentGeneration) {
           void vscode.window.showErrorMessage("Could not load R Console history: " +
             (error instanceof Error ? error.message : String(error)));
         }
+      } finally {
+        if (append) loadingMore = false;
+        if (generation === currentGeneration) {
+          refreshing = false;
+          if (!disposed) picker.busy = false;
+        }
       }
+    };
+    const loadMoreAtEnd = (activeItems: readonly HistoryPickItem[]): void => {
+      if (disposed || renderingItems || refreshing || loadingMore || !hasMore ||
+        pageItems.length === 0) return;
+      const activeId = activeItems[0]?.id;
+      if (!activeId) return;
+      const index = pageItems.findIndex((item) => item.id === activeId);
+      if (index >= pageItems.length - 2) void updateItems(true);
     };
     const deleteEntries = async (): Promise<void> => {
       const entries = [...picker.selectedItems];
@@ -1791,6 +1822,10 @@ export class RTerminal implements vscode.Pseudoterminal {
           picker.selectedItems = [];
           void updateItems();
         });
+        // Keyboard/pointer focus reaching the end loads the next page.
+        // Plain mouse-wheel scrolling has no public QuickPick event; the
+        // toolbar arrow remains available in that case.
+        picker.onDidChangeActive(loadMoreAtEnd);
         picker.onDidTriggerButton(async (button) => {
           if (button === deleteButton) {
             await deleteEntries();

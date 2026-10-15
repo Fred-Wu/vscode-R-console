@@ -897,13 +897,13 @@ in a saved command; repeated Ctrl+R uses the original term to find older
 matches. F8 (`r-console.searchHistory`) uses native VS Code Quick Pick
 multiple-selection checkboxes and the built-in Select All control.
 Selection uses VS Code's native checked state without rerendering items on checkbox changes; the public Quick Pick API does not permit custom row backgrounds.
-Search changes clear selections to avoid deleting hidden commands. The
+Search changes clear selections to avoid deleting hidden commands. An empty history leaves F8 open with an empty-history hint inside the picker instead of a notification. The
 toolbar trash action deletes checked entries currently loaded into the
 picker. The separate **Delete All Command History** command clears the
 entire history scope, including entries not yet loaded. Enter restores
 the highlighted command into the console input without executing it.
-The initial picker page contains the newest 50 matching records; a toolbar
-Load More action retrieves further pages by stable history ID cursor without adding a selectable
+The initial picker page contains the newest 50 matching records; approaching the last active row automatically fetches another page (the toolbar
+Load More action remains available for mouse-wheel scrolling, which the public Quick Pick API cannot observe). Pages follow stable occurrence IDs with recovery for deleted cursors without adding a selectable
 pseudo-entry. Searches are handled by the background worker across the
 retained history, with exact-duplicate collapse governed by the persisted
 global-state preference. Each entry has a stable occurrence ID.

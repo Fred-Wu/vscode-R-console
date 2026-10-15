@@ -477,6 +477,7 @@ test("F8 starts without the search-bar checkbox and refreshes after deletion", a
     onDidChangeValue(callback) { handlers.value = callback; },
     onDidTriggerButton(callback) { handlers.button = callback; },
     onDidChangeSelection(callback) { handlers.selection = callback; },
+    onDidChangeActive(callback) { handlers.active = callback; },
     onDidAccept(callback) { handlers.accept = callback; },
     onDidHide(callback) { handlers.hide = callback; },
     show() {}, hide() { handlers.hide(); }, dispose() {},
@@ -521,6 +522,7 @@ test("F8 check buttons support selecting multiple commands without changing Ente
     onDidChangeValue(cb) { handlers.value = cb; },
     onDidTriggerButton(cb) { handlers.button = cb; },
     onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
     onDidAccept(cb) { handlers.accept = cb; },
     onDidHide(cb) { handlers.hide = cb; },
     show() {}, hide() { handlers.hide(); }, dispose() {},
@@ -677,6 +679,7 @@ test("F8 Enter restores the highlighted command rather than deleting it", async 
     onDidChangeValue(cb) { handlers.value = cb; },
     onDidTriggerButton(cb) { handlers.button = cb; },
     onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
     onDidAccept(cb) { handlers.accept = cb; },
     onDidHide(cb) { handlers.hide = cb; },
     show() {}, hide() { handlers.hide(); }, dispose() {},
@@ -848,6 +851,7 @@ test("native Select All only deletes loaded picker entries; Load More is toolbar
     value: "", items: [], activeItems: [], selectedItems: [],
     onDidChangeValue(fn) { handlers.change = fn; },
     onDidChangeSelection(fn) { handlers.selection = fn; },
+    onDidChangeActive(fn) { handlers.active = fn; },
     onDidTriggerButton(fn) { handlers.button = fn; },
     onDidAccept(fn) { handlers.accept = fn; },
     onDidHide(fn) { handlers.hide = fn; },
@@ -951,6 +955,7 @@ test("picker deletion preserves the number of loaded matching rows", async (t) =
     value: "", items: [], activeItems: [], selectedItems: [],
     onDidChangeValue(fn) { handlers.change = fn; },
     onDidChangeSelection(fn) { handlers.selection = fn; },
+    onDidChangeActive(fn) { handlers.active = fn; },
     onDidTriggerButton(fn) { handlers.button = fn; },
     onDidAccept(fn) { handlers.accept = fn; },
     onDidHide(fn) { handlers.hide = fn; },
@@ -1018,6 +1023,7 @@ test("native Quick Pick checkbox clicks and Select All never replace picker item
     onDidChangeValue(cb) { handlers.value = cb; },
     onDidTriggerButton(cb) { handlers.button = cb; },
     onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
     onDidAccept(cb) { handlers.accept = cb; },
     onDidHide(cb) { handlers.hide = cb; },
     show() {}, hide() { handlers.hide(); }, dispose() {},
@@ -1105,7 +1111,7 @@ test("stale older and newer page anchors use positional hints", async (t) => {
     afterId: "deleted-record", afterIndex: 300, limit: 10,
   });
   assert.equal(newer.entries.length, 10);
-  assert.equal(newer.entries[0].code, "command-301");
+  assert.equal(newer.entries[0].code, "command-300");
 });
 
 test("filtered history keeps paging if another console removes the cursor entry", async (t) => {
@@ -1121,4 +1127,109 @@ test("filtered history keeps paging if another console removes the cursor entry"
   const rest = await a.getPage("", false, 0, 50, boundary.id, boundary.historyIndex);
   assert.equal(rest.entries[0].code, "item-39");
   assert.equal(new Set([...first.entries, ...rest.entries].map((item) => item.id)).size, 90);
+});
+
+test("empty F8 stays open and explains empty history in its input", async (t) => {
+  const f = fixture(t);
+  const h = f.create(); h.load();
+  const handlers = {}; let hideCount = 0; const notices = [];
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { hideCount++; handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: {
+        createQuickPick: () => picker, createOutputChannel: () => ({}),
+        showInformationMessage: (...args) => notices.push(args),
+      },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: h,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.title?.includes("R Console command history is empty."));
+  assert.equal(picker.placeholder, "R Console command history is empty.");
+  assert.equal(hideCount, 0);
+  assert.equal(notices.length, 0);
+  assert.deepEqual(picker.items, []);
+  handlers.hide(); await opened;
+});
+
+test("F8 automatically loads more near last active entry without duplicate requests", async (t) => {
+  const f = fixture(t); const h = f.create(); h.load();
+  for (let i = 0; i < 120; i++) h.push("item-" + i);
+  await waitFor(() => h.unconfirmed.length === 0);
+  const handlers = {};
+  const picker = {
+    value: "", items: [], activeItems: [], selectedItems: [],
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidChangeActive(cb) { handlers.active = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: h,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 50);
+  handlers.active([picker.items[49]]);
+  handlers.active([picker.items[49]]);
+  await waitFor(() => picker.items.length === 100);
+  assert.equal(picker.items.length, 100);
+  assert.match(picker.title, /Showing 100 commands/);
+  handlers.active([picker.items[99]]);
+  await waitFor(() => picker.items.length === 120);
+  assert.match(picker.title, /All 120 matching commands are loaded/);
+  assert.equal(picker.buttons.some(b => b.iconPath.id === "arrow-down"), false);
+  handlers.hide(); await opened;
+});
+
+test("complete CRLF tagged history is preserved during interrupted-write recovery", (t) => {
+  const f=fixture(t), { HistoryStore }=loadSource("src/Terminal/historyStore.ts");
+  const file=path.join(f.dir,"history");
+  const id="11111111-1111-4111-8111-111111111111";
+  const bad="22222222-2222-4222-8222-222222222222";
+  fs.writeFileSync(file,[
+    "# time: now history-id: "+id+" submitted-at: 10",
+    "+keep()",
+    "# history-complete: "+id,
+    "# time: now history-id: "+bad+" submitted-at: 11",
+    "+incomplete()",
+  ].join("\r\n")+"\r\n");
+  const store=new HistoryStore(file); store.load();
+  assert.deepEqual(store.getEntries(), ["keep()"]);
+  assert.ok(!fs.readFileSync(file,"utf8").includes("incomplete()"));
+});
+
+test("real deletion of an anchor keeps the next unvisited record in both page directions", async(t)=>{
+  const f=fixture(t); const a=f.create(),b=f.create();a.load();b.load();
+  for(let i=0;i<90;i++)a.push("item-"+i);
+  await waitFor(()=>a.unconfirmed.length===0);
+  const older=await a.requestPage({beforeId:"item-40-not-valid",beforeIndex:40,limit:10});
+  assert.equal(older.entries.at(-1).code,"item-39");
+  const page=await a.getPage("",false,0,50);
+  const anchor=page.entries.at(-1);
+  await b.deleteEntries([anchor],false);
+  const next=await a.getPage("",false,0,50,anchor.id,anchor.historyIndex);
+  assert.equal(next.entries[0].code,"item-39");
+  const newer=await a.requestPage({afterId:anchor.id,afterIndex:anchor.historyIndex,limit:10});
+  assert.equal(newer.entries[0].code,"item-41");
 });

@@ -381,7 +381,7 @@ export class HistoryStore extends HistoryBuffer {
       const end = i + 1 < boundaries.length ? boundaries[i + 1].index! : raw.length;
       const record = raw.slice(begin, end);
       const tag = /^# time:[^\n]*\bhistory-id: ([0-9a-f-]{36})(?=\s|$)/m.exec(record);
-      if (tag && !record.includes("# history-complete: " + tag[1] + "\n")) {
+      if (tag && !new RegExp("^# history-complete: " + tag[1] + "\\r?$", "m").test(record)) {
         rebuilt += raw.slice(offset, begin);
         offset = end;
         changed = true;
@@ -642,7 +642,7 @@ export class HistoryStore extends HistoryBuffer {
         let record = oldRecords[index];
         record = record.replace(/(# time:[^\n]*)(\r?\n)/, (_line, header: string, newline: string) =>
           (header.includes("history-id: ") ? header : header + " history-id: " + entry.id) + newline);
-        if (!record.includes("# history-complete: " + entry.id + "\n")) {
+        if (!new RegExp("^# history-complete: " + entry.id + "\\r?$", "m").test(record)) {
           record = record.replace(/\s*$/, "") + "\n# history-complete: " + entry.id + "\n";
         }
         records.push(record);

@@ -134,7 +134,7 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       }
       const anchor = index >= 0 ? index : beforeId !== undefined
         ? all.findIndex((entry) => entry.historyIndex >= beforeIndex!)
-        : all.findIndex((entry) => entry.historyIndex > afterIndex!);
+        : all.findIndex((entry) => entry.historyIndex >= afterIndex!);
       const effectiveAnchor = anchor < 0 ? all.length : anchor;
       const from = aroundId !== undefined ? Math.max(0, effectiveAnchor - Math.floor(count / 2))
         : afterId !== undefined ? Math.max(0, index >= 0 ? anchor + 1 : effectiveAnchor) : Math.max(0, effectiveAnchor - count);
