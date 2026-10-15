@@ -703,7 +703,7 @@ test("F8 Enter restores the highlighted command rather than deleting it", async 
   assert.equal(picker.canSelectMany, true);
   assert.equal(picker.items[0].label, "restore()");
   assert.equal(picker.items[0].buttons, undefined);
-  picker.activeItems = [picker.items[0]];
+  picker.selectedItems = [picker.items[0]];
   handlers.accept();
   await opened;
   assert.deepEqual(restored, ["restore()"]);
@@ -1156,7 +1156,8 @@ test("empty F8 stays open and explains empty history in its input", async (t) =>
     historyStorage: { state: { get: () => false, update: async () => {} } },
   });
   const opened = terminal.showHistoryPicker();
-  await waitFor(() => picker.title?.includes("R Console command history is empty."));
+  await waitFor(() => picker.placeholder === "R Console command history is empty.");
+  assert.equal(picker.title, "R Console: Command History");
   assert.equal(picker.placeholder, "R Console command history is empty.");
   assert.equal(hideCount, 0);
   assert.equal(notices.length, 0);
@@ -1194,10 +1195,10 @@ test("F8 automatically loads more near last active entry without duplicate reque
   handlers.active([picker.items[49]]);
   await waitFor(() => picker.items.length === 100);
   assert.equal(picker.items.length, 100);
-  assert.match(picker.title, /Showing 100 commands/);
+  assert.match(picker.title, /100 history loaded/);
   handlers.active([picker.items[99]]);
   await waitFor(() => picker.items.length === 120);
-  assert.match(picker.title, /All 120 matching commands are loaded/);
+  assert.match(picker.title, /120 history loaded/);
   assert.equal(picker.buttons.some(b => b.iconPath.id === "arrow-down"), false);
   handlers.hide(); await opened;
 });
@@ -1232,4 +1233,59 @@ test("real deletion of an anchor keeps the next unvisited record in both page di
   assert.equal(next.entries[0].code,"item-39");
   const newer=await a.requestPage({afterId:anchor.id,afterIndex:anchor.historyIndex,limit:10});
   assert.equal(newer.entries[0].code,"item-41");
+});
+
+test("OK and Enter restore checked commands as one chronological editable draft", async (t) => {
+  const f=fixture(t); const h=f.create(); h.load();
+  for (const code of ["x <- 1","y <- 2","print(x + y)"]) h.push(code);
+  await waitFor(()=>h.unconfirmed.length===0);
+  const handlers={};
+  const picker={
+    value:"",items:[],selectedItems:[],activeItems:[],
+    onDidChangeValue(cb){handlers.value=cb;},
+    onDidChangeActive(cb){handlers.active=cb;},
+    onDidTriggerButton(cb){handlers.button=cb;},
+    onDidAccept(cb){handlers.accept=cb;},
+    onDidHide(cb){handlers.hide=cb;},
+    show(){},hide(){handlers.hide();},dispose(){},
+  };
+  const { RTerminal }=loadSource("src/Terminal/rTerminal.ts",{
+    vscode:{EventEmitter:class{},ThemeIcon:class{constructor(id){this.id=id;}},
+      window:{createQuickPick:()=>picker,createOutputChannel:()=>({})}},
+    "./rTerminal/lang":{},
+  });
+  const {InputState}=loadSource("src/Terminal/inputState.ts");
+  const inputState=new InputState();
+  let executed=0;
+  const terminal=Object.assign(Object.create(RTerminal.prototype),{
+    mode:"ready",promptReady:true,rHistory:h,inputState,
+    historyBrowsing:false,lang:{updateInput(){}},
+    historyStorage:{state:{get:()=>false,update:async()=>{}}},
+    ensureReadyPromptVisibleForInput(){},clearInputRender(){},renderInput(){},
+    enqueueRSubmission(){executed++;},
+  });
+  const opened=terminal.showHistoryPicker();
+  await waitFor(()=>picker.items.length===3);
+  picker.selectedItems=[picker.items[0],picker.items[2],picker.items[1]];
+  handlers.accept();
+  await opened;
+  assert.equal(inputState.text,"x <- 1\ny <- 2\nprint(x + y)");
+  assert.equal(executed,0);
+  assert.deepEqual((await h.getPage("",false)).entries.map(x=>x.code),
+    ["print(x + y)","y <- 2","x <- 1"]);
+});
+
+test("durable record ordering prevents skipped pages after several prior deletions", async(t)=>{
+  const f=fixture(t);const a=f.create(),b=f.create();
+  a.load();b.load();
+  for(let i=0;i<90;i++)a.push("item-"+i);
+  await waitFor(()=>a.unconfirmed.length===0);
+  const first=await a.getPage("",false,0,50);
+  const anchor=first.entries.at(-1);
+  const early=first.entries.find(x=>x.code==="item-85");
+  await b.deleteEntries([anchor,early],false);
+  const second=await a.getPage("",false,0,50,anchor.id,anchor.historyIndex,anchor.order);
+  assert.equal(second.entries[0].code,"item-39");
+  const following=await a.requestPage({afterId:anchor.id,afterOrder:anchor.order,limit:10});
+  assert.equal(following.entries[0].code,"item-41");
 });

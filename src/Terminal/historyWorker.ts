@@ -5,7 +5,7 @@ import type { HistoryRequest, HistoryUpdate } from "./history";
 const port = parentPort!;
 type RecordState = {
   store: HistoryStore;
-  previous: { entries: string[]; ids: string[]; start: number };
+  previous: { entries: string[]; ids: string[]; orders: number[]; start: number };
   unconfirmed: Set<string>;
   closed: boolean;
   initialized: boolean;
@@ -19,13 +19,14 @@ function publish(id: number, record: RecordState): void {
   const full = record.store.getSnapshot();
   const offset = Math.max(0, full.entries.length - 200);
   const snapshot = { entries: full.entries.slice(offset), ids: full.ids.slice(offset),
-    start: full.start + offset };
+    orders: full.orders.slice(offset), start: full.start + offset };
   const previous = record.previous;
   const remove = snapshot.start - previous.start;
   const retained = previous.entries.length - remove;
   const reset = !record.initialized || remove < 0 || retained < 0 ||
     retained > snapshot.entries.length ||
-    previous.ids.slice(remove).some((id, index) => id !== snapshot.ids[index]);
+    previous.ids.slice(remove).some((id, index) => id !== snapshot.ids[index]) ||
+    previous.orders.slice(remove).some((order, index) => order !== snapshot.orders[index]);
   const deletions = record.store.getDeletionRules();
   const identifiers = deletions.map((rule) => JSON.stringify(rule));
   const hasPrefix = record.previousDeletions.every(
@@ -39,6 +40,7 @@ function publish(id: number, record: RecordState): void {
     id, start: snapshot.start, reset, remove,
     entries: reset ? snapshot.entries : snapshot.entries.slice(retained),
     ids: reset ? snapshot.ids : snapshot.ids.slice(retained),
+    orders: reset ? snapshot.orders : snapshot.orders.slice(retained),
     persisted, deletedRules,
   } satisfies HistoryUpdate);
   record.previous = snapshot;
@@ -100,7 +102,7 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       : getHistoryFile(location.storageFolder, location.scope, location.workspaceFolder);
     const store = new HistoryStore(file);
     store.load();
-    record = { store, previous: { entries: [], ids: [], start: 0 },
+    record = { store, previous: { entries: [], ids: [], orders: [], start: 0 },
       unconfirmed: new Set<string>(), closed: false, initialized: false,
       previousDeletions: [], pendingDeletions: [] };
     stores.set(request.id, record);
@@ -108,10 +110,10 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
   if (request.page) {
     const source = record.store.getSnapshot();
     const { requestId, limit, query, collapse, offset, beforeId, afterId, aroundId,
-      beforeIndex, afterIndex } = request.page;
+      beforeIndex, afterIndex, beforeOrder, afterOrder } = request.page;
     const count = Math.max(1, Math.min(200, limit));
     const all = source.entries.map((code, index) => ({
-      code, id: source.ids[index], historyIndex: source.start + index,
+      code, id: source.ids[index], historyIndex: source.start + index, order: source.orders[index],
     }));
     let page: typeof all;
     let next = false;
@@ -127,14 +129,17 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
           entries: [], hasMore: false } });
         return;
       }
-      if (index < 0 && beforeIndex === undefined && afterIndex === undefined) {
+      if (index < 0 && beforeIndex === undefined && afterIndex === undefined &&
+        beforeOrder === undefined && afterOrder === undefined) {
         port.postMessage({ id: request.id, pageResult: { requestId,
           entries: [], hasMore: false } });
         return;
       }
       const anchor = index >= 0 ? index : beforeId !== undefined
-        ? all.findIndex((entry) => entry.historyIndex >= beforeIndex!)
-        : all.findIndex((entry) => entry.historyIndex >= afterIndex!);
+        ? all.findIndex((entry) => beforeOrder !== undefined
+          ? entry.order >= beforeOrder : entry.historyIndex >= beforeIndex!)
+        : all.findIndex((entry) => afterOrder !== undefined
+          ? entry.order > afterOrder : entry.historyIndex >= afterIndex!);
       const effectiveAnchor = anchor < 0 ? all.length : anchor;
       const from = aroundId !== undefined ? Math.max(0, effectiveAnchor - Math.floor(count / 2))
         : afterId !== undefined ? Math.max(0, index >= 0 ? anchor + 1 : effectiveAnchor) : Math.max(0, effectiveAnchor - count);
@@ -166,7 +171,8 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       const start = afterId === undefined ? Math.max(0, offset ?? 0)
         : cursor >= 0 ? cursor + 1
           : afterIndex !== undefined
-            ? matched.findIndex((entry) => entry.historyIndex < afterIndex) : -1;
+            ? matched.findIndex((entry) => afterOrder !== undefined
+              ? entry.order < afterOrder : entry.historyIndex < afterIndex) : -1;
       const effectiveStart = start < 0 ? matched.length : start;
       page = matched.slice(effectiveStart, effectiveStart + count);
       next = effectiveStart + count < matched.length;

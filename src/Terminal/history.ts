@@ -21,7 +21,7 @@ export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean):
     : { icon: "collapse-all", tooltip: "Collapse duplicate commands" };
 }
 
-export type HistoryPickerEntry = { code: string; historyIndex: number; id?: string };
+export type HistoryPickerEntry = { code: string; historyIndex: number; id?: string; order?: number };
 
 export type HistoryLocation = string | {
   storageFolder: string;
@@ -37,7 +37,7 @@ export type HistoryRequest = {
   delete?: { ids?: string[]; codes?: string[]; all?: boolean; before?: number };
   page?: { requestId: number; limit: number; query?: string; collapse?: boolean;
     offset?: number; beforeId?: string; afterId?: string; aroundId?: string;
-    beforeIndex?: number; afterIndex?: number };
+    beforeIndex?: number; afterIndex?: number; beforeOrder?: number; afterOrder?: number };
 };
 
 export type HistoryUpdate = {
@@ -47,6 +47,7 @@ export type HistoryUpdate = {
   remove: number;
   entries: string[];
   ids?: string[];
+  orders?: number[];
   persisted?: string[];
   deleted?: string[];
   deletionComplete?: boolean;
@@ -144,7 +145,9 @@ export class HistoryManager extends HistoryBuffer {
     reject: (reason: Error) => void }>();
   private stored: string[] = [];
   private storedIds: string[] = [];
+  private storedOrders: number[] = [];
   private historyIds: string[] = [];
+  private navigationOrders: number[] = [];
   private sessionIds: string[] = [];
   private sessionTimestamps: number[] = [];
   private storedStart = 0;
@@ -194,7 +197,7 @@ export class HistoryManager extends HistoryBuffer {
   }
 
   async getPage(query: string, collapse: boolean, offset = 0, limit = 50,
-    afterId?: string, afterIndex?: number): Promise<{ entries: HistoryPickerEntry[]; hasMore: boolean }> {
+    afterId?: string, afterIndex?: number, afterOrder?: number): Promise<{ entries: HistoryPickerEntry[]; hasMore: boolean }> {
     // The page must not overtake a submission queued on the extension host.
     // Wait only for queued writes; the worker still performs all disk I/O.
     if (this.pending.length || this.sent?.length) {
@@ -215,7 +218,7 @@ export class HistoryManager extends HistoryBuffer {
         check();
       });
     }
-    return this.requestPage({ query, collapse, offset, limit, afterId, afterIndex });
+    return this.requestPage({ query, collapse, offset, limit, afterId, afterIndex, afterOrder });
   }
 
   private requestPage(page: Omit<NonNullable<HistoryRequest["page"]>, "requestId">): Promise<{
@@ -249,7 +252,8 @@ export class HistoryManager extends HistoryBuffer {
     const first = this.historyIds[0];
     if (!first || this.disabled) return false;
     const page = await this.requestPage({
-      beforeId: first, beforeIndex: this.navigationStart, limit: 200,
+      beforeId: first, beforeIndex: this.navigationStart,
+      beforeOrder: this.navigationOrders[0], limit: 200,
     });
     if (!page.entries.length) return false;
     // Another operation may have replaced this navigation window while
@@ -260,6 +264,7 @@ export class HistoryManager extends HistoryBuffer {
     if (!older.length) return false;
     this.historyBuffer.unshift(...older.map((entry) => entry.code));
     this.historyIds.unshift(...older.map((entry) => entry.id!));
+    this.navigationOrders.unshift(...older.map((entry) => entry.order!));
     this.navigationStart = older[0].historyIndex;
     this.historyIndex += older.length;
     // When moving backwards, discard the newest tail. Down will fetch it
@@ -268,6 +273,7 @@ export class HistoryManager extends HistoryBuffer {
     if (extra) {
       this.historyBuffer.splice(-extra);
       this.historyIds.splice(-extra);
+      this.navigationOrders.splice(-extra);
       // Reverse search may have exhausted the whole preceding window; its
       // cursor can then point beyond the retained tail. Clamp it so another
       // search never indexes beyond the sliding cache.
@@ -284,6 +290,7 @@ export class HistoryManager extends HistoryBuffer {
     if (!page.entries.some((candidate) => candidate.id === entry.id)) return false;
     this.historyBuffer = page.entries.map((candidate) => candidate.code);
     this.historyIds = page.entries.map((candidate) => candidate.id!);
+    this.navigationOrders = page.entries.map((candidate) => candidate.order!);
     this.navigationStart = page.entries[0].historyIndex;
     this.browsingOlder = true;
     const index = this.historyIds.indexOf(entry.id);
@@ -296,6 +303,7 @@ export class HistoryManager extends HistoryBuffer {
     if (!last || this.disabled || !this.browsingOlder) return false;
     const page = await this.requestPage({
       afterId: last, afterIndex: this.navigationStart + this.historyIds.length - 1,
+      afterOrder: this.navigationOrders.at(-1),
       limit: 200,
     });
     if (this.historyIds[this.historyIds.length - 1] !== last) return false;
@@ -312,10 +320,12 @@ export class HistoryManager extends HistoryBuffer {
     if (!newer.length) return false;
     this.historyBuffer.push(...newer.map((entry) => entry.code));
     this.historyIds.push(...newer.map((entry) => entry.id!));
+    this.navigationOrders.push(...newer.map((entry) => entry.order!));
     const extra = Math.max(0, this.historyBuffer.length - this.navigationWindowSize);
     if (extra) {
       this.historyBuffer.splice(0, extra);
       this.historyIds.splice(0, extra);
+      this.navigationOrders.splice(0, extra);
       this.historyIndex = Math.max(0, this.historyIndex - extra);
     }
     this.navigationStart = this.historyIds.length
@@ -364,6 +374,8 @@ export class HistoryManager extends HistoryBuffer {
       this.sessionTimestamps.shift();
     }
     this.historyIds.push(write.id);
+    this.navigationOrders.push((this.navigationOrders.at(-1) ?? -1) + 1);
+    if (this.navigationOrders.length > this.maxHistorySize) this.navigationOrders.shift();
     if (this.historyIds.length > this.maxHistorySize) this.historyIds.shift();
     if (!this.disabled) {
       this.pending.push(write);
@@ -418,6 +430,9 @@ export class HistoryManager extends HistoryBuffer {
       "legacy-test:" + (update.start + (update.reset ? 0 : this.storedIds.length - update.remove) + index));
     this.storedIds = update.reset ? ids
       : [...this.storedIds.slice(update.remove), ...ids];
+    // Older protocol snapshots may omit orders; retain positional fallback.
+    this.storedOrders = update.reset ? (update.orders ?? [])
+      : update.orders ? [...this.storedOrders.slice(update.remove), ...update.orders] : [];
     this.storedStart = update.start;
   }
 
@@ -455,6 +470,9 @@ export class HistoryManager extends HistoryBuffer {
     const trim = Math.max(0, combined.length - this.maxHistorySize);
     this.historyBuffer = combined.slice(trim);
     this.historyIds = ids.slice(trim);
+    this.navigationOrders = [...this.storedOrders,
+      ...[...sent, ...this.pending].map((_entry, index) =>
+        (this.storedOrders.at(-1) ?? -1) + index + 1)].slice(trim);
     this.navigationStart = this.storedStart + trim;
     const position = selected === undefined ? -1 : this.historyIds.indexOf(selected);
     this.historyIndex = atEnd ? this.historyBuffer.length

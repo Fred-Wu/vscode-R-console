@@ -1678,6 +1678,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       code: string;
       historyIndex: number;
       id?: string;
+      order?: number;
     };
     const picker = vscode.window.createQuickPick<HistoryPickItem>();
     const resumeHistoryUpdates = this.rHistory.suspendUpdates();
@@ -1697,7 +1698,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const deleteButton = { iconPath: new vscode.ThemeIcon("trash"),
       tooltip: "Delete selected history entries" };
     const loadMoreButton = { iconPath: new vscode.ThemeIcon("arrow-down"),
-      tooltip: "Load more matching history entries" };
+      tooltip: "Load more history" };
     const itemKey = (item: HistoryPickItem): string =>
       item.id ?? String(item.historyIndex) + ":" + item.code;
     let disposed = false;
@@ -1713,12 +1714,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       // A changing button is ambiguous without showing why it is present.
       // VS Code exposes active-row changes, not a scroll-to-bottom event.
       picker.buttons = [collapseButton, ...(hasMore ? [loadMoreButton] : []), deleteButton];
-      const status = pageItems.length === 0
-        ? (picker.value ? "No matching commands." : historyPickerText.emptyMessage)
-        : hasMore
-          ? `Showing ${pageItems.length} commands. Move to the last entry to load more, or use the toolbar arrow.`
-          : `All ${pageItems.length} matching commands are loaded.`;
-      picker.title = historyPickerText.title + " — " + status;
+      picker.title = pageItems.length
+        ? historyPickerText.title + ` — ${pageItems.length} history loaded`
+        : historyPickerText.title;
       picker.placeholder = pageItems.length === 0 && !picker.value
         ? historyPickerText.emptyMessage : historyPickerText.placeholder;
     };
@@ -1758,10 +1756,11 @@ export class RTerminal implements vscode.Pseudoterminal {
             anchor ? 0 : start + fetched.length,
             Math.min(200, targetCount - fetched.length),
             fetched.at(-1)?.id ?? anchor,
-            fetched.at(-1)?.historyIndex ?? (append ? pageItems.at(-1)?.historyIndex : undefined));
+            fetched.at(-1)?.historyIndex ?? (append ? pageItems.at(-1)?.historyIndex : undefined),
+            fetched.at(-1)?.order ?? (append ? pageItems.at(-1)?.order : undefined));
           if (disposed || generation !== currentGeneration) return;
-          fetched.push(...page.entries.map(({ code, historyIndex, id }) => ({
-            label: code, code, historyIndex, id,
+          fetched.push(...page.entries.map(({ code, historyIndex, id, order }) => ({
+            label: code, code, historyIndex, id, order,
           })));
           more = page.hasMore;
           if (!page.entries.length) break;
@@ -1813,18 +1812,14 @@ export class RTerminal implements vscode.Pseudoterminal {
     updateToolbar();
     void updateItems();
 
-    let selectedItem: HistoryPickItem | undefined;
+    let selectedItems: HistoryPickItem[] = [];
     try {
-      selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
+      selectedItems = await new Promise<HistoryPickItem[]>((resolve) => {
         picker.onDidChangeValue(() => {
-          // Search results have a different selection scope. Clear native
-          // selection before replacing the list to avoid hidden deletions.
+          // Search changes clear hidden selections.
           picker.selectedItems = [];
           void updateItems();
         });
-        // Keyboard/pointer focus reaching the end loads the next page.
-        // Plain mouse-wheel scrolling has no public QuickPick event; the
-        // toolbar arrow remains available in that case.
         picker.onDidChangeActive(loadMoreAtEnd);
         picker.onDidTriggerButton(async (button) => {
           if (button === deleteButton) {
@@ -1846,24 +1841,25 @@ export class RTerminal implements vscode.Pseudoterminal {
             void vscode.window.showErrorMessage("Could not save the R Console history picker preference.");
           }
         });
+        // Native Quick Pick OK and Enter share onDidAccept. Both restore the
+        // checked entries as one editable input; neither executes the code.
         picker.onDidAccept(() => {
-          const selected = picker.activeItems[0] ?? picker.selectedItems[0];
-          if (!selected) return;
-          resolve(selected);
+          const checked = [...picker.selectedItems];
+          if (!checked.length) return;
+          resolve(checked);
           picker.hide();
         });
-        picker.onDidHide(() => resolve(undefined));
+        picker.onDidHide(() => resolve([]));
         picker.show();
       });
-      if (!selectedItem || this.mode !== "ready" || !this.promptReady) {
-        return;
-      }
+      if (!selectedItems.length || this.mode !== "ready" || !this.promptReady) return;
+      // Selection order is arbitrary. Use durable chronology, not display order.
+      selectedItems.sort((a, b) => (a.order ?? a.historyIndex) - (b.order ?? b.historyIndex));
+      // The selected entries are an editable draft, not a history operation.
+      // Do not execute or delete them when accepting the picker.
       this.lastSearchTerm = "";
-      if (!await this.rHistory.selectPickerEntryOnDemand(selectedItem)) {
-        // Do not restore an occurrence which was deleted or evicted.
-        return;
-      }
-      this.applyHistorySearchResult(selectedItem.code);
+      const code = selectedItems.map((item) => item.code).join("\n");
+      this.applyHistorySearchResult(code);
     } finally {
       disposed = true;
       generation++;
