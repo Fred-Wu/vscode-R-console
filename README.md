@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 
 ### Setup
 
-1. Install [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r).
+1. Install a compatible version of [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (see [Dependency Model](#dependency-model)).
 2. Configure `r.executablePath`. The deprecated `r.rpath.<platform>` setting is still supported for compatibility. If neither setting is set, R Console looks for R on `PATH` and, on Windows, falls back to the R installation recorded in the Windows registry.
 3. Enable bracketed paste mode:
 
@@ -115,8 +115,12 @@ R Console also contributes its own settings:
 
 ## Dependency Model
 
-> [!NOTE]
-> Support for vscode-R versions earlier than 3.0 is deprecated and may be removed in a future R Console version.
+Updated vscode-R compatibility requirements: R Console v0.5.3 requires vscode-R v3.2.0 or later. For vscode-R v3.0.1 or earlier, use R Console v0.5.2.
+
+| R Console version | vscode-R version |
+| --- | --- |
+| v0.5.3 and later | v3.2.0 and later |
+| v0.5.2 | v3.0.1 and earlier |
 
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary and the supported `sess` JSON-RPC 2.0 protocol for vscode-R 3.x, while retaining deprecated compatibility with the pre-3.0 session watcher.
 - R's `languageserver` package is optional at runtime but required for language-server completion.
