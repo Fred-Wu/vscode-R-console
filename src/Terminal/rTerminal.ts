@@ -1698,43 +1698,30 @@ export class RTerminal implements vscode.Pseudoterminal {
       tooltip: "Delete selected history entries" };
     const loadMoreButton = { iconPath: new vscode.ThemeIcon("arrow-down"),
       tooltip: "Load more matching history entries" };
-    const checked = new Map<string, HistoryPickItem>();
     const itemKey = (item: HistoryPickItem): string =>
       item.id ?? String(item.historyIndex) + ":" + item.code;
-    const selectedIcon = new vscode.ThemeIcon("circle-filled",
-      new vscode.ThemeColor("errorForeground"));
     let disposed = false;
     let pageOffset = 0;
     let pageItems: HistoryPickItem[] = [];
     let hasMore = false;
     let generation = 0;
-    let settingSelection = false;
+    picker.keepScrollPosition = true;
     const updateToolbar = (): void => {
       picker.buttons = [collapseButton, ...(hasMore ? [loadMoreButton] : []), deleteButton];
     };
     const renderItems = (): void => {
       if (disposed) return;
+      // Native selectedItems is the source of truth. Changing picker.items
+      // inside onDidChangeSelection resets checkboxes in VS Code.
+      // Capture selections only when paging/deletion actually changes the list.
+      const selected = new Set(picker.selectedItems.map(itemKey));
       const activeId = picker.activeItems[0]?.id;
-      settingSelection = true;
-      try {
-        picker.items = pageItems.map((item) => ({
-          ...item, iconPath: checked.has(itemKey(item)) ? selectedIcon : undefined,
-        }));
-        picker.selectedItems = picker.items.filter((item) => checked.has(itemKey(item)));
-        const active = pageItems.find((item) => item.id === activeId);
-        if (active) picker.activeItems = [active];
-      } finally {
-        settingSelection = false;
-      }
+      picker.items = pageItems;
+      picker.selectedItems = pageItems.filter((item) => selected.has(itemKey(item)));
+      const active = pageItems.find((item) => item.id === activeId);
+      if (active) picker.activeItems = [active];
       updateToolbar();
     };
-    picker.onDidChangeSelection((selection) => {
-      if (settingSelection || disposed) return;
-      for (const item of pageItems) checked.delete(itemKey(item));
-      for (const item of selection) checked.set(itemKey(item), item);
-      // Colour the selected entries without adding a per-row action button.
-      renderItems();
-    });
     const updateItems = async (append = false, retainPages = false): Promise<void> => {
       if (disposed) return;
       const currentGeneration = ++generation;
@@ -1773,11 +1760,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       }
     };
     const deleteEntries = async (): Promise<void> => {
-      const entries = [...checked.values()];
+      const entries = [...picker.selectedItems];
       if (!entries.length) return;
       try {
         await this.rHistory.deleteEntries(entries, collapseDuplicates);
-        for (const entry of entries) checked.delete(itemKey(entry));
         if (!disposed) await updateItems(false, true);
       } catch (error) {
         void vscode.window.showErrorMessage(
@@ -1799,7 +1785,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     try {
       selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
         picker.onDidChangeValue(() => {
-          checked.clear();
+          // Search results have a different selection scope. Clear native
+          // selection before replacing the list to avoid hidden deletions.
+          picker.selectedItems = [];
           void updateItems();
         });
         picker.onDidTriggerButton(async (button) => {
@@ -1813,7 +1801,7 @@ export class RTerminal implements vscode.Pseudoterminal {
           }
           if (button !== collapseButton) return;
           collapseDuplicates = !collapseDuplicates;
-          checked.clear();
+          picker.selectedItems = [];
           setCollapseButton();
           await updateItems();
           try {

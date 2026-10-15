@@ -496,7 +496,7 @@ test("F8 starts without the search-bar checkbox and refreshes after deletion", a
   assert.deepEqual(picker.items.map((item) => item.code), ["remove()"]);
   const initialQuery = picker.value;
   const item = picker.items[0];
-  handlers.selection([item]);
+  picker.selectedItems = [item];
   await handlers.button(picker.buttons.at(-1));
   await waitFor(() => picker.items.length === 0);
   assert.equal(picker.value, initialQuery);
@@ -537,7 +537,7 @@ test("F8 check buttons support selecting multiple commands without changing Ente
   const opened = terminal.showHistoryPicker();
   await waitFor(() => picker.items.filter((item) => item.code).length === 3);
   assert.equal(picker.canSelectMany, true);
-  handlers.selection(picker.items.filter((item) => ["first()", "third()"].includes(item.code)));
+  picker.selectedItems = picker.items.filter((item) => ["first()", "third()"].includes(item.code));
   await handlers.button(picker.buttons.at(-1));
   assert.deepEqual(picker.items.filter((item) => item.code).map((item) => item.code), ["second()"]);
   assert.deepEqual(history.getEntries(), ["second()"]);
@@ -866,7 +866,7 @@ test("native Select All only deletes loaded picker entries; Load More is toolbar
   assert.equal(picker.items.filter((item) => item.code).length, 50);
   const more = picker.buttons.find((button) => button.iconPath.id === "arrow-down");
   assert.ok(more, "load more must be a toolbar action rather than a selectable row");
-  handlers.selection([...picker.items]);
+  picker.selectedItems = [...picker.items];
   await handlers.button(picker.buttons.at(-1));
   await waitFor(() => history.getEntries().length === 30);
   assert.equal(picker.items.length, 30);
@@ -967,7 +967,7 @@ test("picker deletion preserves the number of loaded matching rows", async (t) =
   const more = picker.buttons.find((button) => button.iconPath.id === "arrow-down");
   await handlers.button(more);
   assert.equal(picker.items.length, 100);
-  handlers.selection([picker.items[0]]);
+  picker.selectedItems = [picker.items[0]];
   await handlers.button(picker.buttons.at(-1));
   assert.equal(picker.items.length, 100);
   handlers.hide();
@@ -996,4 +996,53 @@ test("F8 pagination observes recently queued local submissions", async (t) => {
   h.push("just-submitted()");
   const page = await h.getPage("", false);
   assert.equal(page.entries[0].code, "just-submitted()");
+});
+
+test("native Quick Pick checkbox clicks and Select All never replace picker items", async (t) => {
+  const f = fixture(t);
+  const history = f.create();
+  history.load();
+  for (const code of ["first()", "second()", "third()"]) history.push(code);
+  await waitFor(() => history.unconfirmed.length === 0);
+  const handlers = {};
+  let itemWrites = 0;
+  let visibleItems = [];
+  const picker = {
+    value: "", activeItems: [], selectedItems: [],
+    get items() { return visibleItems; },
+    set items(next) { itemWrites++; visibleItems = next; },
+    onDidChangeValue(cb) { handlers.value = cb; },
+    onDidTriggerButton(cb) { handlers.button = cb; },
+    onDidChangeSelection(cb) { handlers.selection = cb; },
+    onDidAccept(cb) { handlers.accept = cb; },
+    onDidHide(cb) { handlers.hide = cb; },
+    show() {}, hide() { handlers.hide(); }, dispose() {},
+  };
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: {
+      EventEmitter: class {},
+      ThemeIcon: class { constructor(id) { this.id = id; } },
+      window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
+    }, "./rTerminal/lang": {},
+  });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, rHistory: history,
+    historyStorage: { state: { get: () => false, update: async () => {} } },
+  });
+  const opened = terminal.showHistoryPicker();
+  await waitFor(() => picker.items.length === 3);
+  assert.equal(picker.canSelectMany, true);
+  const initialWrites = itemWrites;
+  picker.selectedItems = [picker.items[0]];
+  handlers.selection?.(picker.selectedItems);
+  assert.equal(itemWrites, initialWrites, "checking a row must not rerender Quick Pick items");
+  picker.selectedItems = [...picker.items];
+  handlers.selection?.(picker.selectedItems);
+  assert.equal(itemWrites, initialWrites, "Select All must not rerender Quick Pick items");
+  assert.equal(picker.selectedItems.length, 3);
+  assert.equal(picker.items.some(item => item.buttons?.length), false,
+    "there must be no per-row trash buttons");
+  assert.equal(picker.buttons.filter(button => button.iconPath.id === "trash").length, 1);
+  handlers.hide();
+  await opened;
 });

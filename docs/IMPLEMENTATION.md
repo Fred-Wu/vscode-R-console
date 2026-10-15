@@ -896,7 +896,7 @@ them. Ctrl+R searches backward for the current line's trimmed text anywhere
 in a saved command; repeated Ctrl+R uses the original term to find older
 matches. F8 (`r-console.searchHistory`) uses native VS Code Quick Pick
 multiple-selection checkboxes and the built-in Select All control.
-Checked entries display a theme-coloured selection indicator; the supported Quick Pick API does not permit a custom row background.
+Selection uses VS Code's native checked state without rerendering items on checkbox changes; the public Quick Pick API does not permit custom row backgrounds.
 Search changes clear selections to avoid deleting hidden commands. The
 toolbar trash action deletes checked entries currently loaded into the
 picker. The separate **Delete All Command History** command clears the
