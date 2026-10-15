@@ -114,7 +114,8 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
     }));
     let page: typeof all;
     let next = false;
-    if (beforeId !== undefined || afterId !== undefined || aroundId !== undefined) {
+    if (beforeId !== undefined || aroundId !== undefined ||
+      (afterId !== undefined && query === undefined)) {
       const target = beforeId ?? afterId ?? aroundId;
       const index = all.findIndex((entry) => entry.id === target);
       if (index < 0) {
@@ -146,7 +147,12 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
         seen.add(entry.code);
         matched.push(entry);
       }
-      const start = Math.max(0, offset ?? 0);
+      // Cursor pagination is stable when other consoles add newer entries.
+      // An absent anchor is treated as stale rather than silently skipping rows.
+      const cursor = afterId === undefined ? -1
+        : matched.findIndex((entry) => entry.id === afterId);
+      const start = afterId === undefined ? Math.max(0, offset ?? 0)
+        : cursor < 0 ? matched.length : cursor + 1;
       page = matched.slice(start, start + count);
       next = start + count < matched.length;
     }

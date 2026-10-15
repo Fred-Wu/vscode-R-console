@@ -229,10 +229,29 @@ export class HistoryManager extends HistoryBuffer {
     });
   }
 
-  getPage(query: string, collapse: boolean, offset = 0, limit = 50): Promise<{
-    entries: HistoryPickerEntry[]; hasMore: boolean
-  }> {
-    return this.requestPage({ query, collapse, offset, limit });
+  async getPage(query: string, collapse: boolean, offset = 0, limit = 50,
+    afterId?: string): Promise<{ entries: HistoryPickerEntry[]; hasMore: boolean }> {
+    // The page must not overtake a submission queued on the extension host.
+    // Wait only for queued writes; the worker still performs all disk I/O.
+    if (this.pending.length || this.sent?.length) {
+      this.save();
+      await new Promise<void>((resolve, reject) => {
+        let tries = 0;
+        const check = (): void => {
+          if (this.disabled || this.closing) {
+            reject(new Error("History storage is unavailable."));
+          } else if (!this.pending.length && !this.sent?.length) {
+            resolve();
+          } else if (++tries >= 500) {
+            reject(new Error("Timed out waiting for pending history submissions."));
+          } else {
+            setTimeout(check, 10);
+          }
+        };
+        check();
+      });
+    }
+    return this.requestPage({ query, collapse, offset, limit, afterId });
   }
 
   private requestPage(page: Omit<NonNullable<HistoryRequest["page"]>, "requestId">): Promise<{

@@ -1701,6 +1701,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const checked = new Map<string, HistoryPickItem>();
     const itemKey = (item: HistoryPickItem): string =>
       item.id ?? String(item.historyIndex) + ":" + item.code;
+    const selectedIcon = new vscode.ThemeIcon("circle-filled",
+      new vscode.ThemeColor("errorForeground"));
     let disposed = false;
     let pageOffset = 0;
     let pageItems: HistoryPickItem[] = [];
@@ -1715,8 +1717,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       const activeId = picker.activeItems[0]?.id;
       settingSelection = true;
       try {
-        picker.items = pageItems;
-        picker.selectedItems = pageItems.filter((item) => checked.has(itemKey(item)));
+        picker.items = pageItems.map((item) => ({
+          ...item, iconPath: checked.has(itemKey(item)) ? selectedIcon : undefined,
+        }));
+        picker.selectedItems = picker.items.filter((item) => checked.has(itemKey(item)));
         const active = pageItems.find((item) => item.id === activeId);
         if (active) picker.activeItems = [active];
       } finally {
@@ -1728,6 +1732,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (settingSelection || disposed) return;
       for (const item of pageItems) checked.delete(itemKey(item));
       for (const item of selection) checked.set(itemKey(item), item);
+      // Colour the selected entries without adding a per-row action button.
+      renderItems();
     });
     const updateItems = async (append = false, retainPages = false): Promise<void> => {
       if (disposed) return;
@@ -1735,12 +1741,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       const query = picker.value;
       const targetCount = retainPages ? Math.max(50, pageOffset) : 50;
       const start = append ? pageOffset : 0;
+      const anchor = append ? pageItems.at(-1)?.id : undefined;
       const fetched: HistoryPickItem[] = [];
       let more = false;
       try {
         do {
           const page = await this.rHistory.getPage(query, collapseDuplicates,
-            start + fetched.length, Math.min(200, targetCount - fetched.length));
+            anchor ? 0 : start + fetched.length,
+            Math.min(200, targetCount - fetched.length),
+            fetched.at(-1)?.id ?? anchor);
           if (disposed || generation !== currentGeneration) return;
           fetched.push(...page.entries.map(({ code, historyIndex, id }) => ({
             label: code, code, historyIndex, id,
@@ -1789,7 +1798,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     let selectedItem: HistoryPickItem | undefined;
     try {
       selectedItem = await new Promise<HistoryPickItem | undefined>((resolve) => {
-        picker.onDidChangeValue(() => { void updateItems(); });
+        picker.onDidChangeValue(() => {
+          checked.clear();
+          void updateItems();
+        });
         picker.onDidTriggerButton(async (button) => {
           if (button === deleteButton) {
             await deleteEntries();

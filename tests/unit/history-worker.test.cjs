@@ -481,6 +481,7 @@ test("F8 starts without the search-bar checkbox and refreshes after deletion", a
     vscode: {
       EventEmitter: class {},
       ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
       window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
     },
     "./rTerminal/lang": {},
@@ -524,6 +525,7 @@ test("F8 check buttons support selecting multiple commands without changing Ente
     vscode: {
       EventEmitter: class {},
       ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
       window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
     },
     "./rTerminal/lang": {},
@@ -679,6 +681,7 @@ test("F8 Enter restores the highlighted command rather than deleting it", async 
     vscode: {
       EventEmitter: class {},
       ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
       window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
     }, "./rTerminal/lang": {},
   });
@@ -849,6 +852,7 @@ test("native Select All only deletes loaded picker entries; Load More is toolbar
   const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
     vscode: {
       EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
       window: { createQuickPick: () => picker, createOutputChannel: () => ({}) },
     }, "./rTerminal/lang": {},
   });
@@ -950,6 +954,7 @@ test("picker deletion preserves the number of loaded matching rows", async (t) =
   };
   const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
     vscode: { EventEmitter: class {}, ThemeIcon: class { constructor(id) { this.id = id; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
       window: { createQuickPick: () => picker, createOutputChannel: () => ({}) } },
     "./rTerminal/lang": {},
   });
@@ -967,4 +972,28 @@ test("picker deletion preserves the number of loaded matching rows", async (t) =
   assert.equal(picker.items.length, 100);
   handlers.hide();
   await opened;
+});
+
+test("filtered pages use stable occurrence cursors after concurrent new submissions", async (t) => {
+  const f = fixture(t);
+  const a = f.create();
+  const b = f.create();
+  a.load(); b.load();
+  for (let i = 0; i < 80; i++) a.push("entry-" + i);
+  await waitFor(() => a.unconfirmed.length === 0);
+  const first = await a.getPage("", false, 0, 50);
+  b.push("newer()");
+  await waitFor(() => b.unconfirmed.length === 0);
+  const second = await a.getPage("", false, 0, 50, first.entries.at(-1).id);
+  assert.equal(second.entries[0].code, "entry-29");
+  assert.equal(new Set([...first.entries, ...second.entries].map(x => x.id)).size, 80);
+});
+
+test("F8 pagination observes recently queued local submissions", async (t) => {
+  const f = fixture(t);
+  const h = f.create();
+  h.load();
+  h.push("just-submitted()");
+  const page = await h.getPage("", false);
+  assert.equal(page.entries[0].code, "just-submitted()");
 });
