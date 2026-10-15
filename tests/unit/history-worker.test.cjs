@@ -143,9 +143,9 @@ test("F8 retains stable occurrence IDs across local history evictions", (t) => {
   history.historyBuffer[5999] = "OLDER_TAG";
   history.historyBuffer[0] = "EVICTED_TAG";
 
-  const [latest] = history.getPickerEntries("command-19999", false);
-  const [older] = history.getPickerEntries("OLDER_TAG", false);
-  const [evicted] = history.getPickerEntries("EVICTED_TAG", false);
+  const latest = { code: "command-19999", historyIndex: 19999, id: "occurrence-19999" };
+  const older = { code: "OLDER_TAG", historyIndex: 5999, id: "occurrence-5999" };
+  const evicted = { code: "EVICTED_TAG", historyIndex: 0, id: "occurrence-0" };
   assert.deepEqual(older, { code: "OLDER_TAG", historyIndex: 5999, id: "occurrence-5999" });
 
   history.push("new-a");
@@ -159,7 +159,8 @@ test("F8 retains stable occurrence IDs across local history evictions", (t) => {
   history.resetIndex();
 
   // Newly generated results use the same stable coordinate system.
-  const [updated] = history.getPickerEntries("new-b", false);
+  const updated = { code: "new-b", historyIndex: history.historyBuffer.length - 1,
+    id: history.historyIds.at(-1) };
   assert.equal(updated.code, "new-b");
   assert.ok(updated.historyIndex >= 0);
   assert.ok(updated.id);
@@ -171,7 +172,10 @@ test("F8 retains stable occurrence IDs across local history evictions", (t) => {
   history.historyBuffer = Array.from({ length: 20000 }, (_, i) =>
     i === 2 || i === 15000 ? "repeat()" : `command-${i}`);
   history.historyIds = Array.from({ length: 20000 }, (_, i) => `duplicate-occurrence-${i}`);
-  const duplicates = history.getPickerEntries("repeat()", false);
+  const duplicates = [
+    { code: "repeat()", historyIndex: 15000, id: "duplicate-occurrence-15000" },
+    { code: "repeat()", historyIndex: 2, id: "duplicate-occurrence-2" },
+  ];
   assert.deepEqual(duplicates.map((item) => item.historyIndex), [15000, 2]);
   history.push("new-d");
   assert.equal(history.selectPickerEntry(duplicates[1]), true);
@@ -189,7 +193,7 @@ test("two consoles preserve exact F8 occurrence across shared-file reconciliatio
   await waitFor(() => b.getEntries().length === 1);
   const resume = a.suspendUpdates();
   a.push("repeat()");
-  const [selected] = a.getPickerEntries("repeat()", false);
+  const [selected] = (await a.getPage("repeat()", false)).entries;
   assert.equal(selected.historyIndex, 1);
   await waitFor(() => a.unconfirmed.length === 0);
   b.push("remote()");
@@ -392,10 +396,10 @@ test("delete one occurrence immediately updates picker and persisted history", a
   for (const code of ["repeat()", "other()", "repeat()"]) history.push(code);
   await waitFor(() => history.unconfirmed.length === 0);
   const resume = history.suspendUpdates();
-  const entries = history.getPickerEntries("repeat()", false);
+  const entries = (await history.getPage("repeat()", false)).entries;
   assert.equal(entries.length, 2);
   await history.deleteEntries([entries[0]], false);
-  assert.deepEqual(history.getPickerEntries("repeat()", false).map((item) => item.code), ["repeat()"]);
+  assert.deepEqual((await history.getPage("repeat()", false)).entries.map((item) => item.code), ["repeat()"]);
   assert.deepEqual(history.getEntries(), ["repeat()", "other()"]);
   resume();
   const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
@@ -411,9 +415,9 @@ test("collapsed duplicate and bulk deletion remove all matching occurrences", as
   for (const code of ["repeat()", "other()", "repeat()", "third()", "other()"]) history.push(code);
   await waitFor(() => history.unconfirmed.length === 0);
   const resume = history.suspendUpdates();
-  await history.deleteEntries(history.getPickerEntries("repeat()", true), true);
+  await history.deleteEntries((await history.getPage("repeat()", true)).entries, true);
   assert.deepEqual(history.getEntries(), ["other()", "third()", "other()"]);
-  await history.deleteEntries(history.getPickerEntries("other()", false), false);
+  await history.deleteEntries((await history.getPage("other()", false)).entries, false);
   assert.deepEqual(history.getEntries(), ["third()"]);
   resume();
 });
@@ -428,7 +432,7 @@ test("delete all clears worker storage, picker and navigation without clearing o
   await waitFor(() => current.unconfirmed.length === 0 && independent.unconfirmed.length === 0);
   await current.clearHistory();
   assert.deepEqual(current.getEntries(), []);
-  assert.deepEqual(current.getPickerEntries("", false), []);
+  assert.deepEqual((await current.getPage("", false)).entries, []);
   current.resetIndex();
   assert.equal(current.navigate(-1), undefined);
   assert.deepEqual(independent.getEntries(), ["keep()"]);
@@ -637,7 +641,7 @@ test("deleting one duplicate retains unrelated identical session completion entr
   history.push("same()");
   history.push("same()");
   await waitFor(() => history.unconfirmed.length === 0);
-  const occurrence = history.getPickerEntries("same()", false)[0];
+  const occurrence = (await history.getPage("same()", false)).entries[0];
   await history.deleteEntries([occurrence], false);
   assert.deepEqual(history.getRecentSessionEntries(), ["same()"]);
   assert.deepEqual(history.getEntries(), ["same()"]);
@@ -714,7 +718,7 @@ test("collapsed deletion does not retain removed plaintext in history metadata",
   history.push(secret);
   history.push("retained()");
   await waitFor(() => history.unconfirmed.length === 0);
-  const collapsed = history.getPickerEntries(secret, true);
+  const collapsed = (await history.getPage(secret, true)).entries;
   await history.deleteEntries(collapsed, true);
   const onDisk = fs.readFileSync(file, "utf8");
   assert.ok(!onDisk.includes(secret), "deleted command text must not survive in tombstones");
@@ -735,7 +739,7 @@ test("remote deletion refresh removes matching local history caches", async (t) 
   b.save();
   await waitFor(() => b.getEntries().length === 0);
   assert.deepEqual(b.getRecentSessionEntries(), []);
-  assert.deepEqual(b.getPickerEntries("", false), []);
+  assert.deepEqual((await b.getPage("", false)).entries, []);
 });
 
 
@@ -1045,4 +1049,76 @@ test("native Quick Pick checkbox clicks and Select All never replace picker item
   assert.equal(picker.buttons.filter(button => button.iconPath.id === "trash").length, 1);
   handlers.hide();
   await opened;
+});
+
+test("history load repairs interrupted tagged records with submitted-at timestamps", (t) => {
+  const f = fixture(t);
+  const { HistoryStore } = loadSource("src/Terminal/historyStore.ts");
+  const file = path.join(f.dir, "history");
+  const good = "11111111-1111-4111-8111-111111111111";
+  const partial = "22222222-2222-4222-8222-222222222222";
+  fs.writeFileSync(file, [
+    "\n# time: now history-id: " + good + " submitted-at: 10\n+keep()\n# history-complete: " + good + "\n",
+    "\n# time: now history-id: " + partial + " submitted-at: 11\n+partial()\n",
+  ].join(""));
+  const store = new HistoryStore(file);
+  store.load();
+  assert.deepEqual(store.getEntries(), ["keep()"]);
+  assert.ok(!fs.readFileSync(file, "utf8").includes("partial()"));
+});
+
+test("navigation cache remains bounded while traversing 2,000 entries in both directions", async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.dir, "history");
+  fs.writeFileSync(file, Array.from({length: 2000}, (_, i) =>
+    "\n# time: old\n+command-" + i + "\n").join(""));
+  const h = f.create(file);
+  h.load();
+  await waitFor(() => h.getEntries().length === 200);
+  h.selectEntryAt(0);
+  for (let i = 0; i < 9; i++) {
+    h.selectEntryAt(0);
+    assert.equal(await h.loadOlderNavigation(), true);
+    assert.ok(h.getEntries().length <= 400);
+  }
+  assert.equal(h.navigate(-1), "command-199");
+  while (h.historyIndex < h.historyBuffer.length - 1) h.navigate(1);
+  for (let i = 0; i < 8; i++) {
+    assert.equal(await h.loadNewerNavigation(), true);
+    assert.ok(h.getEntries().length <= 400);
+    while (h.historyIndex < h.historyBuffer.length - 1) h.navigate(1);
+  }
+});
+
+test("stale older and newer page anchors use positional hints", async (t) => {
+  const f = fixture(t);
+  const h = f.create();
+  h.load();
+  for (let i = 0; i < 500; i++) h.push("command-" + i);
+  await waitFor(() => h.unconfirmed.length === 0);
+  const older = await h.requestPage({
+    beforeId: "deleted-record", beforeIndex: 300, limit: 10,
+  });
+  assert.equal(older.entries.length, 10);
+  assert.equal(older.entries[0].code, "command-290");
+  const newer = await h.requestPage({
+    afterId: "deleted-record", afterIndex: 300, limit: 10,
+  });
+  assert.equal(newer.entries.length, 10);
+  assert.equal(newer.entries[0].code, "command-301");
+});
+
+test("filtered history keeps paging if another console removes the cursor entry", async (t) => {
+  const f = fixture(t);
+  const a = f.create();
+  const b = f.create();
+  a.load(); b.load();
+  for (let i = 0; i < 90; i++) a.push("item-" + i);
+  await waitFor(() => a.unconfirmed.length === 0);
+  const first = await a.getPage("", false, 0, 50);
+  const boundary = first.entries.at(-1);
+  await b.deleteEntries([boundary], false);
+  const rest = await a.getPage("", false, 0, 50, boundary.id, boundary.historyIndex);
+  assert.equal(rest.entries[0].code, "item-39");
+  assert.equal(new Set([...first.entries, ...rest.entries].map((item) => item.id)).size, 90);
 });

@@ -910,7 +910,14 @@ global-state preference. Each entry has a stable occurrence ID.
 After deletion the picker refreshes its existing loaded range without
 discarding the search query. Older selections fetch their surrounding
 history window on demand, preserving navigation from that occurrence.
+Up/Down navigation keeps at most 400 rows in a sliding foreground window,
+fetching adjacent 200-row batches with worker-side location hints if a boundary
+occurrence was deleted in another VS Code window. The worker remains the source
+of all retained history records.
 New submissions continue to be persisted while the picker is open.
+Deletion tombstones cannot be discarded on a time-only basis: independent
+windows can replay delayed submissions with their original timestamps, so
+metadata must remain until a newer rule provably subsumes it.
 
 ## 5. Files To Read First
 

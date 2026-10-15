@@ -1736,7 +1736,8 @@ export class RTerminal implements vscode.Pseudoterminal {
           const page = await this.rHistory.getPage(query, collapseDuplicates,
             anchor ? 0 : start + fetched.length,
             Math.min(200, targetCount - fetched.length),
-            fetched.at(-1)?.id ?? anchor);
+            fetched.at(-1)?.id ?? anchor,
+            fetched.at(-1)?.historyIndex ?? (append ? pageItems.at(-1)?.historyIndex : undefined));
           if (disposed || generation !== currentGeneration) return;
           fetched.push(...page.entries.map(({ code, historyIndex, id }) => ({
             label: code, code, historyIndex, id,

@@ -21,46 +21,7 @@ export function getHistoryPickerTogglePresentation(collapseDuplicates: boolean):
     : { icon: "collapse-all", tooltip: "Collapse duplicate commands" };
 }
 
-export const HISTORY_PICKER_LIMIT = 50;
-
 export type HistoryPickerEntry = { code: string; historyIndex: number; id?: string };
-
-// Search the existing console history buffer without copying it. Quick Pick
-// only needs a small newest-first set; matching runs over the full cache.
-// A subsequence match preserves Quick Pick's fuzzy-search behavior.
-export function getHistoryPickerEntries(
-  entries: readonly string[],
-  collapseDuplicates: boolean,
-  query = "",
-  limit = HISTORY_PICKER_LIMIT
-): HistoryPickerEntry[] {
-  const items: HistoryPickerEntry[] = [];
-  if (!Number.isSafeInteger(limit) || limit <= 0) return items;
-  const term = query.toLowerCase();
-  const seen = collapseDuplicates ? new Set<string>() : undefined;
-  for (let historyIndex = entries.length - 1; historyIndex >= 0; historyIndex--) {
-    const code = entries[historyIndex];
-    if (term) {
-      const lowerCode = code.toLowerCase();
-      let position = 0;
-      let matched = true;
-      for (const char of term) {
-        position = lowerCode.indexOf(char, position);
-        if (position < 0) {
-          matched = false;
-          break;
-        }
-        position++;
-      }
-      if (!matched) continue;
-    }
-    if (seen?.has(code)) continue;
-    seen?.add(code);
-    items.push({ code, historyIndex });
-    if (items.length === limit) break;
-  }
-  return items;
-}
 
 export type HistoryLocation = string | {
   storageFolder: string;
@@ -75,7 +36,8 @@ export type HistoryRequest = {
   close: boolean;
   delete?: { ids?: string[]; codes?: string[]; all?: boolean; before?: number };
   page?: { requestId: number; limit: number; query?: string; collapse?: boolean;
-    offset?: number; beforeId?: string; afterId?: string; aroundId?: string };
+    offset?: number; beforeId?: string; afterId?: string; aroundId?: string;
+    beforeIndex?: number; afterIndex?: number };
 };
 
 export type HistoryUpdate = {
@@ -187,6 +149,10 @@ export class HistoryManager extends HistoryBuffer {
   private sessionTimestamps: number[] = [];
   private storedStart = 0;
   private browsingOlder = false;
+  // The worker retains the complete scoped history. Navigation only caches a
+  // sliding window around the current selection on the extension-host thread.
+  private readonly navigationWindowSize = 400;
+  private navigationStart = 0;
   private scheduled: ReturnType<typeof setImmediate> | undefined;
   private closing = false;
   private disabled = false;
@@ -194,8 +160,6 @@ export class HistoryManager extends HistoryBuffer {
   private deferredHistory: {
     updated: boolean;
   } | undefined;
-  // Only local pushes can evict cached entries while F8 defers worker updates.
-  // Monotonic positions keep each displayed occurrence stable without a snapshot.
 
   constructor(
     private readonly location: HistoryLocation,
@@ -230,7 +194,7 @@ export class HistoryManager extends HistoryBuffer {
   }
 
   async getPage(query: string, collapse: boolean, offset = 0, limit = 50,
-    afterId?: string): Promise<{ entries: HistoryPickerEntry[]; hasMore: boolean }> {
+    afterId?: string, afterIndex?: number): Promise<{ entries: HistoryPickerEntry[]; hasMore: boolean }> {
     // The page must not overtake a submission queued on the extension host.
     // Wait only for queued writes; the worker still performs all disk I/O.
     if (this.pending.length || this.sent?.length) {
@@ -251,7 +215,7 @@ export class HistoryManager extends HistoryBuffer {
         check();
       });
     }
-    return this.requestPage({ query, collapse, offset, limit, afterId });
+    return this.requestPage({ query, collapse, offset, limit, afterId, afterIndex });
   }
 
   private requestPage(page: Omit<NonNullable<HistoryRequest["page"]>, "requestId">): Promise<{
@@ -284,13 +248,31 @@ export class HistoryManager extends HistoryBuffer {
   async loadOlderNavigation(): Promise<boolean> {
     const first = this.historyIds[0];
     if (!first || this.disabled) return false;
-    const page = await this.requestPage({ beforeId: first, limit: 200 });
+    const page = await this.requestPage({
+      beforeId: first, beforeIndex: this.navigationStart, limit: 200,
+    });
     if (!page.entries.length) return false;
-    // Ignore an obsolete response if another operation replaced the cache.
+    // Another operation may have replaced this navigation window while
+    // the background worker was fetching the preceding records.
     if (this.historyIds[0] !== first) return false;
-    this.historyBuffer.unshift(...page.entries.map((entry) => entry.code));
-    this.historyIds.unshift(...page.entries.map((entry) => entry.id!));
-    this.historyIndex += page.entries.length;
+    const alreadyLoaded = new Set(this.historyIds);
+    const older = page.entries.filter((entry) => !alreadyLoaded.has(entry.id!));
+    if (!older.length) return false;
+    this.historyBuffer.unshift(...older.map((entry) => entry.code));
+    this.historyIds.unshift(...older.map((entry) => entry.id!));
+    this.navigationStart = older[0].historyIndex;
+    this.historyIndex += older.length;
+    // When moving backwards, discard the newest tail. Down will fetch it
+    // again from the worker when the user reaches that boundary.
+    const extra = Math.max(0, this.historyBuffer.length - this.navigationWindowSize);
+    if (extra) {
+      this.historyBuffer.splice(-extra);
+      this.historyIds.splice(-extra);
+      // Reverse search may have exhausted the whole preceding window; its
+      // cursor can then point beyond the retained tail. Clamp it so another
+      // search never indexes beyond the sliding cache.
+      this.historyIndex = Math.min(this.historyIndex, this.historyBuffer.length);
+    }
     this.browsingOlder = true;
     return true;
   }
@@ -302,6 +284,7 @@ export class HistoryManager extends HistoryBuffer {
     if (!page.entries.some((candidate) => candidate.id === entry.id)) return false;
     this.historyBuffer = page.entries.map((candidate) => candidate.code);
     this.historyIds = page.entries.map((candidate) => candidate.id!);
+    this.navigationStart = page.entries[0].historyIndex;
     this.browsingOlder = true;
     const index = this.historyIds.indexOf(entry.id);
     this.selectEntryAt(index);
@@ -311,18 +294,32 @@ export class HistoryManager extends HistoryBuffer {
   async loadNewerNavigation(): Promise<boolean> {
     const last = this.historyIds[this.historyIds.length - 1];
     if (!last || this.disabled || !this.browsingOlder) return false;
-    const page = await this.requestPage({ afterId: last, limit: 200 });
-    if (!page.entries.length || this.historyIds[this.historyIds.length - 1] !== last) {
-      if (!page.entries.length) {
-        this.browsingOlder = false;
-        this.reconcileHistory();
-        // The next Down press should restore the editable input immediately.
-        return true;
-      }
-      return false;
+    const page = await this.requestPage({
+      afterId: last, afterIndex: this.navigationStart + this.historyIds.length - 1,
+      limit: 200,
+    });
+    if (this.historyIds[this.historyIds.length - 1] !== last) return false;
+    if (!page.entries.length) {
+      this.browsingOlder = false;
+      this.reconcileHistory();
+      // We were on the newest entry. The pending Down should return the
+      // saved editable draft, not jump to the oldest recent entry.
+      this.historyIndex = Math.max(0, this.historyBuffer.length - 1);
+      return true;
     }
-    this.historyBuffer.push(...page.entries.map((entry) => entry.code));
-    this.historyIds.push(...page.entries.map((entry) => entry.id!));
+    const alreadyLoaded = new Set(this.historyIds);
+    const newer = page.entries.filter((entry) => !alreadyLoaded.has(entry.id!));
+    if (!newer.length) return false;
+    this.historyBuffer.push(...newer.map((entry) => entry.code));
+    this.historyIds.push(...newer.map((entry) => entry.id!));
+    const extra = Math.max(0, this.historyBuffer.length - this.navigationWindowSize);
+    if (extra) {
+      this.historyBuffer.splice(0, extra);
+      this.historyIds.splice(0, extra);
+      this.historyIndex = Math.max(0, this.historyIndex - extra);
+    }
+    this.navigationStart = this.historyIds.length
+      ? page.entries.at(-1)!.historyIndex - this.historyIds.length + 1 : this.navigationStart;
     return true;
   }
 
@@ -340,13 +337,8 @@ export class HistoryManager extends HistoryBuffer {
     return super.navigate(direction);
   }
 
-  getPickerEntries(query: string, collapseDuplicates: boolean): HistoryPickerEntry[] {
-    return getHistoryPickerEntries(this.historyBuffer, collapseDuplicates, query)
-      .map(({ code, historyIndex }) => ({ code, historyIndex, id: this.historyIds[historyIndex] }));
-  }
-
-  // F8 items carry a position from when they were displayed, not a live
-  // array index. Return false if local submissions evicted the occurrence.
+  // Match the exact occurrence ID; a stale picker position cannot select
+  // another command after navigation paging or cross-window changes.
   selectPickerEntry(entry: HistoryPickerEntry): boolean {
     const index = entry.id ? this.historyIds.indexOf(entry.id) : -1;
     if (!Number.isSafeInteger(index) || index < 0 || index >= this.historyBuffer.length ||
@@ -463,6 +455,7 @@ export class HistoryManager extends HistoryBuffer {
     const trim = Math.max(0, combined.length - this.maxHistorySize);
     this.historyBuffer = combined.slice(trim);
     this.historyIds = ids.slice(trim);
+    this.navigationStart = this.storedStart + trim;
     const position = selected === undefined ? -1 : this.historyIds.indexOf(selected);
     this.historyIndex = atEnd ? this.historyBuffer.length
       : position >= 0 ? position : 0;

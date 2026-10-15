@@ -380,7 +380,7 @@ export class HistoryStore extends HistoryBuffer {
       const begin = boundaries[i].index!;
       const end = i + 1 < boundaries.length ? boundaries[i + 1].index! : raw.length;
       const record = raw.slice(begin, end);
-      const tag = /history-id: ([0-9a-f-]{36})\r?\n/.exec(record);
+      const tag = /^# time:[^\n]*\bhistory-id: ([0-9a-f-]{36})(?=\s|$)/m.exec(record);
       if (tag && !record.includes("# history-complete: " + tag[1] + "\n")) {
         rebuilt += raw.slice(offset, begin);
         offset = end;

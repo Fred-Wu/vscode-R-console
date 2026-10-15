@@ -107,7 +107,8 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
   }
   if (request.page) {
     const source = record.store.getSnapshot();
-    const { requestId, limit, query, collapse, offset, beforeId, afterId, aroundId } = request.page;
+    const { requestId, limit, query, collapse, offset, beforeId, afterId, aroundId,
+      beforeIndex, afterIndex } = request.page;
     const count = Math.max(1, Math.min(200, limit));
     const all = source.entries.map((code, index) => ({
       code, id: source.ids[index], historyIndex: source.start + index,
@@ -118,16 +119,27 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       (afterId !== undefined && query === undefined)) {
       const target = beforeId ?? afterId ?? aroundId;
       const index = all.findIndex((entry) => entry.id === target);
-      if (index < 0) {
+      // A history entry can be removed by another VS Code window between
+      // requests. Use its absolute index to continue at the boundary.
+      // Never return arbitrary records if no position was supplied.
+      if (index < 0 && aroundId !== undefined) {
         port.postMessage({ id: request.id, pageResult: { requestId,
           entries: [], hasMore: false } });
         return;
       }
-      const anchor = index;
-      const from = aroundId !== undefined ? Math.max(0, anchor - Math.floor(count / 2))
-        : afterId !== undefined ? Math.max(0, anchor + 1) : Math.max(0, anchor - count);
+      if (index < 0 && beforeIndex === undefined && afterIndex === undefined) {
+        port.postMessage({ id: request.id, pageResult: { requestId,
+          entries: [], hasMore: false } });
+        return;
+      }
+      const anchor = index >= 0 ? index : beforeId !== undefined
+        ? all.findIndex((entry) => entry.historyIndex >= beforeIndex!)
+        : all.findIndex((entry) => entry.historyIndex > afterIndex!);
+      const effectiveAnchor = anchor < 0 ? all.length : anchor;
+      const from = aroundId !== undefined ? Math.max(0, effectiveAnchor - Math.floor(count / 2))
+        : afterId !== undefined ? Math.max(0, index >= 0 ? anchor + 1 : effectiveAnchor) : Math.max(0, effectiveAnchor - count);
       const to = aroundId !== undefined ? Math.min(all.length, from + count)
-        : afterId !== undefined ? Math.min(all.length, from + count) : anchor;
+        : afterId !== undefined ? Math.min(all.length, from + count) : effectiveAnchor;
       page = all.slice(from, to);
       next = beforeId !== undefined ? from > 0 : to < all.length;
     } else {
@@ -152,9 +164,12 @@ port.on("message", (request: HistoryRequest | { shutdown: true }) => {
       const cursor = afterId === undefined ? -1
         : matched.findIndex((entry) => entry.id === afterId);
       const start = afterId === undefined ? Math.max(0, offset ?? 0)
-        : cursor < 0 ? matched.length : cursor + 1;
-      page = matched.slice(start, start + count);
-      next = start + count < matched.length;
+        : cursor >= 0 ? cursor + 1
+          : afterIndex !== undefined
+            ? matched.findIndex((entry) => entry.historyIndex < afterIndex) : -1;
+      const effectiveStart = start < 0 ? matched.length : start;
+      page = matched.slice(effectiveStart, effectiveStart + count);
+      next = effectiveStart + count < matched.length;
     }
     port.postMessage({ id: request.id, pageResult: { requestId, entries: page,
       hasMore: next } });
