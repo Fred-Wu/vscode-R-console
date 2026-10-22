@@ -1173,8 +1173,8 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         this.expandForEdit();
         this.handleTextInsert(action.text);
-        this.renderInput();
         this.scheduleInlineCompletion();
+        this.renderInput();
         return;
       case "enter":
         void this.handleEnterKey();
@@ -1185,15 +1185,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       case "backspace":
         this.expandForEdit();
         this.handleBackspace();
-        this.renderInput();
         this.scheduleInlineCompletion();
+        this.renderInput();
         return;
       case "delete":
         this.expandForEdit();
         if (!this.inputState.isAtEnd) {
           this.inputState.deleteAfterCursor();
-          this.renderInput();
           this.scheduleInlineCompletion();
+          this.renderInput();
         }
         return;
       case "home":
@@ -2030,6 +2030,11 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private scheduleInlineCompletion(): void {
     if (!this.inlineCompletion) return;
+    // An empty command must close the panel and cancel pending async completions.
+    if (this.inputState.text.trim().length === 0) {
+      this.dismissInlineCompletion(false);
+      return;
+    }
     if (this.inlineCompletionMode() !== "inline" ||
         vscode.workspace.getConfiguration("r.console").get<string>("inlineCompletion.trigger", "tab") !== "typing") return;
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
@@ -2041,6 +2046,10 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private requestInlineCompletion(force: boolean): void {
     if (this.mode !== "ready" || !this.promptReady || this.inlineCompletionMode() !== "inline") return;
+    if (this.inputState.text.trim().length === 0) {
+      this.dismissInlineCompletion();
+      return;
+    }
     // Keep the existing panel visible while new results are collected.
     const token = this.inlineCompletion.invalidate();
     void this.lang.handleAutocomplete({
