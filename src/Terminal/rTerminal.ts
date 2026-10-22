@@ -1173,8 +1173,8 @@ export class RTerminal implements vscode.Pseudoterminal {
         // Terminal-wide SGR mouse reporting consumes ordinary wheel input.
         // Forward outside-wheel events to VS Code's scrollback navigation.
         void vscode.commands.executeCommand(action.dir === "up"
-          ? "workbench.action.terminal.scrollUp"
-          : "workbench.action.terminal.scrollDown");
+          ? "workbench.action.terminal.scrollUpPage"
+          : "workbench.action.terminal.scrollDownPage");
       }
       return;
     }

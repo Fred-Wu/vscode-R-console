@@ -570,8 +570,8 @@ test("mouse wheel outside the panel scrolls terminal history without moving comp
   terminal.applyKeyAction({ type: "wheel", dir: "up", col: 1, row: 1 });
   terminal.applyKeyAction({ type: "wheel", dir: "down", col: 1, row: 1 });
   assert.deepEqual(scrollCommands, [
-    "workbench.action.terminal.scrollUp",
-    "workbench.action.terminal.scrollDown",
+    "workbench.action.terminal.scrollUpPage",
+    "workbench.action.terminal.scrollDownPage",
   ]);
   assert.equal(terminal.inlineCompletion.selected, initial);
   assert.equal(terminal.inlineCompletion.visible, true);
