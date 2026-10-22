@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem } from "../Language/completion";
-import { InlineCompletion } from "./inlineCompletion";
+import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import { setNativeParseCallback } from "../Language/parser";
 import {
   ANSI,
@@ -152,6 +152,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private inlinePressedChoice: CompletionPickItem | undefined;
   private inlineSuggestionRowCount = 0;
   private inlineCompletionTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly inlineThemeDisposables: vscode.Disposable[] = [];
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
   private pidEmitter = new vscode.EventEmitter<number | undefined>();
@@ -293,6 +294,15 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.renderer = new Renderer((text) => this.writeEmitter.fire(text), this.syntax);
 
     this.loadSettings();
+    this.inlineThemeDisposables.push(
+      vscode.window.onDidChangeActiveColorTheme(() => {
+        if (this.inlineCompletion.visible) this.renderInput();
+      }),
+      vscode.workspace.onDidChangeConfiguration(event => {
+        if (event.affectsConfiguration("workbench.colorCustomizations") &&
+            this.inlineCompletion.visible) this.renderInput();
+      })
+    );
     this.runtimeHostAdapter = this.createRuntimeHost();
 
     if (restoreState?.runtime && this.runtimeBackend) {
@@ -2660,8 +2670,22 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private renderInput(): void {
     this.lang.updateInput(this.inputState.text);
+    const plan = this.buildCurrentInputRenderPlan();
+    const columns = Math.max(1, this.dimensions.columns);
+    const promptLength = plan.promptKinds[plan.cursorRow] === "main"
+      ? this.renderer.promptLen
+      : (this.renderer.continuationPromptText?.length ?? 2);
+    // Anchor the panel under the last character before the caret, including
+    // terminal wrapping and windowed multiline input.
+    const anchorColumn = (Math.max(0, promptLength + plan.cursorCol - 1) % columns) + 1;
+    const isLight = vscode.window.activeColorTheme?.kind === vscode.ColorThemeKind?.Light;
+    const overrides = vscode.workspace.getConfiguration("workbench")
+      .get<Record<string, unknown>>("colorCustomizations", {});
+    const inputPrefix = this.inputState.currentLine.slice(0, this.inputState.cursorCol);
+    this.inlineCompletion.setQuery(/[A-Za-z._][\\w.]*$/.exec(inputPrefix)?.[0] ?? "");
     const suggestions = this.mode === "ready" ? this.inlineCompletion.lines(
-      this.dimensions.columns, Math.min(13, Math.max(5, this.dimensions.rows - 5))
+      columns, Math.min(13, Math.max(5, this.dimensions.rows - 5)), anchorColumn,
+      resolveInlineCompletionColors(isLight, overrides)
     ) : [];
     const previousRows = this.inlineSuggestionRowCount;
     this.inlineSuggestionRowCount = suggestions.length;
@@ -2675,6 +2699,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         historyBrowsing: this.historyBrowsing,
         historyCollapsed: this.historyCollapsed,
         suggestions,
+        plan,
       });
       if (suggestions.length > 0) this.writeEmitter.fire("\x1b[6n");
     });
@@ -3026,6 +3051,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   dispose(): Promise<void> {
+    for (const subscription of this.inlineThemeDisposables) subscription.dispose();
     const cleanup = this.releaseExtensionResources();
     this.writeEmitter.dispose();
     this.closeEmitter.dispose();
