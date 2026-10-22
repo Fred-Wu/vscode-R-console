@@ -650,18 +650,30 @@ and insertion rules. Inline completions can be triggered by Tab or while
 typing through `r.console.inlineCompletion.trigger`.
 
 The terminal renderer displays a bordered, transient list of group headings,
-labels, descriptions and details, excluded from persistent replay. It keeps
-the panel in place while typing and updates it when asynchronous results arrive.
-The active suggestion is highlighted with terminal inverse video, using the
-active theme's foreground and background colors rather than a circular marker.
-A scrollbar appears inside the border when results exceed the visible height.
-The suggestion viewport scrolls only when the selection reaches either edge;
-modules use blue `{}` glyphs. Other picker codicons use ANSI-colored terminal glyphs
-because VS Code codicons cannot be rendered directly in a terminal. Arrow and
-Page Up/Down keys navigate results; temporary SGR mouse reporting also permits
-wheel navigation only when the pointer is within the box. Left mouse press and release on a\nsuggestion (including its detail row) accepts it; group headings and borders\nare non-interactive. Cursor-position reports locate the box for hit testing.\nCompletion labels use normal-weight terminal text and muted descriptions to\napproximate Quick Pick, although a pseudoterminal cannot use a separate UI font.\nMouse reporting is disabled when
-the panel closes. Clearing the command dismisses the panel and invalidates
-outstanding completion requests.
+labels, descriptions and details, excluded from persistent replay. The box is
+anchored horizontally beneath the last character before the input caret,
+clamped to the terminal width, and repositioned as the caret moves or wraps.
+Asynchronous results update the existing box rather than clearing it.
+
+All nonselected rows and group headings use the terminal's ordinary background.
+The selected item uses a continuous background behind its icon, text and
+padding; matching typed characters use a separate foreground color, following
+`editorSuggestWidget.highlightForeground` and
+`editorSuggestWidget.selectedBackground` overrides when supplied through
+`workbench.colorCustomizations`. The foreground/background fallback adapts to
+light and dark VS Code themes and updates when the theme changes. The terminal
+API does not expose resolved VS Code theme colors or the editor widget font, so
+the fallback is an approximation. Modules use blue `{}` glyphs; other codicons
+are represented by colored terminal glyphs.
+
+A scrollbar appears within the border when suggestions exceed the visible
+height. Up/Down and Page Up/Down navigate the choices, with the viewport only
+scrolling when the selection reaches an edge. Temporary SGR mouse reporting
+enables wheel navigation while the pointer is inside the box. Clicking a
+suggestion or its detail row accepts it; headings and borders do nothing.
+Cursor-position reports locate the box for mouse hit-testing. Mouse reporting
+is disabled when the box closes. Clearing the command dismisses the box and
+invalidates outstanding completion requests.
 
 `RTermLang` owns the console completion flow. It detects the completion
 context, builds fast runtime suggestions from cached session data and the
