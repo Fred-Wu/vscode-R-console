@@ -2028,7 +2028,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private setInlineMouseReporting(active: boolean): void {
-    if (this.inlineMouseReporting === active) return;
+    if (Boolean(this.inlineMouseReporting) === active) return;
     this.inlineMouseReporting = active;
     this.writeEmitter.fire(active ? "\x1b[?1006h\x1b[?1000h" : "\x1b[?1000l\x1b[?1006l");
   }
