@@ -1125,9 +1125,18 @@ export class RTerminal implements vscode.Pseudoterminal {
       }
       if (action.type === "tab" || action.type === "enter") {
         const item = this.inlineCompletion.current();
+        const isCurrent = item?.snapshotInput === this.inputState.currentLine &&
+          item.snapshotCursor === this.inputState.cursorCol;
         this.dismissInlineCompletion();
-        if (item && item.snapshotInput === this.inputState.currentLine && item.snapshotCursor === this.inputState.cursorCol) this.applyCompletion(item);
-        return;
+        if (item && isCurrent) {
+          this.applyCompletion(item);
+          return;
+        }
+        if (action.type === "tab") {
+          this.requestInlineCompletion(true);
+          return;
+        }
+        // An Enter pressed during an outstanding refresh still submits input.
       }
       if (action.type === "escape") {
         this.dismissInlineCompletion();
