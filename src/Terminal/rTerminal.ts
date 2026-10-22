@@ -148,6 +148,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
   private readonly inlineCompletion = new InlineCompletion();
   private inlineMouseReporting = false;
+  private inlineBoxTop: number | undefined;
+  private inlinePressedChoice: CompletionPickItem | undefined;
+  private inlineSuggestionRowCount = 0;
   private inlineCompletionTimer: ReturnType<typeof setTimeout> | undefined;
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
@@ -1113,6 +1116,30 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.ensureReadyPromptVisibleForInput();
 
+    if (action.type === "cursor-report") {
+      if (this.inlineCompletion?.hasRenderedRows) {
+        this.inlineBoxTop = action.row - this.renderer.cursorRowFromTop +
+          this.renderer.renderedLineCount - this.inlineSuggestionRowCount;
+      }
+      return;
+    }
+    if (action.type === "mouse") {
+      const item = this.inlineBoxTop === undefined ? undefined :
+        this.inlineCompletion.hitTest(action.row - this.inlineBoxTop, action.col);
+      if (action.pressed) {
+        this.inlinePressedChoice = item;
+      } else {
+        const pressed = this.inlinePressedChoice;
+        this.inlinePressedChoice = undefined;
+        if (item && item === pressed &&
+          item.snapshotInput === this.inputState.currentLine &&
+          item.snapshotCursor === this.inputState.cursorCol) {
+          this.dismissInlineCompletion();
+          this.applyCompletion(item);
+        }
+      }
+      return;
+    }
     if (action.type === "wheel") {
       if (this.inlineCompletion?.visible && action.col <= Math.min(72, this.dimensions.columns - 1)) {
         this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
@@ -2038,6 +2065,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.inlineCompletionTimer = undefined;
     const wasVisible = this.inlineCompletion.visible;
     this.inlineCompletion.clear();
+    this.inlineBoxTop = undefined;
+    this.inlinePressedChoice = undefined;
+    this.inlineSuggestionRowCount = 0;
     this.setInlineMouseReporting(false);
     this.lang.cancelCompletion();
     if (wasVisible && redraw && this.mode === "ready") this.renderInput();
@@ -2629,6 +2659,12 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private renderInput(): void {
     this.lang.updateInput(this.inputState.text);
+    const suggestions = this.mode === "ready" ? this.inlineCompletion.lines(
+      this.dimensions.columns, Math.min(13, Math.max(5, this.dimensions.rows - 5))
+    ) : [];
+    const previousRows = this.inlineSuggestionRowCount;
+    this.inlineSuggestionRowCount = suggestions.length;
+    if (previousRows !== suggestions.length) this.inlineBoxTop = undefined;
     this.withTerminalStateCaptureSuppressed(() => {
       renderViewInput({
         syntax: this.syntax,
@@ -2637,8 +2673,9 @@ export class RTerminal implements vscode.Pseudoterminal {
         dimensions: this.dimensions,
         historyBrowsing: this.historyBrowsing,
         historyCollapsed: this.historyCollapsed,
-        suggestions: this.mode === "ready" ? this.inlineCompletion.lines(this.dimensions.columns, Math.min(13, Math.max(5, this.dimensions.rows - 5))) : [],
+        suggestions,
       });
+      if (suggestions.length > 0) this.writeEmitter.fire("\x1b[6n");
     });
   }
 
