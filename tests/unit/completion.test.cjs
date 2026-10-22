@@ -1211,3 +1211,48 @@ test("function argument completion awaits parameters before offering runtime var
   assert.equal(published.length, 1);
   assert.equal(published[0][0].label, "na.rm");
 });
+
+test("library path changes trigger console LSP state synchronization", () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {},
+    "../../Language/completion": {},
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    requestMemberCompletions: async () => [],
+  });
+  const states = [];
+  lang.consoleLsp = { syncSessionState: (state) => {
+    states.push(state);
+    return Promise.resolve();
+  } };
+  const data = { search: [".GlobalEnv", "package:stats"], loaded_namespaces: [],
+    globalenv: {}, libraryPaths: ["/project/.uvr/library", "/base/library"] };
+  assert.equal(lang.updateSessionData(data), true);
+  assert.deepEqual(states[0], {
+    attachedPackages: ["stats"],
+    libraryPaths: data.libraryPaths,
+  });
+  assert.equal(lang.updateSessionData({ ...data }), false);
+  assert.equal(lang.updateSessionData({
+    ...data, libraryPaths: ["/another/library", "/base/library"],
+  }), true);
+  assert.equal(states.length, 2);
+});
+
+test("console LSP uses live session libraries at startup", async (t) => {
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode: { window: { createOutputChannel: () => ({ dispose() {} }) } },
+    "vscode-languageclient/node": { LanguageClient: class {} },
+  });
+  const lsp = new ConsoleLspClient({
+    consoleId: "library-env-test", env: {}, rPath: "R",
+  });
+  t.after(() => lsp.dispose());
+  lsp.sessionState = { attachedPackages: [], libraryPaths: ["/project/.uvr/library"] };
+  const config = { get: (key) => key === "libPaths" ? ["/fallback"] : false };
+  const env = lsp.buildServerEnv(config);
+  assert.equal(env.VSCR_LIB_PATHS, "/project/.uvr/library");
+});

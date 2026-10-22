@@ -112,6 +112,17 @@ export class SessProxy {
     if (!isWorkspaceData(result)) {
       return this.workspaceData;
     }
+    // Query the attached R session rather than the extension host's R libraries.
+    // sess's completion method returns list names without modifying R state.
+    const paths = await this.request("completion", {
+      expr: "stats::setNames(as.list(.libPaths()), .libPaths())",
+      trigger: "$",
+    });
+    if (Array.isArray(paths) && paths.every((item) =>
+      item && typeof item.name === "string" && item.name.length > 0
+    )) {
+      result.libraryPaths = paths.map((item) => item.name);
+    }
     this.setWorkspaceData(result);
     return result;
   }

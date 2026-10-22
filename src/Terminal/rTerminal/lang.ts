@@ -46,6 +46,7 @@ type AutocompleteRequest = {
 
 type ConsoleSessionState = {
   attachedPackages: string[];
+  libraryPaths?: string[];
 };
 
 export class RTermLang {
@@ -523,7 +524,8 @@ export class RTermLang {
     const nextState = this.toSessionState(data);
     if (
       this.sessionState &&
-      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages)
+      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages) &&
+      this.arraysEqual(nextState.libraryPaths ?? [], this.sessionState.libraryPaths ?? [])
     ) {
       return false;
     }
@@ -629,6 +631,7 @@ export class RTermLang {
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))
         .map((value) => value.slice(8)),
+      ...(data.libraryPaths ? { libraryPaths: data.libraryPaths } : {}),
     };
   }
 

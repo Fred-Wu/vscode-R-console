@@ -45,6 +45,7 @@ type ConsoleLspClientOptions = {
 
 type ConsoleLspSessionState = {
   attachedPackages: string[];
+  libraryPaths?: string[];
 };
 
 type SessionStateSyncResult = {
@@ -96,6 +97,8 @@ export class ConsoleLspClient implements CompletionProvider {
   private packageCheckPromise: Promise<boolean> | undefined;
   private packageRefreshPromise: Promise<void> | undefined;
   private lastPackageCheckAt = 0;
+  private runningLibraryPathsKey: string | undefined;
+  private libraryPathRefreshPromise: Promise<void> | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -254,6 +257,9 @@ export class ConsoleLspClient implements CompletionProvider {
         const projection = this.inputDocument.project(doc.getText());
         await this.syncDocument(client, projection.document);
         await this.applySessionState(client);
+        if (this.client !== client) {
+          continue;
+        }
         if (await this.packageChangesDetected(client, projection.document.getText())) {
           if (attempt === 0) {
             await this.restartForPackageChanges(client);
@@ -327,6 +333,12 @@ export class ConsoleLspClient implements CompletionProvider {
     }
     const state = this.sessionState;
     const stateKey = this.getSessionStateKey(state);
+    if (state.libraryPaths &&
+        this.runningLibraryPathsKey !== JSON.stringify(state.libraryPaths)) {
+      await this.restartForLibraryPaths();
+      if (this.client?.isRunning()) await this.applySessionState(this.client);
+      return;
+    }
     if (this.syncedSessionStateKey === stateKey) {
       return;
     }
@@ -377,7 +389,32 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {
-    return state.attachedPackages.join("\u0000");
+    return JSON.stringify([state.attachedPackages, state.libraryPaths]);
+  }
+
+  private async restartForLibraryPaths(): Promise<void> {
+    if (this.libraryPathRefreshPromise) {
+      await this.libraryPathRefreshPromise;
+      if (this.sessionState?.libraryPaths &&
+          this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)) {
+        await this.restartForLibraryPaths();
+      }
+      return;
+    }
+    const refresh = (async () => {
+      if (!(await this.stop())) {
+        throw new Error("Cannot restart console language server for library paths.");
+      }
+      if (!this.disposed) await this.start();
+    })();
+    this.libraryPathRefreshPromise = refresh;
+    try { await refresh; } finally {
+      if (this.libraryPathRefreshPromise === refresh) this.libraryPathRefreshPromise = undefined;
+    }
+    if (this.sessionState?.libraryPaths &&
+        this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)) {
+      await this.restartForLibraryPaths();
+    }
   }
 
   private async packageChangesDetected(
@@ -464,6 +501,8 @@ export class ConsoleLspClient implements CompletionProvider {
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
     const env = this.buildServerEnv(config);
+    this.runningLibraryPathsKey = this.sessionState?.libraryPaths
+      ? JSON.stringify(this.sessionState.libraryPaths) : undefined;
     const useStdio = config.get<boolean>("lsp.use_stdio") === true && process.platform !== "win32";
 
     const clientOptions: LanguageClientOptions = {
@@ -734,7 +773,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = config.get<string[]>("libPaths") ?? [];
+    const libPaths = this.sessionState?.libraryPaths ?? config.get<string[]>("libPaths") ?? [];
 
     // The lifecycle channel reports errors only; languageserver writes its
     // debug and info entries to the same stderr stream as errors.

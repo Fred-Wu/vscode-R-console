@@ -642,3 +642,20 @@ test("proxy replacement survives old socket close, forwards Unicode, and propaga
   assert.equal(proxy.getSessionId(), undefined);
   assert.equal(proxy.getWorkspaceData(), undefined);
 });
+
+test("sess workspace refresh reads active session library paths", async () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts", {});
+  const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  const methods = [];
+  proxy.request = async (method, params) => {
+    methods.push([method, params]);
+    if (method === "workspace") {
+      return { search: [], loaded_namespaces: [], globalenv: {} };
+    }
+    return [{ name: "/project/.uvr/library" }, { name: "/base/library" }];
+  };
+  const workspace = await proxy.requestWorkspace();
+  assert.deepEqual(workspace.libraryPaths, ["/project/.uvr/library", "/base/library"]);
+  assert.equal(methods[1][0], "completion");
+  assert.match(methods[1][1].expr, /\\.libPaths\\(\\)/);
+});
