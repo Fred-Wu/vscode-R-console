@@ -1141,7 +1141,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     if (action.type === "wheel") {
-      if (this.inlineCompletion?.visible && action.col <= Math.min(72, this.dimensions.columns - 1)) {
+      if (this.inlineBoxTop !== undefined &&
+          this.inlineCompletion?.contains(action.row - this.inlineBoxTop, action.col)) {
         this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
         this.renderInput();
       }
