@@ -1148,6 +1148,6 @@ test("shared typed ranking places exact matches before longer prefix matches", (
     { label: "librarySuffix", insertText: "librarySuffix", source: "session" },
     { label: "otherlibrary", insertText: "otherlibrary", source: "buffer" },
   ];
-  assert.deepEqual(completion.filterCompletionEntries(entries, "library").map(e => e.label),
+  assert.deepEqual(completion.rankCompletionEntries(entries, "library").map(e => e.label),
     ["library", "library.extra", "librarySuffix", "otherlibrary"]);
 });
