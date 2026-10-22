@@ -164,7 +164,10 @@ export class RTermLang {
           latestInput.text
         );
       })();
-      const stagedEntries = needsStagedEntries && context.kind !== "package"
+      // Argument candidates must await LSP parameters; early session-only
+      // results would select an unrelated runtime variable.
+      const stagedEntries = needsStagedEntries &&
+        context.kind !== "package" && context.kind !== "argument"
         ? await collectCompletionEntries(
             context,
             undefined,
@@ -181,7 +184,7 @@ export class RTermLang {
         return;
       }
 
-      const opensBeforeFullResults = force || !!stagedEntries?.length;
+      const opensBeforeFullResults = (force && context.kind !== "argument") || !!stagedEntries?.length;
       const entries = stagedEntries?.length
         ? stagedEntries
         : opensBeforeFullResults

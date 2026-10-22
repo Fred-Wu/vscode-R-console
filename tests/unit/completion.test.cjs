@@ -1156,3 +1156,58 @@ test("shared typed ranking places exact matches before longer prefix matches", (
   assert.deepEqual(completion.rankCompletionEntries(entries, "library").map(e => e.label),
     ["library", "library.extra", "librarySuffix", "otherlibrary"]);
 });
+
+test("function argument completion awaits parameters before offering runtime variables", async () => {
+  let finishLsp;
+  const fullResult = new Promise(resolve => { finishLsp = resolve; });
+  let stagedCalls = 0;
+  const published = [];
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position },
+    "../../Language/completion": {
+      getCompletionContext: () => ({
+        kind: "argument", prefix: "na", replaceStart: 5,
+        snapshotInput: "mean(na", snapshotCursor: 7,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (_context, document) => {
+        if (!document) {
+          stagedCalls++;
+          return [{ label: "naive", insertText: "naive", source: "session" }];
+        }
+        return fullResult;
+      },
+      rankCompletionEntries: entries => entries,
+      toCompletionQuickPickItems: entries => entries,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    requestWorkspaceData: async () => ({ globalenv: { naive: {} } }),
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: () => [] });
+  lang.getOrOpenCompletionDocument = async () => ({});
+  const input = {
+    text: "mean(na", currentLine: "mean(na", cursorCol: 7,
+    cursorRow: 0, lines: ["mean(na"], textBeforeCursor: "mean(na",
+  };
+  let completed = false;
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => ({ globalenv: { naive: {} } }),
+    applyCompletion: () => {},
+    onInlineEntries: entries => published.push(entries),
+  }).then(() => { completed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false, "wait for complete argument information");
+  assert.equal(stagedCalls, 0, "runtime candidates must not be published before arguments");
+  assert.deepEqual(published, []);
+  finishLsp([{ label: "na.rm", insertText: "na.rm = ", detail: "parameter", source: "lsp" }]);
+  await request;
+  assert.equal(published.length, 1);
+  assert.equal(published[0][0].label, "na.rm");
+});
