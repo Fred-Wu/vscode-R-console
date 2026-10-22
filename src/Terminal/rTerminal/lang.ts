@@ -40,6 +40,7 @@ type AutocompleteRequest = {
   getWorkspaceData: () => WorkspaceData | undefined;
   force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
+  onInlineEntries?: (items: CompletionPickItem[]) => void;
 };
 
 type ConsoleSessionState = {
@@ -77,6 +78,7 @@ export class RTermLang {
     getWorkspaceData,
     force = false,
     applyCompletion,
+    onInlineEntries,
   }: AutocompleteRequest): Promise<void> {
     if (this.disposed) {
       return;
@@ -193,6 +195,23 @@ export class RTermLang {
         }
       }
       const initialEntries = entries ?? [];
+
+      if (onInlineEntries) {
+        const publish = (results: CompletionEntries): void => {
+          if (!this.isCurrentCompletionRequest(requestId)) return;
+          const current = getCurrentInput();
+          if (current.currentLine !== context.snapshotInput ||
+              current.cursorCol !== context.snapshotCursor) return;
+          onInlineEntries(toCompletionQuickPickItems(results, context).filter(isCompletionPickItem));
+        };
+        publish(initialEntries);
+        if (opensBeforeFullResults) {
+          void fullEntriesPromise.then(results => {
+            if (results) publish(results);
+          }).catch(() => undefined);
+        }
+        return;
+      }
 
       const completionPlaceHolder = "R console completions";
       const shouldPrefillQuickPick =
@@ -465,6 +484,8 @@ export class RTermLang {
       applyCompletion(selection);
     }
   }
+
+  cancelCompletion(): void { this.completionRequestId++; }
 
   dispose(): Promise<void> {
     if (this.disposePromise) {
