@@ -23,18 +23,40 @@ test("old asynchronous completion results cannot reopen a dismissed list", () =>
   assert.equal(state.visible, false);
 });
 
-test("inline suggestions paginate and never emit candidate ANSI escapes", () => {
+test("inline completion draws a border, shows picker metadata, and hides codicon markup", () => {
+  const state = new InlineCompletion();
+  state.set([
+    { label: "Runtime Variables" },
+    { ...item("$(symbol-variable) mtcars"), description: "variable", detail: "session" },
+    { ...item("$(symbol-function) mean"), description: "function", detail: "{base}" },
+  ], state.token);
+  const lines = state.lines(60, 9);
+  const plain = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  assert.match(plain, /╭─/);
+  assert.match(plain, /╰─/);
+  assert.match(plain, /Runtime Variables/);
+  assert.match(plain, /mtcars/);
+  assert.match(plain, /variable/);
+  assert.match(plain, /session/);
+  assert.match(plain, /{base}/);
+  assert.doesNotMatch(plain, /\$\(symbol-|> mtcars/);
+  assert.match(lines.join(""), /\x1b\[38;5;75m/);
+  state.move(1);
+  assert.equal(state.current().insertText, "$(symbol-function) mean");
+});
+
+test("inline scrolling follows selected completion and removes unsafe escapes", () => {
   const state = new InlineCompletion();
   state.set(Array.from({ length: 20 }, (_, i) => item("item" + i)), state.token);
   state.move(14);
-  const lines = state.lines(28, 5);
-  assert.equal(lines.length, 5);
-  assert.match(lines[4], /\x1b\[2m\d+-\d+\/20/);
+  const lines = state.lines(40, 8);
+  assert.equal(lines.length, 8);
   assert.ok(lines.some(line => line.includes("item14")));
-  assert.ok(lines.every(line => !line.includes("item0\x1b[7m")));
+  assert.ok(lines.some(line => line.includes("of 20")));
   state.clear();
   state.set([item("bad\x1b[31m red")], state.token);
-  assert.equal(state.lines(30, 5)[0].includes("bad\x1b[31m"), false);
+  const plain = state.lines(40, 7).join("");
+  assert.equal(plain.includes("bad\x1b[31m"), false);
   assert.deepEqual(state.lines(10, 5), []);
 });
 
