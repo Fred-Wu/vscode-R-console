@@ -532,7 +532,7 @@ export class RTermLang {
 
     this.sessionState = nextState;
     if (this.consoleLsp) {
-      void this.consoleLsp.syncSessionState(nextState);
+      void this.consoleLsp.syncSessionState(nextState).catch(() => undefined);
     }
     return true;
   }

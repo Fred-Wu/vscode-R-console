@@ -108,6 +108,14 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   async start(): Promise<void> {
+    if (this.libraryPathRefreshPromise) {
+      await this.libraryPathRefreshPromise;
+      return;
+    }
+    await this.startClient();
+  }
+
+  private async startClient(): Promise<void> {
     if (this.disposed) {
       throw new Error("Cannot start a disposed console language server.");
     }
@@ -304,8 +312,11 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return;
     }
-    await this.syncDocument(client, this.inputDocument.project(doc.getText()).document);
     await this.applySessionState(client);
+    const currentClient = this.client;
+    if (currentClient?.isRunning()) {
+      await this.syncDocument(currentClient, this.inputDocument.project(doc.getText()).document);
+    }
   }
 
   updateInput(input: string): void {
@@ -329,6 +340,12 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private async applySessionState(client: ConsoleLanguageClient): Promise<void> {
     if (!this.sessionState) {
+      return;
+    }
+    if (this.client !== client) {
+      if (this.client?.isRunning()) {
+        await this.applySessionState(this.client);
+      }
       return;
     }
     const state = this.sessionState;
@@ -395,25 +412,32 @@ export class ConsoleLspClient implements CompletionProvider {
   private async restartForLibraryPaths(): Promise<void> {
     if (this.libraryPathRefreshPromise) {
       await this.libraryPathRefreshPromise;
-      if (this.sessionState?.libraryPaths &&
-          this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)) {
-        await this.restartForLibraryPaths();
-      }
       return;
     }
+    // Concurrent starts wait for the restart. Capture path updates that arrive
+    // while the new server is starting before releasing the restart lock.
     const refresh = (async () => {
-      if (!(await this.stop())) {
-        throw new Error("Cannot restart console language server for library paths.");
-      }
-      if (!this.disposed) await this.start();
+      do {
+        if (!(await this.stop())) {
+          throw new Error("Cannot restart console language server for library paths.");
+        }
+        if (this.disposed) {
+          return;
+        }
+        await this.startClient();
+      } while (
+        !this.disposed &&
+        this.sessionState?.libraryPaths &&
+        this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)
+      );
     })();
     this.libraryPathRefreshPromise = refresh;
-    try { await refresh; } finally {
-      if (this.libraryPathRefreshPromise === refresh) this.libraryPathRefreshPromise = undefined;
-    }
-    if (this.sessionState?.libraryPaths &&
-        this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)) {
-      await this.restartForLibraryPaths();
+    try {
+      await refresh;
+    } finally {
+      if (this.libraryPathRefreshPromise === refresh) {
+        this.libraryPathRefreshPromise = undefined;
+      }
     }
   }
 
@@ -479,6 +503,16 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
+    if (this.libraryPathRefreshPromise) {
+      try {
+        await this.libraryPathRefreshPromise;
+      } catch {
+        return undefined;
+      }
+    }
     if (this.disposed) {
       return undefined;
     }

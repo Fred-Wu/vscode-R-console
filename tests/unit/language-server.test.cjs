@@ -69,6 +69,6 @@ test("active console libraries take precedence over fallback R libraries", () =>
   const script = fs.readFileSync(
     path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8"
   );
-  assert.match(script, /\\.paths <- c\\(add_lib_paths, \\.paths\\)/);
-  assert.match(script, /\\.libPaths\\(\\.paths\\)/);
+  assert.match(script, /\.paths <- c\(add_lib_paths, \.paths\)/);
+  assert.match(script, /\.libPaths\(\.paths\)/);
 });

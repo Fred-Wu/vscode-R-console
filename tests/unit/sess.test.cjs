@@ -592,8 +592,12 @@ test("proxy forwards protocol 2 attach metadata and keeps workspace and completi
   assert.deepEqual(proxy.getWorkspaceData(), workspace);
 
   const completion = proxy.requestMemberCompletions("x", "$");
-  await waitFor(() => r.messages.some((message) => message.method === "completion"));
-  const request = r.messages.find((message) => message.method === "completion");
+  await waitFor(() => r.messages.some((message) =>
+    message.method === "completion" && message.params?.expr === "x"
+  ));
+  const request = r.messages.find((message) =>
+    message.method === "completion" && message.params?.expr === "x"
+  );
   send(r.socket, {
     jsonrpc: "2.0",
     id: request.id,
@@ -643,19 +647,73 @@ test("proxy replacement survives old socket close, forwards Unicode, and propaga
   assert.equal(proxy.getWorkspaceData(), undefined);
 });
 
-test("sess workspace refresh reads active session library paths", async () => {
-  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts", {});
+test("sess workspace refresh publishes promptly and then synchronizes library paths", async () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
   const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  proxy.rSocket = { destroyed: false, destroy() { this.destroyed = true; } };
+  let resolvePaths;
+  const pathsPending = new Promise((resolve) => { resolvePaths = resolve; });
   const methods = [];
+  const updates = [];
+  proxy.setWorkspaceDataListener((data) => updates.push(data));
   proxy.request = async (method, params) => {
     methods.push([method, params]);
     if (method === "workspace") {
       return { search: [], loaded_namespaces: [], globalenv: {} };
     }
-    return [{ name: "/project/.uvr/library" }, { name: "/base/library" }];
+    return pathsPending;
   };
   const workspace = await proxy.requestWorkspace();
-  assert.deepEqual(workspace.libraryPaths, ["/project/.uvr/library", "/base/library"]);
+  assert.deepEqual(workspace, { search: [], loaded_namespaces: [], globalenv: {} });
+  assert.deepEqual(proxy.getWorkspaceData(), workspace);
+  assert.equal(updates.length, 1, "do not delay the workspace behind the paths request");
   assert.equal(methods[1][0], "completion");
-  assert.match(methods[1][1].expr, /\\.libPaths\\(\\)/);
+  assert.match(methods[1][1].expr, /\.libPaths\(\)/);
+
+  resolvePaths([{ name: "/project/.uvr/library" }, { name: "/base/library" }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(proxy.getWorkspaceData().libraryPaths, [
+    "/project/.uvr/library", "/base/library",
+  ]);
+  assert.equal(updates.length, 2);
+  await proxy.requestWorkspace();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(updates.length, 3, "unchanged libraries do not emit a separate update");
+  proxy.dispose();
+});
+
+test("late workspace responses cannot restore a disconnected session", async () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  const socket = { destroyed: false, destroy() { this.destroyed = true; } };
+  proxy.rSocket = socket;
+  let completeWorkspace;
+  proxy.request = async () => new Promise((resolve) => { completeWorkspace = resolve; });
+  const pending = proxy.requestWorkspace();
+  proxy.dispose();
+  completeWorkspace({ search: [".GlobalEnv"], loaded_namespaces: [], globalenv: {} });
+  await pending;
+  assert.equal(proxy.getWorkspaceData(), undefined);
+});
+
+test("late library-path responses do not overwrite a replacement R socket", async () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  const oldSocket = { destroyed: false, destroy() { this.destroyed = true; } };
+  const newSocket = { destroyed: false, destroy() { this.destroyed = true; } };
+  proxy.rSocket = oldSocket;
+  let completePaths;
+  proxy.request = async (method) => method === "workspace"
+    ? { search: [], loaded_namespaces: [], globalenv: {} }
+    : new Promise((resolve) => { completePaths = resolve; });
+  await proxy.requestWorkspace();
+  assert.equal(typeof completePaths, "function");
+  proxy.rSocket = newSocket;
+  proxy.workspaceData = undefined;
+  proxy.libraryPathsRequest = undefined;
+  completePaths([{ name: "/stale/library" }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(proxy.getWorkspaceData(), undefined);
+  oldSocket.destroy();
+  proxy.dispose();
 });
