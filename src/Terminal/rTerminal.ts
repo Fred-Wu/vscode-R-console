@@ -2015,6 +2015,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private scheduleInlineCompletion(): void {
+    if (!this.inlineCompletion) return;
     if (this.inlineCompletionMode() !== "inline" ||
         vscode.workspace.getConfiguration("r.console").get<string>("inlineCompletion.trigger", "tab") !== "typing") return;
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
