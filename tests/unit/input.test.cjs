@@ -767,3 +767,12 @@ test("F8 history picker wording, icons, and command label remain consistent", ()
     (binding) => binding.key === "f8" && binding.command === "r-console.searchHistory"
   ));
 });
+
+test("terminal wheel events decode for inline completion scrolling", () => {
+  const keys = new KeyProcessor();
+  assert.deepEqual(keys.parseInputChunk("\x1b[<64;12;7M\x1b[<65;12;8M"), [
+    { type: "wheel", dir: "up", col: 12, row: 7 },
+    { type: "wheel", dir: "down", col: 12, row: 8 },
+  ]);
+  assert.deepEqual(keys.parseInputChunk("\x1b[<0;12;7M"), []);
+});
