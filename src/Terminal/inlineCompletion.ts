@@ -146,7 +146,7 @@ export class InlineCompletion {
     const body = rows.slice(start, start + capacity);
     const frame = (text: string, selected = false, isGroup = false, isDetail = false, bar = " "): string => {
       const plainLength = [...text.replace(/\x1b\[[0-9;]*m/g, "")].length;
-      const padded = text + " ".repeat(Math.max(0, contentWidth - 1 - plainLength));
+      const padded = text + " ".repeat(Math.max(0, contentWidth - plainLength));
       const styled = selected ? SELECTED + padded.replace(/\x1b\[0m/g, SELECTED) + RESET :
         isGroup || isDetail ? DIM + padded + RESET : padded;
       return BORDER + "│" + RESET + " " + styled + BORDER + bar + RESET + BORDER + "│" + RESET;
