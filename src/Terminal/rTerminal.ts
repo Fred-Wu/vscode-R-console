@@ -2059,7 +2059,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       force,
       applyCompletion: selection => this.applyCompletion(selection),
       onInlineEntries: items => {
-        if (this.mode !== "ready" || !this.inlineCompletion.set(items, token)) return;
+        if (this.mode !== "ready" || !this.inlineCompletion.set(items, token, this.getInputSnapshot().currentLine.slice(0, this.inputState.cursorCol).match(/[A-Za-z._][\w.]*$/)?.[0] ?? "")) return;
         this.renderInput();
       },
     });
