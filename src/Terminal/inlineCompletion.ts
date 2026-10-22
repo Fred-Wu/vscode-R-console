@@ -1,6 +1,6 @@
 import type { CompletionPickItem, CompletionQuickPickItem } from "../Language/completion";
 
-type DisplayRow = { text: string; choice?: number; group?: boolean; detail?: boolean };
+type DisplayRow = { item: CompletionQuickPickItem; choice?: number; detail?: boolean };
 
 export type InlineCompletionColors = {
   matchForeground: string;
@@ -66,6 +66,8 @@ export class InlineCompletion {
   items: CompletionQuickPickItem[] = [];
   selected = 0;
   private choiceIndexes: number[] = [];
+  private rows: DisplayRow[] = [];
+  private choiceRows: number[] = [];
   private generation = 0;
   private renderedTargets: Array<number | undefined> = [];
   private renderedWidth = 0;
@@ -88,10 +90,10 @@ export class InlineCompletion {
   }
 
   scrollTo(row: number): void {
-    const index = this.choiceIndexes[Math.min(this.choiceIndexes.length - 1,
+    const choice = Math.min(this.choiceIndexes.length - 1,
       Math.max(0, Math.round((row - 1) / Math.max(1, this.renderedTargets.length - 4) *
-        (this.choiceIndexes.length - 1))))];
-    if (index !== undefined) this.move(this.choiceIndexes.indexOf(index) - this.selected);
+        (this.choiceIndexes.length - 1))));
+    this.move(choice - this.selected);
   }
 
   contains(row: number, col: number): boolean {
@@ -113,6 +115,8 @@ export class InlineCompletion {
     this.generation++;
     this.items = [];
     this.choiceIndexes = [];
+    this.rows = [];
+    this.choiceRows = [];
     this.selected = 0;
     this.renderedTargets = [];
     this.renderedWidth = 0;
@@ -133,8 +137,18 @@ export class InlineCompletion {
     this.items = items;
     this.query = query;
     this.choiceIndexes = [];
+    this.rows = [];
+    this.choiceRows = [];
     items.forEach((item, index) => {
-      if (isChoice(item)) this.choiceIndexes.push(index);
+      if (isChoice(item)) {
+        const choice = this.choiceIndexes.length;
+        this.choiceIndexes.push(index);
+        this.choiceRows.push(this.rows.length);
+        this.rows.push({ item, choice });
+        if (item.detail) this.rows.push({ item, choice, detail: true });
+      } else {
+        this.rows.push({ item });
+      }
     });
     const matching = previous && this.choiceIndexes.findIndex(index => {
       const entry = items[index];
@@ -221,40 +235,12 @@ export class InlineCompletion {
     ));
     const indent = " ".repeat(left);
     const contentWidth = boxWidth - 4;
-    const rows: DisplayRow[] = [];
-    let choice = 0;
-
-    for (const item of this.items) {
-      if (!isChoice(item)) {
-        rows.push({ text: this.fit(item.label, contentWidth), group: true });
-        continue;
-      }
-
-      const iconKind = ICON.exec(item.label)?.[1];
-      const moduleIcon = iconKind === "module";
-      const label = this.fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 4 : 3));
-      const description = this.fit(item.description ?? "", contentWidth);
-      const iconColor = ESC + "38;5;" + (ICON_COLORS[iconKind ?? ""] ?? 245) + "m";
-      const icon = iconColor + (moduleIcon ? "{}" : "●") + FG_RESET;
-      const rest = contentWidth - this.cellWidth(label) - (moduleIcon ? 4 : 3);
-      const descriptionWidth = this.cellWidth(description);
-      const suffix = description && rest >= descriptionWidth + 2
-        ? " ".repeat(rest - descriptionWidth) + DIM + description + DIM_RESET
-        : "";
-      rows.push({
-        text: icon + " " + highlightMatch(label, this.query, colors.matchForeground) + suffix,
-        choice,
-      });
-      if (item.detail) {
-        rows.push({ text: "  " + this.fit(item.detail, contentWidth - 2), choice, detail: true });
-      }
-      choice++;
-    }
+    const rows = this.rows;
 
     // Include boundary headings/details at the endpoints; otherwise scroll only
     // when selection leaves the visible viewport.
     const capacity = availableRows - 3;
-    const activeRow = rows.findIndex(row => row.choice === this.selected && !row.detail);
+    const activeRow = this.choiceRows[this.selected];
     if (activeRow < this.scrollStart) this.scrollStart = activeRow;
     if (activeRow >= this.scrollStart + capacity) this.scrollStart = activeRow - capacity + 1;
     if (this.selected === 0) this.scrollStart = 0;
@@ -284,8 +270,29 @@ export class InlineCompletion {
     const thumb = overflow ? Math.max(1, Math.round(capacity * capacity / rows.length)) : 0;
     const thumbStart = overflow ? Math.round(start * (capacity - thumb) / (rows.length - capacity)) : 0;
     for (const [index, row] of body.entries()) {
+      const item = row.item;
+      let text: string;
+      const group = !isChoice(item);
+      if (group) {
+        text = this.fit(item.label, contentWidth);
+      } else if (row.detail) {
+        text = "  " + this.fit(item.detail ?? "", contentWidth - 2);
+      } else {
+        const iconKind = ICON.exec(item.label)?.[1];
+        const moduleIcon = iconKind === "module";
+        const label = this.fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 4 : 3));
+        const description = this.fit(item.description ?? "", contentWidth);
+        const iconColor = ESC + "38;5;" + (ICON_COLORS[iconKind ?? ""] ?? 245) + "m";
+        const icon = iconColor + (moduleIcon ? "{}" : "●") + FG_RESET;
+        const rest = contentWidth - this.cellWidth(label) - (moduleIcon ? 4 : 3);
+        const descriptionWidth = this.cellWidth(description);
+        const suffix = description && rest >= descriptionWidth + 2
+          ? " ".repeat(rest - descriptionWidth) + DIM + description + DIM_RESET
+          : "";
+        text = icon + " " + highlightMatch(label, this.query, colors.matchForeground) + suffix;
+      }
       const bar = !overflow ? " " : index >= thumbStart && index < thumbStart + thumb ? "█" : "│";
-      output.push(frame(row.text, row.choice === this.selected && !row.detail, row.group || row.detail, bar));
+      output.push(frame(text, row.choice === this.selected && !row.detail, group || row.detail, bar));
       this.renderedTargets.push(row.choice);
     }
     const first = body.find(row => row.choice !== undefined)?.choice;

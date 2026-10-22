@@ -654,6 +654,7 @@ are selected before runtime symbols; explicit selection is retained on refresh.
 The `r.console.inlineCompletion.trigger` setting chooses automatic
 debounced suggestions or Tab activation. In Tab mode, editing refreshes an open
 list without opening a closed one. Tab or Enter accepts the selected suggestion,
+or requests fresh suggestions without submitting input if the visible results are stale.
 Escape dismisses it, and clearing the input dismisses the list and invalidates
 outstanding requests. Backspace resets the suggestion selection and viewport.
 

@@ -41,6 +41,46 @@ function getPromptLengthForLine(
   return lineIndex === 0 ? promptLen : continuationPromptLen;
 }
 
+export function getWrappedLineLayout(
+  line: string,
+  columns: number,
+  promptLen: number,
+  widthOf: (text: string) => number,
+  cursorCol = line.length
+): { rows: number; endColumn: number; cursorRow: number; cursorColumn: number; splitIndex: number } {
+  const width = Math.max(1, columns);
+  let row = Math.max(0, Math.ceil(promptLen / width) - 1);
+  let col = promptLen - row * width;
+  let index = 0;
+  let cursorRow = -1;
+  let cursorColumn = 1;
+  let splitIndex = line.length;
+  for (const char of line) {
+    const size = widthOf(char);
+    // A wide character leaves the final cell empty if it cannot fit there.
+    if (size > 0 && col + size > width) {
+      row++;
+      col = 0;
+    }
+    if (cursorRow < 0 && index >= cursorCol) {
+      cursorRow = row;
+      cursorColumn = Math.min(width, col + 1);
+    }
+    if (cursorRow >= 0 && row > cursorRow && splitIndex === line.length) {
+      splitIndex = index;
+    }
+    col += size;
+    index += char.length;
+  }
+  return {
+    rows: row + 1,
+    endColumn: col,
+    cursorRow: cursorRow < 0 ? row : cursorRow,
+    cursorColumn: cursorRow < 0 ? Math.min(width, col + 1) : cursorColumn,
+    splitIndex,
+  };
+}
+
 function getRenderedRowCountForLine(
   line: string,
   lineIndex: number,
@@ -55,8 +95,7 @@ function getRenderedRowCountForLine(
     promptLen,
     continuationPromptLen
   );
-  const visibleLen = visiblePromptLen + widthOf(line);
-  return Math.max(1, Math.ceil(visibleLen / safeColumns));
+  return getWrappedLineLayout(line, safeColumns, visiblePromptLen, widthOf).rows;
 }
 
 export function getContinuationPromptLength(
@@ -218,75 +257,39 @@ function clipViewportLine(
     };
   }
 
-  if (widthOf(line) !== line.length) {
-    const total = widthOf(line);
-    const focus = widthOf(line.slice(0, clampedFocusCol ?? line.length));
-    const usable = maxLen - 3;
-    const desired = clampedFocusCol === undefined || focus <= usable ? 0 :
-      total - focus <= usable ? Math.max(0, total - usable) :
-      Math.max(0, focus - Math.floor((maxLen - 6) / 2));
-    let start = 0;
-    let cells = 0;
-    for (const char of line) {
+  const total = widthOf(line);
+  const focus = widthOf(line.slice(0, clampedFocusCol ?? line.length));
+  const usable = maxLen - 3;
+  const desired = clampedFocusCol === undefined || focus <= usable ? 0 :
+    total - focus <= usable ? Math.max(0, total - usable) :
+    Math.max(0, focus - Math.floor((maxLen - 6) / 2));
+  let start = 0;
+  let cells = 0;
+  for (const char of line) {
+    const size = widthOf(char);
+    if (cells + size > desired) break;
+    cells += size;
+    start += char.length;
+  }
+  const prefix = start ? "..." : "";
+  const take = (budget: number): { text: string; end: number } => {
+    let text = "";
+    let used = 0;
+    let end = start;
+    for (const char of line.slice(start)) {
       const size = widthOf(char);
-      if (cells + size > desired) break;
-      cells += size;
-      start += char.length;
+      if (used + size > budget) break;
+      text += char;
+      used += size;
+      end += char.length;
     }
-    const prefix = start ? "..." : "";
-    const take = (budget: number): { text: string; end: number } => {
-      let text = "";
-      let used = 0;
-      let end = start;
-      for (const char of line.slice(start)) {
-        const size = widthOf(char);
-        if (used + size > budget) break;
-        text += char;
-        used += size;
-        end += char.length;
-      }
-      return { text, end };
-    };
-    const preview = take(maxLen - prefix.length);
-    const slice = preview.end === line.length ? preview : take(maxLen - prefix.length - 3);
-    return {
-      text: prefix + slice.text + (slice.end < line.length ? "..." : ""),
-      cursorCol: prefix.length + Math.max(0, Math.min((clampedFocusCol ?? slice.end) - start, slice.text.length)),
-    };
-  }
-
-  if (clampedFocusCol === undefined) {
-    return {
-      text: `${line.slice(0, maxLen - 3)}...`,
-      cursorCol: maxLen,
-    };
-  }
-
-  const ellipsis = "...";
-  const singleSidedBudget = maxLen - ellipsis.length;
-
-  if (clampedFocusCol <= singleSidedBudget) {
-    return {
-      text: `${line.slice(0, singleSidedBudget)}${ellipsis}`,
-      cursorCol: clampedFocusCol,
-    };
-  }
-
-  const tailStart = Math.max(0, line.length - singleSidedBudget);
-  if (clampedFocusCol >= tailStart) {
-    return {
-      text: `${ellipsis}${line.slice(tailStart)}`,
-      cursorCol: ellipsis.length + (clampedFocusCol - tailStart),
-    };
-  }
-
-  const middleBudget = Math.max(1, maxLen - ellipsis.length * 2);
-  const desiredStart = clampedFocusCol - Math.floor(middleBudget / 2);
-  const start = Math.max(0, Math.min(desiredStart, line.length - middleBudget));
-  const end = start + middleBudget;
+    return { text, end };
+  };
+  const preview = take(maxLen - prefix.length);
+  const slice = preview.end === line.length ? preview : take(maxLen - prefix.length - 3);
   return {
-    text: `${ellipsis}${line.slice(start, end)}${ellipsis}`,
-    cursorCol: ellipsis.length + (clampedFocusCol - start),
+    text: prefix + slice.text + (slice.end < line.length ? "..." : ""),
+    cursorCol: prefix.length + Math.max(0, Math.min((clampedFocusCol ?? slice.end) - start, slice.text.length)),
   };
 }
 

@@ -16,6 +16,7 @@ import { KeyProcessor, KeyAction } from "./keyProcessor";
 import { Renderer } from "./renderer";
 import {
   getContinuationPromptLength,
+  getWrappedLineLayout,
 } from "./inputViewport";
 import {
   type RTerminalOptions,
@@ -1193,16 +1194,13 @@ export class RTerminal implements vscode.Pseudoterminal {
         const item = this.inlineCompletion.current();
         const isCurrent = item?.snapshotInput === this.inputState.currentLine &&
           item.snapshotCursor === this.inputState.cursorCol;
-        this.dismissInlineCompletion();
         if (item && isCurrent) {
+          this.dismissInlineCompletion();
           this.applyCompletion(item);
-          return;
-        }
-        if (action.type === "tab") {
+        } else {
           this.requestInlineCompletion(true);
-          return;
         }
-        // An Enter pressed during an outstanding refresh still submits input.
+        return;
       }
       if (action.type === "escape") {
         this.dismissInlineCompletion();
@@ -2124,6 +2122,8 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private requestInlineCompletion(force: boolean): void {
     if (this.mode !== "ready" || !this.promptReady || this.inlineCompletionMode() !== "inline") return;
+    if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
+    this.inlineCompletionTimer = undefined;
     if (this.inputState.text.trim().length === 0) {
       this.dismissInlineCompletion();
       return;
@@ -2698,8 +2698,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       : (this.renderer.continuationPromptText?.length ?? 2);
     // Anchor the panel under the last character before the caret, including
     // terminal wrapping and windowed multiline input.
-    const anchorColumn = (Math.max(0, promptLength +
-      this.renderer.displayWidth(plan.lines[plan.cursorRow]?.slice(0, plan.cursorCol) ?? "") - 1) % columns) + 1;
+    const anchorColumn = Math.max(1, getWrappedLineLayout(
+      plan.lines[plan.cursorRow]?.slice(0, plan.cursorCol) ?? "", columns,
+      promptLength, this.renderer.displayWidth).endColumn);
     const isLight = vscode.window.activeColorTheme?.kind === vscode.ColorThemeKind?.Light;
     const overrides = vscode.workspace.getConfiguration("workbench")
       .get<Record<string, unknown>>("colorCustomizations", {});
@@ -2719,8 +2720,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       const windowPromptLength = plan.promptKinds[plan.cursorRow] === "main"
         ? this.renderer.promptLen
         : (this.renderer.continuationPromptText?.length ?? 2);
-      const windowAnchorColumn = (Math.max(0, windowPromptLength +
-        this.renderer.displayWidth(plan.lines[plan.cursorRow]?.slice(0, plan.cursorCol) ?? "") - 1) % columns) + 1;
+      const windowAnchorColumn = Math.max(1, getWrappedLineLayout(
+        plan.lines[plan.cursorRow]?.slice(0, plan.cursorCol) ?? "", columns,
+        windowPromptLength, this.renderer.displayWidth).endColumn);
       if (windowAnchorColumn !== anchorColumn) {
         suggestions = this.inlineCompletion.lines(columns, availableRows, windowAnchorColumn, colors);
       }

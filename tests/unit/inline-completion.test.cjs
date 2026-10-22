@@ -36,7 +36,8 @@ function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
     applyCompletion(selection) { this.accepted = selection; },
     handleEnterKey() { this.submitted = this.inputState.text; },
   });
-  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text));
+  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text), undefined,
+    text => [...text].reduce((sum, char) => sum + unicode.wcwidth(char.codePointAt(0)), 0));
   terminal.renderer.setContinuationPrompt("   ");
   const keys = new KeyProcessor();
   screen.onData(data => {
@@ -180,6 +181,64 @@ test("Tab mode refreshes an open list on edits without opening one for ordinary 
   terminal.applyKeyAction({ type: "arrow", dir: "down" });
   terminal.applyKeyAction({ type: "tab" });
   assert.equal(terminal.accepted, choices[1], "Tab accepts the selected entry when the list is open");
+});
+
+test("Enter refreshes stale visible suggestions without submitting input", t => {
+  for (const trigger of ["tab", "typing"]) {
+    const { terminal } = createTerminal(t, 80, 24, trigger);
+    terminal.inputState.insertText("mea");
+    terminal.inlineCompletion.set([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }],
+      terminal.inlineCompletion.token);
+    terminal.renderInput();
+    const requests = [];
+    terminal.lang.handleAutocomplete = async request => { requests.push(request); };
+    terminal.applyKeyAction({ type: "text", text: "n" });
+    assert.ok(terminal.inlineCompletionTimer);
+    for (let i = 0; i < 2; i++) {
+      terminal.applyKeyAction({ type: "enter" });
+      assert.equal(terminal.submitted, undefined);
+      assert.equal(terminal.accepted, undefined);
+      assert.equal(terminal.inlineCompletion.hasRenderedRows, true);
+      assert.equal(terminal.inlineCompletionTimer, undefined);
+      assert.equal(requests[i].input.currentLine, "mean");
+    }
+    requests[0].onInlineEntries([]);
+    assert.equal(terminal.inlineCompletion.hasRenderedRows, true, "ignore superseded results");
+    const fresh = { ...item("mean"), snapshotInput: "mean", snapshotCursor: 4 };
+    requests[1].onInlineEntries([fresh]);
+    terminal.applyKeyAction({ type: "enter" });
+    assert.equal(terminal.accepted, fresh);
+    assert.equal(terminal.submitted, undefined);
+    terminal.applyKeyAction({ type: "enter" });
+    assert.equal(terminal.submitted, "mean", "normal Enter resumes after acceptance closes the panel");
+  }
+});
+
+test("large completion lists only measure visible rows on navigation and redraw", () => {
+  let measured = 0;
+  const state = new InlineCompletion({ wcwidth(codePoint) {
+    measured++;
+    return unicode.wcwidth(codePoint);
+  } });
+  const entries = Array.from({ length: 10000 }, (_, i) => ({
+    ...item("$(symbol-variable) column_" + String(i).padStart(5, "0")),
+    description: "numeric", detail: "column information",
+  }));
+  state.set([{ label: "Columns" }, ...entries], state.token, "column");
+  assert.equal(measured, 0);
+  for (const delta of [0, 5000, 5000, -10000]) {
+    state.move(delta);
+    measured = 0;
+    assert.equal(state.lines(80, 13).length, 13);
+    assert.ok(measured < 1500, `only the viewport is measured: ${measured}`);
+    assert.ok(state.renderedTargets.includes(state.selected));
+  }
+  state.set([{ label: "New group" }, { ...item("replacement"), detail: "new detail" }], state.token);
+  const output = state.lines(40, 13).join("\n");
+  assert.ok(output.includes("New group") && output.includes("replacement") && output.includes("new detail"));
+  assert.ok(!output.includes("column_"));
+  state.clear();
+  assert.deepEqual(state.lines(80, 13), []);
 });
 
 test("Backspace resets selection and scrolling through staged and full results", async t => {
@@ -579,8 +638,6 @@ test("mouse wheel outside the panel scrolls terminal history without moving comp
 
 test("Unicode characters before the caret use terminal display cells for suggestion anchoring", t => {
   const { terminal, screen } = createTerminal(t, 80, 24);
-  terminal.renderer.displayWidth = text => [...text].reduce((n, character) =>
-    n + unicode.wcwidth(character.codePointAt(0)), 0);
   terminal.inputState.insertText("字a");
   terminal.inlineCompletion.set([item("alpha")], terminal.inlineCompletion.token);
   terminal.renderInput();
@@ -618,8 +675,6 @@ test("multiline suggestions appear below the active caret line and accept clicks
 
 test("windowed Unicode input fits its reserved viewport row", t => {
   const { terminal, screen } = createTerminal(t, 24, 7);
-  terminal.renderer.displayWidth = text => [...text].reduce((sum, char) =>
-    sum + unicode.wcwidth(char.codePointAt(0)), 0);
   terminal.inputState.insertText("漢".repeat(30));
   terminal.inlineCompletion.set([item("candidate")], terminal.inlineCompletion.token);
   terminal.renderInput();
@@ -699,4 +754,75 @@ test("cursor at an exact wrap boundary distinguishes end-of-line and mid-line", 
   terminal.renderInput();
   assert.equal(terminal.renderer.cursorRowFromTop, 0);
   assert.equal(screen.buffer.active.cursorX, 19, "end-of-line caret stays in final cell");
+});
+
+test("wide characters at wrap boundaries keep redraws, cursor and mouse targets aligned", t => {
+  const input = "x".repeat(20) + "漢" + "z".repeat(23);
+  for (const [cursor, row, col, panelRow] of [[input.length, 2, 1, 3], [10, 0, 13, 1], [20, 1, 0, 2], [21, 1, 2, 2]]) {
+    const { terminal, screen } = createTerminal(t, 24, 18);
+    terminal.inputState.insertText(input);
+    terminal.inputState.cursorPosition = cursor;
+    const entry = { ...item("candidate"), snapshotInput: input, snapshotCursor: cursor };
+    terminal.inlineCompletion.set([entry], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    const buffer = screen.buffer.active;
+    const before = Array.from({ length: 8 }, (_, i) => buffer.getLine(i).translateToString(true));
+    assert.equal(terminal.renderer.renderedLineCount, 7);
+    assert.equal(terminal.renderer.suggestionStartRow, panelRow);
+    assert.ok(before[panelRow].includes("╭"));
+    assert.deepEqual([buffer.cursorY, buffer.cursorX], [row, col]);
+    terminal.renderInput();
+    assert.deepEqual(Array.from({ length: 8 }, (_, i) => buffer.getLine(i).translateToString(true)), before);
+    assert.deepEqual([buffer.cursorY, buffer.cursorX], [row, col]);
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row: panelRow + 2, col: 4 });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row: panelRow + 2, col: 4 });
+    assert.equal(terminal.accepted, entry);
+    assert.equal(terminal.renderer.renderedLineCount, 3);
+    assert.deepEqual([buffer.cursorY, buffer.cursorX], [row, col]);
+    screen.reset();
+    terminal.renderer.renderFreshWithCursor([input], 0, cursor, 24, [0], ["main"]);
+    assert.equal(terminal.renderer.renderedLineCount, 3);
+    assert.deepEqual([buffer.cursorY, buffer.cursorX], [row, col]);
+  }
+});
+
+test("windowed clipping preserves supplementary characters and mixed Unicode cell widths", () => {
+  const { buildWindowedRenderPlan } = loadSource("src/Terminal/inputViewport.ts");
+  const width = text => [...text].reduce((sum, char) => sum + unicode.wcwidth(char.codePointAt(0)), 0);
+  for (const text of ["𠀀".repeat(30), "漢".repeat(20) + "e\u0301".repeat(20)]) {
+    assert.equal(width(text), text.length);
+    for (const columns of [24, 25]) {
+      for (const cursor of [2, 30, text.length]) {
+        const plan = buildWindowedRenderPlan([text], 0, cursor, 1, columns, 3, 3, width);
+        assert.ok(width(plan.lines[0]) <= columns - 3);
+        assert.ok(plan.lines[0].isWellFormed());
+        assert.ok(plan.cursorCol <= plan.lines[0].length);
+      }
+    }
+  }
+});
+
+test("splitting a highlighted token preserves its style below the completion panel", t => {
+  const { terminal, screen } = createTerminal(t, 24, 16);
+  const { Renderer } = loadSource("src/Terminal/renderer.ts");
+  const { ConsoleSyntax } = loadSource("src/Terminal/consoleSyntax.ts", {
+    "./syntaxTheme": { SyntaxTheme: class {
+      resolveDefaultForegroundAnsi() { return "\x1b[37m"; }
+      resolveSemanticTokenToAnsi() { return "\x1b[32m"; }
+      resolveBracketPairAnsi() { return "\x1b[33m"; }
+    } },
+  });
+  terminal.syntax = new ConsoleSyntax(() => {});
+  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text), terminal.syntax);
+  terminal.inputState.insertText("variable_" + "x".repeat(48));
+  terminal.inputState.cursorPosition = 4;
+  terminal.inlineCompletion.set([item("candidate")], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  const prefix = buffer.getLine(0).getCell(3);
+  const suffix = buffer.getLine(5).getCell(0);
+  assert.equal(suffix.getChars(), "x");
+  assert.equal(prefix.getFgColor(), 2);
+  assert.equal(suffix.getFgColorMode(), prefix.getFgColorMode());
+  assert.equal(suffix.getFgColor(), prefix.getFgColor());
 });

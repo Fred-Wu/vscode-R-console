@@ -1,4 +1,5 @@
 import { ANSI } from "./ansi";
+import { getWrappedLineLayout } from "./inputViewport";
 
 export interface RendererLineHighlighter {
   highlightLines(lines: string[], sourceLineMap?: Array<number | undefined>): string[];
@@ -45,36 +46,22 @@ export class Renderer {
     this.continuationPromptColor = ANSI.reset;
   }
 
-  private cursorCellPosition(offset: number, columns: number, atEnd: boolean):
-    { row: number; col: number } {
-    const lastCell = offset > 0 && offset % columns === 0 && atEnd;
-    return {
-      row: Math.max(0, Math.floor(offset / columns) - (lastCell ? 1 : 0)),
-      col: lastCell ? columns : offset % columns + 1,
-    };
-  }
-
-  private splitStyledLine(line: string, cells: number): [string, string] {
-    let first = "";
-    let rest = "";
+  private splitStyledLine(line: string, offset: number): [string, string] {
     let count = 0;
     let style = "";
-    for (let i = 0; i < line.length;) {
+    let i = 0;
+    while (i < line.length && count < offset) {
       const sgr = /^\x1b\[[0-9;]*m/.exec(line.slice(i));
       if (sgr) {
-        if (count < cells) first += sgr[0];
-        else rest += sgr[0];
         style = sgr[0] === "\x1b[0m" ? "" : style + sgr[0];
         i += sgr[0].length;
         continue;
       }
       const char = String.fromCodePoint(line.codePointAt(i)!);
-      if (count < cells) first += char;
-      else rest += char;
-      count += this.displayWidth(char);
+      count += char.length;
       i += char.length;
     }
-    return [first, style + rest];
+    return [line.slice(0, i) + ANSI.reset, style + line.slice(i)];
   }
 
   renderWithCursor(
@@ -93,20 +80,16 @@ export class Renderer {
     const continuationLen = this.continuationPromptText?.length ?? 2;
     const promptLen = promptKinds[cursorRow] === "main" ? this.promptLen : continuationLen;
     const sourceLine = lines[cursorRow] ?? "";
-    const caretCells = promptLen + this.displayWidth(sourceLine.slice(0, cursorCol));
-    const lineCells = promptLen + this.displayWidth(sourceLine);
-    const physicalEnd = (Math.floor(caretCells / safeColumns) + 1) * safeColumns;
+    const caret = getWrappedLineLayout(sourceLine, safeColumns, promptLen, this.displayWidth, cursorCol);
     // Split a long logical input line at the end of the caret's physical row.
     // The suffix stays below the panel, while the caret remains in the prefix.
-    const split = suggestions.length > 0 && lineCells > physicalEnd;
-    let splitIndex = -1;
+    const split = suggestions.length > 0 && caret.splitIndex < sourceLine.length;
     let inputLines = input;
     let inputKinds: Array<RenderPromptKind | "none"> = [...promptKinds];
     if (split) {
-      const before = this.splitStyledLine(input[cursorRow] ?? "", physicalEnd - promptLen);
+      const before = this.splitStyledLine(input[cursorRow] ?? "", caret.splitIndex);
       inputLines = [...input.slice(0, cursorRow), before[0], before[1], ...input.slice(cursorRow + 1)];
       inputKinds = [...promptKinds.slice(0, cursorRow + 1), "none", ...promptKinds.slice(cursorRow + 1)];
-      splitIndex = cursorRow;
     }
     const insertAt = Math.min(inputLines.length, cursorRow + 1);
     const highlighted = [
@@ -125,10 +108,8 @@ export class Renderer {
       if (getPromptKind(idx) === "none" && idx < insertAt + suggestions.length) return 1;
       const pLen = getPromptKind(idx) === "none" ? 0 :
         getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
-      const visibleLen =
-        pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
-      if (idx === splitIndex) return Math.max(1, Math.ceil(visibleLen / safeColumns));
-      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+      return getWrappedLineLayout(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""),
+        safeColumns, pLen, this.displayWidth).rows;
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
     const inputRows = lineRows.reduce((sum, n, index) =>
@@ -191,14 +172,10 @@ export class Renderer {
         this.write(prompt + line);
       });
       const prefix = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
-      const promptLen = getPromptKind(cursorRow) === "main" ? this.promptLen : continuationLen;
-      const offset = promptLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
-      const position = this.cursorCellPosition(offset, safeColumns,
-        cursorCol >= (lines[cursorRow]?.length ?? 0));
-      const terminalRow = prefix + position.row;
+      const terminalRow = prefix + caret.cursorRow;
       const delta = Math.max(0, inputRows - 1 - terminalRow);
       if (delta > 0) this.write(`\x1b[${delta}A`);
-      this.write(`\r\x1b[${position.col}G`);
+      this.write(`\r\x1b[${caret.cursorColumn}G`);
       this.cursorRowFromTop = terminalRow;
       return;
     }
@@ -227,15 +204,8 @@ export class Renderer {
     });
 
     const prefixRows = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
-    const pLen =
-      getPromptKind(cursorRow) === "main"
-        ? this.promptLen
-        : continuationLen;
-    const cursorOffset = pLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
-    const position = this.cursorCellPosition(cursorOffset, safeColumns,
-      cursorCol >= (lines[cursorRow]?.length ?? 0));
-    const terminalRow = prefixRows + position.row;
-    const col = position.col;
+    const terminalRow = prefixRows + caret.cursorRow;
+    const col = caret.cursorColumn;
 
     const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
     if (deltaUp > 0) {
@@ -270,9 +240,8 @@ export class Renderer {
         getPromptKind(idx) === "main"
           ? this.promptLen
           : continuationLen;
-      const visibleLen =
-        pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
-      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+      return getWrappedLineLayout(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""),
+        safeColumns, pLen, this.displayWidth).rows;
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
 
@@ -296,11 +265,9 @@ export class Renderer {
       getPromptKind(cursorRow) === "main"
         ? this.promptLen
         : continuationLen;
-    const cursorOffset = pLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
-    const position = this.cursorCellPosition(cursorOffset, safeColumns,
-      cursorCol >= (lines[cursorRow]?.length ?? 0));
-    const terminalRow = prefixRows + position.row;
-    const col = position.col;
+    const caret = getWrappedLineLayout(lines[cursorRow] ?? "", safeColumns, pLen, this.displayWidth, cursorCol);
+    const terminalRow = prefixRows + caret.cursorRow;
+    const col = caret.cursorColumn;
 
     const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
     if (deltaUp > 0) {
