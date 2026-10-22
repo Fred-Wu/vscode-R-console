@@ -204,11 +204,14 @@ export class InlineCompletion {
       choice++;
     }
 
-    // Scroll only when selection leaves the visible viewport.
+    // Include boundary headings/details at the endpoints; otherwise scroll only
+    // when selection leaves the visible viewport.
     const capacity = availableRows - 3;
     const activeRow = rows.findIndex(row => row.choice === this.selected && !row.detail);
     if (activeRow < this.scrollStart) this.scrollStart = activeRow;
     if (activeRow >= this.scrollStart + capacity) this.scrollStart = activeRow - capacity + 1;
+    if (this.selected === 0) this.scrollStart = 0;
+    else if (this.selected === this.choiceIndexes.length - 1) this.scrollStart = rows.length - capacity;
     this.scrollStart = Math.max(0, Math.min(this.scrollStart, Math.max(0, rows.length - capacity)));
     const start = this.scrollStart;
     const body = rows.slice(start, start + capacity);

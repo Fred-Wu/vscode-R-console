@@ -332,6 +332,30 @@ test("scrollbar follows viewport and selection scrolls only at visible edges", (
   assert.ok(!back.includes("entry0"), "moving inside current viewport preserves position");
 });
 
+test("first and last choices reach scrollbar endpoints including headings and details", () => {
+  for (const withDetails of [false, true]) {
+    const state = new InlineCompletion();
+    const count = withDetails ? 6 : 10;
+    state.set([
+      { label: "Functions" },
+      ...Array.from({ length: count }, (_, i) => ({
+        ...item("entry" + i),
+        detail: withDetails ? "detail" + i : undefined,
+      })),
+    ], state.token);
+    state.lines(60, 13);
+    state.move(count - 1);
+    const bottom = state.lines(60, 13).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    assert.ok(bottom[bottom.length - 3].endsWith("█│"), "thumb reaches the last content row");
+    if (withDetails) assert.ok(bottom.some(line => line.includes("detail5")));
+    state.move(-(count - 1));
+    const top = state.lines(60, 13).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    assert.ok(top[1].includes("Functions"), "returning to the first choice restores its heading");
+    assert.ok(top[1].endsWith("█│"), "thumb reaches the first content row");
+    assert.ok(top.some(line => line.includes("entry0")));
+  }
+});
+
 test("hit-test bounds restrict mouse-wheel navigation to box contents", () => {
   const state = new InlineCompletion();
   state.set([item("one"), item("two")], state.token);
