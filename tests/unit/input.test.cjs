@@ -774,7 +774,9 @@ test("terminal wheel events decode for inline completion scrolling", () => {
     { type: "wheel", dir: "up", col: 12, row: 7 },
     { type: "wheel", dir: "down", col: 12, row: 8 },
   ]);
-  assert.deepEqual(keys.parseInputChunk("\x1b[<0;12;7M"), []);
+  assert.deepEqual(keys.parseInputChunk("\x1b[<0;12;7M"), [
+    { type: "mouse", pressed: true, col: 12, row: 7 },
+  ]);
 });
 
 test("SGR left-click and cursor reports decode without treating other buttons as clicks", () => {
