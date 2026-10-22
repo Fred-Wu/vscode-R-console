@@ -147,6 +147,7 @@ export type PersistedRTerminalState = {
 export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
   private readonly inlineCompletion = new InlineCompletion();
+  private inlineMouseReporting = false;
   private inlineCompletionTimer: ReturnType<typeof setTimeout> | undefined;
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
@@ -1112,6 +1113,13 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.ensureReadyPromptVisibleForInput();
 
+    if (action.type === "wheel") {
+      if (this.inlineCompletion?.visible && action.col <= Math.min(72, this.dimensions.columns - 1)) {
+        this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
+        this.renderInput();
+      }
+      return;
+    }
     if (this.inlineCompletion?.visible) {
       if (action.type === "arrow" && (action.dir === "up" || action.dir === "down")) {
         this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
@@ -2019,11 +2027,18 @@ export class RTerminal implements vscode.Pseudoterminal {
     return vscode.workspace.getConfiguration("r.console").get<"inline" | "quickPick">("completionUI", "quickPick");
   }
 
+  private setInlineMouseReporting(active: boolean): void {
+    if (this.inlineMouseReporting === active) return;
+    this.inlineMouseReporting = active;
+    this.writeEmitter.fire(active ? "\x1b[?1006h\x1b[?1000h" : "\x1b[?1000l\x1b[?1006l");
+  }
+
   private dismissInlineCompletion(redraw = true): void {
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
     this.inlineCompletionTimer = undefined;
     const wasVisible = this.inlineCompletion.visible;
     this.inlineCompletion.clear();
+    this.setInlineMouseReporting(false);
     this.lang.cancelCompletion();
     if (wasVisible && redraw && this.mode === "ready") this.renderInput();
   }
@@ -2060,6 +2075,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       applyCompletion: selection => this.applyCompletion(selection),
       onInlineEntries: items => {
         if (this.mode !== "ready" || !this.inlineCompletion.set(items, token, this.getInputSnapshot().currentLine.slice(0, this.inputState.cursorCol).match(/[A-Za-z._][\w.]*$/)?.[0] ?? "")) return;
+        this.setInlineMouseReporting(this.inlineCompletion.visible);
         this.renderInput();
       },
     });
