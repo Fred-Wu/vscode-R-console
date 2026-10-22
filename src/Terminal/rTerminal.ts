@@ -1165,7 +1165,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     if (action.type === "wheel") {
       if (this.inlineBoxTop !== undefined &&
-          this.inlineCompletion?.contains(action.row - this.inlineBoxTop, action.col)) {
+          (this.inlineCompletion.contains(action.row - this.inlineBoxTop, action.col) ||
+            this.inlineCompletion.isScrollbar(action.row - this.inlineBoxTop, action.col))) {
         this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
         this.renderInput();
       } else {

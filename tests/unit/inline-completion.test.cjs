@@ -629,3 +629,19 @@ test("windowed Unicode input fits its reserved viewport row", t => {
   assert.ok(Array.from({ length: 7 }, (_, i) =>
     buffer.getLine(buffer.baseY + i).translateToString(true)).some(line => line.includes("╭")));
 });
+
+test("wheel over suggestion scrollbar navigates suggestions, not terminal history", t => {
+  const { terminal, scrollCommands } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  terminal.inlineCompletion.set(Array.from({ length: 20 }, (_, i) => item("alpha" + i)),
+    terminal.inlineCompletion.token);
+  terminal.renderInput();
+  assert.ok(terminal.inlineBoxTop !== undefined);
+  const scrollbarCol = terminal.inlineCompletion.renderedLeft +
+    terminal.inlineCompletion.renderedWidth - 1;
+  const row = terminal.inlineBoxTop + 3;
+  assert.ok(terminal.inlineCompletion.isScrollbar(3, scrollbarCol));
+  terminal.applyKeyAction({ type: "wheel", dir: "down", col: scrollbarCol, row });
+  assert.equal(terminal.inlineCompletion.selected, 1);
+  assert.deepEqual(scrollCommands, []);
+});
