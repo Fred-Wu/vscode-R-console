@@ -6,7 +6,7 @@ const ESC = "\x1b[";
 const RESET = ESC + "0m";
 const DIM = ESC + "2m";
 const BORDER = ESC + "90m";
-const SELECTED = ESC + "1m";
+const SELECTED = ESC + "7m"; // terminal-theme foreground/background contrast
 const ICON = /^\$\(symbol-([a-z-]+)\)\s*/;
 const ICON_COLORS: Record<string, number> = {
   variable: 75, field: 75, property: 75, function: 141, method: 141,
@@ -35,10 +35,15 @@ export class InlineCompletion {
   private generation = 0;
   private renderedTargets: Array<number | undefined> = [];
   private renderedWidth = 0;
+  private scrollStart = 0;
 
   get visible(): boolean { return this.choiceIndexes.length > 0; }
   get token(): number { return this.generation; }
   get hasRenderedRows(): boolean { return this.renderedTargets.length > 0; }
+  contains(row: number, col: number): boolean {
+    return Number.isInteger(row) && row > 0 && row < this.renderedTargets.length - 2 &&
+      col > 1 && col < this.renderedWidth;
+  }
 
   invalidate(): number { return ++this.generation; }
 
@@ -49,6 +54,7 @@ export class InlineCompletion {
     this.selected = 0;
     this.renderedTargets = [];
     this.renderedWidth = 0;
+    this.scrollStart = 0;
   }
 
   set(items: CompletionQuickPickItem[], token: number, query = ""): boolean {
@@ -71,6 +77,7 @@ export class InlineCompletion {
     }) : -1;
     this.selected = exact !== undefined && exact >= 0 ? exact :
       matching !== undefined && matching >= 0 ? matching : 0;
+    this.scrollStart = 0;
     return true;
   }
 
@@ -112,12 +119,12 @@ export class InlineCompletion {
 
       const iconKind = ICON.exec(item.label)?.[1];
       const moduleIcon = iconKind === "module";
-      const label = fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 3 : 2));
+      const label = fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 4 : 3));
       const description = clean(item.description ?? "");
       const color = ESC + "38;5;" + (ICON_COLORS[iconKind ?? ""] ?? 245) + "m";
-      const icon = color + (moduleIcon ? "{}" : choice === this.selected ? "◉" : "●") + RESET;
+      const icon = color + (moduleIcon ? "{}" : "●") + RESET;
       const labelWidth = [...label].length;
-      const rest = contentWidth - labelWidth - (moduleIcon ? 3 : 2);
+      const rest = contentWidth - labelWidth - (moduleIcon ? 4 : 3);
       const suffix = description && rest >= [...description].length + 2
         ? " ".repeat(rest - [...description].length) + DIM + description + RESET
         : "";
@@ -131,14 +138,18 @@ export class InlineCompletion {
     // Keep the active completion in view; headers and details share the same row budget.
     const capacity = availableRows - 3; // top border, position footer, bottom border
     const activeRow = rows.findIndex(row => row.choice === this.selected && !row.detail);
-    const start = Math.max(0, Math.min(activeRow - Math.floor(capacity / 2), rows.length - capacity));
+    // Only scroll after the selected row actually leaves the visible viewport.
+    if (activeRow < this.scrollStart) this.scrollStart = activeRow;
+    if (activeRow >= this.scrollStart + capacity) this.scrollStart = activeRow - capacity + 1;
+    this.scrollStart = Math.max(0, Math.min(this.scrollStart, Math.max(0, rows.length - capacity)));
+    const start = this.scrollStart;
     const body = rows.slice(start, start + capacity);
-    const frame = (text: string, isGroup = false, isDetail = false): string => {
+    const frame = (text: string, selected = false, isGroup = false, isDetail = false, bar = " "): string => {
       const plainLength = [...text.replace(/\x1b\[[0-9;]*m/g, "")].length;
-      const padded = text + " ".repeat(Math.max(0, contentWidth - plainLength));
-      const styled = isGroup ? DIM + padded + RESET :
-        isDetail ? DIM + padded + RESET : padded;
-      return BORDER + "│" + RESET + " " + styled + " " + BORDER + "│" + RESET;
+      const padded = text + " ".repeat(Math.max(0, contentWidth - 1 - plainLength));
+      const styled = selected ? SELECTED + padded.replace(/\x1b\[0m/g, SELECTED) + RESET :
+        isGroup || isDetail ? DIM + padded + RESET : padded;
+      return BORDER + "│" + RESET + " " + styled + BORDER + bar + RESET + BORDER + "│" + RESET;
     };
     const border = (left: string, right: string) =>
       BORDER + left + "─".repeat(boxWidth - 2) + right + RESET;
@@ -146,8 +157,12 @@ export class InlineCompletion {
     const output = [border("╭", "╮")];
     this.renderedWidth = boxWidth;
     this.renderedTargets.push(undefined);
-    for (const row of body) {
-      output.push(frame(row.text, row.group, row.detail));
+    const overflow = rows.length > capacity;
+    const thumb = overflow ? Math.max(1, Math.round(capacity * capacity / rows.length)) : 0;
+    const thumbStart = overflow ? Math.round(start * (capacity - thumb) / (rows.length - capacity)) : 0;
+    for (const [index, row] of body.entries()) {
+      const bar = !overflow ? " " : index >= thumbStart && index < thumbStart + thumb ? "█" : "│";
+      output.push(frame(row.text, row.choice === this.selected && !row.detail, row.group, row.detail, bar));
       this.renderedTargets.push(row.choice);
     }
     const first = body.find(row => row.choice !== undefined)?.choice;
