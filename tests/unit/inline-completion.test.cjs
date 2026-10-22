@@ -41,6 +41,8 @@ test("inline completion draws a border, shows picker metadata, and hides codicon
   assert.match(plain, /{base}/);
   assert.doesNotMatch(plain, /\$\(symbol-|> mtcars/);
   assert.match(lines.join(""), /\x1b\[38;5;75m/);
+  assert.doesNotMatch(lines.join(""), /\x1b\[7m/);
+  assert.match(plain, /◉ mtcars/);
   state.move(1);
   assert.equal(state.current().insertText, "$(symbol-function) mean");
 });
@@ -58,6 +60,27 @@ test("inline scrolling follows selected completion and removes unsafe escapes", 
   const plain = state.lines(40, 7).join("");
   assert.equal(plain.includes("bad\x1b[31m"), false);
   assert.deepEqual(state.lines(10, 5), []);
+});
+
+test("invalidation retains panel and preserves selection on updated entries", () => {
+  const state = new InlineCompletion();
+  state.set([item("one"), item("two")], state.token);
+  state.move(1);
+  const old = state.token;
+  const next = state.invalidate();
+  assert.equal(state.visible, true);
+  assert.ok(state.lines(40, 8).some(line => line.includes("two")));
+  assert.equal(state.set([item("stale")], old), false);
+  assert.equal(state.set([item("zero"), item("two")], next), true);
+  assert.equal(state.current().label, "two");
+});
+
+test("module icons use blue braces rather than a yellow dot", () => {
+  const state = new InlineCompletion();
+  state.set([{ ...item("$(symbol-module) stats"), description: "module" }], state.token);
+  const rendered = state.lines(40, 7).join("");
+  assert.match(rendered, /\\x1b\[38;5;75m\{\}/);
+  assert.doesNotMatch(rendered, /\$\(symbol-module\)/);
 });
 
 test("empty completion lists do not reserve terminal rows", () => {
