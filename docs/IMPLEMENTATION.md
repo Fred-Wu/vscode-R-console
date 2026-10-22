@@ -656,7 +656,7 @@ A circular selection indicator replaces reverse-video highlighting, and modules
 use blue `{}` glyphs. Other picker codicons use ANSI-colored terminal glyphs
 because VS Code codicons cannot be rendered directly in a terminal. Arrow and
 Page Up/Down keys navigate results; temporary SGR mouse reporting also permits
-wheel navigation while the panel is visible. Mouse reporting is disabled when
+wheel navigation while the panel is visible. Left mouse press and release on a\nsuggestion (including its detail row) accepts it; group headings and borders\nare non-interactive. Cursor-position reports locate the box for hit testing.\nCompletion labels use normal-weight terminal text and muted descriptions to\napproximate Quick Pick, although a pseudoterminal cannot use a separate UI font.\nMouse reporting is disabled when
 the panel closes. Clearing the command dismisses the panel and invalidates
 outstanding completion requests.
 
