@@ -647,8 +647,10 @@ Inline completion is an alternative frontend selected with
 default and F7 remains available. Inline suggestions use the same completion
 sources and insertion rules, and can be triggered by Tab or while typing via
 `r.console.inlineCompletion.trigger`. The terminal renderer owns the
-temporary suggestion rows, selection and scrolling; they are excluded from
-persisted replay. Keys route to the list only while it is visible and completion
+temporary bordered suggestion rows, group headings, labels, descriptions,
+details, selection and scrolling; they are excluded from persisted replay.
+Picker codicon markup is replaced with ANSI-colored terminal glyphs because
+codicons are not available in the terminal renderer. Keys route to the list only while it is visible and completion
 requests are invalidated after input changes or dismissal.
 
 `RTermLang` owns the console completion flow. It detects the completion
