@@ -791,14 +791,44 @@ test("windowed clipping preserves supplementary characters and mixed Unicode cel
   const width = text => [...text].reduce((sum, char) => sum + unicode.wcwidth(char.codePointAt(0)), 0);
   for (const text of ["𠀀".repeat(30), "漢".repeat(20) + "e\u0301".repeat(20)]) {
     assert.equal(width(text), text.length);
-    for (const columns of [24, 25]) {
+    for (const columns of [24, 25, 26, 27]) {
       for (const cursor of [2, 30, text.length]) {
         const plan = buildWindowedRenderPlan([text], 0, cursor, 1, columns, 3, 3, width);
         assert.ok(width(plan.lines[0]) <= columns - 3);
         assert.ok(plan.lines[0].isWellFormed());
         assert.ok(plan.cursorCol <= plan.lines[0].length);
+        if (cursor === text.length) {
+          assert.ok(plan.lines[0].endsWith(text.slice(-2)), "keep the input tail visible");
+          assert.equal(plan.cursorCol, plan.lines[0].length);
+        }
       }
     }
+  }
+});
+
+test("completion popup keeps the input tail and caret visible while editing clipped wide text", t => {
+  for (const columns of [25, 27]) {
+    const { terminal, screen } = createTerminal(t, columns, 7);
+    const input = "漢".repeat(29) + "終";
+    const entry = { ...item("candidate"), snapshotInput: input, snapshotCursor: input.length };
+    terminal.inputState.insertText(input);
+    terminal.inlineCompletion.set([entry], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    for (const action of [undefined, { type: "text", text: "末" }, { type: "backspace" }]) {
+      if (action) terminal.applyKeyAction(action);
+      const buffer = screen.buffer.active;
+      const line = buffer.getLine(buffer.baseY).translateToString(true);
+      assert.ok(line.endsWith(terminal.inputState.text.at(-1)), line);
+      assert.equal(buffer.cursorY, 0);
+      assert.equal(buffer.cursorX, columns - 1, "caret follows the final wide character");
+      assert.ok(buffer.getLine(buffer.baseY + 1).translateToString(true).includes("╭"));
+      assert.equal(buffer.getLine(buffer.baseY + 1).isWrapped, false);
+      terminal.renderInput();
+      assert.equal(buffer.getLine(buffer.baseY).translateToString(true), line);
+    }
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row: 3, col: 4 });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row: 3, col: 4 });
+    assert.equal(terminal.accepted, entry);
   }
 });
 

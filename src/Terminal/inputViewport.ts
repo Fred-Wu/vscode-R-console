@@ -267,7 +267,8 @@ function clipViewportLine(
   let cells = 0;
   for (const char of line) {
     const size = widthOf(char);
-    if (cells + size > desired) break;
+    // Round forward to a character boundary so the reserved tail still fits.
+    if (cells >= desired && size > 0) break;
     cells += size;
     start += char.length;
   }
