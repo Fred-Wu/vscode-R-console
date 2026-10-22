@@ -60,10 +60,10 @@ export class InlineCompletion {
         entry.insertText === previous.insertText &&
         entry.description === previous.description && entry.detail === previous.detail;
     });
-    const exact = query && this.choiceIndexes.findIndex(index => {
+    const exact = query.length > 0 ? this.choiceIndexes.findIndex(index => {
       const entry = items[index];
       return isChoice(entry) && entry.label.replace(ICON, "").toLowerCase() === query.toLowerCase();
-    });
+    }) : -1;
     this.selected = exact !== undefined && exact >= 0 ? exact :
       matching !== undefined && matching >= 0 ? matching : 0;
     return true;
