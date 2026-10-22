@@ -33,9 +33,12 @@ export class InlineCompletion {
   selected = 0;
   private choiceIndexes: number[] = [];
   private generation = 0;
+  private renderedTargets: Array<number | undefined> = [];
+  private renderedWidth = 0;
 
   get visible(): boolean { return this.choiceIndexes.length > 0; }
   get token(): number { return this.generation; }
+  get hasRenderedRows(): boolean { return this.renderedTargets.length > 0; }
 
   invalidate(): number { return ++this.generation; }
 
@@ -44,6 +47,8 @@ export class InlineCompletion {
     this.items = [];
     this.choiceIndexes = [];
     this.selected = 0;
+    this.renderedTargets = [];
+    this.renderedWidth = 0;
   }
 
   set(items: CompletionQuickPickItem[], token: number, query = ""): boolean {
@@ -81,7 +86,18 @@ export class InlineCompletion {
     return item && isChoice(item) ? item : undefined;
   }
 
+  /** Row is zero-based from the top border; columns use terminal coordinates (1-based). */
+  hitTest(row: number, col: number): CompletionPickItem | undefined {
+    if (col < 2 || col >= this.renderedWidth || !Number.isInteger(row)) return undefined;
+    const choice = this.renderedTargets[row];
+    const index = choice === undefined ? undefined : this.choiceIndexes[choice];
+    const item = index === undefined ? undefined : this.items[index];
+    return item && isChoice(item) ? item : undefined;
+  }
+
   lines(width: number, availableRows: number): string[] {
+    this.renderedTargets = [];
+    this.renderedWidth = 0;
     if (!this.visible || width < 20 || availableRows < 5) return [];
     const boxWidth = Math.min(72, width - 1);
     const contentWidth = boxWidth - 4;
@@ -103,9 +119,9 @@ export class InlineCompletion {
       const labelWidth = [...label].length;
       const rest = contentWidth - labelWidth - (moduleIcon ? 3 : 2);
       const suffix = description && rest >= [...description].length + 2
-        ? " ".repeat(rest - [...description].length) + description
+        ? " ".repeat(rest - [...description].length) + DIM + description + RESET
         : "";
-      rows.push({ text: icon + " " + (choice === this.selected ? SELECTED : "") + label + (choice === this.selected ? RESET : "") + suffix, choice });
+      rows.push({ text: icon + " " + label + suffix, choice });
       if (item.detail) {
         rows.push({ text: "  " + fit(item.detail, contentWidth - 2), choice, detail: true });
       }
@@ -120,7 +136,7 @@ export class InlineCompletion {
     const frame = (text: string, isGroup = false, isDetail = false): string => {
       const plainLength = [...text.replace(/\x1b\[[0-9;]*m/g, "")].length;
       const padded = text + " ".repeat(Math.max(0, contentWidth - plainLength));
-      const styled = isGroup ? SELECTED + padded + RESET :
+      const styled = isGroup ? DIM + padded + RESET :
         isDetail ? DIM + padded + RESET : padded;
       return BORDER + "│" + RESET + " " + styled + " " + BORDER + "│" + RESET;
     };
@@ -128,14 +144,18 @@ export class InlineCompletion {
       BORDER + left + "─".repeat(boxWidth - 2) + right + RESET;
 
     const output = [border("╭", "╮")];
+    this.renderedWidth = boxWidth;
+    this.renderedTargets.push(undefined);
     for (const row of body) {
       output.push(frame(row.text, row.group, row.detail));
+      this.renderedTargets.push(row.choice);
     }
     const first = body.find(row => row.choice !== undefined)?.choice;
     const last = [...body].reverse().find(row => row.choice !== undefined)?.choice;
     const status = first === undefined ? "" : (first + 1) + "–" + (last! + 1) + " of " + this.choiceIndexes.length;
     output.push(frame(DIM + fit(status, contentWidth) + RESET));
     output.push(border("╰", "╯"));
+    this.renderedTargets.push(undefined, undefined);
     return output;
   }
 }
