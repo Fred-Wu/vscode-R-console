@@ -107,6 +107,7 @@ test("unchanged inline suggestions are not repainted for a same-row input edit",
 
 test("clearing the last typed character dismisses suggestions and blocks stale results", () => {
   const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    "./rTerminal/lang": {},
     vscode: { workspace: { getConfiguration: () => ({ get: (key) =>
       key === "completionUI" ? "inline" : "typing" }) } },
   });
@@ -130,6 +131,7 @@ test("clearing the last typed character dismisses suggestions and blocks stale r
 
 test("whitespace-only input also dismisses pending inline suggestions", () => {
   const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    "./rTerminal/lang": {},
     vscode: { workspace: { getConfiguration: () => ({ get: () => "inline" }) } },
   });
   const { InputState } = loadSource("src/Terminal/inputState.ts");
