@@ -88,3 +88,19 @@ test("empty completion lists do not reserve terminal rows", () => {
   assert.deepEqual(state.lines(80, 20), []);
   assert.equal(state.current(), undefined);
 });
+
+test("unchanged inline suggestions are not repainted for a same-row input edit", () => {
+  const { Renderer } = loadSource("src/Terminal/renderer.ts");
+  let writes = [];
+  const renderer = new Renderer(text => writes.push(text));
+  renderer.renderWithCursor(["a"], 0, 1, 80, [0], ["main"], ["╭───╮", "│ ● │", "╰───╯"]);
+  writes = [];
+  renderer.renderWithCursor(["ab"], 0, 2, 80, [0], ["main"], ["╭───╮", "│ ● │", "╰───╯"]);
+  const output = writes.join("");
+  assert.ok(output.includes("ab"));
+  assert.ok(!output.includes("╭───╮"), "stable suggestions must not be repainted");
+  assert.ok(!output.includes("●"), "stable choice rows must not be repainted");
+  writes = [];
+  renderer.renderWithCursor(["ab"], 0, 2, 80, [0], ["main"], ["╭───╮", "│ ◉ │", "╰───╯"]);
+  assert.ok(writes.join("").includes("◉"), "changed selection must repaint");
+});
