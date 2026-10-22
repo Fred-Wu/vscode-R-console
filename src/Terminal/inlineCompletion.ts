@@ -21,9 +21,35 @@ const ICON_COLORS: Record<string, number> = {
   keyword: 176, operator: 176, snippet: 110, text: 245,
 };
 const DEFAULT_COLORS: InlineCompletionColors = {
-  matchForeground: ESC + "94m",
-  selectedBackground: ESC + "48;2;58;74;93m",
+  matchForeground: ESC + "38;2;79;193;255m",
+  selectedBackground: ESC + "48;2;38;79;120m",
 };
+
+/** The terminal API cannot resolve VS Code ThemeColor values. Respect explicit
+ * workbench overrides, otherwise use contrasting terminal-safe light/dark colors. */
+export function resolveInlineCompletionColors(
+  isLight: boolean,
+  overrides: Record<string, unknown> = {}
+): InlineCompletionColors {
+  const foreground = parseHexColor(overrides["editorSuggestWidget.highlightForeground"]) ??
+    (isLight ? [0, 91, 175] : [79, 193, 255]);
+  const background = parseHexColor(overrides["editorSuggestWidget.selectedBackground"]) ??
+    (isLight ? [208, 225, 245] : [38, 79, 120]);
+  return {
+    matchForeground: ESC + "38;2;" + foreground.join(";") + "m",
+    selectedBackground: ESC + "48;2;" + background.join(";") + "m",
+  };
+}
+
+function parseHexColor(value: unknown): number[] | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value);
+  if (!match) return undefined;
+  const hex = match[1].length === 3
+    ? [...match[1]].map(character => character + character).join("")
+    : match[1];
+  return [0, 2, 4].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
+}
 
 function clean(value: string): string {
   return value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
