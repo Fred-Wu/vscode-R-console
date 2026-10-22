@@ -1186,9 +1186,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       }
       if (action.type === "escape") {
         this.dismissInlineCompletion();
-        this.renderInput();
         return;
       }
+    }
+    if (this.inlineCompletion) {
       if (action.type === "text" || action.type === "backspace" || action.type === "delete") {
         this.inlineCompletion.invalidate();
       } else {
@@ -2116,7 +2117,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       applyCompletion: selection => this.applyCompletion(selection),
       onInlineEntries: items => {
         if (this.mode !== "ready" || !this.inlineCompletion.set(items, token, this.getInputSnapshot().currentLine.slice(0, this.inputState.cursorCol).match(/[A-Za-z._][\w.]*$/)?.[0] ?? "")) return;
-        this.setInlineMouseReporting(this.inlineCompletion.visible);
         this.renderInput();
       },
     });
@@ -2670,7 +2670,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private renderInput(): void {
     this.lang.updateInput(this.inputState.text);
-    const plan = this.buildCurrentInputRenderPlan();
+    let plan = this.buildCurrentInputRenderPlan();
     const columns = Math.max(1, this.dimensions.columns);
     const promptLength = plan.promptKinds[plan.cursorRow] === "main"
       ? this.renderer.promptLen
@@ -2683,10 +2683,26 @@ export class RTerminal implements vscode.Pseudoterminal {
       .get<Record<string, unknown>>("colorCustomizations", {});
     const inputPrefix = this.inputState.currentLine.slice(0, this.inputState.cursorCol);
     this.inlineCompletion.setQuery(/[A-Za-z._][\w.]*$/.exec(inputPrefix)?.[0] ?? "");
-    const suggestions = this.mode === "ready" ? this.inlineCompletion.lines(
-      columns, Math.min(13, Math.max(5, this.dimensions.rows - 5)), anchorColumn,
-      resolveInlineCompletionColors(isLight, overrides)
+    const availableRows = Math.min(13, this.dimensions.rows - 2);
+    const colors = resolveInlineCompletionColors(isLight, overrides);
+    let suggestions = this.mode === "ready" ? this.inlineCompletion.lines(
+      columns, availableRows, anchorColumn,
+      colors
     ) : [];
+    if (plan.renderedRowCount + suggestions.length >= this.dimensions.rows && suggestions.length > 0) {
+      plan = this.buildCurrentInputRenderPlan(suggestions.length);
+      const windowPromptLength = plan.promptKinds[plan.cursorRow] === "main"
+        ? this.renderer.promptLen
+        : (this.renderer.continuationPromptText?.length ?? 2);
+      const windowAnchorColumn = (Math.max(0, windowPromptLength + plan.cursorCol - 1) % columns) + 1;
+      if (windowAnchorColumn !== anchorColumn) {
+        suggestions = this.inlineCompletion.lines(columns, availableRows, windowAnchorColumn, colors);
+      }
+    }
+    if (this.inlineCompletion.visible && suggestions.length === 0) {
+      this.dismissInlineCompletion(false);
+    }
+    this.setInlineMouseReporting(suggestions.length > 0);
     const previousRows = this.inlineSuggestionRowCount;
     this.inlineSuggestionRowCount = suggestions.length;
     if (previousRows !== suggestions.length) this.inlineBoxTop = undefined;
@@ -2705,12 +2721,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     });
   }
 
-  private buildCurrentInputRenderPlan(): InputRenderPlan {
+  private buildCurrentInputRenderPlan(reservedRows = 0): InputRenderPlan {
     this.syntax.setSource(this.inputState.lines);
     return buildInputRenderPlan({
       renderer: this.renderer,
       inputState: this.inputState,
-      dimensions: this.dimensions,
+      dimensions: { columns: this.dimensions.columns, rows: this.dimensions.rows - reservedRows },
       historyBrowsing: this.historyBrowsing,
       historyCollapsed: this.historyCollapsed,
     });

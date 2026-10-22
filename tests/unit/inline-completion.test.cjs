@@ -5,6 +5,146 @@ const { InlineCompletion } = loadSource("src/Terminal/inlineCompletion.ts");
 
 const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInput: "", snapshotCursor: 0, source: "session" });
 
+function createTerminal(t, columns = 80, rows = 24) {
+  const { Terminal } = require("@xterm/headless");
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const { Renderer } = loadSource("src/Terminal/renderer.ts");
+  const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    "./rTerminal/lang": {},
+    vscode: {
+      EventEmitter: class {}, window: {},
+      workspace: { getConfiguration: () => ({ get: (key, fallback) =>
+        key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? "typing" : fallback }) },
+    },
+  });
+  const screen = new Terminal({ cols: columns, rows, allowProposedApi: true });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    inputState: new InputState(), inlineCompletion: new InlineCompletion(),
+    mode: "ready", promptReady: true, dimensions: { columns, rows },
+    inlineSuggestionRowCount: 0,
+    lang: { cancelCompletion() {}, updateInput() {} },
+    syntax: { setSource() {} },
+    writeEmitter: { fire(text) { screen._core._writeBuffer.writeSync(text); } },
+    ensureReadyPromptVisibleForInput() {},
+    withTerminalStateCaptureSuppressed(callback) { callback(); },
+    applyCompletion(selection) { this.accepted = selection; },
+    handleEnterKey() { this.submitted = this.inputState.text; },
+  });
+  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text));
+  terminal.renderer.setContinuationPrompt("   ");
+  const keys = new KeyProcessor();
+  screen.onData(data => {
+    for (const action of keys.parseInputChunk(data)) terminal.applyKeyAction(action);
+  });
+  t.after(() => {
+    terminal.dismissInlineCompletion(false);
+    screen.dispose();
+  });
+  return { terminal, screen };
+}
+
+test("multiline input and suggestions share the viewport across redraw and dismissal", t => {
+  const { terminal, screen } = createTerminal(t, 80, 12);
+  const input = Array.from({ length: 10 }, (_, i) => i === 9 ? "mea" : "x <- " + i).join("\n");
+  terminal.inputState.insertText(input);
+  terminal.inlineCompletion.set(Array.from({ length: 20 }, (_, i) => item("mean" + i)), terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  const before = Array.from({ length: 12 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true));
+  assert.ok(before.some(line => line.includes("╭")));
+  assert.ok(before.some(line => line.includes("╰")));
+  assert.match(buffer.getLine(buffer.baseY + buffer.cursorY).translateToString(true), /mea$/);
+  assert.ok(terminal.renderer.renderedLineCount <= 12);
+  const baseY = buffer.baseY;
+  terminal.renderInput();
+  assert.equal(buffer.baseY, baseY, "redrawing must not push the panel into scrollback");
+  assert.deepEqual(Array.from({ length: 12 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true)), before);
+  terminal.applyKeyAction({ type: "escape" });
+  assert.equal(terminal.inputState.text, input);
+  assert.ok(!Array.from({ length: 12 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true)).join("\n").includes("│"));
+});
+
+test("clicking the visible suggestion still works after the panel shrinks", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const choices = Array.from({ length: 20 }, (_, i) => ({ ...item("alpha" + i), snapshotInput: "a", snapshotCursor: 1 }));
+  terminal.inlineCompletion.set(choices, terminal.inlineCompletion.token);
+  terminal.renderInput();
+  terminal.inlineCompletion.set([choices[0]], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  const row = Array.from({ length: 24 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true)).findIndex(line => line.includes("alpha0")) + 1;
+  assert.ok(row > 0);
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: 8 });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: 8 });
+  assert.equal(terminal.accepted, choices[0]);
+});
+
+test("a panel that cannot fit releases Enter and mouse reporting", t => {
+  for (const [columns, rows] of [[19, 24], [80, 5]]) {
+    const { terminal } = createTerminal(t, columns, rows);
+    terminal.inputState.insertText("mea");
+    terminal.inlineCompletion.set([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    assert.equal(terminal.inlineCompletion.visible, false);
+    assert.equal(Boolean(terminal.inlineMouseReporting), false);
+    terminal.applyKeyAction({ type: "enter" });
+    assert.equal(terminal.accepted, undefined);
+    assert.equal(terminal.submitted, "mea");
+  }
+});
+
+test("Escape cancels both delayed results and the typing debounce before a panel appears", async t => {
+  const { terminal } = createTerminal(t);
+  terminal.inputState.insertText("mea");
+  let publish;
+  let requests = 0;
+  terminal.lang.handleAutocomplete = async ({ onInlineEntries }) => {
+    requests++;
+    publish = onInlineEntries;
+  };
+  terminal.requestInlineCompletion(true);
+  terminal.applyKeyAction({ type: "escape" });
+  publish([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }]);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  terminal.escPendingClear = false;
+  terminal.scheduleInlineCompletion();
+  terminal.applyKeyAction({ type: "escape" });
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.equal(requests, 1);
+  assert.equal(terminal.inputState.text, "mea");
+});
+
+test("typing publishes an empty list when matches or the completion context disappear", async () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Field: 4, Variable: 5, Function: 2 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions: async () => [] });
+  lang.ensureConsoleLspStarted = async () => undefined;
+  lang.getOrOpenCompletionDocument = async () => undefined;
+  const panel = new InlineCompletion();
+  for (const text of ["df$a", "df$az", "df$a", "# comment"]) {
+    const input = { text, currentLine: text, cursorCol: text.length, cursorRow: 0, lines: [text], textBeforeCursor: text };
+    const token = panel.invalidate();
+    await lang.handleAutocomplete({
+      input, getCurrentInput: () => input,
+      getWorkspaceData: () => ({ globalenv: { df: { names: ["alpha"] } } }),
+      applyCompletion() {},
+      onInlineEntries(items) { panel.set(items, token); },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(panel.visible, text === "df$a", text);
+  }
+});
+
 test("inline completion navigates, clamps and accepts selected item", () => {
   const state = new InlineCompletion();
   assert.ok(state.set(["apple", "apricot", "avocado"].map(item), state.token));

@@ -84,6 +84,7 @@ export class RTermLang {
     if (this.disposed) {
       return;
     }
+    const requestId = ++this.completionRequestId;
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -98,10 +99,10 @@ export class RTermLang {
         }
       : undefined);
     if (!context) {
+      onInlineEntries?.([]);
       return;
     }
 
-    const requestId = ++this.completionRequestId;
     {
       const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
       const workspaceDataRequest = shouldRequestWorkspaceData
@@ -191,7 +192,7 @@ export class RTermLang {
       }
 
       if (!entries || entries.length === 0) {
-        if (!force) {
+        if (!force && !onInlineEntries) {
           return;
         }
       }

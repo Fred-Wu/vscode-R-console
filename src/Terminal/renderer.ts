@@ -173,6 +173,7 @@ export class Renderer {
     }
     this.write(`\r\x1b[${col}G`);
 
+    this.renderedLineCount = totalRows;
     this.cursorRowFromTop = terminalRow;
   }
 
