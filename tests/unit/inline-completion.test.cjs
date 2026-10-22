@@ -230,14 +230,13 @@ test("typed matches use theme foreground, selected text has a continuous backgro
   state.set([{ label: "Functions" }, { ...item("$(symbol-function) library"), description: "base" }], state.token, "lib");
   const lines = state.lines(80, 8, 4, colors);
   const heading = lines.find(line => line.includes("Functions"));
-  const selected = lines.find(line => line.includes("library"));
+  const selected = lines.find(line => line.includes("rary"));
   assert.ok(heading && !heading.includes("\x1b[48;2;"), "group headers have no separate background");
   assert.ok(selected);
   assert.ok(selected.includes("\x1b[38;2;19;121;189mlib\x1b[39mrary"));
   assert.ok(selected.indexOf(colors.selectedBackground) < selected.indexOf("●"),
     "selection background must start before icon and text");
-  assert.ok(selected.indexOf("\x1b[49m") > selected.indexOf("library") ||
-    selected.indexOf("\x1b[49m") > selected.indexOf("rary"),
+  assert.ok(selected.indexOf("\x1b[49m") > selected.indexOf("rary"),
     "selection background must extend behind all text");
   assert.ok(!selected.includes("\x1b[7m"), "do not invert icon or matched foreground");
 });
