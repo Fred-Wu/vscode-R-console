@@ -615,3 +615,17 @@ test("multiline suggestions appear below the active caret line and accept clicks
   terminal.applyKeyAction({ type: "mouse", pressed: false, row: suggestionRow, col: 14 });
   assert.equal(terminal.accepted, entry);
 });
+
+test("windowed Unicode input fits its reserved viewport row", t => {
+  const { terminal, screen } = createTerminal(t, 24, 7);
+  terminal.renderer.displayWidth = text => [...text].reduce((sum, char) =>
+    sum + unicode.wcwidth(char.codePointAt(0)), 0);
+  terminal.inputState.insertText("漢".repeat(30));
+  terminal.inlineCompletion.set([item("candidate")], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  assert.ok(terminal.renderer.renderedLineCount <= 7);
+  const buffer = screen.buffer.active;
+  assert.equal(buffer.getLine(buffer.baseY).isWrapped, false);
+  assert.ok(Array.from({ length: 7 }, (_, i) =>
+    buffer.getLine(buffer.baseY + i).translateToString(true)).some(line => line.includes("╭")));
+});

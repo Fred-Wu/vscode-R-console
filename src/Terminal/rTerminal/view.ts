@@ -216,7 +216,8 @@ function buildWindowedInputRenderPlan({
     Math.max(1, dimensions.rows - 1),
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   return plan;
@@ -236,7 +237,8 @@ function buildCollapsedInputRenderPlan({
     Math.max(1, dimensions.rows - 1),
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   if (!plan) {
