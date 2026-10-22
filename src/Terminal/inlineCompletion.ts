@@ -46,7 +46,7 @@ export class InlineCompletion {
     this.selected = 0;
   }
 
-  set(items: CompletionQuickPickItem[], token: number): boolean {
+  set(items: CompletionQuickPickItem[], token: number, query = ""): boolean {
     if (token !== this.generation) return false;
     const previous = this.current();
     this.items = items;
@@ -60,7 +60,12 @@ export class InlineCompletion {
         entry.insertText === previous.insertText &&
         entry.description === previous.description && entry.detail === previous.detail;
     });
-    this.selected = matching !== undefined && matching >= 0 ? matching : 0;
+    const exact = query && this.choiceIndexes.findIndex(index => {
+      const entry = items[index];
+      return isChoice(entry) && entry.label.replace(ICON, "").toLowerCase() === query.toLowerCase();
+    });
+    this.selected = exact !== undefined && exact >= 0 ? exact :
+      matching !== undefined && matching >= 0 ? matching : 0;
     return true;
   }
 
