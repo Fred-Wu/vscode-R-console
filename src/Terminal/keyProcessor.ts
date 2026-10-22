@@ -11,6 +11,7 @@ export type KeyAction =
   | { type: "backtab" }
   | { type: "completion" }
   | { type: "page"; dir: "up" | "down" }
+  | { type: "wheel"; dir: "up" | "down"; col: number; row: number }
   | { type: "history" }
   | { type: "escape" }
   | { type: "ctrl_c" }
@@ -158,6 +159,12 @@ export class KeyProcessor {
           }
 
           const sequence = parsed.sequence!;
+          const mouse = /^\x1b\[<(64|65);(\d+);(\d+)M$/.exec(sequence);
+          if (mouse) {
+            actions.push({ type: "wheel", dir: mouse[1] === "64" ? "up" : "down", col: Number(mouse[2]), row: Number(mouse[3]) });
+            i += sequence.length;
+            continue;
+          }
           const action = getCsiAction(sequence);
           if (action) {
             if (action.type === "paste-start") this.inPaste = true;
