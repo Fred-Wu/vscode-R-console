@@ -16,6 +16,8 @@ export class Renderer {
   continuationPromptColor = ANSI.reset;
   private readonly write: (text: string) => void;
   private lineHighlighter: RendererLineHighlighter | undefined;
+  private lastSuggestions: string[] = [];
+  private lastInputRows = 0;
 
   constructor(write: (text: string) => void, lineHighlighter?: RendererLineHighlighter) {
     this.write = write;
@@ -65,6 +67,14 @@ export class Renderer {
       return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
+    const inputRows = lineRows.slice(0, lines.length).reduce((sum, n) => sum + n, 0);
+    const sameSuggestions = suggestions.length > 0 &&
+      suggestions.length === this.lastSuggestions.length &&
+      suggestions.every((line, index) => line === this.lastSuggestions[index]);
+    const repaintInputOnly = sameSuggestions && inputRows === this.lastInputRows &&
+      totalRows === this.renderedLineCount;
+    this.lastSuggestions = [...suggestions];
+    this.lastInputRows = inputRows;
     const previousRows = this.renderedLineCount;
     const clearRenderedArea = (rowCount: number): void => {
       for (let i = 0; i < rowCount; i++) {
@@ -92,6 +102,37 @@ export class Renderer {
       this.cursorRowFromTop = this.renderedLineCount - 1;
     }
     const areaRows = this.renderedLineCount;
+
+    // A changed command does not need to repaint a stable suggestion panel.
+    // Cursor movements and changed suggestions still use the standard redraw.
+    if (repaintInputOnly) {
+      this.write("\r");
+      if (this.cursorRowFromTop > 0) this.write(`\x1b[${this.cursorRowFromTop}A`);
+      for (let row = 0; row < inputRows; row++) {
+        this.write("\x1b[2K");
+        if (row < inputRows - 1) this.write("\x1b[1B\r");
+      }
+      if (inputRows > 1) this.write(`\x1b[${inputRows - 1}A\r`);
+      highlighted.slice(0, lines.length).forEach((line, idx) => {
+        if (idx > 0) this.write("\r\n");
+        const promptKind = getPromptKind(idx);
+        const prompt = promptKind === "main"
+          ? `${ANSI.reset}${this.promptColor}${this.promptText}${ANSI.reset}`
+          : (this.continuationPromptText === null
+              ? " ".repeat(continuationPad)
+              : `${ANSI.reset}${this.continuationPromptColor}${this.continuationPromptText}${ANSI.reset}`);
+        this.write(prompt + line);
+      });
+      const prefix = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
+      const promptLen = getPromptKind(cursorRow) === "main" ? this.promptLen : continuationLen;
+      const offset = promptLen + cursorCol;
+      const terminalRow = prefix + (offset > 0 ? Math.floor(offset / safeColumns) : 0);
+      const delta = Math.max(0, inputRows - 1 - terminalRow);
+      if (delta > 0) this.write(`\x1b[${delta}A`);
+      this.write(`\r\x1b[${(offset % safeColumns) + 1}G`);
+      this.cursorRowFromTop = terminalRow;
+      return;
+    }
 
     this.write("\r");
     if (this.cursorRowFromTop > 0) {
