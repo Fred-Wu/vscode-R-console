@@ -80,7 +80,7 @@ export class Renderer {
         getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
       const visibleLen =
         pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
-      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+      return Math.max(1, Math.floor(visibleLen / safeColumns) + 1);
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
     const inputRows = lineRows.reduce((sum, n, index) =>
@@ -221,7 +221,7 @@ export class Renderer {
           : continuationLen;
       const visibleLen =
         pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
-      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+      return Math.max(1, Math.floor(visibleLen / safeColumns) + 1);
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
 

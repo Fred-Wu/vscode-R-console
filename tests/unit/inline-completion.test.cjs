@@ -645,3 +645,20 @@ test("wheel over suggestion scrollbar navigates suggestions, not terminal histor
   assert.equal(terminal.inlineCompletion.selected, 1);
   assert.deepEqual(scrollCommands, []);
 });
+
+test("exact-width input reserves cursor wrap row before suggestions", t => {
+  const { terminal, screen } = createTerminal(t, 20, 16);
+  const input = "x".repeat(17); // 3-cell main prompt + 17 = 20 physical cells
+  terminal.inputState.insertText(input);
+  terminal.inlineCompletion.set([{ ...item("xfield"), snapshotInput: input, snapshotCursor: 17 }],
+    terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  assert.equal(terminal.renderer.suggestionStartRow, 2);
+  assert.ok(buffer.getLine(buffer.baseY + 2).translateToString(true).includes("╭"));
+  assert.equal(terminal.renderer.cursorRowFromTop, 1);
+  terminal.applyKeyAction({ type: "escape" });
+  assert.equal(terminal.inputState.text, input);
+  assert.ok(!Array.from({ length: 6 }, (_, i) =>
+    buffer.getLine(buffer.baseY + i).translateToString(true)).join("").includes("╭"));
+});
