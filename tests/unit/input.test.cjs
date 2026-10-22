@@ -776,3 +776,13 @@ test("terminal wheel events decode for inline completion scrolling", () => {
   ]);
   assert.deepEqual(keys.parseInputChunk("\x1b[<0;12;7M"), []);
 });
+
+test("SGR left-click and cursor reports decode without treating other buttons as clicks", () => {
+  const keys = new KeyProcessor();
+  assert.deepEqual(keys.parseInputChunk("\x1b[<0;9;12M\x1b[<0;9;12m\x1b[15;4R"), [
+    { type: "mouse", pressed: true, col: 9, row: 12 },
+    { type: "mouse", pressed: false, col: 9, row: 12 },
+    { type: "cursor-report", row: 15, col: 4 },
+  ]);
+  assert.deepEqual(keys.parseInputChunk("\x1b[<2;9;12M"), []);
+});
