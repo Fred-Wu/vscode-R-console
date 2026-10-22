@@ -12,6 +12,8 @@ export type KeyAction =
   | { type: "completion" }
   | { type: "page"; dir: "up" | "down" }
   | { type: "wheel"; dir: "up" | "down"; col: number; row: number }
+  | { type: "mouse"; pressed: boolean; col: number; row: number }
+  | { type: "cursor-report"; col: number; row: number }
   | { type: "history" }
   | { type: "escape" }
   | { type: "ctrl_c" }
@@ -159,6 +161,18 @@ export class KeyProcessor {
           }
 
           const sequence = parsed.sequence!;
+          const position = /^\x1b\[(\d+);(\d+)R$/.exec(sequence);
+          if (position) {
+            actions.push({ type: "cursor-report", row: Number(position[1]), col: Number(position[2]) });
+            i += sequence.length;
+            continue;
+          }
+          const click = /^\x1b\[<0;(\d+);(\d+)(M|m)$/.exec(sequence);
+          if (click) {
+            actions.push({ type: "mouse", pressed: click[3] === "M", col: Number(click[1]), row: Number(click[2]) });
+            i += sequence.length;
+            continue;
+          }
           const mouse = /^\x1b\[<(64|65);(\d+);(\d+)M$/.exec(sequence);
           if (mouse) {
             actions.push({ type: "wheel", dir: mouse[1] === "64" ? "up" : "down", col: Number(mouse[2]), row: Number(mouse[3]) });
