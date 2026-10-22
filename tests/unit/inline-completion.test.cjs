@@ -104,3 +104,43 @@ test("unchanged inline suggestions are not repainted for a same-row input edit",
   renderer.renderWithCursor(["ab"], 0, 2, 80, [0], ["main"], ["╭───╮", "│ ◉ │", "╰───╯"]);
   assert.ok(writes.join("").includes("◉"), "changed selection must repaint");
 });
+
+test("clearing the last typed character dismisses suggestions and blocks stale results", () => {
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { workspace: { getConfiguration: () => ({ get: (key) =>
+      key === "completionUI" ? "inline" : "typing" }) } },
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    inputState: new InputState(), mode: "ready", promptReady: true,
+    inlineCompletion: new InlineCompletion(),
+    lang: { cancelCompletion() {} },
+    renderInput() {},
+  });
+  terminal.inputState.insertText("l");
+  terminal.inlineCompletion.set([item("library")], terminal.inlineCompletion.token);
+  const pending = terminal.inlineCompletion.token;
+  terminal.inputState.deleteBeforeCursor();
+  terminal.scheduleInlineCompletion();
+  assert.equal(terminal.inputState.text, "");
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(terminal.inlineCompletion.set([item("library")], pending), false);
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+});
+
+test("whitespace-only input also dismisses pending inline suggestions", () => {
+  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+    vscode: { workspace: { getConfiguration: () => ({ get: () => "inline" }) } },
+  });
+  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    inputState: new InputState(), mode: "ready", promptReady: true,
+    inlineCompletion: new InlineCompletion(),
+    lang: { cancelCompletion() {} },
+    renderInput() {},
+  });
+  terminal.inputState.insertText("   ");
+  terminal.inlineCompletion.set([item("library")], terminal.inlineCompletion.token);
+  terminal.requestInlineCompletion(true);
+  assert.equal(terminal.inlineCompletion.visible, false);
+});
