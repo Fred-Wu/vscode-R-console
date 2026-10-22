@@ -643,15 +643,22 @@ Implementation files:
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
 
 Inline completion is an alternative frontend selected with
-`r.console.completionUI = "inline"`; the existing Quick Pick remains the
-default; F7 and the Quick Pick are disabled while inline mode is selected. Inline suggestions use the same completion
-sources and insertion rules, and can be triggered by Tab or while typing via
-`r.console.inlineCompletion.trigger`. The terminal renderer owns the
-temporary bordered suggestion rows, group headings, labels, descriptions,
-details, selection and scrolling; they are excluded from persisted replay.
-The panel remains displayed while typing, with asynchronous results replacing its entries\nafter they arrive rather than clearing and reopening it. Selected items use a\ncircular indicator instead of reverse-video highlighting, and modules use blue\n`{}` glyphs. Picker codicon markup is replaced with ANSI-colored terminal glyphs because
-codicons are not available in the terminal renderer. Keys route to the list only while it is visible and completion
-requests are invalidated after input changes or dismissal.
+`r.console.completionUI = "inline"`. Quick Pick remains the default, but
+Quick Pick and F7 are disabled in inline mode. Both frontends use the same
+completion sources, typed-query filtering, exact-match-first ranking, grouping
+and insertion rules. Inline completions can be triggered by Tab or while
+typing through `r.console.inlineCompletion.trigger`.
+
+The terminal renderer displays a bordered, transient list of group headings,
+labels, descriptions and details, excluded from persistent replay. It keeps
+the panel in place while typing and updates it when asynchronous results arrive.
+A circular selection indicator replaces reverse-video highlighting, and modules
+use blue `{}` glyphs. Other picker codicons use ANSI-colored terminal glyphs
+because VS Code codicons cannot be rendered directly in a terminal. Arrow and
+Page Up/Down keys navigate results; temporary SGR mouse reporting also permits
+wheel navigation while the panel is visible. Mouse reporting is disabled when
+the panel closes. Clearing the command dismisses the panel and invalidates
+outstanding completion requests.
 
 `RTermLang` owns the console completion flow. It detects the completion
 context, builds fast runtime suggestions from cached session data and the
