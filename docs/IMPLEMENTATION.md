@@ -646,8 +646,10 @@ Inline completion is the terminal completion frontend selected with
 `r.console.completionUI = "inline"`; the default `quickPick` mode uses the
 VS Code picker. F7 is inactive in inline mode. `RTermLang` supplies both
 frontends with the same completion sources, query ranking, groups and insertion
-rules. Argument completions are selected first in function-call contexts when
-available; an explicit user selection remains active while results refresh.
+rules. In function-call contexts, initial completion entries await the LSP
+parameter results before the list is published, so runtime-only suggestions
+cannot become the default while parameters are pending. Parameter entries
+are selected before runtime symbols; explicit selection is retained on refresh.
 
 The `r.console.inlineCompletion.trigger` setting chooses automatic
 debounced suggestions or Tab activation. In Tab mode, editing refreshes an open
@@ -656,11 +658,15 @@ Escape dismisses it, and clearing the input dismisses the list and invalidates
 outstanding requests. Backspace resets the suggestion selection and viewport.
 
 The terminal renderer draws a bordered transient suggestion panel below the
-active input caret line. It anchors the panel horizontally to the preceding
-display cell, clamps it to the terminal width, and reserves rows for the panel
-inside the input viewport. Terminal Unicode display-cell widths determine
-suggestion alignment, input row counts and cursor positioning. Suggestion rows
-are excluded from saved replay and restored terminal history.
+physical terminal row containing the input caret. Within a wrapped logical
+line, the remaining input is rendered below the panel. The renderer anchors
+the panel horizontally to the preceding display cell, clamps it to terminal
+width and fits the panel in the available viewport, reducing its height before
+windowing the input. Terminal Unicode display-cell widths determine
+suggestion alignment, input row counts and cursor positioning. Cursor
+positions exactly at the terminal's right edge remain in its final cell
+until xterm wraps on the next printable character. Suggestion rows are
+excluded from saved replay and restored terminal history.
 
 Each row can display the completion icon, label, match highlighting,
 description and detail. Group labels share the terminal background with
@@ -678,7 +684,9 @@ the viewport when the selected item reaches a visible edge. Temporary SGR mouse
 reporting permits wheel navigation within the panel and clicks on suggestions
 or their detail rows. Scrollbar clicks navigate the suggestion list without
 accepting an item; group headings and frame borders are not selectable.
-Wheel reports outside the box invoke VS Code terminal scrollback commands.
+Wheel reports outside the box invoke VS Code terminal page-scrolling commands.
+Wheel events over either the suggestion content or its scrollbar navigate
+the completion list.
 Cursor-position reports establish the panel's screen coordinates for mouse
 hit-testing. Mouse reporting is disabled when the panel closes.
 

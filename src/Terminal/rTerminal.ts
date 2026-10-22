@@ -2705,7 +2705,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       .get<Record<string, unknown>>("colorCustomizations", {});
     const inputPrefix = this.inputState.currentLine.slice(0, this.inputState.cursorCol);
     this.inlineCompletion.setQuery(/[A-Za-z._][\w.]*$/.exec(inputPrefix)?.[0] ?? "");
-    const availableRows = Math.min(13, this.dimensions.rows - 2);
+    // Keep the active input's physical rows visible when possible by
+    // reducing the completion height before resorting to windowing.
+    const availableRows = Math.min(13, this.dimensions.rows - 2, Math.max(5,
+      this.dimensions.rows - plan.renderedRowCount - 1));
     const colors = resolveInlineCompletionColors(isLight, overrides);
     let suggestions = this.mode === "ready" ? this.inlineCompletion.lines(
       columns, availableRows, anchorColumn,

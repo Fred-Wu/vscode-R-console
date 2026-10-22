@@ -654,11 +654,49 @@ test("exact-width input reserves cursor wrap row before suggestions", t => {
     terminal.inlineCompletion.token);
   terminal.renderInput();
   const buffer = screen.buffer.active;
-  assert.equal(terminal.renderer.suggestionStartRow, 2);
-  assert.ok(buffer.getLine(buffer.baseY + 2).translateToString(true).includes("╭"));
-  assert.equal(terminal.renderer.cursorRowFromTop, 1);
+  assert.equal(terminal.renderer.suggestionStartRow, 1);
+  assert.ok(buffer.getLine(buffer.baseY + 1).translateToString(true).includes("╭"));
+  assert.equal(terminal.renderer.cursorRowFromTop, 0);
   terminal.applyKeyAction({ type: "escape" });
   assert.equal(terminal.inputState.text, input);
   assert.ok(!Array.from({ length: 6 }, (_, i) =>
     buffer.getLine(buffer.baseY + i).translateToString(true)).join("").includes("╭"));
+});
+
+test("wrapped caret displays the completion panel before the rest of its logical line", t => {
+  const { terminal, screen } = createTerminal(t, 24, 16);
+  const text = "x".repeat(20) + "mean(" + "z".repeat(24) + "END_OF_LINE";
+  terminal.inputState.insertText(text);
+  terminal.inputState.cursorPosition = 22;
+  terminal.inlineCompletion.set([{ ...item("data = "), snapshotInput: text, snapshotCursor: 22 }],
+    terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  const rows = Array.from({ length: 16 }, (_, index) =>
+    buffer.getLine(buffer.baseY + index).translateToString(true));
+  const top = rows.findIndex(line => line.includes("╭"));
+  const suffix = rows.findIndex(line => line.includes("END_OF_LINE"));
+  assert.ok(top > 0, "box follows the current wrapped caret row");
+  assert.ok(suffix > top, `remaining input after box: top=${top}, suffix=${suffix}, start=${terminal.renderer.suggestionStartRow}, rendered=${terminal.renderer.renderedLineCount}, rows=${JSON.stringify(rows)}`);
+  assert.ok(rows.some(line => line.includes("data = ")));
+  terminal.applyKeyAction({ type: "escape" });
+  assert.equal(terminal.inputState.text, text);
+});
+
+test("cursor at an exact wrap boundary distinguishes end-of-line and mid-line", t => {
+  const { terminal, screen } = createTerminal(t, 20, 18);
+  const prefix = "x".repeat(17);
+  terminal.inputState.insertText(prefix + "suffix");
+  terminal.inputState.cursorPosition = 17;
+  terminal.inlineCompletion.set([{ ...item("example"), snapshotInput: prefix + "suffix", snapshotCursor: 17 }],
+    terminal.inlineCompletion.token);
+  terminal.renderInput();
+  assert.equal(terminal.renderer.cursorRowFromTop, 1);
+  assert.equal(screen.buffer.active.cursorX, 0, "mid-line caret begins on next physical row");
+  terminal.applyKeyAction({ type: "escape" });
+  terminal.inputState.text = prefix;
+  terminal.inputState.cursorPosition = 17;
+  terminal.renderInput();
+  assert.equal(terminal.renderer.cursorRowFromTop, 0);
+  assert.equal(screen.buffer.active.cursorX, 19, "end-of-line caret stays in final cell");
 });

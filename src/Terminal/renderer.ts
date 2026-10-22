@@ -45,6 +45,38 @@ export class Renderer {
     this.continuationPromptColor = ANSI.reset;
   }
 
+  private cursorCellPosition(offset: number, columns: number, atEnd: boolean):
+    { row: number; col: number } {
+    const lastCell = offset > 0 && offset % columns === 0 && atEnd;
+    return {
+      row: Math.max(0, Math.floor(offset / columns) - (lastCell ? 1 : 0)),
+      col: lastCell ? columns : offset % columns + 1,
+    };
+  }
+
+  private splitStyledLine(line: string, cells: number): [string, string] {
+    let first = "";
+    let rest = "";
+    let count = 0;
+    let style = "";
+    for (let i = 0; i < line.length;) {
+      const sgr = /^\x1b\[[0-9;]*m/.exec(line.slice(i));
+      if (sgr) {
+        if (count < cells) first += sgr[0];
+        else rest += sgr[0];
+        style = sgr[0] === "\x1b[0m" ? "" : style + sgr[0];
+        i += sgr[0].length;
+        continue;
+      }
+      const char = String.fromCodePoint(line.codePointAt(i)!);
+      if (count < cells) first += char;
+      else rest += char;
+      count += this.displayWidth(char);
+      i += char.length;
+    }
+    return [first, style + rest];
+  }
+
   renderWithCursor(
     lines: string[],
     cursorRow: number,
@@ -57,30 +89,46 @@ export class Renderer {
     const input = this.lineHighlighter
       ? this.lineHighlighter.highlightLines(lines, sourceLineMap)
       : lines;
-    const insertAt = Math.min(lines.length, cursorRow + 1);
+    const safeColumns = Math.max(1, columns);
+    const continuationLen = this.continuationPromptText?.length ?? 2;
+    const promptLen = promptKinds[cursorRow] === "main" ? this.promptLen : continuationLen;
+    const sourceLine = lines[cursorRow] ?? "";
+    const caretCells = promptLen + this.displayWidth(sourceLine.slice(0, cursorCol));
+    const lineCells = promptLen + this.displayWidth(sourceLine);
+    const physicalEnd = (Math.floor(caretCells / safeColumns) + 1) * safeColumns;
+    // Split a long logical input line at the end of the caret's physical row.
+    // The suffix stays below the panel, while the caret remains in the prefix.
+    const split = suggestions.length > 0 && lineCells > physicalEnd;
+    let splitIndex = -1;
+    let inputLines = input;
+    let inputKinds: Array<RenderPromptKind | "none"> = [...promptKinds];
+    if (split) {
+      const before = this.splitStyledLine(input[cursorRow] ?? "", physicalEnd - promptLen);
+      inputLines = [...input.slice(0, cursorRow), before[0], before[1], ...input.slice(cursorRow + 1)];
+      inputKinds = [...promptKinds.slice(0, cursorRow + 1), "none", ...promptKinds.slice(cursorRow + 1)];
+      splitIndex = cursorRow;
+    }
+    const insertAt = Math.min(inputLines.length, cursorRow + 1);
     const highlighted = [
-      ...input.slice(0, insertAt), ...suggestions, ...input.slice(insertAt),
+      ...inputLines.slice(0, insertAt), ...suggestions, ...inputLines.slice(insertAt),
     ];
     const layoutKinds: Array<RenderPromptKind | "none"> = [
-      ...promptKinds.slice(0, insertAt),
+      ...inputKinds.slice(0, insertAt),
       ...suggestions.map(() => "none" as const),
-      ...promptKinds.slice(insertAt),
+      ...inputKinds.slice(insertAt),
     ];
-    const safeColumns = Math.max(1, columns);
     const continuationPad = 2;
-    const continuationLen = this.continuationPromptText
-      ? this.continuationPromptText.length
-      : continuationPad;
     const getPromptKind = (index: number): RenderPromptKind | "none" => layoutKinds[index] ?? "none";
 
     const lineRows = highlighted.map((_, idx) => {
       // Suggestion rows are already fitted to the terminal's cell width.
-      if (getPromptKind(idx) === "none") return 1;
+      if (getPromptKind(idx) === "none" && idx < insertAt + suggestions.length) return 1;
       const pLen = getPromptKind(idx) === "none" ? 0 :
         getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
       const visibleLen =
         pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
-      return Math.max(1, Math.floor(visibleLen / safeColumns) + 1);
+      if (idx === splitIndex) return Math.max(1, Math.ceil(visibleLen / safeColumns));
+      return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
     const inputRows = lineRows.reduce((sum, n, index) =>
@@ -89,7 +137,7 @@ export class Renderer {
     const sameSuggestions = suggestions.length > 0 &&
       suggestions.length === this.lastSuggestions.length &&
       suggestions.every((line, index) => line === this.lastSuggestions[index]);
-    const repaintInputOnly = insertAt === lines.length &&
+    const repaintInputOnly = !split && insertAt === lines.length &&
       sameSuggestions && inputRows === this.lastInputRows &&
       totalRows === this.renderedLineCount;
     this.lastSuggestions = [...suggestions];
@@ -145,10 +193,12 @@ export class Renderer {
       const prefix = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
       const promptLen = getPromptKind(cursorRow) === "main" ? this.promptLen : continuationLen;
       const offset = promptLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
-      const terminalRow = prefix + (offset > 0 ? Math.floor(offset / safeColumns) : 0);
+      const position = this.cursorCellPosition(offset, safeColumns,
+        cursorCol >= (lines[cursorRow]?.length ?? 0));
+      const terminalRow = prefix + position.row;
       const delta = Math.max(0, inputRows - 1 - terminalRow);
       if (delta > 0) this.write(`\x1b[${delta}A`);
-      this.write(`\r\x1b[${(offset % safeColumns) + 1}G`);
+      this.write(`\r\x1b[${position.col}G`);
       this.cursorRowFromTop = terminalRow;
       return;
     }
@@ -182,9 +232,10 @@ export class Renderer {
         ? this.promptLen
         : continuationLen;
     const cursorOffset = pLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
-    const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
-    const terminalRow = prefixRows + rowWithinLine;
-    const col = (cursorOffset % safeColumns) + 1;
+    const position = this.cursorCellPosition(cursorOffset, safeColumns,
+      cursorCol >= (lines[cursorRow]?.length ?? 0));
+    const terminalRow = prefixRows + position.row;
+    const col = position.col;
 
     const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
     if (deltaUp > 0) {
@@ -221,7 +272,7 @@ export class Renderer {
           : continuationLen;
       const visibleLen =
         pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
-      return Math.max(1, Math.floor(visibleLen / safeColumns) + 1);
+      return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
 
@@ -246,9 +297,10 @@ export class Renderer {
         ? this.promptLen
         : continuationLen;
     const cursorOffset = pLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
-    const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
-    const terminalRow = prefixRows + rowWithinLine;
-    const col = (cursorOffset % safeColumns) + 1;
+    const position = this.cursorCellPosition(cursorOffset, safeColumns,
+      cursorCol >= (lines[cursorRow]?.length ?? 0));
+    const terminalRow = prefixRows + position.row;
+    const col = position.col;
 
     const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
     if (deltaUp > 0) {

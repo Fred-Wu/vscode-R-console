@@ -56,7 +56,7 @@ function getRenderedRowCountForLine(
     continuationPromptLen
   );
   const visibleLen = visiblePromptLen + widthOf(line);
-  return Math.max(1, Math.floor(visibleLen / safeColumns) + 1);
+  return Math.max(1, Math.ceil(visibleLen / safeColumns));
 }
 
 export function getContinuationPromptLength(
