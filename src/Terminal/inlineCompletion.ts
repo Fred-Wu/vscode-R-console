@@ -73,6 +73,7 @@ export class InlineCompletion {
   private scrollStart = 0;
   private query = "";
   private resetSelectionOnUpdate = false;
+  private manuallySelected = false;
 
   constructor(private readonly unicode: { wcwidth(codePoint: number): number }) {}
 
@@ -90,6 +91,7 @@ export class InlineCompletion {
       this.selected = 0;
       this.scrollStart = 0;
       this.resetSelectionOnUpdate = true;
+      this.manuallySelected = false;
     }
     return ++this.generation;
   }
@@ -105,6 +107,7 @@ export class InlineCompletion {
     this.scrollStart = 0;
     this.query = "";
     this.resetSelectionOnUpdate = false;
+    this.manuallySelected = false;
   }
 
   setQuery(query: string): void {
@@ -130,7 +133,12 @@ export class InlineCompletion {
       const entry = items[index];
       return isChoice(entry) && entry.label.replace(ICON, "").toLowerCase() === query.toLowerCase();
     }) : -1;
-    this.selected = this.resetSelectionOnUpdate ? 0 : exact >= 0 ? exact :
+    const argumentHeading = items.findIndex(item => !isChoice(item) && item.label === "Arguments");
+    const firstArgument = argumentHeading < 0 ? -1 : this.choiceIndexes.indexOf(argumentHeading + 1);
+    this.selected = !this.resetSelectionOnUpdate && this.manuallySelected &&
+      matching !== undefined && matching >= 0 ? matching :
+      firstArgument >= 0 ? firstArgument :
+      this.resetSelectionOnUpdate ? 0 : exact >= 0 ? exact :
       matching !== undefined && matching >= 0 ? matching : 0;
     this.scrollStart = 0;
     return true;
@@ -139,6 +147,7 @@ export class InlineCompletion {
   move(delta: number): void {
     if (this.visible) {
       this.resetSelectionOnUpdate = false;
+      this.manuallySelected = true;
       this.selected = Math.max(0, Math.min(this.choiceIndexes.length - 1, this.selected + delta));
     }
   }

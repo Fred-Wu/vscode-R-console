@@ -514,3 +514,26 @@ test("typed matches use theme foreground, selected text has a continuous backgro
     "selection background must extend behind all text");
   assert.ok(!selected.includes("\x1b[7m"), "do not invert icon or matched foreground");
 });
+
+test("function arguments remain selected ahead of an exact runtime variable", () => {
+  const panel = new InlineCompletion(unicode);
+  const argument = { ...item("data = "), insertText: "data = " };
+  const variable = { ...item("data"), source: "session" };
+  const choices = [
+    { label: "Fields" }, { ...item("dataset") },
+    { label: "Arguments" }, argument,
+    { label: "Runtime Variables" }, variable,
+  ];
+  panel.set(choices, panel.token, "data");
+  assert.equal(panel.current(), argument, "argument group takes precedence over an exact runtime match");
+  panel.move(1);
+  assert.equal(panel.current(), variable);
+  panel.set(choices, panel.token, "data");
+  assert.equal(panel.current(), variable, "retain an explicit user selection during updates");
+  panel.invalidate(true);
+  panel.set(choices, panel.token, "data");
+  assert.equal(panel.current(), argument, "edits reset selection to the function argument");
+  const ordinary = new InlineCompletion(unicode);
+  ordinary.set([{ label: "Runtime Variables" }, variable], ordinary.token, "data");
+  assert.equal(ordinary.current(), variable, "normal completion without arguments is unchanged");
+});
