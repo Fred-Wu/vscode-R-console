@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added optional inline console autocompletion with typing or Tab triggers alongside the existing completion picker.
+
 ## [0.5.3] - 2026-10-15
 
 ### Added
