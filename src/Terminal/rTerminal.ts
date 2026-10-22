@@ -1133,7 +1133,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (action.type === "cursor-report") {
       if (this.inlineCompletion?.hasRenderedRows) {
         this.inlineBoxTop = action.row - this.renderer.cursorRowFromTop +
-          this.renderer.renderedLineCount - this.inlineSuggestionRowCount;
+          this.renderer.suggestionStartRow;
       }
       return;
     }

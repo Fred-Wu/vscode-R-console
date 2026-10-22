@@ -548,7 +548,6 @@ test("scrollbar click changes navigation but cannot accept a suggestion", t => {
   }));
   terminal.inlineCompletion.set(choices, terminal.inlineCompletion.token);
   terminal.renderInput();
-  const left = terminal.inlineCompletion.lines(80, 13, 1)[0].indexOf("╭");
   const barCol = terminal.inlineCompletion.renderedLeft + terminal.inlineCompletion.renderedWidth - 1;
   const boxRow = terminal.inlineBoxTop;
   assert.ok(boxRow !== undefined);
@@ -587,7 +586,32 @@ test("Unicode characters before the caret use terminal display cells for suggest
   terminal.renderInput();
   const buffer = screen.buffer.active;
   assert.equal(buffer.cursorX, 6, "CJK occupies two cells before the caret");
-  assert.equal(buffer.getLine(buffer.baseY + 1).getCell(4).getChars(), "╭",
+  assert.equal(buffer.getLine(buffer.baseY + 1).getCell(5).getChars(), "╭",
     "completion uses display-cell width, not JavaScript string length");
-  assert.equal(terminal.renderer.renderedLineCount, 6);
+  assert.equal(terminal.renderer.renderedLineCount, 5);
+});
+
+test("multiline suggestions appear below the active caret line and accept clicks", t => {
+  const { terminal, screen } = createTerminal(t, 80, 24);
+  terminal.inputState.insertText("mean(\n  x <- 1\n  y <- 2");
+  terminal.inputState.cursorPosition = "mean(".length;
+  const entry = { ...item("na.rm = "), snapshotInput: "mean(", snapshotCursor: 5 };
+  terminal.inlineCompletion.set([{ label: "Arguments" }, entry], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  assert.match(buffer.getLine(buffer.baseY).translateToString(true), /mean\($/);
+  assert.ok(buffer.getLine(buffer.baseY + 1).translateToString(true).includes("╭"),
+    "box is immediately below the caret line");
+  assert.ok(Array.from({ length: 12 }, (_, i) =>
+    buffer.getLine(buffer.baseY + i).translateToString(true)).some(line =>
+    line.includes("x <- 1")), "input after the caret remains visible");
+  const suggestionRow = Array.from({ length: 12 }, (_, i) =>
+    buffer.getLine(buffer.baseY + i).translateToString(true)).findIndex(line =>
+    line.includes("na.rm")) + 1;
+  assert.ok(suggestionRow > 0);
+  assert.equal(terminal.inlineCompletion.hitTest(suggestionRow - terminal.inlineBoxTop, 14), entry,
+    `hit target: row=${suggestionRow}, top=${terminal.inlineBoxTop}, cursor=${buffer.cursorY}, selected=${terminal.inlineCompletion.selected}`);
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: suggestionRow, col: 14 });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row: suggestionRow, col: 14 });
+  assert.equal(terminal.accepted, entry);
 });

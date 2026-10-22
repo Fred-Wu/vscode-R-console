@@ -9,6 +9,7 @@ type RenderPromptKind = "main" | "cont";
 export class Renderer {
   renderedLineCount = 1;
   cursorRowFromTop = 0;
+  suggestionStartRow = 0;
   promptText = "R> ";
   promptColor = ANSI.brightGreen;
   promptLen = 3;
@@ -53,19 +54,28 @@ export class Renderer {
     promptKinds: RenderPromptKind[],
     suggestions: string[] = []
   ): void {
-    const highlighted = (this.lineHighlighter
+    const input = this.lineHighlighter
       ? this.lineHighlighter.highlightLines(lines, sourceLineMap)
-      : lines).concat(suggestions);
+      : lines;
+    const insertAt = Math.min(lines.length, cursorRow + 1);
+    const highlighted = [
+      ...input.slice(0, insertAt), ...suggestions, ...input.slice(insertAt),
+    ];
+    const layoutKinds: Array<RenderPromptKind | "none"> = [
+      ...promptKinds.slice(0, insertAt),
+      ...suggestions.map(() => "none" as const),
+      ...promptKinds.slice(insertAt),
+    ];
     const safeColumns = Math.max(1, columns);
     const continuationPad = 2;
     const continuationLen = this.continuationPromptText
       ? this.continuationPromptText.length
       : continuationPad;
-    const getPromptKind = (index: number): RenderPromptKind | "none" => promptKinds[index] ?? "none";
+    const getPromptKind = (index: number): RenderPromptKind | "none" => layoutKinds[index] ?? "none";
 
     const lineRows = highlighted.map((_, idx) => {
       // Suggestion rows are already fitted to the terminal's cell width.
-      if (idx >= lines.length) return 1;
+      if (getPromptKind(idx) === "none") return 1;
       const pLen = getPromptKind(idx) === "none" ? 0 :
         getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
       const visibleLen =
@@ -73,11 +83,14 @@ export class Renderer {
       return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
-    const inputRows = lineRows.slice(0, lines.length).reduce((sum, n) => sum + n, 0);
+    const inputRows = lineRows.reduce((sum, n, index) =>
+      sum + (getPromptKind(index) === "none" ? 0 : n), 0);
+    this.suggestionStartRow = lineRows.slice(0, insertAt).reduce((sum, n) => sum + n, 0);
     const sameSuggestions = suggestions.length > 0 &&
       suggestions.length === this.lastSuggestions.length &&
       suggestions.every((line, index) => line === this.lastSuggestions[index]);
-    const repaintInputOnly = sameSuggestions && inputRows === this.lastInputRows &&
+    const repaintInputOnly = insertAt === lines.length &&
+      sameSuggestions && inputRows === this.lastInputRows &&
       totalRows === this.renderedLineCount;
     this.lastSuggestions = [...suggestions];
     this.lastInputRows = inputRows;
