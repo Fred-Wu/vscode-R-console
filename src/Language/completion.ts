@@ -508,7 +508,7 @@ export function needsLanguageServerCompletion(context: CompletionContext): boole
 }
 
 /** Use the same typed-query filtering and ranking for Quick Pick and inline results. */
-export function filterCompletionEntries(entries: CompletionEntry[], query: string): CompletionEntry[] {
+export function rankCompletionEntries(entries: CompletionEntry[], query: string): CompletionEntry[] {
   const needle = query.toLowerCase();
   if (!needle) return entries;
   return entries
