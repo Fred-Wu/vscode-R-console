@@ -8,7 +8,7 @@ import {
   collectCompletionEntries,
   getCompletionContext,
   getCompletionIdentityKey,
-  filterCompletionEntries,
+  rankCompletionEntries,
   isCompletionPickItem,
   needsLanguageServerCompletion,
   toCompletionQuickPickItems,
@@ -203,7 +203,7 @@ export class RTermLang {
           const current = getCurrentInput();
           if (current.currentLine !== context.snapshotInput ||
               current.cursorCol !== context.snapshotCursor) return;
-          onInlineEntries(toCompletionQuickPickItems(filterCompletionEntries(results, context.prefix), context));
+          onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix), context));
         };
         publish(initialEntries);
         if (opensBeforeFullResults) {
@@ -232,7 +232,7 @@ export class RTermLang {
         return value;
       };
       const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
-        filterCompletionEntries(sourceEntries, searchValue(value));
+        rankCompletionEntries(sourceEntries, searchValue(value));
       const mergeCompletionEntries = (
         firstEntries: CompletionEntry[],
         secondEntries: CompletionEntry[]
