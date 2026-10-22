@@ -10,6 +10,7 @@ export type KeyAction =
   | { type: "tab" }
   | { type: "backtab" }
   | { type: "completion" }
+  | { type: "page"; dir: "up" | "down" }
   | { type: "history" }
   | { type: "escape" }
   | { type: "ctrl_c" }
@@ -39,6 +40,8 @@ const CSI_5: Map<string, KeyAction> = new Map([
 const CSI_4: Map<string, KeyAction> = new Map([
   ["\x1b[3~", { type: "delete" }],
   ["\x1b[1~", { type: "home" }],
+  ["\x1b[5~", { type: "page", dir: "up" }],
+  ["\x1b[6~", { type: "page", dir: "down" }],
   ["\x1b[4~", { type: "end" }],
   ["\x1b[7~", { type: "home" }],
   ["\x1b[8~", { type: "end" }],
