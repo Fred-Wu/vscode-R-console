@@ -8,6 +8,7 @@ import {
   collectCompletionEntries,
   getCompletionContext,
   getCompletionIdentityKey,
+  filterCompletionEntries,
   isCompletionPickItem,
   needsLanguageServerCompletion,
   toCompletionQuickPickItems,
@@ -202,7 +203,7 @@ export class RTermLang {
           const current = getCurrentInput();
           if (current.currentLine !== context.snapshotInput ||
               current.cursorCol !== context.snapshotCursor) return;
-          onInlineEntries(toCompletionQuickPickItems(results, context));
+          onInlineEntries(toCompletionQuickPickItems(filterCompletionEntries(results, context.prefix), context));
         };
         publish(initialEntries);
         if (opensBeforeFullResults) {
@@ -230,28 +231,8 @@ export class RTermLang {
         }
         return value;
       };
-      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] => {
-        const query = searchValue(value).toLowerCase();
-        if (query.length === 0) {
-          return sourceEntries;
-        }
-        return sourceEntries
-          .map((entry, index) => ({ entry, index }))
-          .filter(({ entry }) => entry.label.toLowerCase().includes(query))
-          .sort((a, b) => {
-            const aLabel = a.entry.label.toLowerCase();
-            const bLabel = b.entry.label.toLowerCase();
-            const aRank = aLabel === query ? 0 : aLabel.startsWith(query) ? 1 : 2;
-            const bRank = bLabel === query ? 0 : bLabel.startsWith(query) ? 1 : 2;
-            return (
-              aRank - bRank ||
-              aLabel.indexOf(query) - bLabel.indexOf(query) ||
-              aLabel.length - bLabel.length ||
-              a.index - b.index
-            );
-          })
-          .map(({ entry }) => entry);
-      };
+      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
+        filterCompletionEntries(sourceEntries, searchValue(value));
       const mergeCompletionEntries = (
         firstEntries: CompletionEntry[],
         secondEntries: CompletionEntry[]
