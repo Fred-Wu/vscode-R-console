@@ -652,11 +652,14 @@ typing through `r.console.inlineCompletion.trigger`.
 The terminal renderer displays a bordered, transient list of group headings,
 labels, descriptions and details, excluded from persistent replay. It keeps
 the panel in place while typing and updates it when asynchronous results arrive.
-A circular selection indicator replaces reverse-video highlighting, and modules
-use blue `{}` glyphs. Other picker codicons use ANSI-colored terminal glyphs
+The active suggestion is highlighted with terminal inverse video, using the
+active theme's foreground and background colors rather than a circular marker.
+A scrollbar appears inside the border when results exceed the visible height.
+The suggestion viewport scrolls only when the selection reaches either edge;
+modules use blue `{}` glyphs. Other picker codicons use ANSI-colored terminal glyphs
 because VS Code codicons cannot be rendered directly in a terminal. Arrow and
 Page Up/Down keys navigate results; temporary SGR mouse reporting also permits
-wheel navigation while the panel is visible. Left mouse press and release on a\nsuggestion (including its detail row) accepts it; group headings and borders\nare non-interactive. Cursor-position reports locate the box for hit testing.\nCompletion labels use normal-weight terminal text and muted descriptions to\napproximate Quick Pick, although a pseudoterminal cannot use a separate UI font.\nMouse reporting is disabled when
+wheel navigation only when the pointer is within the box. Left mouse press and release on a\nsuggestion (including its detail row) accepts it; group headings and borders\nare non-interactive. Cursor-position reports locate the box for hit testing.\nCompletion labels use normal-weight terminal text and muted descriptions to\napproximate Quick Pick, although a pseudoterminal cannot use a separate UI font.\nMouse reporting is disabled when
 the panel closes. Clearing the command dismisses the panel and invalidates
 outstanding completion requests.
 
