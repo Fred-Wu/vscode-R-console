@@ -79,7 +79,7 @@ test("module icons use blue braces rather than a yellow dot", () => {
   const state = new InlineCompletion();
   state.set([{ ...item("$(symbol-module) stats"), description: "module" }], state.token);
   const rendered = state.lines(40, 7).join("");
-  assert.match(rendered, /\\x1b\[38;5;75m\{\}/);
+  assert.ok(rendered.includes("\x1b[38;5;75m{}"));
   assert.doesNotMatch(rendered, /\$\(symbol-module\)/);
 });
 
