@@ -1117,6 +1117,11 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.renderInput();
         return;
       }
+      if (action.type === "page") {
+        this.inlineCompletion.move(action.dir === "up" ? -8 : 8);
+        this.renderInput();
+        return;
+      }
       if (action.type === "tab" || action.type === "enter") {
         const item = this.inlineCompletion.current();
         this.dismissInlineCompletion();
