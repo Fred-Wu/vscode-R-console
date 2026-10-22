@@ -40,7 +40,7 @@ type AutocompleteRequest = {
   getWorkspaceData: () => WorkspaceData | undefined;
   force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
-  onInlineEntries?: (items: CompletionPickItem[]) => void;
+  onInlineEntries?: (items: import("../../Language/completion").CompletionQuickPickItem[]) => void;
 };
 
 type ConsoleSessionState = {
@@ -202,7 +202,7 @@ export class RTermLang {
           const current = getCurrentInput();
           if (current.currentLine !== context.snapshotInput ||
               current.cursorCol !== context.snapshotCursor) return;
-          onInlineEntries(toCompletionQuickPickItems(results, context).filter(isCompletionPickItem));
+          onInlineEntries(toCompletionQuickPickItems(results, context));
         };
         publish(initialEntries);
         if (opensBeforeFullResults) {
