@@ -118,7 +118,8 @@ export function buildInputRenderPlan({
     lines,
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   let plan:
@@ -151,7 +152,8 @@ export function buildInputRenderPlan({
     plan.lines,
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   return {

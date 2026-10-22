@@ -46,7 +46,8 @@ function getRenderedRowCountForLine(
   lineIndex: number,
   columns: number,
   promptLen: number,
-  continuationPromptLen: number
+  continuationPromptLen: number,
+  widthOf: (text: string) => number = text => text.length
 ): number {
   const safeColumns = Math.max(1, columns || 80);
   const visiblePromptLen = getPromptLengthForLine(
@@ -54,7 +55,7 @@ function getRenderedRowCountForLine(
     promptLen,
     continuationPromptLen
   );
-  const visibleLen = visiblePromptLen + line.length;
+  const visibleLen = visiblePromptLen + widthOf(line);
   return Math.max(1, Math.ceil(visibleLen / safeColumns));
 }
 
@@ -71,7 +72,8 @@ export function getRenderedRowCount(
   lines: string[],
   columns: number,
   promptLen: number,
-  continuationPromptLen: number
+  continuationPromptLen: number,
+  widthOf: (text: string) => number = text => text.length
 ): number {
   return lines.reduce((sum, line, idx) => {
     return (
@@ -81,7 +83,8 @@ export function getRenderedRowCount(
         idx,
         columns,
         promptLen,
-        continuationPromptLen
+        continuationPromptLen,
+        widthOf
       )
     );
   }, 0);

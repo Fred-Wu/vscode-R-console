@@ -577,3 +577,17 @@ test("mouse wheel outside the panel scrolls terminal history without moving comp
   assert.equal(terminal.inlineCompletion.selected, initial);
   assert.equal(terminal.inlineCompletion.visible, true);
 });
+
+test("Unicode characters before the caret use terminal display cells for suggestion anchoring", t => {
+  const { terminal, screen } = createTerminal(t, 80, 24);
+  terminal.renderer.displayWidth = text => [...text].reduce((n, character) =>
+    n + unicode.wcwidth(character.codePointAt(0)), 0);
+  terminal.inputState.insertText("字a");
+  terminal.inlineCompletion.set([item("alpha")], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const buffer = screen.buffer.active;
+  assert.equal(buffer.cursorX, 6, "CJK occupies two cells before the caret");
+  assert.equal(buffer.getLine(buffer.baseY + 1).getCell(4).getChars(), "╭",
+    "completion uses display-cell width, not JavaScript string length");
+  assert.equal(terminal.renderer.renderedLineCount, 6);
+});

@@ -19,7 +19,11 @@ export class Renderer {
   private lastSuggestions: string[] = [];
   private lastInputRows = 0;
 
-  constructor(write: (text: string) => void, lineHighlighter?: RendererLineHighlighter) {
+  constructor(
+    write: (text: string) => void,
+    lineHighlighter?: RendererLineHighlighter,
+    readonly displayWidth: (text: string) => number = text => text.length
+  ) {
     this.write = write;
     this.lineHighlighter = lineHighlighter;
   }
@@ -65,7 +69,7 @@ export class Renderer {
       const pLen = getPromptKind(idx) === "none" ? 0 :
         getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
       const visibleLen =
-        pLen + highlighted[idx].replace(/\x1b\[[0-9;]*m/g, "").length;
+        pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
       return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
@@ -127,7 +131,7 @@ export class Renderer {
       });
       const prefix = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
       const promptLen = getPromptKind(cursorRow) === "main" ? this.promptLen : continuationLen;
-      const offset = promptLen + cursorCol;
+      const offset = promptLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
       const terminalRow = prefix + (offset > 0 ? Math.floor(offset / safeColumns) : 0);
       const delta = Math.max(0, inputRows - 1 - terminalRow);
       if (delta > 0) this.write(`\x1b[${delta}A`);
@@ -164,7 +168,7 @@ export class Renderer {
       getPromptKind(cursorRow) === "main"
         ? this.promptLen
         : continuationLen;
-    const cursorOffset = pLen + cursorCol;
+    const cursorOffset = pLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
     const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
     const terminalRow = prefixRows + rowWithinLine;
     const col = (cursorOffset % safeColumns) + 1;
@@ -203,7 +207,7 @@ export class Renderer {
           ? this.promptLen
           : continuationLen;
       const visibleLen =
-        pLen + highlighted[idx].replace(/\x1b\[[0-9;]*m/g, "").length;
+        pLen + this.displayWidth(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""));
       return Math.max(1, Math.ceil(visibleLen / safeColumns));
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
@@ -228,7 +232,7 @@ export class Renderer {
       getPromptKind(cursorRow) === "main"
         ? this.promptLen
         : continuationLen;
-    const cursorOffset = pLen + cursorCol;
+    const cursorOffset = pLen + this.displayWidth(lines[cursorRow]?.slice(0, cursorCol) ?? "");
     const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
     const terminalRow = prefixRows + rowWithinLine;
     const col = (cursorOffset % safeColumns) + 1;
