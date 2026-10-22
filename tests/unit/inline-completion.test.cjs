@@ -537,3 +537,24 @@ test("function arguments remain selected ahead of an exact runtime variable", ()
   ordinary.set([{ label: "Runtime Variables" }, variable], ordinary.token, "data");
   assert.equal(ordinary.current(), variable, "normal completion without arguments is unchanged");
 });
+
+test("scrollbar click changes navigation but cannot accept a suggestion", t => {
+  const { terminal, screen } = createTerminal(t, 80, 24);
+  terminal.inputState.insertText("a");
+  const choices = Array.from({ length: 25 }, (_, i) => ({
+    ...item("alpha" + i), snapshotInput: "a", snapshotCursor: 1,
+  }));
+  terminal.inlineCompletion.set(choices, terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const left = terminal.inlineCompletion.lines(80, 13, 1)[0].indexOf("╭");
+  const barCol = terminal.inlineCompletion.renderedLeft + terminal.inlineCompletion.renderedWidth - 1;
+  const boxRow = terminal.inlineBoxTop;
+  assert.ok(boxRow !== undefined);
+  const start = terminal.inlineCompletion.selected;
+  const row = boxRow + 8;
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: barCol });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: barCol });
+  assert.equal(terminal.accepted, undefined, "scrollbar is never an accept target");
+  assert.ok(terminal.inlineCompletion.selected > start, "track click scrolls to lower suggestion");
+  assert.equal(terminal.inlineCompletion.hitTest(8, barCol), undefined);
+});

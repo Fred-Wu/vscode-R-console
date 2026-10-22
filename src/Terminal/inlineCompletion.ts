@@ -81,9 +81,22 @@ export class InlineCompletion {
   get token(): number { return this.generation; }
   get hasRenderedRows(): boolean { return this.renderedTargets.length > 0; }
 
+  isScrollbar(row: number, col: number): boolean {
+    return this.renderedTargets.length > 0 &&
+      Number.isInteger(row) && row > 0 && row < this.renderedTargets.length - 2 &&
+      col === this.renderedLeft + this.renderedWidth - 1;
+  }
+
+  scrollTo(row: number): void {
+    const index = this.choiceIndexes[Math.min(this.choiceIndexes.length - 1,
+      Math.max(0, Math.round((row - 1) / Math.max(1, this.renderedTargets.length - 4) *
+        (this.choiceIndexes.length - 1))))];
+    if (index !== undefined) this.move(this.choiceIndexes.indexOf(index) - this.selected);
+  }
+
   contains(row: number, col: number): boolean {
     return Number.isInteger(row) && row > 0 && row < this.renderedTargets.length - 2 &&
-      col > this.renderedLeft + 1 && col < this.renderedLeft + this.renderedWidth;
+      col > this.renderedLeft + 1 && col < this.renderedLeft + this.renderedWidth - 1;
   }
 
   invalidate(resetSelection = false): number {

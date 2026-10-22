@@ -1136,6 +1136,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     if (action.type === "mouse") {
+      const boxRow = this.inlineBoxTop === undefined ? -1 : action.row - this.inlineBoxTop;
+      if (this.inlineCompletion.isScrollbar(boxRow, action.col)) {
+        this.inlinePressedChoice = undefined;
+        if (action.pressed) {
+          this.inlineCompletion.scrollTo(boxRow);
+          this.renderInput();
+        }
+        return;
+      }
       const item = this.inlineBoxTop === undefined ? undefined :
         this.inlineCompletion.hitTest(action.row - this.inlineBoxTop, action.col);
       if (action.pressed) {
