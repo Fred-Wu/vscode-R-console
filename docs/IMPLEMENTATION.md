@@ -648,6 +648,9 @@ Quick Pick and F7 are disabled in inline mode. Both frontends use the same
 completion sources, typed-query filtering, exact-match-first ranking, grouping
 and insertion rules. Inline completions can be triggered by Tab or while
 typing through `r.console.inlineCompletion.trigger`.
+In Tab mode, Tab opens the list. Once open, edits update the suggestions,
+and Tab or Enter accepts the selected entry. Backspace returns the selection
+and scroll position to the beginning of the list.
 
 The terminal renderer displays a bordered, transient list of group headings,
 labels, descriptions and details, excluded from persistent replay. The box is

@@ -60,6 +60,8 @@ export class Renderer {
     const getPromptKind = (index: number): RenderPromptKind | "none" => promptKinds[index] ?? "none";
 
     const lineRows = highlighted.map((_, idx) => {
+      // Suggestion rows are already fitted to the terminal's cell width.
+      if (idx >= lines.length) return 1;
       const pLen = getPromptKind(idx) === "none" ? 0 :
         getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
       const visibleLen =

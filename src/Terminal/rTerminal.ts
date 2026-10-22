@@ -80,6 +80,7 @@ class TrackingWriteEmitter extends vscode.EventEmitter<string> {
 
 type ReplayTerminal = HeadlessTerminal & {
   _core: {
+    unicodeService: { wcwidth(codePoint: number): number };
     _writeBuffer: {
       writeSync(data: string): void;
     };
@@ -146,7 +147,7 @@ export type PersistedRTerminalState = {
 
 export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
-  private readonly inlineCompletion = new InlineCompletion();
+  private readonly inlineCompletion: InlineCompletion;
   private inlineMouseReporting = false;
   private inlineBoxTop: number | undefined;
   private inlinePressedChoice: CompletionPickItem | undefined;
@@ -258,6 +259,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       };
     }
     this.terminalState = this.createReplayTerminal();
+    this.inlineCompletion = new InlineCompletion(this.terminalState._core.unicodeService);
     this.writeEmitter = this.createWriteEmitter();
     this.runtimeBackend = createRuntimeBackend(this.extensionPath);
     if (!historyStorage) {
@@ -1191,9 +1193,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     if (this.inlineCompletion) {
       if (action.type === "text" || action.type === "backspace" || action.type === "delete") {
-        this.inlineCompletion.invalidate();
+        this.inlineCompletion.invalidate(action.type === "backspace");
       } else {
-        this.dismissInlineCompletion(false);
+        this.dismissInlineCompletion();
       }
     }
 
@@ -2093,7 +2095,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
     if (this.inlineCompletionMode() !== "inline" ||
-        vscode.workspace.getConfiguration("r.console").get<string>("inlineCompletion.trigger", "tab") !== "typing") return;
+        (!this.inlineCompletion.visible &&
+         vscode.workspace.getConfiguration("r.console").get<string>("inlineCompletion.trigger", "tab") !== "typing")) return;
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
     this.inlineCompletionTimer = setTimeout(() => {
       this.inlineCompletionTimer = undefined;

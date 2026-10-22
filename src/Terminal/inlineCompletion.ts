@@ -8,7 +8,6 @@ export type InlineCompletionColors = {
 };
 
 const ESC = "\x1b[";
-const RESET = ESC + "0m";
 const FG_RESET = ESC + "39m";
 const BG_RESET = ESC + "49m";
 const DIM = ESC + "2m";
@@ -51,16 +50,6 @@ function parseHexColor(value: unknown): number[] | undefined {
   return [0, 2, 4].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
 }
 
-function clean(value: string): string {
-  return value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-}
-
-function fit(value: string, width: number): string {
-  const characters = [...clean(value)];
-  return characters.length <= width ? characters.join("") :
-    characters.slice(0, Math.max(0, width - 1)).join("") + "…";
-}
-
 function highlightMatch(label: string, query: string, color: string): string {
   if (!query) return label;
   const start = label.toLowerCase().indexOf(query.toLowerCase());
@@ -83,6 +72,9 @@ export class InlineCompletion {
   private renderedLeft = 0;
   private scrollStart = 0;
   private query = "";
+  private resetSelectionOnUpdate = false;
+
+  constructor(private readonly unicode: { wcwidth(codePoint: number): number }) {}
 
   get visible(): boolean { return this.choiceIndexes.length > 0; }
   get token(): number { return this.generation; }
@@ -93,7 +85,14 @@ export class InlineCompletion {
       col > this.renderedLeft + 1 && col < this.renderedLeft + this.renderedWidth;
   }
 
-  invalidate(): number { return ++this.generation; }
+  invalidate(resetSelection = false): number {
+    if (resetSelection) {
+      this.selected = 0;
+      this.scrollStart = 0;
+      this.resetSelectionOnUpdate = true;
+    }
+    return ++this.generation;
+  }
 
   clear(): void {
     this.generation++;
@@ -105,6 +104,7 @@ export class InlineCompletion {
     this.renderedLeft = 0;
     this.scrollStart = 0;
     this.query = "";
+    this.resetSelectionOnUpdate = false;
   }
 
   setQuery(query: string): void {
@@ -130,7 +130,7 @@ export class InlineCompletion {
       const entry = items[index];
       return isChoice(entry) && entry.label.replace(ICON, "").toLowerCase() === query.toLowerCase();
     }) : -1;
-    this.selected = exact >= 0 ? exact :
+    this.selected = this.resetSelectionOnUpdate ? 0 : exact >= 0 ? exact :
       matching !== undefined && matching >= 0 ? matching : 0;
     this.scrollStart = 0;
     return true;
@@ -138,6 +138,7 @@ export class InlineCompletion {
 
   move(delta: number): void {
     if (this.visible) {
+      this.resetSelectionOnUpdate = false;
       this.selected = Math.max(0, Math.min(this.choiceIndexes.length - 1, this.selected + delta));
     }
   }
@@ -155,6 +156,29 @@ export class InlineCompletion {
     const index = choice === undefined ? undefined : this.choiceIndexes[choice];
     const item = index === undefined ? undefined : this.items[index];
     return item && isChoice(item) ? item : undefined;
+  }
+
+  private cellWidth(value: string): number {
+    let width = 0;
+    for (const character of value) {
+      width += this.unicode.wcwidth(character.codePointAt(0)!);
+    }
+    return width;
+  }
+
+  private fit(value: string, width: number): string {
+    if (width <= 0) return "";
+    const text = value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+    let cells = 0;
+    let offset = 0;
+    let ellipsisOffset = 0;
+    for (const character of text) {
+      cells += this.unicode.wcwidth(character.codePointAt(0)!);
+      if (cells > width) return text.slice(0, ellipsisOffset) + "…";
+      offset += character.length;
+      if (cells < width) ellipsisOffset = offset;
+    }
+    return text;
   }
 
   lines(
@@ -180,26 +204,27 @@ export class InlineCompletion {
 
     for (const item of this.items) {
       if (!isChoice(item)) {
-        rows.push({ text: fit(item.label, contentWidth), group: true });
+        rows.push({ text: this.fit(item.label, contentWidth), group: true });
         continue;
       }
 
       const iconKind = ICON.exec(item.label)?.[1];
       const moduleIcon = iconKind === "module";
-      const label = fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 4 : 3));
-      const description = fit(item.description ?? "", contentWidth);
+      const label = this.fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 4 : 3));
+      const description = this.fit(item.description ?? "", contentWidth);
       const iconColor = ESC + "38;5;" + (ICON_COLORS[iconKind ?? ""] ?? 245) + "m";
       const icon = iconColor + (moduleIcon ? "{}" : "●") + FG_RESET;
-      const rest = contentWidth - [...label].length - (moduleIcon ? 4 : 3);
-      const suffix = description && rest >= [...description].length + 2
-        ? " ".repeat(rest - [...description].length) + DIM + description + DIM_RESET
+      const rest = contentWidth - this.cellWidth(label) - (moduleIcon ? 4 : 3);
+      const descriptionWidth = this.cellWidth(description);
+      const suffix = description && rest >= descriptionWidth + 2
+        ? " ".repeat(rest - descriptionWidth) + DIM + description + DIM_RESET
         : "";
       rows.push({
         text: icon + " " + highlightMatch(label, this.query, colors.matchForeground) + suffix,
         choice,
       });
       if (item.detail) {
-        rows.push({ text: "  " + fit(item.detail, contentWidth - 2), choice, detail: true });
+        rows.push({ text: "  " + this.fit(item.detail, contentWidth - 2), choice, detail: true });
       }
       choice++;
     }
@@ -216,7 +241,7 @@ export class InlineCompletion {
     const start = this.scrollStart;
     const body = rows.slice(start, start + capacity);
     const frame = (text: string, selected = false, muted = false, bar = " "): string => {
-      const plainLength = [...text.replace(/\x1b\[[0-9;]*m/g, "")].length;
+      const plainLength = this.cellWidth(text.replace(/\x1b\[[0-9;]*m/g, ""));
       const padded = text + " ".repeat(Math.max(0, contentWidth - plainLength));
       const styled = muted ? DIM + padded + DIM_RESET : padded;
       // Selected background begins before the text, and foreground spans reset
@@ -244,7 +269,7 @@ export class InlineCompletion {
     const first = body.find(row => row.choice !== undefined)?.choice;
     const last = [...body].reverse().find(row => row.choice !== undefined)?.choice;
     const status = first === undefined ? "" : (first + 1) + "–" + (last! + 1) + " of " + this.choiceIndexes.length;
-    output.push(frame(fit(status, contentWidth), false, true));
+    output.push(frame(this.fit(status, contentWidth), false, true));
     output.push(border("╰", "╯"));
     this.renderedTargets.push(undefined, undefined);
     return output.map(line => indent + line);

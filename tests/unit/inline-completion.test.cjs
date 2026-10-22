@@ -1,12 +1,15 @@
 const assert = require("node:assert/strict");
-const { test } = require("node:test");
+const { test, after } = require("node:test");
+const { Terminal } = require("@xterm/headless");
 const loadSource = require("../helpers/load-source.cjs");
 const { InlineCompletion } = loadSource("src/Terminal/inlineCompletion.ts");
+const widthTerminal = new Terminal({ cols: 20, rows: 2 });
+const unicode = widthTerminal._core.unicodeService;
+after(() => widthTerminal.dispose());
 
 const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInput: "", snapshotCursor: 0, source: "session" });
 
-function createTerminal(t, columns = 80, rows = 24) {
-  const { Terminal } = require("@xterm/headless");
+function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
   const { InputState } = loadSource("src/Terminal/inputState.ts");
   const { Renderer } = loadSource("src/Terminal/renderer.ts");
   const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
@@ -15,12 +18,12 @@ function createTerminal(t, columns = 80, rows = 24) {
     vscode: {
       EventEmitter: class {}, window: {},
       workspace: { getConfiguration: () => ({ get: (key, fallback) =>
-        key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? "typing" : fallback }) },
+        key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? trigger : fallback }) },
     },
   });
   const screen = new Terminal({ cols: columns, rows, allowProposedApi: true });
   const terminal = Object.assign(Object.create(RTerminal.prototype), {
-    inputState: new InputState(), inlineCompletion: new InlineCompletion(),
+    inputState: new InputState(), inlineCompletion: new InlineCompletion(unicode),
     mode: "ready", promptReady: true, dimensions: { columns, rows },
     inlineSuggestionRowCount: 0,
     lang: { cancelCompletion() {}, updateInput() {} },
@@ -95,6 +98,38 @@ test("a panel that cannot fit releases Enter and mouse reporting", t => {
   }
 });
 
+test("wide and combining characters fit the panel without moving the input cursor or mouse targets", t => {
+  for (const label of ["字段名称", "姓名".repeat(30), "𠀀".repeat(30), "e\u0301".repeat(40), "a".repeat(31) + "姓名"]) {
+    const { terminal, screen } = createTerminal(t, 40, 24);
+    terminal.inputState.insertText("df$");
+    const choice = {
+      ...item(label), snapshotInput: "df$", snapshotCursor: 3,
+      description: "变量", detail: "详细信息".repeat(20),
+    };
+    terminal.inlineCompletion.set([{ label: "列名称".repeat(20) }, choice], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    const buffer = screen.buffer.active;
+    assert.equal(buffer.cursorY, 0, label);
+    assert.equal(buffer.cursorX, 6, label);
+    assert.equal(buffer.getLine(buffer.baseY).translateToString(true), "R> df$");
+    assert.equal(terminal.renderer.renderedLineCount, 7);
+    const labelRow = buffer.getLine(buffer.baseY + 3).translateToString(true);
+    assert.ok(labelRow.includes(label === "字段名称" ? label : "…"), "preserve short labels and mark truncation");
+    for (let row = 1; row < 7; row++) {
+      const line = buffer.getLine(buffer.baseY + row);
+      assert.equal(line.isWrapped, false, label);
+      assert.equal(line.getCell(0).getChars(), row === 1 ? "╭" : row === 6 ? "╰" : "│");
+      assert.equal(line.getCell(38).getChars(), row === 1 ? "╮" : row === 6 ? "╯" : "│");
+      assert.equal(line.getCell(39).getChars(), "");
+    }
+    terminal.renderInput();
+    assert.equal(buffer.cursorY, 0, "stable redraw keeps the caret beside the input");
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row: 4, col: 8 });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row: 4, col: 8 });
+    assert.equal(terminal.accepted, choice);
+  }
+});
+
 test("Escape cancels both delayed results and the typing debounce before a panel appears", async t => {
   const { terminal } = createTerminal(t);
   terminal.inputState.insertText("mea");
@@ -117,6 +152,81 @@ test("Escape cancels both delayed results and the typing debounce before a panel
   assert.equal(terminal.inputState.text, "mea");
 });
 
+test("Tab mode refreshes an open list on edits without opening one for ordinary typing", async t => {
+  const { terminal } = createTerminal(t, 80, 24, "tab");
+  let publish;
+  let requestedInput;
+  terminal.lang.handleAutocomplete = async ({ input, onInlineEntries }) => {
+    requestedInput = input.currentLine;
+    publish = onInlineEntries;
+  };
+  terminal.applyKeyAction({ type: "text", text: "df$a" });
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  terminal.inlineCompletion.set([{ ...item("alpha"), snapshotInput: "df$a", snapshotCursor: 4 }], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  terminal.applyKeyAction({ type: "text", text: "z" });
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.equal(requestedInput, "df$az");
+  publish([]);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(terminal.inlineMouseReporting, false);
+  terminal.applyKeyAction({ type: "tab" });
+  const choices = ["aztec", "azimuth"].map(label => ({
+    ...item(label), snapshotInput: "df$az", snapshotCursor: 5,
+  }));
+  publish(choices);
+  terminal.applyKeyAction({ type: "arrow", dir: "down" });
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.accepted, choices[1], "Tab accepts the selected entry when the list is open");
+});
+
+test("Backspace resets selection and scrolling through staged and full results", async t => {
+  for (const trigger of ["typing", "tab"]) {
+    const { terminal, screen } = createTerminal(t, 80, 24, trigger);
+    terminal.inputState.insertText("librar");
+    const choices = Array.from({ length: 20 }, (_, i) => ({
+      ...item("library" + i), snapshotInput: "librar", snapshotCursor: 6,
+    }));
+    terminal.inlineCompletion.set([{ label: "Functions" }, ...choices], terminal.inlineCompletion.token);
+    terminal.inlineCompletion.move(15);
+    terminal.renderInput();
+    let publish;
+    terminal.lang.handleAutocomplete = async ({ onInlineEntries }) => { publish = onInlineEntries; };
+    terminal.applyKeyAction({ type: "backspace" });
+    assert.equal(terminal.inputState.text, "libra");
+    assert.equal(terminal.inlineCompletion.selected, 0, "reset before results arrive");
+    const buffer = screen.buffer.active;
+    assert.ok(Array.from({ length: 24 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true)).some(line => line.includes("Functions")));
+    terminal.applyKeyAction({ type: "backspace" });
+    assert.equal(terminal.inputState.text, "libr");
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const updated = choices.map(choice => ({ ...choice, snapshotInput: "libr", snapshotCursor: 4 }));
+    publish([{ label: "Functions" }, ...updated]);
+    assert.equal(terminal.inlineCompletion.selected, 0);
+    const full = [{ ...updated[0], label: "libr_new", insertText: "libr_new" }, ...updated];
+    publish([{ label: "Functions" }, ...full]);
+    assert.equal(terminal.inlineCompletion.selected, 0, "full results must not restore an old selection");
+    terminal.applyKeyAction({ type: "arrow", dir: "down" });
+    publish([{ label: "Functions" }, ...full]);
+    assert.equal(terminal.inlineCompletion.selected, 1, "respect navigation after the reset");
+  }
+});
+
+test("dismissal erases the panel even when the following key does not edit input", t => {
+  for (const type of ["backtab", "ctrl_d", "completion"]) {
+    const { terminal, screen } = createTerminal(t);
+    terminal.inputState.insertText("mea");
+    terminal.inlineCompletion.set([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    terminal.applyKeyAction({ type });
+    assert.equal(terminal.inputState.text, "mea");
+    assert.equal(terminal.inlineCompletion.visible, false);
+    assert.equal(terminal.inlineMouseReporting, false);
+    const buffer = screen.buffer.active;
+    assert.ok(!Array.from({ length: 24 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true)).join("\n").includes("╭"), type);
+  }
+});
+
 test("typing publishes an empty list when matches or the completion context disappear", async () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {
@@ -130,7 +240,7 @@ test("typing publishes an empty list when matches or the completion context disa
   const lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions: async () => [] });
   lang.ensureConsoleLspStarted = async () => undefined;
   lang.getOrOpenCompletionDocument = async () => undefined;
-  const panel = new InlineCompletion();
+  const panel = new InlineCompletion(unicode);
   for (const text of ["df$a", "df$az", "df$a", "# comment"]) {
     const input = { text, currentLine: text, cursorCol: text.length, cursorRow: 0, lines: [text], textBeforeCursor: text };
     const token = panel.invalidate();
@@ -146,7 +256,7 @@ test("typing publishes an empty list when matches or the completion context disa
 });
 
 test("inline completion navigates, clamps and accepts selected item", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   assert.ok(state.set(["apple", "apricot", "avocado"].map(item), state.token));
   state.move(10);
   assert.equal(state.current().label, "avocado");
@@ -156,7 +266,7 @@ test("inline completion navigates, clamps and accepts selected item", () => {
 });
 
 test("old asynchronous completion results cannot reopen a dismissed list", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   const token = state.token;
   state.clear();
   assert.equal(state.set([item("stale")], token), false);
@@ -164,7 +274,7 @@ test("old asynchronous completion results cannot reopen a dismissed list", () =>
 });
 
 test("inline completion draws a border, shows picker metadata, and hides codicon markup", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([
     { label: "Runtime Variables" },
     { ...item("$(symbol-variable) mtcars"), description: "variable", detail: "session" },
@@ -188,7 +298,7 @@ test("inline completion draws a border, shows picker metadata, and hides codicon
 });
 
 test("inline scrolling follows selected completion and removes unsafe escapes", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set(Array.from({ length: 20 }, (_, i) => item("item" + i)), state.token);
   state.move(14);
   const lines = state.lines(40, 8);
@@ -203,7 +313,7 @@ test("inline scrolling follows selected completion and removes unsafe escapes", 
 });
 
 test("invalidation retains panel and preserves selection on updated entries", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([item("one"), item("two")], state.token);
   state.move(1);
   const old = state.token;
@@ -216,7 +326,7 @@ test("invalidation retains panel and preserves selection on updated entries", ()
 });
 
 test("module icons use blue braces rather than a yellow dot", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([{ ...item("$(symbol-module) stats"), description: "module" }], state.token);
   const rendered = state.lines(40, 7).join("");
   assert.ok(rendered.includes("\x1b[38;5;75m{}"));
@@ -224,7 +334,7 @@ test("module icons use blue braces rather than a yellow dot", () => {
 });
 
 test("empty completion lists do not reserve terminal rows", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   assert.deepEqual(state.lines(80, 20), []);
   assert.equal(state.current(), undefined);
 });
@@ -254,7 +364,7 @@ test("clearing the last typed character dismisses suggestions and blocks stale r
   const { InputState } = loadSource("src/Terminal/inputState.ts");
   const terminal = Object.assign(Object.create(RTerminal.prototype), {
     inputState: new InputState(), mode: "ready", promptReady: true,
-    inlineCompletion: new InlineCompletion(),
+    inlineCompletion: new InlineCompletion(unicode),
     lang: { cancelCompletion() {} },
     renderInput() {},
   });
@@ -277,7 +387,7 @@ test("whitespace-only input also dismisses pending inline suggestions", () => {
   const { InputState } = loadSource("src/Terminal/inputState.ts");
   const terminal = Object.assign(Object.create(RTerminal.prototype), {
     inputState: new InputState(), mode: "ready", promptReady: true,
-    inlineCompletion: new InlineCompletion(),
+    inlineCompletion: new InlineCompletion(unicode),
     lang: { cancelCompletion() {} },
     renderInput() {},
   });
@@ -288,7 +398,7 @@ test("whitespace-only input also dismisses pending inline suggestions", () => {
 });
 
 test("mouse hit testing maps displayed rows, including scrolled entries and details", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([
     { label: "Functions" },
     { ...item("alpha"), detail: "details" },
@@ -315,7 +425,7 @@ test("mouse hit testing maps displayed rows, including scrolled entries and deta
 });
 
 test("scrollbar follows viewport and selection scrolls only at visible edges", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set(Array.from({ length: 12 }, (_, i) => item("entry" + i)), state.token);
   const first = state.lines(40, 8).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
   assert.match(first, /█/);
@@ -334,7 +444,7 @@ test("scrollbar follows viewport and selection scrolls only at visible edges", (
 
 test("first and last choices reach scrollbar endpoints including headings and details", () => {
   for (const withDetails of [false, true]) {
-    const state = new InlineCompletion();
+    const state = new InlineCompletion(unicode);
     const count = withDetails ? 6 : 10;
     state.set([
       { label: "Functions" },
@@ -357,7 +467,7 @@ test("first and last choices reach scrollbar endpoints including headings and de
 });
 
 test("hit-test bounds restrict mouse-wheel navigation to box contents", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([item("one"), item("two")], state.token);
   const lines = state.lines(40, 7);
   assert.equal(state.contains(1, 8), true);
@@ -370,7 +480,7 @@ test("hit-test bounds restrict mouse-wheel navigation to box contents", () => {
 });
 
 test("suggestion panel tracks typed column, clamps near right edge and hit-tests the shifted box", () => {
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([item("library")], state.token, "lib");
   const original = state.lines(80, 8, 15);
   assert.ok(original[0].startsWith(" ".repeat(14) + "\x1b[90m╭"));
@@ -390,7 +500,7 @@ test("typed matches use theme foreground, selected text has a continuous backgro
   });
   assert.equal(colors.matchForeground, "\x1b[38;2;19;121;189m");
   assert.equal(colors.selectedBackground, "\x1b[48;2;221;238;255m");
-  const state = new InlineCompletion();
+  const state = new InlineCompletion(unicode);
   state.set([{ label: "Functions" }, { ...item("$(symbol-function) library"), description: "base" }], state.token, "lib");
   const lines = state.lines(80, 8, 4, colors);
   const heading = lines.find(line => line.includes("Functions"));
