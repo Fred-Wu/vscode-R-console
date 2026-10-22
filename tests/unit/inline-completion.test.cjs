@@ -41,8 +41,8 @@ test("inline completion draws a border, shows picker metadata, and hides codicon
   assert.match(plain, /{base}/);
   assert.doesNotMatch(plain, /\$\(symbol-|> mtcars/);
   assert.match(lines.join(""), /\x1b\[38;5;75m/);
-  assert.doesNotMatch(lines.join(""), /\x1b\[7m/);
-  assert.match(plain, /◉ mtcars/);
+  assert.match(lines.join(""), /\x1b\[7m/);
+  assert.match(plain, /● mtcars/);
   state.move(1);
   assert.equal(state.current().insertText, "$(symbol-function) mean");
 });
@@ -172,4 +172,35 @@ test("mouse hit testing maps displayed rows, including scrolled entries and deta
   assert.equal(state.hitTest(1, 8), undefined);
   assert.equal(state.hitTest(2, 8)?.label, "alpha");
   assert.equal(state.hitTest(3, 8)?.label, "alpha");
+});
+
+test("scrollbar follows viewport and selection scrolls only at visible edges", () => {
+  const state = new InlineCompletion();
+  state.set(Array.from({ length: 12 }, (_, i) => item("entry" + i)), state.token);
+  const first = state.lines(40, 8).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  assert.match(first, /█/);
+  assert.ok(first.includes("entry0"));
+  assert.ok(first.includes("entry4"));
+  state.move(2);
+  const middle = state.lines(40, 8).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  assert.ok(middle.includes("entry0"), "moving within the viewport must not scroll");
+  state.move(3);
+  const edge = state.lines(40, 8).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  assert.ok(!edge.includes("entry0"), "leaving the viewport scrolls by a row");
+  state.move(-2);
+  const back = state.lines(40, 8).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  assert.ok(!back.includes("entry0"), "moving inside current viewport preserves position");
+});
+
+test("hit-test bounds restrict mouse-wheel navigation to box contents", () => {
+  const state = new InlineCompletion();
+  state.set([item("one"), item("two")], state.token);
+  const lines = state.lines(40, 7);
+  assert.equal(state.contains(1, 8), true);
+  assert.equal(state.contains(0, 8), false);
+  assert.equal(state.contains(lines.length - 1, 8), false);
+  assert.equal(state.contains(1, 1), false);
+  assert.equal(state.contains(1, 40), false);
+  state.clear();
+  assert.equal(state.contains(1, 8), false);
 });
