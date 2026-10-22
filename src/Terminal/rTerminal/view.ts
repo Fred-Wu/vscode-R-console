@@ -22,6 +22,8 @@ type RenderInputOptions = {
   dimensions: Dimensions;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
+  suggestions?: string[];
+  plan?: InputRenderPlan;
 };
 
 export type InputRenderPlan = {
@@ -75,10 +77,12 @@ export function renderInput({
   dimensions,
   historyBrowsing,
   historyCollapsed,
+  suggestions = [],
+  plan: providedPlan,
 }: RenderInputOptions): void {
   syntax.setSource(inputState.lines);
 
-  const plan = buildInputRenderPlan({
+  const plan = providedPlan ?? buildInputRenderPlan({
     renderer,
     inputState,
     dimensions,
@@ -92,7 +96,8 @@ export function renderInput({
     plan.cursorCol,
     dimensions.columns,
     plan.sourceLineMap,
-    plan.promptKinds
+    plan.promptKinds,
+    suggestions
   );
 }
 
@@ -113,7 +118,8 @@ export function buildInputRenderPlan({
     lines,
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   let plan:
@@ -146,7 +152,8 @@ export function buildInputRenderPlan({
     plan.lines,
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   return {
@@ -209,7 +216,8 @@ function buildWindowedInputRenderPlan({
     Math.max(1, dimensions.rows - 1),
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   return plan;
@@ -229,7 +237,8 @@ function buildCollapsedInputRenderPlan({
     Math.max(1, dimensions.rows - 1),
     dimensions.columns,
     renderer.promptLen,
-    continuationPromptLen
+    continuationPromptLen,
+    renderer.displayWidth
   );
 
   if (!plan) {

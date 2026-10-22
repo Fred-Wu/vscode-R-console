@@ -1,4 +1,5 @@
 import { ANSI } from "./ansi";
+import { getWrappedLineLayout } from "./inputViewport";
 
 export interface RendererLineHighlighter {
   highlightLines(lines: string[], sourceLineMap?: Array<number | undefined>): string[];
@@ -9,6 +10,7 @@ type RenderPromptKind = "main" | "cont";
 export class Renderer {
   renderedLineCount = 1;
   cursorRowFromTop = 0;
+  suggestionStartRow = 0;
   promptText = "R> ";
   promptColor = ANSI.brightGreen;
   promptLen = 3;
@@ -16,8 +18,14 @@ export class Renderer {
   continuationPromptColor = ANSI.reset;
   private readonly write: (text: string) => void;
   private lineHighlighter: RendererLineHighlighter | undefined;
+  private lastSuggestions: string[] = [];
+  private lastInputRows = 0;
 
-  constructor(write: (text: string) => void, lineHighlighter?: RendererLineHighlighter) {
+  constructor(
+    write: (text: string) => void,
+    lineHighlighter?: RendererLineHighlighter,
+    readonly displayWidth: (text: string) => number = text => text.length
+  ) {
     this.write = write;
     this.lineHighlighter = lineHighlighter;
   }
@@ -38,34 +46,83 @@ export class Renderer {
     this.continuationPromptColor = ANSI.reset;
   }
 
+  private splitStyledLine(line: string, offset: number): [string, string] {
+    let count = 0;
+    let style = "";
+    let i = 0;
+    while (i < line.length && count < offset) {
+      const sgr = /^\x1b\[[0-9;]*m/.exec(line.slice(i));
+      if (sgr) {
+        style = sgr[0] === "\x1b[0m" ? "" : style + sgr[0];
+        i += sgr[0].length;
+        continue;
+      }
+      const char = String.fromCodePoint(line.codePointAt(i)!);
+      count += char.length;
+      i += char.length;
+    }
+    return [line.slice(0, i) + ANSI.reset, style + line.slice(i)];
+  }
+
   renderWithCursor(
     lines: string[],
     cursorRow: number,
     cursorCol: number,
     columns: number,
     sourceLineMap: Array<number | undefined>,
-    promptKinds: RenderPromptKind[]
+    promptKinds: RenderPromptKind[],
+    suggestions: string[] = []
   ): void {
-    const highlighted = this.lineHighlighter
+    const input = this.lineHighlighter
       ? this.lineHighlighter.highlightLines(lines, sourceLineMap)
       : lines;
     const safeColumns = Math.max(1, columns);
+    const continuationLen = this.continuationPromptText?.length ?? 2;
+    const promptLen = promptKinds[cursorRow] === "main" ? this.promptLen : continuationLen;
+    const sourceLine = lines[cursorRow] ?? "";
+    const caret = getWrappedLineLayout(sourceLine, safeColumns, promptLen, this.displayWidth, cursorCol);
+    // Split a long logical input line at the end of the caret's physical row.
+    // The suffix stays below the panel, while the caret remains in the prefix.
+    const split = suggestions.length > 0 && caret.splitIndex < sourceLine.length;
+    let inputLines = input;
+    let inputKinds: Array<RenderPromptKind | "none"> = [...promptKinds];
+    if (split) {
+      const before = this.splitStyledLine(input[cursorRow] ?? "", caret.splitIndex);
+      inputLines = [...input.slice(0, cursorRow), before[0], before[1], ...input.slice(cursorRow + 1)];
+      inputKinds = [...promptKinds.slice(0, cursorRow + 1), "none", ...promptKinds.slice(cursorRow + 1)];
+    }
+    const insertAt = Math.min(inputLines.length, cursorRow + 1);
+    const highlighted = [
+      ...inputLines.slice(0, insertAt), ...suggestions, ...inputLines.slice(insertAt),
+    ];
+    const layoutKinds: Array<RenderPromptKind | "none"> = [
+      ...inputKinds.slice(0, insertAt),
+      ...suggestions.map(() => "none" as const),
+      ...inputKinds.slice(insertAt),
+    ];
     const continuationPad = 2;
-    const continuationLen = this.continuationPromptText
-      ? this.continuationPromptText.length
-      : continuationPad;
-    const getPromptKind = (index: number): RenderPromptKind => promptKinds[index]!;
+    const getPromptKind = (index: number): RenderPromptKind | "none" => layoutKinds[index] ?? "none";
 
-    const lineRows = lines.map((_, idx) => {
-      const pLen =
-        getPromptKind(idx) === "main"
-          ? this.promptLen
-          : continuationLen;
-      const visibleLen =
-        pLen + highlighted[idx].replace(/\x1b\[[0-9;]*m/g, "").length;
-      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+    const lineRows = highlighted.map((_, idx) => {
+      // Suggestion rows are already fitted to the terminal's cell width.
+      if (getPromptKind(idx) === "none" && idx < insertAt + suggestions.length) return 1;
+      const pLen = getPromptKind(idx) === "none" ? 0 :
+        getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
+      return getWrappedLineLayout(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""),
+        safeColumns, pLen, this.displayWidth).rows;
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
+    const inputRows = lineRows.reduce((sum, n, index) =>
+      sum + (getPromptKind(index) === "none" ? 0 : n), 0);
+    this.suggestionStartRow = lineRows.slice(0, insertAt).reduce((sum, n) => sum + n, 0);
+    const sameSuggestions = suggestions.length > 0 &&
+      suggestions.length === this.lastSuggestions.length &&
+      suggestions.every((line, index) => line === this.lastSuggestions[index]);
+    const repaintInputOnly = !split && insertAt === lines.length &&
+      sameSuggestions && inputRows === this.lastInputRows &&
+      totalRows === this.renderedLineCount;
+    this.lastSuggestions = [...suggestions];
+    this.lastInputRows = inputRows;
     const previousRows = this.renderedLineCount;
     const clearRenderedArea = (rowCount: number): void => {
       for (let i = 0; i < rowCount; i++) {
@@ -94,6 +151,35 @@ export class Renderer {
     }
     const areaRows = this.renderedLineCount;
 
+    // A changed command does not need to repaint a stable suggestion panel.
+    // Cursor movements and changed suggestions still use the standard redraw.
+    if (repaintInputOnly) {
+      this.write("\r");
+      if (this.cursorRowFromTop > 0) this.write(`\x1b[${this.cursorRowFromTop}A`);
+      for (let row = 0; row < inputRows; row++) {
+        this.write("\x1b[2K");
+        if (row < inputRows - 1) this.write("\x1b[1B\r");
+      }
+      if (inputRows > 1) this.write(`\x1b[${inputRows - 1}A\r`);
+      highlighted.slice(0, lines.length).forEach((line, idx) => {
+        if (idx > 0) this.write("\r\n");
+        const promptKind = getPromptKind(idx);
+        const prompt = promptKind === "main"
+          ? `${ANSI.reset}${this.promptColor}${this.promptText}${ANSI.reset}`
+          : (this.continuationPromptText === null
+              ? " ".repeat(continuationPad)
+              : `${ANSI.reset}${this.continuationPromptColor}${this.continuationPromptText}${ANSI.reset}`);
+        this.write(prompt + line);
+      });
+      const prefix = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
+      const terminalRow = prefix + caret.cursorRow;
+      const delta = Math.max(0, inputRows - 1 - terminalRow);
+      if (delta > 0) this.write(`\x1b[${delta}A`);
+      this.write(`\r\x1b[${caret.cursorColumn}G`);
+      this.cursorRowFromTop = terminalRow;
+      return;
+    }
+
     this.write("\r");
     if (this.cursorRowFromTop > 0) {
       this.write(`\x1b[${this.cursorRowFromTop}A`);
@@ -108,7 +194,7 @@ export class Renderer {
     highlighted.forEach((line, idx) => {
       if (idx > 0) this.write("\r\n");
       const promptKind = getPromptKind(idx);
-      const prompt =
+      const prompt = promptKind === "none" ? "" :
         promptKind === "main"
           ? `${ANSI.reset}${this.promptColor}${this.promptText}${ANSI.reset}`
           : (this.continuationPromptText === null
@@ -118,14 +204,8 @@ export class Renderer {
     });
 
     const prefixRows = lineRows.slice(0, cursorRow).reduce((sum, n) => sum + n, 0);
-    const pLen =
-      getPromptKind(cursorRow) === "main"
-        ? this.promptLen
-        : continuationLen;
-    const cursorOffset = pLen + cursorCol;
-    const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
-    const terminalRow = prefixRows + rowWithinLine;
-    const col = (cursorOffset % safeColumns) + 1;
+    const terminalRow = prefixRows + caret.cursorRow;
+    const col = caret.cursorColumn;
 
     const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
     if (deltaUp > 0) {
@@ -133,6 +213,7 @@ export class Renderer {
     }
     this.write(`\r\x1b[${col}G`);
 
+    this.renderedLineCount = totalRows;
     this.cursorRowFromTop = terminalRow;
   }
 
@@ -159,9 +240,8 @@ export class Renderer {
         getPromptKind(idx) === "main"
           ? this.promptLen
           : continuationLen;
-      const visibleLen =
-        pLen + highlighted[idx].replace(/\x1b\[[0-9;]*m/g, "").length;
-      return Math.max(1, Math.ceil(visibleLen / safeColumns));
+      return getWrappedLineLayout(highlighted[idx].replace(/\x1b\[[0-9;]*m/g, ""),
+        safeColumns, pLen, this.displayWidth).rows;
     });
     const totalRows = lineRows.reduce((sum, n) => sum + n, 0) || 1;
 
@@ -185,10 +265,9 @@ export class Renderer {
       getPromptKind(cursorRow) === "main"
         ? this.promptLen
         : continuationLen;
-    const cursorOffset = pLen + cursorCol;
-    const rowWithinLine = cursorOffset > 0 ? Math.floor(cursorOffset / safeColumns) : 0;
-    const terminalRow = prefixRows + rowWithinLine;
-    const col = (cursorOffset % safeColumns) + 1;
+    const caret = getWrappedLineLayout(lines[cursorRow] ?? "", safeColumns, pLen, this.displayWidth, cursorCol);
+    const terminalRow = prefixRows + caret.cursorRow;
+    const col = caret.cursorColumn;
 
     const deltaUp = Math.max(0, totalRows - 1 - terminalRow);
     if (deltaUp > 0) {

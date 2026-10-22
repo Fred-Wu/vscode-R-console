@@ -767,3 +767,24 @@ test("F8 history picker wording, icons, and command label remain consistent", ()
     (binding) => binding.key === "f8" && binding.command === "r-console.searchHistory"
   ));
 });
+
+test("terminal wheel events decode for inline completion scrolling", () => {
+  const keys = new KeyProcessor();
+  assert.deepEqual(keys.parseInputChunk("\x1b[<64;12;7M\x1b[<65;12;8M"), [
+    { type: "wheel", dir: "up", col: 12, row: 7 },
+    { type: "wheel", dir: "down", col: 12, row: 8 },
+  ]);
+  assert.deepEqual(keys.parseInputChunk("\x1b[<0;12;7M"), [
+    { type: "mouse", pressed: true, col: 12, row: 7 },
+  ]);
+});
+
+test("SGR left-click and cursor reports decode without treating other buttons as clicks", () => {
+  const keys = new KeyProcessor();
+  assert.deepEqual(keys.parseInputChunk("\x1b[<0;9;12M\x1b[<0;9;12m\x1b[15;4R"), [
+    { type: "mouse", pressed: true, col: 9, row: 12 },
+    { type: "mouse", pressed: false, col: 9, row: 12 },
+    { type: "cursor-report", row: 15, col: 4 },
+  ]);
+  assert.deepEqual(keys.parseInputChunk("\x1b[<2;9;12M"), []);
+});

@@ -10,6 +10,10 @@ export type KeyAction =
   | { type: "tab" }
   | { type: "backtab" }
   | { type: "completion" }
+  | { type: "page"; dir: "up" | "down" }
+  | { type: "wheel"; dir: "up" | "down"; col: number; row: number }
+  | { type: "mouse"; pressed: boolean; col: number; row: number }
+  | { type: "cursor-report"; col: number; row: number }
   | { type: "history" }
   | { type: "escape" }
   | { type: "ctrl_c" }
@@ -39,6 +43,8 @@ const CSI_5: Map<string, KeyAction> = new Map([
 const CSI_4: Map<string, KeyAction> = new Map([
   ["\x1b[3~", { type: "delete" }],
   ["\x1b[1~", { type: "home" }],
+  ["\x1b[5~", { type: "page", dir: "up" }],
+  ["\x1b[6~", { type: "page", dir: "down" }],
   ["\x1b[4~", { type: "end" }],
   ["\x1b[7~", { type: "home" }],
   ["\x1b[8~", { type: "end" }],
@@ -155,6 +161,24 @@ export class KeyProcessor {
           }
 
           const sequence = parsed.sequence!;
+          const position = /^\x1b\[(\d+);(\d+)R$/.exec(sequence);
+          if (position) {
+            actions.push({ type: "cursor-report", row: Number(position[1]), col: Number(position[2]) });
+            i += sequence.length;
+            continue;
+          }
+          const click = /^\x1b\[<0;(\d+);(\d+)(M|m)$/.exec(sequence);
+          if (click) {
+            actions.push({ type: "mouse", pressed: click[3] === "M", col: Number(click[1]), row: Number(click[2]) });
+            i += sequence.length;
+            continue;
+          }
+          const mouse = /^\x1b\[<(64|65);(\d+);(\d+)M$/.exec(sequence);
+          if (mouse) {
+            actions.push({ type: "wheel", dir: mouse[1] === "64" ? "up" : "down", col: Number(mouse[2]), row: Number(mouse[3]) });
+            i += sequence.length;
+            continue;
+          }
           const action = getCsiAction(sequence);
           if (action) {
             if (action.type === "paste-start") this.inPaste = true;

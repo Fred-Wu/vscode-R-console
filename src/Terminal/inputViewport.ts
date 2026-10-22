@@ -41,12 +41,53 @@ function getPromptLengthForLine(
   return lineIndex === 0 ? promptLen : continuationPromptLen;
 }
 
+export function getWrappedLineLayout(
+  line: string,
+  columns: number,
+  promptLen: number,
+  widthOf: (text: string) => number,
+  cursorCol = line.length
+): { rows: number; endColumn: number; cursorRow: number; cursorColumn: number; splitIndex: number } {
+  const width = Math.max(1, columns);
+  let row = Math.max(0, Math.ceil(promptLen / width) - 1);
+  let col = promptLen - row * width;
+  let index = 0;
+  let cursorRow = -1;
+  let cursorColumn = 1;
+  let splitIndex = line.length;
+  for (const char of line) {
+    const size = widthOf(char);
+    // A wide character leaves the final cell empty if it cannot fit there.
+    if (size > 0 && col + size > width) {
+      row++;
+      col = 0;
+    }
+    if (cursorRow < 0 && index >= cursorCol) {
+      cursorRow = row;
+      cursorColumn = Math.min(width, col + 1);
+    }
+    if (cursorRow >= 0 && row > cursorRow && splitIndex === line.length) {
+      splitIndex = index;
+    }
+    col += size;
+    index += char.length;
+  }
+  return {
+    rows: row + 1,
+    endColumn: col,
+    cursorRow: cursorRow < 0 ? row : cursorRow,
+    cursorColumn: cursorRow < 0 ? Math.min(width, col + 1) : cursorColumn,
+    splitIndex,
+  };
+}
+
 function getRenderedRowCountForLine(
   line: string,
   lineIndex: number,
   columns: number,
   promptLen: number,
-  continuationPromptLen: number
+  continuationPromptLen: number,
+  widthOf: (text: string) => number = text => text.length
 ): number {
   const safeColumns = Math.max(1, columns || 80);
   const visiblePromptLen = getPromptLengthForLine(
@@ -54,8 +95,7 @@ function getRenderedRowCountForLine(
     promptLen,
     continuationPromptLen
   );
-  const visibleLen = visiblePromptLen + line.length;
-  return Math.max(1, Math.ceil(visibleLen / safeColumns));
+  return getWrappedLineLayout(line, safeColumns, visiblePromptLen, widthOf).rows;
 }
 
 export function getContinuationPromptLength(
@@ -71,7 +111,8 @@ export function getRenderedRowCount(
   lines: string[],
   columns: number,
   promptLen: number,
-  continuationPromptLen: number
+  continuationPromptLen: number,
+  widthOf: (text: string) => number = text => text.length
 ): number {
   return lines.reduce((sum, line, idx) => {
     return (
@@ -81,7 +122,8 @@ export function getRenderedRowCount(
         idx,
         columns,
         promptLen,
-        continuationPromptLen
+        continuationPromptLen,
+        widthOf
       )
     );
   }, 0);
@@ -192,7 +234,8 @@ function clipViewportLine(
   line: string,
   columns: number,
   promptLen: number,
-  focusCol?: number
+  focusCol?: number,
+  widthOf: (text: string) => number = text => text.length
 ): { text: string; cursorCol: number } {
   const safeColumns = Math.max(20, columns || 80);
   const maxLen = Math.max(1, safeColumns - Math.max(0, promptLen));
@@ -201,7 +244,7 @@ function clipViewportLine(
       ? undefined
       : Math.max(0, Math.min(focusCol, line.length));
 
-  if (line.length <= maxLen) {
+  if (widthOf(line) <= maxLen) {
     return {
       text: line,
       cursorCol: clampedFocusCol ?? line.length,
@@ -214,38 +257,40 @@ function clipViewportLine(
     };
   }
 
-  if (clampedFocusCol === undefined) {
-    return {
-      text: `${line.slice(0, maxLen - 3)}...`,
-      cursorCol: maxLen,
-    };
+  const total = widthOf(line);
+  const focus = widthOf(line.slice(0, clampedFocusCol ?? line.length));
+  const usable = maxLen - 3;
+  const desired = clampedFocusCol === undefined || focus <= usable ? 0 :
+    total - focus <= usable ? Math.max(0, total - usable) :
+    Math.max(0, focus - Math.floor((maxLen - 6) / 2));
+  let start = 0;
+  let cells = 0;
+  for (const char of line) {
+    const size = widthOf(char);
+    // Round forward to a character boundary so the reserved tail still fits.
+    if (cells >= desired && size > 0) break;
+    cells += size;
+    start += char.length;
   }
-
-  const ellipsis = "...";
-  const singleSidedBudget = maxLen - ellipsis.length;
-
-  if (clampedFocusCol <= singleSidedBudget) {
-    return {
-      text: `${line.slice(0, singleSidedBudget)}${ellipsis}`,
-      cursorCol: clampedFocusCol,
-    };
-  }
-
-  const tailStart = Math.max(0, line.length - singleSidedBudget);
-  if (clampedFocusCol >= tailStart) {
-    return {
-      text: `${ellipsis}${line.slice(tailStart)}`,
-      cursorCol: ellipsis.length + (clampedFocusCol - tailStart),
-    };
-  }
-
-  const middleBudget = Math.max(1, maxLen - ellipsis.length * 2);
-  const desiredStart = clampedFocusCol - Math.floor(middleBudget / 2);
-  const start = Math.max(0, Math.min(desiredStart, line.length - middleBudget));
-  const end = start + middleBudget;
+  const prefix = start ? "..." : "";
+  const take = (budget: number): { text: string; end: number } => {
+    let text = "";
+    let used = 0;
+    let end = start;
+    for (const char of line.slice(start)) {
+      const size = widthOf(char);
+      if (used + size > budget) break;
+      text += char;
+      used += size;
+      end += char.length;
+    }
+    return { text, end };
+  };
+  const preview = take(maxLen - prefix.length);
+  const slice = preview.end === line.length ? preview : take(maxLen - prefix.length - 3);
   return {
-    text: `${ellipsis}${line.slice(start, end)}${ellipsis}`,
-    cursorCol: ellipsis.length + (clampedFocusCol - start),
+    text: prefix + slice.text + (slice.end < line.length ? "..." : ""),
+    cursorCol: prefix.length + Math.max(0, Math.min((clampedFocusCol ?? slice.end) - start, slice.text.length)),
   };
 }
 
@@ -263,13 +308,15 @@ function clipDisplayLine(
   promptKind: "main" | "cont",
   promptLen: number,
   continuationPromptLen: number,
-  focusCol?: number
+  focusCol?: number,
+  widthOf: (text: string) => number = text => text.length
 ): { text: string; cursorCol: number } {
   return clipViewportLine(
     line,
     columns,
     getPromptLengthForDisplayLine(promptKind, promptLen, continuationPromptLen),
-    focusCol
+    focusCol,
+    widthOf
   );
 }
 
@@ -280,7 +327,8 @@ export function buildWindowedRenderPlan(
   visibleRowBudget: number,
   columns: number,
   promptLen: number,
-  continuationPromptLen: number
+  continuationPromptLen: number,
+  widthOf: (text: string) => number = text => text.length
 ): WindowedRenderPlan {
   if (visibleRowBudget === 1) {
     const promptKinds: Array<"main" | "cont"> = [cursorRow === 0 ? "main" : "cont"];
@@ -290,7 +338,8 @@ export function buildWindowedRenderPlan(
       promptKinds[0],
       promptLen,
       continuationPromptLen,
-      cursorCol
+      cursorCol,
+      widthOf
     );
     return {
       lines: [onlyLine.text],
@@ -343,7 +392,8 @@ export function buildWindowedRenderPlan(
       promptKinds[idx]!,
       promptLen,
       continuationPromptLen,
-      idx === adjustedCursorRow ? cursorCol : undefined
+      idx === adjustedCursorRow ? cursorCol : undefined,
+      widthOf
     )
   );
   const cursorLine = clippedLines[adjustedCursorRow];
@@ -362,7 +412,8 @@ export function buildCollapsedRenderPlan(
   visibleRowBudget: number,
   columns: number,
   promptLen: number,
-  continuationPromptLen: number
+  continuationPromptLen: number,
+  widthOf: (text: string) => number = text => text.length
 ): CollapsedRenderPlan | undefined {
   const totalLines = allLines.length;
 
@@ -377,7 +428,8 @@ export function buildCollapsedRenderPlan(
       promptKinds[0],
       promptLen,
       continuationPromptLen,
-      (allLines[sourceLineIndex] ?? "").length
+      (allLines[sourceLineIndex] ?? "").length,
+      widthOf
     );
     return {
       multiline: [],
@@ -430,7 +482,8 @@ export function buildCollapsedRenderPlan(
       promptKinds[idx]!,
       promptLen,
       continuationPromptLen,
-      idx === visibleLines.length - 1 ? line.length : undefined
+      idx === visibleLines.length - 1 ? line.length : undefined,
+      widthOf
     )
   );
 

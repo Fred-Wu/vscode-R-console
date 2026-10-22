@@ -8,6 +8,7 @@ import {
   collectCompletionEntries,
   getCompletionContext,
   getCompletionIdentityKey,
+  rankCompletionEntries,
   isCompletionPickItem,
   needsLanguageServerCompletion,
   toCompletionQuickPickItems,
@@ -40,6 +41,7 @@ type AutocompleteRequest = {
   getWorkspaceData: () => WorkspaceData | undefined;
   force?: boolean;
   applyCompletion: (selection: CompletionPickItem) => void;
+  onInlineEntries?: (items: import("../../Language/completion").CompletionQuickPickItem[]) => void;
 };
 
 type ConsoleSessionState = {
@@ -77,10 +79,12 @@ export class RTermLang {
     getWorkspaceData,
     force = false,
     applyCompletion,
+    onInlineEntries,
   }: AutocompleteRequest): Promise<void> {
     if (this.disposed) {
       return;
     }
+    const requestId = ++this.completionRequestId;
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -95,10 +99,10 @@ export class RTermLang {
         }
       : undefined);
     if (!context) {
+      onInlineEntries?.([]);
       return;
     }
 
-    const requestId = ++this.completionRequestId;
     {
       const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
       const workspaceDataRequest = shouldRequestWorkspaceData
@@ -160,7 +164,10 @@ export class RTermLang {
           latestInput.text
         );
       })();
-      const stagedEntries = needsStagedEntries && context.kind !== "package"
+      // Argument candidates must await LSP parameters; early session-only
+      // results would select an unrelated runtime variable.
+      const stagedEntries = needsStagedEntries &&
+        context.kind !== "package" && context.kind !== "argument"
         ? await collectCompletionEntries(
             context,
             undefined,
@@ -177,7 +184,7 @@ export class RTermLang {
         return;
       }
 
-      const opensBeforeFullResults = force || !!stagedEntries?.length;
+      const opensBeforeFullResults = (force && context.kind !== "argument") || !!stagedEntries?.length;
       const entries = stagedEntries?.length
         ? stagedEntries
         : opensBeforeFullResults
@@ -188,11 +195,28 @@ export class RTermLang {
       }
 
       if (!entries || entries.length === 0) {
-        if (!force) {
+        if (!force && !onInlineEntries) {
           return;
         }
       }
       const initialEntries = entries ?? [];
+
+      if (onInlineEntries) {
+        const publish = (results: CompletionEntries): void => {
+          if (!this.isCurrentCompletionRequest(requestId)) return;
+          const current = getCurrentInput();
+          if (current.currentLine !== context.snapshotInput ||
+              current.cursorCol !== context.snapshotCursor) return;
+          onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix), context));
+        };
+        publish(initialEntries);
+        if (opensBeforeFullResults) {
+          void fullEntriesPromise.then(results => {
+            if (results) publish(results);
+          }).catch(() => undefined);
+        }
+        return;
+      }
 
       const completionPlaceHolder = "R console completions";
       const shouldPrefillQuickPick =
@@ -211,28 +235,8 @@ export class RTermLang {
         }
         return value;
       };
-      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] => {
-        const query = searchValue(value).toLowerCase();
-        if (query.length === 0) {
-          return sourceEntries;
-        }
-        return sourceEntries
-          .map((entry, index) => ({ entry, index }))
-          .filter(({ entry }) => entry.label.toLowerCase().includes(query))
-          .sort((a, b) => {
-            const aLabel = a.entry.label.toLowerCase();
-            const bLabel = b.entry.label.toLowerCase();
-            const aRank = aLabel === query ? 0 : aLabel.startsWith(query) ? 1 : 2;
-            const bRank = bLabel === query ? 0 : bLabel.startsWith(query) ? 1 : 2;
-            return (
-              aRank - bRank ||
-              aLabel.indexOf(query) - bLabel.indexOf(query) ||
-              aLabel.length - bLabel.length ||
-              a.index - b.index
-            );
-          })
-          .map(({ entry }) => entry);
-      };
+      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
+        rankCompletionEntries(sourceEntries, searchValue(value));
       const mergeCompletionEntries = (
         firstEntries: CompletionEntry[],
         secondEntries: CompletionEntry[]
@@ -465,6 +469,8 @@ export class RTermLang {
       applyCompletion(selection);
     }
   }
+
+  cancelCompletion(): void { this.completionRequestId++; }
 
   dispose(): Promise<void> {
     if (this.disposePromise) {

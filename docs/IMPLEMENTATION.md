@@ -642,6 +642,55 @@ Implementation files:
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
 
+Inline completion is the terminal completion frontend selected with
+`r.console.completionUI = "inline"`; the default `quickPick` mode uses the
+VS Code picker. F7 is inactive in inline mode. `RTermLang` supplies both
+frontends with the same completion sources, query ranking, groups and insertion
+rules. In function-call contexts, initial completion entries await the LSP
+parameter results before the list is published, so runtime-only suggestions
+cannot become the default while parameters are pending. Parameter entries
+are selected before runtime symbols; explicit selection is retained on refresh.
+
+The `r.console.inlineCompletion.trigger` setting chooses automatic
+debounced suggestions or Tab activation. In Tab mode, editing refreshes an open
+list without opening a closed one. Tab or Enter accepts the selected suggestion,
+or requests fresh suggestions without submitting input if the visible results are stale.
+Escape dismisses it, and clearing the input dismisses the list and invalidates
+outstanding requests. Backspace resets the suggestion selection and viewport.
+
+The terminal renderer draws a bordered transient suggestion panel below the
+physical terminal row containing the input caret. Within a wrapped logical
+line, the remaining input is rendered below the panel. The renderer anchors
+the panel horizontally to the preceding display cell, clamps it to terminal
+width and fits the panel in the available viewport, reducing its height before
+windowing the input. Terminal Unicode display-cell widths determine
+suggestion alignment, input row counts and cursor positioning. Cursor
+positions exactly at the terminal's right edge remain in its final cell
+until xterm wraps on the next printable character. Suggestion rows are
+excluded from saved replay and restored terminal history.
+
+Each row can display the completion icon, label, match highlighting,
+description and detail. Group labels share the terminal background with
+unselected suggestions. The active row has a continuous selection background.
+Colors use the `workbench.colorCustomizations`
+`editorSuggestWidget.highlightForeground` and
+`editorSuggestWidget.selectedBackground` settings when defined, otherwise
+light/dark terminal-compatible defaults. Module icons use `{}`; other symbols
+use colored terminal glyphs. The pseudoterminal inherits the configured
+terminal font and cannot access resolved editor widget theme colors.
+
+The completion controller manages a bounded, scrollable viewport with an
+in-box scrollbar. Up/Down and Page Up/Down navigate completion choices, moving
+the viewport when the selected item reaches a visible edge. Temporary SGR mouse
+reporting permits wheel navigation within the panel and clicks on suggestions
+or their detail rows. Scrollbar clicks navigate the suggestion list without
+accepting an item; group headings and frame borders are not selectable.
+Wheel reports outside the box invoke VS Code terminal page-scrolling commands.
+Wheel events over either the suggestion content or its scrollbar navigate
+the completion list.
+Cursor-position reports establish the panel's screen coordinates for mouse
+hit-testing. Mouse reporting is disabled when the panel closes.
+
 `RTermLang` owns the console completion flow. It detects the completion
 context, builds fast runtime suggestions from cached session data and the
 current input, then merges the full completion result when language-server and

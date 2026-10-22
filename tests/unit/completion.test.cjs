@@ -439,6 +439,7 @@ test("language-server completion starts before a fresh workspace request finishe
       },
       getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
+      rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: () => [],
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
@@ -509,6 +510,7 @@ test("member and package completions do not refresh workspace data", async () =>
       collectCompletionEntries: async () => [],
       getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
+      rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: () => [],
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
@@ -602,6 +604,7 @@ test("F7 refinement starts language-server completion before workspace refresh f
       },
       getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
+      rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: () => [],
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
@@ -698,6 +701,7 @@ test("package completion filters locally without repeated language-server reques
       },
       getCompletionIdentityKey: (entry) => entry.label,
       isCompletionPickItem: () => false,
+      rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: (entries) => entries,
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
@@ -1086,6 +1090,7 @@ test("incomplete package completion re-queries until a complete result arrives",
       },
       getCompletionIdentityKey: (entry) => entry.label,
       isCompletionPickItem: () => false,
+      rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: (entries) => entries,
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
@@ -1139,4 +1144,70 @@ test("incomplete package completion re-queries until a complete result arrives",
 
   quickPick.hide();
   await request;
+});
+
+test("shared typed ranking places exact matches before longer prefix matches", () => {
+  const entries = [
+    { label: "library.extra", insertText: "library.extra", source: "lsp" },
+    { label: "library", insertText: "library()", source: "lsp" },
+    { label: "librarySuffix", insertText: "librarySuffix", source: "session" },
+    { label: "otherlibrary", insertText: "otherlibrary", source: "buffer" },
+  ];
+  assert.deepEqual(completion.rankCompletionEntries(entries, "library").map(e => e.label),
+    ["library", "library.extra", "librarySuffix", "otherlibrary"]);
+});
+
+test("function argument completion awaits parameters before offering runtime variables", async () => {
+  let finishLsp;
+  const fullResult = new Promise(resolve => { finishLsp = resolve; });
+  let stagedCalls = 0;
+  const published = [];
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position },
+    "../../Language/completion": {
+      getCompletionContext: () => ({
+        kind: "argument", prefix: "na", replaceStart: 5,
+        snapshotInput: "mean(na", snapshotCursor: 7,
+      }),
+      needsLanguageServerCompletion: () => true,
+      collectCompletionEntries: async (_context, document) => {
+        if (!document) {
+          stagedCalls++;
+          return [{ label: "naive", insertText: "naive", source: "session" }];
+        }
+        return fullResult;
+      },
+      rankCompletionEntries: entries => entries,
+      toCompletionQuickPickItems: entries => entries,
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    requestWorkspaceData: async () => ({ globalenv: { naive: {} } }),
+    requestMemberCompletions: async () => [],
+  });
+  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: () => [] });
+  lang.getOrOpenCompletionDocument = async () => ({});
+  const input = {
+    text: "mean(na", currentLine: "mean(na", cursorCol: 7,
+    cursorRow: 0, lines: ["mean(na"], textBeforeCursor: "mean(na",
+  };
+  let completed = false;
+  const request = lang.handleAutocomplete({
+    input,
+    getCurrentInput: () => input,
+    getWorkspaceData: () => ({ globalenv: { naive: {} } }),
+    applyCompletion: () => {},
+    onInlineEntries: entries => published.push(entries),
+  }).then(() => { completed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false, "wait for complete argument information");
+  assert.equal(stagedCalls, 0, "runtime candidates must not be published before arguments");
+  assert.deepEqual(published, []);
+  finishLsp([{ label: "na.rm", insertText: "na.rm = ", detail: "parameter", source: "lsp" }]);
+  await request;
+  assert.equal(published.length, 1);
+  assert.equal(published[0][0].label, "na.rm");
 });

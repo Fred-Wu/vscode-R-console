@@ -507,6 +507,25 @@ export function needsLanguageServerCompletion(context: CompletionContext): boole
   );
 }
 
+/** Use the same typed-query filtering and ranking for Quick Pick and inline results. */
+export function rankCompletionEntries(entries: CompletionEntry[], query: string): CompletionEntry[] {
+  const needle = query.toLowerCase();
+  if (!needle) return entries;
+  return entries
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.label.toLowerCase().includes(needle))
+    .sort((a, b) => {
+      const aLabel = a.entry.label.toLowerCase();
+      const bLabel = b.entry.label.toLowerCase();
+      const aRank = aLabel === needle ? 0 : aLabel.startsWith(needle) ? 1 : 2;
+      const bRank = bLabel === needle ? 0 : bLabel.startsWith(needle) ? 1 : 2;
+      return aRank - bRank ||
+        aLabel.indexOf(needle) - bLabel.indexOf(needle) ||
+        aLabel.length - bLabel.length || a.index - b.index;
+    })
+    .map(({ entry }) => entry);
+}
+
 export function toCompletionPick(
   entry: CompletionEntry,
   context: CompletionContext
