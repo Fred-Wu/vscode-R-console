@@ -44,23 +44,22 @@ export class Renderer {
     cursorCol: number,
     columns: number,
     sourceLineMap: Array<number | undefined>,
-    promptKinds: RenderPromptKind[]
+    promptKinds: RenderPromptKind[],
+    suggestions: string[] = []
   ): void {
-    const highlighted = this.lineHighlighter
+    const highlighted = (this.lineHighlighter
       ? this.lineHighlighter.highlightLines(lines, sourceLineMap)
-      : lines;
+      : lines).concat(suggestions);
     const safeColumns = Math.max(1, columns);
     const continuationPad = 2;
     const continuationLen = this.continuationPromptText
       ? this.continuationPromptText.length
       : continuationPad;
-    const getPromptKind = (index: number): RenderPromptKind => promptKinds[index]!;
+    const getPromptKind = (index: number): RenderPromptKind | "none" => promptKinds[index] ?? "none";
 
-    const lineRows = lines.map((_, idx) => {
-      const pLen =
-        getPromptKind(idx) === "main"
-          ? this.promptLen
-          : continuationLen;
+    const lineRows = highlighted.map((_, idx) => {
+      const pLen = getPromptKind(idx) === "none" ? 0 :
+        getPromptKind(idx) === "main" ? this.promptLen : continuationLen;
       const visibleLen =
         pLen + highlighted[idx].replace(/\x1b\[[0-9;]*m/g, "").length;
       return Math.max(1, Math.ceil(visibleLen / safeColumns));
@@ -108,7 +107,7 @@ export class Renderer {
     highlighted.forEach((line, idx) => {
       if (idx > 0) this.write("\r\n");
       const promptKind = getPromptKind(idx);
-      const prompt =
+      const prompt = promptKind === "none" ? "" :
         promptKind === "main"
           ? `${ANSI.reset}${this.promptColor}${this.promptText}${ANSI.reset}`
           : (this.continuationPromptText === null
