@@ -41,7 +41,7 @@ test("inline completion draws a border, shows picker metadata, and hides codicon
   assert.match(plain, /{base}/);
   assert.doesNotMatch(plain, /\$\(symbol-|> mtcars/);
   assert.match(lines.join(""), /\x1b\[38;5;75m/);
-  assert.match(lines.join(""), /\x1b\[7m/);
+  assert.match(lines.join(""), /\x1b\[48;2;/);
   assert.match(plain, /● mtcars/);
   state.move(1);
   assert.equal(state.current().insertText, "$(symbol-function) mean");
