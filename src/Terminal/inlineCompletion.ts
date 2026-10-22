@@ -6,11 +6,11 @@ const ESC = "\x1b[";
 const RESET = ESC + "0m";
 const DIM = ESC + "2m";
 const BORDER = ESC + "90m";
-const HIGHLIGHT = ESC + "7m";
+const SELECTED = ESC + "1m";
 const ICON = /^\$\(symbol-([a-z-]+)\)\s*/;
 const ICON_COLORS: Record<string, number> = {
   variable: 75, field: 75, property: 75, function: 141, method: 141,
-  class: 215, interface: 215, module: 215, enum: 215, constant: 81,
+  class: 215, interface: 215, module: 75, enum: 215, constant: 81,
   keyword: 176, operator: 176, snippet: 110, text: 245,
 };
 
@@ -37,6 +37,8 @@ export class InlineCompletion {
   get visible(): boolean { return this.choiceIndexes.length > 0; }
   get token(): number { return this.generation; }
 
+  invalidate(): number { return ++this.generation; }
+
   clear(): void {
     this.generation++;
     this.items = [];
@@ -46,12 +48,19 @@ export class InlineCompletion {
 
   set(items: CompletionQuickPickItem[], token: number): boolean {
     if (token !== this.generation) return false;
+    const previous = this.current();
     this.items = items;
     this.choiceIndexes = [];
     items.forEach((item, index) => {
       if (isChoice(item)) this.choiceIndexes.push(index);
     });
-    this.selected = 0;
+    const matching = previous && this.choiceIndexes.findIndex(index => {
+      const entry = items[index];
+      return isChoice(entry) && entry.label === previous.label &&
+        entry.insertText === previous.insertText &&
+        entry.description === previous.description && entry.detail === previous.detail;
+    });
+    this.selected = matching !== undefined && matching >= 0 ? matching : 0;
     return true;
   }
 
@@ -81,15 +90,17 @@ export class InlineCompletion {
       }
 
       const iconKind = ICON.exec(item.label)?.[1];
-      const label = fit(item.label.replace(ICON, ""), contentWidth - 2);
+      const moduleIcon = iconKind === "module";
+      const label = fit(item.label.replace(ICON, ""), contentWidth - (moduleIcon ? 3 : 2));
       const description = clean(item.description ?? "");
-      const icon = ESC + "38;5;" + (ICON_COLORS[iconKind ?? ""] ?? 245) + "m●" + RESET;
+      const color = ESC + "38;5;" + (ICON_COLORS[iconKind ?? ""] ?? 245) + "m";
+      const icon = color + (moduleIcon ? "{}" : choice === this.selected ? "◉" : "●") + RESET;
       const labelWidth = [...label].length;
-      const rest = contentWidth - labelWidth - 2;
+      const rest = contentWidth - labelWidth - (moduleIcon ? 3 : 2);
       const suffix = description && rest >= [...description].length + 2
         ? " ".repeat(rest - [...description].length) + description
         : "";
-      rows.push({ text: icon + " " + label + suffix, choice });
+      rows.push({ text: icon + " " + (choice === this.selected ? SELECTED : "") + label + (choice === this.selected ? RESET : "") + suffix, choice });
       if (item.detail) {
         rows.push({ text: "  " + fit(item.detail, contentWidth - 2), choice, detail: true });
       }
@@ -101,11 +112,10 @@ export class InlineCompletion {
     const activeRow = rows.findIndex(row => row.choice === this.selected && !row.detail);
     const start = Math.max(0, Math.min(activeRow - Math.floor(capacity / 2), rows.length - capacity));
     const body = rows.slice(start, start + capacity);
-    const frame = (text: string, isSelected = false, isGroup = false, isDetail = false): string => {
+    const frame = (text: string, isGroup = false, isDetail = false): string => {
       const plainLength = [...text.replace(/\x1b\[[0-9;]*m/g, "")].length;
       const padded = text + " ".repeat(Math.max(0, contentWidth - plainLength));
-      const styled = isSelected ? HIGHLIGHT + padded + RESET :
-        isGroup ? ESC + "1m" + padded + RESET :
+      const styled = isGroup ? SELECTED + padded + RESET :
         isDetail ? DIM + padded + RESET : padded;
       return BORDER + "│" + RESET + " " + styled + " " + BORDER + "│" + RESET;
     };
@@ -114,7 +124,7 @@ export class InlineCompletion {
 
     const output = [border("╭", "╮")];
     for (const row of body) {
-      output.push(frame(row.text, row.choice === this.selected && !row.detail, row.group, row.detail));
+      output.push(frame(row.text, row.group, row.detail));
     }
     const first = body.find(row => row.choice !== undefined)?.choice;
     const last = [...body].reverse().find(row => row.choice !== undefined)?.choice;
