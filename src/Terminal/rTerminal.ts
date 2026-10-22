@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem } from "../Language/completion";
+import { InlineCompletion } from "./inlineCompletion";
 import { setNativeParseCallback } from "../Language/parser";
 import {
   ANSI,
@@ -145,6 +146,8 @@ export type PersistedRTerminalState = {
 
 export class RTerminal implements vscode.Pseudoterminal {
   private writeEmitter: vscode.EventEmitter<string>;
+  private readonly inlineCompletion = new InlineCompletion();
+  private inlineCompletionTimer: ReturnType<typeof setTimeout> | undefined;
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
   private pidEmitter = new vscode.EventEmitter<number | undefined>();
@@ -627,6 +630,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.ensureReadyPromptVisibleForInput();
     this.escPendingClear = false;
     this.expandForEdit();
+    this.dismissInlineCompletion();
     void this.handleAutocomplete(true);
   }
 
@@ -716,6 +720,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.promptVisible = false;
     }
 
+    this.dismissInlineCompletion(false);
     this.dimensions = dimensions;
 
     this.syncReplayTerminalSize();
@@ -1106,6 +1111,26 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.ensureReadyPromptVisibleForInput();
 
+    if (this.inlineCompletion.visible) {
+      if (action.type === "arrow" && (action.dir === "up" || action.dir === "down")) {
+        this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
+        this.renderInput();
+        return;
+      }
+      if (action.type === "tab" || action.type === "enter") {
+        const item = this.inlineCompletion.current();
+        this.dismissInlineCompletion();
+        if (item) this.applyCompletion(item);
+        return;
+      }
+      if (action.type === "escape") {
+        this.dismissInlineCompletion();
+        this.renderInput();
+        return;
+      }
+      this.dismissInlineCompletion(false);
+    }
+
     if (action.type !== "escape") {
       this.escPendingClear = false;
     }
@@ -1130,6 +1155,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.expandForEdit();
         this.handleTextInsert(action.text);
         this.renderInput();
+        this.scheduleInlineCompletion();
         return;
       case "enter":
         void this.handleEnterKey();
@@ -1186,7 +1212,8 @@ export class RTerminal implements vscode.Pseudoterminal {
           this.inputState.insertText(" ".repeat(this.tabSize));
           this.renderInput();
         } else {
-          void this.handleAutocomplete();
+          if (this.inlineCompletionMode() === "inline") this.requestInlineCompletion(true);
+          else void this.handleAutocomplete();
         }
         return;
       }
@@ -1967,6 +1994,46 @@ export class RTerminal implements vscode.Pseudoterminal {
     };
   }
 
+  private inlineCompletionMode(): "inline" | "quickPick" {
+    return vscode.workspace.getConfiguration("r.console").get<"inline" | "quickPick">("completionUI", "quickPick");
+  }
+
+  private dismissInlineCompletion(redraw = true): void {
+    if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
+    this.inlineCompletionTimer = undefined;
+    const wasVisible = this.inlineCompletion.visible;
+    this.inlineCompletion.clear();
+    this.lang.cancelCompletion();
+    if (wasVisible && redraw && this.mode === "ready") this.renderInput();
+  }
+
+  private scheduleInlineCompletion(): void {
+    if (this.inlineCompletionMode() !== "inline" ||
+        vscode.workspace.getConfiguration("r.console").get("inlineCompletion.trigger", "tab") !== "typing") return;
+    if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
+    this.inlineCompletionTimer = setTimeout(() => {
+      this.inlineCompletionTimer = undefined;
+      this.requestInlineCompletion(false);
+    }, 150);
+  }
+
+  private requestInlineCompletion(force: boolean): void {
+    if (this.mode !== "ready" || !this.promptReady) return;
+    this.dismissInlineCompletion(false);
+    const token = this.inlineCompletion.token;
+    void this.lang.handleAutocomplete({
+      input: this.getInputSnapshot(),
+      getCurrentInput: () => this.getInputSnapshot(),
+      getWorkspaceData: () => getCachedRuntimeWorkspaceData(this.runtimeHost()),
+      force,
+      applyCompletion: selection => this.applyCompletion(selection),
+      onInlineEntries: items => {
+        if (this.mode !== "ready" || !this.inlineCompletion.set(items, token)) return;
+        this.renderInput();
+      },
+    });
+  }
+
   private async handleAutocomplete(force = false): Promise<void> {
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
@@ -2501,6 +2568,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private clearInputRender(): void {
+    this.dismissInlineCompletion(false);
     this.withTerminalStateCaptureSuppressed(() => {
       clearViewInputRender(
         (text) => {
@@ -2521,6 +2589,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         dimensions: this.dimensions,
         historyBrowsing: this.historyBrowsing,
         historyCollapsed: this.historyCollapsed,
+        suggestions: this.mode === "ready" ? this.inlineCompletion.lines(this.dimensions.columns, Math.min(10, Math.max(2, this.dimensions.rows - 5))) : [],
       });
     });
   }
