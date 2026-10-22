@@ -29,7 +29,7 @@ test("inline suggestions paginate and never emit candidate ANSI escapes", () => 
   state.move(14);
   const lines = state.lines(28, 5);
   assert.equal(lines.length, 5);
-  assert.match(lines[4], /\\x1b\[2m\d+-\d+\/20/);
+  assert.match(lines[4], /\x1b\[2m\d+-\d+\/20/);
   assert.ok(lines.some(line => line.includes("item14")));
   assert.ok(lines.every(line => !line.includes("item0\x1b[7m")));
   state.clear();
