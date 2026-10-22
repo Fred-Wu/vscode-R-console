@@ -1167,12 +1167,14 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.expandForEdit();
         this.handleBackspace();
         this.renderInput();
+        this.scheduleInlineCompletion();
         return;
       case "delete":
         this.expandForEdit();
         if (!this.inputState.isAtEnd) {
           this.inputState.deleteAfterCursor();
           this.renderInput();
+          this.scheduleInlineCompletion();
         }
         return;
       case "home":
