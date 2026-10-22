@@ -146,3 +146,30 @@ test("whitespace-only input also dismisses pending inline suggestions", () => {
   terminal.requestInlineCompletion(true);
   assert.equal(terminal.inlineCompletion.visible, false);
 });
+
+test("mouse hit testing maps displayed rows, including scrolled entries and details", () => {
+  const state = new InlineCompletion();
+  state.set([
+    { label: "Functions" },
+    { ...item("alpha"), detail: "details" },
+    ...Array.from({ length: 15 }, (_, i) => item("item" + i)),
+  ], state.token);
+  state.move(9);
+  const lines = state.lines(40, 9);
+  const strip = line => line.replace(/\x1b\[[0-9;]*m/g, "");
+  const target = lines.findIndex(line => strip(line).includes("item8"));
+  assert.ok(target > 0);
+  assert.equal(state.hitTest(target, 8)?.label, "item8");
+  assert.equal(state.hitTest(0, 8), undefined);
+  assert.equal(state.hitTest(lines.length - 1, 8), undefined);
+  assert.equal(state.hitTest(target, 1), undefined);
+  assert.equal(state.hitTest(target, 40), undefined);
+  state.clear();
+  assert.equal(state.hitTest(target, 8), undefined);
+
+  state.set([{ label: "Functions" }, { ...item("alpha"), detail: "help" }], state.token);
+  state.lines(40, 8);
+  assert.equal(state.hitTest(1, 8), undefined);
+  assert.equal(state.hitTest(2, 8)?.label, "alpha");
+  assert.equal(state.hitTest(3, 8)?.label, "alpha");
+});
