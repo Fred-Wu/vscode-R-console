@@ -2597,7 +2597,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         dimensions: this.dimensions,
         historyBrowsing: this.historyBrowsing,
         historyCollapsed: this.historyCollapsed,
-        suggestions: this.mode === "ready" ? this.inlineCompletion.lines(this.dimensions.columns, Math.min(10, Math.max(2, this.dimensions.rows - 5))) : [],
+        suggestions: this.mode === "ready" ? this.inlineCompletion.lines(this.dimensions.columns, Math.min(13, Math.max(5, this.dimensions.rows - 5))) : [],
       });
     });
   }
