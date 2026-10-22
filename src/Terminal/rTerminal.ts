@@ -630,6 +630,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.ensureReadyPromptVisibleForInput();
     this.escPendingClear = false;
     this.expandForEdit();
+    if (this.inlineCompletionMode() === "inline") return;
     this.dismissInlineCompletion();
     void this.handleAutocomplete(true);
   }
@@ -1125,7 +1126,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (action.type === "tab" || action.type === "enter") {
         const item = this.inlineCompletion.current();
         this.dismissInlineCompletion();
-        if (item) this.applyCompletion(item);
+        if (item && item.snapshotInput === this.inputState.currentLine && item.snapshotCursor === this.inputState.cursorCol) this.applyCompletion(item);
         return;
       }
       if (action.type === "escape") {
@@ -1133,7 +1134,11 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.renderInput();
         return;
       }
-      this.dismissInlineCompletion(false);
+      if (action.type === "text" || action.type === "backspace" || action.type === "delete") {
+        this.inlineCompletion.invalidate();
+      } else {
+        this.dismissInlineCompletion(false);
+      }
     }
 
     if (action.type !== "escape") {
@@ -2026,9 +2031,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private requestInlineCompletion(force: boolean): void {
-    if (this.mode !== "ready" || !this.promptReady) return;
-    this.dismissInlineCompletion(false);
-    const token = this.inlineCompletion.token;
+    if (this.mode !== "ready" || !this.promptReady || this.inlineCompletionMode() !== "inline") return;
+    // Keep the existing panel visible while new results are collected.
+    const token = this.inlineCompletion.invalidate();
     void this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
@@ -2043,6 +2048,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handleAutocomplete(force = false): Promise<void> {
+    if (this.inlineCompletionMode() === "inline") return;
     await this.lang.handleAutocomplete({
       input: this.getInputSnapshot(),
       getCurrentInput: () => this.getInputSnapshot(),
