@@ -1166,6 +1166,12 @@ export class RTerminal implements vscode.Pseudoterminal {
           this.inlineCompletion?.contains(action.row - this.inlineBoxTop, action.col)) {
         this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
         this.renderInput();
+      } else {
+        // Terminal-wide SGR mouse reporting consumes ordinary wheel input.
+        // Forward outside-wheel events to VS Code's scrollback navigation.
+        void vscode.commands.executeCommand(action.dir === "up"
+          ? "workbench.action.terminal.scrollUp"
+          : "workbench.action.terminal.scrollDown");
       }
       return;
     }

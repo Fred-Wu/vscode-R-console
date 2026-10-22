@@ -10,6 +10,7 @@ after(() => widthTerminal.dispose());
 const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInput: "", snapshotCursor: 0, source: "session" });
 
 function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
+  const scrollCommands = [];
   const { InputState } = loadSource("src/Terminal/inputState.ts");
   const { Renderer } = loadSource("src/Terminal/renderer.ts");
   const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
@@ -17,6 +18,7 @@ function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
     "./rTerminal/lang": {},
     vscode: {
       EventEmitter: class {}, window: {},
+      commands: { executeCommand(command) { scrollCommands.push(command); return Promise.resolve(); } },
       workspace: { getConfiguration: () => ({ get: (key, fallback) =>
         key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? trigger : fallback }) },
     },
@@ -44,7 +46,7 @@ function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
     terminal.dismissInlineCompletion(false);
     screen.dispose();
   });
-  return { terminal, screen };
+  return { terminal, screen, scrollCommands };
 }
 
 test("multiline input and suggestions share the viewport across redraw and dismissal", t => {
@@ -557,4 +559,21 @@ test("scrollbar click changes navigation but cannot accept a suggestion", t => {
   assert.equal(terminal.accepted, undefined, "scrollbar is never an accept target");
   assert.ok(terminal.inlineCompletion.selected > start, "track click scrolls to lower suggestion");
   assert.equal(terminal.inlineCompletion.hitTest(8, barCol), undefined);
+});
+
+test("mouse wheel outside the panel scrolls terminal history without moving completions", t => {
+  const { terminal, scrollCommands } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  terminal.inlineCompletion.set(Array.from({ length: 15 }, (_, i) => item("alpha" + i)),
+    terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const initial = terminal.inlineCompletion.selected;
+  terminal.applyKeyAction({ type: "wheel", dir: "up", col: 1, row: 1 });
+  terminal.applyKeyAction({ type: "wheel", dir: "down", col: 1, row: 1 });
+  assert.deepEqual(scrollCommands, [
+    "workbench.action.terminal.scrollUp",
+    "workbench.action.terminal.scrollDown",
+  ]);
+  assert.equal(terminal.inlineCompletion.selected, initial);
+  assert.equal(terminal.inlineCompletion.visible, true);
 });
