@@ -204,3 +204,40 @@ test("hit-test bounds restrict mouse-wheel navigation to box contents", () => {
   state.clear();
   assert.equal(state.contains(1, 8), false);
 });
+
+test("suggestion panel tracks typed column, clamps near right edge and hit-tests the shifted box", () => {
+  const state = new InlineCompletion();
+  state.set([item("library")], state.token, "lib");
+  const original = state.lines(80, 8, 15);
+  assert.ok(original[0].startsWith(" ".repeat(14) + "\x1b[90m╭"));
+  assert.equal(state.hitTest(1, 16)?.label, "library");
+  assert.equal(state.hitTest(1, 3), undefined);
+  const moved = state.lines(80, 8, 17);
+  assert.ok(moved[0].startsWith(" ".repeat(16) + "\x1b[90m╭"));
+  const clamped = state.lines(80, 8, 79);
+  assert.ok(clamped[0].startsWith(" ".repeat(19) + "\x1b[90m╭"));
+});
+
+test("typed matches use theme foreground, selected text has a continuous background, and group backgrounds remain plain", () => {
+  const { resolveInlineCompletionColors } = loadSource("src/Terminal/inlineCompletion.ts");
+  const colors = resolveInlineCompletionColors(true, {
+    "editorSuggestWidget.highlightForeground": "#1379bd",
+    "editorSuggestWidget.selectedBackground": "#ddeeff",
+  });
+  assert.equal(colors.matchForeground, "\x1b[38;2;19;121;189m");
+  assert.equal(colors.selectedBackground, "\x1b[48;2;221;238;255m");
+  const state = new InlineCompletion();
+  state.set([{ label: "Functions" }, { ...item("$(symbol-function) library"), description: "base" }], state.token, "lib");
+  const lines = state.lines(80, 8, 4, colors);
+  const heading = lines.find(line => line.includes("Functions"));
+  const selected = lines.find(line => line.includes("library"));
+  assert.ok(heading && !heading.includes("\x1b[48;2;"), "group headers have no separate background");
+  assert.ok(selected);
+  assert.ok(selected.includes("\x1b[38;2;19;121;189mlib\x1b[39mrary"));
+  assert.ok(selected.indexOf(colors.selectedBackground) < selected.indexOf("●"),
+    "selection background must start before icon and text");
+  assert.ok(selected.indexOf("\x1b[49m") > selected.indexOf("library") ||
+    selected.indexOf("\x1b[49m") > selected.indexOf("rary"),
+    "selection background must extend behind all text");
+  assert.ok(!selected.includes("\x1b[7m"), "do not invert icon or matched foreground");
+});
