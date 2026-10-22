@@ -22,6 +22,7 @@ type RenderInputOptions = {
   dimensions: Dimensions;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
+  suggestions?: string[];
 };
 
 export type InputRenderPlan = {
@@ -75,6 +76,7 @@ export function renderInput({
   dimensions,
   historyBrowsing,
   historyCollapsed,
+  suggestions = [],
 }: RenderInputOptions): void {
   syntax.setSource(inputState.lines);
 
@@ -92,7 +94,8 @@ export function renderInput({
     plan.cursorCol,
     dimensions.columns,
     plan.sourceLineMap,
-    plan.promptKinds
+    plan.promptKinds,
+    suggestions
   );
 }
 
