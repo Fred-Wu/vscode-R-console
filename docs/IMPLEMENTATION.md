@@ -644,12 +644,12 @@ Implementation files:
 
 Inline completion is an alternative frontend selected with
 `r.console.completionUI = "inline"`; the existing Quick Pick remains the
-default and F7 remains available. Inline suggestions use the same completion
+default; F7 and the Quick Pick are disabled while inline mode is selected. Inline suggestions use the same completion
 sources and insertion rules, and can be triggered by Tab or while typing via
 `r.console.inlineCompletion.trigger`. The terminal renderer owns the
 temporary bordered suggestion rows, group headings, labels, descriptions,
 details, selection and scrolling; they are excluded from persisted replay.
-Picker codicon markup is replaced with ANSI-colored terminal glyphs because
+The panel remains displayed while typing, with asynchronous results replacing its entries\nafter they arrive rather than clearing and reopening it. Selected items use a\ncircular indicator instead of reverse-video highlighting, and modules use blue\n`{}` glyphs. Picker codicon markup is replaced with ANSI-colored terminal glyphs because
 codicons are not available in the terminal renderer. Keys route to the list only while it is visible and completion
 requests are invalidated after input changes or dismissal.
 
