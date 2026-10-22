@@ -1140,3 +1140,14 @@ test("incomplete package completion re-queries until a complete result arrives",
   quickPick.hide();
   await request;
 });
+
+test("shared typed ranking places exact matches before longer prefix matches", () => {
+  const entries = [
+    { label: "library.extra", insertText: "library.extra", source: "lsp" },
+    { label: "library", insertText: "library()", source: "lsp" },
+    { label: "librarySuffix", insertText: "librarySuffix", source: "session" },
+    { label: "otherlibrary", insertText: "otherlibrary", source: "buffer" },
+  ];
+  assert.deepEqual(completion.filterCompletionEntries(entries, "library").map(e => e.label),
+    ["library", "library.extra", "librarySuffix", "otherlibrary"]);
+});
