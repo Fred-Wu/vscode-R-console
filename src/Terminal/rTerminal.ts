@@ -1111,7 +1111,7 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     this.ensureReadyPromptVisibleForInput();
 
-    if (this.inlineCompletion.visible) {
+    if (this.inlineCompletion?.visible) {
       if (action.type === "arrow" && (action.dir === "up" || action.dir === "down")) {
         this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
         this.renderInput();
