@@ -23,6 +23,7 @@ type RenderInputOptions = {
   historyBrowsing: boolean;
   historyCollapsed: boolean;
   suggestions?: string[];
+  plan?: InputRenderPlan;
 };
 
 export type InputRenderPlan = {
@@ -77,10 +78,11 @@ export function renderInput({
   historyBrowsing,
   historyCollapsed,
   suggestions = [],
+  plan: providedPlan,
 }: RenderInputOptions): void {
   syntax.setSource(inputState.lines);
 
-  const plan = buildInputRenderPlan({
+  const plan = providedPlan ?? buildInputRenderPlan({
     renderer,
     inputState,
     dimensions,
