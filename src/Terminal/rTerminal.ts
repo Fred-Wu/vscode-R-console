@@ -2682,7 +2682,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const overrides = vscode.workspace.getConfiguration("workbench")
       .get<Record<string, unknown>>("colorCustomizations", {});
     const inputPrefix = this.inputState.currentLine.slice(0, this.inputState.cursorCol);
-    this.inlineCompletion.setQuery(/[A-Za-z._][\\w.]*$/.exec(inputPrefix)?.[0] ?? "");
+    this.inlineCompletion.setQuery(/[A-Za-z._][\w.]*$/.exec(inputPrefix)?.[0] ?? "");
     const suggestions = this.mode === "ready" ? this.inlineCompletion.lines(
       columns, Math.min(13, Math.max(5, this.dimensions.rows - 5)), anchorColumn,
       resolveInlineCompletionColors(isLight, overrides)
