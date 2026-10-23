@@ -45,6 +45,7 @@ type ConsoleLspClientOptions = {
 
 type ConsoleLspSessionState = {
   attachedPackages: string[];
+  libraryPaths?: string[];
 };
 
 type SessionStateSyncResult = {
@@ -96,6 +97,8 @@ export class ConsoleLspClient implements CompletionProvider {
   private packageCheckPromise: Promise<boolean> | undefined;
   private packageRefreshPromise: Promise<void> | undefined;
   private lastPackageCheckAt = 0;
+  private runningLibraryPathsKey: string | undefined;
+  private libraryPathRefreshPromise: Promise<void> | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -105,6 +108,14 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   async start(): Promise<void> {
+    if (this.libraryPathRefreshPromise) {
+      await this.libraryPathRefreshPromise;
+      return;
+    }
+    await this.startClient();
+  }
+
+  private async startClient(): Promise<void> {
     if (this.disposed) {
       throw new Error("Cannot start a disposed console language server.");
     }
@@ -254,6 +265,9 @@ export class ConsoleLspClient implements CompletionProvider {
         const projection = this.inputDocument.project(doc.getText());
         await this.syncDocument(client, projection.document);
         await this.applySessionState(client);
+        if (this.client !== client) {
+          continue;
+        }
         if (await this.packageChangesDetected(client, projection.document.getText())) {
           if (attempt === 0) {
             await this.restartForPackageChanges(client);
@@ -298,8 +312,11 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!client) {
       return;
     }
-    await this.syncDocument(client, this.inputDocument.project(doc.getText()).document);
     await this.applySessionState(client);
+    const currentClient = this.client;
+    if (currentClient?.isRunning()) {
+      await this.syncDocument(currentClient, this.inputDocument.project(doc.getText()).document);
+    }
   }
 
   updateInput(input: string): void {
@@ -325,8 +342,20 @@ export class ConsoleLspClient implements CompletionProvider {
     if (!this.sessionState) {
       return;
     }
+    if (this.client !== client) {
+      if (this.client?.isRunning()) {
+        await this.applySessionState(this.client);
+      }
+      return;
+    }
     const state = this.sessionState;
     const stateKey = this.getSessionStateKey(state);
+    if (state.libraryPaths &&
+        this.runningLibraryPathsKey !== JSON.stringify(state.libraryPaths)) {
+      await this.restartForLibraryPaths();
+      if (this.client?.isRunning()) await this.applySessionState(this.client);
+      return;
+    }
     if (this.syncedSessionStateKey === stateKey) {
       return;
     }
@@ -377,7 +406,39 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {
-    return state.attachedPackages.join("\u0000");
+    return JSON.stringify([state.attachedPackages, state.libraryPaths]);
+  }
+
+  private async restartForLibraryPaths(): Promise<void> {
+    if (this.libraryPathRefreshPromise) {
+      await this.libraryPathRefreshPromise;
+      return;
+    }
+    // Concurrent starts wait for the restart. Capture path updates that arrive
+    // while the new server is starting before releasing the restart lock.
+    const refresh = (async () => {
+      do {
+        if (!(await this.stop())) {
+          throw new Error("Cannot restart console language server for library paths.");
+        }
+        if (this.disposed) {
+          return;
+        }
+        await this.startClient();
+      } while (
+        !this.disposed &&
+        this.sessionState?.libraryPaths &&
+        this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)
+      );
+    })();
+    this.libraryPathRefreshPromise = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (this.libraryPathRefreshPromise === refresh) {
+        this.libraryPathRefreshPromise = undefined;
+      }
+    }
   }
 
   private async packageChangesDetected(
@@ -445,6 +506,16 @@ export class ConsoleLspClient implements CompletionProvider {
     if (this.disposed) {
       return undefined;
     }
+    if (this.libraryPathRefreshPromise) {
+      try {
+        await this.libraryPathRefreshPromise;
+      } catch {
+        return undefined;
+      }
+    }
+    if (this.disposed) {
+      return undefined;
+    }
     if (this.client?.isRunning()) {
       return this.client;
     }
@@ -464,6 +535,8 @@ export class ConsoleLspClient implements CompletionProvider {
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
     const env = this.buildServerEnv(config);
+    this.runningLibraryPathsKey = this.sessionState?.libraryPaths
+      ? JSON.stringify(this.sessionState.libraryPaths) : undefined;
     const useStdio = config.get<boolean>("lsp.use_stdio") === true && process.platform !== "win32";
 
     const clientOptions: LanguageClientOptions = {
@@ -734,7 +807,10 @@ export class ConsoleLspClient implements CompletionProvider {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = config.get<string[]>("libPaths") ?? [];
+    const libPaths = [
+      ...(this.sessionState?.libraryPaths ?? []),
+      ...(config.get<string[]>("libPaths") ?? []),
+    ];
 
     // The lifecycle channel reports errors only; languageserver writes its
     // debug and info entries to the same stderr stream as errors.

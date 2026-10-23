@@ -3,7 +3,7 @@
 add_lib_paths <- Sys.getenv("VSCR_LIB_PATHS")
 if (nzchar(add_lib_paths)) {
     add_lib_paths <- strsplit(add_lib_paths, "\n", fixed = TRUE)[[1L]]
-    .paths <- c(.paths, add_lib_paths)
+    .paths <- c(add_lib_paths, .paths)
 }
 
 use_renv_lib_path <- Sys.getenv("VSCR_USE_RENV_LIB_PATH")

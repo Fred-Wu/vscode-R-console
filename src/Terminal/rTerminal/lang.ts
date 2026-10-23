@@ -46,6 +46,7 @@ type AutocompleteRequest = {
 
 type ConsoleSessionState = {
   attachedPackages: string[];
+  libraryPaths?: string[];
 };
 
 export class RTermLang {
@@ -523,14 +524,15 @@ export class RTermLang {
     const nextState = this.toSessionState(data);
     if (
       this.sessionState &&
-      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages)
+      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages) &&
+      this.arraysEqual(nextState.libraryPaths ?? [], this.sessionState.libraryPaths ?? [])
     ) {
       return false;
     }
 
     this.sessionState = nextState;
     if (this.consoleLsp) {
-      void this.consoleLsp.syncSessionState(nextState);
+      void this.consoleLsp.syncSessionState(nextState).catch(() => undefined);
     }
     return true;
   }
@@ -629,6 +631,7 @@ export class RTermLang {
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))
         .map((value) => value.slice(8)),
+      ...(data.libraryPaths ? { libraryPaths: data.libraryPaths } : {}),
     };
   }
 

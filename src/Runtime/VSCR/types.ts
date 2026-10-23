@@ -12,6 +12,7 @@ export type GlobalEnvItem = {
 export type WorkspaceData = {
   search: string[];
   loaded_namespaces: string[];
+  libraryPaths?: string[];
   globalenv: Record<string, GlobalEnvItem>;
 };
 

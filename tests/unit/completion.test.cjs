@@ -1211,3 +1211,130 @@ test("function argument completion awaits parameters before offering runtime var
   assert.equal(published.length, 1);
   assert.equal(published[0][0].label, "na.rm");
 });
+
+test("library path changes trigger console LSP state synchronization", () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {},
+    "../../Language/completion": {},
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    requestMemberCompletions: async () => [],
+  });
+  const states = [];
+  lang.consoleLsp = { syncSessionState: (state) => {
+    states.push(state);
+    return Promise.resolve();
+  } };
+  const data = { search: [".GlobalEnv", "package:stats"], loaded_namespaces: [],
+    globalenv: {}, libraryPaths: ["/project/.uvr/library", "/base/library"] };
+  assert.equal(lang.updateSessionData(data), true);
+  assert.deepEqual(states[0], {
+    attachedPackages: ["stats"],
+    libraryPaths: data.libraryPaths,
+  });
+  assert.equal(lang.updateSessionData({ ...data }), false);
+  assert.equal(lang.updateSessionData({
+    ...data, libraryPaths: ["/another/library", "/base/library"],
+  }), true);
+  assert.equal(states.length, 2);
+});
+
+test("console LSP keeps configured libraries after live session libraries", async (t) => {
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode: {
+      Uri: { parse: (value) => ({ toString: () => value }) },
+      window: { createOutputChannel: () => ({ dispose() {} }) },
+    },
+    "vscode-languageclient/node": { LanguageClient: class {} },
+  });
+  const lsp = new ConsoleLspClient({
+    consoleId: "library-env-test", env: {}, rPath: "R",
+  });
+  t.after(() => lsp.dispose());
+  const config = { get: (key) => key === "libPaths" ? ["/fallback"] : false };
+  assert.equal(lsp.buildServerEnv(config).VSCR_LIB_PATHS, "/fallback");
+  lsp.sessionState = { attachedPackages: [], libraryPaths: ["/project/.uvr/library"] };
+  const env = lsp.buildServerEnv(config);
+  assert.equal(env.VSCR_LIB_PATHS, "/project/.uvr/library\n/fallback");
+});
+
+test("library-path restart serializes concurrent starts and applies the latest paths", async (t) => {
+  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
+    vscode: {
+      Uri: { parse: (value) => ({ toString: () => value }) },
+      window: { createOutputChannel: () => ({ dispose() {} }) },
+    },
+    "vscode-languageclient/node": { LanguageClient: class {} },
+  });
+  const lsp = new ConsoleLspClient({ consoleId: "restart-order", env: {} });
+  t.after(() => lsp.dispose());
+  const requests = [];
+  const fakeClient = () => ({
+    isRunning: () => true,
+    sendRequest: async (_method, state) => { requests.push(state); },
+  });
+  lsp.client = fakeClient();
+  lsp.runningLibraryPathsKey = JSON.stringify(["/original"]);
+  let stopCount = 0;
+  let startCount = 0;
+  let releaseStart;
+  const firstStartGate = new Promise((resolve) => { releaseStart = resolve; });
+  lsp.stop = async () => {
+    stopCount++;
+    lsp.client = undefined;
+    return true;
+  };
+  lsp.startClient = async () => {
+    const startupPaths = JSON.stringify(lsp.sessionState?.libraryPaths);
+    startCount++;
+    if (startCount === 1) await firstStartGate;
+    lsp.runningLibraryPathsKey = startupPaths;
+    lsp.client = fakeClient();
+  };
+  const first = lsp.syncSessionState({
+    attachedPackages: ["stats"], libraryPaths: ["/first"],
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopCount, 1);
+
+  // A completion-triggered start must join the restart rather than start
+  // another server; a new session snapshot must win over the old one.
+  const concurrentStart = lsp.start();
+  const latest = lsp.syncSessionState({
+    attachedPackages: ["stats"], libraryPaths: ["/latest"],
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(startCount, 1);
+  releaseStart();
+  await Promise.all([first, latest, concurrentStart]);
+  assert.equal(stopCount, 2);
+  assert.equal(startCount, 2);
+  assert.equal(lsp.runningLibraryPathsKey, JSON.stringify(["/latest"]));
+  assert.deepEqual(requests.at(-1), {
+    attachedPackages: ["stats"], libraryPaths: ["/latest"],
+  });
+  const previousStops = stopCount;
+  await lsp.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/latest"] });
+  assert.equal(stopCount, previousStops, "unchanged paths do not restart");
+});
+
+test("language-server state sync failures do not reject terminal workspace updates", async () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {},
+    "../../Language/completion": {},
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    requestMemberCompletions: async () => [],
+  });
+  lang.consoleLsp = { syncSessionState: async () => { throw Error("restart failed"); } };
+  assert.equal(lang.updateSessionData({
+    search: [], loaded_namespaces: [], globalenv: {}, libraryPaths: ["/new"],
+  }), true);
+  await new Promise((resolve) => setImmediate(resolve));
+});
