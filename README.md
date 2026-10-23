@@ -13,11 +13,17 @@ R Console is a lightweight R console for VS Code that runs R inside a custom pse
 > [!IMPORTANT]
 > The bundled backend executable, R_CONSOLE_HOST, is not currently code-signed. Depending on your OS and security settings, it may trigger a security warning or be blocked when first launched. Install R Console only from the official VS Code Marketplace or this repository's GitHub Releases.
 
+## New in 0.5.4
+
+Completion suggestions can now appear directly in the terminal. Choose inline completion and show suggestions while typing or when pressing Tab, or keep the default Quick Pick completion picker. This release also fixes completions for project-specific R package folders and Unicode input on Windows. See the [release notes](CHANGELOG.md#054---2026-10-23) for details.
+
 ## Features
 
 - Custom R console hosted in the VS Code terminal area.
 - Persistent R console sessions that can be attached, detached, or closed from VS Code, while preserving custom console names.
-- Tab-triggered completion, including objects from the active R session and runtime `$` / `@` member completion. `F7` opens the **R console completions** picker at the cursor, including empty positions where Tab is used for indentation.
+- Console completion, including objects from the active R session and runtime `$` / `@` member completion:
+  - **Quick Pick completion picker:** The default mode (`r.console.completionUI: "quickPick"`). Press Tab for completions, or `F7` to open the **R console completions** picker at the cursor, including empty positions where Tab is used for indentation.
+  - **Inline terminal completion:** Set `r.console.completionUI` to `"inline"` to show suggestions directly in the terminal. Press Tab to open the list, use Up/Down to select a suggestion, Tab or Enter to insert it, and Escape to dismiss the list. Set `r.console.inlineCompletion.trigger` to `"typing"` for automatic suggestions or keep `"tab"` for Tab-triggered suggestions. This trigger setting applies only to inline completion and does not affect Quick Pick. Tab still indents at the start of a line, and `F7` is only used in Quick Pick mode.
 - Syntax highlighting that follows the active VS Code color theme.
 - Multiline editing and long-input rendering.
 - Reverse search on entered text using `Ctrl+R`; repeated presses find older matches. `F8` opens **Command History**, a searchable picker with on-demand loading, native multi-selection checkboxes, Select All, and a toggle to collapse or expand exact duplicate entries. Selected entries can be restored as a single editable input without execution, or deleted using the picker toolbar.
@@ -108,6 +114,8 @@ R Console also contributes its own settings:
 
 | Setting                    | Default       | Purpose                                                                                                                       |
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `r.console.completionUI` | `quickPick` | Choose the Quick Pick completion picker (`quickPick`) or suggestions directly in the terminal (`inline`). |
+| `r.console.inlineCompletion.trigger` | `tab` | Show inline suggestions while typing (`typing`) or when pressing Tab (`tab`). Applies only when `r.console.completionUI` is `inline`; it does not affect Quick Pick. |
 | `r.console.historyScope` | `workspace` | Share history by workspace folder or use `global`. Applies when a console is created or reattached. |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
