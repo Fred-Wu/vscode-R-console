@@ -2,7 +2,7 @@
   "name": "vsc-r-console",
   "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
-  "version": "0.5.3-9001",
+  "version": "0.5.4",
   "publisher": "RConsole",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "images/Rlogo.png",
@@ -158,13 +158,13 @@
           "type": "string",
           "enum": ["quickPick", "inline"],
           "default": "quickPick",
-          "description": "Use the existing completion picker or an inline terminal list."
+          "description": "Show completion suggestions in Quick Pick or directly in the terminal."
         },
         "r.console.inlineCompletion.trigger": {
           "type": "string",
           "enum": ["typing", "tab"],
           "default": "tab",
-          "description": "Show inline completions while typing or only when Tab is pressed."
+          "description": "Show inline completions while typing or only when Tab is pressed. Applies only when r.console.completionUI is inline; it does not affect Quick Pick."
         },
         "r.console.autoMatch": {
           "type": "boolean",
