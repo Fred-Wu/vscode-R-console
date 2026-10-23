@@ -158,13 +158,13 @@
           "type": "string",
           "enum": ["quickPick", "inline"],
           "default": "quickPick",
-          "description": "Choose the Quick Pick completion picker or an inline terminal list."
+          "description": "Show completion suggestions in Quick Pick or directly in the terminal."
         },
         "r.console.inlineCompletion.trigger": {
           "type": "string",
           "enum": ["typing", "tab"],
           "default": "tab",
-          "description": "Show inline completions while typing or only when Tab is pressed. Applies only when r.console.completionUI is inline; it does not affect the Quick Pick completion picker."
+          "description": "Show inline completions while typing or only when Tab is pressed. Applies only when r.console.completionUI is inline; it does not affect Quick Pick."
         },
         "r.console.autoMatch": {
           "type": "boolean",

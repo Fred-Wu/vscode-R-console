@@ -7,7 +7,7 @@ All notable changes to R Console will be documented in this file.
 ### Added
 
 - Inline terminal completion:
-  - Set `r.console.completionUI` to `inline` to show completion suggestions directly in the terminal. The existing Quick Pick completion picker remains the default (`quickPick`).
+  - Set `r.console.completionUI` to `inline` to show completion suggestions directly in the terminal. Quick Pick remains the default (`quickPick`).
   - Set `r.console.inlineCompletion.trigger` to `typing` for automatic suggestions or keep the default `tab` to open suggestions with Tab. This setting applies only to inline completion and does not affect Quick Pick.
   - Use Up/Down to select a suggestion, Tab or Enter to insert it, and Escape to dismiss the list.
 
