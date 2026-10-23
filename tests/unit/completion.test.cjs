@@ -1242,7 +1242,7 @@ test("library path changes trigger console LSP state synchronization", () => {
   assert.equal(states.length, 2);
 });
 
-test("console LSP uses live session libraries at startup", async (t) => {
+test("console LSP keeps configured libraries after live session libraries", async (t) => {
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
     vscode: {
       Uri: { parse: (value) => ({ toString: () => value }) },
@@ -1254,10 +1254,11 @@ test("console LSP uses live session libraries at startup", async (t) => {
     consoleId: "library-env-test", env: {}, rPath: "R",
   });
   t.after(() => lsp.dispose());
-  lsp.sessionState = { attachedPackages: [], libraryPaths: ["/project/.uvr/library"] };
   const config = { get: (key) => key === "libPaths" ? ["/fallback"] : false };
+  assert.equal(lsp.buildServerEnv(config).VSCR_LIB_PATHS, "/fallback");
+  lsp.sessionState = { attachedPackages: [], libraryPaths: ["/project/.uvr/library"] };
   const env = lsp.buildServerEnv(config);
-  assert.equal(env.VSCR_LIB_PATHS, "/project/.uvr/library");
+  assert.equal(env.VSCR_LIB_PATHS, "/project/.uvr/library\n/fallback");
 });
 
 test("library-path restart serializes concurrent starts and applies the latest paths", async (t) => {

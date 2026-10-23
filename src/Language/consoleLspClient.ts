@@ -807,7 +807,10 @@ export class ConsoleLspClient implements CompletionProvider {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = this.sessionState?.libraryPaths ?? config.get<string[]>("libPaths") ?? [];
+    const libPaths = [
+      ...(this.sessionState?.libraryPaths ?? []),
+      ...(config.get<string[]>("libPaths") ?? []),
+    ];
 
     // The lifecycle channel reports errors only; languageserver writes its
     // debug and info entries to the same stderr stream as errors.
