@@ -96,11 +96,29 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");
   await submit('stop("EXPECTED_SMOKE_ERROR")', "EXPECTED_SMOKE_ERROR");
 
+  await submit('test <- data.frame("中文" = 1); stopifnot(identical(names(test), "中文")); cat("UNICODE_COLUMN_OK\\n")', "UNICODE_COLUMN_OK");
+  assert.doesNotMatch(output, /Warning/);
+  assert.equal(await backend.requestParseStatus(session, '中文 <- "日本語 café 🙂"'), 1);
+  await submit(`
+    local({
+      old <- options(warn = 2)
+      on.exit(options(old))
+      stopifnot(identical(names(test), "中文"), test$中文 == 1)
+      中文 <- "日本語 café 🙂"
+      stopifnot(identical(中文, r"(日本語 café 🙂)"))
+      file <- "中文-🙂.txt"
+      on.exit(unlink(file), add = TRUE)
+      writeLines(中文, file, useBytes = TRUE)
+      stopifnot(identical(readLines(file, encoding = "UTF-8"), 中文))
+      cat("UNICODE:", 中文, "\\n")
+    })
+  `, "UNICODE: 日本語 café 🙂");
+
   const inputStart = events.length;
   assert.equal(backend.sendSessionCommand(session, { type: "submit", code: 'reply <- readline("SMOKE_INPUT>"); cat("REPLY:", reply, "\\n")' }), true);
   await waitFor(() => events.slice(inputStart).some((event) => event.type === "input-request"), "nested input");
-  assert.equal(backend.sendSessionCommand(session, { type: "reply-input", text: "hello" }), true);
-  await waitFor(() => output.includes("REPLY: hello") && events.slice(inputStart).some(isPrompt), "nested reply");
+  assert.equal(backend.sendSessionCommand(session, { type: "reply-input", text: "中文 café 🙂" }), true);
+  await waitFor(() => output.includes("REPLY: 中文 café 🙂") && events.slice(inputStart).some(isPrompt), "nested reply");
 
   const busyStart = events.length;
   assert.equal(backend.sendSessionCommand(session, { type: "submit", code: "Sys.sleep(30)" }), true);
