@@ -11,6 +11,7 @@ All notable changes to R Console will be documented in this file.
 ### Fixed
 
 - Fixed missing package and function completions when the active R session uses project-specific package folders, including those managed by uvr or renv. Completions now follow the session's package folders as they change, search them first, and keep folders configured in `r.libPaths` as fallbacks.
+- Fixed Unicode column names, variable names, and text input in Windows consoles.
 
 ## [0.5.3] - 2026-10-15
 
