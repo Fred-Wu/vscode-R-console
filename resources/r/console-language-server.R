@@ -142,6 +142,12 @@ check_package_changes <- function(workspace, packages = character()) {
 record_package_fingerprints("languageserver")
 
 server <- languageserver:::LanguageServer$new(host, port)
+if (!is.null(port)) {
+    token <- Sys.getenv("VSCR_LSP_AUTH_TOKEN")
+    if (!grepl("^[0-9a-f]{64}$", token)) stop("Missing console language server token")
+    writeBin(charToRaw(token), server$outputcon)
+    flush(server$outputcon)
+}
 for (workspace in server$workspaces$values()) {
     record_cached_package_fingerprints(workspace)
 }

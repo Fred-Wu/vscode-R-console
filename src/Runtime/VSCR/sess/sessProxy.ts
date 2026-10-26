@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as net from "net";
 import * as path from "path";
+import * as os from "os";
 import type {
   SessionMemberCompletionItem,
   WorkspaceData,
@@ -18,6 +19,7 @@ type SessProxyOptions = {
 
 const REQUEST_TIMEOUT_MS = 2000;
 const R_SOCKET_WAIT_TIMEOUT_MS = 1200;
+const MAX_SESS_LINE_BYTES = 16 * 1024 * 1024;
 
 async function setOwnerOnlyPermissions(filePath: string): Promise<void> {
   if (process.platform === "win32") {
@@ -29,6 +31,7 @@ async function setOwnerOnlyPermissions(filePath: string): Promise<void> {
 export class SessProxy {
   private server: net.Server | undefined;
   private proxyPipePath: string | undefined;
+  private socketDirectory: string | undefined;
   private rSocket: net.Socket | undefined;
   private upstreamSocket: net.Socket | undefined;
   private rBuffer = "";
@@ -46,11 +49,11 @@ export class SessProxy {
 
   async start(): Promise<string> {
     this.dispose();
-    const pipePath = this.createPipePath();
+    const pipePath = process.platform === "win32"
+      ? this.createPipePath()
+      : path.join(await fs.promises.mkdtemp(path.join(os.tmpdir(), "vrc-")), "sess.sock");
+    if (process.platform !== "win32") this.socketDirectory = path.dirname(pipePath);
     this.proxyPipePath = pipePath;
-    if (process.platform !== "win32") {
-      await fs.promises.rm(pipePath, { force: true }).catch(() => undefined);
-    }
 
     this.server = net.createServer((socket) => this.attachRSocket(socket));
     try {
@@ -104,9 +107,9 @@ export class SessProxy {
 
     const pipePath = this.proxyPipePath;
     this.proxyPipePath = undefined;
-    if (pipePath && process.platform !== "win32") {
-      void fs.promises.rm(pipePath, { force: true }).catch(() => undefined);
-    }
+    const directory = this.socketDirectory;
+    this.socketDirectory = undefined;
+    if (directory) void fs.promises.rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }
 
   async requestWorkspace(): Promise<WorkspaceData | undefined> {
@@ -206,7 +209,7 @@ export class SessProxy {
     if (process.platform === "win32") {
       return `\\\\.\\pipe\\vscode-r-console-${suffix}`;
     }
-    return path.join("/tmp", `vrc-${suffix}.sock`);
+    return path.join(os.tmpdir(), `vrc-${suffix}.sock`);
   }
 
   private attachRSocket(socket: net.Socket): void {
@@ -283,6 +286,13 @@ export class SessProxy {
     const combined = buffer + chunk.toString();
     const lines = combined.split("\n");
     const carry = lines.pop() ?? "";
+    // A large batch of valid JSON-RPC messages is safe: bound each line,
+    // not the entire socket chunk containing multiple completed messages.
+    if ([...lines, carry].some((line) => Buffer.byteLength(line, "utf8") > MAX_SESS_LINE_BYTES)) {
+      this.rSocket?.destroy();
+      this.upstreamSocket?.destroy();
+      return "";
+    }
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line) {

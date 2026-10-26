@@ -22,6 +22,8 @@ use windows_sys::Win32::{
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
+const MAX_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const FRAME_AUTH: u16 = 21;
 
 const FRAME_BACKEND_READY: u16 = 1;
 const FRAME_HOST_CONNECTED: u16 = 2;
@@ -531,6 +533,22 @@ pub(crate) enum PromptKind {
     Cont,
 }
 
+/// Authenticate clients before replacing the active R console session.
+pub(crate) fn authenticate_client<R: Read>(reader: &mut R, expected: &[u8]) -> io::Result<bool> {
+    if expected.len() != 64 { return Ok(false); }
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    let length = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let kind = u16::from_le_bytes(header[4..6].try_into().unwrap());
+    if kind != FRAME_AUTH || length != expected.len() || header[6..].iter().any(|byte| *byte != 0) {
+        return Ok(false);
+    }
+    let mut supplied = [0_u8; 64];
+    reader.read_exact(&mut supplied)?;
+    let mismatch = supplied.iter().zip(expected).fold(0_u8, |acc, (a, b)| acc | (a ^ b));
+    Ok(mismatch == 0)
+}
+
 pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<IncomingCommand>> {
     let mut header = [0_u8; FRAME_HEADER_LEN];
     let mut read = 0_usize;
@@ -553,6 +571,9 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
     let kind = u16::from_le_bytes(header[4..6].try_into().expect("kind slice"));
     let request_id = u32::from_le_bytes(header[8..12].try_into().expect("request id slice"));
 
+    if payload_len > MAX_INPUT_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "backend frame exceeds size limit"));
+    }
     let mut payload = vec![0_u8; payload_len];
     if payload_len > 0 {
         reader.read_exact(&mut payload)?;
@@ -731,6 +752,26 @@ mod tests {
             Some(IncomingCommand::Shutdown)
         ));
         assert!(read_next_command(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn requires_valid_authentication_before_processing_commands() {
+        let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(authenticate_client(&mut Cursor::new(frame(FRAME_AUTH, 0, secret)), secret).unwrap());
+        assert!(!authenticate_client(&mut Cursor::new(frame(FRAME_SUBMIT, 0, secret)), secret).unwrap());
+        assert!(!authenticate_client(&mut Cursor::new(frame(FRAME_AUTH, 0, b"wrong")), secret).unwrap());
+        let mut wrong = *secret;
+        wrong[63] ^= 1;
+        assert!(!authenticate_client(&mut Cursor::new(frame(FRAME_AUTH, 0, &wrong)), secret).unwrap());
+    }
+
+    #[test]
+    fn rejects_excessive_input_before_allocating() {
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        header[..4].copy_from_slice(&((MAX_INPUT_FRAME_BYTES + 1) as u32).to_le_bytes());
+        header[4..6].copy_from_slice(&FRAME_SUBMIT.to_le_bytes());
+        let error = read_next_command(&mut Cursor::new(header)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

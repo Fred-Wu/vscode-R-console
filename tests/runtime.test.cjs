@@ -3,6 +3,7 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const net = require("node:net");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
@@ -92,6 +93,30 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
     isPrompt(event) || (event.type === "session-state" && event.wait.kind === "top-level")), "startup");
   pid = backend.getPid(session);
   assert.ok(pid);
+  const bootstrap = path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`);
+  const sessionData = JSON.parse(fs.readFileSync(bootstrap, "utf8"));
+  assert.equal(sessionData.authToken, undefined, "bootstrap must never disclose backend credentials");
+  assert.match(backend.getReconnectInfo(session).authToken, /^[0-9a-f]{64}$/);
+  if (process.platform !== "win32") assert.equal(fs.statSync(bootstrap).mode & 0o777, 0o600);
+  // Wrong and missing credentials must not replace the authenticated console.
+  for (const content of [Buffer.alloc(0), Buffer.from("unauthenticated"), Buffer.concat([
+    Buffer.from([64, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0]),
+    Buffer.from("0".repeat(64)),
+  ])]) {
+    await new Promise((resolve) => {
+      const socket = net.createConnection({ host: "127.0.0.1", port: sessionData.port });
+      socket.on("error", resolve);
+      socket.on("connect", () => socket.end(content));
+      socket.on("close", resolve);
+    });
+  }
+  assert.equal(backend.canUseSessionCommands(session), true);
+  // A peer holding an incomplete handshake cannot block the legitimate session.
+  const stalled = net.createConnection({ host: "127.0.0.1", port: sessionData.port });
+  stalled.on("error", () => {});
+  await new Promise((resolve) => stalled.once("connect", resolve));
+  await submit('cat("AUTHENTICATED_CONSOLE_OK\\n")', "AUTHENTICATED_CONSOLE_OK");
+  stalled.destroy();
   assert.equal(await backend.requestParseStatus(session, "x <- ("), 2);
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");
   await submit('stop("EXPECTED_SMOKE_ERROR")', "EXPECTED_SMOKE_ERROR");
@@ -131,7 +156,7 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   backend.detach(session);
   assert.equal(alive(), true, "detach must preserve the R process");
   backend = new RustSidecarRuntimeBackend(binary);
-  session = backend.reconnect(reconnect);
+  session = backend.reconnect(JSON.parse(JSON.stringify(reconnect)));
   events.length = 0;
   backend.attach(session, handlers);
   await waitFor(() => backend.canUseSessionCommands(session) && events.some((event) =>

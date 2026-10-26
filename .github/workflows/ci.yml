@@ -8,6 +8,10 @@ on:
   workflow_dispatch:
   workflow_call:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -35,6 +39,9 @@ jobs:
           r-version: release
           rtools-version: none
       - run: npm ci
+      - name: Audit npm dependencies
+        if: runner.os == 'Linux'
+        run: npm audit --audit-level=low
       - name: Type-check and bundle
         run: npm run package:extension
       - name: Unit tests

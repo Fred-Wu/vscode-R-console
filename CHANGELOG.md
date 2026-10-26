@@ -2,6 +2,21 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [Unreleased]
+
+### Security
+
+- Authenticate initial and reattached persistent R backend connections before allowing execution control. Rejected clients cannot replace an existing console.
+- Reject oversized backend protocol frames before allocation and store session credentials in the restricted persistent-session registry, not the temporary bootstrap file.
+- Authenticate console language-server TCP connections before accepting LSP traffic.
+- Bound unauthenticated backend connection attempts and `sess` JSON-RPC message buffering, and reject remote legacy session-server addresses.
+- Restrict the legacy vscode-R watcher directory to its owner and audit all npm dependencies in CI.
+- Update vulnerable npm dependencies, including development tooling, and add targeted overrides for transitive dependencies that lack compatible security updates.
+- Create Unix sess sockets inside private directories and persist session metadata with restricted, atomic file replacements.
+- Avoid disconnecting `sess` sessions when a socket chunk contains several individually valid messages, and cancel superseded CI workflow runs.
+- Increase the bundled runtime version to 0.2.4 and prevent release packaging from restoring stale sidecar binaries when Rust inputs change.
+- Existing detached sessions without authentication must be closed with the older release before upgrading.
+
 ## [0.5.4] - 2026-10-23
 
 ### Added

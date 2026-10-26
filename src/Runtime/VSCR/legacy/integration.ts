@@ -43,7 +43,8 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
       throw new Error(`Legacy vscode-R bootstrap script not found at ${bootstrapPath}`);
     }
 
-    fs.mkdirSync(this.options.watcherDir, { recursive: true });
+    fs.mkdirSync(this.options.watcherDir, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") fs.chmodSync(this.options.watcherDir, 0o700);
     env.R_CONSOLE_SESSION_BOOTSTRAP = bootstrapPath;
     env.VSCODE_INIT_R = this.options.initPath;
     env.VSCODE_WATCHER_DIR = this.options.watcherDir;

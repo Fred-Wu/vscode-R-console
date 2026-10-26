@@ -1,4 +1,5 @@
 const FRAME_HEADER_LEN = 12;
+const MAX_BACKEND_FRAME_BYTES = 8 * 1024 * 1024;
 
 const FrameKind = {
   BackendReady: 1,
@@ -20,6 +21,7 @@ const FrameKind = {
   DialogResult: 18,
   HostError: 19,
   SessionState: 20,
+  Authenticate: 21,
 } as const;
 
 export type BackendCapability =
@@ -398,6 +400,9 @@ export function parseBackendFrames(
   while (cursor + FRAME_HEADER_LEN <= combined.length) {
     const payloadLength = combined.readUInt32LE(cursor);
     const kind = combined.readUInt16LE(cursor + 4);
+    if (payloadLength > MAX_BACKEND_FRAME_BYTES) {
+      return { events, output, carry: Buffer.alloc(0), error: "Backend frame exceeds size limit" };
+    }
     const frameLength = FRAME_HEADER_LEN + payloadLength;
     if (cursor + frameLength > combined.length) {
       break;
@@ -442,6 +447,11 @@ export function parseBackendFrames(
     output,
     carry: Buffer.from(combined.subarray(cursor)),
   };
+}
+
+export function encodeAuthFrame(token: string): Buffer {
+  if (!/^[0-9a-f]{64}$/.test(token)) throw new Error("Invalid backend authentication token.");
+  return createFrame(FrameKind.Authenticate, 0, Buffer.from(token, "ascii"));
 }
 
 export function encodeSubmitFrame(code: string): Buffer {

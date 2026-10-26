@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
@@ -317,7 +318,7 @@ function isRuntimeSessionReconnectInfo(
   if (typeof value.sessionId !== "string" || value.sessionId.trim().length === 0) {
     return false;
   }
-  if (!isPositiveInteger(value.port)) {
+  if (!isPositiveInteger(value.port) || typeof value.authToken !== "string" || !/^[0-9a-f]{64}$/.test(value.authToken)) {
     return false;
   }
   if (value.pid !== undefined && !isPositiveInteger(value.pid)) {
@@ -1457,7 +1458,16 @@ function persistPersistentSessions(): void {
     const sessionState: PersistentSessionState = {
       sessions: persisted,
     };
-    fs.writeFileSync(persistentSessionFilePath, JSON.stringify(sessionState), "utf8");
+    const temporary = `${persistentSessionFilePath}.${randomUUID()}.tmp`;
+    try {
+      // Keep metadata private and never truncate the live registry on failure.
+      fs.writeFileSync(temporary, JSON.stringify(sessionState), {
+        encoding: "utf8", mode: 0o600, flag: "wx",
+      });
+      fs.renameSync(temporary, persistentSessionFilePath);
+    } finally {
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+    }
   } catch {
   }
 }

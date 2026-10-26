@@ -128,6 +128,13 @@ jobs:
             exit 0
           fi
 
+          # Even if the version is unchanged, never restore a backend whose
+          # Rust implementation differs from the published binary.
+          if ! git diff --quiet "${previous_tag}" HEAD -- sidecar/pty-host/src sidecar/pty-host/Cargo.toml sidecar/pty-host/Cargo.lock; then
+            echo "Rust runtime inputs changed; building the sidecar rather than restoring a stale binary."
+            exit 0
+          fi
+
           runtime_build_inputs=(scripts/build-sidecar.js scripts/sidecar-targets.js)
           if [[ "${TARGET}" == win32-* ]]; then
             runtime_build_inputs+=(images/Rlogo.ico)

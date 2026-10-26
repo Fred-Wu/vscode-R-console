@@ -65,7 +65,8 @@ export class SessionWatcher {
     this.sessionDirWatcher = undefined;
     this.startedAt = Date.now();
 
-    fs.mkdirSync(this.watcherDir, { recursive: true });
+    fs.mkdirSync(this.watcherDir, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") fs.chmodSync(this.watcherDir, 0o700);
     const lockFile = path.join(this.watcherDir, "request.lock");
     if (!fs.existsSync(lockFile)) {
       fs.writeFileSync(lockFile, "");
@@ -278,10 +279,11 @@ export class SessionWatcher {
     const { host, port, token } = server;
     if (
       typeof host !== "string" ||
-      !host ||
+      !["127.0.0.1", "localhost", "::1"].includes(host.toLowerCase()) ||
       typeof port !== "number" ||
       !Number.isFinite(port) ||
       port <= 0 ||
+      port > 65535 ||
       typeof token !== "string" ||
       !token
     ) {
@@ -321,8 +323,16 @@ export class SessionWatcher {
         },
         (res) => {
           const chunks: Buffer[] = [];
+          let responseBytes = 0;
           res.on("data", (chunk: Buffer | string) => {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            responseBytes += bytes.length;
+            if (responseBytes > 16 * 1024 * 1024) {
+              res.destroy();
+              done(undefined);
+              return;
+            }
+            chunks.push(bytes);
           });
           res.on("end", () => {
             if (res.statusCode !== 200) {
