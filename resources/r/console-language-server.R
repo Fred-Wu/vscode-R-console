@@ -141,7 +141,7 @@ check_package_changes <- function(workspace, packages = character()) {
 
 record_package_fingerprints("languageserver")
 
-server <- languageserver:::LanguageServer$new(host, port)
+server <- languageserver:::LanguageServer$new(host, NULL)
 if (!is.null(port)) {
     token <- Sys.getenv("VSCR_LSP_AUTH_TOKEN")
     if (!grepl("^[0-9a-f]{64}$", token)) stop("Missing console language server token")
@@ -157,6 +157,15 @@ if (!is.null(port)) {
     if (is.na(auth_timeout) || auth_timeout <= 0L) {
         stop("Missing or invalid language server authentication timeout")
     }
+
+    # Initialize the server before connecting: the TCP constructor connects
+    # before its task managers and workspaces are initialized.
+    # Switch the initialized server from stdio to TCP before authenticating.
+    stdio_input <- server$inputcon
+    server$inputcon <- socketConnection(host = host, port = port, open = "r+b", blocking = FALSE)
+    server$outputcon <- server$inputcon
+    server$tcp <- TRUE
+    close(stdio_input)
 
     # The languageserver TCP input is nonblocking. Enforce one deadline across
     # fragmented reads, and bound any underlying socket operation.

@@ -76,7 +76,7 @@ test("active console libraries take precedence over fallback R libraries", () =>
 
 test("console R language server authenticates before entering the LSP event loop", () => {
   const script = fs.readFileSync(path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8");
-  const create = script.indexOf("LanguageServer$new(host, port)");
+  const create = script.indexOf("LanguageServer$new(host, NULL)");
   const token = script.indexOf("digest::hmac(");
   const run = script.indexOf("server$run()");
   assert.ok(create >= 0 && token > create && run > token);
@@ -86,4 +86,16 @@ test("console R language server authenticates before entering the LSP event loop
   assert.match(script, /rconsole-lsp-server-v2/);
   assert.match(script, /rconsole-lsp-client-v2/);
   assert.doesNotMatch(script, /writeBin\(charToRaw\(token\)/);
+});
+
+test("console LSP connects only after language-server initialization", () => {
+  const script = fs.readFileSync(
+    path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8"
+  );
+  assert.match(script, /server <- languageserver:::LanguageServer\$new\(host, NULL\)/);
+  const initialized = script.indexOf("server <- languageserver:::LanguageServer$new(host, NULL)");
+  const connect = script.indexOf('server$inputcon <- socketConnection(', initialized);
+  const authentication = script.indexOf('writeBin(nonce, server$outputcon)', initialized);
+  assert.ok(initialized >= 0 && connect > initialized && authentication > connect);
+  assert.match(script, /server\$tcp <- TRUE/);
 });
