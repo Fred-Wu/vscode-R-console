@@ -31,6 +31,8 @@ const FRAME_SERVER_CHALLENGE: u16 = 22;
 const FRAME_CLIENT_PROOF: u16 = 23;
 const FRAME_SERVER_PROOF: u16 = 24;
 const AUTH_NONCE_BYTES: usize = 32;
+// Keep in sync with BACKEND_AUTH_TIMEOUT_MS in backendAuthentication.ts.
+const BACKEND_AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const AUTH_CLIENT_CONTEXT: &[u8] = b"rconsole-backend-client-v2";
 const AUTH_SERVER_CONTEXT: &[u8] = b"rconsole-backend-server-v2";
 
@@ -636,7 +638,7 @@ pub(crate) fn authenticate_client<S: Read + Write>(
 /// blocking reads. Restore blocking mode explicitly on each accepted socket.
 pub(crate) fn authenticate_session_stream(stream: &mut TcpStream, secret: &[u8]) -> io::Result<bool> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(BACKEND_AUTH_TIMEOUT))?;
     let result = authenticate_client(stream, secret);
     stream.set_read_timeout(None)?;
     result
@@ -930,7 +932,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream.set_read_timeout(Some(BACKEND_AUTH_TIMEOUT)).unwrap();
             let mut challenge = [0_u8; FRAME_HEADER_LEN + 32];
             stream.read_exact(&mut challenge).unwrap();
             assert_eq!(u32::from_le_bytes(challenge[0..4].try_into().unwrap()), 32);

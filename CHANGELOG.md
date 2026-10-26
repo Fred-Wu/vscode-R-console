@@ -6,6 +6,8 @@ All notable changes to R Console will be documented in this file.
 
 ### Security
 
+- Use the same 3-second authentication deadline in Rust and TypeScript; retain separate bootstrap and retry policies.
+
 - Restore blocking mode for accepted backend sockets before the challenge-response handshake, ensuring macOS and Windows can authenticate correctly.
 
 - Use mutual HMAC-SHA256 challenge-response with fresh nonces instead of sending a reusable backend token over TCP; both sides authenticate before processing R commands.

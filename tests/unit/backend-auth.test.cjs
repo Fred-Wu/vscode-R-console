@@ -1,13 +1,22 @@
 const assert = require("node:assert/strict");
 const { createHmac } = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const net = require("node:net");
 const { once } = require("node:events");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
-const { authenticateBackendSocket, BackendAuthenticationError } =
+const { authenticateBackendSocket, BackendAuthenticationError, BACKEND_AUTH_TIMEOUT_MS } =
   loadSource("src/Runtime/backendAuthentication.ts");
 
 const token = "0123456789abcdef".repeat(4);
+
+test("Rust and TypeScript use the same backend authentication deadline", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../../sidecar/pty-host/src/protocol.rs"), "utf8");
+  const matched = /^const BACKEND_AUTH_TIMEOUT: Duration = Duration::from_secs\((\d+)\);$/m.exec(source);
+  assert.ok(matched, "Rust must declare the backend authentication deadline");
+  assert.equal(BACKEND_AUTH_TIMEOUT_MS, Number(matched[1]) * 1000);
+});
 function frame(kind, payload) {
   const header = Buffer.alloc(12);
   header.writeUInt32LE(payload.length, 0);

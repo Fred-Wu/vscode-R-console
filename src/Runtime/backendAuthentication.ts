@@ -6,6 +6,9 @@ const FRAME_CHALLENGE = 22;
 const FRAME_CLIENT_PROOF = 23;
 const FRAME_SERVER_PROOF = 24;
 const NONCE_BYTES = 32;
+
+/** Maximum time for one local backend mutual-authentication handshake. */
+export const BACKEND_AUTH_TIMEOUT_MS = 3_000;
 const CLIENT_CONTEXT = Buffer.from("rconsole-backend-client-v2", "ascii");
 const SERVER_CONTEXT = Buffer.from("rconsole-backend-server-v2", "ascii");
 
@@ -29,7 +32,7 @@ function mac(secret: string, context: Buffer, serverNonce: Buffer, clientNonce: 
 }
 
 /** Both peers prove the shared secret without transmitting it over TCP. */
-export function authenticateBackendSocket(socket: net.Socket, token: string, timeoutMs = 3000): Promise<net.Socket> {
+export function authenticateBackendSocket(socket: net.Socket, token: string, timeoutMs = BACKEND_AUTH_TIMEOUT_MS): Promise<net.Socket> {
   if (!/^[0-9a-f]{64}$/.test(token)) {
     return Promise.reject(new BackendAuthenticationError("Invalid backend authentication credentials."));
   }
