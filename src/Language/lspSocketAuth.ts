@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import * as net from "net";
+import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 
 const NONCE_BYTES = 32;
 const SECRET_BYTES = 64;
@@ -15,7 +16,7 @@ function proof(token: string, context: Buffer, clientNonce: Buffer, serverNonce:
 export function authenticateLspSocket(
   socket: net.Socket,
   token: string,
-  timeoutMs = 15000,
+  timeoutMs = BACKEND_AUTH_TIMEOUT_MS,
   expectedClientNonce?: string
 ): Promise<boolean> {
   if (!/^[0-9a-f]{64}$/.test(token)) {

@@ -153,17 +153,28 @@ if (!is.null(port)) {
     nonce <- as.raw(strtoi(substring(nonce_hex, seq.int(1L, 64L, 2L),
                               seq.int(2L, 64L, 2L)), 16L))
 
-    read_auth <- function(count, timeout = 5) {
+    auth_timeout <- suppressWarnings(as.integer(Sys.getenv("VSCR_LSP_AUTH_TIMEOUT_SECONDS")))
+    if (is.na(auth_timeout) || auth_timeout <= 0L) {
+        stop("Missing or invalid language server authentication timeout")
+    }
+
+    # The languageserver TCP input is nonblocking. Enforce one deadline across
+    # fragmented reads, and bound any underlying socket operation.
+    previous_socket_timeout <- socketTimeout(server$inputcon, auth_timeout)
+    deadline <- proc.time()[["elapsed"]] + auth_timeout
+    read_auth <- function(count) {
         received <- raw()
-        deadline <- Sys.time() + timeout
         while (length(received) < count) {
-            part <- tryCatch(readBin(server$inputcon, "raw", n = count - length(received)),
-                             error = function(e) raw())
-            if (length(part)) received <- c(received, part)
-            if (length(received) == count) break
-            if (Sys.time() >= deadline) stop("Language server authentication timed out")
-            Sys.sleep(0.01)
+            remaining <- deadline - proc.time()[["elapsed"]]
+            if (remaining <= 0 ||
+                !isTRUE(socketSelect(list(server$inputcon), timeout = remaining)[[1L]])) {
+                stop("Language server authentication timed out")
+            }
+            part <- readBin(server$inputcon, "raw", n = count - length(received))
+            if (!length(part)) stop("Language server authentication socket closed")
+            received <- c(received, part)
         }
+        if (proc.time()[["elapsed"]] > deadline) stop("Language server authentication timed out")
         received
     }
     auth_mac <- function(context, peer_nonce) {
@@ -187,6 +198,7 @@ if (!is.null(port)) {
     }
     writeBin(auth_mac("rconsole-lsp-client-v2", peer_nonce), server$outputcon)
     flush(server$outputcon)
+    socketTimeout(server$inputcon, previous_socket_timeout)
 }
 for (workspace in server$workspaces$values()) {
     record_cached_package_fingerprints(workspace)

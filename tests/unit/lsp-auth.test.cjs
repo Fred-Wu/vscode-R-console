@@ -1,12 +1,44 @@
 const assert = require("node:assert/strict");
 const { createHmac } = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const net = require("node:net");
 const { once } = require("node:events");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
+const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 
 const token = "a".repeat(64);
+
+test("LSP handshake uses the backend authentication deadline, not the R startup deadline", () => {
+  assert.equal(BACKEND_AUTH_TIMEOUT_MS, 3000);
+  const authSource = fs.readFileSync(path.join(__dirname, "../../src/Language/lspSocketAuth.ts"), "utf8");
+  const clientSource = fs.readFileSync(path.join(__dirname, "../../src/Language/consoleLspClient.ts"), "utf8");
+  const script = fs.readFileSync(path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8");
+  assert.match(authSource, /timeoutMs = BACKEND_AUTH_TIMEOUT_MS/);
+  assert.match(clientSource, /authenticateLspSocket\(socket, authToken, BACKEND_AUTH_TIMEOUT_MS, clientNonce\)/);
+  assert.match(clientSource, /VSCR_LSP_AUTH_TIMEOUT_SECONDS: String\(BACKEND_AUTH_TIMEOUT_MS \/ 1_000\)/);
+  assert.match(script, /Sys.getenv\("VSCR_LSP_AUTH_TIMEOUT_SECONDS"\)/);
+  assert.match(script, /socketTimeout\(server\$inputcon, auth_timeout\)/);
+  assert.match(script, /socketSelect\(list\(server\$inputcon\), timeout = remaining\)/);
+  assert.match(script, /readBin\(server\$inputcon, "raw", n = count - length\(received\)\)/);
+  assert.match(script, /socketTimeout\(server\$inputcon, previous_socket_timeout\)/);
+});
+
+test("LSP handshake rejects an idle peer when its deadline expires", async (t) => {
+  let result;
+  const server = net.createServer((socket) => {
+    void authenticateLspSocket(socket, token, 80).then((accepted) => { result = accepted; });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => server.close());
+  const peer = net.createConnection({ host: "127.0.0.1", port: server.address().port });
+  peer.on("error", () => {});
+  await once(peer, "close");
+  assert.equal(result, false);
+});
 function mac(key, context, clientNonce, serverNonce) {
   return createHmac("sha256", Buffer.from(key, "ascii"))
     .update(Buffer.from(context, "ascii")).update(clientNonce).update(serverNonce).digest();

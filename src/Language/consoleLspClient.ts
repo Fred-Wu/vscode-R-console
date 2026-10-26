@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as net from "net";
 import { randomBytes } from "crypto";
 import { authenticateLspSocket } from "./lspSocketAuth";
+import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
@@ -664,7 +665,7 @@ export class ConsoleLspClient implements CompletionProvider {
           return;
         }
         pendingAuth += 1;
-        void authenticateLspSocket(socket, authToken, 15000, clientNonce).then((accepted) => {
+        void authenticateLspSocket(socket, authToken, BACKEND_AUTH_TIMEOUT_MS, clientNonce).then((accepted) => {
           pendingAuth -= 1;
           if (!accepted || settled) {
             socket.destroy();
@@ -714,6 +715,7 @@ export class ConsoleLspClient implements CompletionProvider {
           VSCR_LSP_HOST: CONSOLE_LSP_HOST,
           VSCR_LSP_PORT: String(address.port),
           VSCR_LSP_AUTH_TOKEN: authToken,
+          VSCR_LSP_AUTH_TIMEOUT_SECONDS: String(BACKEND_AUTH_TIMEOUT_MS / 1_000),
           VSCR_LSP_CLIENT_NONCE: clientNonce,
         };
         let child: ChildProcess;
