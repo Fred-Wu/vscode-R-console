@@ -9,7 +9,7 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::protocol::{
-        authenticate_client, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
     };
     use libloading::os::unix::{Library, Symbol};
@@ -477,10 +477,7 @@ mod unix_host {
                         let sender = authenticated_tx.clone();
                         let pending = Arc::clone(&pending_auth);
                         thread::spawn(move || {
-                            let accepted = stream.set_read_timeout(Some(Duration::from_millis(500))).is_ok()
-                                && matches!(authenticate_client(&mut stream, token.as_bytes()), Ok(true));
-                            if accepted {
-                                let _ = stream.set_read_timeout(None);
+                            if matches!(authenticate_session_stream(&mut stream, token.as_bytes()), Ok(true)) {
                                 let _ = sender.send(stream);
                             }
                             pending.fetch_sub(1, Ordering::SeqCst);
@@ -1739,7 +1736,7 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::protocol::{
-        authenticate_client, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
     };
     use libloading::os::windows::{
@@ -2307,10 +2304,7 @@ mod windows_host {
                         let sender = authenticated_tx.clone();
                         let pending = Arc::clone(&pending_auth);
                         thread::spawn(move || {
-                            let accepted = stream.set_read_timeout(Some(Duration::from_millis(500))).is_ok()
-                                && matches!(authenticate_client(&mut stream, token.as_bytes()), Ok(true));
-                            if accepted {
-                                let _ = stream.set_read_timeout(None);
+                            if matches!(authenticate_session_stream(&mut stream, token.as_bytes()), Ok(true)) {
                                 let _ = sender.send(stream);
                             }
                             pending.fetch_sub(1, Ordering::SeqCst);

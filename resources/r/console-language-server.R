@@ -145,7 +145,47 @@ server <- languageserver:::LanguageServer$new(host, port)
 if (!is.null(port)) {
     token <- Sys.getenv("VSCR_LSP_AUTH_TOKEN")
     if (!grepl("^[0-9a-f]{64}$", token)) stop("Missing console language server token")
-    writeBin(charToRaw(token), server$outputcon)
+
+    # VS Code generated this fresh process-specific nonce using the OS CSPRNG.
+    # It is independent from the shared secret and never reused on a restart.
+    nonce_hex <- Sys.getenv("VSCR_LSP_CLIENT_NONCE")
+    if (!grepl("^[0-9a-f]{64}$", nonce_hex)) stop("Missing language server client nonce")
+    nonce <- as.raw(strtoi(substring(nonce_hex, seq.int(1L, 64L, 2L),
+                              seq.int(2L, 64L, 2L)), 16L))
+
+    read_auth <- function(count, timeout = 5) {
+        received <- raw()
+        deadline <- Sys.time() + timeout
+        while (length(received) < count) {
+            part <- tryCatch(readBin(server$inputcon, "raw", n = count - length(received)),
+                             error = function(e) raw())
+            if (length(part)) received <- c(received, part)
+            if (length(received) == count) break
+            if (Sys.time() >= deadline) stop("Language server authentication timed out")
+            Sys.sleep(0.01)
+        }
+        received
+    }
+    auth_mac <- function(context, peer_nonce) {
+        digest::hmac(
+            key = charToRaw(token),
+            object = c(charToRaw(context), nonce, peer_nonce),
+            algo = "sha256",
+            serialize = FALSE,
+            raw = TRUE
+        )
+    }
+    writeBin(nonce, server$outputcon)
+    flush(server$outputcon)
+    response <- read_auth(64L)
+    peer_nonce <- response[seq_len(32L)]
+    server_mac <- response[33:64]
+    expected <- auth_mac("rconsole-lsp-server-v2", peer_nonce)
+    # Compare all bytes, without an early exit on a mismatch.
+    if (sum(bitwXor(as.integer(server_mac), as.integer(expected))) != 0L) {
+        stop("Invalid language server authentication proof")
+    }
+    writeBin(auth_mac("rconsole-lsp-client-v2", peer_nonce), server$outputcon)
     flush(server$outputcon)
 }
 for (workspace in server$workspaces$values()) {

@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "crypto";
+import { authenticateBackendSocket, BackendAuthenticationError } from "./backendAuthentication";
 import { ChildProcess, spawn, SpawnOptions } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
@@ -8,7 +9,6 @@ import {
   type BackendCapability,
   type BackendControlEvent,
   type BackendDialogResult,
-  encodeAuthFrame,
   encodeDialogResultFrame,
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
@@ -534,6 +534,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           state.handlers?.onExit?.(0);
         }
       });
+      socket.resume();
     } catch (error) {
       if (state.attachGeneration !== generation || state.explicitClose) {
         return;
@@ -592,28 +593,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   }
 
   private connectSocket(port: number, token: string): Promise<net.Socket> {
-    return new Promise((resolve, reject) => {
-      const socket = net.createConnection({
-        host: "127.0.0.1",
-        port,
-      });
-      const onError = (error: Error) => {
-        socket.off("connect", onConnect);
-        socket.destroy();
-        reject(error instanceof Error ? error : new Error(String(error)));
-      };
-      const onConnect = () => {
-        try {
-          socket.write(encodeAuthFrame(token));
-          socket.off("error", onError);
-          resolve(socket);
-        } catch (error) {
-          onError(error instanceof Error ? error : new Error(String(error)));
-        }
-      };
-      socket.once("error", onError);
-      socket.once("connect", onConnect);
-    });
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    return authenticateBackendSocket(socket, token);
   }
 
   private async connectSocketWithRetry(
@@ -654,7 +635,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       if (!token) throw new Error("Session authentication unavailable. Close legacy detached R Console sessions before upgrading.");
       try {
         return await this.connectSocket(info.port, token);
-      } catch {
+      } catch (error) {
+        // A wrong server or mismatched secret must not be retried indefinitely.
+        if (error instanceof BackendAuthenticationError && !error.retryable) throw error;
       }
 
       await new Promise((resolve) => setTimeout(resolve, RECONNECT_SOCKET_RETRY_MS));
@@ -765,21 +748,17 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
     const token = state.authToken;
     if (!token) return;
-    await new Promise<void>((resolve) => {
-      const socket = net.createConnection(
-        {
-          host: "127.0.0.1",
-          port,
-        },
-        () => {
-          socket.end(Buffer.concat([encodeAuthFrame(token), encodeShutdownFrame()]));
-        }
-      );
-      const done = () => resolve();
-      socket.once("error", done);
-      socket.once("close", done);
-      socket.setTimeout(2000, () => socket.destroy());
-    });
+    try {
+      const socket = await this.connectSocket(port, token);
+      await new Promise<void>((resolve) => {
+        socket.once("error", () => resolve());
+        socket.once("close", () => resolve());
+        socket.setTimeout(2000, () => socket.destroy());
+        socket.end(encodeShutdownFrame());
+      });
+    } catch {
+      // A mismatched peer must never receive the shutdown frame.
+    }
   }
 
   private readReconnectInfoFromBootstrapFile(

@@ -1,5 +1,9 @@
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 #[cfg(any(unix, windows))]
 use std::thread;
@@ -23,7 +27,12 @@ use windows_sys::Win32::{
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 const MAX_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
-const FRAME_AUTH: u16 = 21;
+const FRAME_SERVER_CHALLENGE: u16 = 22;
+const FRAME_CLIENT_PROOF: u16 = 23;
+const FRAME_SERVER_PROOF: u16 = 24;
+const AUTH_NONCE_BYTES: usize = 32;
+const AUTH_CLIENT_CONTEXT: &[u8] = b"rconsole-backend-client-v2";
+const AUTH_SERVER_CONTEXT: &[u8] = b"rconsole-backend-server-v2";
 
 const FRAME_BACKEND_READY: u16 = 1;
 const FRAME_HOST_CONNECTED: u16 = 2;
@@ -533,20 +542,104 @@ pub(crate) enum PromptKind {
     Cont,
 }
 
-/// Authenticate clients before replacing the active R console session.
-pub(crate) fn authenticate_client<R: Read>(reader: &mut R, expected: &[u8]) -> io::Result<bool> {
-    if expected.len() != 64 { return Ok(false); }
+fn secure_server_nonce() -> io::Result<[u8; AUTH_NONCE_BYTES]> {
+    let mut nonce = [0_u8; AUTH_NONCE_BYTES];
+    #[cfg(unix)]
+    {
+        let mut random = std::fs::File::open("/dev/urandom")?;
+        random.read_exact(&mut nonce)?;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let result = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                nonce.as_mut_ptr(),
+                nonce.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::other(format!("OS random generator returned {result}")));
+        }
+    }
+    Ok(nonce)
+}
+
+fn auth_mac(
+    secret: &[u8],
+    context: &[u8],
+    server_nonce: &[u8; AUTH_NONCE_BYTES],
+    client_nonce: &[u8; AUTH_NONCE_BYTES],
+) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC supports the session token");
+    mac.update(context);
+    mac.update(server_nonce);
+    mac.update(client_nonce);
+    mac
+}
+
+fn write_auth_frame<W: Write>(writer: &mut W, kind: u16, payload: &[u8]) -> io::Result<()> {
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(&kind.to_le_bytes())?;
+    writer.write_all(&[0_u8; 6])?;
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+/// Never transmit the reusable session secret. Both sides prove knowledge of it
+/// using independently domain-separated HMACs over a fresh server/client nonce pair.
+fn authenticate_with_nonce<S: Read + Write>(
+    stream: &mut S,
+    secret: &[u8],
+    server_nonce: [u8; AUTH_NONCE_BYTES],
+) -> io::Result<bool> {
+    write_auth_frame(stream, FRAME_SERVER_CHALLENGE, &server_nonce)?;
     let mut header = [0_u8; FRAME_HEADER_LEN];
-    reader.read_exact(&mut header)?;
-    let length = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    stream.read_exact(&mut header)?;
+    let length = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let kind = u16::from_le_bytes(header[4..6].try_into().unwrap());
-    if kind != FRAME_AUTH || length != expected.len() || header[6..].iter().any(|byte| *byte != 0) {
+    if kind != FRAME_CLIENT_PROOF || length != 64 || header[6..].iter().any(|b| *b != 0) {
         return Ok(false);
     }
-    let mut supplied = [0_u8; 64];
-    reader.read_exact(&mut supplied)?;
-    let mismatch = supplied.iter().zip(expected).fold(0_u8, |acc, (a, b)| acc | (a ^ b));
-    Ok(mismatch == 0)
+
+    let mut payload = [0_u8; 64];
+    stream.read_exact(&mut payload)?;
+    let client_nonce: [u8; 32] = payload[..32].try_into().unwrap();
+    if auth_mac(secret, AUTH_CLIENT_CONTEXT, &server_nonce, &client_nonce)
+        .verify_slice(&payload[32..])
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    let proof = auth_mac(secret, AUTH_SERVER_CONTEXT, &server_nonce, &client_nonce)
+        .finalize().into_bytes();
+    write_auth_frame(stream, FRAME_SERVER_PROOF, &proof)?;
+    Ok(true)
+}
+
+pub(crate) fn authenticate_client<S: Read + Write>(
+    stream: &mut S,
+    secret: &[u8],
+) -> io::Result<bool> {
+    if secret.len() != 64 || !secret.iter().all(u8::is_ascii_hexdigit) {
+        return Ok(false);
+    }
+    authenticate_with_nonce(stream, secret, secure_server_nonce()?)
+}
+
+/// The listener is nonblocking, but the authentication protocol performs
+/// blocking reads. Restore blocking mode explicitly on each accepted socket.
+pub(crate) fn authenticate_session_stream(stream: &mut TcpStream, secret: &[u8]) -> io::Result<bool> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let result = authenticate_client(stream, secret);
+    stream.set_read_timeout(None)?;
+    result
 }
 
 pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<IncomingCommand>> {
@@ -754,15 +847,118 @@ mod tests {
         assert!(read_next_command(&mut reader).unwrap().is_none());
     }
 
+    struct Duplex {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
     #[test]
-    fn requires_valid_authentication_before_processing_commands() {
+    fn mutual_authentication_uses_distinct_proofs_and_never_sends_token() {
         let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert!(authenticate_client(&mut Cursor::new(frame(FRAME_AUTH, 0, secret)), secret).unwrap());
-        assert!(!authenticate_client(&mut Cursor::new(frame(FRAME_SUBMIT, 0, secret)), secret).unwrap());
-        assert!(!authenticate_client(&mut Cursor::new(frame(FRAME_AUTH, 0, b"wrong")), secret).unwrap());
-        let mut wrong = *secret;
-        wrong[63] ^= 1;
-        assert!(!authenticate_client(&mut Cursor::new(frame(FRAME_AUTH, 0, &wrong)), secret).unwrap());
+        let server_nonce = [7_u8; 32];
+        let client_nonce = [9_u8; 32];
+        let client_proof = auth_mac(secret, AUTH_CLIENT_CONTEXT, &server_nonce, &client_nonce)
+            .finalize().into_bytes();
+        let mut payload = Vec::from(client_nonce);
+        payload.extend_from_slice(&client_proof);
+        let mut stream = Duplex {
+            input: Cursor::new(frame(FRAME_CLIENT_PROOF, 0, &payload)),
+            output: Vec::new(),
+        };
+        assert!(authenticate_with_nonce(&mut stream, secret, server_nonce).unwrap());
+        let server_proof = auth_mac(secret, AUTH_SERVER_CONTEXT, &server_nonce, &client_nonce)
+            .finalize().into_bytes();
+        let mut expected = frame(FRAME_SERVER_CHALLENGE, 0, &server_nonce);
+        expected.extend(frame(FRAME_SERVER_PROOF, 0, &server_proof));
+        assert_eq!(stream.output, expected);
+        assert_ne!(client_proof.as_slice(), server_proof.as_slice());
+        assert!(!stream.output.windows(secret.len()).any(|part| part == secret));
+    }
+
+    #[test]
+    fn every_backend_connection_gets_a_fresh_os_nonce() {
+        assert_ne!(secure_server_nonce().unwrap(), secure_server_nonce().unwrap());
+    }
+
+    #[test]
+    fn malformed_and_replayed_authentication_cannot_attach() {
+        let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let previous_nonce = [3_u8; 32];
+        let current_nonce = [4_u8; 32];
+        let client_nonce = [8_u8; 32];
+        let old_proof = auth_mac(secret, AUTH_CLIENT_CONTEXT, &previous_nonce, &client_nonce)
+            .finalize().into_bytes();
+        let mut payload = Vec::from(client_nonce);
+        payload.extend_from_slice(&old_proof);
+        for kind in [FRAME_CLIENT_PROOF, FRAME_SUBMIT, 21] {
+            let mut stream = Duplex {
+                input: Cursor::new(frame(kind, 0, &payload)),
+                output: Vec::new(),
+            };
+            assert!(!authenticate_with_nonce(&mut stream, secret, current_nonce).unwrap());
+            assert_eq!(stream.output, frame(FRAME_SERVER_CHALLENGE, 0, &current_nonce));
+        }
+        let correct_proof = auth_mac(secret, AUTH_CLIENT_CONTEXT, &current_nonce, &client_nonce)
+            .finalize().into_bytes();
+        payload[32..].copy_from_slice(&correct_proof);
+        let mut stream = Duplex {
+            input: Cursor::new(frame(FRAME_CLIENT_PROOF, 0, &payload)),
+            output: Vec::new(),
+        };
+        assert!(authenticate_with_nonce(&mut stream, secret, current_nonce).unwrap());
+    }
+
+    #[test]
+    fn authenticates_an_accepted_socket_with_nonblocking_mode_set() {
+        use std::net::TcpListener;
+        let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut challenge = [0_u8; FRAME_HEADER_LEN + 32];
+            stream.read_exact(&mut challenge).unwrap();
+            assert_eq!(u32::from_le_bytes(challenge[0..4].try_into().unwrap()), 32);
+            assert_eq!(u16::from_le_bytes(challenge[4..6].try_into().unwrap()), FRAME_SERVER_CHALLENGE);
+            let server_nonce: [u8; 32] = challenge[12..44].try_into().unwrap();
+            let client_nonce = [9_u8; 32];
+            let proof = auth_mac(secret, AUTH_CLIENT_CONTEXT, &server_nonce, &client_nonce)
+                .finalize().into_bytes();
+            let mut payload = Vec::from(client_nonce);
+            payload.extend_from_slice(&proof);
+            stream.write_all(&frame(FRAME_CLIENT_PROOF, 0, &payload)).unwrap();
+            let mut reply = [0_u8; FRAME_HEADER_LEN + 32];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(u16::from_le_bytes(reply[4..6].try_into().unwrap()), FRAME_SERVER_PROOF);
+            let expected = auth_mac(secret, AUTH_SERVER_CONTEXT, &server_nonce, &client_nonce)
+                .finalize().into_bytes();
+            assert_eq!(&reply[12..], expected.as_slice());
+        });
+        let mut accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        accepted.set_nonblocking(true).unwrap();
+        assert!(authenticate_session_stream(&mut accepted, secret).unwrap());
+        client.join().unwrap();
     }
 
     #[test]

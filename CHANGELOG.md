@@ -6,6 +6,12 @@ All notable changes to R Console will be documented in this file.
 
 ### Security
 
+- Restore blocking mode for accepted backend sockets before the challenge-response handshake, ensuring macOS and Windows can authenticate correctly.
+
+- Use mutual HMAC-SHA256 challenge-response with fresh nonces instead of sending a reusable backend token over TCP; both sides authenticate before processing R commands.
+- Mutually authenticate the dedicated R language-server TCP connection, using a fresh process-specific nonce and HMAC proofs rather than transmitting the secret.
+- Update the native runtime to 0.2.5 for the new wire handshake.
+
 - Authenticate initial and reattached persistent R backend connections before allowing execution control. Rejected clients cannot replace an existing console.
 - Reject oversized backend protocol frames before allocation and store session credentials in the restricted persistent-session registry, not the temporary bootstrap file.
 - Authenticate console language-server TCP connections before accepting LSP traffic.

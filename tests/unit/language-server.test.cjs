@@ -77,8 +77,13 @@ test("active console libraries take precedence over fallback R libraries", () =>
 test("console R language server authenticates before entering the LSP event loop", () => {
   const script = fs.readFileSync(path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8");
   const create = script.indexOf("LanguageServer$new(host, port)");
-  const token = script.indexOf("writeBin(charToRaw(token), server$outputcon)");
+  const token = script.indexOf("digest::hmac(");
   const run = script.indexOf("server$run()");
   assert.ok(create >= 0 && token > create && run > token);
   assert.match(script, /VSCR_LSP_AUTH_TOKEN/);
+  assert.match(script, /VSCR_LSP_CLIENT_NONCE/);
+  assert.match(script, /bitwXor/);
+  assert.match(script, /rconsole-lsp-server-v2/);
+  assert.match(script, /rconsole-lsp-client-v2/);
+  assert.doesNotMatch(script, /writeBin\(charToRaw\(token\)/);
 });

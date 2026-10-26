@@ -21,7 +21,6 @@ const FrameKind = {
   DialogResult: 18,
   HostError: 19,
   SessionState: 20,
-  Authenticate: 21,
 } as const;
 
 export type BackendCapability =
@@ -447,11 +446,6 @@ export function parseBackendFrames(
     output,
     carry: Buffer.from(combined.subarray(cursor)),
   };
-}
-
-export function encodeAuthFrame(token: string): Buffer {
-  if (!/^[0-9a-f]{64}$/.test(token)) throw new Error("Invalid backend authentication token.");
-  return createFrame(FrameKind.Authenticate, 0, Buffer.from(token, "ascii"));
 }
 
 export function encodeSubmitFrame(code: string): Buffer {

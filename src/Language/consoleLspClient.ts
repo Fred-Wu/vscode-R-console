@@ -656,6 +656,7 @@ export class ConsoleLspClient implements CompletionProvider {
     return new Promise<StreamInfo>((resolve, reject) => {
       let settled = false;
       const authToken = randomBytes(32).toString("hex");
+      const clientNonce = randomBytes(32).toString("hex");
       let pendingAuth = 0;
       const server = net.createServer((socket) => {
         if (settled || pendingAuth >= 8) {
@@ -663,7 +664,7 @@ export class ConsoleLspClient implements CompletionProvider {
           return;
         }
         pendingAuth += 1;
-        void authenticateLspSocket(socket, authToken).then((accepted) => {
+        void authenticateLspSocket(socket, authToken, 15000, clientNonce).then((accepted) => {
           pendingAuth -= 1;
           if (!accepted || settled) {
             socket.destroy();
@@ -713,6 +714,7 @@ export class ConsoleLspClient implements CompletionProvider {
           VSCR_LSP_HOST: CONSOLE_LSP_HOST,
           VSCR_LSP_PORT: String(address.port),
           VSCR_LSP_AUTH_TOKEN: authToken,
+          VSCR_LSP_CLIENT_NONCE: clientNonce,
         };
         let child: ChildProcess;
         try {

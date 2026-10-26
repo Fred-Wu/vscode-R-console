@@ -55,8 +55,6 @@ test("oversized incoming backend frames fail without retaining the announced pay
 });
 
 test("commands use the Rust wire format and UTF-8 byte lengths", () => {
-  assert.deepEqual(protocol.encodeAuthFrame("a".repeat(64)), frame(21, Buffer.from("a".repeat(64))));
-  assert.throws(() => protocol.encodeAuthFrame("bad"), /authentication/);
   assert.deepEqual(protocol.encodeSubmitFrame("日本語"), frame(12, Buffer.from("日本語")));
   assert.deepEqual(protocol.encodeReplyInputFrame("yes"), frame(13, Buffer.from("yes")));
   assert.deepEqual(protocol.encodeParseStatusRequestFrame(42, "x["), frame(10, Buffer.from("x["), 42));
