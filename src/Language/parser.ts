@@ -96,6 +96,7 @@ interface Token {
   type: TokenType;
   value: string;
   position: number;
+  closed?: boolean;
 }
 
 export type HighlightTokenKind =
@@ -460,55 +461,29 @@ function parseRawString(
   pos: number
 ): { token: Token; newPos: number } | null {
   const start = pos;
-  pos += 1;
-
-  const quote = code[pos];
-  pos += 1;
-
-  let delimiter = "";
-  if (pos < code.length) {
-    const delim = code[pos];
-    if (delim === "(" || delim === "[" || delim === "{") {
-      delimiter = delim;
-      pos += 1;
-    } else if (delim === "-") {
-      let dashes = "";
-      while (pos < code.length && code[pos] === "-") {
-        dashes += "-";
-        pos += 1;
-      }
-      delimiter = dashes;
-    }
-  }
-
-  const closeDelim =
-    delimiter === "(" ? ")" : delimiter === "[" ? "]" : delimiter === "{" ? "}" : delimiter;
-
-  while (pos < code.length) {
-    if (delimiter) {
-      if (code[pos] === closeDelim) {
-        const remaining = code.slice(pos);
-        if (remaining.startsWith(closeDelim + quote)) {
-          pos += closeDelim.length + 1;
-          return {
-            token: { type: TokenType.RawString, value: code.slice(start, pos), position: start },
-            newPos: pos,
-          };
-        }
-      }
-    } else if (code[pos] === quote) {
-      pos += 1;
-      return {
-        token: { type: TokenType.RawString, value: code.slice(start, pos), position: start },
-        newPos: pos,
-      };
-    }
+  const quote = code[pos + 1];
+  pos += 2;
+  const dashStart = pos;
+  while (code[pos] === "-") {
     pos += 1;
   }
+  const closingBracket =
+    code[pos] === "(" ? ")" : code[pos] === "[" ? "]" : code[pos] === "{" ? "}" : undefined;
+  if (!closingBracket) {
+    return null;
+  }
 
+  const terminator = closingBracket + code.slice(dashStart, pos) + quote;
+  const end = code.indexOf(terminator, pos + 1);
+  const newPos = end < 0 ? code.length : end + terminator.length;
   return {
-    token: { type: TokenType.RawString, value: code.slice(start, pos), position: start },
-    newPos: pos,
+    token: {
+      type: TokenType.RawString,
+      value: code.slice(start, newPos),
+      position: start,
+      closed: end >= 0,
+    },
+    newPos,
   };
 }
 
@@ -661,7 +636,7 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
         break;
       }
       case TokenType.RawString:
-        if (!isRawStringClosed(token.value)) {
+        if (!token.closed) {
           return "incomplete";
         }
         break;
@@ -792,35 +767,6 @@ function isDefinitelyCompleteToken(token: Token): boolean {
     default:
       return false;
   }
-}
-
-function isRawStringClosed(value: string): boolean {
-  if (value.length < 3) {
-    return false;
-  }
-
-  const quote = value[1];
-  if (value.length >= 4) {
-    const delim = value[2];
-    if (delim === "(") {
-      return value.endsWith(`)${quote}`);
-    }
-    if (delim === "[") {
-      return value.endsWith(`]${quote}`);
-    }
-    if (delim === "{") {
-      return value.endsWith(`}${quote}`);
-    }
-    if (delim === "-") {
-      let dashes = 0;
-      for (let i = 2; i < value.length && value[i] === "-"; i += 1) {
-        dashes += 1;
-      }
-      return value.endsWith(`${"-".repeat(dashes)}${quote}`);
-    }
-  }
-
-  return value.endsWith(quote);
 }
 
 function isAwaitingBody(tokens: Token[]): boolean {

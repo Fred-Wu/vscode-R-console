@@ -223,6 +223,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
   private suppressNextEnterAfterPasteEnd = false;
 
+  private submissionGeneration = 0;
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
   private extensionResourcesDisposePromise: Promise<void> | undefined;
@@ -525,6 +526,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       set activeSubmission(value) {
         self.activeSubmission = value;
       },
+      get submissionGeneration() {
+        return self.submissionGeneration;
+      },
+      cancelPendingSubmissions: () => self.cancelPendingSubmissions(),
       get submissionQueue() {
         return self.submissionQueue;
       },
@@ -950,26 +955,23 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private queueProgrammaticSubmission(data: string): void {
+    const generation = this.submissionGeneration;
     this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
-      async () => this.handleQueuedProgrammaticSubmission(data),
-      async () => this.handleQueuedProgrammaticSubmission(data)
+      async () => this.handleQueuedProgrammaticSubmission(data, generation),
+      async () => this.handleQueuedProgrammaticSubmission(data, generation)
     );
   }
 
-  private async handleQueuedProgrammaticSubmission(data: string): Promise<void> {
-    if (this.mode === "closed") {
-      return;
-    }
-
-    if (!this.canRunProgrammaticSubmission()) {
+  private async handleQueuedProgrammaticSubmission(data: string, generation: number): Promise<void> {
+    while (this.mode !== "closed" && generation === this.submissionGeneration) {
+      if (this.canRunProgrammaticSubmission()) {
+        await this.handleProgrammaticSubmission(data);
+        return;
+      }
       await new Promise<void>((resolve) => {
         setTimeout(resolve, this.getProgrammaticSubmissionFlushDelay());
       });
-      await this.handleQueuedProgrammaticSubmission(data);
-      return;
     }
-
-    await this.handleProgrammaticSubmission(data);
   }
 
   private canRunProgrammaticSubmission(): boolean {
@@ -985,9 +987,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const normalized = stripBracketedPasteMarkers(data)
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n");
-    const trimmed = normalized.replace(/\n+$/, "");
-    const submission = trimmed.trimEnd();
-    if (!submission) {
+    const submission = this.stripFinalInputNewline(normalized);
+    if (!submission.trim()) {
       return;
     }
 
@@ -998,22 +999,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.rHistory.resetIndex();
 
     const blocks = await this.enqueueRSubmission(submission, false);
-    if (blocks.length > 0) {
-      this.recordSubmissionHistory(blocks);
-      return;
-    }
-
-    const isComplete = await this.inputState.isExpressionCompleteAsync(submission);
-    if (
-      !isComplete &&
-      this.mode === "ready" &&
-      this.promptReady &&
-      this.inputState.text.length === 0 &&
-      this.inputState.isAtEnd
-    ) {
-      this.inputState.insertText(trimmed);
-      this.renderInput();
-    }
+    this.recordSubmissionHistory(blocks);
   }
 
   private handleNestedReplyPaste(content: string): boolean {
@@ -1582,7 +1568,11 @@ export class RTerminal implements vscode.Pseudoterminal {
     const trimmed = normalized.replace(/\n+$/, "");
     const fullText = this.inputState.text + trimmed;
 
+    const generation = this.submissionGeneration;
     const isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
+    if (generation !== this.submissionGeneration) {
+      return;
+    }
 
     if ((endsWithNewline || containsNewline) && cursorAtEnd && isComplete) {
       const submission = fullText.trimEnd();
@@ -1688,7 +1678,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
+    const generation = this.submissionGeneration;
     const isComplete = await this.inputState.isExpressionCompleteAsync();
+    if (generation !== this.submissionGeneration) {
+      return;
+    }
     if (!isComplete) {
       if (this.inputState.cursorCol === 0) {
         this.inputState.insertText("\n");
@@ -2220,6 +2214,20 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private sendReadlineReply(text: string): void {
     sendRuntimeReply(this.runtimeHost(), text);
+  }
+
+  private cancelPendingSubmissions(): void {
+    this.submissionGeneration += 1;
+    this.submissionQueue = [];
+    this.programmaticSubmissionQueue = Promise.resolve();
+    this.pendingProgrammaticInput = "";
+    this.clearPendingInputFlushTimer();
+    this.clearPendingConsoleInput();
+    this.pasteBuffer = "";
+    this.inBracketPaste = false;
+    this.suppressNextEnterAfterPasteEnd = false;
+    this.submissionPending = false;
+    this.awaitingExecutionStart = false;
   }
 
   private interruptR(): void {

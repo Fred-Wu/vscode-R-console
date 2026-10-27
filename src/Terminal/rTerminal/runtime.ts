@@ -58,6 +58,7 @@ type Dimensions = {
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
 export type Submission = {
+  kind: "execute" | "edit";
   code: string;
   initialPromptKind: "main" | "cont";
 };
@@ -85,6 +86,8 @@ export type RuntimeHost = {
   sessionHostConnected: boolean;
   activeSubmission: Submission | null;
   submissionQueue: Submission[];
+  readonly submissionGeneration: number;
+  cancelPendingSubmissions(): void;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
   inputState: InputState;
@@ -211,7 +214,7 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.lang.clearSessionState();
-  host.clearPendingConsoleInput();
+  host.cancelPendingSubmissions();
   host.pendingPromptToken = true;
   host.mode = "starting";
   host.promptReady = false;
@@ -1087,6 +1090,12 @@ export function startNextRuntimeSubmission(host: RuntimeHost): void {
   if (!task) {
     return;
   }
+  if (task.kind === "edit") {
+    host.mode = "ready";
+    host.inputState.insertText(task.code);
+    host.renderInput();
+    return;
+  }
   host.activeSubmission = task;
   startRuntimeSubmission(host, task);
 }
@@ -1096,19 +1105,26 @@ export async function enqueueRuntimeSubmission(
   code: string,
   skipSplit: boolean = false
 ) : Promise<string[]> {
-  const blocks = skipSplit
-    ? [normalizeSubmissionBlock(code)]
-    : await splitSubmissionBlocks(host, code);
+  const generation = host.submissionGeneration;
+  const { blocks, remainder } = skipSplit
+    ? { blocks: [normalizeSubmissionBlock(code)], remainder: "" }
+    : await splitSubmissionBlocks(host, code, generation);
 
-  if (blocks.length === 0) {
-    host.submissionPending = false;
-    host.awaitingExecutionStart = false;
+  if (generation !== host.submissionGeneration || host.mode === "closed") {
     return [];
   }
 
   for (const block of blocks) {
     host.submissionQueue.push({
+      kind: "execute",
       code: block,
+      initialPromptKind: host.promptKind,
+    });
+  }
+  if (remainder) {
+    host.submissionQueue.push({
+      kind: "edit",
+      code: remainder,
       initialPromptKind: host.promptKind,
     });
   }
@@ -1124,7 +1140,11 @@ function normalizeSubmissionBlock(code: string): string {
     .trimEnd();
 }
 
-async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<string[]> {
+async function splitSubmissionBlocks(
+  host: RuntimeHost,
+  code: string,
+  generation: number
+): Promise<{ blocks: string[]; remainder: string }> {
   const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const lines = normalized.split("\n");
   const blocks: string[] = [];
@@ -1139,6 +1159,9 @@ async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<s
     }
 
     const isComplete = await host.inputState.isExpressionCompleteAsync(normalizedBlock);
+    if (generation !== host.submissionGeneration) {
+      return { blocks: [], remainder: "" };
+    }
     if (!isComplete) {
       continue;
     }
@@ -1147,12 +1170,8 @@ async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<s
     currentBlock = "";
   }
 
-  const trailingBlock = normalizeSubmissionBlock(currentBlock);
-  if (trailingBlock.trim() && (await host.inputState.isExpressionCompleteAsync(trailingBlock))) {
-    blocks.push(trailingBlock);
-  }
-
-  return blocks;
+  // Keep unfinished source verbatim for editing, including whitespace in strings.
+  return { blocks, remainder: normalizeSubmissionBlock(currentBlock).trim() ? currentBlock : "" };
 }
 
 function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
@@ -1244,7 +1263,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.inputState.reset();
     host.promptVisible = false;
     host.pendingPromptToken = false;
-    host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1260,7 +1279,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.promptVisible = false;
     host.replyPromptText = "";
     host.mode = "executing";
-    host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1268,7 +1287,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.clearInputRender();
     host.inputState.reset();
     host.renderInput();
-    host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1279,7 +1298,7 @@ export function interruptRuntime(host: RuntimeHost): void {
   host.writeEmitter.fire("^C\r\n");
   host.inputState.reset();
   host.promptVisible = false;
-  host.clearPendingConsoleInput();
+  host.cancelPendingSubmissions();
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
@@ -1287,7 +1306,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearPendingInputFlushTimer();
   host.clearPromptRenderTimer();
   host.clearReplyPromptRenderTimer();
-  host.clearPendingConsoleInput();
+  host.cancelPendingSubmissions();
   flushPendingRuntimeRewrite(host);
   setNativeParseCallback(null);
 

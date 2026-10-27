@@ -31,3 +31,22 @@ test("native parsing distinguishes incomplete input from errors and falls back o
   assert.equal(await parser.isExpressionCompleteAsync("x[1]"), true);
   assert.equal(await parser.isExpressionCompleteAsync("x["), false);
 });
+
+test("raw strings use the exact bracket, dash count, and quote across all supported delimiters", async () => {
+  for (const { literal, incomplete } of require("../helpers/raw-string-cases.cjs")) {
+    assert.equal(parser.stripCommentLines(`# outside\ns <- ${literal}\n# outside\ns`), `s <- ${literal}\ns`);
+    assert.equal(await parser.isExpressionCompleteAsync(literal), true, literal);
+    assert.equal(await parser.isExpressionCompleteAsync(incomplete), false, incomplete);
+    assert.equal(await parser.isExpressionCompleteAsync(`${literal}\nx <- (`), false);
+    assert.deepEqual(parser.tokenizeForHighlighting(`${literal}\nx`), [
+      { kind: "string", value: literal, position: 0 },
+      { kind: "identifier", value: "x", position: literal.length + 1 },
+    ]);
+  }
+});
+
+test("unterminated raw strings cannot be made complete by a later ordinary quote", async () => {
+  for (const input of ['r"-(abc-"', 'r"--[abc]--\' tail "', 'R\'{abc)\'']) {
+    assert.equal(await parser.isExpressionCompleteAsync(input), false, input);
+  }
+});
