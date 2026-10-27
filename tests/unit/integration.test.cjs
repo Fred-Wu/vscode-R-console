@@ -27,7 +27,7 @@ test("vscode-R selects disabled, legacy, or sess integration by available capabi
 test("disabled and legacy integration remove inherited sess discovery settings", async () => {
   const { DisabledVscodeRIntegration } = loadSource("src/Runtime/VSCR/disabled/integration.ts");
   const { LegacyVscodeRIntegration } = loadSource("src/Runtime/VSCR/legacy/integration.ts", {
-    fs: { existsSync: () => true, mkdirSync: () => {} },
+    fs: { existsSync: () => true, mkdirSync: () => {}, chmodSync: () => {} },
   });
   const host = { extensionPath: "/console", onSessionDataChanged: () => {} };
   for (const integration of [
@@ -41,4 +41,28 @@ test("disabled and legacy integration remove inherited sess discovery settings",
     assert.equal(env.SESS_PLOT_BACKEND, undefined);
     assert.equal(env.PATH, "keep");
   }
+});
+
+test("legacy session watcher does not forward credentials to remote hosts", () => {
+  const loadSource = require("../helpers/load-source.cjs");
+  const { SessionWatcher } = loadSource("src/Runtime/VSCR/legacy/sessionWatcher.ts");
+  const watcher = new SessionWatcher("unused");
+  assert.equal(watcher.parseServerInfo({ host: "example.com", port: 8888, token: "secret" }), undefined);
+  assert.equal(watcher.parseServerInfo({ host: "127.0.0.1", port: 8888, token: "secret" }).host, "127.0.0.1");
+  assert.equal(watcher.parseServerInfo({ host: "localhost", port: 65536, token: "secret" }), undefined);
+});
+
+
+test("legacy watcher directory is owner-only before IPC metadata is shared", { skip: process.platform === "win32" }, (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vrc-watcher-test-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.chmodSync(dir, 0o755);
+  const { SessionWatcher } = loadSource("src/Runtime/VSCR/legacy/sessionWatcher.ts");
+  const watcher = new SessionWatcher(dir);
+  t.after(() => watcher.dispose());
+  watcher.start();
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
 });

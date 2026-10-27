@@ -1,4 +1,18 @@
 const FRAME_HEADER_LEN = 12;
+export const MAX_BACKEND_FRAME_BYTES = 8 * 1024 * 1024;
+
+export class BackendFrameSizeError extends Error {
+  constructor(bytes: number) {
+    super(`R Console command exceeds the 8 MiB backend frame limit (${bytes} bytes). Nothing was sent to R.`);
+    this.name = "BackendFrameSizeError";
+  }
+}
+
+export function assertBackendFrameSize(bytes: number): void {
+  if (bytes > MAX_BACKEND_FRAME_BYTES) {
+    throw new BackendFrameSizeError(bytes);
+  }
+}
 
 const FrameKind = {
   BackendReady: 1,
@@ -373,6 +387,7 @@ function parseOutputPayload(payload: Buffer): {
 }
 
 function createFrame(kind: number, requestId: number, payload: Buffer): Buffer {
+  assertBackendFrameSize(payload.length);
   const frame = Buffer.allocUnsafe(FRAME_HEADER_LEN + payload.length);
   frame.writeUInt32LE(payload.length, 0);
   frame.writeUInt16LE(kind, 4);
@@ -398,6 +413,9 @@ export function parseBackendFrames(
   while (cursor + FRAME_HEADER_LEN <= combined.length) {
     const payloadLength = combined.readUInt32LE(cursor);
     const kind = combined.readUInt16LE(cursor + 4);
+    if (payloadLength > MAX_BACKEND_FRAME_BYTES) {
+      return { events, output, carry: Buffer.alloc(0), error: "Backend frame exceeds size limit" };
+    }
     const frameLength = FRAME_HEADER_LEN + payloadLength;
     if (cursor + frameLength > combined.length) {
       break;
@@ -468,6 +486,7 @@ export function encodeDialogResultFrame(result: BackendDialogResult): Buffer {
       if (!result.path) {
         return createFrame(FrameKind.DialogResult, 0, Buffer.from([0, 0]));
       }
+      assertBackendFrameSize(6 + Buffer.byteLength(result.path, "utf8"));
       const pathPayload = Buffer.from(result.path, "utf8");
       const payload = Buffer.allocUnsafe(2 + 4 + pathPayload.length);
       payload[0] = 0;

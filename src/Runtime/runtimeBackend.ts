@@ -1,4 +1,5 @@
-import { randomUUID } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
+import { authenticateBackendSocket, BackendAuthenticationError } from "./backendAuthentication";
 import { ChildProcess, spawn, SpawnOptions } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
@@ -8,6 +9,8 @@ import {
   type BackendCapability,
   type BackendControlEvent,
   type BackendDialogResult,
+  BackendFrameSizeError,
+  MAX_BACKEND_FRAME_BYTES,
   encodeDialogResultFrame,
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
@@ -52,6 +55,7 @@ type RuntimeSessionCommand =
 export type RuntimeSessionReconnectInfo = {
   sessionId: string;
   port: number;
+  authToken: string;
   pid?: number;
 };
 
@@ -74,6 +78,7 @@ type BackendSessionState = {
   child?: ChildProcess;
   childListenersAttached: boolean;
   sessionFilePath?: string;
+  authToken?: string;
   reconnectInfo: Partial<RuntimeSessionReconnectInfo> & Pick<RuntimeSessionReconnectInfo, "sessionId">;
   socket?: net.Socket;
   socketCarry: Buffer;
@@ -117,6 +122,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   start(args: string[], options: RuntimeBackendStartOptions): RuntimeSessionHandle {
     const sessionId = randomUUID();
     const sessionFilePath = getSessionBootstrapFilePath(sessionId);
+    const authToken = randomBytes(32).toString("hex");
     try {
       fs.rmSync(sessionFilePath, { force: true });
     } catch {
@@ -127,6 +133,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       env: {
         ...options.env,
         VSC_R_BACKEND_SESSION_FILE: sessionFilePath,
+        VSC_R_BACKEND_AUTH_TOKEN: authToken,
         VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS: String(INITIAL_CONNECT_GRACE_MS),
         VSC_R_BACKEND_RECONNECT_GRACE_MS: String(PERSISTENT_RECONNECT_GRACE_MS),
       },
@@ -149,6 +156,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       child,
       childListenersAttached: false,
       sessionFilePath,
+      authToken,
       reconnectInfo: { sessionId },
       socketCarry: Buffer.alloc(0),
       explicitClose: false,
@@ -159,6 +167,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   }
 
   reconnect(info: RuntimeSessionReconnectInfo): RuntimeSessionHandle {
+    if (!/^[0-9a-f]{64}$/.test(info.authToken)) throw new Error("Session authentication unavailable.");
     const handle: RuntimeSessionHandle = {
       sessionId: info.sessionId,
     };
@@ -170,6 +179,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       pendingParseRequests: new Map(),
       childListenersAttached: false,
       sessionFilePath: getSessionBootstrapFilePath(info.sessionId),
+      authToken: info.authToken,
       reconnectInfo: { ...info },
       socketCarry: Buffer.alloc(0),
       explicitClose: false,
@@ -282,7 +292,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return false;
     }
 
-    switch (command.type) {
+    try {
+      switch (command.type) {
       case "submit":
         if (!state.capabilities.has("top-level-submit")) {
           return false;
@@ -304,6 +315,11 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         return this.writeFrame(state, encodeDialogResultFrame(command.result));
       default:
         return false;
+      }
+    } catch (error) {
+      if (!(error instanceof BackendFrameSizeError)) throw error;
+      state.handlers?.onStderr?.(`${error.message}\n`);
+      return false;
     }
   }
 
@@ -314,6 +330,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     const state = this.sessionStates.get(session);
     if (!state || !state.hostConnected || !state.capabilities.has("parse-status")) {
       return undefined;
+    }
+    // Parsing is advisory; do not allocate/send a frame that Rust will reject.
+    if (Buffer.byteLength(code, "utf8") > MAX_BACKEND_FRAME_BYTES) {
+      return Promise.resolve(1);
     }
 
     return new Promise<number>((resolve, reject) => {
@@ -439,7 +459,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     }
     this.refreshReconnectInfo(state);
     const { sessionId, port, pid } = state.reconnectInfo;
-    if (typeof port !== "number" || !Number.isFinite(port) || port <= 0) {
+    if (typeof port !== "number" || !Number.isFinite(port) || port <= 0 || !state.authToken) {
       return undefined;
     }
     if (isRuntimeSessionPid(pid) && !isRuntimeSessionPidAlive(pid)) {
@@ -450,6 +470,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       sessionId,
       port,
       pid,
+      authToken: state.authToken,
     };
   }
 
@@ -525,6 +546,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           state.handlers?.onExit?.(0);
         }
       });
+      socket.resume();
     } catch (error) {
       if (state.attachGeneration !== generation || state.explicitClose) {
         return;
@@ -559,9 +581,13 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           Number.isFinite(parsed.port) &&
           parsed.port > 0
         ) {
+          if (!state.authToken) {
+            throw new Error("Session authentication unavailable.");
+          }
           return {
             sessionId: reconnectInfo.sessionId,
             port: parsed.port,
+            authToken: state.authToken,
             pid:
               typeof parsed.pid === "number" && Number.isFinite(parsed.pid) && parsed.pid > 0
                 ? parsed.pid
@@ -578,24 +604,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     );
   }
 
-  private connectSocket(port: number): Promise<net.Socket> {
-    return new Promise((resolve, reject) => {
-      const socket = net.createConnection({
-        host: "127.0.0.1",
-        port,
-      });
-      const onError = (error: Error) => {
-        socket.off("connect", onConnect);
-        socket.destroy();
-        reject(error instanceof Error ? error : new Error(String(error)));
-      };
-      const onConnect = () => {
-        socket.off("error", onError);
-        resolve(socket);
-      };
-      socket.once("error", onError);
-      socket.once("connect", onConnect);
-    });
+  private connectSocket(port: number, token: string): Promise<net.Socket> {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    return authenticateBackendSocket(socket, token);
   }
 
   private async connectSocketWithRetry(
@@ -631,9 +642,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         throw new Error(`R backend process ${info.pid} is no longer running`);
       }
 
+      // Fail closed on legacy or missing credentials instead of retrying insecurely.
+      const token = state.authToken;
+      if (!token) throw new Error("Session authentication unavailable. Close legacy detached R Console sessions before upgrading.");
       try {
-        return await this.connectSocket(info.port);
-      } catch {
+        return await this.connectSocket(info.port, token);
+      } catch (error) {
+        // A wrong server or mismatched secret must not be retried indefinitely.
+        if (error instanceof BackendAuthenticationError && !error.retryable) throw error;
       }
 
       await new Promise((resolve) => setTimeout(resolve, RECONNECT_SOCKET_RETRY_MS));
@@ -742,20 +758,19 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return;
     }
 
-    await new Promise<void>((resolve) => {
-      const socket = net.createConnection(
-        {
-          host: "127.0.0.1",
-          port,
-        },
-        () => {
-          socket.end(encodeShutdownFrame());
-        }
-      );
-      const done = () => resolve();
-      socket.once("error", done);
-      socket.once("close", done);
-    });
+    const token = state.authToken;
+    if (!token) return;
+    try {
+      const socket = await this.connectSocket(port, token);
+      await new Promise<void>((resolve) => {
+        socket.once("error", () => resolve());
+        socket.once("close", () => resolve());
+        socket.setTimeout(2000, () => socket.destroy());
+        socket.end(encodeShutdownFrame());
+      });
+    } catch {
+      // A mismatched peer must never receive the shutdown frame.
+    }
   }
 
   private readReconnectInfoFromBootstrapFile(

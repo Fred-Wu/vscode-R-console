@@ -141,7 +141,74 @@ check_package_changes <- function(workspace, packages = character()) {
 
 record_package_fingerprints("languageserver")
 
-server <- languageserver:::LanguageServer$new(host, port)
+server <- languageserver:::LanguageServer$new(host, NULL)
+if (!is.null(port)) {
+    token <- Sys.getenv("VSCR_LSP_AUTH_TOKEN")
+    if (!grepl("^[0-9a-f]{64}$", token)) stop("Missing console language server token")
+
+    # VS Code generated this fresh process-specific nonce using the OS CSPRNG.
+    # It is independent from the shared secret and never reused on a restart.
+    nonce_hex <- Sys.getenv("VSCR_LSP_CLIENT_NONCE")
+    if (!grepl("^[0-9a-f]{64}$", nonce_hex)) stop("Missing language server client nonce")
+    nonce <- as.raw(strtoi(substring(nonce_hex, seq.int(1L, 64L, 2L),
+                              seq.int(2L, 64L, 2L)), 16L))
+
+    auth_timeout <- suppressWarnings(as.integer(Sys.getenv("VSCR_LSP_AUTH_TIMEOUT_SECONDS")))
+    if (is.na(auth_timeout) || auth_timeout <= 0L) {
+        stop("Missing or invalid language server authentication timeout")
+    }
+
+    # Initialize the server before connecting: the TCP constructor connects
+    # before its task managers and workspaces are initialized.
+    # Switch the initialized server from stdio to TCP before authenticating.
+    stdio_input <- server$inputcon
+    server$inputcon <- socketConnection(host = host, port = port, open = "r+b", blocking = FALSE)
+    server$outputcon <- server$inputcon
+    server$tcp <- TRUE
+    close(stdio_input)
+
+    # The languageserver TCP input is nonblocking. Enforce one deadline across
+    # fragmented reads, and bound any underlying socket operation.
+    previous_socket_timeout <- socketTimeout(server$inputcon, auth_timeout)
+    deadline <- proc.time()[["elapsed"]] + auth_timeout
+    read_auth <- function(count) {
+        received <- raw()
+        while (length(received) < count) {
+            remaining <- deadline - proc.time()[["elapsed"]]
+            if (remaining <= 0 ||
+                !isTRUE(socketSelect(list(server$inputcon), timeout = remaining)[[1L]])) {
+                stop("Language server authentication timed out")
+            }
+            part <- readBin(server$inputcon, "raw", n = count - length(received))
+            if (!length(part)) stop("Language server authentication socket closed")
+            received <- c(received, part)
+        }
+        if (proc.time()[["elapsed"]] > deadline) stop("Language server authentication timed out")
+        received
+    }
+    auth_mac <- function(context, peer_nonce) {
+        digest::hmac(
+            key = charToRaw(token),
+            object = c(charToRaw(context), nonce, peer_nonce),
+            algo = "sha256",
+            serialize = FALSE,
+            raw = TRUE
+        )
+    }
+    writeBin(nonce, server$outputcon)
+    flush(server$outputcon)
+    response <- read_auth(64L)
+    peer_nonce <- response[seq_len(32L)]
+    server_mac <- response[33:64]
+    expected <- auth_mac("rconsole-lsp-server-v2", peer_nonce)
+    # Compare all bytes, without an early exit on a mismatch.
+    if (sum(bitwXor(as.integer(server_mac), as.integer(expected))) != 0L) {
+        stop("Invalid language server authentication proof")
+    }
+    writeBin(auth_mac("rconsole-lsp-client-v2", peer_nonce), server$outputcon)
+    flush(server$outputcon)
+    socketTimeout(server$inputcon, previous_socket_timeout)
+}
 for (workspace in server$workspaces$values()) {
     record_cached_package_fingerprints(workspace)
 }

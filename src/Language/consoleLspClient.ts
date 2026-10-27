@@ -1,6 +1,9 @@
 import { ChildProcess, spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
+import { randomBytes } from "crypto";
+import { authenticateLspSocket } from "./lspSocketAuth";
+import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
@@ -8,6 +11,7 @@ import { URL } from "url";
 import * as vscode from "vscode";
 import {
   CloseAction,
+  DataCallback,
   CompletionRequest,
   DidChangeTextDocumentNotification,
   DidCloseTextDocumentNotification,
@@ -15,8 +19,11 @@ import {
   ErrorAction,
   LanguageClient,
   LanguageClientOptions,
+  MessageTransports,
   RevealOutputChannelOn,
   StreamInfo,
+  StreamMessageReader,
+  StreamMessageWriter,
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
@@ -650,23 +657,39 @@ export class ConsoleLspClient implements CompletionProvider {
     });
   }
 
-  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<StreamInfo> {
-    return new Promise<StreamInfo>((resolve, reject) => {
+  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<MessageTransports> {
+    return new Promise<MessageTransports>((resolve, reject) => {
       let settled = false;
+      const authToken = randomBytes(32).toString("hex");
+      const clientNonce = randomBytes(32).toString("hex");
+      let pendingAuth = 0;
       const server = net.createServer((socket) => {
-        if (settled) {
+        if (settled || pendingAuth >= 8) {
           socket.destroy();
           return;
         }
-        settled = true;
-        if (this.pendingSocketServer === server) {
-          this.pendingSocketServer = undefined;
-        }
-        socket.on("error", (error) => {
-          this.logServerError(error);
+        pendingAuth += 1;
+        void authenticateLspSocket(socket, authToken, BACKEND_AUTH_TIMEOUT_MS, clientNonce).then((accepted) => {
+          pendingAuth -= 1;
+          if (!accepted || settled) {
+            socket.destroy();
+            return;
+          }
+          settled = true;
+          if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
+          socket.on("error", (error) => this.logServerError(error));
+          server.close();
+          // Authentication leaves the socket paused, possibly with early LSP
+          // bytes buffered. Resume only after JSON-RPC installs its reader.
+          const reader = new class extends StreamMessageReader {
+            override listen(callback: DataCallback): vscode.Disposable {
+              const subscription = super.listen(callback);
+              socket.resume();
+              return subscription;
+            }
+          }(socket);
+          resolve({ reader, writer: new StreamMessageWriter(socket) });
         });
-        server.close();
-        resolve({ reader: socket, writer: socket });
       });
       const rejectOnce = (error: Error): void => {
         if (settled) {
@@ -704,6 +727,9 @@ export class ConsoleLspClient implements CompletionProvider {
           ...baseEnv,
           VSCR_LSP_HOST: CONSOLE_LSP_HOST,
           VSCR_LSP_PORT: String(address.port),
+          VSCR_LSP_AUTH_TOKEN: authToken,
+          VSCR_LSP_AUTH_TIMEOUT_SECONDS: String(BACKEND_AUTH_TIMEOUT_MS / 1_000),
+          VSCR_LSP_CLIENT_NONCE: clientNonce,
         };
         let child: ChildProcess;
         try {

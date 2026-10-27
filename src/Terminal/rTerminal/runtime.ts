@@ -5,6 +5,8 @@ import { setNativeParseCallback, stripCommentLines } from "../../Language/parser
 import {
   type BackendControlEvent,
   type BackendDialogRequest,
+  BackendFrameSizeError,
+  MAX_BACKEND_FRAME_BYTES,
 } from "../../Runtime/backendProtocol";
 import {
   getBundledRustSidecarPath,
@@ -1035,6 +1037,26 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
 }
 
 export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
+  const bytes = Buffer.byteLength(task.code, "utf8");
+  if (bytes > MAX_BACKEND_FRAME_BYTES) {
+    // R never receives this command and therefore will not send a new prompt.
+    host.submissionPending = false;
+    host.awaitingExecutionStart = false;
+    host.activeSubmission = null;
+    host.mode = "ready";
+    if (host.promptVisible) {
+      host.clearInputRender();
+      host.promptVisible = false;
+    }
+    host.pendingPromptToken = true;
+    handleRuntimeError(host, `${new BackendFrameSizeError(bytes).message}\n`);
+    if (host.submissionQueue.length > 0) {
+      host.startNextSubmission();
+    } else {
+      host.schedulePrompt();
+    }
+    return;
+  }
   host.submissionPending = false;
   host.pendingPromptToken = false;
   host.awaitingExecutionStart = true;

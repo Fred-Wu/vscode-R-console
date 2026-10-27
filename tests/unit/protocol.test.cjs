@@ -45,6 +45,15 @@ test("invalid frames report errors; incomplete frames remain buffered", () => {
   assert.deepEqual(protocol.parseBackendFrames(partial).carry, partial);
 });
 
+test("oversized incoming backend frames fail without retaining the announced payload", () => {
+  const header = Buffer.alloc(12);
+  header.writeUInt32LE(8 * 1024 * 1024 + 1);
+  header.writeUInt16LE(8, 4);
+  const result = protocol.parseBackendFrames(header);
+  assert.match(result.error, /size limit/);
+  assert.equal(result.carry.length, 0);
+});
+
 test("commands use the Rust wire format and UTF-8 byte lengths", () => {
   assert.deepEqual(protocol.encodeSubmitFrame("日本語"), frame(12, Buffer.from("日本語")));
   assert.deepEqual(protocol.encodeReplyInputFrame("yes"), frame(13, Buffer.from("yes")));
@@ -53,4 +62,34 @@ test("commands use the Rust wire format and UTF-8 byte lengths", () => {
   assert.deepEqual(protocol.encodeInterruptFrame(), frame(14, Buffer.alloc(0)));
   assert.deepEqual(protocol.encodeShutdownFrame(), frame(17, Buffer.alloc(0)));
   assert.deepEqual(protocol.encodeDialogResultFrame({ kind: "choose-file" }), frame(18, Buffer.from([0, 0])));
+});
+
+test("outbound commands enforce Rust's 8 MiB payload limit using UTF-8 bytes", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const rust = fs.readFileSync(path.join(__dirname, "../../sidecar/pty-host/src/protocol.rs"), "utf8");
+  const rustLimit = /const MAX_INPUT_FRAME_BYTES: usize = 8 \* 1024 \* 1024;/;
+  assert.match(rust, rustLimit, "Rust and TypeScript must have matching frame limits");
+  const max = protocol.MAX_BACKEND_FRAME_BYTES;
+  assert.equal(max, 8 * 1024 * 1024);
+  assert.equal(protocol.encodeSubmitFrame("x".repeat(max)).readUInt32LE(0), max);
+  // The encoder validates the actual UTF-8 Buffer length after encoding.
+  // Multibyte input at the boundary remains valid without a second byteLength scan.
+  const boundary = "🙂".repeat(max / 4);
+  assert.equal(protocol.encodeSubmitFrame(boundary).readUInt32LE(0), max);
+  assert.equal(protocol.encodeReplyInputFrame(boundary).readUInt32LE(0), max);
+  assert.equal(protocol.encodeParseStatusRequestFrame(1, boundary).readUInt32LE(0), max);
+  for (const encode of [
+    (text) => protocol.encodeSubmitFrame(text),
+    (text) => protocol.encodeReplyInputFrame(text),
+    (text) => protocol.encodeParseStatusRequestFrame(1, text),
+  ]) {
+    assert.throws(() => encode("x".repeat(max + 1)), /8 MiB backend frame limit.*Nothing was sent/);
+    assert.throws(() => encode("🙂".repeat(max / 4) + "a"), /8 MiB backend frame limit/);
+  }
+  assert.equal(protocol.encodeDialogResultFrame({ kind: "choose-file", path: "x".repeat(max - 6) }).readUInt32LE(0), max);
+  assert.throws(
+    () => protocol.encodeDialogResultFrame({ kind: "choose-file", path: "x".repeat(max - 5) }),
+    /8 MiB backend frame limit/
+  );
 });

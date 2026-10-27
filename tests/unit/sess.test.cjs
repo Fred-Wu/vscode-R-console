@@ -154,6 +154,18 @@ function integrationFixture(t, info, overrides = {}) {
     discoveries: () => discoveries };
 }
 
+test("Unix sess proxy is placed in a private directory before listening", { skip: process.platform === "win32" }, async (t) => {
+  const fs = require("node:fs");
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: "/nonexistent-upstream" });
+  t.after(() => proxy.dispose());
+  const socketPath = await proxy.start();
+  const directory = path.dirname(socketPath);
+  assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(socketPath).mode & 0o777, 0o600);
+  proxy.dispose();
+});
+
 test("sess startup uses opaque upstream attachment preparation per proxy", async (t) => {
   for (const plotBackend of ["auto", "standard", "httpgd", "jgd", "native"]) {
     await t.test(plotBackend, async (t) => {
@@ -246,6 +258,7 @@ test("focus before attach activates the stable identity and a detached UI reuses
     terminal: activeTerminal, connectionId: "conn-stable-r-session", select: true,
   }]);
   assert.deepEqual(server.messages[0], attach);
+  await waitFor(() => integration.getCachedWorkspaceData() !== undefined);
   assert.deepEqual(integration.getCachedWorkspaceData(), workspace);
   integration.disposeUi();
   const restored = fixture.create();
@@ -717,3 +730,37 @@ test("late library-path responses do not overwrite a replacement R socket", asyn
   oldSocket.destroy();
   proxy.dispose();
 });
+
+test("sess proxy accepts multiple bounded JSON-RPC messages in one chunk", () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: "unused" });
+  const line = "x".repeat(9 * 1024 * 1024);
+  let handled = 0;
+  const remaining = proxy.forwardLines("", `${line}\n${line}\n`,
+    () => { handled++; return false; }, undefined);
+  assert.equal(remaining, "");
+  assert.equal(handled, 2, "the limit must apply per message, not to the whole batch");
+});
+
+test("sess proxy closes sockets before unbounded JSON lines accumulate", () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ upstreamPipePath: "unused" });
+  const connections = [{ destroyed: false, destroy() { this.destroyed = true; } },
+    { destroyed: false, destroy() { this.destroyed = true; } }];
+  proxy.rSocket = connections[0];
+  proxy.upstreamSocket = connections[1];
+  const remainder = proxy.forwardLines("x".repeat(16 * 1024 * 1024),
+    Buffer.from("b"), () => true, connections[1]);
+  assert.equal(remainder, "");
+  assert.ok(connections.every((socket) => socket.destroyed));
+});
+
+test("CI cancels superseded branch builds instead of retaining a queue", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  for (const workflow of ["ci.yml", "build-sidecar.yml"]) {
+    const source = fs.readFileSync(path.join(__dirname, "../../.github/workflows", workflow), "utf8");
+    assert.match(source.replace(/\r\n/g, "\n"), /^concurrency:\s*\n  group: .*github\.workflow.*\n  cancel-in-progress: true$/m);
+  }
+});
+

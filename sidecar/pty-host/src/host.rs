@@ -9,7 +9,7 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
     };
     use libloading::os::unix::{Library, Symbol};
@@ -18,7 +18,7 @@ mod unix_host {
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
     use std::fs;
     use std::io;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -335,6 +335,14 @@ mod unix_host {
         reconnect_grace: Option<Duration>,
     ) {
         thread::spawn(move || {
+            let auth_token = match std::env::var("VSC_R_BACKEND_AUTH_TOKEN") {
+                Ok(value) if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) => value,
+                _ => {
+                    emit_host_error("backend session authentication token is missing or invalid");
+                    request_shutdown();
+                    return;
+                }
+            };
             let listener = match TcpListener::bind(("127.0.0.1", 0)) {
                 Ok(listener) => listener,
                 Err(error) => {
@@ -364,6 +372,8 @@ mod unix_host {
             }
 
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<usize>();
+            let (authenticated_tx, authenticated_rx) = mpsc::channel::<TcpStream>();
+            let pending_auth = Arc::new(AtomicUsize::new(0));
             let current_client = Arc::new(AtomicUsize::new(0));
             let client_connected = Arc::new(AtomicBool::new(false));
             let mut next_client_id = 0_usize;
@@ -389,8 +399,7 @@ mod unix_host {
                     break;
                 }
 
-                match listener.accept() {
-                    Ok((mut stream, _addr)) => {
+                while let Ok(mut stream) = authenticated_rx.try_recv() {
                         if let Err(error) = stream.set_nonblocking(false) {
                             emit_host_error(&format!(
                                 "backend session stream setup failed: {error}"
@@ -455,6 +464,24 @@ mod unix_host {
                             }
                             let _ = reader_disconnect_tx.send(client_id);
                         });
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        // Authenticate independently so a stalled peer cannot block reconnects.
+                        if pending_auth.load(Ordering::SeqCst) >= 8 {
+                            continue;
+                        }
+                        pending_auth.fetch_add(1, Ordering::SeqCst);
+                        let token = auth_token.clone();
+                        let sender = authenticated_tx.clone();
+                        let pending = Arc::clone(&pending_auth);
+                        thread::spawn(move || {
+                            if matches!(authenticate_session_stream(&mut stream, token.as_bytes()), Ok(true)) {
+                                let _ = sender.send(stream);
+                            }
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if is_shutdown_requested() {
@@ -509,7 +536,15 @@ mod unix_host {
 
     fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
         let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
-        fs::write(session_file, payload)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(session_file)?;
+        std::io::Write::write_all(&mut file, payload.as_bytes())
     }
 
     fn emit_attached_client_state(runtime: &HostRuntime) {
@@ -1701,7 +1736,7 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::protocol::{
-        read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
+        authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
     };
     use libloading::os::windows::{
@@ -1713,7 +1748,7 @@ mod windows_host {
     use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
     use std::fs;
     use std::io;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -2127,6 +2162,14 @@ mod windows_host {
         reconnect_grace: Option<Duration>,
     ) {
         thread::spawn(move || {
+            let auth_token = match std::env::var("VSC_R_BACKEND_AUTH_TOKEN") {
+                Ok(value) if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) => value,
+                _ => {
+                    emit_host_error("backend session authentication token is missing or invalid");
+                    request_shutdown();
+                    return;
+                }
+            };
             let listener = match TcpListener::bind(("127.0.0.1", 0)) {
                 Ok(listener) => listener,
                 Err(error) => {
@@ -2156,6 +2199,8 @@ mod windows_host {
             }
 
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<usize>();
+            let (authenticated_tx, authenticated_rx) = mpsc::channel::<TcpStream>();
+            let pending_auth = Arc::new(AtomicUsize::new(0));
             let current_client = Arc::new(AtomicUsize::new(0));
             let client_connected = Arc::new(AtomicBool::new(false));
             let mut next_client_id = 0_usize;
@@ -2181,8 +2226,7 @@ mod windows_host {
                     break;
                 }
 
-                match listener.accept() {
-                    Ok((mut stream, _addr)) => {
+                while let Ok(mut stream) = authenticated_rx.try_recv() {
                         if let Err(error) = stream.set_nonblocking(false) {
                             emit_host_error(&format!(
                                 "backend session stream setup failed: {error}"
@@ -2247,6 +2291,24 @@ mod windows_host {
                             }
                             let _ = reader_disconnect_tx.send(client_id);
                         });
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        // Authenticate independently so a stalled peer cannot block reconnects.
+                        if pending_auth.load(Ordering::SeqCst) >= 8 {
+                            continue;
+                        }
+                        pending_auth.fetch_add(1, Ordering::SeqCst);
+                        let token = auth_token.clone();
+                        let sender = authenticated_tx.clone();
+                        let pending = Arc::clone(&pending_auth);
+                        thread::spawn(move || {
+                            if matches!(authenticate_session_stream(&mut stream, token.as_bytes()), Ok(true)) {
+                                let _ = sender.send(stream);
+                            }
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if is_shutdown_requested() {
@@ -2301,7 +2363,15 @@ mod windows_host {
 
     fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
         let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
-        fs::write(session_file, payload)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(session_file)?;
+        std::io::Write::write_all(&mut file, payload.as_bytes())
     }
 
     fn emit_attached_client_state(runtime: &HostRuntime) {

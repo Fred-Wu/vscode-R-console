@@ -3,6 +3,7 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const net = require("node:net");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
@@ -57,23 +58,41 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   backend = new RustSidecarRuntimeBackend(binary);
   let output = "";
   let failure;
+  let stage = "startup";
+  const diagnostics = [];
+  const instrument = (runtime) => {
+    const connect = runtime.connectSocket.bind(runtime);
+    runtime.connectSocket = async (port, secret) => {
+      try {
+        const socket = await connect(port, secret);
+        diagnostics.push(`authentication completed (socket destroyed: ${socket.destroyed})`);
+        socket.once("close", () => diagnostics.push("authenticated socket closed"));
+        return socket;
+      } catch (error) {
+        diagnostics.push(`authentication attempt: ${error.name}: ${error.message}`);
+        throw error;
+      }
+    };
+  };
   const events = [];
   const waitFor = async (predicate, label) => {
     const deadline = Date.now() + 10000;
     while (!predicate()) {
       if (failure) throw failure;
-      assert.ok(Date.now() < deadline, `${label}\n${output.slice(-2000)}`);
+      assert.ok(Date.now() < deadline, `${label}\n${output.slice(-2000)}\n${diagnostics.slice(-15).join("\n")}`);
       await delay(20, undefined, { signal: t.signal });
     }
   };
+  instrument(backend);
   const handlers = {
     onStdout: (text) => { output += text; },
     onStderr: (text) => { output += text; },
     onControl: (event) => { events.push(event); },
-    onError: (error) => { failure = error; },
+    onError: (error) => { failure = new Error(`${stage}: ${error.message}`, { cause: error }); },
   };
   const isPrompt = (event) => event.type === "prompt" && event.kind === "main";
   const submit = async (code, expected) => {
+    stage = `submit: ${expected}`;
     const start = events.length;
     output = "";
     assert.equal(backend.sendSessionCommand(session, { type: "submit", code }), true);
@@ -92,6 +111,40 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
     isPrompt(event) || (event.type === "session-state" && event.wait.kind === "top-level")), "startup");
   pid = backend.getPid(session);
   assert.ok(pid);
+  stage = "invalid-client rejection";
+  const bootstrap = path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`);
+  const sessionData = JSON.parse(fs.readFileSync(bootstrap, "utf8"));
+  assert.equal(sessionData.authToken, undefined, "bootstrap must never disclose backend credentials");
+  assert.match(backend.getReconnectInfo(session).authToken, /^[0-9a-f]{64}$/);
+  if (process.platform !== "win32") assert.equal(fs.statSync(bootstrap).mode & 0o777, 0o600);
+  // Wrong and missing credentials must not replace the authenticated console.
+  for (const content of [Buffer.alloc(0), Buffer.from("unauthenticated"), Buffer.concat([
+    Buffer.from([64, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0]),
+    Buffer.from("0".repeat(64)),
+  ])]) {
+    await new Promise((resolve) => {
+      const socket = net.createConnection({ host: "127.0.0.1", port: sessionData.port });
+      socket.on("error", resolve);
+      socket.resume(); // The authenticated server sends a challenge before reading input.
+      socket.setTimeout(3000, () => socket.destroy());
+      socket.on("connect", () => socket.end(content));
+      socket.on("close", resolve);
+    });
+  }
+  assert.equal(backend.canUseSessionCommands(session), true);
+  // A peer holding an incomplete handshake cannot block the legitimate session.
+  const stalled = net.createConnection({ host: "127.0.0.1", port: sessionData.port });
+  stalled.on("error", () => {});
+  stalled.resume();
+  await new Promise((resolve) => stalled.once("connect", resolve));
+  await submit('cat("AUTHENTICATED_CONSOLE_OK\\n")', "AUTHENTICATED_CONSOLE_OK");
+  stage = "oversized outbound command";
+  const beforeOversize = output.length;
+  assert.equal(backend.sendSessionCommand(session, { type: "submit", code: "x".repeat(8 * 1024 * 1024 + 1) }), false);
+  assert.match(output.slice(beforeOversize), /8 MiB backend frame limit.*Nothing was sent/);
+  assert.equal(backend.canUseSessionCommands(session), true, "rejected commands must not disconnect R");
+  await submit('cat("STILL_CONNECTED\\n")', "STILL_CONNECTED");
+  stalled.destroy();
   assert.equal(await backend.requestParseStatus(session, "x <- ("), 2);
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");
   await submit('stop("EXPECTED_SMOKE_ERROR")', "EXPECTED_SMOKE_ERROR");
@@ -126,17 +179,20 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   assert.equal(backend.sendSessionCommand(session, { type: "interrupt" }), true);
   await waitFor(() => events.slice(busyStart).some(isPrompt), "interrupt recovery");
 
+  stage = "reconnect";
   const reconnect = backend.getReconnectInfo(session);
   assert.ok(reconnect);
   backend.detach(session);
   assert.equal(alive(), true, "detach must preserve the R process");
   backend = new RustSidecarRuntimeBackend(binary);
-  session = backend.reconnect(reconnect);
+  instrument(backend);
+  session = backend.reconnect(JSON.parse(JSON.stringify(reconnect)));
   events.length = 0;
   backend.attach(session, handlers);
   await waitFor(() => backend.canUseSessionCommands(session) && events.some((event) =>
     event.type === "session-state" && event.wait.kind === "top-level"), "reconnect");
   await submit('cat("RESTORED:", answer, "\\n")', "RESTORED: 42");
+  stage = "shutdown";
   backend.close(session);
   await waitFor(() => !alive(), "shutdown must terminate R");
 });

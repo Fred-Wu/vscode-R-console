@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## [Unreleased]
+
+### Security
+
+- Improved the security of R Console connections, including persistent sessions and language-server communication.
+
 ## [0.5.4] - 2026-10-23
 
 ### Added
