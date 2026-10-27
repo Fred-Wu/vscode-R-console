@@ -46,9 +46,12 @@ jobs:
         run: npm run package:extension
       - name: Unit tests
         run: npm test
+      - name: Install Linux system dependency for R fs
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - name: Real R LSP authentication and protocol integration
         run: |
-          Rscript -e "needed <- setdiff(c('digest', 'languageserver'), rownames(installed.packages())); if (length(needed)) install.packages(needed, repos = 'https://cloud.r-project.org')"
+          Rscript -e "packages <- c('digest', 'languageserver'); repo <- Sys.getenv('RSPM'); if (!nzchar(repo)) repo <- 'https://cloud.r-project.org'; needed <- setdiff(packages, rownames(installed.packages())); if (length(needed)) install.packages(needed, repos = repo); stopifnot(all(vapply(packages, requireNamespace, logical(1), quietly = TRUE)))"
           node --test tests/lsp-startup.test.cjs tests/lsp-integration.test.cjs
       - name: Extension host smoke test (Linux)
         if: runner.os == 'Linux'

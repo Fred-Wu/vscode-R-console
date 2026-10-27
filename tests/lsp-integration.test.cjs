@@ -17,7 +17,10 @@ function lspConnection(socket) {
   let nextId = 0;
   const pending = new Map();
   const fail = (error) => {
-    for (const { reject } of pending.values()) reject(error);
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
     pending.clear();
   };
 
@@ -79,7 +82,7 @@ function lspConnection(socket) {
 
 test("real console languageserver authenticates, initializes and completes code", { timeout: 90000 }, async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-lsp-integration-"));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  // Cleanup happens after the R process and sockets are closed (Windows holds cwd open).
   const file = path.join(directory, "completion.R");
   fs.writeFileSync(file, "stats::l\n");
   const workspaceUri = pathToFileURL(directory + path.sep).href;
@@ -91,10 +94,7 @@ test("real console languageserver authenticates, initializes and completes code"
   const sockets = new Set();
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
-  t.after(() => {
-    for (const socket of sockets) socket.destroy();
-    server.close();
-  });
+  // Socket/server cleanup is coordinated with child shutdown below.
 
   let accept;
   let rejectConnection;
@@ -127,7 +127,14 @@ test("real console languageserver authenticates, initializes and completes code"
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
-  t.after(() => child.kill());
+  const childClosed = new Promise((resolve) => child.once("close", resolve));
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await childClosed;
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   let stderr = "";
   child.stderr.on("data", (data) => { stderr = (stderr + data.toString()).slice(-12000); });
   const childFailed = new Promise((_, reject) => {
