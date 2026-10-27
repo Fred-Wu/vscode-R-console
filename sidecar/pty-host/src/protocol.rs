@@ -3,7 +3,7 @@ use sha2::Sha256;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 #[cfg(any(unix, windows))]
 use std::thread;
@@ -634,13 +634,56 @@ pub(crate) fn authenticate_client<S: Read + Write>(
     authenticate_with_nonce(stream, secret, secure_server_nonce()?)
 }
 
-/// The listener is nonblocking, but the authentication protocol performs
-/// blocking reads. Restore blocking mode explicitly on each accepted socket.
+/// Bound every read/write by the same deadline. A per-read timeout alone lets
+/// a peer keep read_exact alive by sending one byte before each timeout.
+struct AuthenticationStream<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+
+impl AuthenticationStream<'_> {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline.checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "backend authentication timed out"))
+    }
+}
+
+impl Read for AuthenticationStream<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        let read = self.stream.read(bytes)?;
+        self.remaining()?;
+        Ok(read)
+    }
+}
+
+impl Write for AuthenticationStream<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        let written = self.stream.write(bytes)?;
+        self.remaining()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining()?;
+        self.stream.flush()
+    }
+}
+
+/// The listener is nonblocking, but authentication uses blocking I/O with a
+/// total deadline. Remove both timeouts before handing off an accepted client.
 pub(crate) fn authenticate_session_stream(stream: &mut TcpStream, secret: &[u8]) -> io::Result<bool> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(BACKEND_AUTH_TIMEOUT))?;
-    let result = authenticate_client(stream, secret);
-    stream.set_read_timeout(None)?;
+    let result = authenticate_client(&mut AuthenticationStream {
+        stream,
+        deadline: Instant::now() + BACKEND_AUTH_TIMEOUT,
+    }, secret);
+    let reset_read = stream.set_read_timeout(None);
+    let reset_write = stream.set_write_timeout(None);
+    reset_read?;
+    reset_write?;
     result
 }
 
@@ -960,7 +1003,58 @@ mod tests {
         };
         accepted.set_nonblocking(true).unwrap();
         assert!(authenticate_session_stream(&mut accepted, secret).unwrap());
+        assert_eq!(accepted.read_timeout().unwrap(), None);
+        assert_eq!(accepted.write_timeout().unwrap(), None);
         client.join().unwrap();
+    }
+
+    fn reject_slow_authentication(drip_header: bool) {
+        use std::net::{Shutdown, TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream.set_read_timeout(Some(BACKEND_AUTH_TIMEOUT * 2)).unwrap();
+            let mut challenge = [0_u8; FRAME_HEADER_LEN + 32];
+            stream.read_exact(&mut challenge).unwrap();
+            let bytes = frame(FRAME_CLIENT_PROOF, 0, &[0; 64]);
+            let slow_bytes = if drip_header {
+                &bytes[..]
+            } else {
+                stream.write_all(&bytes[..FRAME_HEADER_LEN]).unwrap();
+                &bytes[FRAME_HEADER_LEN..]
+            };
+            // Every individual read can succeed within its timeout, but the
+            // complete header/payload cannot finish before the total deadline.
+            for byte in slow_bytes.iter().take(16) {
+                if stream.write_all(&[*byte]).is_err() { break; }
+                std::thread::sleep(BACKEND_AUTH_TIMEOUT / 8);
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let result = authenticate_session_stream(&mut stream, &[b'a'; 64]);
+        let elapsed = started.elapsed();
+        // Close before assertions/join so a failing regression never leaves
+        // a drip-feeding client running for the whole frame.
+        stream.shutdown(Shutdown::Both).unwrap();
+        client.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
+        assert!(elapsed < BACKEND_AUTH_TIMEOUT * 2, "handshake lasted {elapsed:?}");
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn authentication_deadline_bounds_a_drip_fed_header() {
+        reject_slow_authentication(true);
+    }
+
+    #[test]
+    fn authentication_deadline_bounds_a_drip_fed_payload() {
+        reject_slow_authentication(false);
     }
 
     #[test]

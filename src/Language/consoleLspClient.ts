@@ -11,6 +11,7 @@ import { URL } from "url";
 import * as vscode from "vscode";
 import {
   CloseAction,
+  DataCallback,
   CompletionRequest,
   DidChangeTextDocumentNotification,
   DidCloseTextDocumentNotification,
@@ -18,8 +19,11 @@ import {
   ErrorAction,
   LanguageClient,
   LanguageClientOptions,
+  MessageTransports,
   RevealOutputChannelOn,
   StreamInfo,
+  StreamMessageReader,
+  StreamMessageWriter,
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
@@ -653,8 +657,8 @@ export class ConsoleLspClient implements CompletionProvider {
     });
   }
 
-  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<StreamInfo> {
-    return new Promise<StreamInfo>((resolve, reject) => {
+  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<MessageTransports> {
+    return new Promise<MessageTransports>((resolve, reject) => {
       let settled = false;
       const authToken = randomBytes(32).toString("hex");
       const clientNonce = randomBytes(32).toString("hex");
@@ -675,7 +679,16 @@ export class ConsoleLspClient implements CompletionProvider {
           if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
           socket.on("error", (error) => this.logServerError(error));
           server.close();
-          resolve({ reader: socket, writer: socket });
+          // Authentication leaves the socket paused, possibly with early LSP
+          // bytes buffered. Resume only after JSON-RPC installs its reader.
+          const reader = new class extends StreamMessageReader {
+            override listen(callback: DataCallback): vscode.Disposable {
+              const subscription = super.listen(callback);
+              socket.resume();
+              return subscription;
+            }
+          }(socket);
+          resolve({ reader, writer: new StreamMessageWriter(socket) });
         });
       });
       const rejectOnce = (error: Error): void => {
