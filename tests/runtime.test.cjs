@@ -138,6 +138,12 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   stalled.resume();
   await new Promise((resolve) => stalled.once("connect", resolve));
   await submit('cat("AUTHENTICATED_CONSOLE_OK\\n")', "AUTHENTICATED_CONSOLE_OK");
+  stage = "oversized outbound command";
+  const beforeOversize = output.length;
+  assert.equal(backend.sendSessionCommand(session, { type: "submit", code: "x".repeat(8 * 1024 * 1024 + 1) }), false);
+  assert.match(output.slice(beforeOversize), /8 MiB backend frame limit.*Nothing was sent/);
+  assert.equal(backend.canUseSessionCommands(session), true, "rejected commands must not disconnect R");
+  await submit('cat("STILL_CONNECTED\\n")', "STILL_CONNECTED");
   stalled.destroy();
   assert.equal(await backend.requestParseStatus(session, "x <- ("), 2);
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");

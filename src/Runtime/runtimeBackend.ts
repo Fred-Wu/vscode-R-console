@@ -9,6 +9,8 @@ import {
   type BackendCapability,
   type BackendControlEvent,
   type BackendDialogResult,
+  BackendFrameSizeError,
+  MAX_BACKEND_FRAME_BYTES,
   encodeDialogResultFrame,
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
@@ -290,7 +292,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return false;
     }
 
-    switch (command.type) {
+    try {
+      switch (command.type) {
       case "submit":
         if (!state.capabilities.has("top-level-submit")) {
           return false;
@@ -312,6 +315,11 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         return this.writeFrame(state, encodeDialogResultFrame(command.result));
       default:
         return false;
+      }
+    } catch (error) {
+      if (!(error instanceof BackendFrameSizeError)) throw error;
+      state.handlers?.onStderr?.(`${error.message}\n`);
+      return false;
     }
   }
 
@@ -322,6 +330,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     const state = this.sessionStates.get(session);
     if (!state || !state.hostConnected || !state.capabilities.has("parse-status")) {
       return undefined;
+    }
+    // Parsing is advisory; do not allocate/send a frame that Rust will reject.
+    if (Buffer.byteLength(code, "utf8") > MAX_BACKEND_FRAME_BYTES) {
+      return Promise.resolve(1);
     }
 
     return new Promise<number>((resolve, reject) => {

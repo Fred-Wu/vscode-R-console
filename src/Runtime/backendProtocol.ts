@@ -1,5 +1,23 @@
 const FRAME_HEADER_LEN = 12;
-const MAX_BACKEND_FRAME_BYTES = 8 * 1024 * 1024;
+export const MAX_BACKEND_FRAME_BYTES = 8 * 1024 * 1024;
+
+export class BackendFrameSizeError extends Error {
+  constructor(bytes: number) {
+    super(`R Console command exceeds the 8 MiB backend frame limit (${bytes} bytes). Nothing was sent to R.`);
+    this.name = "BackendFrameSizeError";
+  }
+}
+
+export function assertBackendFrameSize(bytes: number): void {
+  if (bytes > MAX_BACKEND_FRAME_BYTES) {
+    throw new BackendFrameSizeError(bytes);
+  }
+}
+
+function encodeTextPayload(text: string): Buffer {
+  assertBackendFrameSize(Buffer.byteLength(text, "utf8"));
+  return Buffer.from(text, "utf8");
+}
 
 const FrameKind = {
   BackendReady: 1,
@@ -374,6 +392,7 @@ function parseOutputPayload(payload: Buffer): {
 }
 
 function createFrame(kind: number, requestId: number, payload: Buffer): Buffer {
+  assertBackendFrameSize(payload.length);
   const frame = Buffer.allocUnsafe(FRAME_HEADER_LEN + payload.length);
   frame.writeUInt32LE(payload.length, 0);
   frame.writeUInt16LE(kind, 4);
@@ -449,11 +468,11 @@ export function parseBackendFrames(
 }
 
 export function encodeSubmitFrame(code: string): Buffer {
-  return createFrame(FrameKind.Submit, 0, Buffer.from(code, "utf8"));
+  return createFrame(FrameKind.Submit, 0, encodeTextPayload(code));
 }
 
 export function encodeReplyInputFrame(text: string): Buffer {
-  return createFrame(FrameKind.ReplyInput, 0, Buffer.from(text, "utf8"));
+  return createFrame(FrameKind.ReplyInput, 0, encodeTextPayload(text));
 }
 
 export function encodeInterruptFrame(): Buffer {
@@ -472,6 +491,7 @@ export function encodeDialogResultFrame(result: BackendDialogResult): Buffer {
       if (!result.path) {
         return createFrame(FrameKind.DialogResult, 0, Buffer.from([0, 0]));
       }
+      assertBackendFrameSize(6 + Buffer.byteLength(result.path, "utf8"));
       const pathPayload = Buffer.from(result.path, "utf8");
       const payload = Buffer.allocUnsafe(2 + 4 + pathPayload.length);
       payload[0] = 0;
@@ -499,7 +519,7 @@ export function encodeParseStatusRequestFrame(
   requestId: number,
   code: string
 ): Buffer {
-  return createFrame(FrameKind.ParseStatusRequest, requestId, Buffer.from(code, "utf8"));
+  return createFrame(FrameKind.ParseStatusRequest, requestId, encodeTextPayload(code));
 }
 
 export function encodeShutdownFrame(): Buffer {
