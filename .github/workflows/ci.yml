@@ -46,10 +46,10 @@ jobs:
         run: npm run package:extension
       - name: Unit tests
         run: npm test
-      - name: Real R LSP authentication startup regression
+      - name: Real R LSP authentication and protocol integration
         run: |
-          Rscript -e "if (!requireNamespace('digest', quietly = TRUE)) install.packages('digest', repos = 'https://cloud.r-project.org')"
-          node --test tests/lsp-startup.test.cjs
+          Rscript -e "needed <- setdiff(c('digest', 'languageserver'), rownames(installed.packages())); if (length(needed)) install.packages(needed, repos = 'https://cloud.r-project.org')"
+          node --test tests/lsp-startup.test.cjs tests/lsp-integration.test.cjs
       - name: Extension host smoke test (Linux)
         if: runner.os == 'Linux'
         run: xvfb-run -a npm run test:extension-host
