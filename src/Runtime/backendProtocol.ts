@@ -14,11 +14,6 @@ export function assertBackendFrameSize(bytes: number): void {
   }
 }
 
-function encodeTextPayload(text: string): Buffer {
-  assertBackendFrameSize(Buffer.byteLength(text, "utf8"));
-  return Buffer.from(text, "utf8");
-}
-
 const FrameKind = {
   BackendReady: 1,
   HostConnected: 2,
@@ -468,11 +463,11 @@ export function parseBackendFrames(
 }
 
 export function encodeSubmitFrame(code: string): Buffer {
-  return createFrame(FrameKind.Submit, 0, encodeTextPayload(code));
+  return createFrame(FrameKind.Submit, 0, Buffer.from(code, "utf8"));
 }
 
 export function encodeReplyInputFrame(text: string): Buffer {
-  return createFrame(FrameKind.ReplyInput, 0, encodeTextPayload(text));
+  return createFrame(FrameKind.ReplyInput, 0, Buffer.from(text, "utf8"));
 }
 
 export function encodeInterruptFrame(): Buffer {
@@ -519,7 +514,7 @@ export function encodeParseStatusRequestFrame(
   requestId: number,
   code: string
 ): Buffer {
-  return createFrame(FrameKind.ParseStatusRequest, requestId, encodeTextPayload(code));
+  return createFrame(FrameKind.ParseStatusRequest, requestId, Buffer.from(code, "utf8"));
 }
 
 export function encodeShutdownFrame(): Buffer {

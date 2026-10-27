@@ -73,6 +73,12 @@ test("outbound commands enforce Rust's 8 MiB payload limit using UTF-8 bytes", (
   const max = protocol.MAX_BACKEND_FRAME_BYTES;
   assert.equal(max, 8 * 1024 * 1024);
   assert.equal(protocol.encodeSubmitFrame("x".repeat(max)).readUInt32LE(0), max);
+  // The encoder validates the actual UTF-8 Buffer length after encoding.
+  // Multibyte input at the boundary remains valid without a second byteLength scan.
+  const boundary = "🙂".repeat(max / 4);
+  assert.equal(protocol.encodeSubmitFrame(boundary).readUInt32LE(0), max);
+  assert.equal(protocol.encodeReplyInputFrame(boundary).readUInt32LE(0), max);
+  assert.equal(protocol.encodeParseStatusRequestFrame(1, boundary).readUInt32LE(0), max);
   for (const encode of [
     (text) => protocol.encodeSubmitFrame(text),
     (text) => protocol.encodeReplyInputFrame(text),
