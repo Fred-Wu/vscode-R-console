@@ -1060,16 +1060,34 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
     }
     return;
   }
+  const sent = host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code: task.code,
+  }) ?? false;
+  if (!sent) {
+    const unsent = [task, ...host.submissionQueue].map((entry) => entry.code).join("\n");
+    host.submissionQueue = [];
+    host.activeSubmission = null;
+    host.submissionPending = false;
+    host.awaitingExecutionStart = false;
+    host.mode = "ready";
+    if (host.promptVisible) {
+      host.clearInputRender();
+      host.promptVisible = false;
+    }
+    host.inputState.insertText(unsent);
+    host.pendingPromptToken = true;
+    handleRuntimeError(host, "R submission was not sent. Unsent code restored for editing.\n");
+    host.schedulePrompt();
+    return;
+  }
+
   host.submissionPending = false;
   host.pendingPromptToken = false;
   host.awaitingExecutionStart = true;
   host.mode = "executing";
   writeRuntimeSubmissionEcho(host, task);
   host.clearPromptRenderTimer();
-  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-    type: "submit",
-    code: task.code,
-  });
 }
 
 export function finishRuntimeSubmission(host: RuntimeHost): void {
@@ -1083,7 +1101,7 @@ export function startNextRuntimeSubmission(host: RuntimeHost): void {
   if (host.mode !== "ready" && !(host.mode === "executing" && host.activeSubmission === null)) {
     return;
   }
-  if (host.activeSubmission) {
+  if (host.activeSubmission || host.inputState.text.length > 0) {
     return;
   }
   const task = host.submissionQueue.shift();

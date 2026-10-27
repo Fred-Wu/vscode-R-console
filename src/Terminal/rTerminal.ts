@@ -1382,6 +1382,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       case "ctrl_c":
+        this.cancelPendingSubmissions();
         if (this.inputState.text.length > 0) {
           this.clearInputRender();
           this.inputState.reset();

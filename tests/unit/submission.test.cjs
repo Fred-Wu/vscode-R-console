@@ -13,6 +13,7 @@ const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
 function createTerminal() {
   const commands = [];
   const history = [];
+  const output = [];
   const terminal = Object.assign(Object.create(RTerminal.prototype), {
     mode: "ready", promptReady: true, promptKind: "main", promptVisible: false,
     submissionGeneration: 0, submissionQueue: [], activeSubmission: null,
@@ -31,7 +32,8 @@ function createTerminal() {
       canUseSessionCommands: () => true,
       sendSessionCommand(session, command) { commands.push(command); return true; },
     },
-    writeEmitter: { fire() {} },
+    writeEmitter: { fire(text) { output.push(text); } },
+    ensureReadyPromptVisibleForInput() {},
     renderInput() { this.promptVisible = true; },
     clearInputRender() { this.promptVisible = false; },
     clearPromptRenderTimer() {}, clearReplyPromptRenderTimer() {},
@@ -39,7 +41,7 @@ function createTerminal() {
     getProgrammaticSubmissionFlushDelay() { return 1; },
   });
   terminal.runtimeHostAdapter = terminal.createRuntimeHost();
-  return { terminal, commands, history };
+  return { terminal, commands, history, output };
 }
 
 test("incomplete editor tail survives completed expressions and is editable at the next prompt", async () => {
@@ -104,15 +106,15 @@ test("rejected interrupt retains queued submissions", async () => {
   assert.equal(terminal.submissionGeneration, 0);
 });
 
-test("Ctrl+C invalidates an in-flight parse before it can queue or restore input", async () => {
+test("ready-mode Ctrl+C invalidates an in-flight editor parse with empty input", async () => {
   const { terminal, commands, history } = createTerminal();
   let resolveParse;
   terminal.inputState.isExpressionCompleteAsync = () => new Promise(resolve => { resolveParse = resolve; });
   const pending = terminal.handleProgrammaticSubmission("1\n2\n");
-  terminal.interruptR();
+  terminal.applyKeyAction({ type: "ctrl_c" });
   resolveParse(true);
   await pending;
-  assert.deepEqual(commands, [{ type: "interrupt" }]);
+  assert.deepEqual(commands, []);
   assert.deepEqual(terminal.submissionQueue, []);
   assert.deepEqual(history, []);
   assert.equal(terminal.inputState.text, "");
@@ -126,7 +128,7 @@ for (const action of ["enter", "paste"]) {
     terminal.inputState.insertText("1");
     terminal.pasteBuffer = "\n2\n";
     const pending = action === "enter" ? terminal.handleEnterKey() : terminal.handlePasteEnd();
-    terminal.interruptR();
+    terminal.applyKeyAction({ type: "ctrl_c" });
     resolveParse(true);
     await pending;
     assert.deepEqual(commands, []);
@@ -174,4 +176,82 @@ test("unfinished string contents retain trailing spaces and newlines for editing
     runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
     assert.equal(terminal.inputState.text, tail);
   }
+});
+
+test("ready-mode Ctrl+C cancels queued submissions even with editable input", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText("not submitted");
+  terminal.submissionQueue.push({ kind: "execute", code: "old", initialPromptKind: "main" });
+  terminal.applyKeyAction({ type: "ctrl_c" });
+  assert.equal(terminal.inputState.text, "");
+  assert.deepEqual(terminal.submissionQueue, []);
+  assert.equal(terminal.submissionGeneration, 1);
+  assert.deepEqual(commands, []);
+});
+
+test("rejected delivery restores the unsent batch without leaving R executing", async () => {
+  const { terminal, commands, output } = createTerminal();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  await terminal.handleProgrammaticSubmission("1\n2\ny <- (\n");
+  assert.deepEqual(commands, []);
+  assert.equal(terminal.mode, "ready");
+  assert.equal(terminal.activeSubmission, null);
+  assert.equal(terminal.awaitingExecutionStart, false);
+  assert.deepEqual(terminal.submissionQueue, []);
+  assert.equal(terminal.inputState.text, "1\n2\ny <- (");
+  assert.match(output.join(""), /submission was not sent.*Unsent code restored/);
+});
+
+test("rejected later delivery restores only the code not already submitted", async () => {
+  const { terminal, commands } = createTerminal();
+  let sends = 0;
+  terminal.runtimeBackend.sendSessionCommand = (_session, command) => {
+    if (++sends > 1) return false;
+    commands.push(command);
+    return true;
+  };
+  await terminal.handleProgrammaticSubmission("1\n2\ny <- (\n");
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
+  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+  assert.deepEqual(commands, [{ type: "submit", code: "1" }]);
+  assert.equal(terminal.inputState.text, "2\ny <- (");
+  assert.deepEqual(terminal.submissionQueue, []);
+  assert.equal(terminal.activeSubmission, null);
+  assert.equal(terminal.mode, "ready");
+});
+
+test("async editor parsing cannot overwrite console text entered during the parse", async () => {
+  const { terminal, commands } = createTerminal();
+  let resolveTail;
+  terminal.inputState.isExpressionCompleteAsync = (code) =>
+    code === "1" ? Promise.resolve(true) : new Promise((resolve) => { resolveTail = resolve; });
+  const pending = terminal.handleProgrammaticSubmission("1\ny <- (\n");
+  await Promise.resolve();
+  assert.equal(typeof resolveTail, "function");
+  terminal.inputState.insertText("user input");
+  resolveTail(false);
+  await pending;
+  assert.deepEqual(commands, []);
+  assert.equal(terminal.inputState.text, "user input");
+  assert.deepEqual(terminal.submissionQueue.map((task) => task.kind), ["execute", "edit"]);
+  terminal.inputState.reset();
+  terminal.startNextSubmission();
+  assert.deepEqual(commands, [{ type: "submit", code: "1" }]);
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
+  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+  assert.equal(terminal.inputState.text, "y <- (");
+});
+
+test("an edit tail cannot append to console input entered during earlier execution", async () => {
+  const { terminal, commands } = createTerminal();
+  await terminal.handleProgrammaticSubmission("1\ny <- (\n");
+  terminal.inputState.insertText("user input");
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
+  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+  assert.equal(terminal.inputState.text, "user input");
+  assert.equal(terminal.submissionQueue.length, 1);
+  terminal.inputState.reset();
+  terminal.startNextSubmission();
+  assert.equal(terminal.inputState.text, "y <- (");
+  assert.deepEqual(commands, [{ type: "submit", code: "1" }]);
 });
