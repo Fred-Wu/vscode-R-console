@@ -1565,17 +1565,29 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const cursorAtEnd = this.inputState.text.length === 0 || this.inputState.isAtEnd;
-    const trimmed = normalized.replace(/\n+$/, "");
-    const fullText = this.inputState.text + trimmed;
-
-    const generation = this.submissionGeneration;
-    const isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
-    if (generation !== this.submissionGeneration) {
+    // Apply the paste before awaiting the parser, preserving input order.
+    // Avoid rendering before a complete paste is submitted to R.
+    const cursorAtEnd = this.inputState.isAtEnd;
+    this.inputState.insertText(normalized.replace(/\n+$/, ""));
+    if (!cursorAtEnd) {
+      this.renderInput();
       return;
     }
 
-    if ((endsWithNewline || containsNewline) && cursorAtEnd && isComplete) {
+    const fullText = this.inputState.text;
+    const cursor = this.inputState.cursorPosition;
+    const generation = this.submissionGeneration;
+    const isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
+    if (
+      generation !== this.submissionGeneration ||
+      this.mode !== "ready" ||
+      this.inputState.text !== fullText ||
+      this.inputState.cursorPosition !== cursor
+    ) {
+      return;
+    }
+
+    if (isComplete) {
       const submission = fullText.trimEnd();
       if (submission) {
         this.inputState.reset();
@@ -1589,7 +1601,6 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    this.inputState.insertText(trimmed);
     this.renderInput();
   }
 
@@ -1680,8 +1691,15 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const generation = this.submissionGeneration;
-    const isComplete = await this.inputState.isExpressionCompleteAsync();
-    if (generation !== this.submissionGeneration) {
+    const checkedText = this.inputState.text;
+    const checkedCursor = this.inputState.cursorPosition;
+    const isComplete = await this.inputState.isExpressionCompleteAsync(checkedText);
+    if (
+      generation !== this.submissionGeneration ||
+      this.mode !== "ready" ||
+      this.inputState.text !== checkedText ||
+      this.inputState.cursorPosition !== checkedCursor
+    ) {
       return;
     }
     if (!isComplete) {
