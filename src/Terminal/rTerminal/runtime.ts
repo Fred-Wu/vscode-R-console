@@ -58,6 +58,7 @@ type Dimensions = {
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
 export type Submission = {
+  kind: "execute" | "parse" | "edit";
   code: string;
   initialPromptKind: "main" | "cont";
 };
@@ -85,6 +86,8 @@ export type RuntimeHost = {
   sessionHostConnected: boolean;
   activeSubmission: Submission | null;
   submissionQueue: Submission[];
+  submissionGeneration: number;
+  cancelPendingSubmissions(): void;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
   inputState: InputState;
@@ -1057,16 +1060,35 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
     }
     return;
   }
+  const sent = host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code: task.code,
+  }) ?? false;
+  if (!sent) {
+    const unsent = [task, ...host.submissionQueue].map((item) => item.code).filter(Boolean).join("\n").replace(/\n+$/, "");
+    host.cancelPendingSubmissions();
+    host.activeSubmission = null;
+    host.submissionPending = false;
+    host.awaitingExecutionStart = false;
+    host.mode = "ready";
+    const draft = host.inputState.text;
+    host.inputState.text = unsent + (draft ? "\n" + draft : "");
+    host.inputState.cursorToEnd();
+    if (host.promptVisible) {
+      host.clearInputRender();
+      host.promptVisible = false;
+    }
+    host.pendingPromptToken = true;
+    handleRuntimeError(host, "R submission was not sent. Unsent code restored for editing.\n");
+    host.schedulePrompt();
+    return;
+  }
   host.submissionPending = false;
   host.pendingPromptToken = false;
   host.awaitingExecutionStart = true;
   host.mode = "executing";
   writeRuntimeSubmissionEcho(host, task);
   host.clearPromptRenderTimer();
-  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-    type: "submit",
-    code: task.code,
-  });
 }
 
 export function finishRuntimeSubmission(host: RuntimeHost): void {
@@ -1077,44 +1099,87 @@ export function finishRuntimeSubmission(host: RuntimeHost): void {
 }
 
 export function startNextRuntimeSubmission(host: RuntimeHost): void {
-  if (host.mode !== "ready" && !(host.mode === "executing" && host.activeSubmission === null)) {
+  if (host.mode !== "ready" && !(host.mode === "executing" && host.activeSubmission === null)) return;
+  if (host.activeSubmission) return;
+  const next = host.submissionQueue[0];
+  if (!next || next.kind === "parse") return;
+  host.submissionQueue.shift();
+  if (next.kind === "edit") {
+    const draft = host.inputState.text;
+    const cursor = host.inputState.cursorPosition;
+    const prefix = next.code + (draft && !/\n[ \t]*$/.test(next.code) ? "\n" : "");
+    host.inputState.text = prefix + draft;
+    host.inputState.cursorPosition = prefix.length + cursor;
+    host.mode = "ready";
+    host.renderInput();
     return;
   }
-  if (host.activeSubmission) {
-    return;
-  }
-  const task = host.submissionQueue.shift();
-  if (!task) {
-    return;
-  }
-  host.activeSubmission = task;
-  startRuntimeSubmission(host, task);
+  host.activeSubmission = next;
+  startRuntimeSubmission(host, next);
+}
+
+/** Reserve the accepted batch before asynchronous parsing begins. */
+export function reserveRuntimeSubmission(host: RuntimeHost, code: string): Submission {
+  const slot: Submission = { kind: "parse", code, initialPromptKind: host.promptKind };
+  host.submissionQueue.push(slot);
+  return slot;
 }
 
 export async function enqueueRuntimeSubmission(
   host: RuntimeHost,
   code: string,
-  skipSplit: boolean = false
-) : Promise<string[]> {
-  const blocks = skipSplit
-    ? [normalizeSubmissionBlock(code)]
-    : await splitSubmissionBlocks(host, code);
-
-  if (blocks.length === 0) {
-    host.submissionPending = false;
-    host.awaitingExecutionStart = false;
-    return [];
-  }
-
-  for (const block of blocks) {
-    host.submissionQueue.push({
-      code: block,
-      initialPromptKind: host.promptKind,
+  skipSplit: boolean = false,
+  slot: Submission = reserveRuntimeSubmission(host, code)
+): Promise<string[]> {
+  const generation = host.submissionGeneration;
+  const blocks: string[] = [];
+  const publish = (block: string, kind: Submission["kind"]): void => {
+    const index = host.submissionQueue.indexOf(slot);
+    if (index < 0 || generation !== host.submissionGeneration) return;
+    host.submissionQueue.splice(index, 0, {
+      kind, code: block, initialPromptKind: slot.initialPromptKind,
     });
-  }
+    if (kind === "execute") blocks.push(block);
+    startNextRuntimeSubmission(host);
+  };
 
+  try {
+    if (skipSplit) {
+      slot.code = "";
+      const block = normalizeSubmissionBlock(code);
+      if (block.trim()) publish(block, "execute");
+    } else {
+      const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const lines = normalized.split("\n");
+      let pending = "";
+      let offset = 0;
+      for (const line of lines) {
+        offset += line.length + 1;
+        pending = pending ? pending + "\n" + line : line;
+        const block = normalizeSubmissionBlock(pending);
+        if (!block.trim()) continue;
+        const complete = await host.inputState.isExpressionCompleteAsync(block);
+        if (generation !== host.submissionGeneration || !host.submissionQueue.includes(slot)) return blocks;
+        if (complete) {
+          // On delivery failure, the placeholder contains only the not-yet-published tail.
+          slot.code = normalized.slice(offset);
+          publish(block, "execute");
+          pending = "";
+        }
+      }
+      if (normalizeSubmissionBlock(pending).trim()) {
+        slot.code = "";
+        publish(pending, "edit");
+      }
+    }
+  } finally {
+    const index = host.submissionQueue.indexOf(slot);
+    if (index >= 0) {
+      host.submissionQueue.splice(index, 1);
+      startNextRuntimeSubmission(host);
+    }
+  }
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
-  startNextRuntimeSubmission(host);
   return blocks;
 }
 
@@ -1122,37 +1187,6 @@ function normalizeSubmissionBlock(code: string): string {
   return stripCommentLines(code.replace(/\n+$/, ""))
     .replace(/^(?:[ \t]*[\r\n])+/, "")
     .trimEnd();
-}
-
-async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<string[]> {
-  const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = normalized.split("\n");
-  const blocks: string[] = [];
-  let currentBlock = "";
-
-  for (const line of lines) {
-    currentBlock = currentBlock.length > 0 ? `${currentBlock}\n${line}` : line;
-    const normalizedBlock = normalizeSubmissionBlock(currentBlock);
-
-    if (!normalizedBlock.trim()) {
-      continue;
-    }
-
-    const isComplete = await host.inputState.isExpressionCompleteAsync(normalizedBlock);
-    if (!isComplete) {
-      continue;
-    }
-
-    blocks.push(normalizedBlock);
-    currentBlock = "";
-  }
-
-  const trailingBlock = normalizeSubmissionBlock(currentBlock);
-  if (trailingBlock.trim() && (await host.inputState.isExpressionCompleteAsync(trailingBlock))) {
-    blocks.push(trailingBlock);
-  }
-
-  return blocks;
 }
 
 function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
@@ -1245,6 +1279,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.promptVisible = false;
     host.pendingPromptToken = false;
     host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1261,6 +1296,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.replyPromptText = "";
     host.mode = "executing";
     host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1269,6 +1305,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.inputState.reset();
     host.renderInput();
     host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1280,6 +1317,7 @@ export function interruptRuntime(host: RuntimeHost): void {
   host.inputState.reset();
   host.promptVisible = false;
   host.clearPendingConsoleInput();
+  host.cancelPendingSubmissions();
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
@@ -1302,7 +1340,7 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.awaitingExecutionStart = false;
   host.submissionPending = false;
 
-  host.submissionQueue = [];
+  host.cancelPendingSubmissions();
   host.activeSubmission = null;
 
   host.writeEmitter.fire(
