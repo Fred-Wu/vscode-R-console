@@ -221,6 +221,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private runtimeHostAdapter!: RuntimeHost;
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
+  private inputCommitPending = false;
   private suppressNextEnterAfterPasteEnd = false;
 
   private submissionGeneration = 0;
@@ -874,8 +875,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       !this.inBracketPaste &&
       this.mode !== "closed" &&
       this.mode !== "reply" &&
-      this.inputState.text.length === 0 &&
-      this.inputState.isAtEnd
+      (this.inputCommitPending || (this.inputState.text.length === 0 && this.inputState.isAtEnd))
     );
   }
 
@@ -929,7 +929,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    if (this.mode !== "ready" || !this.promptReady) {
+    if (this.mode !== "ready" || !this.promptReady || this.inputCommitPending) {
       this.pendingProgrammaticInput = data;
       this.clearPendingInputFlushTimer();
       this.pendingInputFlushTimer = setTimeout(() => {
@@ -1095,6 +1095,11 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private applyKeyAction(action: KeyAction): void {
     if (this.mode === "closed") {
+      return;
+    }
+    // Committed Enter/paste input is immutable during the existing parse.
+    // Ctrl+C still cancels the pending submission.
+    if (this.inputCommitPending && action.type !== "ctrl_c") {
       return;
     }
 
@@ -1575,15 +1580,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const fullText = this.inputState.text;
-    const cursor = this.inputState.cursorPosition;
     const generation = this.submissionGeneration;
-    const isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
-    if (
-      generation !== this.submissionGeneration ||
-      this.mode !== "ready" ||
-      this.inputState.text !== fullText ||
-      this.inputState.cursorPosition !== cursor
-    ) {
+    this.inputCommitPending = true;
+    let isComplete: boolean;
+    try {
+      isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
+    } finally {
+      if (generation === this.submissionGeneration) {
+        this.inputCommitPending = false;
+      }
+    }
+    if (generation !== this.submissionGeneration || this.mode !== "ready") {
       return;
     }
 
@@ -1595,8 +1602,16 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.savedHistoryInput = undefined;
         this.historyCollapsed = true;
         this.rHistory.resetIndex();
-        const blocks = await this.enqueueRSubmission(submission, !/[\r\n]/.test(submission));
-        this.recordSubmissionHistory(blocks);
+        // The committed input stays owned until async block splitting has queued it.
+        this.inputCommitPending = true;
+        try {
+          const blocks = await this.enqueueRSubmission(submission, !/[\r\n]/.test(submission));
+          this.recordSubmissionHistory(blocks);
+        } finally {
+          if (generation === this.submissionGeneration) {
+            this.inputCommitPending = false;
+          }
+        }
       }
       return;
     }
@@ -1692,14 +1707,16 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const generation = this.submissionGeneration;
     const checkedText = this.inputState.text;
-    const checkedCursor = this.inputState.cursorPosition;
-    const isComplete = await this.inputState.isExpressionCompleteAsync(checkedText);
-    if (
-      generation !== this.submissionGeneration ||
-      this.mode !== "ready" ||
-      this.inputState.text !== checkedText ||
-      this.inputState.cursorPosition !== checkedCursor
-    ) {
+    this.inputCommitPending = true;
+    let isComplete: boolean;
+    try {
+      isComplete = await this.inputState.isExpressionCompleteAsync(checkedText);
+    } finally {
+      if (generation === this.submissionGeneration) {
+        this.inputCommitPending = false;
+      }
+    }
+    if (generation !== this.submissionGeneration || this.mode !== "ready") {
       return;
     }
     if (!isComplete) {
@@ -1760,11 +1777,19 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const blocks = await this.enqueueRSubmission(
-      sanitized,
-      !/[\r\n]/.test(sanitized)
-    );
-    this.recordSubmissionHistory(blocks);
+    // Keep ownership through block splitting, not only the first parse.
+    this.inputCommitPending = true;
+    try {
+      const blocks = await this.enqueueRSubmission(
+        sanitized,
+        !/[\r\n]/.test(sanitized)
+      );
+      this.recordSubmissionHistory(blocks);
+    } finally {
+      if (generation === this.submissionGeneration) {
+        this.inputCommitPending = false;
+      }
+    }
   }
 
   private reverseSearch(): void {
@@ -2239,6 +2264,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.submissionGeneration += 1;
     this.submissionQueue = [];
     this.programmaticSubmissionQueue = Promise.resolve();
+    this.inputCommitPending = false;
     this.pendingProgrammaticInput = "";
     this.clearPendingInputFlushTimer();
     this.clearPendingConsoleInput();

@@ -256,96 +256,127 @@ test("an edit tail cannot append to console input entered during earlier executi
   assert.deepEqual(commands, [{ type: "submit", code: "1" }]);
 });
 
-test("Enter ignores stale completeness after input changes during parsing", async () => {
+
+test("Enter commits input before the existing parser can finish", async () => {
   for (const complete of [false, true]) {
     const { terminal, commands } = createTerminal();
-    let resolveParse;
-    terminal.inputState.isExpressionCompleteAsync = () => new Promise(resolve => { resolveParse = resolve; });
-    terminal.inputState.insertText("1");
+    let finishParse;
+    terminal.inputState.isExpressionCompleteAsync = () =>
+      new Promise(resolve => { finishParse = resolve; });
+    terminal.inputState.insertText("x <- 1");
     const pending = terminal.handleEnterKey();
-    terminal.inputState.insertText(" + 2");
-    resolveParse(complete);
+    terminal.handleInput("2");
+    terminal.handleInput("\x7f");
+    terminal.handleInput("\x1b[D");
+    terminal.handleInput("\r");
+    assert.equal(terminal.inputState.text, "x <- 1");
+    assert.equal(terminal.inputState.cursorPosition, 6);
+    finishParse(complete);
     await pending;
-    assert.equal(terminal.inputState.text, "1 + 2");
-    assert.deepEqual(commands, []);
+    assert.equal(terminal.inputCommitPending, false);
+    if (complete) {
+      assert.deepEqual(commands, [{ type: "submit", code: "x <- 1" }]);
+      assert.equal(terminal.inputState.text, "");
+    } else {
+      assert.deepEqual(commands, []);
+      assert.equal(terminal.inputState.text, "x <- 1\n");
+    }
   }
 });
 
-test("Enter ignores stale completeness after cursor movement", async () => {
+test("incomplete Enter allows new input after the parse, not during it", async () => {
   const { terminal, commands } = createTerminal();
-  let resolveParse;
-  terminal.inputState.isExpressionCompleteAsync = () => new Promise(resolve => { resolveParse = resolve; });
-  terminal.inputState.insertText("x <- 1");
+  let finishParse;
+  terminal.inputState.isExpressionCompleteAsync = () =>
+    new Promise(resolve => { finishParse = resolve; });
+  terminal.inputState.insertText("x <- (");
   const pending = terminal.handleEnterKey();
-  terminal.inputState.cursorPosition = 0;
-  resolveParse(true);
+  terminal.handleInput("4");
+  assert.equal(terminal.inputState.text, "x <- (");
+  finishParse(false);
   await pending;
-  assert.equal(terminal.inputState.text, "x <- 1");
-  assert.equal(terminal.inputState.cursorPosition, 0);
+  terminal.handleInput("42)");
+  assert.equal(terminal.inputState.text, "x <- (\n  42)");
   assert.deepEqual(commands, []);
 });
 
-test("Enter does not apply a stale result after entering reply mode", async () => {
+test("Ctrl+C releases a committed Enter even when the old parser finishes later", async () => {
   const { terminal, commands } = createTerminal();
-  let resolveParse;
-  terminal.inputState.isExpressionCompleteAsync = () => new Promise(resolve => { resolveParse = resolve; });
+  let finishParse;
+  terminal.inputState.isExpressionCompleteAsync = () =>
+    new Promise(resolve => { finishParse = resolve; });
   terminal.inputState.insertText("x <- 1");
   const pending = terminal.handleEnterKey();
-  terminal.mode = "reply";
-  resolveParse(true);
+  terminal.handleInput("\x03");
+  finishParse(true);
   await pending;
-  assert.equal(terminal.inputState.text, "x <- 1");
+  assert.equal(terminal.inputCommitPending, false);
+  assert.equal(terminal.inputState.text, "");
   assert.deepEqual(commands, []);
 });
 
-test("multiline paste is inserted before parsing and cannot erase subsequent typing", async () => {
+test("multiline paste commits its input before the existing parser returns", async () => {
   for (const complete of [false, true]) {
     const { terminal, commands } = createTerminal();
-    let resolveParse;
-    terminal.inputState.isExpressionCompleteAsync = () => new Promise(resolve => { resolveParse = resolve; });
+    let finishParse;
+    terminal.inputState.isExpressionCompleteAsync = () =>
+      new Promise(resolve => { finishParse = resolve; });
     terminal.pasteBuffer = "x <- 1\n";
     const pending = terminal.handlePasteEnd();
+    terminal.handleInput("2");
+    terminal.handleInput("\x1b[D");
     assert.equal(terminal.inputState.text, "x <- 1");
-    terminal.inputState.insertText(" + 2");
-    resolveParse(complete);
+    assert.equal(terminal.inputState.isAtEnd, true);
+    finishParse(complete);
     await pending;
-    assert.equal(terminal.inputState.text, "x <- 1 + 2");
-    assert.deepEqual(commands, []);
+    assert.equal(terminal.inputCommitPending, false);
+    if (complete) {
+      assert.deepEqual(commands, [{ type: "submit", code: "x <- 1" }]);
+      assert.equal(terminal.inputState.text, "");
+    } else {
+      assert.deepEqual(commands, []);
+      assert.equal(terminal.inputState.text, "x <- 1");
+      terminal.handleInput(" + 2");
+      assert.equal(terminal.inputState.text, "x <- 1 + 2");
+    }
   }
 });
 
-test("paste parse cannot execute after the cursor moves", async () => {
+test("Ctrl+C releases a committed paste without submitting it", async () => {
   const { terminal, commands } = createTerminal();
-  let resolveParse;
-  terminal.inputState.isExpressionCompleteAsync = () => new Promise(resolve => { resolveParse = resolve; });
+  let finishParse;
+  terminal.inputState.isExpressionCompleteAsync = () =>
+    new Promise(resolve => { finishParse = resolve; });
   terminal.pasteBuffer = "x <- 1\n";
   const pending = terminal.handlePasteEnd();
-  terminal.inputState.cursorPosition = 0;
-  resolveParse(true);
+  terminal.handleInput("\x03");
+  finishParse(true);
   await pending;
-  assert.equal(terminal.inputState.text, "x <- 1");
-  assert.equal(terminal.inputState.cursorPosition, 0);
-  assert.deepEqual(commands, []);
-});
-
-test("complete multiline paste still submits without additional checking", async () => {
-  const { terminal, commands, history } = createTerminal();
-  terminal.pasteBuffer = "x <- 1 +\n 2\n";
-  await terminal.handlePasteEnd();
-  assert.deepEqual(commands, [{ type: "submit", code: "x <- 1 +\n 2" }]);
-  assert.deepEqual(history, ["x <- 1 +\n 2"]);
+  assert.equal(terminal.inputCommitPending, false);
   assert.equal(terminal.inputState.text, "");
-});
-
-test("incomplete multiline paste remains in the editable input", async () => {
-  const { terminal, commands } = createTerminal();
-  terminal.pasteBuffer = "x <- (\n";
-  await terminal.handlePasteEnd();
-  assert.equal(terminal.inputState.text, "x <- (");
   assert.deepEqual(commands, []);
 });
 
-test("paste at an interior cursor preserves existing source order", async () => {
+test("Enter and paste preserve one completeness request apiece", async () => {
+  const { terminal, commands } = createTerminal();
+  const requests = [];
+  terminal.inputState.isExpressionCompleteAsync = (code) => {
+    requests.push(code);
+    return Promise.resolve(true);
+  };
+  terminal.inputState.insertText("1");
+  await terminal.handleEnterKey();
+  assert.deepEqual(requests, ["1"]);
+  assert.deepEqual(commands, [{ type: "submit", code: "1" }]);
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
+  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+  terminal.pasteBuffer = "2\n";
+  await terminal.handlePasteEnd();
+  assert.deepEqual(requests, ["1", "2"]);
+  assert.deepEqual(commands.at(-1), { type: "submit", code: "2" });
+});
+
+test("paste at an interior cursor remains an edit, not a submission", async () => {
   const { terminal, commands } = createTerminal();
   terminal.inputState.insertText("x <- 3");
   terminal.inputState.cursorPosition = 5;
@@ -353,4 +384,48 @@ test("paste at an interior cursor preserves existing source order", async () => 
   await terminal.handlePasteEnd();
   assert.equal(terminal.inputState.text, "x <- 23");
   assert.deepEqual(commands, []);
+});
+
+test("submitted multiline paste stays committed through block splitting", async () => {
+  const { terminal, commands } = createTerminal();
+  let finishSplit;
+  terminal.inputState.isExpressionCompleteAsync = code =>
+    code === "a <- 1\nb <- 2"
+      ? Promise.resolve(true)
+      : code === "a <- 1"
+        ? new Promise(resolve => { finishSplit = resolve; })
+        : Promise.resolve(true);
+  terminal.pasteBuffer = "a <- 1\nb <- 2\n";
+  const pending = terminal.handlePasteEnd();
+  await Promise.resolve();
+  assert.equal(typeof finishSplit, "function");
+  assert.equal(terminal.inputCommitPending, true);
+  terminal.handleInput("o");
+  assert.equal(terminal.inputState.text, "");
+  finishSplit(true);
+  await pending;
+  assert.equal(terminal.inputCommitPending, false);
+  assert.deepEqual(commands, [{ type: "submit", code: "a <- 1" }]);
+});
+
+test("source-editor commands received during committed Enter wait in the existing queue", async () => {
+  const { terminal, commands } = createTerminal();
+  let finishParse;
+  terminal.inputState.insertText("x <- 1");
+  terminal.inputState.isExpressionCompleteAsync = code =>
+    code === "x <- 1"
+      ? new Promise(resolve => { finishParse = resolve; })
+      : Promise.resolve(true);
+  const enter = terminal.handleEnterKey();
+  terminal.handleInput("y <- 2\n");
+  assert.equal(terminal.inputState.text, "x <- 1");
+  finishParse(true);
+  await enter;
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
+  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+  await terminal.programmaticSubmissionQueue;
+  assert.deepEqual(commands, [
+    { type: "submit", code: "x <- 1" },
+    { type: "submit", code: "y <- 2" },
+  ]);
 });
