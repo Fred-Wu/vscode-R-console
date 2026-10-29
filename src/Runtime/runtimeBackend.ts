@@ -345,7 +345,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           return;
         }
         state.pendingParseRequests.delete(requestId);
-        settled = true;
+        // reject() owns the settled flag; setting it here would leave the
+        // promise pending forever and prevent the parser's local fallback.
         pending.reject(new Error("native parse-status request timed out"));
       }, PARSE_STATUS_TIMEOUT_MS);
       state.pendingParseRequests.set(requestId, {

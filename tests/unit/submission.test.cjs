@@ -1,59 +1,168 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const loadSource = require("../helpers/load-source.cjs");
-const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
-  "./rTerminal/lang": {},
-  vscode: { EventEmitter: class {} },
-});
-const runtime = loadSource("src/Terminal/rTerminal/runtime.ts", { vscode: {} });
-const { InputState } = loadSource("src/Terminal/inputState.ts");
-const { Renderer } = loadSource("src/Terminal/renderer.ts");
-const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
+const { createTerminal, nextPrompt, deferred, parser } = require("../helpers/submission-terminal.cjs");
 
-function deferred() {
-  let resolve;
-  const promise = new Promise(r => { resolve = r; });
-  return { promise, resolve: value => resolve(value) };
-}
+// An extra turn also drains Enter handlers invoked by handleInput without an
+// exposed promise. Tests control parser completion explicitly, never by sleeps.
+const settle = () => new Promise(resolve => setImmediate(resolve));
 
-function createTerminal() {
-  const commands = [];
-  const history = [];
-  const output = [];
-  const terminal = Object.assign(Object.create(RTerminal.prototype), {
-    mode: "ready", promptReady: true, promptKind: "main", promptVisible: false,
-    autoMatch: false, tabSize: 2,
-    submissionGeneration: 0, submissionQueue: [], activeSubmission: null,
-    programmaticSubmissionQueue: Promise.resolve(), pendingProgrammaticInput: "",
-    pendingConsoleInputLines: [], pasteBuffer: "", inBracketPaste: false,
-    submissionPending: false, awaitingExecutionStart: false,
-    rProcess: {}, sessionHostConnected: true,
-    inputState: new InputState(), keyProcessor: new KeyProcessor(),
-    dimensions: { columns: 80, rows: 24 }, lastWriteEndedWithNewline: true,
-    lang: { refreshCompletionContextDocument: async () => {}, updateInput() {} },
-    rHistory: { resetIndex() {}, push(code) { history.push(code); } },
-    renderer: new Renderer(() => {}),
-    syntax: { setSource() {}, highlightLines(lines) { return lines; } },
-    runtimeBackend: {
-      isAlive: () => true,
-      canUseSessionCommands: () => true,
-      sendSessionCommand(session, command) { commands.push(command); return true; },
-    },
-    writeEmitter: { fire(text) { output.push(text); } },
-    ensureReadyPromptVisibleForInput() {},
-    renderInput() { this.promptVisible = true; },
-    clearInputRender() { this.promptVisible = false; },
-    clearPromptRenderTimer() {}, clearReplyPromptRenderTimer() {},
-    schedulePrompt() {}, scheduleReplyPrompt() {},
-    getProgrammaticSubmissionFlushDelay() { return 1; },
+for (const timing of ["during parsing", "after parsing", "after restoration"]) {
+  test(`editor continuation is consumed once ${timing}`, async () => {
+    const { terminal, commands, history } = createTerminal();
+    terminal.handleInput("Sys.sleep(1)\nx <- (\n");
+    if (timing !== "during parsing") await terminal.programmaticSubmissionQueue;
+    if (timing === "after restoration") {
+      nextPrompt(terminal);
+      assert.equal(terminal.inputState.text, "x <- (\n");
+    }
+    terminal.handleInput("2)\n");
+    await terminal.programmaticSubmissionQueue;
+    await settle();
+    if (timing !== "after restoration") nextPrompt(terminal);
+    assert.deepEqual(commands.map(c => c.code), ["Sys.sleep(1)", "x <- (\n2)"]);
+    assert.deepEqual(history, ["Sys.sleep(1)", "x <- (\n2)"]);
+    assert.equal(terminal.inputState.text, "");
+    assert.deepEqual(terminal.submissionQueue, []);
   });
-  terminal.runtimeHostAdapter = terminal.createRuntimeHost();
-  return { terminal, commands, history, output };
 }
-function nextPrompt(terminal) {
-  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
-  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+
+test("Enter waits for the previous native check and checks only the combined continuation", async (t) => {
+  const { terminal, commands } = createTerminal();
+  const first = deferred();
+  const checked = [];
+  parser.setNativeParseCallback(code => {
+    checked.push(code);
+    return code === "if" ? first.promise : Promise.resolve(1);
+  });
+  t.after(() => parser.setNativeParseCallback(null));
+  terminal.inputState.insertText("if");
+  const a = terminal.handleEnterKey();
+  terminal.inputState.insertText("(TRUE) 1");
+  const b = terminal.handleEnterKey();
+  await settle();
+  assert.deepEqual(checked, ["if"], "no speculative check of the second input");
+  assert.deepEqual(commands, []);
+  first.resolve(2);
+  await Promise.all([a, b]);
+  assert.equal(checked.filter(code => code === "if\n(TRUE) 1").length, 1);
+  assert.ok(checked.every(code => code.startsWith("if")));
+  assert.deepEqual(commands.map(c => c.code), ["if\n(TRUE) 1"]);
+  assert.equal(terminal.inputState.text, "");
+});
+
+for (const source of ["Enter", "paste", "editor"]) {
+  test(`${source} extends a pending editor expression without consuming newer typing`, async () => {
+    const { terminal, commands } = createTerminal();
+    const gate = deferred();
+    const check = terminal.inputState.isExpressionCompleteAsync.bind(terminal.inputState);
+    let first = true;
+    terminal.inputState.isExpressionCompleteAsync = async code => {
+      if (first) { first = false; await gate.promise; }
+      return check(code);
+    };
+    terminal.handleInput("x <- (\n");
+    let accepted;
+    if (source === "Enter") {
+      terminal.inputState.insertText("2)");
+      accepted = terminal.handleEnterKey();
+    } else if (source === "paste") {
+      terminal.pasteBuffer = "2)\n";
+      accepted = terminal.handlePasteEnd();
+    } else {
+      terminal.handleInput("2)\n");
+      accepted = terminal.programmaticSubmissionQueue;
+    }
+    terminal.handleInput("z");
+    gate.resolve();
+    await accepted;
+    assert.deepEqual(commands.map(c => c.code), ["x <- (\n2)"]);
+    assert.equal(terminal.inputState.text, "z");
+  });
 }
+
+test("several editor batches complete nested expressions and leave a new tail", async () => {
+  const { terminal, commands, history } = createTerminal();
+  for (const code of [
+    'cat("Starting\\n")\nSys.sleep(1)\nscore <- function(x) {\n  if (x > 0) {\n',
+    '    x * 2\n  } else {\n',
+    '    -x\n  }\n}\nscore(3)\nanswer <- (\n',
+    '  score(-4) +\n  1\n)\nanswer\n',
+  ]) terminal.handleInput(code);
+  await terminal.programmaticSubmissionQueue;
+  const expected = [
+    'cat("Starting\\n")', 'Sys.sleep(1)',
+    'score <- function(x) {\n  if (x > 0) {\n    x * 2\n  } else {\n    -x\n  }\n}',
+    'score(3)', 'answer <- (\n  score(-4) +\n  1\n)', 'answer',
+  ];
+  for (let i = 1; i < expected.length; i++) nextPrompt(terminal);
+  assert.deepEqual(commands.map(c => c.code), expected);
+  assert.deepEqual(history, expected);
+  assert.equal(terminal.inputState.text, "");
+});
+
+test("overlapping and settled Enter preserve the same indented multiline string", async () => {
+  for (const overlap of [false, true]) {
+    const { terminal, commands } = createTerminal();
+    terminal.inputState.insertText('  x <- paste("a');
+    const first = terminal.handleEnterKey();
+    if (!overlap) await first;
+    terminal.inputState.insertText('b")');
+    await Promise.all([first, terminal.handleEnterKey()]);
+    assert.deepEqual(commands.map(c => c.code), ['  x <- paste("a\n  b")']);
+    assert.equal(terminal.inputState.text, "");
+  }
+});
+
+test("cancellation releases new submissions without waiting for a stale parser", async () => {
+  const { terminal, commands } = createTerminal();
+  const stale = deferred();
+  const check = terminal.inputState.isExpressionCompleteAsync.bind(terminal.inputState);
+  terminal.inputState.isExpressionCompleteAsync = code => code === "if" ? stale.promise : check(code);
+  terminal.inputState.insertText("if");
+  const first = terminal.handleEnterKey();
+  terminal.inputState.insertText("(TRUE) 1");
+  const second = terminal.handleEnterKey();
+  terminal.applyKeyAction({ type: "ctrl_c" });
+  terminal.inputState.insertText("42");
+  await terminal.handleEnterKey();
+  assert.deepEqual(commands.map(c => c.code), ["42"]);
+  stale.resolve(false);
+  await Promise.all([first, second]);
+  assert.deepEqual(commands.map(c => c.code), ["42"]);
+  assert.deepEqual(terminal.submissionQueue, []);
+  assert.equal(terminal.inputState.text, "");
+});
+
+test("delivery failure restores combined continuation and later reservations once", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  terminal.handleInput("x <- (\n");
+  terminal.handleInput("2)\n");
+  terminal.handleInput("3\n");
+  await terminal.programmaticSubmissionQueue;
+  assert.deepEqual(commands, []);
+  assert.equal(terminal.inputState.text, "x <- (\n2)\n3");
+  assert.deepEqual(terminal.submissionQueue, []);
+  assert.equal(terminal.mode, "ready");
+});
+
+test("an empty reservation does not block the next parser", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.queueProgrammaticSubmission("\n");
+  terminal.handleInput("42\n");
+  await terminal.programmaticSubmissionQueue;
+  assert.deepEqual(commands.map(c => c.code), ["42"]);
+});
+
+test("bracketed paste while R is executing remains discarded", async () => {
+  const { terminal, commands } = createTerminal();
+  await terminal.handleProgrammaticSubmission("Sys.sleep(1)\n");
+  terminal.handleInput("\x1b[200~ignored <- 1\nignored <- 2\x1b[201~");
+  nextPrompt(terminal);
+  assert.deepEqual(commands.map(c => c.code), ["Sys.sleep(1)"]);
+  assert.equal(terminal.inputState.text, "");
+  assert.deepEqual(terminal.submissionQueue, []);
+});
 
 test("Enter commits a snapshot, accepts further typing, and executes only the original command", async () => {
   const { terminal, commands } = createTerminal();

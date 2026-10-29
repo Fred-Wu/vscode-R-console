@@ -61,9 +61,16 @@ export type Submission = {
   kind: "execute" | "parse" | "edit";
   code: string;
   initialPromptKind: "main" | "cont";
+  parsing?: {
+    generation: number;
+    previous?: Promise<void>;
+    done?: Promise<void>;
+    finish?(): void;
+  };
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
+const latestParsing = new WeakMap<RuntimeHost, NonNullable<Submission["parsing"]>>();
 
 export type RuntimeHost = {
   options: RTerminalOptions;
@@ -1121,8 +1128,34 @@ export function startNextRuntimeSubmission(host: RuntimeHost): void {
 /** Reserve the accepted batch before asynchronous parsing begins. */
 export function reserveRuntimeSubmission(host: RuntimeHost, code: string): Submission {
   const slot: Submission = { kind: "parse", code, initialPromptKind: host.promptKind };
+  const tail = host.submissionQueue.at(-1);
+  if (tail?.kind === "edit") {
+    // Parsing may have finished while an earlier expression is still running.
+    // The queued tail still belongs to the next accepted input.
+    host.submissionQueue.pop();
+    slot.code = appendContinuation(tail.code, code);
+    slot.initialPromptKind = tail.initialPromptKind;
+  }
+  const previous = latestParsing.get(host);
+  let previousDone: Promise<void> | undefined;
+  if (previous && previous.generation === host.submissionGeneration) {
+    // Allocate a completion promise only when another reservation needs to wait.
+    previous.done ??= new Promise<void>((resolve) => { previous.finish = resolve; });
+    previousDone = previous.done;
+  }
+  slot.parsing = {
+    generation: host.submissionGeneration,
+    previous: previousDone,
+  };
+  latestParsing.set(host, slot.parsing);
   host.submissionQueue.push(slot);
   return slot;
+}
+
+function appendContinuation(prefix: string, code: string): string {
+  // Enter already includes its newline and optional indentation. Preserve both,
+  // including inside a multiline string; only supply a missing line boundary.
+  return prefix + (/\n[ \t]*$/.test(prefix) ? "" : "\n") + code;
 }
 
 export async function enqueueRuntimeSubmission(
@@ -1144,7 +1177,14 @@ export async function enqueueRuntimeSubmission(
   };
 
   try {
-    if (skipSplit) {
+    if (slot.parsing?.previous) {
+      await slot.parsing.previous;
+      slot.parsing.previous = undefined;
+    }
+    if (generation !== host.submissionGeneration || !host.submissionQueue.includes(slot)) return blocks;
+    const hasContinuation = code !== slot.code;
+    code = slot.code;
+    if (skipSplit && !hasContinuation) {
       slot.code = "";
       const block = normalizeSubmissionBlock(code);
       if (block.trim()) publish(block, "execute");
@@ -1169,7 +1209,17 @@ export async function enqueueRuntimeSubmission(
       }
       if (normalizeSubmissionBlock(pending).trim()) {
         slot.code = "";
-        publish(pending, "edit");
+        const next = host.submissionQueue[host.submissionQueue.indexOf(slot) + 1];
+        if (next?.kind === "parse") {
+          // Transfer ownership before releasing the next parser. Never restore
+          // this prefix into the editor as well as passing it to queued input.
+          next.code = appendContinuation(pending, next.code);
+          next.initialPromptKind = slot.initialPromptKind;
+        } else {
+          // With no accepted successor, the editable buffer owns continuation.
+          // Subsequent Enter/paste snapshots already include that buffer.
+          publish(pending, "edit");
+        }
       }
     }
   } finally {
@@ -1178,6 +1228,9 @@ export async function enqueueRuntimeSubmission(
       host.submissionQueue.splice(index, 1);
       startNextRuntimeSubmission(host);
     }
+    slot.parsing?.finish?.();
+    if (latestParsing.get(host) === slot.parsing) latestParsing.delete(host);
+    slot.parsing = undefined;
   }
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
   return blocks;

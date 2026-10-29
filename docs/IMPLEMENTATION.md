@@ -816,6 +816,20 @@ Creating a console follows this implementation path:
 8. backend events update terminal state
 9. the extension schedules persistence of the session record
 
+Enter, accepted multiline paste, and programmatic sends reserve their submission
+positions synchronously. Completeness checks run in reservation order, while
+completed expressions can enter execution immediately. An incomplete tail passes
+to the next reservation before that reservation is checked, including when the
+tail is waiting behind an executing expression. With no accepted successor, the
+tail becomes editable; normal input handling includes that buffer in the next
+Enter or paste snapshot. It is never owned by both the queue and editor.
+
+This ordering retains the existing TypeScript heuristic and optional native R
+parse-status check. Native checks time out after 150 ms and reject so the local
+fallback can run. Cancellation invalidates old reservations by generation; fresh
+input does not wait for a cancelled parser. No speculative checks or collection
+of previously checked prefixes is retained.
+
 ### 4.5 Attaching A Detached Console
 
 Attaching a detached console follows this implementation path:

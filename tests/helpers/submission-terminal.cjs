@@ -1,0 +1,57 @@
+const loadSource = require("./load-source.cjs");
+const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
+  "./rTerminal/lang": {},
+  vscode: { EventEmitter: class {} },
+});
+const runtime = loadSource("src/Terminal/rTerminal/runtime.ts", { vscode: {} });
+const parser = loadSource("src/Language/parser.ts");
+const { InputState } = loadSource("src/Terminal/inputState.ts", { "../Language/parser": parser });
+const { Renderer } = loadSource("src/Terminal/renderer.ts");
+const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve: value => resolve(value) };
+}
+
+function createTerminal() {
+  const commands = [];
+  const history = [];
+  const output = [];
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    mode: "ready", promptReady: true, promptKind: "main", promptVisible: false,
+    autoMatch: false, tabSize: 2,
+    submissionGeneration: 0, submissionQueue: [], activeSubmission: null,
+    programmaticSubmissionQueue: Promise.resolve(), pendingProgrammaticInput: "",
+    pendingConsoleInputLines: [], pasteBuffer: "", inBracketPaste: false,
+    submissionPending: false, awaitingExecutionStart: false,
+    rProcess: {}, sessionHostConnected: true,
+    inputState: new InputState(), keyProcessor: new KeyProcessor(),
+    dimensions: { columns: 80, rows: 24 }, lastWriteEndedWithNewline: true,
+    lang: { refreshCompletionContextDocument: async () => {}, updateInput() {} },
+    rHistory: { resetIndex() {}, push(code) { history.push(code); } },
+    renderer: new Renderer(() => {}),
+    syntax: { setSource() {}, highlightLines(lines) { return lines; } },
+    runtimeBackend: {
+      isAlive: () => true,
+      canUseSessionCommands: () => true,
+      sendSessionCommand(session, command) { commands.push(command); return true; },
+    },
+    writeEmitter: { fire(text) { output.push(text); } },
+    ensureReadyPromptVisibleForInput() {},
+    renderInput() { this.promptVisible = true; },
+    clearInputRender() { this.promptVisible = false; },
+    clearPromptRenderTimer() {}, clearReplyPromptRenderTimer() {},
+    schedulePrompt() {}, scheduleReplyPrompt() {},
+    getProgrammaticSubmissionFlushDelay() { return 1; },
+  });
+  terminal.runtimeHostAdapter = terminal.createRuntimeHost();
+  return { terminal, commands, history, output };
+}
+function nextPrompt(terminal) {
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: true });
+  runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
+}
+
+module.exports = { createTerminal, nextPrompt, deferred, runtime, parser };

@@ -979,7 +979,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       .replace(/\r/g, "\n");
     // Preserve an incomplete source tail, including its trailing continuation newline.
     const submission = normalized;
-    if (!submission.trim()) return;
+    // Even an empty reserved batch must release its parsing position.
 
     this.historyBrowsing = false;
     this.savedHistoryInput = undefined;
