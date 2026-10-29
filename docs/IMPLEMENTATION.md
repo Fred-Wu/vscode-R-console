@@ -823,6 +823,10 @@ to the next reservation before that reservation is checked, including when the
 tail is waiting behind an executing expression. With no accepted successor, the
 tail becomes editable; normal input handling includes that buffer in the next
 Enter or paste snapshot. It is never owned by both the queue and editor.
+Enter retains literal whitespace and applies its continuation newline at the
+saved cursor only when input is incomplete. Each complete expression is recorded
+in history as it is accepted, so interrupting later parsing preserves earlier
+entries.
 
 This ordering retains the existing TypeScript heuristic and optional native R
 parse-status check. Native checks time out after 150 ms and reject so the local

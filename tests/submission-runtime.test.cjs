@@ -151,5 +151,47 @@ test("frontend continuations execute in order with real R parsing and evaluation
     terminal.handleInput(`stopifnot(identical(x, "a\\n  b")); cat("${marker}\\n")\n`);
     await waitFor(() => idle() && output.includes(marker), marker);
   }
+
+  for (const [opening, closing, label] of [
+    ['x <- "a  ', 'b"', "QUOTED"],
+    ['x <- r"(a  ', 'b)"', "RAW"],
+  ]) {
+    terminal.inputState.insertText(opening);
+    await terminal.handleEnterKey();
+    await terminal.handleEnterKey();
+    terminal.inputState.insertText(closing);
+    await terminal.handleEnterKey();
+    await waitFor(idle, "literal whitespace assignment");
+    const marker = `${label}_WHITESPACE_OK`;
+    terminal.handleInput(`stopifnot(identical(x, "a  \\n\\nb")); cat("${marker}\\n")\n`);
+    await waitFor(() => idle() && output.includes(marker), marker);
+  }
+
+  terminal.inputState.insertText("x <- c(1,2");
+  terminal.inputState.cursorPosition = 9;
+  await terminal.handleEnterKey();
+  assert.equal(terminal.inputState.text, "x <- c(1,\n2");
+  assert.equal(terminal.inputState.cursorPosition, 10);
+  terminal.inputState.insertText("3,");
+  terminal.inputState.cursorToEnd();
+  terminal.inputState.insertText(")");
+  await terminal.handleEnterKey();
+  await waitFor(idle, "cursor edit assignment");
+  terminal.handleInput('stopifnot(identical(x, c(1, 3, 2))); cat("CURSOR_EDIT_OK\\n")\n');
+  await waitFor(() => idle() && output.includes("CURSOR_EDIT_OK"), "cursor edit value");
+
+  const historyStart = history.length;
+  terminal.handleInput('cat("HISTORY_KEEP\\n")\nSys.sleep(30)\n42\n');
+  const interruptedBatch = terminal.programmaticSubmissionQueue;
+  await waitFor(() => output.includes("HISTORY_KEEP") &&
+    terminal.activeSubmission?.code === "Sys.sleep(30)" && !terminal.awaitingExecutionStart, "sleep before interrupt");
+  terminal.handleInput("\x03");
+  await interruptedBatch;
+  await waitFor(idle, "interrupt recovery");
+  // If a busy CI runner processes the 150 ms fallback before Ctrl+C, 42 may
+  // already have been accepted too. Earlier entries must survive either timing;
+  // the unit test gates the later check to cover cancellation while it is pending.
+  assert.deepEqual(history.slice(historyStart, historyStart + 2), ['cat("HISTORY_KEEP\\n")', "Sys.sleep(30)"]);
+  assert.equal(history.filter(code => code === 'cat("HISTORY_KEEP\\n")').length, 1);
   assert.doesNotMatch(output, /Error/);
 });

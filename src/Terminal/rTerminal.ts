@@ -986,8 +986,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.historyCollapsed = true;
     this.escPendingClear = false;
     this.rHistory.resetIndex();
-    const blocks = await this.enqueueRSubmission(submission, false, slot);
-    if (generation === this.submissionGeneration) this.recordSubmissionHistory(blocks);
+    await this.enqueueRSubmission(submission, false, slot);
   }
 
   private handleNestedReplyPaste(content: string): boolean {
@@ -1034,9 +1033,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return true;
     }
 
-    void this.enqueueRSubmission(line, true).then((blocks) => {
-      this.recordSubmissionHistory(blocks);
-    });
+    void this.enqueueRSubmission(line, true);
     return true;
   }
 
@@ -1553,15 +1550,13 @@ export class RTerminal implements vscode.Pseudoterminal {
 
     const submitted = this.inputState.text + trimmed;
     const slot = reserveRuntimeSubmission(this.runtimeHost(), submitted);
-    const generation = this.submissionGeneration;
     this.inputState.reset();
     this.lang.updateInput("");
     if (this.promptVisible) {
       this.clearInputRender();
       this.promptVisible = false;
     }
-    const blocks = await this.enqueueRSubmission(submitted, false, slot);
-    if (generation === this.submissionGeneration) this.recordSubmissionHistory(blocks);
+    await this.enqueueRSubmission(submitted, false, slot);
   }
 
   private handleReplyInputAction(action: KeyAction): void {
@@ -1675,10 +1670,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const sanitized = stripBracketedPasteMarkers(fullText).trimEnd();
-    const submitted = sanitized + "\n" + indent;
-    const slot = reserveRuntimeSubmission(this.runtimeHost(), submitted);
-    const generation = this.submissionGeneration;
+    const submitted = stripBracketedPasteMarkers(fullText).replace(/\r\n?/g, "\n");
+    const cursor = stripBracketedPasteMarkers(fullText.slice(0, this.inputState.cursorPosition))
+      .replace(/\r\n?/g, "\n").length;
+    // Keep literal whitespace and the editing position. Apply Enter's newline
+    // only if the snapshot has an incomplete tail; complete code stays intact.
+    const slot = reserveRuntimeSubmission(this.runtimeHost(), submitted, {
+      cursor, text: "\n" + indent,
+    });
     if (this.promptVisible) {
       this.clearInputRender();
       this.promptVisible = false;
@@ -1691,8 +1690,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.rHistory.resetIndex();
     this.lang.updateInput("");
 
-    const blocks = await this.enqueueRSubmission(submitted, false, slot);
-    if (generation === this.submissionGeneration) this.recordSubmissionHistory(blocks);
+    await this.enqueueRSubmission(submitted, false, slot);
   }
 
   private reverseSearch(): void {
@@ -2145,7 +2143,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     skipSplit: boolean = false,
     slot?: Submission
   ): Promise<string[]> {
-    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, slot);
+    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, slot,
+      (block) => this.recordSubmissionHistory([block]));
   }
 
   private recordSubmissionHistory(blocks: string[]): void {

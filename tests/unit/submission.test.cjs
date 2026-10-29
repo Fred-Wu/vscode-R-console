@@ -6,6 +6,134 @@ const { createTerminal, nextPrompt, deferred, parser } = require("../helpers/sub
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+for (const [opening, closing] of [['x <- "a  ', 'b"'], ['x <- r"(a  ', 'b)"']]) {
+  for (const overlap of [false, true]) {
+    test(`Enter preserves literal trailing whitespace (${opening}, overlap=${overlap})`, async () => {
+      const { terminal, commands } = createTerminal();
+      terminal.inputState.insertText(opening);
+      const first = terminal.handleEnterKey();
+      if (!overlap) await first;
+      terminal.inputState.insertText(closing);
+      await Promise.all([first, terminal.handleEnterKey()]);
+      assert.deepEqual(commands.map(c => c.code), [opening + "\n" + closing]);
+    });
+  }
+}
+
+test("repeated Enter preserves blank lines inside a multiline string", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText('x <- "a  ');
+  await terminal.handleEnterKey();
+  await terminal.handleEnterKey();
+  await terminal.handleEnterKey();
+  assert.equal(terminal.inputState.text, 'x <- "a  \n\n\n');
+  terminal.inputState.insertText('b"');
+  await terminal.handleEnterKey();
+  assert.deepEqual(commands.map(c => c.code), ['x <- "a  \n\n\nb"']);
+});
+
+test("Enter restores its newline and cursor inside incomplete input", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText("c(1,2");
+  terminal.inputState.cursorPosition = 4;
+  await terminal.handleEnterKey();
+  assert.equal(terminal.inputState.text, "c(1,\n2");
+  assert.equal(terminal.inputState.cursorPosition, 5);
+  assert.deepEqual(commands, []);
+});
+
+test("Enter inside complete input executes the original expression unchanged", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText('paste("ab")');
+  terminal.inputState.cursorPosition = 8;
+  await terminal.handleEnterKey();
+  assert.deepEqual(commands.map(c => c.code), ['paste("ab")']);
+  assert.equal(terminal.inputState.text, "");
+});
+
+test("typing during a check is restored at the saved cursor, before the suffix", async () => {
+  const { terminal } = createTerminal();
+  const gate = deferred();
+  terminal.inputState.isExpressionCompleteAsync = () => gate.promise;
+  terminal.inputState.insertText("c(1,2");
+  terminal.inputState.cursorPosition = 4;
+  const first = terminal.handleEnterKey();
+  terminal.inputState.insertText("3,");
+  gate.resolve(false);
+  await first;
+  assert.equal(terminal.inputState.text, "c(1,\n3,2");
+  assert.equal(terminal.inputState.cursorPosition, 7);
+});
+
+for (const overlap of [false, true]) {
+  test(`successive Enter edits preserve the original suffix (overlap=${overlap})`, async () => {
+    const { terminal, commands } = createTerminal();
+    terminal.inputState.insertText("c(1,2");
+    terminal.inputState.cursorPosition = 4;
+    const first = terminal.handleEnterKey();
+    if (!overlap) await first;
+    terminal.inputState.insertText("3,");
+    await Promise.all([first, terminal.handleEnterKey()]);
+    assert.equal(terminal.inputState.text, "c(1,\n3,\n2");
+    assert.equal(terminal.inputState.cursorPosition, 8);
+    terminal.inputState.cursorToEnd();
+    terminal.inputState.insertText(")");
+    await terminal.handleEnterKey();
+    assert.deepEqual(commands.map(c => c.code), ["c(1,\n3,\n2)"]);
+  });
+}
+
+test("an editor send extends a queued cursor edit behind execution", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText("1\nc(1,2");
+  terminal.inputState.cursorPosition = 6;
+  await terminal.handleEnterKey();
+  assert.deepEqual(commands.map(c => c.code), ["1"]);
+  terminal.handleInput("3,\n");
+  await terminal.programmaticSubmissionQueue;
+  nextPrompt(terminal);
+  assert.equal(terminal.inputState.text, "c(1,\n3,\n2");
+  assert.equal(terminal.inputState.cursorPosition, 8);
+});
+
+test("interruption retains earlier history while later parsing is pending", async () => {
+  const { terminal, commands, history } = createTerminal();
+  const gate = deferred();
+  const check = terminal.inputState.isExpressionCompleteAsync.bind(terminal.inputState);
+  terminal.inputState.isExpressionCompleteAsync = code => code === "42" ? gate.promise : check(code);
+  terminal.handleInput('cat("ran\\n")\nSys.sleep(30)\n42\n');
+  const batch = terminal.programmaticSubmissionQueue;
+  await settle();
+  nextPrompt(terminal);
+  assert.deepEqual(history, ['cat("ran\\n")', "Sys.sleep(30)"]);
+  terminal.interruptR();
+  gate.resolve(true);
+  await batch;
+  assert.deepEqual(commands.map(c => c.type), ["submit", "submit", "interrupt"]);
+  assert.deepEqual(history, ['cat("ran\\n")', "Sys.sleep(30)"]);
+});
+
+test("a later delivery failure keeps earlier history without duplicating a retry", async () => {
+  const { terminal, commands, history } = createTerminal();
+  const gate = deferred();
+  const check = terminal.inputState.isExpressionCompleteAsync.bind(terminal.inputState);
+  terminal.inputState.isExpressionCompleteAsync = code => code === "2" ? gate.promise : check(code);
+  terminal.handleInput("1\n2\n");
+  const batch = terminal.programmaticSubmissionQueue;
+  await settle();
+  nextPrompt(terminal);
+  const send = terminal.runtimeBackend.sendSessionCommand;
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  gate.resolve(true);
+  await batch;
+  assert.deepEqual(history, ["1"]);
+  assert.equal(terminal.inputState.text, "2");
+  terminal.runtimeBackend.sendSessionCommand = send;
+  await terminal.handleEnterKey();
+  assert.deepEqual(commands.map(c => c.code), ["1", "2"]);
+  assert.deepEqual(history, ["1", "2"]);
+});
+
 for (const timing of ["during parsing", "after parsing", "after restoration"]) {
   test(`editor continuation is consumed once ${timing}`, async () => {
     const { terminal, commands, history } = createTerminal();

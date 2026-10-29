@@ -61,6 +61,8 @@ export type Submission = {
   kind: "execute" | "parse" | "edit";
   code: string;
   initialPromptKind: "main" | "cont";
+  continuationEdit?: { cursor: number; text: string };
+  editCursor?: number;
   parsing?: {
     generation: number;
     previous?: Promise<void>;
@@ -1114,8 +1116,11 @@ export function startNextRuntimeSubmission(host: RuntimeHost): void {
   if (next.kind === "edit") {
     const draft = host.inputState.text;
     const cursor = host.inputState.cursorPosition;
-    const prefix = next.code + (draft && !/\n[ \t]*$/.test(next.code) ? "\n" : "");
-    host.inputState.text = prefix + draft;
+    const prefix = next.editCursor === undefined
+      ? next.code + (draft && !/\n[ \t]*$/.test(next.code) ? "\n" : "")
+      : next.code.slice(0, next.editCursor);
+    const suffix = next.editCursor === undefined ? "" : next.code.slice(next.editCursor);
+    host.inputState.text = prefix + draft + suffix;
     host.inputState.cursorPosition = prefix.length + cursor;
     host.mode = "ready";
     host.renderInput();
@@ -1126,15 +1131,18 @@ export function startNextRuntimeSubmission(host: RuntimeHost): void {
 }
 
 /** Reserve the accepted batch before asynchronous parsing begins. */
-export function reserveRuntimeSubmission(host: RuntimeHost, code: string): Submission {
-  const slot: Submission = { kind: "parse", code, initialPromptKind: host.promptKind };
+export function reserveRuntimeSubmission(
+  host: RuntimeHost,
+  code: string,
+  continuationEdit?: Submission["continuationEdit"]
+): Submission {
+  const slot: Submission = { kind: "parse", code, initialPromptKind: host.promptKind, continuationEdit };
   const tail = host.submissionQueue.at(-1);
   if (tail?.kind === "edit") {
     // Parsing may have finished while an earlier expression is still running.
     // The queued tail still belongs to the next accepted input.
     host.submissionQueue.pop();
-    slot.code = appendContinuation(tail.code, code);
-    slot.initialPromptKind = tail.initialPromptKind;
+    continueSubmission(slot, tail.code, tail.initialPromptKind, tail.editCursor);
   }
   const previous = latestParsing.get(host);
   let previousDone: Promise<void> | undefined;
@@ -1152,28 +1160,46 @@ export function reserveRuntimeSubmission(host: RuntimeHost, code: string): Submi
   return slot;
 }
 
-function appendContinuation(prefix: string, code: string): string {
-  // Enter already includes its newline and optional indentation. Preserve both,
-  // including inside a multiline string; only supply a missing line boundary.
-  return prefix + (/\n[ \t]*$/.test(prefix) ? "" : "\n") + code;
+function continueSubmission(
+  slot: Submission,
+  code: string,
+  promptKind: Submission["initialPromptKind"],
+  cursor?: number
+): void {
+  // Input accepted while Enter is being checked belongs at the saved editing
+  // position, just as typing after restoration would. Editor tails without an
+  // Enter edit continue on the next line.
+  const prefix = cursor === undefined
+    ? code + (/\n[ \t]*$/.test(code) ? "" : "\n")
+    : code.slice(0, cursor);
+  const suffix = cursor === undefined ? "" : code.slice(cursor);
+  if (cursor !== undefined) slot.editCursor = prefix.length + slot.code.length;
+  slot.code = prefix + slot.code + suffix;
+  if (slot.continuationEdit) slot.continuationEdit.cursor += prefix.length;
+  slot.initialPromptKind = promptKind;
 }
 
 export async function enqueueRuntimeSubmission(
   host: RuntimeHost,
   code: string,
   skipSplit: boolean = false,
-  slot: Submission = reserveRuntimeSubmission(host, code)
+  slot: Submission = reserveRuntimeSubmission(host, code),
+  onAcceptedBlock?: (block: string) => void
 ): Promise<string[]> {
   const generation = host.submissionGeneration;
   const blocks: string[] = [];
-  const publish = (block: string, kind: Submission["kind"]): void => {
+  const publish = (block: string, kind: Submission["kind"], editCursor?: number): void => {
     const index = host.submissionQueue.indexOf(slot);
     if (index < 0 || generation !== host.submissionGeneration) return;
     host.submissionQueue.splice(index, 0, {
-      kind, code: block, initialPromptKind: slot.initialPromptKind,
+      kind, code: block, initialPromptKind: slot.initialPromptKind, editCursor,
     });
     if (kind === "execute") blocks.push(block);
     startNextRuntimeSubmission(host);
+    // Record each accepted expression now; cancelling later parsing must not
+    // erase earlier history. An immediate delivery failure invalidates this
+    // generation and leaves the unsent expression available for retry instead.
+    if (kind === "execute" && generation === host.submissionGeneration) onAcceptedBlock?.(block);
   };
 
   try {
@@ -1192,8 +1218,10 @@ export async function enqueueRuntimeSubmission(
       const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
       const lines = normalized.split("\n");
       let pending = "";
+      let pendingStart = 0;
       let offset = 0;
       for (const line of lines) {
+        if (!pending) pendingStart = offset;
         offset += line.length + 1;
         pending = pending ? pending + "\n" + line : line;
         const block = normalizeSubmissionBlock(pending);
@@ -1208,17 +1236,24 @@ export async function enqueueRuntimeSubmission(
         }
       }
       if (normalizeSubmissionBlock(pending).trim()) {
+        let editCursor = slot.editCursor === undefined ? undefined
+          : Math.max(0, Math.min(pending.length, slot.editCursor - pendingStart));
+        if (slot.continuationEdit) {
+          const { cursor, text } = slot.continuationEdit;
+          const position = Math.max(0, Math.min(pending.length, cursor - pendingStart));
+          pending = pending.slice(0, position) + text + pending.slice(position);
+          editCursor = position + text.length;
+        }
         slot.code = "";
         const next = host.submissionQueue[host.submissionQueue.indexOf(slot) + 1];
         if (next?.kind === "parse") {
           // Transfer ownership before releasing the next parser. Never restore
           // this prefix into the editor as well as passing it to queued input.
-          next.code = appendContinuation(pending, next.code);
-          next.initialPromptKind = slot.initialPromptKind;
+          continueSubmission(next, pending, slot.initialPromptKind, editCursor);
         } else {
           // With no accepted successor, the editable buffer owns continuation.
           // Subsequent Enter/paste snapshots already include that buffer.
-          publish(pending, "edit");
+          publish(pending, "edit", editCursor);
         }
       }
     }
