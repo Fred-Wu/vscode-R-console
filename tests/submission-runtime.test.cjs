@@ -167,6 +167,15 @@ test("frontend continuations execute in order with real R parsing and evaluation
     await waitFor(() => idle() && output.includes(marker), marker);
   }
 
+  terminal.inputState.insertText('x <- "a');
+  terminal.handleInput("\r\r\r");
+  await waitFor(() => idle() && terminal.inputState.text === 'x <- "a\n\n\n', "coalesced continuation Enters");
+  terminal.inputState.insertText('b"');
+  await terminal.handleEnterKey();
+  await waitFor(idle, "coalesced Enter assignment");
+  terminal.handleInput('stopifnot(identical(x, "a\\n\\n\\nb")); cat("COALESCED_ENTER_OK\\n")\n');
+  await waitFor(() => idle() && output.includes("COALESCED_ENTER_OK"), "coalesced Enter value");
+
   terminal.inputState.insertText("x <- c(1,2");
   terminal.inputState.cursorPosition = 9;
   await terminal.handleEnterKey();

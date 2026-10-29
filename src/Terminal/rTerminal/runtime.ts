@@ -1262,6 +1262,14 @@ export async function enqueueRuntimeSubmission(
     if (index >= 0) {
       host.submissionQueue.splice(index, 1);
       startNextRuntimeSubmission(host);
+      // A comment-only batch produces no R prompt event. Restore the local
+      // prompt once all accepted work is idle, without interrupting execution
+      // or redrawing an already visible prompt.
+      if (generation === host.submissionGeneration && host.mode === "ready" &&
+        !host.activeSubmission && host.submissionQueue.length === 0 && !host.promptVisible) {
+        host.pendingPromptToken = true;
+        host.schedulePrompt();
+      }
     }
     slot.parsing?.finish?.();
     if (latestParsing.get(host) === slot.parsing) latestParsing.delete(host);

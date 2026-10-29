@@ -1,10 +1,82 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { createTerminal, nextPrompt, deferred, parser } = require("../helpers/submission-terminal.cjs");
+const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, parser } = require("../helpers/submission-terminal.cjs");
 
 // An extra turn also drains Enter handlers invoked by handleInput without an
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
 const settle = () => new Promise(resolve => setImmediate(resolve));
+
+for (const source of ["# comment", "# first\n# second"]) {
+  test(`comment-only console Enter restores the visible prompt: ${source}`, async t => {
+    const { terminal, commands, history, screenLines } = createTerminalWithScreen(t);
+    terminal.inputState.insertText(source);
+    terminal.renderInput();
+    terminal.handleInput("\r");
+    await settle();
+    assert.deepEqual(screenLines(), ["R> "]);
+    assert.equal(terminal.promptVisible, true);
+    assert.equal(terminal.inputState.text, "");
+    assert.deepEqual(commands, []);
+    assert.deepEqual(history, []);
+  });
+}
+
+for (const path of ["editor", "paste"]) {
+  test(`comment-only ${path} submission leaves a visible prompt`, async t => {
+    const { terminal, commands, screenLines } = createTerminalWithScreen(t);
+    terminal.handleInput(path === "editor" ? "# comment\n" : "\x1b[200~# comment\n\x1b[201~");
+    await terminal.programmaticSubmissionQueue;
+    await settle();
+    assert.deepEqual(screenLines(), ["R> "]);
+    assert.deepEqual(commands, []);
+  });
+}
+
+test("discarding comments behind execution does not render an early prompt", async t => {
+  const { terminal, commands, screenLines } = createTerminalWithScreen(t);
+  terminal.handleInput("1\n# comment\n");
+  await terminal.programmaticSubmissionQueue;
+  assert.equal(terminal.mode, "executing");
+  assert.equal(terminal.promptVisible, false);
+  assert.deepEqual(screenLines(), ["R> 1"]);
+  assert.deepEqual(commands.map(c => c.code), ["1"]);
+  nextPrompt(terminal);
+  assert.deepEqual(screenLines(), ["R> 1", "R> "]);
+});
+
+for (const [opening, closing] of [['x <- "a', 'b"'], ['x <- r"(a', 'b)"']]) {
+  test(`coalesced Enter actions preserve blank literal lines: ${opening}`, async () => {
+    const { terminal, commands } = createTerminal();
+    terminal.inputState.insertText(opening);
+    terminal.handleInput("\r\r\r");
+    await settle();
+    assert.equal(terminal.inputState.text, opening + "\n\n\n");
+    terminal.inputState.insertText(closing);
+    await terminal.handleEnterKey();
+    assert.deepEqual(commands.map(c => c.code), [opening + "\n\n\n" + closing]);
+  });
+}
+
+test("a queued whitespace-only Enter preserves spaces inside a literal", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText('x <- "a');
+  const first = terminal.handleEnterKey();
+  terminal.inputState.insertText("  ");
+  await Promise.all([first, terminal.handleEnterKey()]);
+  terminal.inputState.insertText('b"');
+  await terminal.handleEnterKey();
+  assert.deepEqual(commands.map(c => c.code), ['x <- "a\n  \nb"']);
+});
+
+test("empty Enter behind complete code does not submit an extra expression", async () => {
+  const { terminal, commands } = createTerminal();
+  terminal.inputState.insertText("42");
+  terminal.handleInput("\r\r");
+  await settle();
+  assert.deepEqual(commands.map(c => c.code), ["42"]);
+  assert.deepEqual(terminal.submissionQueue, []);
+  assert.equal(terminal.promptVisible, false);
+});
 
 for (const [opening, closing] of [['x <- "a  ', 'b"'], ['x <- r"(a  ', 'b)"']]) {
   for (const overlap of [false, true]) {

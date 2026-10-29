@@ -1,7 +1,10 @@
 const loadSource = require("./load-source.cjs");
 const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
   "./rTerminal/lang": {},
-  vscode: { EventEmitter: class {} },
+  vscode: {
+    EventEmitter: class {}, window: {},
+    workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
+  },
 });
 const runtime = loadSource("src/Terminal/rTerminal/runtime.ts", { vscode: {} });
 const parser = loadSource("src/Language/parser.ts");
@@ -54,4 +57,34 @@ function nextPrompt(terminal) {
   runtime.handleBackendPrompt(terminal.runtimeHostAdapter, "main");
 }
 
-module.exports = { createTerminal, nextPrompt, deferred, runtime, parser };
+function createTerminalWithScreen(t) {
+  const { Terminal } = require("@xterm/headless");
+  const { InlineCompletion } = loadSource("src/Terminal/inlineCompletion.ts");
+  const fixture = createTerminal();
+  const { terminal, output } = fixture;
+  const screen = new Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+  terminal.inlineCompletion = new InlineCompletion(screen._core.unicodeService);
+  terminal.inlineSuggestionRowCount = 0;
+  terminal.lang.cancelCompletion = () => {};
+  terminal.pendingPromptToken = false;
+  terminal.writeEmitter.fire = text => {
+    output.push(text);
+    screen._core._writeBuffer.writeSync(text);
+  };
+  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text));
+  // Exercise the actual prompt, clear, and rendering paths, including ANSI output.
+  for (const key of ["ensureReadyPromptVisibleForInput", "renderInput", "clearInputRender",
+    "schedulePrompt", "clearPromptRenderTimer"]) delete terminal[key];
+  terminal.getPromptRenderDelay = () => 0;
+  terminal.showPrompt();
+  t.after(() => {
+    terminal.clearPromptRenderTimer();
+    terminal.dismissInlineCompletion(false);
+    screen.dispose();
+  });
+  const screenLines = () => Array.from({ length: screen.buffer.active.length },
+    (_, index) => screen.buffer.active.getLine(index).translateToString(true)).filter(Boolean);
+  return { ...fixture, screenLines };
+}
+
+module.exports = { createTerminal, createTerminalWithScreen, nextPrompt, deferred, runtime, parser };

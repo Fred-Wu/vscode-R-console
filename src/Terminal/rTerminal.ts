@@ -1649,7 +1649,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     // Enter consumes only the current editable snapshot. Subsequent typing is independent.
     const indent = this.inputState.cursorCol === 0
       ? "" : " ".repeat(this.inputState.calculateNewLineIndent(this.tabSize));
-    if (!fullText.trim()) {
+    // An empty Enter can still belong to an earlier incomplete reservation.
+    // Keep it in order until parsing decides whether it is a continuation.
+    if (!fullText.trim() && this.submissionQueue.length === 0) {
       this.inputState.reset();
       if (this.promptVisible) {
         this.clearInputRender();
