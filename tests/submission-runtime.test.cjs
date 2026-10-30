@@ -6,7 +6,7 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
-const { createTerminal, runtime, parser } = require("./helpers/submission-terminal.cjs");
+const { createTerminal, runtime } = require("./helpers/submission-terminal.cjs");
 const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
 
 test("frontend continuations execute in order with real R parsing and evaluation", { timeout: 60000 }, async t => {
@@ -64,9 +64,7 @@ test("frontend continuations execute in order with real R parsing and evaluation
   });
   terminal.runtimeBackend = backend;
   terminal.rProcess = session;
-  parser.setNativeParseCallback(code => runtime.requestRuntimeParseStatus(terminal.runtimeHostAdapter, code));
   t.after(async () => {
-    parser.setNativeParseCallback(null);
     terminal.cancelPendingSubmissions();
     const pid = backend.getPid(session);
     backend.close(session);
@@ -288,4 +286,122 @@ test("frontend continuations execute in order with real R parsing and evaluation
   await waitFor(() => idle() && output.includes("RECOVERY_LITERAL_OK"), "recovered literal value");
   if (failure) throw failure;
   assert.doesNotMatch(output, /Error/);
+});
+
+test("two real R consoles parse and execute independently across busy, reply, detach and exit", { timeout: 60000 }, async t => {
+  const root = path.resolve(__dirname, "..");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-sessions-"));
+  const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"], { encoding: "utf8" }).trim();
+  const rPath = path.join(rHome, "bin", process.platform === "win32" ? "R.exe" : "R");
+  const settings = {
+    executablePath: rPath, sessionWatcher: false,
+    consoleArgs: ["--quiet", "--no-save", "--no-restore", "--no-site-file", "--no-environ"],
+  };
+  const { resolveRTerminalOptions } = loadSource("src/Terminal/options.ts", {
+    vscode: {
+      extensions: { getExtension: () => undefined },
+      workspace: {
+        getConfiguration: () => ({ get: key => settings[key] }),
+        workspaceFolders: [{ uri: { fsPath: cwd } }],
+      },
+      window: { showErrorMessage: message => { throw new Error(message); } },
+    },
+  });
+  const options = resolveRTerminalOptions();
+  assert.ok(options);
+  // Sharing a backend instance also exercises its per-session request maps.
+  const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(root));
+  const fixtures = [], checked = [], failures = [];
+  const request = backend.requestParseStatus.bind(backend);
+  backend.requestParseStatus = (session, code) => {
+    const result = request(session, code);
+    assert.ok(result);
+    return result.then(status => { checked.push({ session, code, status }); return status; }, error => {
+      failures.push(error);
+      throw error;
+    });
+  };
+  t.after(async () => {
+    const pids = fixtures.map(f => backend.getPid(f.session));
+    for (const f of fixtures) {
+      f.terminal.cancelPendingSubmissions();
+      backend.close(f.session);
+      backend.detach(f.session);
+    }
+    await delay(100);
+    for (const pid of pids) if (pid) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    fs.rmSync(cwd, { recursive: true, force: true });
+    for (const f of fixtures) {
+      fs.rmSync(path.join(os.tmpdir(), `r-console-session-${f.session.sessionId}.json`), { force: true });
+    }
+  });
+  const waitFor = async (predicate, label) => {
+    const deadline = Date.now() + 10000;
+    while (!predicate()) {
+      assert.equal(failures.length, 0, failures.map(e => e.message).join("\n"));
+      assert.ok(Date.now() < deadline, `${label}: ${fixtures.map(f => `${f.name}: ${f.terminal.mode}\n${f.output.join("")}`).join("\n")}`);
+      await delay(10, undefined, { signal: t.signal });
+    }
+  };
+  const idle = f => f.terminal.mode === "ready" && f.terminal.promptReady && !f.terminal.activeSubmission && !f.terminal.submissionQueue.length;
+  for (const name of ["A", "B"]) {
+    const fixture = createTerminal();
+    const { terminal } = fixture;
+    const session = backend.start([rPath, ...options.rArgs], {
+      cwd, env: { ...options.env, R_PROFILE_USER: path.join(root, "resources/r/console-profile.R") },
+    });
+    Object.assign(terminal, { runtimeBackend: backend, rProcess: session,
+      mode: "starting", promptReady: false, sessionHostConnected: false });
+    const f = { ...fixture, session, name };
+    fixtures.push(f);
+    runtime.attachRuntimeSession(terminal.runtimeHostAdapter, true);
+    await waitFor(() => idle(f) && backend.hasCapability(session, "parse-status"), `${name} startup`);
+  }
+  const [a, b] = fixtures;
+  let value = 8100;
+  async function execute(f, input) {
+    const number = ++value;
+    const terminal = f.terminal;
+    if (input === "Enter") {
+      terminal.inputState.insertText(String(number));
+      void terminal.handleEnterKey();
+    } else {
+      terminal.handleInput(input === "editor" ? `${number}\n` : `\x1b[200~${number}\n\x1b[201~`);
+    }
+    await waitFor(() => idle(f) && f.output.join("").includes(`[1] ${number}`), `${f.name} ${input}`);
+    assert.ok(checked.some(c => c.code === String(number) && c.session === f.session && c.status === 1));
+    assert.ok(checked.filter(c => c.code === String(number)).every(c => c.session === f.session));
+  }
+  // Exercise both ownership directions; B is the last console to connect.
+  for (const [working, busy] of [[a, b], [b, a]]) {
+    busy.terminal.handleInput("Sys.sleep(30)\n");
+    await waitFor(() => busy.terminal.mode === "executing" && !busy.terminal.awaitingExecutionStart, "other R executing");
+    for (const input of ["Enter", "editor", "paste"]) await execute(working, input);
+    assert.equal(busy.terminal.mode, "executing", "submissions must finish before the other console is released");
+    busy.terminal.interruptR();
+    await waitFor(() => idle(busy), "other R interrupted");
+  }
+  b.terminal.handleInput('readline("OTHER_REPLY>")\n');
+  await waitFor(() => b.terminal.mode === "reply", "other R nested reply");
+  await execute(a, "editor");
+  assert.equal(b.terminal.mode, "reply");
+  b.terminal.handleInput("answer\n");
+  await waitFor(() => idle(b), "other R reply completed");
+
+  backend.detach(b.session);
+  b.terminal.cancelPendingSubmissions();
+  await execute(a, "paste");
+  runtime.attachRuntimeSession(b.terminal.runtimeHostAdapter);
+  await waitFor(() => backend.hasCapability(b.session, "parse-status"), "other R reattached");
+  await execute(b, "Enter");
+  b.terminal.handleInput('q("no")\n');
+  await waitFor(() => b.terminal.mode === "closed", "other R exited");
+  a.terminal.inputState.insertText("if");
+  await a.terminal.handleEnterKey();
+  assert.ok(checked.some(c => c.session === a.session && c.code === "if" && c.status === 2));
+  assert.equal(a.terminal.inputState.text, "if\n");
+  a.terminal.inputState.insertText("(TRUE) 9191");
+  await a.terminal.handleEnterKey();
+  await waitFor(() => idle(a) && a.output.join("").includes("[1] 9191"), "continuation after other console exited");
+  assert.deepEqual(failures, [], "native parsing must succeed without timeout fallback");
 });

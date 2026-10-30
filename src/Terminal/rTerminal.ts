@@ -3,7 +3,6 @@ import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from
 import { spawnSync } from "child_process";
 import { CompletionPickItem } from "../Language/completion";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
-import { setNativeParseCallback } from "../Language/parser";
 import {
   ANSI,
   stripBracketedPasteMarkers,
@@ -2887,7 +2886,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearPendingConsoleInput();
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
-    setNativeParseCallback(null);
     this.extensionResourcesDisposePromise = this.lang.dispose();
     return this.extensionResourcesDisposePromise;
   }

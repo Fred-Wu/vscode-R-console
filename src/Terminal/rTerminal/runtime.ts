@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { setNativeParseCallback, stripCommentLines } from "../../Language/parser";
+import { stripCommentLines } from "../../Language/parser";
 import {
   type BackendControlEvent,
   type BackendDialogRequest,
@@ -91,8 +91,10 @@ export function wakeRuntimeParser(host: RuntimeHost): void {
 export async function requestRuntimeParseStatus(host: RuntimeHost, code: string): Promise<number> {
   const generation = host.submissionGeneration;
   const process = host.rProcess;
+  const backend = host.runtimeBackend;
   for (;;) {
-    if (generation !== host.submissionGeneration || process !== host.rProcess || host.mode === "closed") {
+    if (generation !== host.submissionGeneration || process !== host.rProcess ||
+      backend !== host.runtimeBackend || host.mode === "closed") {
       throw new Error("R parse check cancelled");
     }
     if (runtimeIsReady(host)) break;
@@ -105,7 +107,9 @@ export async function requestRuntimeParseStatus(host: RuntimeHost, code: string)
     }
     await waiting.promise;
   }
-  return await (host.runtimeBackend?.requestParseStatus(process, code) ?? 1);
+  const result = backend?.requestParseStatus(process, code);
+  if (!result) throw new Error("R native parser unavailable");
+  return await result;
 }
 
 export type RuntimeHost = {
@@ -309,7 +313,6 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
     });
     integration.afterRuntimeStarted();
     primeRuntimeAttach(host);
-    setNativeParseCallback(null);
     attachRuntimeSession(host, true);
 
     updateRuntimeTerminalName(host);
@@ -334,32 +337,35 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
     return;
   }
   vscodeRIntegration(host).attachRuntime();
-  setNativeParseCallback(null);
-  host.runtimeBackend.attach(host.rProcess, {
+  const backend = host.runtimeBackend;
+  const session = host.rProcess;
+  const isCurrent = (): boolean => host.runtimeBackend === backend && host.rProcess === session && host.mode !== "closed";
+  backend.attach(session, {
     onStdout: (output) => {
+      if (!isCurrent()) return;
       handleRuntimeOutput(host, output);
     },
     onStderr: (errorText) => {
+      if (!isCurrent()) return;
       handleRuntimeError(host, errorText);
     },
     onControl: (event) => {
+      if (!isCurrent()) return;
       handleRuntimeControl(host, event);
     },
     onExit: (code) => {
+      if (!isCurrent()) return;
       handleRuntimeExit(host, code);
     },
     onError: (err) => {
-      setNativeParseCallback(null);
+      if (!isCurrent()) return;
       if (showStartupErrors) {
         host.writeEmitter.fire(
           `${ANSI.red}Failed to start R: ${err.message}${ANSI.reset}\r\n`
         );
       }
-      const failedRuntime = host.rProcess;
-      if (failedRuntime && host.runtimeBackend) {
-        host.runtimeBackend.detach(failedRuntime);
-        host.runtimeBackend.close(failedRuntime);
-      }
+      backend.detach(session);
+      backend.close(session);
       handleRuntimeExit(host, 1);
     },
   });
@@ -389,7 +395,6 @@ export function handleRuntimeControl(
     case "host-connected":
       host.sessionHostConnected = true;
       vscodeRIntegration(host).handleHostConnected();
-      updateNativeParseCallback(host);
       return;
     case "prompt":
       handleBackendPrompt(host, event.kind);
@@ -467,7 +472,6 @@ function applyRuntimeSessionState(
   }
 
   host.sessionHostConnected = true;
-  updateNativeParseCallback(host);
 
   if (event.busy || event.wait.kind === "none") {
     host.clearPromptRenderTimer();
@@ -1270,6 +1274,10 @@ export async function enqueueRuntimeSubmission(
       slot.parsing.previous = undefined;
     }
     if (generation !== host.submissionGeneration || !host.submissionQueue.includes(slot)) return blocks;
+    // Parser ownership follows the submission, never the last console to connect.
+    const nativeParse = host.sessionHostConnected && host.runtimeBackend?.hasCapability(host.rProcess, "parse-status")
+      ? (source: string) => requestRuntimeParseStatus(host, source)
+      : undefined;
     const hasContinuation = code !== slot.code;
     code = slot.code;
     if (skipSplit && !hasContinuation) {
@@ -1288,7 +1296,7 @@ export async function enqueueRuntimeSubmission(
         pending = pending ? pending + "\n" + line : line;
         const block = normalizeSubmissionBlock(pending);
         if (!block.trim()) continue;
-        const complete = await host.inputState.isExpressionCompleteAsync(block);
+        const complete = await host.inputState.isExpressionCompleteAsync(block, nativeParse);
         if (generation !== host.submissionGeneration || !host.submissionQueue.includes(slot)) return blocks;
         if (complete) {
           // On delivery failure, the placeholder contains only the not-yet-published tail.
@@ -1487,7 +1495,6 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearReplyPromptRenderTimer();
   host.clearPendingConsoleInput();
   flushPendingRuntimeRewrite(host);
-  setNativeParseCallback(null);
 
   host.lang.clearSessionState();
   host.rProcess = null;
@@ -1507,18 +1514,4 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
     `\r\n${ANSI.yellow}R exited with code ${code}${ANSI.reset}\r\n`
   );
   host.closeEmitter.fire(code);
-}
-
-function updateNativeParseCallback(host: RuntimeHost): void {
-  if (
-    !host.runtimeBackend ||
-    !host.rProcess ||
-    !host.sessionHostConnected ||
-    !host.runtimeBackend.hasCapability(host.rProcess, "parse-status")
-  ) {
-    setNativeParseCallback(null);
-    return;
-  }
-
-  setNativeParseCallback((code: string) => requestRuntimeParseStatus(host, code));
 }

@@ -497,6 +497,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       state.socketCarry = Buffer.alloc(0);
 
       socket.on("data", (chunk: Buffer) => {
+        if (state.socket !== socket || state.attachGeneration !== generation) {
+          return;
+        }
         const parsed = parseBackendFrames(chunk, state.socketCarry);
         state.socketCarry = parsed.carry;
 

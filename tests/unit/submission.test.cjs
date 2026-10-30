@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, parser, runtime } = require("../helpers/submission-terminal.cjs");
+const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, runtime } = require("../helpers/submission-terminal.cjs");
 
 // An extra turn also drains Enter handlers invoked by handleInput without an
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
@@ -230,11 +230,11 @@ test("Enter waits for the previous native check and checks only the combined con
   const { terminal, commands } = createTerminal();
   const first = deferred();
   const checked = [];
-  parser.setNativeParseCallback(code => {
+  terminal.runtimeBackend.hasCapability = () => true;
+  terminal.runtimeBackend.requestParseStatus = (_session, code) => {
     checked.push(code);
     return code === "if" ? first.promise : Promise.resolve(1);
-  });
-  t.after(() => parser.setNativeParseCallback(null));
+  };
   terminal.inputState.insertText("if");
   const a = terminal.handleEnterKey();
   terminal.inputState.insertText("(TRUE) 1");
@@ -536,8 +536,7 @@ function nativeChecks(t, terminal) {
     checked.push(code);
     return Promise.resolve(code === "if" ? 2 : 1);
   };
-  parser.setNativeParseCallback(code => runtime.requestRuntimeParseStatus(terminal.runtimeHostAdapter, code));
-  t.after(() => parser.setNativeParseCallback(null));
+  terminal.runtimeBackend.hasCapability = () => true;
   return checked;
 }
 

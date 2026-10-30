@@ -41,6 +41,7 @@ function createTerminal() {
     syntax: { setSource() {}, highlightLines(lines) { return lines; } },
     runtimeBackend: {
       isAlive: () => true,
+      hasCapability: () => false,
       canUseSessionCommands: () => true,
       sendSessionCommand(session, command) { commands.push(command); return true; },
     },

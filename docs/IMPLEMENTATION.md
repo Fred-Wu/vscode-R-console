@@ -832,6 +832,10 @@ This ordering retains the existing TypeScript heuristic and optional native R
 parse-status check. Native checks wait for a confirmed top-level ready state
 before sending; their 150 ms timeout starts only after sending. A lazy per-console
 notification wakes waiting checks on readiness or cancellation, without polling.
+Each submission passes its own console's native parser explicitly; the language
+parser holds no shared session callback. Connecting, interrupting, or closing one
+console cannot change another console's parser or readiness wait. Runtime callbacks
+and socket data from a detached or replaced session cannot update its successor.
 Dispatch also requires readiness, including after attaching to an already busy R
 session. Cancellation invalidates old reservations by generation; fresh
 input does not wait for a cancelled parser. No speculative checks or collection
