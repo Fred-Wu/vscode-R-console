@@ -65,7 +65,7 @@ jobs:
         run: |
           npm run build:sidecar
           npm run stage:sidecar
-      - name: Real R smoke test
+      - name: Real R runtime and frontend submission tests
         run: npm run test:runtime
       - name: Package and verify VSIX
         run: |

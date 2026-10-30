@@ -3,7 +3,6 @@ import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from
 import { spawnSync } from "child_process";
 import { CompletionPickItem } from "../Language/completion";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
-import { setNativeParseCallback } from "../Language/parser";
 import {
   ANSI,
   stripBracketedPasteMarkers,
@@ -44,6 +43,8 @@ import {
   createRuntimeBackend,
   closeRuntimeVscodeRIntegration,
   enqueueRuntimeSubmission,
+  reserveRuntimeSubmission,
+  wakeRuntimeParser,
   finishRuntimeSubmission,
   getCachedRuntimeWorkspaceData,
   getRuntimeTerminalName,
@@ -221,6 +222,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private runtimeHostAdapter!: RuntimeHost;
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
+  private submissionGeneration = 0;
   private suppressNextEnterAfterPasteEnd = false;
 
   private submissionQueue: Submission[] = [];
@@ -531,6 +533,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       set submissionQueue(value) {
         self.submissionQueue = value;
       },
+      get submissionGeneration() {
+        return self.submissionGeneration;
+      },
+      set submissionGeneration(value) {
+        self.submissionGeneration = value;
+      },
+      cancelPendingSubmissions: () => self.cancelPendingSubmissions(),
       get historyBrowsing() {
         return self.historyBrowsing;
       },
@@ -950,70 +959,34 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private queueProgrammaticSubmission(data: string): void {
+    // The reservation is synchronous; a later Enter or paste cannot overtake it.
+    const slot = reserveRuntimeSubmission(this.runtimeHost(), data);
+    const generation = this.submissionGeneration;
     this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
-      async () => this.handleQueuedProgrammaticSubmission(data),
-      async () => this.handleQueuedProgrammaticSubmission(data)
+      () => this.handleProgrammaticSubmission(data, slot, generation),
+      () => this.handleProgrammaticSubmission(data, slot, generation)
     );
   }
 
-  private async handleQueuedProgrammaticSubmission(data: string): Promise<void> {
-    if (this.mode === "closed") {
-      return;
-    }
-
-    if (!this.canRunProgrammaticSubmission()) {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, this.getProgrammaticSubmissionFlushDelay());
-      });
-      await this.handleQueuedProgrammaticSubmission(data);
-      return;
-    }
-
-    await this.handleProgrammaticSubmission(data);
-  }
-
-  private canRunProgrammaticSubmission(): boolean {
-    return (
-      this.mode === "ready" &&
-      this.promptReady &&
-      this.inputState.text.length === 0 &&
-      this.inputState.isAtEnd
-    );
-  }
-
-  private async handleProgrammaticSubmission(data: string): Promise<void> {
+  private async handleProgrammaticSubmission(
+    data: string,
+    slot?: Submission,
+    generation: number = this.submissionGeneration
+  ): Promise<void> {
+    if (generation !== this.submissionGeneration || this.mode === "closed") return;
     const normalized = stripBracketedPasteMarkers(data)
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n");
-    const trimmed = normalized.replace(/\n+$/, "");
-    const submission = trimmed.trimEnd();
-    if (!submission) {
-      return;
-    }
+    // Preserve an incomplete source tail, including its trailing continuation newline.
+    const submission = normalized;
+    // Even an empty reserved batch must release its parsing position.
 
     this.historyBrowsing = false;
     this.savedHistoryInput = undefined;
     this.historyCollapsed = true;
     this.escPendingClear = false;
     this.rHistory.resetIndex();
-
-    const blocks = await this.enqueueRSubmission(submission, false);
-    if (blocks.length > 0) {
-      this.recordSubmissionHistory(blocks);
-      return;
-    }
-
-    const isComplete = await this.inputState.isExpressionCompleteAsync(submission);
-    if (
-      !isComplete &&
-      this.mode === "ready" &&
-      this.promptReady &&
-      this.inputState.text.length === 0 &&
-      this.inputState.isAtEnd
-    ) {
-      this.inputState.insertText(trimmed);
-      this.renderInput();
-    }
+    await this.enqueueRSubmission(submission, false, slot);
   }
 
   private handleNestedReplyPaste(content: string): boolean {
@@ -1060,9 +1033,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       return true;
     }
 
-    void this.enqueueRSubmission(line, true).then((blocks) => {
-      this.recordSubmissionHistory(blocks);
-    });
+    void this.enqueueRSubmission(line, true);
     return true;
   }
 
@@ -1396,6 +1367,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         }
         return;
       case "ctrl_c":
+        this.cancelPendingSubmissions();
         if (this.inputState.text.length > 0) {
           this.clearInputRender();
           this.inputState.reset();
@@ -1560,46 +1532,31 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private async handlePasteEnd(): Promise<void> {
-    if (this.pasteBuffer.length === 0) {
-      return;
-    }
+    if (!this.pasteBuffer) return;
     const content = stripBracketedPasteMarkers(this.pasteBuffer);
     this.pasteBuffer = "";
     const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-
-    const endsWithNewline = normalized.endsWith("\n");
-    const containsNewline = normalized.includes("\n");
-
-    // Single-line paste must update the input buffer synchronously so a trailing
-    // Enter action in the same input chunk executes that line immediately.
-    if (!containsNewline && !endsWithNewline) {
+    if (!normalized.includes("\n")) {
       this.inputState.insertText(normalized);
       this.renderInput();
       return;
     }
-
-    const cursorAtEnd = this.inputState.text.length === 0 || this.inputState.isAtEnd;
     const trimmed = normalized.replace(/\n+$/, "");
-    const fullText = this.inputState.text + trimmed;
-
-    const isComplete = await this.inputState.isExpressionCompleteAsync(fullText);
-
-    if ((endsWithNewline || containsNewline) && cursorAtEnd && isComplete) {
-      const submission = fullText.trimEnd();
-      if (submission) {
-        this.inputState.reset();
-        this.historyBrowsing = false;
-        this.savedHistoryInput = undefined;
-        this.historyCollapsed = true;
-        this.rHistory.resetIndex();
-        const blocks = await this.enqueueRSubmission(submission, !/[\r\n]/.test(submission));
-        this.recordSubmissionHistory(blocks);
-      }
+    if (!this.inputState.isAtEnd) {
+      this.inputState.insertText(trimmed);
+      this.renderInput();
       return;
     }
 
-    this.inputState.insertText(trimmed);
-    this.renderInput();
+    const submitted = this.inputState.text + trimmed;
+    const slot = reserveRuntimeSubmission(this.runtimeHost(), submitted);
+    this.inputState.reset();
+    this.lang.updateInput("");
+    if (this.promptVisible) {
+      this.clearInputRender();
+      this.promptVisible = false;
+    }
+    await this.enqueueRSubmission(submitted, false, slot);
   }
 
   private handleReplyInputAction(action: KeyAction): void {
@@ -1688,24 +1645,13 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const isComplete = await this.inputState.isExpressionCompleteAsync();
-    if (!isComplete) {
-      if (this.inputState.cursorCol === 0) {
-        this.inputState.insertText("\n");
-      } else {
-        const indent = this.inputState.calculateNewLineIndent(this.tabSize);
-        this.inputState.insertText("\n" + " ".repeat(indent));
-      }
-      this.renderInput();
-      return;
-    }
-
-    if (!this.inputState.isAtEnd) {
-      this.inputState.cursorPosition = this.inputState.text.length;
-    }
-
     const fullText = this.inputState.text;
-    if (!fullText.trim()) {
+    // Enter consumes only the current editable snapshot. Subsequent typing is independent.
+    const indent = this.inputState.cursorCol === 0
+      ? "" : " ".repeat(this.inputState.calculateNewLineIndent(this.tabSize));
+    // An empty Enter can still belong to an earlier incomplete reservation.
+    // Keep it in order until parsing decides whether it is a continuation.
+    if (!fullText.trim() && this.submissionQueue.length === 0) {
       this.inputState.reset();
       if (this.promptVisible) {
         this.clearInputRender();
@@ -1726,11 +1672,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       return;
     }
 
-    const sanitized = stripBracketedPasteMarkers(fullText).trimEnd();
+    const submitted = stripBracketedPasteMarkers(fullText).replace(/\r\n?/g, "\n");
+    const cursor = stripBracketedPasteMarkers(fullText.slice(0, this.inputState.cursorPosition))
+      .replace(/\r\n?/g, "\n").length;
+    // Keep literal whitespace and the editing position. Apply Enter's newline
+    // only if the snapshot has an incomplete tail; complete code stays intact.
+    const slot = reserveRuntimeSubmission(this.runtimeHost(), submitted, {
+      cursor, text: "\n" + indent,
+    });
     if (this.promptVisible) {
-      // Clear the live input viewport before any async submission work starts.
-      // Otherwise async completion context updates can race against the reset
-      // input state and leave stale viewport content behind.
       this.clearInputRender();
       this.promptVisible = false;
       this.lastWriteEndedWithNewline = true;
@@ -1742,16 +1692,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.rHistory.resetIndex();
     this.lang.updateInput("");
 
-    if (!sanitized) {
-      this.showPrompt();
-      return;
-    }
-
-    const blocks = await this.enqueueRSubmission(
-      sanitized,
-      !/[\r\n]/.test(sanitized)
-    );
-    this.recordSubmissionHistory(blocks);
+    await this.enqueueRSubmission(submitted, false, slot);
   }
 
   private reverseSearch(): void {
@@ -2201,9 +2142,11 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private async enqueueRSubmission(
     code: string,
-    skipSplit: boolean = false
+    skipSplit: boolean = false,
+    slot?: Submission
   ): Promise<string[]> {
-    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit);
+    return await enqueueRuntimeSubmission(this.runtimeHost(), code, skipSplit, slot,
+      (block) => this.recordSubmissionHistory([block]));
   }
 
   private recordSubmissionHistory(blocks: string[]): void {
@@ -2212,6 +2155,16 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.rHistory.push(block);
       }
     }
+  }
+
+  private cancelPendingSubmissions(): void {
+    this.submissionGeneration++;
+    this.submissionQueue = [];
+    this.programmaticSubmissionQueue = Promise.resolve();
+    this.pendingProgrammaticInput = "";
+    this.clearPendingInputFlushTimer();
+    this.clearPendingConsoleInput();
+    wakeRuntimeParser(this.runtimeHost());
   }
 
   private startNextSubmission(): void {
@@ -2924,6 +2877,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.extensionResourcesDisposePromise) {
       return this.extensionResourcesDisposePromise;
     }
+    this.cancelPendingSubmissions();
     this.rHistory.dispose();
     disposeRuntimeVscodeRIntegrationUi(this.runtimeHost());
     this.syntax.dispose();
@@ -2932,7 +2886,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.clearPendingConsoleInput();
     this.clearPromptRenderTimer();
     this.clearReplyPromptRenderTimer();
-    setNativeParseCallback(null);
     this.extensionResourcesDisposePromise = this.lang.dispose();
     return this.extensionResourcesDisposePromise;
   }
@@ -2982,6 +2935,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     runtimeBackend.detach(runtimeSession);
+    this.cancelPendingSubmissions();
     this.rProcess = null;
     this.backendChildPid = undefined;
     this.sessionHostConnected = false;

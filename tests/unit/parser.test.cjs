@@ -21,13 +21,10 @@ test("comment stripping preserves strings, inline comments, and line endings", (
     'x <- "first\n# inside string\nlast"');
 });
 
-test("native parsing distinguishes incomplete input from errors and falls back on failure", async (t) => {
-  t.after(() => parser.setNativeParseCallback(null));
-  parser.setNativeParseCallback(async () => 2);
-  assert.equal(await parser.isExpressionCompleteAsync("x"), false);
-  parser.setNativeParseCallback(async () => 3);
-  assert.equal(await parser.isExpressionCompleteAsync("x"), true);
-  parser.setNativeParseCallback(async () => { throw new Error("timeout"); });
-  assert.equal(await parser.isExpressionCompleteAsync("x[1]"), true);
-  assert.equal(await parser.isExpressionCompleteAsync("x["), false);
+test("native parsing distinguishes incomplete input from errors and falls back on failure", async () => {
+  assert.equal(await parser.isExpressionCompleteAsync("x", async () => 2), false);
+  assert.equal(await parser.isExpressionCompleteAsync("x", async () => 3), true);
+  const unavailable = async () => { throw new Error("timeout"); };
+  assert.equal(await parser.isExpressionCompleteAsync("x[1]", unavailable), true);
+  assert.equal(await parser.isExpressionCompleteAsync("x[", unavailable), false);
 });
