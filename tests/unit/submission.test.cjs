@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, parser } = require("../helpers/submission-terminal.cjs");
+const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, parser, runtime } = require("../helpers/submission-terminal.cjs");
 
 // An extra turn also drains Enter handlers invoked by handleInput without an
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
@@ -341,7 +341,7 @@ test("delivery failure restores combined continuation and later reservations onc
   terminal.handleInput("3\n");
   await terminal.programmaticSubmissionQueue;
   assert.deepEqual(commands, []);
-  assert.equal(terminal.inputState.text, "x <- (\n2)\n3");
+  assert.equal(terminal.inputState.text, "x <- (\n2)\n3\n");
   assert.deepEqual(terminal.submissionQueue, []);
   assert.equal(terminal.mode, "ready");
 });
@@ -504,7 +504,7 @@ test("failed backend delivery restores unsent blocks and does not strand the con
   assert.equal(terminal.mode, "ready");
   assert.equal(terminal.activeSubmission, null);
   assert.equal(terminal.submissionQueue.length, 0);
-  assert.equal(terminal.inputState.text, "a <- 1\nb <- 2");
+  assert.equal(terminal.inputState.text, "a <- 1\nb <- 2\n");
   assert.match(output.join(""), /submission was not sent/i);
 });
 
@@ -528,4 +528,223 @@ test("rejected interrupt does not discard queued source", async () => {
   terminal.runtimeBackend.sendSessionCommand = () => false;
   terminal.interruptR();
   assert.equal(terminal.submissionQueue.length, 1);
+});
+
+function nativeChecks(t, terminal) {
+  const checked = [];
+  terminal.runtimeBackend.requestParseStatus = (_session, code) => {
+    checked.push(code);
+    return Promise.resolve(code === "if" ? 2 : 1);
+  };
+  parser.setNativeParseCallback(code => runtime.requestRuntimeParseStatus(terminal.runtimeHostAdapter, code));
+  t.after(() => parser.setNativeParseCallback(null));
+  return checked;
+}
+
+for (const input of ["Enter", "editor", "paste"]) {
+  test(`${input} reserves immediately and waits for readiness between native checks`, async t => {
+    const { terminal, commands } = createTerminal();
+    const checked = nativeChecks(t, terminal);
+    let pending;
+    if (input === "Enter") {
+      terminal.inputState.insertText("1\n2\n3");
+      pending = terminal.handleEnterKey();
+    } else if (input === "editor") {
+      terminal.handleInput("1\n2\n3\n");
+      pending = terminal.programmaticSubmissionQueue;
+    } else {
+      terminal.handleInput("\x1b[200~1\n2\n3\n\x1b[201~");
+    }
+    assert.equal(terminal.submissionQueue[0].kind, "parse");
+    await settle();
+    assert.deepEqual(checked, ["1"]);
+    assert.deepEqual(commands.map(c => c.code), ["1"]);
+    runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: false });
+    await settle();
+    assert.deepEqual(checked, ["1"], "busy(false) cannot release the next check");
+    nextPrompt(terminal);
+    await settle();
+    assert.deepEqual(checked, ["1", "2"]);
+    nextPrompt(terminal);
+    await pending;
+    await settle();
+    assert.deepEqual(checked, ["1", "2", "3"]);
+    assert.deepEqual(commands.map(c => c.code), ["1", "2", "3"]);
+  });
+}
+
+for (const withNative of [false, true]) {
+  test(`busy reconnect keeps editor work cancellable (native=${withNative})`, async t => {
+    const { terminal, commands } = createTerminal();
+    const checked = withNative ? nativeChecks(t, terminal) : [];
+    terminal.mode = "executing";
+    terminal.promptReady = false;
+    terminal.handleInput('cat("must not execute")\n');
+    const batch = terminal.programmaticSubmissionQueue;
+    await settle();
+    assert.deepEqual(commands, []);
+    assert.deepEqual(checked, []);
+    runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "busy", value: false });
+    await settle();
+    assert.equal(terminal.mode, "executing");
+    assert.deepEqual(commands, []);
+    terminal.handleInput("\x03");
+    await batch;
+    nextPrompt(terminal);
+    await settle();
+    assert.deepEqual(commands.map(c => c.type), ["interrupt"]);
+    assert.deepEqual(checked, []);
+    terminal.handleInput("42\n");
+    await terminal.programmaticSubmissionQueue;
+    assert.deepEqual(commands.map(c => c.code).filter(Boolean), ["42"]);
+  });
+}
+
+test("waiting native checks retain continuation semantics after readiness", async t => {
+  const { terminal, commands } = createTerminal();
+  const checked = nativeChecks(t, terminal);
+  terminal.mode = "executing";
+  terminal.promptReady = false;
+  terminal.handleInput("if\n");
+  terminal.handleInput("(TRUE) 1\n");
+  await settle();
+  assert.deepEqual(checked, []);
+  nextPrompt(terminal);
+  await terminal.programmaticSubmissionQueue;
+  assert.equal(checked.at(-1), "if\n(TRUE) 1");
+  assert.ok(checked.slice(0, -1).every(code => code === "if"));
+  assert.deepEqual(commands.map(c => c.code), ["if\n(TRUE) 1"]);
+});
+
+test("cancelling a readiness wait releases its batch without an R event", async t => {
+  const { terminal } = createTerminal();
+  const checked = nativeChecks(t, terminal);
+  terminal.mode = "executing";
+  terminal.promptReady = false;
+  terminal.handleInput("42\n");
+  const oldBatch = terminal.programmaticSubmissionQueue;
+  await settle();
+  terminal.cancelPendingSubmissions();
+  await oldBatch;
+  assert.deepEqual(checked, []);
+  assert.deepEqual(terminal.submissionQueue, []);
+});
+
+for (const input of ["Enter", "editor", "paste"]) {
+  for (const raw of [false, true]) {
+    test(`${input} delivery recovery preserves a split ${raw ? "raw" : "quoted"} literal`, async () => {
+      const { terminal, commands } = createTerminal();
+      terminal.runtimeBackend.sendSessionCommand = () => false;
+      const opening = raw ? 'x <- r"(hello' : 'x <- "hello';
+      const closing = raw ? 'world)"' : 'world"';
+      let first, second;
+      if (input === "Enter") {
+        terminal.inputState.insertText("1\n" + opening);
+        first = terminal.handleEnterKey();
+        terminal.inputState.insertText(closing);
+        second = terminal.handleEnterKey();
+      } else if (input === "editor") {
+        terminal.handleInput("1\n" + opening + "\n");
+        terminal.handleInput(closing + "\n");
+        second = terminal.programmaticSubmissionQueue;
+      } else {
+        terminal.handleInput("\x1b[200~1\n" + opening + "\n\x1b[201~");
+        terminal.handleInput("\x1b[200~" + closing + "\n\x1b[201~");
+      }
+      await Promise.all([first, second]);
+      await settle();
+      const expected = "1\n" + opening + "\n" + closing;
+      assert.equal(terminal.inputState.text, expected + (input === "editor" ? "\n" : ""));
+      assert.deepEqual(commands, []);
+      terminal.runtimeBackend.sendSessionCommand = (_session, command) => { commands.push(command); return true; };
+      await terminal.handleEnterKey();
+      nextPrompt(terminal);
+      assert.deepEqual(commands.map(c => c.code), ["1", opening + "\n" + closing]);
+    });
+  }
+}
+
+test("failed delivery retains trailing literal blank lines and continuation indentation", async () => {
+  const { terminal } = createTerminal();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  terminal.handleInput('1\nx <- "hello\n\n  ');
+  terminal.handleInput('world\n\n');
+  await terminal.programmaticSubmissionQueue;
+  assert.equal(terminal.inputState.text, '1\nx <- "hello\n\n  world\n\n');
+});
+
+test("failed delivery retains an empty Enter queued inside a literal", async () => {
+  const { terminal } = createTerminal();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  terminal.inputState.insertText('1\nx <- "hello');
+  const first = terminal.handleEnterKey();
+  const blank = terminal.handleEnterKey();
+  terminal.inputState.insertText('world"');
+  await Promise.all([first, blank, terminal.handleEnterKey()]);
+  assert.equal(terminal.inputState.text, '1\nx <- "hello\n\nworld"');
+});
+
+test("a top-level session snapshot releases a native check without a separate prompt event", async t => {
+  const { terminal, commands } = createTerminal();
+  const checked = nativeChecks(t, terminal);
+  terminal.runtimeBackend.hasCapability = () => true;
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "session-state", busy: true, wait: { kind: "none" } });
+  terminal.handleInput("42\n");
+  await settle();
+  assert.deepEqual(checked, []);
+  runtime.handleRuntimeControl(terminal.runtimeHostAdapter, { type: "session-state", busy: false, wait: { kind: "top-level", prompt: "main" } });
+  await terminal.programmaticSubmissionQueue;
+  assert.deepEqual(checked, ["42"]);
+  assert.deepEqual(commands.map(c => c.code), ["42"]);
+});
+
+test("R exit cancels a waiting native check without sending it", async t => {
+  const { terminal, commands } = createTerminal();
+  const checked = nativeChecks(t, terminal);
+  terminal.mode = "executing";
+  terminal.promptReady = false;
+  terminal.handleInput("42\n");
+  const batch = terminal.programmaticSubmissionQueue;
+  await settle();
+  runtime.handleRuntimeExit(terminal.runtimeHostAdapter, 0);
+  await batch;
+  assert.deepEqual(checked, []);
+  assert.deepEqual(commands, []);
+  assert.equal(terminal.mode, "closed");
+});
+
+test("a rejected complete Enter restores its original source without a continuation newline", async () => {
+  const { terminal } = createTerminal();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  terminal.inputState.insertText('paste("ab")');
+  terminal.inputState.cursorPosition = 8;
+  await terminal.handleEnterKey();
+  assert.equal(terminal.inputState.text, 'paste("ab")');
+});
+
+test("a later delivery failure preserves the cursor inside a queued continuation", async () => {
+  const { terminal } = createTerminal();
+  terminal.inputState.insertText("1\n2\nc(1,2");
+  terminal.inputState.cursorPosition = 8;
+  await terminal.handleEnterKey();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  nextPrompt(terminal);
+  assert.equal(terminal.inputState.text, "2\nc(1,\n2");
+  assert.equal(terminal.inputState.cursorPosition, 7);
+});
+
+test("recovery keeps a saved cursor relative to the unparsed remainder", async t => {
+  const { terminal } = createTerminal();
+  nativeChecks(t, terminal);
+  terminal.inputState.insertText("1\nc(1,2");
+  terminal.inputState.cursorPosition = 6;
+  await terminal.handleEnterKey();
+  terminal.handleInput("3)\n4 +\n");
+  const pending = terminal.programmaticSubmissionQueue;
+  await settle();
+  terminal.runtimeBackend.sendSessionCommand = () => false;
+  nextPrompt(terminal);
+  await pending;
+  assert.equal(terminal.inputState.text, "c(1,\n3)\n4 +\n2");
+  assert.equal(terminal.inputState.cursorPosition, terminal.inputState.text.length - 1);
 });

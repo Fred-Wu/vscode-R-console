@@ -75,28 +75,17 @@ test("console input and submission continue while history reads, compacts, and w
     "\n# time: original\n+command-" + i + "\n").join(""));
   const history = f.create();
   history.load();
-  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
-    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
-    "./rTerminal/lang": {},
-  });
-  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const { createTerminal, nextPrompt } = require("../helpers/submission-terminal.cjs");
+  const { terminal } = createTerminal();
+  terminal.rHistory = history;
   const sent = [];
-  const terminal = Object.assign(Object.create(RTerminal.prototype), {
-    mode: "ready", promptReady: true, promptVisible: false, rHistory: history,
-    inputState: new InputState(), lang: { updateInput() {} },
-    ensureReadyPromptVisibleForInput() {}, renderInput() {},
-  });
-  const host = {
-    mode: "ready", promptReady: false, activeSubmission: null, submissionQueue: [],
-    inputState: terminal.inputState, promptKind: "main", clearPromptRenderTimer() {},
-    lang: { refreshCompletionContextDocument() {} },
-    runtimeBackend: { sendSessionCommand(_session, command) { sent.push(command.code); return true; } },
+  terminal.runtimeBackend.sendSessionCommand = (_session, command) => {
+    sent.push(command.code);
+    return true;
   };
-  terminal.runtimeHost = () => host;
   for (const operation of ["readSync", "renameSync", "appendFileSync"]) {
     await waitFor(() => f.messages.some((message) => message.blocked === operation));
-    host.mode = "ready";
-    host.activeSubmission = null;
+    if (terminal.activeSubmission) nextPrompt(terminal);
     const code = `print("${operation}")`;
     terminal.applyKeyAction({ type: "text", text: code });
     assert.equal(terminal.inputState.text, code);

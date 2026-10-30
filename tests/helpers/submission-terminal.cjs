@@ -1,13 +1,14 @@
 const loadSource = require("./load-source.cjs");
+const parser = loadSource("src/Language/parser.ts");
+const runtime = loadSource("src/Terminal/rTerminal/runtime.ts", { vscode: {}, "../../Language/parser": parser });
 const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
   "./rTerminal/lang": {},
+  "./rTerminal/runtime": runtime,
   vscode: {
     EventEmitter: class {}, window: {},
     workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   },
 });
-const runtime = loadSource("src/Terminal/rTerminal/runtime.ts", { vscode: {} });
-const parser = loadSource("src/Language/parser.ts");
 const { InputState } = loadSource("src/Terminal/inputState.ts", { "../Language/parser": parser });
 const { Renderer } = loadSource("src/Terminal/renderer.ts");
 const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
@@ -23,6 +24,7 @@ function createTerminal() {
   const history = [];
   const output = [];
   const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    options: { vscodeR: { kind: "disabled" } },
     mode: "ready", promptReady: true, promptKind: "main", promptVisible: false,
     autoMatch: false, tabSize: 2,
     submissionGeneration: 0, submissionQueue: [], activeSubmission: null,
@@ -30,9 +32,10 @@ function createTerminal() {
     pendingConsoleInputLines: [], pasteBuffer: "", inBracketPaste: false,
     submissionPending: false, awaitingExecutionStart: false,
     rProcess: {}, sessionHostConnected: true,
+    nameEmitter: { fire() {} }, closeEmitter: { fire() {} }, notifyDisplayPidChanged() {},
     inputState: new InputState(), keyProcessor: new KeyProcessor(),
     dimensions: { columns: 80, rows: 24 }, lastWriteEndedWithNewline: true,
-    lang: { refreshCompletionContextDocument: async () => {}, updateInput() {} },
+    lang: { refreshCompletionContextDocument: async () => {}, updateInput() {}, clearSessionState() {} },
     rHistory: { resetIndex() {}, push(code) { history.push(code); } },
     renderer: new Renderer(() => {}),
     syntax: { setSource() {}, highlightLines(lines) { return lines; } },
@@ -43,6 +46,7 @@ function createTerminal() {
     },
     writeEmitter: { fire(text) { output.push(text); } },
     ensureReadyPromptVisibleForInput() {},
+    captureVisibleInputForReplay() {},
     renderInput() { this.promptVisible = true; },
     clearInputRender() { this.promptVisible = false; },
     clearPromptRenderTimer() {}, clearReplyPromptRenderTimer() {},

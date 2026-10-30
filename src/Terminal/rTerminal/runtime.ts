@@ -65,6 +65,7 @@ export type Submission = {
   editCursor?: number;
   parsing?: {
     generation: number;
+    sourceOffset?: number;
     previous?: Promise<void>;
     done?: Promise<void>;
     finish?(): void;
@@ -73,6 +74,39 @@ export type Submission = {
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
 const latestParsing = new WeakMap<RuntimeHost, NonNullable<Submission["parsing"]>>();
+const pendingParseReadiness = new WeakMap<RuntimeHost, { promise: Promise<void>; resolve(): void }>();
+
+function runtimeIsReady(host: RuntimeHost): boolean {
+  return host.mode === "ready" && host.promptReady && host.activeSubmission === null;
+}
+
+// One lazy waiter per console, shared by readiness and cancellation. No polling
+// and no native request (or native timeout) until R can service the check.
+export function wakeRuntimeParser(host: RuntimeHost): void {
+  const waiting = pendingParseReadiness.get(host);
+  pendingParseReadiness.delete(host);
+  waiting?.resolve();
+}
+
+export async function requestRuntimeParseStatus(host: RuntimeHost, code: string): Promise<number> {
+  const generation = host.submissionGeneration;
+  const process = host.rProcess;
+  for (;;) {
+    if (generation !== host.submissionGeneration || process !== host.rProcess || host.mode === "closed") {
+      throw new Error("R parse check cancelled");
+    }
+    if (runtimeIsReady(host)) break;
+    let waiting = pendingParseReadiness.get(host);
+    if (!waiting) {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      waiting = { promise, resolve };
+      pendingParseReadiness.set(host, waiting);
+    }
+    await waiting.promise;
+  }
+  return await (host.runtimeBackend?.requestParseStatus(process, code) ?? 1);
+}
 
 export type RuntimeHost = {
   options: RTerminalOptions;
@@ -236,7 +270,7 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
   host.lastWriteEndedWithNewline = true;
   host.hasReceivedOutput = false;
   host.inputState.reset();
-  host.submissionQueue = [];
+  host.cancelPendingSubmissions();
   host.activeSubmission = null;
   host.backendChildPid = undefined;
   host.sessionHostConnected = false;
@@ -365,6 +399,7 @@ export function handleRuntimeControl(
       return;
     case "busy":
       if (event.value) {
+        host.promptReady = false;
         if (host.awaitingExecutionStart && host.activeSubmission) {
           host.awaitingExecutionStart = false;
         }
@@ -463,6 +498,8 @@ function applyRuntimeSessionState(
       if (event.wait.prompt === "main") {
         vscodeRIntegration(host).handleMainPrompt();
       }
+      wakeRuntimeParser(host);
+      host.startNextSubmission();
       return;
     case "nested":
       host.promptReady = false;
@@ -485,6 +522,9 @@ function restoreReadyStateAfterExecution(host: RuntimeHost): void {
     host.awaitingExecutionStart = false;
     return;
   }
+
+  // busy(false) is not an input-ready event, including on a busy reconnect.
+  if (!host.promptReady) return;
 
   host.mode = "ready";
 
@@ -529,6 +569,8 @@ export function handleBackendPrompt(
   } else {
     host.mode = "ready";
   }
+
+  wakeRuntimeParser(host);
 
   if (host.submissionPending) {
     host.pendingPromptToken = false;
@@ -1074,15 +1116,15 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
     code: task.code,
   }) ?? false;
   if (!sent) {
-    const unsent = [task, ...host.submissionQueue].map((item) => item.code).filter(Boolean).join("\n").replace(/\n+$/, "");
+    const restored = restoreSubmissionSource([task, ...host.submissionQueue], host.inputState.text,
+      host.inputState.cursorPosition);
     host.cancelPendingSubmissions();
     host.activeSubmission = null;
     host.submissionPending = false;
     host.awaitingExecutionStart = false;
     host.mode = "ready";
-    const draft = host.inputState.text;
-    host.inputState.text = unsent + (draft ? "\n" + draft : "");
-    host.inputState.cursorToEnd();
+    host.inputState.text = restored.code;
+    host.inputState.cursorPosition = restored.cursor;
     if (host.promptVisible) {
       host.clearInputRender();
       host.promptVisible = false;
@@ -1097,6 +1139,7 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
   host.awaitingExecutionStart = true;
   host.mode = "executing";
   writeRuntimeSubmissionEcho(host, task);
+  host.promptReady = false;
   host.clearPromptRenderTimer();
 }
 
@@ -1108,8 +1151,7 @@ export function finishRuntimeSubmission(host: RuntimeHost): void {
 }
 
 export function startNextRuntimeSubmission(host: RuntimeHost): void {
-  if (host.mode !== "ready" && !(host.mode === "executing" && host.activeSubmission === null)) return;
-  if (host.activeSubmission) return;
+  if (!runtimeIsReady(host)) return;
   const next = host.submissionQueue[0];
   if (!next || next.kind === "parse") return;
   host.submissionQueue.shift();
@@ -1174,9 +1216,29 @@ function continueSubmission(
     : code.slice(0, cursor);
   const suffix = cursor === undefined ? "" : code.slice(cursor);
   if (cursor !== undefined) slot.editCursor = prefix.length + slot.code.length;
+  else if (slot.editCursor !== undefined) slot.editCursor += prefix.length;
   slot.code = prefix + slot.code + suffix;
   if (slot.continuationEdit) slot.continuationEdit.cursor += prefix.length;
   slot.initialPromptKind = promptKind;
+}
+
+function restoreSubmissionSource(submissions: Submission[], draft: string, draftCursor: number): { code: string; cursor: number } {
+  let restored: Submission | undefined;
+  for (const submission of submissions) {
+    const code = submission.code || submission.continuationEdit?.text || "";
+    if (!code) continue;
+    const editCursor = submission.editCursor === undefined ? undefined
+      : Math.max(0, Math.min(code.length, submission.editCursor - (submission.parsing?.sourceOffset ?? 0)));
+    const next = { ...submission, code: code.replace(/\r\n?/g, "\n"), editCursor, continuationEdit: undefined };
+    if (restored) continueSubmission(next, restored.code, restored.initialPromptKind, restored.editCursor);
+    restored = next;
+  }
+  if (!restored) return { code: draft, cursor: draftCursor };
+  const cursor = restored.editCursor ?? restored.code.length;
+  const prefix = restored.code.slice(0, cursor);
+  const suffix = restored.code.slice(cursor);
+  const separator = draft && restored.editCursor === undefined && !/\n[ \t]*$/.test(prefix) ? "\n" : "";
+  return { code: prefix + separator + draft + suffix, cursor: cursor + separator.length + draftCursor };
 }
 
 export async function enqueueRuntimeSubmission(
@@ -1231,6 +1293,8 @@ export async function enqueueRuntimeSubmission(
         if (complete) {
           // On delivery failure, the placeholder contains only the not-yet-published tail.
           slot.code = normalized.slice(offset);
+          if (slot.parsing) slot.parsing.sourceOffset = offset;
+          if (!slot.code) slot.continuationEdit = undefined;
           publish(block, "execute");
           pending = "";
         }
@@ -1456,11 +1520,5 @@ function updateNativeParseCallback(host: RuntimeHost): void {
     return;
   }
 
-  setNativeParseCallback(async (code: string) => {
-    const request = host.runtimeBackend?.requestParseStatus(host.rProcess, code);
-    if (!request) {
-      return 1;
-    }
-    return await request;
-  });
+  setNativeParseCallback((code: string) => requestRuntimeParseStatus(host, code));
 }

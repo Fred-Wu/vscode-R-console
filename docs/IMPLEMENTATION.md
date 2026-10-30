@@ -829,10 +829,15 @@ in history as it is accepted, so interrupting later parsing preserves earlier
 entries.
 
 This ordering retains the existing TypeScript heuristic and optional native R
-parse-status check. Native checks time out after 150 ms and reject so the local
-fallback can run. Cancellation invalidates old reservations by generation; fresh
+parse-status check. Native checks wait for a confirmed top-level ready state
+before sending; their 150 ms timeout starts only after sending. A lazy per-console
+notification wakes waiting checks on readiness or cancellation, without polling.
+Dispatch also requires readiness, including after attaching to an already busy R
+session. Cancellation invalidates old reservations by generation; fresh
 input does not wait for a cancelled parser. No speculative checks or collection
-of previously checked prefixes is retained.
+of previously checked prefixes is retained. Failed delivery restores pending
+source using the same continuation boundaries, preserving existing newlines and
+saved editing positions instead of adding separators unconditionally.
 
 ### 4.5 Attaching A Detached Console
 

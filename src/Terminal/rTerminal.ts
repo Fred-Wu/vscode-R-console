@@ -45,6 +45,7 @@ import {
   closeRuntimeVscodeRIntegration,
   enqueueRuntimeSubmission,
   reserveRuntimeSubmission,
+  wakeRuntimeParser,
   finishRuntimeSubmission,
   getCachedRuntimeWorkspaceData,
   getRuntimeTerminalName,
@@ -2164,6 +2165,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.pendingProgrammaticInput = "";
     this.clearPendingInputFlushTimer();
     this.clearPendingConsoleInput();
+    wakeRuntimeParser(this.runtimeHost());
   }
 
   private startNextSubmission(): void {
@@ -2876,6 +2878,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (this.extensionResourcesDisposePromise) {
       return this.extensionResourcesDisposePromise;
     }
+    this.cancelPendingSubmissions();
     this.rHistory.dispose();
     disposeRuntimeVscodeRIntegrationUi(this.runtimeHost());
     this.syntax.dispose();
@@ -2934,6 +2937,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     runtimeBackend.detach(runtimeSession);
+    this.cancelPendingSubmissions();
     this.rProcess = null;
     this.backendChildPid = undefined;
     this.sessionHostConnected = false;
