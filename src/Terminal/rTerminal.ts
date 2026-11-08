@@ -2119,6 +2119,9 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.inputState.cursorRow,
       newCursorCol
     );
+    if (cursorInsideEmptyCall) {
+      this.scheduleInlineCompletion();
+    }
     this.renderInput();
   }
 

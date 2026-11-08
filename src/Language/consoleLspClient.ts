@@ -58,6 +58,7 @@ type ConsoleLspSessionState = {
 type SessionStateSyncResult = {
   synced: boolean;
   stateKey: string;
+  restartRequired?: boolean;
 };
 
 class SilentOutputChannel implements vscode.OutputChannel {
@@ -102,10 +103,9 @@ export class ConsoleLspClient implements CompletionProvider {
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
   private packageCheckPromise: Promise<boolean> | undefined;
-  private packageRefreshPromise: Promise<void> | undefined;
   private lastPackageCheckAt = 0;
-  private runningLibraryPathsKey: string | undefined;
-  private libraryPathRefreshPromise: Promise<void> | undefined;
+  private configuredLibraryPaths: string[] = [];
+  private restartPromise: Promise<void> | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -115,8 +115,8 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   async start(): Promise<void> {
-    if (this.libraryPathRefreshPromise) {
-      await this.libraryPathRefreshPromise;
+    if (this.restartPromise) {
+      await this.restartPromise;
       return;
     }
     await this.startClient();
@@ -275,9 +275,13 @@ export class ConsoleLspClient implements CompletionProvider {
         if (this.client !== client) {
           continue;
         }
-        if (await this.packageChangesDetected(client, projection.document.getText())) {
+        const packagesChanged = await this.packageChangesDetected(client, projection.document.getText());
+        if (this.client !== client || !client.isRunning()) {
+          continue;
+        }
+        if (packagesChanged) {
           if (attempt === 0) {
-            await this.restartForPackageChanges(client);
+            await this.restartClient(client);
             continue;
           }
           return undefined;
@@ -295,6 +299,9 @@ export class ConsoleLspClient implements CompletionProvider {
           projection.document, projection.toServerPosition(position), context
         );
         const result = await client.sendRequest(CompletionRequest.type, params);
+        if (this.client !== client) {
+          continue;
+        }
         const completions = await client.protocol2CodeConverter.asCompletionResult(result);
         const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
           projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
@@ -308,6 +315,11 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         return completions;
       } catch {
+        // A session update can replace the server at any await above. Reopen
+        // the document and retry on that server, but do not retry input errors.
+        if (this.client !== client || !client.isRunning()) {
+          continue;
+        }
         return undefined;
       }
     }
@@ -357,53 +369,43 @@ export class ConsoleLspClient implements CompletionProvider {
     }
     const state = this.sessionState;
     const stateKey = this.getSessionStateKey(state);
-    if (state.libraryPaths &&
-        this.runningLibraryPathsKey !== JSON.stringify(state.libraryPaths)) {
-      await this.restartForLibraryPaths();
-      if (this.client?.isRunning()) await this.applySessionState(this.client);
-      return;
-    }
     if (this.syncedSessionStateKey === stateKey) {
       return;
     }
 
-    if (this.sessionStateSyncPromise) {
-      const result = await this.sessionStateSyncPromise;
-      if (!this.sessionState || this.client !== client) {
-        return;
-      }
-      const currentStateKey = this.getSessionStateKey(this.sessionState);
-      if (
-        this.syncedSessionStateKey !== currentStateKey &&
-        (result.synced || result.stateKey !== currentStateKey)
-      ) {
-        await this.applySessionState(client);
-      }
-      return;
+    let syncPromise = this.sessionStateSyncPromise;
+    if (!syncPromise) {
+      const params = state.libraryPaths && this.configuredLibraryPaths.length
+        ? { ...state, libraryPaths: [...state.libraryPaths, ...this.configuredLibraryPaths] }
+        : state;
+      syncPromise = client.sendRequest<boolean | { restartRequired: boolean }>("rConsole/syncSessionState", params)
+        .then((reply) => {
+          const restartRequired = typeof reply === "object" && reply?.restartRequired === true;
+          const synced = this.client === client && !restartRequired;
+          if (synced) {
+            this.syncedSessionStateKey = stateKey;
+          }
+          return { synced, stateKey, restartRequired };
+        })
+        .catch(() => ({ synced: false, stateKey }))
+        .finally(() => {
+          if (this.sessionStateSyncPromise === syncPromise) {
+            this.sessionStateSyncPromise = undefined;
+          }
+        });
+      this.sessionStateSyncPromise = syncPromise;
     }
-
-    let syncPromise: Promise<SessionStateSyncResult>;
-    syncPromise = client.sendRequest("rConsole/syncSessionState", state)
-      .then(() => {
-        const synced = this.client === client;
-        if (synced) {
-          this.syncedSessionStateKey = stateKey;
-        }
-        return { synced, stateKey };
-      })
-      .catch(() => ({ synced: false, stateKey }))
-      .finally(() => {
-        if (this.sessionStateSyncPromise === syncPromise) {
-          this.sessionStateSyncPromise = undefined;
-        }
-      });
-    this.sessionStateSyncPromise = syncPromise;
 
     const result = await syncPromise;
     if (!this.sessionState || this.client !== client) {
       return;
     }
     const currentStateKey = this.getSessionStateKey(this.sessionState);
+    if (result.restartRequired && result.stateKey === currentStateKey) {
+      await this.restartClient(client);
+      if (this.client?.isRunning()) await this.applySessionState(this.client);
+      return;
+    }
     if (
       this.syncedSessionStateKey !== currentStateKey &&
       (result.synced || result.stateKey !== currentStateKey)
@@ -416,34 +418,31 @@ export class ConsoleLspClient implements CompletionProvider {
     return JSON.stringify([state.attachedPackages, state.libraryPaths]);
   }
 
-  private async restartForLibraryPaths(): Promise<void> {
-    if (this.libraryPathRefreshPromise) {
-      await this.libraryPathRefreshPromise;
+  private async restartClient(client: ConsoleLanguageClient): Promise<void> {
+    if (this.restartPromise) {
+      await this.restartPromise;
       return;
     }
-    // Concurrent starts wait for the restart. Capture path updates that arrive
-    // while the new server is starting before releasing the restart lock.
+    if (this.client !== client) {
+      return;
+    }
+
+    // Package and library updates share one replacement. Completion and startup
+    // callers wait for it instead of launching or using a server being stopped.
     const refresh = (async () => {
-      do {
-        if (!(await this.stop())) {
-          throw new Error("Cannot restart console language server for library paths.");
-        }
-        if (this.disposed) {
-          return;
-        }
+      if (!(await this.stop())) {
+        throw new Error("Cannot restart the console language server.");
+      }
+      if (!this.disposed) {
         await this.startClient();
-      } while (
-        !this.disposed &&
-        this.sessionState?.libraryPaths &&
-        this.runningLibraryPathsKey !== JSON.stringify(this.sessionState.libraryPaths)
-      );
+      }
     })();
-    this.libraryPathRefreshPromise = refresh;
+    this.restartPromise = refresh;
     try {
       await refresh;
     } finally {
-      if (this.libraryPathRefreshPromise === refresh) {
-        this.libraryPathRefreshPromise = undefined;
+      if (this.restartPromise === refresh) {
+        this.restartPromise = undefined;
       }
     }
   }
@@ -480,42 +479,13 @@ export class ConsoleLspClient implements CompletionProvider {
     return await checkPromise;
   }
 
-  private async restartForPackageChanges(client: ConsoleLanguageClient): Promise<void> {
-    if (this.packageRefreshPromise) {
-      await this.packageRefreshPromise;
-      return;
-    }
-    if (this.client !== client) {
-      return;
-    }
-
-    let refreshPromise: Promise<void>;
-    refreshPromise = (async () => {
-      if (this.client !== client) {
-        return;
-      }
-      if (!(await this.stop())) {
-        throw new Error("Cannot restart the console language server after a package change.");
-      }
-      if (!this.disposed) {
-        await this.start();
-      }
-    })().finally(() => {
-      if (this.packageRefreshPromise === refreshPromise) {
-        this.packageRefreshPromise = undefined;
-      }
-    });
-    this.packageRefreshPromise = refreshPromise;
-    await refreshPromise;
-  }
-
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
     if (this.disposed) {
       return undefined;
     }
-    if (this.libraryPathRefreshPromise) {
+    if (this.restartPromise) {
       try {
-        await this.libraryPathRefreshPromise;
+        await this.restartPromise;
       } catch {
         return undefined;
       }
@@ -541,9 +511,8 @@ export class ConsoleLspClient implements CompletionProvider {
     const config = vscode.workspace.getConfiguration("r");
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
+    this.configuredLibraryPaths = config.get<string[]>("libPaths") ?? [];
     const env = this.buildServerEnv(config);
-    this.runningLibraryPathsKey = this.sessionState?.libraryPaths
-      ? JSON.stringify(this.sessionState.libraryPaths) : undefined;
     const useStdio = config.get<boolean>("lsp.use_stdio") === true && process.platform !== "win32";
 
     const clientOptions: LanguageClientOptions = {
