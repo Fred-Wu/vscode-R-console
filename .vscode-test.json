@@ -1,7 +1,18 @@
-{
-  "files": "tests/extension-host/*.test.cjs",
-  "mocha": {
-    "ui": "tdd",
-    "timeout": 60000
+[
+  {
+    "version": "1.101.0",
+    "files": "tests/extension-host/*.test.cjs",
+    "mocha": {
+      "ui": "tdd",
+      "timeout": 60000
+    }
+  },
+  {
+    "version": "stable",
+    "files": "tests/extension-host/*.test.cjs",
+    "mocha": {
+      "ui": "tdd",
+      "timeout": 60000
+    }
   }
-}
+]

@@ -40,6 +40,8 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 
 ### Setup
 
+Requires VS Code 1.101.0 or later.
+
 1. Install a compatible version of [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (see [Dependency Model](#dependency-model)).
 2. Configure `r.executablePath`. The deprecated `r.rpath.<platform>` setting is still supported for compatibility. If neither setting is set, R Console looks for R on `PATH` and, on Windows, falls back to the R installation recorded in the Windows registry.
 3. Enable bracketed paste mode:

@@ -4,6 +4,10 @@ All notable changes to R Console will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the minimum supported VS Code version to 1.101.0 and updated the extension's Node.js target and type definitions to 22.
+
 ### Fixed
 
 - Fixed missing argument suggestions after accepting a partial function name match in automatic inline completion, such as `libr` to `library()`.
