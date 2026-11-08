@@ -1,11 +1,5 @@
 .paths <- .libPaths()
 
-add_lib_paths <- Sys.getenv("VSCR_LIB_PATHS")
-if (nzchar(add_lib_paths)) {
-    add_lib_paths <- strsplit(add_lib_paths, "\n", fixed = TRUE)[[1L]]
-    .paths <- c(add_lib_paths, .paths)
-}
-
 use_renv_lib_path <- Sys.getenv("VSCR_USE_RENV_LIB_PATH")
 use_renv_lib_path <- if (nzchar(use_renv_lib_path)) as.logical(use_renv_lib_path) else FALSE
 if (use_renv_lib_path) {
@@ -14,6 +8,13 @@ if (use_renv_lib_path) {
     } else {
         warning("renv package is not installed. Please install renv to use renv library path.")
     }
+}
+
+fallback_lib_paths <- .paths
+add_lib_paths <- Sys.getenv("VSCR_LIB_PATHS")
+if (nzchar(add_lib_paths)) {
+    add_lib_paths <- strsplit(add_lib_paths, "\n", fixed = TRUE)[[1L]]
+    .paths <- c(add_lib_paths, .paths)
 }
 
 .libPaths(.paths)
@@ -48,6 +49,15 @@ normalize_character <- function(value) {
     }
     value <- value[nzchar(value)]
     unique(value)
+}
+
+library_paths_changed <- function(paths) {
+    current <- .libPaths()
+    # Ask R to resolve existing folders and normalize their names exactly as it
+    # does at startup. Restore the running server's paths before doing any work.
+    on.exit(.libPaths(current))
+    .libPaths(c(normalize_character(paths), fallback_lib_paths))
+    !identical(current, .libPaths())
 }
 
 console_text_document_did_close <- function(self, params) {
@@ -236,6 +246,11 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
 }
 
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
+    if (!is.null(params$libraryPaths) && library_paths_changed(params$libraryPaths)) {
+        # Loaded namespaces cannot safely switch libraries in this process.
+        # Only a real change in the effective search order needs a fresh server.
+        return(self$deliver(languageserver:::Response$new(id, result = list(restartRequired = TRUE))))
+    }
     attached_packages <- normalize_character(params$attachedPackages)
     workspace <- self$get_workspace(self$rootUri)
 

@@ -607,11 +607,16 @@ export class RTermLang {
     }
 
     try {
-      await lsp.start();
+      const initialState = this.sessionState;
+      if (initialState) {
+        await lsp.syncSessionState(initialState);
+      } else {
+        await lsp.start();
+      }
       if (this.disposed || this.consoleLsp !== lsp) {
         return undefined;
       }
-      if (this.sessionState) {
+      if (this.sessionState && this.sessionState !== initialState) {
         await lsp.syncSessionState(this.sessionState);
       }
       return this.disposed || this.consoleLsp !== lsp ? undefined : lsp;
