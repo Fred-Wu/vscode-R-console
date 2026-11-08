@@ -6,7 +6,7 @@ Implementation details are documented in [docs/IMPLEMENTATION.md](docs/IMPLEMENT
 
 ## Requirements
 
-- VS Code 1.85.0 or later.
+- VS Code 1.101.0 or later.
 - Node.js 24.x for the extension build and packaging scripts.
 - A local R installation. R Console resolves `r.executablePath`, then deprecated `r.rpath.*`, then `PATH`, with the Windows registry as the final Windows fallback.
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r). R Console declares `REditorSupport.r` in `extensionDependencies` and depends on [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) session bootstrap/configuration.
@@ -23,6 +23,10 @@ npm run stage:sidecar
 ```
 
 `compile` type-checks the extension and bundles the extension host and background history worker into `dist/extension.js` and `dist/historyWorker.js`.
+
+The extension uses VS Code's bundled Node.js runtime. Its Node.js 22 bundle target
+and type definitions align with the runtime in VS Code 1.101. Node.js 24 is used
+separately for build and packaging tools and CI.
 
 `stage:sidecar` copies the current platform's `R_CONSOLE_HOST` into `bundled/bin/`.
 
@@ -61,8 +65,9 @@ npm run package:vsix
 npm run test:package
 ```
 
-The extension host smoke test launches VS Code, installs declared extension
-dependencies, activates R Console, and checks its core commands are registered.
+The extension host smoke test runs on VS Code 1.101.0 and current stable, installs
+declared extension dependencies, activates R Console, and checks its core commands
+are registered.
 The language server tests require R's `languageserver` package and exercise
 startup, authenticated connections, and completion during session updates and
 server restarts. They run the production R server with a simulated VS Code host.

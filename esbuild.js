@@ -12,7 +12,7 @@ async function main() {
     bundle: true,
     format: "cjs",
     platform: "node",
-    target: "node18",
+    target: "node22",
     outdir: "dist",
     external: ["vscode"],
     sourcemap: !production,
