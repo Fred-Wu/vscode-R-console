@@ -6,6 +6,7 @@ All notable changes to R Console will be documented in this file.
 
 ### Fixed
 
+- Fixed code suggestions sometimes failing when typing or pressing Tab just after opening an R Console.
 - Improved the reliability of code submission in the R Console.
 - Fixed cases where code suggestions could get stuck when using older versions of vscode-R.
 - Fixed interruptions when displaying large amounts of R output.

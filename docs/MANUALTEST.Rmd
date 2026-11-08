@@ -455,6 +455,12 @@ Expected:
 
 ## 12. Completion And Session Watcher
 
+Before running the setup below, open a fresh R Console, immediately type
+`stats::l`, and press Tab. Repeat with inline suggestions triggered by typing.
+Suggestions should include `lm` on the first request. The `R Console Language
+Server` output channel should show one startup when the session uses the same
+package folders as the server, without a connection reset or another startup.
+
 Run:
 
 ```{r completion-setup}

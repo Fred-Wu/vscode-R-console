@@ -262,7 +262,7 @@ test("package change restarts the console language server before completion", as
     client.client = undefined;
     return true;
   };
-  client.start = async () => {
+  client.startClient = async () => {
     starts += 1;
     client.client = secondClient;
     client.lastPackageCheckAt = 0;
@@ -1272,12 +1272,15 @@ test("library-path restart serializes concurrent starts and applies the latest p
   const lsp = new ConsoleLspClient({ consoleId: "restart-order", env: {} });
   t.after(() => lsp.dispose());
   const requests = [];
-  const fakeClient = () => ({
+  const fakeClient = (paths) => ({
     isRunning: () => true,
-    sendRequest: async (_method, state) => { requests.push(state); },
+    sendRequest: async (_method, state) => {
+      requests.push(state);
+      return JSON.stringify(state.libraryPaths) === paths ? true : { restartRequired: true };
+    },
   });
-  lsp.client = fakeClient();
-  lsp.runningLibraryPathsKey = JSON.stringify(["/original"]);
+  lsp.client = fakeClient(JSON.stringify(["/original"]));
+  let runningPaths;
   let stopCount = 0;
   let startCount = 0;
   let releaseStart;
@@ -1291,8 +1294,8 @@ test("library-path restart serializes concurrent starts and applies the latest p
     const startupPaths = JSON.stringify(lsp.sessionState?.libraryPaths);
     startCount++;
     if (startCount === 1) await firstStartGate;
-    lsp.runningLibraryPathsKey = startupPaths;
-    lsp.client = fakeClient();
+    runningPaths = startupPaths;
+    lsp.client = fakeClient(startupPaths);
   };
   const first = lsp.syncSessionState({
     attachedPackages: ["stats"], libraryPaths: ["/first"],
@@ -1312,7 +1315,7 @@ test("library-path restart serializes concurrent starts and applies the latest p
   await Promise.all([first, latest, concurrentStart]);
   assert.equal(stopCount, 2);
   assert.equal(startCount, 2);
-  assert.equal(lsp.runningLibraryPathsKey, JSON.stringify(["/latest"]));
+  assert.equal(runningPaths, JSON.stringify(["/latest"]));
   assert.deepEqual(requests.at(-1), {
     attachedPackages: ["stats"], libraryPaths: ["/latest"],
   });

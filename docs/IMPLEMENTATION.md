@@ -1,8 +1,10 @@
-# Implementation
+# Design and Implementation
 
-This document describes the implementation of `vscode-R-console`.
+`vscode-R-console` runs an embedded R session through a Rust backend and presents
+it in a VS Code pseudoterminal. The extension manages console input, output,
+completion, command history, and persistent sessions.
 
-The implementation is centered on four parts:
+The architecture has four main parts:
 
 1. the embedded R backend
 2. the transport model between the backend and the VS Code UI
@@ -11,9 +13,8 @@ The implementation is centered on four parts:
 
 ## Implementation References
 
-These are the main implementation references and the parts of this extension
-they informed. They are references unless the entry explicitly says the project
-is used as a dependency.
+The following projects inform the extension's design. The table identifies
+runtime dependencies and the local components associated with each reference.
 
 | Project | What is referenced or used | Where it appears here |
 | --- | --- | --- |
@@ -22,11 +23,10 @@ is used as a dependency.
 | [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
 | [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
 | [`radian`](https://github.com/randy3k/radian) | Reference for terminal-first console interaction, prompt-centric editing, multiline editing, history, reverse search, and bracketed paste expectations. | `src/Terminal/rTerminal.ts` and supporting terminal modules |
-| [`languageserver`](https://github.com/REditorSupport/languageserver) | Used directly as the R language server package for console completion. It is no longer used for console syntax highlighting. | `src/Language/consoleLspClient.ts`, `resources/r/console-language-server.R` |
+| [`languageserver`](https://github.com/REditorSupport/languageserver) | R package dependency for console completion. | `src/Language/consoleLspClient.ts`, `resources/r/console-language-server.R` |
 
-No Ark, arf, radian, or rchitect source files are vendored into this repository.
-The embedded backend, protocol, and terminal frontend are local
-implementations adapted from those ideas.
+The embedded backend, protocol, and terminal frontend are implemented in this
+repository, drawing on the host and terminal interaction patterns above.
 
 ## 1. Embedded Backend
 
@@ -41,9 +41,8 @@ Source files:
 - [`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs)
 - [`sidecar/pty-host/src/protocol.rs`](../sidecar/pty-host/src/protocol.rs)
 
-`R_CONSOLE_HOST` embeds R directly in its own process. It is not a wrapper
-around another R terminal process, and it does not start a second session-host
-binary.
+`R_CONSOLE_HOST` loads the R runtime into its own process and connects R's
+callbacks to the extension's input and output protocol.
 
 On Windows, `main.rs` uses a launcher mode. The first process starts a detached
 real host process using the same `R_CONSOLE_HOST.exe` binary. The detached
@@ -112,8 +111,7 @@ It also sets:
 - `R_Outputfile = NULL`
 - `R_Consolefile = NULL`
 
-That makes embedded R route console IO through the callback functions instead
-of file-backed console streams.
+These settings route embedded R console IO through the registered callbacks.
 
 Unix initialization calls:
 
@@ -146,8 +144,7 @@ DLL directory:
 4. `Rlapack.dll`
 5. `R.dll`
 
-This preload order is part of the backend implementation because embedded R and
-some R packages rely on those DLLs resolving from the same R installation.
+The preload order resolves R and its support DLLs from the selected installation.
 
 ### 1.5 Windows Symbol Loading And Initialization
 
@@ -168,8 +165,7 @@ The Windows backend loads Windows-specific R symbols when present:
 - `UserBreak`
 - fallback `R_interrupts_pending`
 
-Windows initialization uses `Rstart` instead of the Unix
-`ptr_R_ReadConsole` startup path:
+Windows initialization configures the runtime through `Rstart`:
 
 1. create an `Rstart` struct
 2. initialize defaults through `R_DefParamsEx(..., 0)` or `R_DefParams`
@@ -204,8 +200,8 @@ Unix implementation.
 
 ### 1.7 R Event Loop And Input Handler Pumping
 
-The backend does not hardcode package event loops. It only calls generic R and
-platform event APIs.
+The backend pumps R's event handlers and the platform event queue while waiting
+for input. R packages participate through the handlers registered with R.
 
 Unix event pumping uses available symbols such as:
 
@@ -255,8 +251,7 @@ While `ReadConsole` is waiting, the backend also handles:
 
 After busy evaluation or nested input returns, the backend can insert one
 top-level recovery input before the next user command is consumed. The recovery
-step is implemented in the shared backend state and is generic R console
-handling; it does not inspect individual packages.
+step is implemented in the shared backend state.
 
 ### 1.9 Interrupt Implementation
 
@@ -275,8 +270,6 @@ Windows interrupt implementation uses:
 Both platforms install a base R interrupt calling handler on the first real
 top-level console read. That handler uses R's `abort` restart so R can unwind
 through normal cleanup paths.
-
-Windows does not use `GenerateConsoleCtrlEvent`.
 
 ## 2. Transport Model Between Backend And UI
 
@@ -298,8 +291,9 @@ When a console starts, `RustSidecarRuntimeBackend.start(...)`:
 2. creates a per-session bootstrap file path
 3. spawns `R_CONSOLE_HOST`
 4. passes `VSC_R_BACKEND_SESSION_FILE` to the backend
-5. passes initial connect and reconnect grace values
-6. detaches/unrefs the process from the VS Code extension host
+5. generates a session secret and passes it through `VSC_R_BACKEND_AUTH_TOKEN`
+6. passes initial connect and reconnect grace values
+7. detaches/unrefs the process from the VS Code extension host
 
 The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 `127.0.0.1:0`, then writes JSON to the bootstrap file:
@@ -309,7 +303,10 @@ The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 ```
 
 The TypeScript side polls that file, reads the port and pid, then connects to
-the loopback server.
+the loopback server. Before exchanging session traffic, both peers prove
+possession of the session secret using HMAC-SHA256 and fresh nonces. The
+authentication implementation is in
+[`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
 
 ### 2.2 Reconnect Transport
 
@@ -317,11 +314,12 @@ Reconnect uses `RuntimeSessionReconnectInfo`:
 
 - `sessionId`
 - `port`
+- `authToken`
 - `pid`
 
 `RustSidecarRuntimeBackend.reconnect(...)` creates a new
-`RuntimeSessionHandle` around that information. It does not spawn a new R
-backend. It connects to the existing loopback TCP server.
+`RuntimeSessionHandle` around that information and authenticates a connection
+to the existing backend's loopback TCP server.
 
 The runtime checks process liveness before reconnecting:
 
@@ -335,16 +333,16 @@ The Rust backend accepts one active control client at a time.
 
 Implementation details:
 
-- each accepted socket receives a client id
+- each active connection has a client id
 - `current_client` stores the currently active id
-- a new socket replaces the previous active socket
+- a successfully authenticated connection replaces the previous active socket
 - command-reader threads exit when their client id is no longer current
 - output is attached to the active client writer
 - when the active client disconnects, output is detached and the reconnect
   grace timer is applied
 
-This is how a console tab can detach and another UI instance can attach to the
-same embedded R backend.
+This connection model supports detaching a console tab and attaching another UI
+instance to the same embedded R backend.
 
 ### 2.4 Framed Protocol
 
@@ -392,9 +390,9 @@ Host capabilities are advertised through `backend-ready`:
 
 Rust emits console output and control events through the active protocol writer.
 Console output is streamed in 8 KiB chunks, including output received directly
-from R callbacks. This keeps each frame within the frontend's existing 8 MiB
-frame limit without limiting total output. Each output stream has its own UTF-8
-decoder in the frontend, so characters split between frames are preserved.
+from R callbacks. The frontend accepts frames up to 8 MiB. Each output stream
+has its own UTF-8 decoder in the frontend, so characters split between frames
+are preserved.
 If no client is attached, `protocol.rs` queues frames in an output backlog.
 
 The backlog is bounded by:
@@ -425,34 +423,32 @@ The Rust command reader maps `shutdown` to the backend shared shutdown state.
 
 ### 2.7 Transport Bounds And Deadlines
 
-The security follow-up retains existing protocol limits and normal request
-timing. It fixes response lifecycle handling, stream flow control, pipe access,
-and output framing at their respective boundaries.
+Transport limits bound message sizes, connection admission, and request waits.
+Authentication deadlines apply during the handshake; the native parse deadline
+begins after a request is sent to a ready R session.
 
 | Boundary | Bound or timing | Purpose and behavior |
 | --- | --- | --- |
-| Backend and console language-server authentication | 3 seconds; fixed-size challenge/proof messages; bounded pending clients | Bounds incomplete authentication. Backend read/write deadlines are cleared after authentication. This does not time R evaluation. |
+| Backend and console language-server authentication | 3 seconds; fixed-size challenge/proof messages; bounded pending clients | Bounds incomplete authentication. Backend read/write deadlines are cleared after authentication. |
 | Backend frames | 8 MiB per payload | Rejects excessive allocation before reading a payload. Oversized submitted commands are rejected before sending; output is streamed across frames. |
-| Detached backend output | 1,000,000 bytes or 4,096 frames | Retains a rolling backlog while no frontend is connected. This is separate from connected output delivery. |
+| Detached backend output | 1,000,000 bytes or 4,096 frames | Retains a rolling backlog until a frontend connects. |
 | Session proxy admission | 8 pending clients; 3 seconds to send attach | Bounds incomplete attachments. Active sessions are replaced only after an attach message, independently of these resource guards. |
-| Session proxy messages | 16 MiB per JSON line | Bounds a complete message. Forwarding obeys writable backpressure with no additional total write-queue cutoff. |
-| Optional session data requests | 1.2 seconds waiting for an R socket; 2 seconds for a response | Returns unavailable workspace/completion data if the probe cannot finish. Does not close the established session or interrupt R. |
+| Session proxy messages | 16 MiB per JSON line | Bounds a complete message. Forwarding follows writable stream backpressure. |
+| Optional session data requests | 1.2 seconds waiting for an R socket; 2 seconds for a response | Resolves unavailable workspace/completion data when the request expires. |
 | Legacy HTTP session data | 1.2 seconds of inactivity; 16 MiB response | Progressing responses may take longer. Response abort/error/close events settle the request directly. |
-| Native parse query | 150 milliseconds after sending | Falls back to the local parser; submission readiness is checked before sending. Does not time code execution. |
-| Backend startup and reconnect | 5 seconds for the bootstrap file; 60-second initial connection grace; unlimited persistent reconnect grace | Governs connection lifecycle. The 40/100 ms poll/retry intervals schedule checks; they are not execution deadlines. Detached shutdown uses a 2-second socket inactivity timeout. |
+| Native parse query | 150 milliseconds after sending | Falls back to the local parser; submission readiness is checked before sending. |
+| Backend startup and reconnect | 5 seconds for the bootstrap file; 60-second initial connection grace; unlimited persistent reconnect grace | The 40/100 ms poll/retry intervals schedule connection checks. Detached shutdown uses a 2-second socket inactivity timeout. |
 | Manual session recovery | 1.5 seconds after R returns to its main prompt | Waits for attachment confirmation after the recovery command finishes. |
 
-Terminal render/completion debounces, native event polling, persistence
-heartbeats, history refresh/retry/lock handling, and the history close wait
-serve UI scheduling or storage lifecycle purposes. They are separate from
-socket admission and R execution, and this follow-up does not retune them.
-The older `languageserver` workspace API compatibility error is a separate
-language-server lifecycle issue; these transport fixes do not resolve it.
+Terminal rendering and completion use debounces to schedule UI work. Native
+event polling drives R callbacks. Persistence heartbeats, history refreshes,
+lock retries, and close waits coordinate storage and shutdown.
 
 ## 3. `vscode-R` Integration
 
-The console depends on `vscode-R`, but it does not own or manage the
-`vscode-R` session.
+R Console uses vscode-R's public session APIs to attach its embedded R session,
+obtain workspace metadata, and request runtime completions. vscode-R manages
+the shared session services, including plots, data viewers, help, and addins.
 
 Implementation files:
 
@@ -474,19 +470,9 @@ legacy, or `sess` implementation. Transport-specific state, startup, completion,
 activation, reconnect, output filtering, and disposal stay inside the selected
 implementation directory.
 
-Support for vscode-R versions earlier than 3.0 is deprecated and may be removed
-in a future R Console version. The legacy integration remains isolated so it can
-be removed without changing the terminal or runtime architecture.
-
-When legacy support is retired, its removal boundary is:
-
-1. delete `src/Runtime/VSCR/legacy/` and `resources/r/VSCR/legacy.R`
-2. remove the legacy option variant and detection branch from
-   `src/Runtime/VSCR/types.ts` and `src/Runtime/VSCR/config.ts`
-3. remove the legacy factory branch from `src/Runtime/VSCR/index.ts`
-
-No terminal, runtime, language-service, or persistence code should require a
-legacy-specific edit.
+The deprecated pre-3.0 integration is contained in the legacy directories, its
+configuration variant, and the factory selection branch. Terminal, language,
+and persistence components access session services through the shared interface.
 
 ### 3.1 Startup Settings From `vscode-R`
 
@@ -497,9 +483,8 @@ R Console resolves the R executable in this order:
 3. `R` on `PATH`
 4. the Windows R registry entry on Windows
 
-Ambient `R_HOME` is not used to choose an R executable. After an executable is
-selected, R Console derives `R_HOME` from that executable so the embedded
-runtime stays anchored to the same R installation.
+R Console derives `R_HOME` from the selected executable, anchoring the embedded
+runtime to that R installation.
 
 The selected executable is used to derive:
 
@@ -529,12 +514,9 @@ integration:
   sources vscode-R's `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
 
 In `sess` mode, vscode-R owns the IPC server and package installation/update
-policy. The `sess` R package may be bundled with vscode-R or installed as a
-regular R package; R Console does not use its filesystem location for
-architecture detection. The transport is a Unix socket on macOS/Linux or a
-Windows named pipe. Messages are JSON-RPC 2.0 objects framed as
-newline-delimited JSON. R Console does not target the obsolete
-WebSocket/port-token `sess` transport.
+policy. R Console selects the integration through vscode-R's public session API.
+The transport is a Unix socket on macOS/Linux or a Windows named pipe. Messages
+are JSON-RPC 2.0 objects framed as newline-delimited JSON.
 
 The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
 the console-owned proxy endpoint, and the proxy connects to vscode-R's endpoint.
@@ -542,61 +524,45 @@ Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
 Console observes workspace responses and injects its own `workspace` and
 `completion` requests when the console needs session data. It uses vscode-R's
 public API for connection discovery, attachment preparation, terminal
-registration, connection references, and session activation; it does not use
-VS Code's global completion command for runtime completion.
+registration, connection references, and session activation.
 
 Before replacing an active R connection, the proxy waits for a newline-delimited
-`attach` message with a nonempty session id. Pending connections receive no
-session requests and do not connect upstream. There are at most eight pending
-connections, each with a three-second total deadline; attachment messages use
-the existing 16 MiB line limit. The count and deadline bound resources held by
-clients that never attach. The protection against silent or read-only clients
-comes from delaying connection replacement and session traffic until an attach
-message arrives. It is not credential validation: vscode-R retains responsibility
-for attachment validation.
+`attach` message with a nonempty session id. Upstream connections and session
+requests begin after that message arrives. The proxy admits at most eight
+pending connections, each with a three-second deadline and a 16 MiB line limit.
+vscode-R validates the forwarded attachment handshake.
 
 On Windows, the bundled host's `--secure-session-pipe` command applies a protected
 DACL that grants access only to the current user and denies network logons. All
 instances of the named pipe share that descriptor. The proxy publishes its
 endpoint only after permission setup succeeds; setup failure closes the server.
-Connections accepted during setup receive no session data and are closed before
-the endpoint is returned. This secures R Console's endpoint independently of
-vscode-R's upstream endpoint. On Unix the socket remains in a private directory
-with owner-only permissions.
+Connections accepted during setup are closed before the endpoint is returned.
+On Unix the socket resides in a private directory with owner-only permissions.
 
 Forwarding follows Node's [stream backpressure contract](https://nodejs.org/api/stream.html#event-drain):
 after a write returns false, the proxy pauses the source and retains the
 unprocessed remainder of the current batch. On drain, it forwards that remainder
-before resuming reads. Optional local workspace/completion requests return
-unavailable data while the destination is blocked, rather than adding more
-queued writes. Slow receivers do not trigger a separate queue-size disconnect.
-The existing 16 MiB per-line limit remains in effect. Regression tests cover
-both directions, batch remainders, local requests, reconnection, and pending
-clients. Windows-only tests inspect the DACL across new pipe instances, exercise
-a read-only handle, and verify that permission failures prevent startup. Actual
-Windows execution and a separate-account access check are still required to
-validate that platform's access boundary.
+before resuming reads. Optional local workspace/completion requests resolve as
+unavailable while the destination is blocked. Each JSON line is limited to
+16 MiB, and stream drain events govern forwarding to slow receivers.
 
 The proxy is scoped to the embedded backend runtime session and is indexed by
 the backend session id while connected. The managed bootstrap connects `sess`
 through the proxy endpoint and forwards the versioned attach handshake to
 vscode-R. R Console validates attachment and connection references before
-binding the corresponding pseudoterminal. Background consoles are bound
-without changing the active R session; terminal focus selects the matching
-session through vscode-R's public `session.activate()` API. No native shell
-PID is required for the pseudoterminal.
+binding the corresponding pseudoterminal. Background consoles are registered
+with their session references; terminal focus selects the matching session
+through vscode-R's public `session.activate()` API.
 
-The console passes its proxy endpoint to `prepareAttachment()`, not through
-the launch environment, and does not create discovery files. It retains
-`SESS_PLOT_BACKEND` and `SESS_RSTUDIOAPI` in the R environment for compatibility
-with code that reads these settings. The values reflect vscode-R's resolved
-plot-backend preference and `r.session.emulateRStudioAPI` setting, respectively;
-vscode-R's managed bootstrap independently configures the actual sess options.
+The console passes its proxy endpoint to `prepareAttachment()`. The
+`SESS_PLOT_BACKEND` and `SESS_RSTUDIOAPI` environment variables expose vscode-R's
+resolved plot-backend preference and `r.session.emulateRStudioAPI` setting,
+respectively; vscode-R's managed bootstrap configures the corresponding sess options.
 Reconnection refreshes both variables from the current configuration before
 sourcing the newly prepared managed bootstrap.
-It clears inherited `SESS_DISCOVERY_FILE` values so a console cannot attach through
-another terminal's settings. After a window reload, it obtains a new endpoint
-and reconnects when the restored console reaches an empty main prompt.
+Inherited `SESS_DISCOVERY_FILE` values are cleared during environment preparation.
+After a window reload, the console obtains a new endpoint and reconnects when
+the restored console reaches an empty main prompt.
 Detached consoles in the same window reuse their existing proxy connection.
 
 The backend launch environment includes:
@@ -628,18 +594,17 @@ At launch time, `rTerminal/runtime.ts` also sets:
 3. installs the console pager
 4. locks the prompt options used by the embedded console contract
 
-The `sess` bootstrap is prepared by vscode-R and is not bundled with R Console.
-The legacy implementation still sources `resources/r/VSCR/legacy.R`, which
-runs vscode-R's legacy `init.R`.
+vscode-R prepares the `sess` bootstrap. The legacy implementation sources
+`resources/r/VSCR/legacy.R`, which runs vscode-R's legacy `init.R`.
 
 ### 3.3 Session Metadata
 
 In `legacy` mode, `SessionWatcher` reads the file-based `request.log`,
 `workspace.lock`, and `workspace.json` files.
-Its loopback HTTP requests retain the existing 1.2-second inactivity timeout
-and 16 MiB response limit. Responses can take longer while data continues to
-arrive. Truncated, aborted, failed, or oversized responses resolve as unavailable
-data and close the request, so a failed response cannot leave a request pending.
+Its loopback HTTP requests use a 1.2-second inactivity timeout and a 16 MiB
+response limit. Responses can take longer while data continues to arrive.
+Truncated, aborted, failed, or oversized responses close the request and resolve
+as unavailable data.
 
 In `sess` mode, session metadata flows through the proxy between R and vscode-R.
 The R side sends JSON-RPC notifications such as `attach` and
@@ -664,16 +629,15 @@ The `workspace` response provides:
 - loaded namespaces
 - global environment summary
 
-The `completion` response provides runtime `$` and `@` members for an
-expression. Console data-frame bracket completion uses the same runtime
-completion request with the data object expression, because vscode-R 3.0
-workspace summaries do not carry column/member names.
+The `completion` response provides runtime `$` and `@` members for an expression.
+Console data-frame bracket completion obtains column names through a completion
+request for the data object expression. The proxy also queries `.libPaths()`
+through a completion expression and includes the resulting package folders in
+the cached workspace data.
 
-For reconnect in `sess` mode, R Console does not create a vscode-R discovery
-file. After a VS Code window reload, it obtains the current endpoint again through
-vscode-R's public session API and reconnects the restored console when it reaches
-an empty main prompt. Detached consoles in the same window reuse their existing
-proxy connection.
+In `sess` mode, a restored console obtains the current endpoint through vscode-R's
+public session API and reconnects at an empty main prompt. A console detached
+within the same window reuses its existing proxy connection.
 
 ### 3.4 Metadata Consumers
 
@@ -684,19 +648,17 @@ In `legacy` mode, the console consumes watcher metadata for:
 - global-environment completion
 - `$` and `@` member completion through the `vscode-R` session server when
   available
-- attached package and namespace sync into the console-owned language server
+- attached-package synchronization with the console-owned language server
 
-In `sess` mode, vscode-R owns the broader session metadata stream. `R Console`
-owns only the console-side proxy and completion routing needed for the embedded
-console. Runtime `$`, `@`, and data-frame bracket completion are requested from
-the current embedded R session through the `sess` JSON-RPC `completion` method.
+In `sess` mode, R Console caches metadata passing through its proxy and routes
+completion requests to its embedded session. Runtime `$`, `@`, and data-frame
+bracket completion are requested from the current embedded R session through
+the `sess` JSON-RPC `completion` method.
 Workspace snapshots are cached from forwarded or console-injected `workspace`
 responses and are used for search-path/package synchronization and top-level
 workspace completions.
 
-This integration is read-only with respect to broader `vscode-R` session
-features. The console does not create, replace, restore, or stop vscode-R plot,
-data, help, browser, httpgd, or addin sessions.
+vscode-R manages plot, data, help, browser, httpgd, and addin session lifecycles.
 
 ### 3.5 Completion And Language Server
 
@@ -708,14 +670,15 @@ Implementation files:
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
 
+#### Completion Frontends
+
 Inline completion is the terminal completion frontend selected with
 `r.console.completionUI = "inline"`; the default `quickPick` mode uses the
 VS Code picker. F7 is inactive in inline mode. `RTermLang` supplies both
 frontends with the same completion sources, query ranking, groups and insertion
-rules. In function-call contexts, initial completion entries await the LSP
-parameter results before the list is published, so runtime-only suggestions
-cannot become the default while parameters are pending. Parameter entries
-are selected before runtime symbols; explicit selection is retained on refresh.
+rules. In function-call contexts, the list is published after the LSP parameter
+results arrive. Parameter entries take selection priority over runtime symbols;
+an explicit selection is retained on refresh.
 
 The `r.console.inlineCompletion.trigger` setting chooses automatic
 debounced suggestions or Tab activation. In Tab mode, editing refreshes an open
@@ -742,20 +705,21 @@ Colors use the `workbench.colorCustomizations`
 `editorSuggestWidget.highlightForeground` and
 `editorSuggestWidget.selectedBackground` settings when defined, otherwise
 light/dark terminal-compatible defaults. Module icons use `{}`; other symbols
-use colored terminal glyphs. The pseudoterminal inherits the configured
-terminal font and cannot access resolved editor widget theme colors.
+use colored terminal glyphs. The pseudoterminal inherits the configured terminal
+font and reads explicit color customizations through the configuration API.
 
 The completion controller manages a bounded, scrollable viewport with an
 in-box scrollbar. Up/Down and Page Up/Down navigate completion choices, moving
 the viewport when the selected item reaches a visible edge. Temporary SGR mouse
-reporting permits wheel navigation within the panel and clicks on suggestions
-or their detail rows. Scrollbar clicks navigate the suggestion list without
-accepting an item; group headings and frame borders are not selectable.
+reporting permits wheel navigation within the panel. Clicks on suggestions or
+their detail rows accept a completion, and scrollbar clicks move the viewport.
 Wheel reports outside the box invoke VS Code terminal page-scrolling commands.
 Wheel events over either the suggestion content or its scrollbar navigate
 the completion list.
 Cursor-position reports establish the panel's screen coordinates for mouse
 hit-testing. Mouse reporting is disabled when the panel closes.
+
+#### Completion Sources
 
 `RTermLang` owns the console completion flow. It detects the completion
 context, builds fast runtime suggestions from cached session data and the
@@ -773,34 +737,61 @@ Completion data comes from one shared flow:
   and current input for the first suggestion pass
 - language-server symbols come from the console-owned `languageserver` process
 
-The console starts and owns a separate `languageserver` process through
-`ConsoleLspClient`. The client manually sends open/change/close notifications
-for in-memory `r-console://` documents so completion requests observe the
-latest console input. Attached packages and loaded namespaces are synced
-through `rConsole/syncSessionState`; unchanged state is not resent on every
-completion request. The console starts the language server when the console
-opens and sends one silent completion request to warm the first language-server
-completion path. Runtime start and attach events reuse that same client rather
-than replacing it. Each client owns a unique temporary working directory and
-removes it only after its R process has stopped. The language-server child also
-inherits the normalized R environment used by the console runtime. Diagnostics
-are disabled because the virtual console document exists only to provide
-completion context and must not be linted as a source file.
+#### Language Server Lifecycle
 
-The contributed `F7` keybinding is limited to an active R Console and invokes
-its internal forced-completion handler when VS Code handles the keybinding. If
-VS Code instead forwards F7 to the pseudoterminal, `KeyProcessor` maps the
-standard xterm `ESC [ 18 ~` sequence to the same forced-completion handler.
-This fallback keeps completion available when
-`terminal.integrated.sendKeybindingsToShell` is enabled without changing the
-separate Tab action used for indentation and contextual completion. Forced
-completion shows the Quick Pick before full workspace and language-server
-results arrive, then fills the open window asynchronously.
+`ConsoleLspClient` owns a `languageserver` child process for each console UI.
+The child inherits the console runtime's normalized R environment and runs
+`resources/r/console-language-server.R` in a temporary working directory.
+Opening the console starts the client and issues a silent completion request
+to initialize completion caches. Known session state supplies the initial
+library paths before launch. Runtime start and attach events reuse the client.
 
-Console syntax highlighting is separate from language-server completion. It is
-implemented locally by `src/Terminal/consoleSyntax.ts` and
-`src/Terminal/syntaxTheme.ts`, mapping local token types to the active VS Code
-theme's semantic-token colors.
+Windows uses an authenticated loopback TCP connection. On Unix,
+`r.lsp.use_stdio` selects stdio or TCP. For TCP, the R server initializes its
+workspaces before connecting. The peers exchange HMAC-SHA256 proofs using a
+process-specific secret and fresh nonces. The socket reader begins LSP traffic
+after authentication and reader registration.
+
+The client sends open/change/close notifications for in-memory `r-console://`
+documents before requesting completion. `VirtualRDocument` projects console
+input into the server document and maps completion positions and ranges back
+to the console. Diagnostics are disabled for these completion documents.
+
+`rConsole/syncSessionState` synchronizes attached packages and library paths.
+The client deduplicates unchanged snapshots and shares an in-flight sync request
+among concurrent callers. The R server resolves the requested session paths,
+configured fallback paths, and default libraries with `.libPaths()`. It compares
+their effective search order with the running server's paths, then restores
+those paths before replying. A changed search order requests a process restart
+so namespaces load from the selected libraries.
+
+`rConsole/checkPackageChanges` compares fingerprints for cached and explicitly
+referenced packages. Fingerprints include package paths, file sizes, and
+modification timestamps. The client throttles these checks to one per second;
+changed packages request a restart to refresh loaded namespaces and cached data.
+
+Package and library changes share one restart promise. Startup and completion
+callers await the replacement process, and session synchronization applies the
+latest snapshot. A completion interrupted by replacement reopens its document
+and retries once on the replacement client. Disposal stops the child process
+before removing its working directory. The `R Console Language Server` output
+channel records process starts, stops, and errors.
+
+#### Keybinding Dispatch
+
+In Quick Pick mode, the contributed `F7` keybinding invokes the active console's
+forced-completion handler. `KeyProcessor` maps the xterm `ESC [ 18 ~` sequence
+to the same handler when `terminal.integrated.sendKeybindingsToShell` forwards
+F7 to the pseudoterminal. Tab performs indentation or contextual completion
+according to the input position. Forced completion opens Quick Pick with cached
+entries and fills it asynchronously as workspace and language-server results
+arrive.
+
+#### Syntax Highlighting
+
+`src/Terminal/consoleSyntax.ts` tokenizes console input locally.
+`src/Terminal/syntaxTheme.ts` maps the token types to the active VS Code theme's
+semantic-token colors.
 
 ## 4. Self-managed Console
 
@@ -810,8 +801,8 @@ Self-managed console implementation is split between:
 - [`src/Terminal/rTerminal.ts`](../src/Terminal/rTerminal.ts)
 - [`src/Runtime/runtimeBackend.ts`](../src/Runtime/runtimeBackend.ts)
 
-The self-managed console is the extension's own embedded backend session. It is
-separate from the `vscode-R` session watcher.
+R Console manages the embedded backend's lifetime, frontend attachment, replay
+state, and persistent session records.
 
 ### 4.1 Runtime Session Handles
 
@@ -844,15 +835,15 @@ The file is stored under extension storage:
 
 Each record contains:
 
-- runtime reconnect info: session id, port, pid
+- runtime reconnect info: session id, port, authentication token, pid
 - persisted terminal options: R path, R args, watcher settings, bracketed paste,
   cwd
 - UI replay state: replay buffer, dimensions, mode, prompt state, input text,
   cursor position, backend pid
 - terminal location: panel or editor column
 
-The persisted data belongs to R Console. It is not a `vscode-R` session
-snapshot.
+The session manager uses these records to reconnect the backend and reconstruct
+its console UI.
 
 ### 4.3 Registry Loading And Pruning
 
@@ -882,32 +873,32 @@ Creating a console follows this implementation path:
 8. backend events update terminal state
 9. the extension schedules persistence of the session record
 
+#### Submission Queue
+
 Enter, accepted multiline paste, and programmatic sends reserve their submission
 positions synchronously. Completeness checks run in reservation order, while
 completed expressions can enter execution immediately. An incomplete tail passes
 to the next reservation before that reservation is checked, including when the
 tail is waiting behind an executing expression. With no accepted successor, the
 tail becomes editable; normal input handling includes that buffer in the next
-Enter or paste snapshot. It is never owned by both the queue and editor.
+Enter or paste snapshot. Ownership transfers between the queue and input editor
+at that boundary.
 Enter retains literal whitespace and applies its continuation newline at the
 saved cursor only when input is incomplete. Each complete expression is recorded
 in history as it is accepted, so interrupting later parsing preserves earlier
 entries.
 
-This ordering retains the existing TypeScript heuristic and optional native R
-parse-status check. Native checks wait for a confirmed top-level ready state
-before sending; their 150 ms timeout starts only after sending. A lazy per-console
-notification wakes waiting checks on readiness or cancellation, without polling.
-Each submission passes its own console's native parser explicitly; the language
-parser holds no shared session callback. Connecting, interrupting, or closing one
-console cannot change another console's parser or readiness wait. Runtime callbacks
-and socket data from a detached or replaced session cannot update its successor.
-Dispatch also requires readiness, including after attaching to an already busy R
-session. Cancellation invalidates old reservations by generation; fresh
-input does not wait for a cancelled parser. No speculative checks or collection
-of previously checked prefixes is retained. Failed delivery restores pending
-source using the same continuation boundaries, preserving existing newlines and
-saved editing positions instead of adding separators unconditionally.
+#### Readiness and Cancellation
+
+Completeness checks combine a local TypeScript heuristic with the console's
+native R parser when available. Native requests wait for a confirmed top-level
+ready state; their 150 ms timeout starts after sending. A per-console notification
+wakes waiting checks on readiness or cancellation. Each submission receives its
+console's parser explicitly, and runtime callbacks carry the owning session
+generation. Dispatch requires readiness, including after attachment to a busy R
+session. Cancellation invalidates queued reservations by generation and releases
+the queue for fresh input. Failed delivery restores pending source at its saved
+continuation boundaries, including literal newlines and cursor positions.
 
 ### 4.5 Attaching A Detached Console
 
@@ -921,7 +912,7 @@ Attaching a detached console follows this implementation path:
 5. TypeScript connects to the existing backend socket
 6. the terminal replay state is used to rebuild the visible terminal
 
-No new embedded R backend is started for a reconnect.
+The frontend resumes the running embedded R session through that connection.
 
 ### 4.6 Detaching Or Closing A Managed Console
 
@@ -938,8 +929,7 @@ Detached console close uses the persisted reconnect info:
 3. call `close(...)`
 4. remove the persistent registry record
 
-The close command targets the R Console backend socket. It does not send any
-command to `vscode-R`.
+The close command sends a `shutdown` frame to the R Console backend socket.
 
 ### 4.7 Persistence Updates
 
@@ -952,117 +942,103 @@ The extension persists console records:
 - on a heartbeat timer
 - during extension shutdown
 
-`RTerminal.exportPersistentState()` is the source of the persisted runtime and
-UI state. If the runtime backend cannot provide reconnect info, the terminal is
-not persisted.
+`RTerminal.exportPersistentState()` supplies the runtime and UI state. Persistence
+requires valid reconnect information from the runtime backend.
 
 ### 4.8 Command History
 
-`src/Terminal/history.ts` keeps command history in memory for console input,
-search, and navigation. One shared background worker handles file access,
+`src/Terminal/history.ts` provides in-memory command history for console input,
+search, and navigation. One shared background worker owns file access,
 workspace-path resolution, parsing, and compaction through `historyStore.ts`.
-Console startup and command submission do not wait for history storage.
-Each submitted command has a stable record ID and an explicit completion marker;
-the foreground retains unconfirmed submissions until a durable acknowledgement.
-If the worker fails, it is restarted and replays unconfirmed records idempotently.
-Worker-instance lock tokens allow the replacement to reclaim an orphaned lock
-without treating other live workers as stale. Partial tagged records can be
-removed atomically while preserving completed records appended by other consoles.
-New commands are available locally immediately; saved commands and changes
-from other consoles arrive in the background. Updates carry only changed
-entries when possible. The foreground retains a recent history window, while the background worker
-keeps the bounded durable history store. F8 searches and fetches results through
-paged worker requests, initially returning up to 50 matches and loading further
-matches on demand. Up/Down navigation requests older/newer windows when reaching
-a loaded boundary. An older picker selection loads its surrounding commands
-before restoring the navigation cursor. Deleting individual or checked entries
-operates on persisted occurrence IDs; collapsed duplicates are matched within
-the chosen history scope. Deletion rewrites under the history file lock. Durable deletion metadata
-records occurrence IDs or hashes of deleted command text, never the deleted
-plaintext, together with a submission-time boundary. This prevents stale
-pending writes in another window or restarted worker from recreating deleted
-records while allowing genuinely new submissions after deletion.
-The Command Palette exposes Delete All Command History for the active scope.
+Foreground updates are immediate; storage requests and acknowledgements run
+asynchronously.
 
-The worker manages plaintext command history separately
-from persistent terminal replay. Each console selects its scope at creation or
-reattachment using `r.console.historyScope`: the default `workspace` scope
-shares commands between consoles whose initial working directory belongs to the
-same workspace folder, while `global` (and consoles without a workspace
-folder) uses one shared history. Files are stored under
-`context.globalStorageUri/history/`, named `global.history` or
-`workspace-<SHA256>.history`. The old `~/.r_console_history` is not used.
+#### Storage and Scope
 
-Each history file is limited to 20,000 commands; compaction retains the newest
-19,000 before subsequent appends. Entries preserve multiline text and timestamps.
-The `# r-console-history-base:` marker tracks removed entries so concurrent
-consoles maintain stable navigation positions even across duplicate commands.
-Normal appends reconcile only bytes added since the last known disk offset
-under the per-file lock; file replacement or compaction triggers a full
-reload. Pending local commands are excluded during reconciliation and
-restored if persistence fails. Each new record carries a stable command ID
-and completion marker; the worker acknowledges only saved IDs. On a failed
-partial append, rollback removes bytes written by that attempt when safe.
-If rollback fails, recovery discards incomplete tagged records using an
-atomic rewrite under the per-file lock while preserving other consoles'
-completed records. Unacknowledged entries are replayed using their stable
-IDs so repeated identical commands remain distinct without duplicating
-retries. If compaction succeeds but a subsequent append fails, the in-memory
-view retains the compacted entries alongside pending commands instead of
-reviving entries already pruned from disk. A failed non-compacting append
-restores its previous disk cursor and count so retries reread concurrent
-writes correctly. Invalid or empty lock owners are reclaimed after the
-stale-lock timeout, while recent locks stay protected. A replacement worker
-can also reclaim a lock identified as belonging to a terminated worker.
-F8 keeps the current in-memory history positions stable while the picker is
-open by deferring visible foreground cache updates. Worker snapshots and
-persistence acknowledgements are processed immediately, so additional
-submissions can be sent to disk even while the picker remains open. The
-visible cache is reconciled when the picker closes, preserving navigation
-positions. Background worker file access is never suspended.
-Readers and writers coordinate through a per-file lock; queued submissions
-are retried after lock contention or write failures. The terminal disposal
-path queues remaining writes and releases the console immediately. The worker
-finishes pending writes after the console closes. Extension shutdown allows
-a bounded asynchronous drain before stopping the worker. If
-storage remains unavailable when VS Code exits, persistence cannot be
-guaranteed. If a write fails after
-synchronizing the disk snapshot, the console restores its in-memory history
-and navigation cursor so unsaved commands remain available in F8 and Up/Down
-until a subsequent retry succeeds. Newly created history directories and
-files request Unix permissions `0700` and `0600`; existing permissions
-remain unchanged, and Windows relies on inherited filesystem permissions.
+Each console selects a history scope at creation or reattachment through
+`r.console.historyScope`. The default `workspace` scope shares commands between
+consoles whose initial working directory belongs to the same workspace folder.
+The `global` scope and consoles outside a workspace use a shared global history.
+Files are stored under `context.globalStorageUri/history/` as `global.history`
+or `workspace-<SHA256>.history`.
 
-Up/Down and Ctrl+P/Ctrl+N skip consecutive identical entries without removing
-them. Ctrl+R searches backward for the current line's trimmed text anywhere
-in a saved command; repeated Ctrl+R uses the original term to find older
-matches. F8 (`r-console.searchHistory`) uses native VS Code Quick Pick
-multiple-selection checkboxes and the built-in Select All control.
-Selection uses VS Code's native checked state without rerendering items on checkbox changes; the public Quick Pick API does not permit custom row backgrounds.
-Search changes clear selections to avoid deleting hidden commands. An empty history leaves F8 open with the empty-history hint in the search box only, not in the title or a notification. The title shows the number of loaded history entries when nonempty. The
-toolbar trash action deletes checked entries currently loaded into the
-picker. The separate **Delete All Command History** command clears the
-entire history scope, including entries not yet loaded. Accept restores the checked commands in chronological order into one editable multiline console input without executing them. Neither an unchecked highlighted command nor an empty selection is accepted. VS Code's Quick Pick API does not expose separate Enter and OK events.
-The initial picker page contains the newest 50 matching records; approaching the last active row automatically fetches another page (the toolbar
-Load More action remains available for mouse-wheel scrolling, which the public Quick Pick API cannot observe). Pages follow stable occurrence IDs with recovery for deleted cursors without adding a selectable
-pseudo-entry. Searches are handled by the background worker across the
-retained history, with exact-duplicate collapse governed by the persisted
-global-state preference. Each entry has a stable occurrence ID.
-After deletion the picker refreshes its existing loaded range without
-discarding the search query. A single checked entry restores its exact
-historical navigation position, fetching the surrounding history on demand
-if needed. Multiple checked entries create a combined draft without a
-history position: Up starts from the newest saved command and Down past
-that entry restores the combined draft without executing it. Editing
-the combined input expands the collapsed history-navigation mode.
-Up/Down navigation keeps at most 400 rows in a sliding foreground window,
-fetching adjacent 200-row batches with worker-side location hints if a boundary
-occurrence was deleted in another VS Code window. The worker remains the source
-of all retained history records.
-New submissions continue to be persisted while the picker is open.
-Deletion tombstones cannot be discarded on a time-only basis: independent
-windows can replay delayed submissions with their original timestamps, so
-metadata must remain until a newer rule provably subsumes it.
+History records contain multiline command text, a timestamp, a stable command
+ID, and a completion marker. Files hold up to 20,000 commands; compaction retains
+the newest 19,000 before subsequent appends. The `# r-console-history-base:`
+marker tracks removed entries so consoles can maintain stable navigation
+positions across compaction and duplicate commands.
+
+New history directories and files request Unix permissions `0700` and `0600`.
+Windows uses inherited filesystem permissions.
+
+#### Writes and Recovery
+
+Readers and writers coordinate through a per-file lock. Normal appends reconcile
+bytes added since the last disk offset; file replacement or compaction triggers
+a full reload. The foreground keeps pending local commands until the worker
+acknowledges their saved IDs. Stable IDs make retries idempotent while preserving
+distinct occurrences of identical commands.
+
+Lock contention and write failures leave submissions queued for retry. A failed
+append rolls back its partial bytes when safe. Recovery from an incomplete
+tagged record uses an atomic rewrite under the file lock, retaining completed
+records from every console. Failed appends restore the disk cursor and count;
+when compaction has completed, recovery retains the compacted snapshot together
+with pending commands. The foreground restores its history and navigation cursor
+after a failed write so unsaved input stays available.
+
+A replacement worker replays unacknowledged records and uses worker-instance
+tokens to reclaim locks owned by its terminated predecessor. Invalid or empty
+lock owners are reclaimed after the stale-lock timeout.
+
+Console disposal queues remaining writes and releases the UI. The worker drains
+those writes after the console closes, and extension shutdown provides a bounded
+drain interval before stopping the worker. Durable storage requires successful
+acknowledgement before VS Code exits.
+
+#### Navigation and Search
+
+The foreground holds a sliding window of at most 400 history rows and fetches
+adjacent 200-row batches on demand. The worker supplies location hints when a
+boundary occurrence has been deleted in another window. Selecting an older
+entry loads the surrounding records before restoring its navigation cursor.
+
+Up/Down and Ctrl+P/Ctrl+N skip consecutive identical entries during navigation.
+Ctrl+R searches backward for the current line's trimmed text anywhere in a saved
+command; repeated presses use the original term to find earlier matches.
+
+F8 (`r-console.searchHistory`) uses a VS Code Quick Pick with native checkboxes
+and Select All. The worker searches the retained history and returns the newest
+50 matches initially. Approaching the last active row requests another page;
+the Load More toolbar action also supports explicit paging. Pages use stable
+occurrence IDs and recover their position after cursor deletion. Exact-duplicate
+collapse follows a preference stored in global state.
+
+The picker defers visible foreground cache updates while processing worker
+snapshots and persistence acknowledgements immediately. Its navigation positions
+remain stable while additional submissions reach storage. Closing the picker
+reconciles the visible cache.
+
+An empty history displays a hint in the search box. A populated picker shows
+the loaded entry count in its title. Changing the search clears checked
+selections. Enter and OK use the same acceptance event to restore checked
+commands in chronological order as editable input. A single selected occurrence
+restores its history position. Multiple selections form a combined draft;
+Up starts at the newest saved command and Down past that command restores the
+draft. Editing the combined input expands collapsed history navigation.
+
+#### Deletion
+
+The picker trash action deletes checked occurrences from the loaded results.
+Delete All Command History clears the active history scope. After deletion,
+the picker refreshes its loaded range with the current query.
+
+Deletions rewrite the file under its lock. Durable deletion metadata stores
+occurrence IDs or command hashes together with a submission-time boundary.
+Queued submissions are checked against those rules, allowing delayed writes
+from other windows to respect deletions while accepting later commands.
+Deletion rules remain until a newer rule subsumes them, since another window
+may replay a delayed submission with its original timestamp.
 
 ## 5. Files To Read First
 
