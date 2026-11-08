@@ -57,6 +57,9 @@ const FRAME_HOST_ERROR: u16 = 19;
 const FRAME_SESSION_STATE: u16 = 20;
 const MAX_BUFFERED_FRAMES: usize = 4096;
 const MAX_BUFFERED_BYTES: usize = 1_000_000;
+// Use the same streaming granularity for R callbacks and captured native IO.
+// This is a chunk size, not a limit on how much output R may produce.
+const OUTPUT_CHUNK_BYTES: usize = 8192;
 
 #[derive(Debug)]
 pub(crate) enum DialogRequest {
@@ -204,13 +207,17 @@ impl OutputSink {
     }
 
     pub(crate) fn emit_output(&self, stream: OutputStream, payload: &[u8]) -> io::Result<()> {
-        let mut framed = Vec::with_capacity(payload.len() + 1);
-        framed.push(match stream {
+        let stream = match stream {
             OutputStream::Stdout => 0,
             OutputStream::Stderr => 1,
-        });
-        framed.extend_from_slice(payload);
-        self.emit_frame(FRAME_OUTPUT, 0, &framed)
+        };
+        for chunk in payload.chunks(OUTPUT_CHUNK_BYTES) {
+            let mut framed = Vec::with_capacity(chunk.len() + 1);
+            framed.push(stream);
+            framed.extend_from_slice(chunk);
+            self.emit_frame(FRAME_OUTPUT, 0, &framed)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn emit_output_flush(&self) -> io::Result<()> {
@@ -407,7 +414,7 @@ fn capture_unix_fd_to_sink(
 
         thread::spawn(move || {
             let mut reader = File::from_raw_fd(read_fd);
-            let mut buffer = [0_u8; 8192];
+            let mut buffer = [0_u8; OUTPUT_CHUNK_BYTES];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
@@ -515,7 +522,7 @@ fn capture_windows_fd_to_sink(
         let read_handle_value = read_handle as isize;
         thread::spawn(move || {
             let mut reader = File::from_raw_handle(read_handle_value as _);
-            let mut buffer = [0_u8; 8192];
+            let mut buffer = [0_u8; OUTPUT_CHUNK_BYTES];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
@@ -853,6 +860,46 @@ fn decode_string(payload: &[u8], offset: usize) -> io::Result<(String, usize)> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    struct CapturedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn large_output_is_framed_without_losing_bytes_or_exceeding_the_reader_limit() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = OutputSink {
+            output_state: Arc::new(Mutex::new(OutputChannelState {
+                writer: Some(Box::new(CapturedOutput(Arc::clone(&captured)))),
+                backlog: VecDeque::new(), backlog_bytes: 0,
+            })),
+            host_name: Arc::new(String::new()), capabilities: Arc::new(Vec::new()),
+        };
+        let payload = "café 😀".repeat(MAX_INPUT_FRAME_BYTES / 8 + 1).into_bytes();
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            captured.lock().unwrap().clear();
+            sink.emit_output(stream, &payload).unwrap();
+            let frames = captured.lock().unwrap();
+            let mut offset = 0;
+            let mut restored = Vec::new();
+            while offset < frames.len() {
+                let length = u32::from_le_bytes(frames[offset..offset + 4].try_into().unwrap()) as usize;
+                assert!(length <= MAX_INPUT_FRAME_BYTES, "output frame exceeds the frontend limit");
+                assert_eq!(u16::from_le_bytes(frames[offset + 4..offset + 6].try_into().unwrap()), FRAME_OUTPUT);
+                let start = offset + FRAME_HEADER_LEN;
+                assert_eq!(frames[start], if matches!(stream, OutputStream::Stdout) { 0 } else { 1 });
+                restored.extend_from_slice(&frames[start + 1..start + length]);
+                offset = start + length;
+            }
+            assert_eq!(restored, payload);
+        }
+    }
 
     fn frame(kind: u16, request_id: u32, payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();

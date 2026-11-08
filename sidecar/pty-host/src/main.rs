@@ -1,5 +1,7 @@
 mod host;
 mod protocol;
+#[cfg(windows)]
+mod windows_pipe_security;
 
 fn main() {
     #[cfg(windows)]
@@ -27,6 +29,13 @@ fn windows_launch_or_run_real_host() -> Result<(), Box<dyn std::error::Error>> {
     const REAL_HOST_ENV: &str = "VSC_R_CONSOLE_REAL_HOST";
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--secure-session-pipe") {
+        if args.len() != 2 {
+            return Err("--secure-session-pipe requires one pipe name".into());
+        }
+        windows_pipe_security::secure_session_pipe(&args[1])?;
+        return Ok(());
+    }
     if std::env::var_os(REAL_HOST_ENV).is_some() {
         unsafe {
             // The real sidecar owns the embedded R session and TCP server. It
