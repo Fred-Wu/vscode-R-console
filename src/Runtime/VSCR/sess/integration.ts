@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import type { RuntimeHost } from "../../../Terminal/rTerminal/runtime";
 import { BaseVscodeRSessionIntegration } from "../integration";
 import type {
@@ -479,6 +480,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
 
     const proxy = new SessProxy({
       upstreamPipePath: upstreamConnection.pipePath,
+      runtimeHostPath: path.join(this.host.extensionPath, "bundled", "bin", "R_CONSOLE_HOST.exe"),
     });
     try {
       const pipePath = await proxy.start();

@@ -144,6 +144,11 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   assert.match(output.slice(beforeOversize), /8 MiB backend frame limit.*Nothing was sent/);
   assert.equal(backend.canUseSessionCommands(session), true, "rejected commands must not disconnect R");
   await submit('cat("STILL_CONNECTED\\n")', "STILL_CONNECTED");
+  stage = "large output";
+  await submit('cat(strrep("café 😀", 1024 * 1024)); cat("\\nLARGE_OUTPUT_DONE\\n")', "LARGE_OUTPUT_DONE");
+  assert.ok(output.includes("café 😀".repeat(1024 * 1024)),
+    "large output must arrive intact without disconnecting the frontend");
+  assert.equal(backend.canUseSessionCommands(session), true);
   stalled.destroy();
   assert.equal(await backend.requestParseStatus(session, "x <- ("), 2);
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");
