@@ -205,7 +205,7 @@ jobs:
         run: node scripts/package-vsix.js --target ${{ matrix.target }}
 
       - name: Upload VSIX
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vsix-${{ matrix.target }}
           path: vsc-r-console-*-${{ matrix.target }}.vsix
