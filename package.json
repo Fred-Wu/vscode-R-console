@@ -226,11 +226,11 @@
   "devDependencies": {
     "@types/node": "^24.12.2",
     "@types/vscode": "1.85.0",
-    "@vscode/vsce": "^3.7.1",
+    "@vscode/vsce": "^4.1.0",
     "esbuild": "^0.28.2",
-    "typescript": "^5.3.0",
+    "typescript": "^7.0.2",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/test-cli": "^0.0.12"
+    "@vscode/test-cli": "^0.0.15"
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0",

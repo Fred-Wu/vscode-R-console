@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -962,8 +962,14 @@ mod tests {
         let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let server_nonce = [7_u8; 32];
         let client_nonce = [9_u8; 32];
-        let client_proof = auth_mac(secret, AUTH_CLIENT_CONTEXT, &server_nonce, &client_nonce)
-            .finalize().into_bytes();
+        // Fixed vectors from Node's createHmac('sha256', Buffer.from(secret, 'ascii')),
+        // updated with context, server nonce, then client nonce, matching the extension.
+        let client_proof = [
+            0xa2, 0x5e, 0x45, 0x65, 0x05, 0x0f, 0x1d, 0xe1,
+            0x2f, 0x37, 0x29, 0xc6, 0xfd, 0x0c, 0xa5, 0xc6,
+            0x25, 0x10, 0x24, 0x61, 0xa2, 0xd8, 0x8b, 0x12,
+            0x93, 0x3b, 0x98, 0x05, 0x35, 0x32, 0xd8, 0x36,
+        ];
         let mut payload = Vec::from(client_nonce);
         payload.extend_from_slice(&client_proof);
         let mut stream = Duplex {
@@ -971,8 +977,12 @@ mod tests {
             output: Vec::new(),
         };
         assert!(authenticate_with_nonce(&mut stream, secret, server_nonce).unwrap());
-        let server_proof = auth_mac(secret, AUTH_SERVER_CONTEXT, &server_nonce, &client_nonce)
-            .finalize().into_bytes();
+        let server_proof = [
+            0xbc, 0xb6, 0xd2, 0x0b, 0x82, 0x23, 0xc9, 0x84,
+            0xfa, 0x3c, 0x84, 0x7d, 0xf6, 0x81, 0x7c, 0x24,
+            0x58, 0x79, 0xf2, 0x4a, 0xe4, 0x62, 0xb6, 0x1f,
+            0x96, 0xb4, 0x4f, 0xa4, 0xda, 0x0e, 0x4d, 0xa2,
+        ];
         let mut expected = frame(FRAME_SERVER_CHALLENGE, 0, &server_nonce);
         expected.extend(frame(FRAME_SERVER_PROOF, 0, &server_proof));
         assert_eq!(stream.output, expected);
