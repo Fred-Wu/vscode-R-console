@@ -1,10 +1,4 @@
-let nativeParseCallback: ((code: string) => Promise<number>) | null = null;
-
-export function setNativeParseCallback(
-  callback: ((code: string) => Promise<number>) | null
-): void {
-  nativeParseCallback = callback;
-}
+export type NativeParseCallback = (code: string) => Promise<number>;
 
 type LocalParseClassification = "complete" | "incomplete" | "unknown";
 
@@ -606,13 +600,14 @@ interface ParserState {
   bracketDepth: number;
 }
 
-export async function isExpressionCompleteAsync(code: string): Promise<boolean> {
-  const result = await getExpressionCompletenessAsync(code);
+export async function isExpressionCompleteAsync(code: string, nativeParse?: NativeParseCallback): Promise<boolean> {
+  const result = await getExpressionCompletenessAsync(code, nativeParse);
   return result.isComplete;
 }
 
 async function getExpressionCompletenessAsync(
-  code: string
+  code: string,
+  nativeParse?: NativeParseCallback
 ): Promise<{ isComplete: boolean; localClassification: LocalParseClassification }> {
   const sanitized = stripCommentLines(code);
   const trimmed = sanitized.trim();
@@ -625,9 +620,9 @@ async function getExpressionCompletenessAsync(
     return { isComplete: false, localClassification };
   }
 
-  if (nativeParseCallback) {
+  if (nativeParse) {
     try {
-      const status = await nativeParseCallback(sanitized);
+      const status = await nativeParse(sanitized);
       return { isComplete: status !== 2, localClassification };
     } catch {
     }

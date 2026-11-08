@@ -202,8 +202,9 @@
   ],
   "scripts": {
     "test": "node --test tests/unit/*.test.cjs",
+    "test:lsp": "node --test tests/lsp-startup.test.cjs tests/lsp-integration.test.cjs tests/lsp-lifecycle.test.cjs",
     "test:extension-host": "vscode-test",
-    "test:runtime": "node --test tests/runtime.test.cjs",
+    "test:runtime": "node --test tests/runtime.test.cjs tests/submission-runtime.test.cjs",
     "test:package": "node --test tests/package.test.cjs",
     "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",
     "build:sidecar": "node scripts/build-sidecar.js",
@@ -216,6 +217,8 @@
     "package": "npm run vscode:prepublish && npm run package:vsix"
   },
   "overrides": {
+    "glob": "^14.0.4",
+    "minimatch@>=7": "^11.0.5",
     "serialize-javascript": "^7.1.3",
     "diff": "^8.0.3",
     "uuid": "^11.1.1"
@@ -225,7 +228,7 @@
     "@types/vscode": "1.85.0",
     "@vscode/vsce": "^4.1.0",
     "esbuild": "^0.28.2",
-    "typescript": "^5.3.0",
+    "typescript": "^7.0.2",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/test-cli": "^0.0.12"
   },

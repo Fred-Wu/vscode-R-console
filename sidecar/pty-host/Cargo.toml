@@ -11,11 +11,12 @@ path = "src/main.rs"
 hmac = "0.12.1"
 sha2 = "0.10.9"
 libc = "0.2"
-libloading = "0.8"
+libloading = "0.9"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Security",
+  "Win32_Security_Authorization",
   "Win32_Security_Cryptography",
   "Win32_System_Console",
   "Win32_System_LibraryLoader",

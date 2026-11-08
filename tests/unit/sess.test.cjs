@@ -7,6 +7,7 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
+const runtimeHostPath = path.resolve(__dirname, "../../bundled/bin/R_CONSOLE_HOST.exe");
 
 const workspace = { search: [".GlobalEnv"], loaded_namespaces: ["base"], globalenv: {} };
 const attach = { jsonrpc: "2.0", method: "attach", params: {
@@ -157,13 +158,44 @@ function integrationFixture(t, info, overrides = {}) {
 test("Unix sess proxy is placed in a private directory before listening", { skip: process.platform === "win32" }, async (t) => {
   const fs = require("node:fs");
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: "/nonexistent-upstream" });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "/nonexistent-upstream" });
   t.after(() => proxy.dispose());
   const socketPath = await proxy.start();
   const directory = path.dirname(socketPath);
   assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
   assert.equal(fs.statSync(socketPath).mode & 0o777, 0o600);
   proxy.dispose();
+});
+
+test("sess proxy publishes its endpoint only after permissions succeed", { skip: process.platform === "win32" }, async (t) => {
+  const fs = require("node:fs");
+  let releasePermissions;
+  const permissionGate = new Promise((resolve) => { releasePermissions = resolve; });
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts", {
+    fs: { ...fs, promises: { ...fs.promises, chmod: async (...args) => {
+      await permissionGate;
+      return fs.promises.chmod(...args);
+    } } },
+  });
+  const server = await upstream(t);
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => { releasePermissions(); proxy.dispose(); });
+  const starting = proxy.start();
+  await waitFor(() => proxy.server?.listening);
+  assert.equal(proxy.getPipePath(), undefined);
+  const premature = await connectR(t, proxy.server.address());
+  send(premature.socket, attach);
+  await delay(30);
+  assert.equal(proxy.isConnected(), false);
+  assert.equal(server.sockets.length, 0);
+  assert.deepEqual(premature.messages, []);
+  releasePermissions();
+  const endpoint = await starting;
+  await waitFor(() => premature.socket.destroyed);
+  const r = await connectR(t, endpoint);
+  send(r.socket, attach);
+  await waitFor(() => proxy.getWorkspaceData());
+  assert.equal(proxy.getSessionId(), attach.params.session_id);
 });
 
 test("sess startup uses opaque upstream attachment preparation per proxy", async (t) => {
@@ -586,7 +618,7 @@ test("cancelled manual recovery does not submit R code after preparation resolve
 test("proxy forwards protocol 2 attach metadata and keeps workspace and completion capabilities", { timeout: 10000 }, async (t) => {
   const server = await upstream(t);
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: server.endpoint });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
   t.after(() => proxy.dispose());
 
   const endpoint = await proxy.start();
@@ -622,23 +654,26 @@ test("proxy forwards protocol 2 attach metadata and keeps workspace and completi
 test("proxy replacement survives old socket close, forwards Unicode, and propagates upstream disconnect", { timeout: 10000 }, async (t) => {
   const server = await upstream(t);
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: server.endpoint });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
   t.after(() => proxy.dispose());
   const endpoint = await proxy.start();
   const first = await connectR(t, endpoint, false);
   send(first.socket, attach);
   await waitFor(() => proxy.getSessionId() && server.sockets.length === 1);
   const oldSocket = proxy.rSocket;
+  const oldUpstream = proxy.upstreamSocket;
   const pending = proxy.requestMemberCompletions("x", "$");
   await waitFor(() => first.messages.some((message) => message.method === "completion"));
   const second = await connectR(t, endpoint);
-  await waitFor(() => server.sockets.length === 2);
-  assert.equal(await pending, undefined);
-  assert.equal(proxy.getSessionId(), undefined);
-  oldSocket.emit("close");
-  assert.equal(proxy.isConnected(), true);
   const replacement = { ...attach, params: { ...attach.params, session_id: "replacement" } };
   send(second.socket, replacement);
+  await waitFor(() => server.sockets.length === 2);
+  assert.equal(await pending, undefined);
+  assert.equal(proxy.getSessionId(), "replacement");
+  oldSocket.emit("close");
+  oldSocket.emit("drain");
+  oldUpstream.emit("drain");
+  assert.equal(proxy.isConnected(), true);
   await waitFor(() => proxy.getSessionId() === "replacement" && proxy.getWorkspaceData());
   const unicode = { jsonrpc: "2.0", method: "help", params: { text: "café 😀" } };
   const bytes = Buffer.from(`${JSON.stringify(unicode)}\n`);
@@ -662,7 +697,7 @@ test("proxy replacement survives old socket close, forwards Unicode, and propaga
 
 test("sess workspace refresh publishes promptly and then synchronizes library paths", async () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "/not-connected" });
   proxy.rSocket = { destroyed: false, destroy() { this.destroyed = true; } };
   let resolvePaths;
   const pathsPending = new Promise((resolve) => { resolvePaths = resolve; });
@@ -697,7 +732,7 @@ test("sess workspace refresh publishes promptly and then synchronizes library pa
 
 test("late workspace responses cannot restore a disconnected session", async () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "/not-connected" });
   const socket = { destroyed: false, destroy() { this.destroyed = true; } };
   proxy.rSocket = socket;
   let completeWorkspace;
@@ -711,7 +746,7 @@ test("late workspace responses cannot restore a disconnected session", async () 
 
 test("late library-path responses do not overwrite a replacement R socket", async () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: "/not-connected" });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "/not-connected" });
   const oldSocket = { destroyed: false, destroy() { this.destroyed = true; } };
   const newSocket = { destroyed: false, destroy() { this.destroyed = true; } };
   proxy.rSocket = oldSocket;
@@ -733,7 +768,7 @@ test("late library-path responses do not overwrite a replacement R socket", asyn
 
 test("sess proxy accepts multiple bounded JSON-RPC messages in one chunk", () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: "unused" });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "unused" });
   const line = "x".repeat(9 * 1024 * 1024);
   let handled = 0;
   const remaining = proxy.forwardLines("", `${line}\n${line}\n`,
@@ -744,7 +779,7 @@ test("sess proxy accepts multiple bounded JSON-RPC messages in one chunk", () =>
 
 test("sess proxy closes sockets before unbounded JSON lines accumulate", () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ upstreamPipePath: "unused" });
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "unused" });
   const connections = [{ destroyed: false, destroy() { this.destroyed = true; } },
     { destroyed: false, destroy() { this.destroyed = true; } }];
   proxy.rSocket = connections[0];
@@ -753,6 +788,312 @@ test("sess proxy closes sockets before unbounded JSON lines accumulate", () => {
     Buffer.from("b"), () => true, connections[1]);
   assert.equal(remainder, "");
   assert.ok(connections.every((socket) => socket.destroyed));
+});
+
+for (const direction of ["R to vscode-R", "vscode-R to R"]) {
+  test(`sess proxy applies backpressure and resumes delivery: ${direction}`, { timeout: 10000 }, async (t) => {
+    const server = await upstream(t);
+    const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+    const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+    t.after(() => proxy.dispose());
+    const r = await connectR(t, await proxy.start());
+    send(r.socket, attach);
+    await waitFor(() => proxy.getWorkspaceData() && server.messages.length);
+    const fromR = direction === "R to vscode-R";
+    const sender = fromR ? r.socket : server.sockets[0];
+    const receiver = fromR ? server.sockets[0] : r.socket;
+    const source = fromR ? proxy.rSocket : proxy.upstreamSocket;
+    const target = fromR ? proxy.upstreamSocket : proxy.rSocket;
+    const messages = fromR ? server.messages : r.messages;
+    receiver.pause();
+    for (let index = 0; index < 64; index++) {
+      send(sender, { jsonrpc: "2.0", method: "bulk", params: { index, text: "x".repeat(256 * 1024) } });
+    }
+    await waitFor(() => source.isPaused());
+    await delay(30);
+    assert.ok(target.writableLength <= target.writableHighWaterMark + 257 * 1024,
+      "stop queuing after the first write that fills the destination");
+    receiver.resume();
+    await waitFor(() => messages.filter((message) => message.method === "bulk").length === 64);
+    assert.deepEqual(messages.filter((message) => message.method === "bulk").map((message) => message.params.index),
+      Array.from({ length: 64 }, (_, index) => index));
+    await waitFor(() => !source.isPaused());
+    assert.equal(proxy.isConnected(), true);
+
+    // Hold a final batch in the proxy's writable queue. No later data event
+    // may be needed to flush its remainder after the destination drains.
+    const finalBatch = [
+      { method: "final", params: { index: 0, text: "x".repeat(128 * 1024) } },
+      { method: "final", params: { index: 1, text: "café 😀" } },
+      { method: "final", params: { index: 2, text: "done" } },
+    ];
+    target.cork();
+    sender.write(finalBatch.map((message) => JSON.stringify(message) + "\n").join(""));
+    await waitFor(() => source.isPaused());
+    target.uncork();
+    await waitFor(() => messages.filter((message) => message.method === "final").length === 3);
+    assert.deepEqual(messages.filter((message) => message.method === "final"), finalBatch);
+    await waitFor(() => !source.isPaused());
+    assert.equal(proxy.isConnected(), true);
+  });
+}
+
+test("sess proxy retains the rest of a batch when a write applies backpressure", async (t) => {
+  const { Writable } = require("node:stream");
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "unused" });
+  let release;
+  const written = [];
+  const target = new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) {
+    written.push(chunk.toString());
+    release = callback;
+  } });
+  t.after(() => target.destroy());
+  let pauses = 0;
+  const source = { pause() { pauses++; } };
+  const lines = [1, 2, 3].map((index) => `${JSON.stringify({ method: "test", index })}\n`);
+  const handled = [];
+  const handle = (line) => { handled.push(JSON.parse(line).index); return true; };
+  let remaining = proxy.forwardLines("", lines.join("") + '{"partial":', handle, target, source);
+  for (let index = 0; index < lines.length; index++) {
+    assert.equal(target.writableLength, Buffer.byteLength(lines[index]));
+    assert.deepEqual(handled, [1, 2, 3].slice(0, index + 1));
+    assert.equal(remaining, lines.slice(index + 1).join("") + '{"partial":');
+    const drained = once(target, "drain");
+    release();
+    await drained;
+    remaining = proxy.forwardLines(remaining, "", handle, target, source);
+  }
+  assert.deepEqual(written, lines);
+  assert.ok(pauses >= 3);
+  assert.equal(target.destroyed, false);
+});
+
+test("local sess requests respect backpressure without disconnecting R", async () => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "unused" });
+  let writes = 0;
+  const socket = {
+    destroyed: false, writableNeedDrain: true,
+    write(data) {
+      writes++;
+      const { id } = JSON.parse(data);
+      setImmediate(() => proxy.handleRLine(JSON.stringify({ id, result: [{ name: "member" }] })));
+      return true;
+    },
+    destroy() { this.destroyed = true; },
+  };
+  proxy.rSocket = socket;
+  assert.equal(await proxy.requestMemberCompletions("x", "$"), undefined);
+  assert.equal(writes, 0);
+  assert.equal(proxy.pendingRequests.size, 0);
+  assert.equal(socket.destroyed, false);
+  socket.writableNeedDrain = false;
+  const result = await proxy.requestMemberCompletions("x", "$");
+  assert.equal(result[0].name, "member");
+  assert.equal(writes, 1);
+  proxy.dispose();
+});
+
+test("a silent sess connection cannot evict the active R session or receive its requests", async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const endpoint = await proxy.start();
+  const r = await connectR(t, endpoint);
+  send(r.socket, attach);
+  await waitFor(() => proxy.getWorkspaceData());
+  const original = proxy.rSocket;
+  const silent = await connectR(t, endpoint);
+  await delay(100);
+  assert.equal(proxy.rSocket, original);
+  assert.equal(server.sockets.length, 1);
+  assert.deepEqual(await proxy.requestWorkspace(), workspace);
+  assert.deepEqual(silent.messages, []);
+});
+
+test("sess admission bounds pending clients and expires trickled attachment attempts", { timeout: 10000 }, async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const endpoint = await proxy.start();
+  const r = await connectR(t, endpoint);
+  send(r.socket, attach);
+  await waitFor(() => proxy.getWorkspaceData());
+  const candidates = [];
+  for (let index = 0; index < 8; index++) candidates.push(await connectR(t, endpoint));
+  const socketErrors = [];
+  // Expiry may break an in-flight write before close. events.once("close")
+  // rejects on that error, even though the proxy is closing as intended.
+  const closed = Promise.all(candidates.map(({ socket }) => new Promise((resolve) => {
+    socket.on("error", (error) => socketErrors.push(error));
+    socket.once("close", resolve);
+  })));
+  const excess = await connectR(t, endpoint);
+  await waitFor(() => excess.socket.destroyed);
+  const trickleSocket = candidates[0].socket;
+  const stopTrickling = () => clearInterval(timer);
+  const timer = setInterval(() => {
+    if (trickleSocket.destroyed || !trickleSocket.writable) {
+      stopTrickling();
+      return;
+    }
+    trickleSocket.write(" ");
+  }, 100);
+  trickleSocket.once("error", stopTrickling);
+  trickleSocket.once("close", stopTrickling);
+  t.after(stopTrickling);
+  await closed;
+  stopTrickling();
+  for (const error of socketErrors) {
+    assert.ok(["EPIPE", "ECONNRESET"].includes(error.code), `Unexpected socket error: ${error}`);
+  }
+  assert.equal(proxy.pendingRSockets.size, 0);
+  assert.equal(server.sockets.length, 1);
+  assert.equal(proxy.getSessionId(), attach.params.session_id);
+  assert.deepEqual(await proxy.requestWorkspace(), workspace);
+});
+
+test("sess admission rejects malformed and oversized first messages without replacing R", async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const endpoint = await proxy.start();
+  const r = await connectR(t, endpoint);
+  send(r.socket, attach);
+  await waitFor(() => proxy.getWorkspaceData());
+  for (const input of ["not JSON\n", '{"method":"workspace_updated"}\n',
+    '{"method":"attach","params":null}\n', "x".repeat(16 * 1024 * 1024 + 1)]) {
+    const candidate = await connectR(t, endpoint);
+    // Closing an oversized stream can race with the sender's remaining writes.
+    candidate.socket.on("error", () => {});
+    candidate.socket.write(input);
+    await waitFor(() => candidate.socket.destroyed);
+    assert.equal(proxy.getSessionId(), attach.params.session_id);
+    assert.equal(r.socket.destroyed, false);
+  }
+  assert.equal(server.sockets.length, 1);
+});
+
+test("sess admission preserves the existing message-size allowance", async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const r = await connectR(t, await proxy.start());
+  const message = { ...attachV2, params: { ...attachV2.params, extra: "x".repeat(1024 * 1024 + 1) } };
+  send(r.socket, message);
+  await waitFor(() => server.messages.some((message) => message.method === "attach"));
+  assert.deepEqual(server.messages.find((message) => message.method === "attach"), message);
+  assert.equal(proxy.getSessionId(), attachV2.params.session_id);
+});
+
+test("sess admission preserves fragmented Unicode attach and coalesced following messages", async (t) => {
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const r = await connectR(t, await proxy.start(), false);
+  const message = { ...attachV2, params: { ...attachV2.params, wd: "/café/😀" } };
+  const following = { jsonrpc: "2.0", method: "help", params: { text: "preserved 😀" } };
+  const data = Buffer.from(`\n${JSON.stringify(message)}\n${JSON.stringify(following)}\n`);
+  const split = data.indexOf(Buffer.from("😀")) + 1;
+  r.socket.write(data.subarray(0, split));
+  await delay(10);
+  assert.equal(proxy.isConnected(), false);
+  const nextSplit = data.lastIndexOf(Buffer.from("😀")) + 1;
+  r.socket.write(data.subarray(split, nextSplit));
+  await delay(10);
+  r.socket.write(data.subarray(nextSplit));
+  await waitFor(() => server.messages.length >= 2);
+  assert.deepEqual(server.messages.slice(0, 2), [message, following]);
+  assert.equal(proxy.getSessionId(), message.params.session_id);
+  const pending = await connectR(t, proxy.getPipePath());
+  const closed = once(pending.socket, "close");
+  proxy.dispose();
+  await closed;
+  assert.equal(proxy.pendingRSockets.size, 0);
+});
+
+test("Windows read-only named-pipe client cannot evict R or read session requests", {
+  skip: process.platform !== "win32", timeout: 15000,
+}, async (t) => {
+  const { execFile } = require("node:child_process");
+  const { promisify } = require("node:util");
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const endpoint = await proxy.start();
+  const r = await connectR(t, endpoint);
+  send(r.socket, attach);
+  await waitFor(() => proxy.getWorkspaceData());
+  const original = proxy.rSocket;
+  // Use a real read-only Windows handle; Node's net clients request duplex access.
+  const result = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `
+    $ErrorActionPreference = 'Stop'
+    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:VRC_TEST_PIPE, [System.IO.Pipes.PipeDirection]::In)
+    try {
+      $pipe.Connect(3000)
+      [Console]::WriteLine($pipe.ReadByte())
+    } finally { $pipe.Dispose() }
+  `], { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, timeout: 10000 });
+  assert.equal(result.stdout.trim(), "-1", "the read-only client must receive EOF without session bytes");
+  assert.equal(proxy.rSocket, original);
+  assert.equal(proxy.getSessionId(), attach.params.session_id);
+  assert.deepEqual(await proxy.requestWorkspace(), workspace);
+});
+
+test("Windows sess pipe grants access only to its local owner across instances", {
+  skip: process.platform !== "win32", timeout: 15000,
+}, async (t) => {
+  const { execFile } = require("node:child_process");
+  const { promisify } = require("node:util");
+  const server = await upstream(t);
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
+  t.after(() => proxy.dispose());
+  const endpoint = await proxy.start();
+  // Inspect several fresh instances, including ones Node creates after start.
+  const result = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `
+    $ErrorActionPreference = 'Stop'
+    $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    for ($i = 0; $i -lt 6; $i++) {
+      $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:VRC_TEST_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
+      try {
+        $pipe.Connect(3000)
+        $security = $pipe.GetAccessControl()
+        if (!$security.AreAccessRulesProtected) { throw 'Pipe DACL is not protected' }
+        $rules = $security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+        $allowed = @($rules | Where-Object { $_.AccessControlType -eq 'Allow' })
+        $denied = @($rules | Where-Object { $_.AccessControlType -eq 'Deny' })
+        if ($allowed.Count -ne 1 -or $allowed[0].IdentityReference.Value -ne $owner) { throw 'Unexpected pipe access grant' }
+        if ($denied.Count -ne 1 -or $denied[0].IdentityReference.Value -ne 'S-1-5-2') { throw 'Network logons are not denied' }
+      } finally { $pipe.Dispose() }
+    }
+    [Console]::WriteLine('owner-only')
+  `], { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, timeout: 10000 });
+  assert.equal(result.stdout.trim(), "owner-only");
+  assert.equal(server.sockets.length, 0, "permission inspection must not attach a session");
+  const r = await connectR(t, endpoint);
+  send(r.socket, attach);
+  await waitFor(() => proxy.getWorkspaceData());
+  assert.equal(proxy.getSessionId(), attach.params.session_id);
+});
+
+test("Windows sess startup fails closed if pipe permissions cannot be set", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
+  const proxy = new SessProxy({ runtimeHostPath: path.join(os.tmpdir(), randomUUID() + ".exe"), upstreamPipePath: "unused" });
+  t.after(() => proxy.dispose());
+  await assert.rejects(proxy.start());
+  assert.equal(proxy.getPipePath(), undefined);
+  assert.equal(proxy.server, undefined);
+  assert.equal(proxy.isConnected(), false);
 });
 
 test("CI cancels superseded branch builds instead of retaining a queue", () => {

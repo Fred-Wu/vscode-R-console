@@ -4,9 +4,17 @@ All notable changes to R Console will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed missing argument suggestions after accepting a partial function name match in automatic inline completion, such as `libr` to `library()`.
+- Fixed code suggestions sometimes failing when typing or pressing Tab just after opening an R Console.
+- Improved the reliability of code submission in the R Console.
+- Fixed cases where code suggestions could get stuck when using older versions of vscode-R.
+- Fixed interruptions when displaying large amounts of R output.
+
 ### Security
 
-- Improved the security of R Console connections, including persistent sessions and language-server communication.
+- Improved the security and stability of R Console connections.
 
 ## [0.5.4] - 2026-10-23
 

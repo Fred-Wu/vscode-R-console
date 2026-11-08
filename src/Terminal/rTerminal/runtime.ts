@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { setNativeParseCallback, stripCommentLines } from "../../Language/parser";
+import { stripCommentLines } from "../../Language/parser";
 import {
   type BackendControlEvent,
   type BackendDialogRequest,
@@ -58,11 +58,59 @@ type Dimensions = {
 export type TerminalMode = "starting" | "ready" | "executing" | "reply" | "closed";
 
 export type Submission = {
+  kind: "execute" | "parse" | "edit";
   code: string;
   initialPromptKind: "main" | "cont";
+  continuationEdit?: { cursor: number; text: string };
+  editCursor?: number;
+  parsing?: {
+    generation: number;
+    sourceOffset?: number;
+    previous?: Promise<void>;
+    done?: Promise<void>;
+    finish?(): void;
+  };
 };
 
 const pendingRuntimeRewrites = new WeakMap<RuntimeHost, PendingRuntimeRewrite>();
+const latestParsing = new WeakMap<RuntimeHost, NonNullable<Submission["parsing"]>>();
+const pendingParseReadiness = new WeakMap<RuntimeHost, { promise: Promise<void>; resolve(): void }>();
+
+function runtimeIsReady(host: RuntimeHost): boolean {
+  return host.mode === "ready" && host.promptReady && host.activeSubmission === null;
+}
+
+// One lazy waiter per console, shared by readiness and cancellation. No polling
+// and no native request (or native timeout) until R can service the check.
+export function wakeRuntimeParser(host: RuntimeHost): void {
+  const waiting = pendingParseReadiness.get(host);
+  pendingParseReadiness.delete(host);
+  waiting?.resolve();
+}
+
+export async function requestRuntimeParseStatus(host: RuntimeHost, code: string): Promise<number> {
+  const generation = host.submissionGeneration;
+  const process = host.rProcess;
+  const backend = host.runtimeBackend;
+  for (;;) {
+    if (generation !== host.submissionGeneration || process !== host.rProcess ||
+      backend !== host.runtimeBackend || host.mode === "closed") {
+      throw new Error("R parse check cancelled");
+    }
+    if (runtimeIsReady(host)) break;
+    let waiting = pendingParseReadiness.get(host);
+    if (!waiting) {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      waiting = { promise, resolve };
+      pendingParseReadiness.set(host, waiting);
+    }
+    await waiting.promise;
+  }
+  const result = backend?.requestParseStatus(process, code);
+  if (!result) throw new Error("R native parser unavailable");
+  return await result;
+}
 
 export type RuntimeHost = {
   options: RTerminalOptions;
@@ -85,6 +133,8 @@ export type RuntimeHost = {
   sessionHostConnected: boolean;
   activeSubmission: Submission | null;
   submissionQueue: Submission[];
+  submissionGeneration: number;
+  cancelPendingSubmissions(): void;
   historyBrowsing: boolean;
   historyCollapsed: boolean;
   inputState: InputState;
@@ -224,7 +274,7 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
   host.lastWriteEndedWithNewline = true;
   host.hasReceivedOutput = false;
   host.inputState.reset();
-  host.submissionQueue = [];
+  host.cancelPendingSubmissions();
   host.activeSubmission = null;
   host.backendChildPid = undefined;
   host.sessionHostConnected = false;
@@ -263,7 +313,6 @@ export async function startRuntime(host: RuntimeHost): Promise<void> {
     });
     integration.afterRuntimeStarted();
     primeRuntimeAttach(host);
-    setNativeParseCallback(null);
     attachRuntimeSession(host, true);
 
     updateRuntimeTerminalName(host);
@@ -288,32 +337,35 @@ export function attachRuntimeSession(host: RuntimeHost, showStartupErrors: boole
     return;
   }
   vscodeRIntegration(host).attachRuntime();
-  setNativeParseCallback(null);
-  host.runtimeBackend.attach(host.rProcess, {
+  const backend = host.runtimeBackend;
+  const session = host.rProcess;
+  const isCurrent = (): boolean => host.runtimeBackend === backend && host.rProcess === session && host.mode !== "closed";
+  backend.attach(session, {
     onStdout: (output) => {
+      if (!isCurrent()) return;
       handleRuntimeOutput(host, output);
     },
     onStderr: (errorText) => {
+      if (!isCurrent()) return;
       handleRuntimeError(host, errorText);
     },
     onControl: (event) => {
+      if (!isCurrent()) return;
       handleRuntimeControl(host, event);
     },
     onExit: (code) => {
+      if (!isCurrent()) return;
       handleRuntimeExit(host, code);
     },
     onError: (err) => {
-      setNativeParseCallback(null);
+      if (!isCurrent()) return;
       if (showStartupErrors) {
         host.writeEmitter.fire(
           `${ANSI.red}Failed to start R: ${err.message}${ANSI.reset}\r\n`
         );
       }
-      const failedRuntime = host.rProcess;
-      if (failedRuntime && host.runtimeBackend) {
-        host.runtimeBackend.detach(failedRuntime);
-        host.runtimeBackend.close(failedRuntime);
-      }
+      backend.detach(session);
+      backend.close(session);
       handleRuntimeExit(host, 1);
     },
   });
@@ -343,7 +395,6 @@ export function handleRuntimeControl(
     case "host-connected":
       host.sessionHostConnected = true;
       vscodeRIntegration(host).handleHostConnected();
-      updateNativeParseCallback(host);
       return;
     case "prompt":
       handleBackendPrompt(host, event.kind);
@@ -353,6 +404,7 @@ export function handleRuntimeControl(
       return;
     case "busy":
       if (event.value) {
+        host.promptReady = false;
         if (host.awaitingExecutionStart && host.activeSubmission) {
           host.awaitingExecutionStart = false;
         }
@@ -420,7 +472,6 @@ function applyRuntimeSessionState(
   }
 
   host.sessionHostConnected = true;
-  updateNativeParseCallback(host);
 
   if (event.busy || event.wait.kind === "none") {
     host.clearPromptRenderTimer();
@@ -451,6 +502,8 @@ function applyRuntimeSessionState(
       if (event.wait.prompt === "main") {
         vscodeRIntegration(host).handleMainPrompt();
       }
+      wakeRuntimeParser(host);
+      host.startNextSubmission();
       return;
     case "nested":
       host.promptReady = false;
@@ -473,6 +526,9 @@ function restoreReadyStateAfterExecution(host: RuntimeHost): void {
     host.awaitingExecutionStart = false;
     return;
   }
+
+  // busy(false) is not an input-ready event, including on a busy reconnect.
+  if (!host.promptReady) return;
 
   host.mode = "ready";
 
@@ -517,6 +573,8 @@ export function handleBackendPrompt(
   } else {
     host.mode = "ready";
   }
+
+  wakeRuntimeParser(host);
 
   if (host.submissionPending) {
     host.pendingPromptToken = false;
@@ -1057,16 +1115,36 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
     }
     return;
   }
+  const sent = host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+    type: "submit",
+    code: task.code,
+  }) ?? false;
+  if (!sent) {
+    const restored = restoreSubmissionSource([task, ...host.submissionQueue], host.inputState.text,
+      host.inputState.cursorPosition);
+    host.cancelPendingSubmissions();
+    host.activeSubmission = null;
+    host.submissionPending = false;
+    host.awaitingExecutionStart = false;
+    host.mode = "ready";
+    host.inputState.text = restored.code;
+    host.inputState.cursorPosition = restored.cursor;
+    if (host.promptVisible) {
+      host.clearInputRender();
+      host.promptVisible = false;
+    }
+    host.pendingPromptToken = true;
+    handleRuntimeError(host, "R submission was not sent. Unsent code restored for editing.\n");
+    host.schedulePrompt();
+    return;
+  }
   host.submissionPending = false;
   host.pendingPromptToken = false;
   host.awaitingExecutionStart = true;
   host.mode = "executing";
   writeRuntimeSubmissionEcho(host, task);
+  host.promptReady = false;
   host.clearPromptRenderTimer();
-  host.runtimeBackend?.sendSessionCommand(host.rProcess, {
-    type: "submit",
-    code: task.code,
-  });
 }
 
 export function finishRuntimeSubmission(host: RuntimeHost): void {
@@ -1077,44 +1155,199 @@ export function finishRuntimeSubmission(host: RuntimeHost): void {
 }
 
 export function startNextRuntimeSubmission(host: RuntimeHost): void {
-  if (host.mode !== "ready" && !(host.mode === "executing" && host.activeSubmission === null)) {
+  if (!runtimeIsReady(host)) return;
+  const next = host.submissionQueue[0];
+  if (!next || next.kind === "parse") return;
+  host.submissionQueue.shift();
+  if (next.kind === "edit") {
+    const draft = host.inputState.text;
+    const cursor = host.inputState.cursorPosition;
+    const prefix = next.editCursor === undefined
+      ? next.code + (draft && !/\n[ \t]*$/.test(next.code) ? "\n" : "")
+      : next.code.slice(0, next.editCursor);
+    const suffix = next.editCursor === undefined ? "" : next.code.slice(next.editCursor);
+    host.inputState.text = prefix + draft + suffix;
+    host.inputState.cursorPosition = prefix.length + cursor;
+    host.mode = "ready";
+    host.renderInput();
     return;
   }
-  if (host.activeSubmission) {
-    return;
+  host.activeSubmission = next;
+  startRuntimeSubmission(host, next);
+}
+
+/** Reserve the accepted batch before asynchronous parsing begins. */
+export function reserveRuntimeSubmission(
+  host: RuntimeHost,
+  code: string,
+  continuationEdit?: Submission["continuationEdit"]
+): Submission {
+  const slot: Submission = { kind: "parse", code, initialPromptKind: host.promptKind, continuationEdit };
+  const tail = host.submissionQueue.at(-1);
+  if (tail?.kind === "edit") {
+    // Parsing may have finished while an earlier expression is still running.
+    // The queued tail still belongs to the next accepted input.
+    host.submissionQueue.pop();
+    continueSubmission(slot, tail.code, tail.initialPromptKind, tail.editCursor);
   }
-  const task = host.submissionQueue.shift();
-  if (!task) {
-    return;
+  const previous = latestParsing.get(host);
+  let previousDone: Promise<void> | undefined;
+  if (previous && previous.generation === host.submissionGeneration) {
+    // Allocate a completion promise only when another reservation needs to wait.
+    previous.done ??= new Promise<void>((resolve) => { previous.finish = resolve; });
+    previousDone = previous.done;
   }
-  host.activeSubmission = task;
-  startRuntimeSubmission(host, task);
+  slot.parsing = {
+    generation: host.submissionGeneration,
+    previous: previousDone,
+  };
+  latestParsing.set(host, slot.parsing);
+  host.submissionQueue.push(slot);
+  return slot;
+}
+
+function continueSubmission(
+  slot: Submission,
+  code: string,
+  promptKind: Submission["initialPromptKind"],
+  cursor?: number
+): void {
+  // Input accepted while Enter is being checked belongs at the saved editing
+  // position, just as typing after restoration would. Editor tails without an
+  // Enter edit continue on the next line.
+  const prefix = cursor === undefined
+    ? code + (/\n[ \t]*$/.test(code) ? "" : "\n")
+    : code.slice(0, cursor);
+  const suffix = cursor === undefined ? "" : code.slice(cursor);
+  if (cursor !== undefined) slot.editCursor = prefix.length + slot.code.length;
+  else if (slot.editCursor !== undefined) slot.editCursor += prefix.length;
+  slot.code = prefix + slot.code + suffix;
+  if (slot.continuationEdit) slot.continuationEdit.cursor += prefix.length;
+  slot.initialPromptKind = promptKind;
+}
+
+function restoreSubmissionSource(submissions: Submission[], draft: string, draftCursor: number): { code: string; cursor: number } {
+  let restored: Submission | undefined;
+  for (const submission of submissions) {
+    const code = submission.code || submission.continuationEdit?.text || "";
+    if (!code) continue;
+    const editCursor = submission.editCursor === undefined ? undefined
+      : Math.max(0, Math.min(code.length, submission.editCursor - (submission.parsing?.sourceOffset ?? 0)));
+    const next = { ...submission, code: code.replace(/\r\n?/g, "\n"), editCursor, continuationEdit: undefined };
+    if (restored) continueSubmission(next, restored.code, restored.initialPromptKind, restored.editCursor);
+    restored = next;
+  }
+  if (!restored) return { code: draft, cursor: draftCursor };
+  const cursor = restored.editCursor ?? restored.code.length;
+  const prefix = restored.code.slice(0, cursor);
+  const suffix = restored.code.slice(cursor);
+  const separator = draft && restored.editCursor === undefined && !/\n[ \t]*$/.test(prefix) ? "\n" : "";
+  return { code: prefix + separator + draft + suffix, cursor: cursor + separator.length + draftCursor };
 }
 
 export async function enqueueRuntimeSubmission(
   host: RuntimeHost,
   code: string,
-  skipSplit: boolean = false
-) : Promise<string[]> {
-  const blocks = skipSplit
-    ? [normalizeSubmissionBlock(code)]
-    : await splitSubmissionBlocks(host, code);
-
-  if (blocks.length === 0) {
-    host.submissionPending = false;
-    host.awaitingExecutionStart = false;
-    return [];
-  }
-
-  for (const block of blocks) {
-    host.submissionQueue.push({
-      code: block,
-      initialPromptKind: host.promptKind,
+  skipSplit: boolean = false,
+  slot: Submission = reserveRuntimeSubmission(host, code),
+  onAcceptedBlock?: (block: string) => void
+): Promise<string[]> {
+  const generation = host.submissionGeneration;
+  const blocks: string[] = [];
+  const publish = (block: string, kind: Submission["kind"], editCursor?: number): void => {
+    const index = host.submissionQueue.indexOf(slot);
+    if (index < 0 || generation !== host.submissionGeneration) return;
+    host.submissionQueue.splice(index, 0, {
+      kind, code: block, initialPromptKind: slot.initialPromptKind, editCursor,
     });
-  }
+    if (kind === "execute") blocks.push(block);
+    startNextRuntimeSubmission(host);
+    // Record each accepted expression now; cancelling later parsing must not
+    // erase earlier history. An immediate delivery failure invalidates this
+    // generation and leaves the unsent expression available for retry instead.
+    if (kind === "execute" && generation === host.submissionGeneration) onAcceptedBlock?.(block);
+  };
 
+  try {
+    if (slot.parsing?.previous) {
+      await slot.parsing.previous;
+      slot.parsing.previous = undefined;
+    }
+    if (generation !== host.submissionGeneration || !host.submissionQueue.includes(slot)) return blocks;
+    // Parser ownership follows the submission, never the last console to connect.
+    const nativeParse = host.sessionHostConnected && host.runtimeBackend?.hasCapability(host.rProcess, "parse-status")
+      ? (source: string) => requestRuntimeParseStatus(host, source)
+      : undefined;
+    const hasContinuation = code !== slot.code;
+    code = slot.code;
+    if (skipSplit && !hasContinuation) {
+      slot.code = "";
+      const block = normalizeSubmissionBlock(code);
+      if (block.trim()) publish(block, "execute");
+    } else {
+      const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const lines = normalized.split("\n");
+      let pending = "";
+      let pendingStart = 0;
+      let offset = 0;
+      for (const line of lines) {
+        if (!pending) pendingStart = offset;
+        offset += line.length + 1;
+        pending = pending ? pending + "\n" + line : line;
+        const block = normalizeSubmissionBlock(pending);
+        if (!block.trim()) continue;
+        const complete = await host.inputState.isExpressionCompleteAsync(block, nativeParse);
+        if (generation !== host.submissionGeneration || !host.submissionQueue.includes(slot)) return blocks;
+        if (complete) {
+          // On delivery failure, the placeholder contains only the not-yet-published tail.
+          slot.code = normalized.slice(offset);
+          if (slot.parsing) slot.parsing.sourceOffset = offset;
+          if (!slot.code) slot.continuationEdit = undefined;
+          publish(block, "execute");
+          pending = "";
+        }
+      }
+      if (normalizeSubmissionBlock(pending).trim()) {
+        let editCursor = slot.editCursor === undefined ? undefined
+          : Math.max(0, Math.min(pending.length, slot.editCursor - pendingStart));
+        if (slot.continuationEdit) {
+          const { cursor, text } = slot.continuationEdit;
+          const position = Math.max(0, Math.min(pending.length, cursor - pendingStart));
+          pending = pending.slice(0, position) + text + pending.slice(position);
+          editCursor = position + text.length;
+        }
+        slot.code = "";
+        const next = host.submissionQueue[host.submissionQueue.indexOf(slot) + 1];
+        if (next?.kind === "parse") {
+          // Transfer ownership before releasing the next parser. Never restore
+          // this prefix into the editor as well as passing it to queued input.
+          continueSubmission(next, pending, slot.initialPromptKind, editCursor);
+        } else {
+          // With no accepted successor, the editable buffer owns continuation.
+          // Subsequent Enter/paste snapshots already include that buffer.
+          publish(pending, "edit", editCursor);
+        }
+      }
+    }
+  } finally {
+    const index = host.submissionQueue.indexOf(slot);
+    if (index >= 0) {
+      host.submissionQueue.splice(index, 1);
+      startNextRuntimeSubmission(host);
+      // A comment-only batch produces no R prompt event. Restore the local
+      // prompt once all accepted work is idle, without interrupting execution
+      // or redrawing an already visible prompt.
+      if (generation === host.submissionGeneration && host.mode === "ready" &&
+        !host.activeSubmission && host.submissionQueue.length === 0 && !host.promptVisible) {
+        host.pendingPromptToken = true;
+        host.schedulePrompt();
+      }
+    }
+    slot.parsing?.finish?.();
+    if (latestParsing.get(host) === slot.parsing) latestParsing.delete(host);
+    slot.parsing = undefined;
+  }
   void host.lang.refreshCompletionContextDocument(host.inputState.text);
-  startNextRuntimeSubmission(host);
   return blocks;
 }
 
@@ -1122,37 +1355,6 @@ function normalizeSubmissionBlock(code: string): string {
   return stripCommentLines(code.replace(/\n+$/, ""))
     .replace(/^(?:[ \t]*[\r\n])+/, "")
     .trimEnd();
-}
-
-async function splitSubmissionBlocks(host: RuntimeHost, code: string): Promise<string[]> {
-  const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = normalized.split("\n");
-  const blocks: string[] = [];
-  let currentBlock = "";
-
-  for (const line of lines) {
-    currentBlock = currentBlock.length > 0 ? `${currentBlock}\n${line}` : line;
-    const normalizedBlock = normalizeSubmissionBlock(currentBlock);
-
-    if (!normalizedBlock.trim()) {
-      continue;
-    }
-
-    const isComplete = await host.inputState.isExpressionCompleteAsync(normalizedBlock);
-    if (!isComplete) {
-      continue;
-    }
-
-    blocks.push(normalizedBlock);
-    currentBlock = "";
-  }
-
-  const trailingBlock = normalizeSubmissionBlock(currentBlock);
-  if (trailingBlock.trim() && (await host.inputState.isExpressionCompleteAsync(trailingBlock))) {
-    blocks.push(trailingBlock);
-  }
-
-  return blocks;
 }
 
 function writeRuntimeSubmissionEcho(host: RuntimeHost, task: Submission): void {
@@ -1245,6 +1447,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.promptVisible = false;
     host.pendingPromptToken = false;
     host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1261,6 +1464,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.replyPromptText = "";
     host.mode = "executing";
     host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1269,6 +1473,7 @@ export function interruptRuntime(host: RuntimeHost): void {
     host.inputState.reset();
     host.renderInput();
     host.clearPendingConsoleInput();
+    host.cancelPendingSubmissions();
     return;
   }
 
@@ -1280,6 +1485,7 @@ export function interruptRuntime(host: RuntimeHost): void {
   host.inputState.reset();
   host.promptVisible = false;
   host.clearPendingConsoleInput();
+  host.cancelPendingSubmissions();
 }
 
 export function handleRuntimeExit(host: RuntimeHost, code: number): void {
@@ -1289,7 +1495,6 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.clearReplyPromptRenderTimer();
   host.clearPendingConsoleInput();
   flushPendingRuntimeRewrite(host);
-  setNativeParseCallback(null);
 
   host.lang.clearSessionState();
   host.rProcess = null;
@@ -1302,31 +1507,11 @@ export function handleRuntimeExit(host: RuntimeHost, code: number): void {
   host.awaitingExecutionStart = false;
   host.submissionPending = false;
 
-  host.submissionQueue = [];
+  host.cancelPendingSubmissions();
   host.activeSubmission = null;
 
   host.writeEmitter.fire(
     `\r\n${ANSI.yellow}R exited with code ${code}${ANSI.reset}\r\n`
   );
   host.closeEmitter.fire(code);
-}
-
-function updateNativeParseCallback(host: RuntimeHost): void {
-  if (
-    !host.runtimeBackend ||
-    !host.rProcess ||
-    !host.sessionHostConnected ||
-    !host.runtimeBackend.hasCapability(host.rProcess, "parse-status")
-  ) {
-    setNativeParseCallback(null);
-    return;
-  }
-
-  setNativeParseCallback(async (code: string) => {
-    const request = host.runtimeBackend?.requestParseStatus(host.rProcess, code);
-    if (!request) {
-      return 1;
-    }
-    return await request;
-  });
 }
