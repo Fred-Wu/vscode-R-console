@@ -59,7 +59,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -376,7 +376,7 @@ jobs:
           node -e "const pkg=require('./package.json'); const tag=process.env.GITHUB_REF_NAME; const expected='v' + pkg.version; if(tag !== expected){throw new Error('Tag ' + tag + ' does not match package version ' + expected);}"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -408,7 +408,7 @@ jobs:
           node -e "const pkg=require('./package.json'); const tag=process.env.GITHUB_REF_NAME; const expected='v' + pkg.version; if(tag !== expected){throw new Error('Tag ' + tag + ' does not match package version ' + expected);}"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
