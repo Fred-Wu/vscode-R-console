@@ -75,28 +75,17 @@ test("console input and submission continue while history reads, compacts, and w
     "\n# time: original\n+command-" + i + "\n").join(""));
   const history = f.create();
   history.load();
-  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
-    vscode: { EventEmitter: class {}, window: { createOutputChannel: () => ({}) } },
-    "./rTerminal/lang": {},
-  });
-  const { InputState } = loadSource("src/Terminal/inputState.ts");
+  const { createTerminal, nextPrompt } = require("../helpers/submission-terminal.cjs");
+  const { terminal } = createTerminal();
+  terminal.rHistory = history;
   const sent = [];
-  const terminal = Object.assign(Object.create(RTerminal.prototype), {
-    mode: "ready", promptReady: true, promptVisible: false, rHistory: history,
-    inputState: new InputState(), lang: { updateInput() {} },
-    ensureReadyPromptVisibleForInput() {}, renderInput() {},
-  });
-  const host = {
-    mode: "ready", promptReady: false, activeSubmission: null, submissionQueue: [],
-    inputState: terminal.inputState, promptKind: "main", clearPromptRenderTimer() {},
-    lang: { refreshCompletionContextDocument() {} },
-    runtimeBackend: { sendSessionCommand(_session, command) { sent.push(command.code); return true; } },
+  terminal.runtimeBackend.sendSessionCommand = (_session, command) => {
+    sent.push(command.code);
+    return true;
   };
-  terminal.runtimeHost = () => host;
   for (const operation of ["readSync", "renameSync", "appendFileSync"]) {
     await waitFor(() => f.messages.some((message) => message.blocked === operation));
-    host.mode = "ready";
-    host.activeSubmission = null;
+    if (terminal.activeSubmission) nextPrompt(terminal);
     const code = `print("${operation}")`;
     terminal.applyKeyAction({ type: "text", text: code });
     assert.equal(terminal.inputState.text, code);
@@ -345,13 +334,12 @@ test("worker restart replays unacknowledged commands without duplicates", async 
   assert.deepEqual(restored.getEntries(), ["before()", "during-lock()", "after()"]);
 });
 
-test("dead worker's lock token can be reclaimed by its replacement", async (t) => {
-  const f = fixture(t);
-  const file = path.join(f.dir, "history");
-  const history = f.create();
-  history.load();
-  await waitFor(() => f.workers.length === 1);
-  // Observe the worker's lock identity by blocking its first append.
+test("dead worker's lock token can be reclaimed by its replacement", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-orphan-lock-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "history");
+  // Exercise the store directly: a live worker could acquire a new lock
+  // between recovery and the lock-removal assertion below.
   const token = String(process.pid) + ":orphan-worker-token";
   const lock = file + ".lock";
   fs.writeFileSync(lock, token);
@@ -368,6 +356,9 @@ test("dead worker's lock token can be reclaimed by its replacement", async (t) =
   store.push("recovered()");
   assert.deepEqual(store.getEntries(), ["recovered()"]);
   assert.equal(fs.existsSync(lock), false);
+  const restored = new HistoryStore(file);
+  restored.load();
+  assert.deepEqual(restored.getEntries(), ["recovered()"]);
 });
 
 test("worker failure retains history and resumes persistence", async (t) => {

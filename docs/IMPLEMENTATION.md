@@ -816,6 +816,33 @@ Creating a console follows this implementation path:
 8. backend events update terminal state
 9. the extension schedules persistence of the session record
 
+Enter, accepted multiline paste, and programmatic sends reserve their submission
+positions synchronously. Completeness checks run in reservation order, while
+completed expressions can enter execution immediately. An incomplete tail passes
+to the next reservation before that reservation is checked, including when the
+tail is waiting behind an executing expression. With no accepted successor, the
+tail becomes editable; normal input handling includes that buffer in the next
+Enter or paste snapshot. It is never owned by both the queue and editor.
+Enter retains literal whitespace and applies its continuation newline at the
+saved cursor only when input is incomplete. Each complete expression is recorded
+in history as it is accepted, so interrupting later parsing preserves earlier
+entries.
+
+This ordering retains the existing TypeScript heuristic and optional native R
+parse-status check. Native checks wait for a confirmed top-level ready state
+before sending; their 150 ms timeout starts only after sending. A lazy per-console
+notification wakes waiting checks on readiness or cancellation, without polling.
+Each submission passes its own console's native parser explicitly; the language
+parser holds no shared session callback. Connecting, interrupting, or closing one
+console cannot change another console's parser or readiness wait. Runtime callbacks
+and socket data from a detached or replaced session cannot update its successor.
+Dispatch also requires readiness, including after attaching to an already busy R
+session. Cancellation invalidates old reservations by generation; fresh
+input does not wait for a cancelled parser. No speculative checks or collection
+of previously checked prefixes is retained. Failed delivery restores pending
+source using the same continuation boundaries, preserving existing newlines and
+saved editing positions instead of adding separators unconditionally.
+
 ### 4.5 Attaching A Detached Console
 
 Attaching a detached console follows this implementation path:

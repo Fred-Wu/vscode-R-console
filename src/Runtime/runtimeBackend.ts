@@ -345,7 +345,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           return;
         }
         state.pendingParseRequests.delete(requestId);
-        settled = true;
+        // reject() owns the settled flag; setting it here would leave the
+        // promise pending forever and prevent the parser's local fallback.
         pending.reject(new Error("native parse-status request timed out"));
       }, PARSE_STATUS_TIMEOUT_MS);
       state.pendingParseRequests.set(requestId, {
@@ -496,6 +497,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       state.socketCarry = Buffer.alloc(0);
 
       socket.on("data", (chunk: Buffer) => {
+        if (state.socket !== socket || state.attachGeneration !== generation) {
+          return;
+        }
         const parsed = parseBackendFrames(chunk, state.socketCarry);
         state.socketCarry = parsed.carry;
 

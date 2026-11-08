@@ -1,5 +1,6 @@
 import {
   isExpressionCompleteAsync as parserIsExpressionCompleteAsync,
+  type NativeParseCallback,
 } from "../Language/parser";
 import {
   moveCursorByRenderedRows,
@@ -185,8 +186,8 @@ export class InputState {
     this.preferredColumn = null;
   }
 
-  async isExpressionCompleteAsync(code: string = this._text): Promise<boolean> {
-    return parserIsExpressionCompleteAsync(code);
+  async isExpressionCompleteAsync(code: string = this._text, nativeParse?: NativeParseCallback): Promise<boolean> {
+    return parserIsExpressionCompleteAsync(code, nativeParse);
   }
 
   private moveByRenderedRows(

@@ -4,6 +4,10 @@ All notable changes to R Console will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Improved the reliability of code submission in the R Console.
+
 ### Security
 
 - Improved the security of R Console connections, including persistent sessions and language-server communication.
