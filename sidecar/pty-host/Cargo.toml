@@ -8,7 +8,7 @@ name = "R_CONSOLE_HOST"
 path = "src/main.rs"
 
 [dependencies]
-hmac = "0.12.1"
+hmac = "0.13.0"
 sha2 = "0.10.9"
 libc = "0.2"
 libloading = "0.9"
