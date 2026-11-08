@@ -959,12 +959,14 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private queueProgrammaticSubmission(data: string): void {
+    // Continuation cursors must use the same normalized source as parsing.
+    const submission = this.normalizeProgrammaticInput(stripBracketedPasteMarkers(data));
     // The reservation is synchronous; a later Enter or paste cannot overtake it.
-    const slot = reserveRuntimeSubmission(this.runtimeHost(), data);
+    const slot = reserveRuntimeSubmission(this.runtimeHost(), submission);
     const generation = this.submissionGeneration;
     this.programmaticSubmissionQueue = this.programmaticSubmissionQueue.then(
-      () => this.handleProgrammaticSubmission(data, slot, generation),
-      () => this.handleProgrammaticSubmission(data, slot, generation)
+      () => this.handleProgrammaticSubmission(submission, slot, generation),
+      () => this.handleProgrammaticSubmission(submission, slot, generation)
     );
   }
 

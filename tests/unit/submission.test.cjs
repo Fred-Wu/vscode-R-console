@@ -168,6 +168,37 @@ test("an editor send extends a queued cursor edit behind execution", async () =>
   assert.equal(terminal.inputState.cursorPosition, 8);
 });
 
+for (const [ending, newline] of [["LF", "\n"], ["CRLF", "\r\n"], ["CR", "\r"]]) {
+  for (const overlap of [false, true]) {
+    test(`${ending} editor continuations preserve the saved cursor and literal suffix (overlap=${overlap})`, async () => {
+      const { terminal, commands, history } = createTerminal();
+      terminal.runtimeBackend.hasCapability = () => true;
+      terminal.runtimeBackend.requestParseStatus = () => Promise.resolve(1);
+      const opening = '1\nx <- "ab';
+      terminal.inputState.insertText(opening);
+      terminal.inputState.cursorPosition = opening.length - 1;
+      const first = terminal.handleEnterKey();
+      if (!overlap) await first;
+
+      // Both sends belong before the retained "b", even when the first send
+      // uses CRLF and the next uses LF. Cover transfer during and after parsing.
+      terminal.handleInput(`c${newline}`);
+      terminal.handleInput("d\n");
+      await Promise.all([first, terminal.programmaticSubmissionQueue]);
+      nextPrompt(terminal);
+      assert.equal(terminal.inputState.text, 'x <- "a\nc\nd\nb');
+      assert.equal(terminal.inputState.cursorPosition, 'x <- "a\nc\nd\n'.length);
+
+      terminal.inputState.cursorToEnd();
+      terminal.inputState.insertText('"');
+      await terminal.handleEnterKey();
+      const expected = ["1", 'x <- "a\nc\nd\nb"'];
+      assert.deepEqual(commands.map(command => command.code), expected);
+      assert.deepEqual(history, expected);
+    });
+  }
+}
+
 test("interruption retains earlier history while later parsing is pending", async () => {
   const { terminal, commands, history } = createTerminal();
   const gate = deferred();
