@@ -687,6 +687,11 @@ or requests fresh suggestions without submitting input if the visible results ar
 Escape dismisses it, and clearing the input dismisses the list and invalidates
 outstanding requests. Backspace resets the suggestion selection and viewport.
 
+Accepting a suggestion for a partial function name replaces the partial name
+and places the cursor inside the inserted empty parentheses. In inline
+completion's typing mode, this schedules argument suggestions using the same
+debounce as input edits.
+
 The terminal renderer draws a bordered transient suggestion panel below the
 physical terminal row containing the input caret. Within a wrapped logical
 line, the remaining input is rendered below the panel. The renderer anchors

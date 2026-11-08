@@ -461,6 +461,14 @@ Suggestions should include `lm` on the first request. The `R Console Language
 Server` output channel should show one startup when the session uses the same
 package folders as the server, without a connection reset or another startup.
 
+With `r.console.completionUI` set to `inline` and
+`r.console.inlineCompletion.trigger` set to `typing`, type `libr` and accept
+the matching `library()` suggestion. The partial name should expand to
+`library()`, with the cursor inside `()` and argument suggestions opening
+automatically. Dismiss completion immediately after accepting the match to
+check that it cancels pending argument suggestions. In manual trigger mode,
+argument suggestions should wait for an explicit completion request.
+
 Run:
 
 ```{r completion-setup}
