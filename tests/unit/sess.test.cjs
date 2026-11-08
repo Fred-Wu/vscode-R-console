@@ -924,13 +924,32 @@ test("sess admission bounds pending clients and expires trickled attachment atte
   await waitFor(() => proxy.getWorkspaceData());
   const candidates = [];
   for (let index = 0; index < 8; index++) candidates.push(await connectR(t, endpoint));
-  const closed = Promise.all(candidates.map(({ socket }) => once(socket, "close")));
+  const socketErrors = [];
+  // Expiry may break an in-flight write before close. events.once("close")
+  // rejects on that error, even though the proxy is closing as intended.
+  const closed = Promise.all(candidates.map(({ socket }) => new Promise((resolve) => {
+    socket.on("error", (error) => socketErrors.push(error));
+    socket.once("close", resolve);
+  })));
   const excess = await connectR(t, endpoint);
   await waitFor(() => excess.socket.destroyed);
-  const timer = setInterval(() => candidates[0].socket.write(" "), 100);
-  t.after(() => clearInterval(timer));
+  const trickleSocket = candidates[0].socket;
+  const stopTrickling = () => clearInterval(timer);
+  const timer = setInterval(() => {
+    if (trickleSocket.destroyed || !trickleSocket.writable) {
+      stopTrickling();
+      return;
+    }
+    trickleSocket.write(" ");
+  }, 100);
+  trickleSocket.once("error", stopTrickling);
+  trickleSocket.once("close", stopTrickling);
+  t.after(stopTrickling);
   await closed;
-  clearInterval(timer);
+  stopTrickling();
+  for (const error of socketErrors) {
+    assert.ok(["EPIPE", "ECONNRESET"].includes(error.code), `Unexpected socket error: ${error}`);
+  }
   assert.equal(proxy.pendingRSockets.size, 0);
   assert.equal(server.sockets.length, 1);
   assert.equal(proxy.getSessionId(), attach.params.session_id);
