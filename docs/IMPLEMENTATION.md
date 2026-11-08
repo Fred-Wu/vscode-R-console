@@ -391,6 +391,10 @@ Host capabilities are advertised through `backend-ready`:
 ### 2.5 Output Channel
 
 Rust emits console output and control events through the active protocol writer.
+Console output is streamed in 8 KiB chunks, including output received directly
+from R callbacks. This keeps each frame within the frontend's existing 8 MiB
+frame limit without limiting total output. Each output stream has its own UTF-8
+decoder in the frontend, so characters split between frames are preserved.
 If no client is attached, `protocol.rs` queues frames in an output backlog.
 
 The backlog is bounded by:
@@ -418,6 +422,32 @@ Detached sessions close by:
 3. writing the same `shutdown` frame
 
 The Rust command reader maps `shutdown` to the backend shared shutdown state.
+
+### 2.7 Transport Bounds And Deadlines
+
+The security follow-up retains existing protocol limits and normal request
+timing. It fixes response lifecycle handling, stream flow control, pipe access,
+and output framing at their respective boundaries.
+
+| Boundary | Bound or timing | Purpose and behavior |
+| --- | --- | --- |
+| Backend and console language-server authentication | 3 seconds; fixed-size challenge/proof messages; bounded pending clients | Bounds incomplete authentication. Backend read/write deadlines are cleared after authentication. This does not time R evaluation. |
+| Backend frames | 8 MiB per payload | Rejects excessive allocation before reading a payload. Oversized submitted commands are rejected before sending; output is streamed across frames. |
+| Detached backend output | 1,000,000 bytes or 4,096 frames | Retains a rolling backlog while no frontend is connected. This is separate from connected output delivery. |
+| Session proxy admission | 8 pending clients; 3 seconds to send attach | Bounds incomplete attachments. Active sessions are replaced only after an attach message, independently of these resource guards. |
+| Session proxy messages | 16 MiB per JSON line | Bounds a complete message. Forwarding obeys writable backpressure with no additional total write-queue cutoff. |
+| Optional session data requests | 1.2 seconds waiting for an R socket; 2 seconds for a response | Returns unavailable workspace/completion data if the probe cannot finish. Does not close the established session or interrupt R. |
+| Legacy HTTP session data | 1.2 seconds of inactivity; 16 MiB response | Progressing responses may take longer. Response abort/error/close events settle the request directly. |
+| Native parse query | 150 milliseconds after sending | Falls back to the local parser; submission readiness is checked before sending. Does not time code execution. |
+| Backend startup and reconnect | 5 seconds for the bootstrap file; 60-second initial connection grace; unlimited persistent reconnect grace | Governs connection lifecycle. The 40/100 ms poll/retry intervals schedule checks; they are not execution deadlines. Detached shutdown uses a 2-second socket inactivity timeout. |
+| Manual session recovery | 1.5 seconds after R returns to its main prompt | Waits for attachment confirmation after the recovery command finishes. |
+
+Terminal render/completion debounces, native event polling, persistence
+heartbeats, history refresh/retry/lock handling, and the history close wait
+serve UI scheduling or storage lifecycle purposes. They are separate from
+socket admission and R execution, and this follow-up does not retune them.
+The older `languageserver` workspace API compatibility error is a separate
+language-server lifecycle issue; these transport fixes do not resolve it.
 
 ## 3. `vscode-R` Integration
 
@@ -515,6 +545,38 @@ public API for connection discovery, attachment preparation, terminal
 registration, connection references, and session activation; it does not use
 VS Code's global completion command for runtime completion.
 
+Before replacing an active R connection, the proxy waits for a newline-delimited
+`attach` message with a nonempty session id. Pending connections receive no
+session requests and do not connect upstream. There are at most eight pending
+connections, each with a three-second total deadline; attachment messages use
+the existing 16 MiB line limit. The count and deadline bound resources held by
+clients that never attach. The protection against silent or read-only clients
+comes from delaying connection replacement and session traffic until an attach
+message arrives. It is not credential validation: vscode-R retains responsibility
+for attachment validation.
+
+On Windows, the bundled host's `--secure-session-pipe` command applies a protected
+DACL that grants access only to the current user and denies network logons. All
+instances of the named pipe share that descriptor. The proxy publishes its
+endpoint only after permission setup succeeds; setup failure closes the server.
+Connections accepted during setup receive no session data and are closed before
+the endpoint is returned. This secures R Console's endpoint independently of
+vscode-R's upstream endpoint. On Unix the socket remains in a private directory
+with owner-only permissions.
+
+Forwarding follows Node's [stream backpressure contract](https://nodejs.org/api/stream.html#event-drain):
+after a write returns false, the proxy pauses the source and retains the
+unprocessed remainder of the current batch. On drain, it forwards that remainder
+before resuming reads. Optional local workspace/completion requests return
+unavailable data while the destination is blocked, rather than adding more
+queued writes. Slow receivers do not trigger a separate queue-size disconnect.
+The existing 16 MiB per-line limit remains in effect. Regression tests cover
+both directions, batch remainders, local requests, reconnection, and pending
+clients. Windows-only tests inspect the DACL across new pipe instances, exercise
+a read-only handle, and verify that permission failures prevent startup. Actual
+Windows execution and a separate-account access check are still required to
+validate that platform's access boundary.
+
 The proxy is scoped to the embedded backend runtime session and is indexed by
 the backend session id while connected. The managed bootstrap connects `sess`
 through the proxy endpoint and forwards the versioned attach handshake to
@@ -574,6 +636,10 @@ runs vscode-R's legacy `init.R`.
 
 In `legacy` mode, `SessionWatcher` reads the file-based `request.log`,
 `workspace.lock`, and `workspace.json` files.
+Its loopback HTTP requests retain the existing 1.2-second inactivity timeout
+and 16 MiB response limit. Responses can take longer while data continues to
+arrive. Truncated, aborted, failed, or oversized responses resolve as unavailable
+data and close the request, so a failed response cannot leave a request pending.
 
 In `sess` mode, session metadata flows through the proxy between R and vscode-R.
 The R side sends JSON-RPC notifications such as `attach` and

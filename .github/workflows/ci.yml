@@ -42,6 +42,10 @@ jobs:
       - name: Audit npm dependencies
         if: runner.os == 'Linux'
         run: npm audit --audit-level=low
+      - name: Build and stage runtime
+        run: |
+          npm run build:sidecar
+          npm run stage:sidecar
       - name: Type-check and bundle
         run: npm run package:extension
       - name: Unit tests
@@ -61,10 +65,6 @@ jobs:
         run: npm run test:extension-host
       - name: Rust tests
         run: cargo test --locked --manifest-path sidecar/pty-host/Cargo.toml
-      - name: Build and stage runtime
-        run: |
-          npm run build:sidecar
-          npm run stage:sidecar
       - name: Real R runtime and frontend submission tests
         run: npm run test:runtime
       - name: Package and verify VSIX
