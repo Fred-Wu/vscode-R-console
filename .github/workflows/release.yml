@@ -255,7 +255,7 @@ jobs:
 
       - name: Download VSIX artifacts
         if: steps.development-notes.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vsix-*
           merge-multiple: true
@@ -306,7 +306,7 @@ jobs:
           node -e "const pkg=require('./package.json'); const tag=process.env.GITHUB_REF_NAME; const expected='v' + pkg.version; if(tag !== expected){throw new Error('Tag ' + tag + ' does not match package version ' + expected);}"
 
       - name: Download VSIX artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vsix-*
           merge-multiple: true
@@ -384,7 +384,7 @@ jobs:
         run: npm ci
 
       - name: Download VSIX artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vsix-*
           merge-multiple: true
@@ -413,7 +413,7 @@ jobs:
           node-version: '24'
 
       - name: Download VSIX artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vsix-*
           merge-multiple: true
