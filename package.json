@@ -227,7 +227,7 @@
     "esbuild": "^0.28.2",
     "typescript": "^5.3.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/test-cli": "^0.0.12"
+    "@vscode/test-cli": "^0.0.15"
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0",
