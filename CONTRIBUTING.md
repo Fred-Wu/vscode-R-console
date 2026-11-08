@@ -51,6 +51,7 @@ For the same checks as CI, with Node.js 24, Rust, and R on `PATH`:
 npm ci
 npm run package:extension
 npm test
+npm run test:lsp
 npm run test:extension-host
 cargo test --locked --manifest-path sidecar/pty-host/Cargo.toml
 npm run build:sidecar
@@ -62,6 +63,11 @@ npm run test:package
 
 The extension host smoke test launches VS Code, installs declared extension
 dependencies, activates R Console, and checks its core commands are registered.
+The language server tests require R's `languageserver` package and exercise
+startup, authenticated connections, and completion during session updates and
+server restarts. They run the production R server with a simulated VS Code host.
+Set `R_TEST_EXECUTABLE` to choose the R executable for these lifecycle tests;
+the authentication and protocol tests also require `Rscript` on `PATH`.
 The runtime smoke test starts an isolated R session using a temporary profile,
 checks evaluation, nested input, interruption, persistence, and shutdown, then
 cleans up. Set `R_TEST_EXECUTABLE` to choose the R executable used to locate R.
