@@ -8,8 +8,8 @@ name = "R_CONSOLE_HOST"
 path = "src/main.rs"
 
 [dependencies]
-hmac = "0.12.1"
-sha2 = "0.10.9"
+hmac = "0.13.0"
+sha2 = "0.11.1"
 libc = "0.2"
 libloading = "0.9"
 windows-sys = { version = "0.61", features = [
