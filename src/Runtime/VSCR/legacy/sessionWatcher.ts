@@ -306,6 +306,7 @@ export class SessionWatcher {
           return;
         }
         settled = true;
+        req.destroy();
         resolve(value);
       };
 
@@ -325,6 +326,7 @@ export class SessionWatcher {
           const chunks: Buffer[] = [];
           let responseBytes = 0;
           res.on("data", (chunk: Buffer | string) => {
+            if (settled) return;
             const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
             responseBytes += bytes.length;
             if (responseBytes > 16 * 1024 * 1024) {
@@ -346,14 +348,16 @@ export class SessionWatcher {
               done(undefined);
             }
           });
+          res.on("aborted", () => done(undefined));
+          res.on("error", () => done(undefined));
+          // A response can close without emitting end or a request error.
+          res.on("close", () => done(undefined));
         }
       );
 
       req.on("error", () => done(undefined));
-      req.setTimeout(1200, () => {
-        req.destroy();
-        done(undefined);
-      });
+      // Preserve the inactivity timeout while allowing a response to keep progressing.
+      req.setTimeout(1200, () => done(undefined));
       req.write(body);
       req.end();
     });

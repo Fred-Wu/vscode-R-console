@@ -214,6 +214,138 @@ test("Enter refreshes stale visible suggestions without submitting input", t => 
   }
 });
 
+for (const accept of ["enter", "tab", "mouse"]) {
+  test(`accepting a partial function name match automatically opens argument suggestions (${accept})`, async t => {
+    const { terminal, screen } = createTerminal(t);
+    delete terminal.applyCompletion;
+    const recorded = [];
+    terminal.lang.recordCompletion = (...args) => recorded.push(args);
+    terminal.inputState.insertText("libr");
+    const choice = {
+      ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+      source: "lsp", packageName: "base",
+    };
+    terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    const requests = [];
+    terminal.lang.handleAutocomplete = async request => {
+      requests.push(request);
+      const { input } = request;
+      request.onInlineEntries([{ label: "Arguments" }, {
+        ...item("package = "), replaceStart: input.cursorCol,
+        snapshotInput: input.currentLine, snapshotCursor: input.cursorCol, source: "lsp",
+      }]);
+    };
+    if (accept === "mouse") {
+      const buffer = screen.buffer.active;
+      const row = Array.from({ length: 24 }, (_, i) =>
+        buffer.getLine(buffer.baseY + i).translateToString(true)).findIndex(line => line.includes("library")) + 1;
+      assert.ok(row > 0, "the function suggestion must be visible");
+      terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: 8 });
+      terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: 8 });
+    } else {
+      terminal.applyKeyAction({ type: accept });
+    }
+    assert.equal(terminal.inputState.text, "library()");
+    assert.equal(terminal.inputState.textBeforeCursor, "library(");
+    assert.equal(terminal.submitted, undefined, "accepting the function must leave it editable");
+    assert.deepEqual(recorded, [["library()", 0, choice]], "record the chosen package before requesting arguments");
+    await new Promise(resolve => setTimeout(resolve, 180));
+    assert.equal(requests.length, 1, "request arguments without another keystroke");
+    assert.equal(requests[0].input.textBeforeCursor, "library(");
+    assert.equal(terminal.inlineCompletion.current().insertText, "package = ");
+    assert.equal(terminal.inputState.text, "library()", "show arguments without inserting one");
+  });
+}
+
+test("accepting a partial function name match respects manual completion mode", async t => {
+  const { terminal } = createTerminal(t, 80, 24, "tab");
+  delete terminal.applyCompletion;
+  terminal.lang.recordCompletion = () => {};
+  terminal.inputState.insertText("libr");
+  terminal.inlineCompletion.set([{
+    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+  }], terminal.inlineCompletion.token);
+  const requests = [];
+  terminal.lang.handleAutocomplete = async request => { requests.push(request); };
+  terminal.applyKeyAction({ type: "enter" });
+  assert.equal(terminal.inputState.textBeforeCursor, "library(");
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.equal(requests.length, 0);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].input.textBeforeCursor, "library(");
+});
+
+test("dismissal cancels argument suggestions scheduled after accepting a partial function name match", async t => {
+  const { terminal } = createTerminal(t);
+  delete terminal.applyCompletion;
+  terminal.lang.recordCompletion = () => {};
+  terminal.inputState.insertText("libr");
+  terminal.inlineCompletion.set([{
+    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+  }], terminal.inlineCompletion.token);
+  let requests = 0;
+  terminal.lang.handleAutocomplete = async () => { requests++; };
+  terminal.applyKeyAction({ type: "enter" });
+  assert.ok(terminal.inlineCompletionTimer, "function acceptance must schedule argument completion");
+  terminal.applyKeyAction({ type: "escape" });
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.equal(requests, 0);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(terminal.inputState.text, "library()");
+});
+
+test("typing after accepting a partial function name match refreshes the pending argument request", async t => {
+  const { terminal } = createTerminal(t);
+  delete terminal.applyCompletion;
+  terminal.lang.recordCompletion = () => {};
+  terminal.inputState.insertText("libr");
+  terminal.inlineCompletion.set([{
+    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+  }], terminal.inlineCompletion.token);
+  const requests = [];
+  terminal.lang.handleAutocomplete = async request => { requests.push(request); };
+  terminal.applyKeyAction({ type: "enter" });
+  terminal.applyKeyAction({ type: "text", text: "m" });
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.equal(requests.length, 1, "typing and function acceptance share the debounce");
+  assert.equal(requests[0].input.text, "library(m)");
+  assert.equal(requests[0].input.textBeforeCursor, "library(m");
+});
+
+test("accepting a variable does not reopen its completed suggestion list", async t => {
+  const { terminal } = createTerminal(t);
+  delete terminal.applyCompletion;
+  terminal.lang.recordCompletion = () => {};
+  terminal.inputState.insertText("lib");
+  terminal.inlineCompletion.set([{
+    ...item("library_path"), snapshotInput: "lib", snapshotCursor: 3,
+  }], terminal.inlineCompletion.token);
+  terminal.applyKeyAction({ type: "enter" });
+  assert.equal(terminal.inputState.text, "library_path");
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  terminal.applyKeyAction({ type: "enter" });
+  assert.equal(terminal.submitted, "library_path");
+});
+
+test("Quick Pick function acceptance keeps argument completion manual", t => {
+  const { terminal } = createTerminal(t);
+  delete terminal.applyCompletion;
+  terminal.lang.recordCompletion = () => {};
+  terminal.inlineCompletionMode = () => "quickPick";
+  terminal.inputState.insertText("libr");
+  terminal.applyCompletion({
+    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+  });
+  assert.equal(terminal.inputState.textBeforeCursor, "library(");
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  assert.equal(terminal.inlineCompletion.visible, false);
+});
+
 test("large completion lists only measure visible rows on navigation and redraw", () => {
   let measured = 0;
   const state = new InlineCompletion({ wcwidth(codePoint) {

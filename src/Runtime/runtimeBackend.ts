@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import { StringDecoder } from "string_decoder";
 import {
   type BackendCapability,
   type BackendControlEvent,
@@ -345,7 +346,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           return;
         }
         state.pendingParseRequests.delete(requestId);
-        settled = true;
+        // reject() owns the settled flag; setting it here would leave the
+        // promise pending forever and prevent the parser's local fallback.
         pending.reject(new Error("native parse-status request timed out"));
       }, PARSE_STATUS_TIMEOUT_MS);
       state.pendingParseRequests.set(requestId, {
@@ -494,8 +496,13 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
       state.socket = socket;
       state.socketCarry = Buffer.alloc(0);
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
 
       socket.on("data", (chunk: Buffer) => {
+        if (state.socket !== socket || state.attachGeneration !== generation) {
+          return;
+        }
         const parsed = parseBackendFrames(chunk, state.socketCarry);
         state.socketCarry = parsed.carry;
 
@@ -509,11 +516,12 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
             continue;
           }
 
-          const text = outputChunk.data.toString("utf8");
           if (outputChunk.stream === "stderr") {
-            state.handlers?.onStderr?.(text);
+            const text = stderrDecoder.write(outputChunk.data);
+            if (text) state.handlers?.onStderr?.(text);
           } else {
-            state.handlers?.onStdout?.(text);
+            const text = stdoutDecoder.write(outputChunk.data);
+            if (text) state.handlers?.onStdout?.(text);
           }
         }
 
@@ -538,6 +546,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         if (state.socket !== socket) {
           return;
         }
+        const stdoutTail = stdoutDecoder.end();
+        const stderrTail = stderrDecoder.end();
+        if (stdoutTail) state.handlers?.onStdout?.(stdoutTail);
+        if (stderrTail) state.handlers?.onStderr?.(stderrTail);
         const wasHostConnected = state.hostConnected;
         state.socket = undefined;
         state.hostConnected = false;
