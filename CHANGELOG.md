@@ -2,24 +2,24 @@
 
 All notable changes to R Console will be documented in this file.
 
-## [Unreleased]
+## [0.5.5] - 2026-11-09
+
+### Added
+
+- `r.console.inlineCompletion.minCharacters` (default: `3`): choose how many characters to type before automatic suggestions appear. Applies only to inline completion with the typing trigger.
+- `r.console.inlineCompletion.acceptOnEnter` (default: `true`): disable to submit input with Enter and accept suggestions with Tab. Applies only to inline completion.
 
 ### Changed
 
-- Raised the minimum supported VS Code version to 1.101.0 and updated the extension's Node.js target and type definitions to 22.
+- Raised the minimum supported VS Code version to 1.101.0.
+- Improved the security, stability, and responsiveness of R Console.
+- Improved the appearance and usability of inline autocompletion.
 
 ### Fixed
 
-- Preserved older persistent-session records across the connection protocol update and added a one-time notice offering Close Old Session or Cancel.
+- Older persistent sessions that can no longer reconnect now show a notice offering to close them.
 - Fixed missing argument suggestions after accepting a partial function name match in automatic inline completion, such as `libr` to `library()`.
 - Fixed code suggestions sometimes failing when typing or pressing Tab just after opening an R Console.
-- Improved the reliability of code submission in the R Console.
-- Fixed cases where code suggestions could get stuck when using older versions of vscode-R.
-- Fixed interruptions when displaying large amounts of R output.
-
-### Security
-
-- Improved the security and stability of R Console connections.
 
 ## [0.5.4] - 2026-10-23
 
