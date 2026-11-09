@@ -1,6 +1,6 @@
 const FRAME_HEADER_LEN = 12;
 export const BACKEND_PROTOCOL_VERSION = 2;
-export const MAX_BACKEND_FRAME_BYTES = 8 * 1024 * 1024;
+export const MAX_BACKEND_FRAME_BYTES = 16 * 1024 * 1024;
 
 export class BackendProtocolVersionError extends Error {
   constructor(version: unknown) {
@@ -15,7 +15,7 @@ export function assertBackendProtocolVersion(version: unknown): void {
 
 export class BackendFrameSizeError extends Error {
   constructor(bytes: number) {
-    super(`R Console command exceeds the 8 MiB backend frame limit (${bytes} bytes). Nothing was sent to R.`);
+    super(`R Console command exceeds the 16 MiB backend frame limit (${bytes} bytes). Nothing was sent to R.`);
     this.name = "BackendFrameSizeError";
   }
 }

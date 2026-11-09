@@ -553,10 +553,26 @@ test("failed later backend delivery restores only unsent blocks", async () => {
   assert.equal(terminal.inputState.text, "2");
 });
 
+test("an expression at the 16 MiB limit executes before its dependent expression", async () => {
+  const { terminal, commands, history } = createTerminal();
+  const prefix = 'x <- "';
+  const code = prefix + "a".repeat(16 * 1024 * 1024 - prefix.length - 1) + '"';
+  await terminal.handleProgrammaticSubmission(`${code}\ny <- nchar(x)\n`);
+  assert.equal(commands.length, 1);
+  assert.ok(commands[0].code === code, "the full assignment is delivered first");
+  assert.equal(terminal.mode, "executing");
+  nextPrompt(terminal);
+  assert.equal(commands.length, 2);
+  assert.equal(commands[1].code, "y <- nchar(x)");
+  assert.equal(history.length, 2);
+  assert.ok(history[0] === code);
+  assert.equal(history[1], "y <- nchar(x)");
+});
+
 for (const character of ["a", "\u00e9"]) {
   test(`oversized ${character === "a" ? "ASCII" : "UTF-8"} expression stops its batch and restores unsent source`, async () => {
     const { terminal, commands, history, output } = createTerminal();
-    const oversized = `x <- "${character.repeat(8 * 1024 * 1024 / Buffer.byteLength(character))}"`;
+    const oversized = `x <- "${character.repeat(16 * 1024 * 1024 / Buffer.byteLength(character))}"`;
     const source = `${oversized}\ny <- nchar(x)\n`;
     await terminal.handleProgrammaticSubmission(source);
 
@@ -569,7 +585,7 @@ for (const character of ["a", "\u00e9"]) {
     assert.equal(terminal.submissionPending, false);
     assert.equal(terminal.awaitingExecutionStart, false);
     assert.deepEqual(terminal.submissionQueue, []);
-    assert.match(output.join(""), /8 MiB backend frame limit/);
+    assert.match(output.join(""), /16 MiB backend frame limit/);
     assert.match(output.join(""), /Unsent code restored for editing/);
 
     terminal.inputState.text = 'x <- "fixed"\ny <- nchar(x)';
@@ -584,7 +600,7 @@ for (const character of ["a", "\u00e9"]) {
 
 test("queued oversized expression restores only unsent code and preserves the current draft", async () => {
   const { terminal, commands } = createTerminal();
-  const oversized = `x <- "${"a".repeat(8 * 1024 * 1024)}"`;
+  const oversized = `x <- "${"a".repeat(16 * 1024 * 1024)}"`;
   await terminal.handleProgrammaticSubmission(`1\n${oversized}\ny <- nchar(x)\n`);
   terminal.inputState.insertText("draft");
   terminal.inputState.cursorPosition = 2;

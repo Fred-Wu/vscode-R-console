@@ -26,7 +26,7 @@ use windows_sys::Win32::{
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
-const MAX_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INPUT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_SERVER_CHALLENGE: u16 = 22;
 const FRAME_CLIENT_PROOF: u16 = 23;
 const FRAME_SERVER_PROOF: u16 = 24;
@@ -1112,6 +1112,26 @@ mod tests {
     #[test]
     fn authentication_deadline_bounds_a_drip_fed_payload() {
         reject_slow_authentication(false);
+    }
+
+    #[test]
+    fn accepts_console_input_at_sixteen_mib() {
+        let source = "é".repeat(8 * 1024 * 1024);
+        for kind in [FRAME_SUBMIT, FRAME_PARSE_STATUS_REQUEST, FRAME_REPLY_INPUT] {
+            let mut bytes = frame(kind, 42, source.as_bytes());
+            bytes.extend(frame(FRAME_INTERRUPT, 0, &[]));
+            let mut reader = Cursor::new(bytes);
+            let code = match read_next_command(&mut reader).unwrap().unwrap() {
+                IncomingCommand::Submit(code) | IncomingCommand::ReplyInput(code) => code,
+                IncomingCommand::ParseStatus { request_id, code } => {
+                    assert_eq!(request_id, 42);
+                    code
+                }
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(code, source);
+            assert!(matches!(read_next_command(&mut reader).unwrap(), Some(IncomingCommand::Interrupt)));
+        }
     }
 
     #[test]
