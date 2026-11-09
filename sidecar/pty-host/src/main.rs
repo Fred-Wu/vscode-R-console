@@ -1,3 +1,5 @@
+#[cfg(any(unix, windows))]
+mod console_input;
 mod host;
 mod protocol;
 #[cfg(windows)]
