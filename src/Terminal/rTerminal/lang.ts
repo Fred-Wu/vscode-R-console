@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import {
   type CompletionEntries,
+  type CompletionContext,
   type CompletionEntry,
   type CompletionProvider,
   type RuntimeMemberCompletionRequester,
@@ -51,6 +52,7 @@ type ConsoleSessionState = {
 
 export class RTermLang {
   private completionRequestId = 0;
+  private inlineCache: { input: InputSnapshot; context: CompletionContext; entries: CompletionEntries } | undefined;
   private completionDocument: VirtualRDocument | undefined;
   private readonly completionDocumentId = `${process.pid}-${Date.now()}-${Math.random()
     .toString(36)
@@ -206,11 +208,12 @@ export class RTermLang {
         const publish = (results: CompletionEntries): void => {
           if (!this.isCurrentCompletionRequest(requestId)) return;
           const current = getCurrentInput();
-          if (current.currentLine !== context.snapshotInput ||
+          if (current.text !== latestInput.text || current.cursorRow !== latestInput.cursorRow ||
               current.cursorCol !== context.snapshotCursor) return;
+          this.inlineCache = { input: latestInput, context, entries: results };
           onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix), context));
         };
-        publish(initialEntries);
+        if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries);
         if (opensBeforeFullResults) {
           void fullEntriesPromise.then(results => {
             if (results) publish(results);
@@ -471,7 +474,30 @@ export class RTermLang {
     }
   }
 
-  cancelCompletion(): void { this.completionRequestId++; }
+  /** Reuse candidates only for a refinement of the same replacement span.
+   * Rebuild edit snapshots before exposing them: an old LSP edit must never be
+   * accepted against a different line, suffix, object, or multiline context. */
+  refineInlineCompletion(input: InputSnapshot): import("../../Language/completion").CompletionQuickPickItem[] | undefined {
+    this.completionRequestId++;
+    const cached = this.inlineCache;
+    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor);
+    if (!cached || !context) return undefined;
+    const old = cached.context;
+    if (context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
+        input.cursorRow !== cached.input.cursorRow || !context.prefix.startsWith(old.prefix) ||
+        input.textBeforeCursor.slice(0, input.textBeforeCursor.length - context.prefix.length) !==
+          cached.input.textBeforeCursor.slice(0, cached.input.textBeforeCursor.length - old.prefix.length) ||
+        input.text.slice(input.textBeforeCursor.length) !== cached.input.text.slice(cached.input.textBeforeCursor.length)) {
+      return undefined;
+    }
+    const safeEntries = cached.entries.filter(entry => entry.replaceStart === undefined || entry.replaceStart === old.replaceStart);
+    return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix), context);
+  }
+
+  cancelCompletion(): void {
+    this.completionRequestId++;
+    this.inlineCache = undefined;
+  }
 
   dispose(): Promise<void> {
     if (this.disposePromise) {
@@ -517,6 +543,7 @@ export class RTermLang {
   }
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
+    this.inlineCache = undefined;
     if (this.disposed || !data) {
       return false;
     }

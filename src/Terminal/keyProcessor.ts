@@ -13,6 +13,7 @@ export type KeyAction =
   | { type: "page"; dir: "up" | "down" }
   | { type: "wheel"; dir: "up" | "down"; col: number; row: number }
   | { type: "mouse"; pressed: boolean; col: number; row: number }
+  | { type: "mouse-move"; col: number; row: number }
   | { type: "cursor-report"; col: number; row: number }
   | { type: "history" }
   | { type: "escape" }
@@ -170,6 +171,12 @@ export class KeyProcessor {
           const click = /^\x1b\[<0;(\d+);(\d+)(M|m)$/.exec(sequence);
           if (click) {
             actions.push({ type: "mouse", pressed: click[3] === "M", col: Number(click[1]), row: Number(click[2]) });
+            i += sequence.length;
+            continue;
+          }
+          const drag = /^\x1b\[<32;(\d+);(\d+)M$/.exec(sequence);
+          if (drag) {
+            actions.push({ type: "mouse-move", col: Number(drag[1]), row: Number(drag[2]) });
             i += sequence.length;
             continue;
           }

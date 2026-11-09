@@ -469,6 +469,25 @@ automatically. Dismiss completion immediately after accepting the match to
 check that it cancels pending argument suggestions. In manual trigger mode,
 argument suggestions should wait for an explicit completion request.
 
+For inline completion, also check:
+
+- Type `rdcsv` and `utils::rdcsv`: `read.csv` should be offered and inserted correctly.
+- With many suggestions, scroll the wheel, drag the scrollbar to both ends, and
+  click the `◀` / `▶` footer buttons. These should move the list without changing
+  the selected suggestion or inserting text. Release a drag outside the box.
+- Press Up/Down after scrolling away from the selection: the selected item should
+  return into view. Resize horizontally and vertically: the box and selection
+  should remain visible while they fit, and any active drag should end cleanly.
+- Shrink the terminal: a compact list should remain usable while enough room
+  remains for one candidate and the footer. Only the selected item's details
+  should appear when the panel has room for them.
+- Set `r.console.inlineCompletion.minCharacters` to `3` in inline/typing mode.
+  `df_test$al` should not open automatically; `df_test$alp` should. Tab should
+  still open suggestions below the threshold. Manual mode and Quick Pick should
+  be unaffected. The default is `3`; `1` starts at the first typed character.
+- Disable `r.console.inlineCompletion.acceptOnEnter`: Enter should submit the
+  editable input and Tab should accept a suggestion. Restore `true` afterward.
+
 Run:
 
 ```{r completion-setup}
