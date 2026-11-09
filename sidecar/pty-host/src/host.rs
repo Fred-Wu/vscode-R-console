@@ -8,6 +8,7 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 mod unix_host {
+    use crate::console_input::ConsoleInput;
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -140,7 +141,7 @@ mod unix_host {
     struct SharedState {
         pending_commands: VecDeque<PendingCommand>,
         active_submission_lines: VecDeque<Vec<u8>>,
-        pending_fragment: Option<Vec<u8>>,
+        pending_fragment: Option<ConsoleInput>,
         pending_fragment_from_nested: bool,
         pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
@@ -662,6 +663,10 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            // Cancel earlier submissions and replies without dropping parse requests.
+            state.pending_commands.retain(|command| {
+                matches!(command, PendingCommand::ParseStatus { .. })
+            });
             state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
             should_signal = state.busy;
             runtime.cv.notify_all();
@@ -927,6 +932,23 @@ mod unix_host {
                 set_r_interrupts_pending(false);
             }
 
+            // Interrupt before handing R another fragment or line. The outer
+            // callback raises R's interrupt only after this lock is released.
+            if state.interrupt_requested {
+                state.interrupt_requested = false;
+                state.pending_fragment = None;
+                state.pending_fragment_from_nested = false;
+                state.active_submission_lines.clear();
+                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
+                state.wait_state = None;
+                if matches!(wait_kind, WaitKind::Nested(_)) {
+                    let _ = runtime.output.emit_input_end();
+                    let _ = runtime.output.emit_output_flush();
+                }
+                READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
+                return 0;
+            }
+
             if let Some((request_id, code)) = take_next_parse_request(&mut state) {
                 drop(state);
                 let status = parse_status(code);
@@ -967,7 +989,7 @@ mod unix_host {
                 return write_read_buffer(
                     buffer,
                     buflen,
-                    STARTUP_INTERRUPT_HANDLER_INPUT.as_bytes().to_vec(),
+                    STARTUP_INTERRUPT_HANDLER_INPUT.as_bytes().to_vec().into(),
                     &mut state,
                     false,
                     &runtime.output,
@@ -979,7 +1001,7 @@ mod unix_host {
                 return write_read_buffer(
                     buffer,
                     buflen,
-                    recovery_input,
+                    recovery_input.into(),
                     &mut state,
                     false,
                     &runtime.output,
@@ -990,7 +1012,7 @@ mod unix_host {
                 return write_read_buffer(
                     buffer,
                     buflen,
-                    line.bytes,
+                    line.bytes.into(),
                     &mut state,
                     line.signal_input_end,
                     &runtime.output,
@@ -1003,16 +1025,6 @@ mod unix_host {
                     let _ = runtime.output.emit_input_end();
                     let _ = runtime.output.emit_output_flush();
                 }
-                return 0;
-            }
-
-            if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
-                state.interrupt_requested = false;
-                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
-                state.wait_state = None;
-                let _ = runtime.output.emit_input_end();
-                let _ = runtime.output.emit_output_flush();
-                READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
                 return 0;
             }
 
@@ -1092,7 +1104,13 @@ mod unix_host {
                         state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                     }
                     state.suppress_idle_event_pump = state.interrupt_requested;
-                    state.interrupt_requested = false;
+                    // R also reports not-busy between input refills. Preserve an
+                    // interrupt until the reader can discard the unread input.
+                    if state.pending_fragment.is_none()
+                        && state.active_submission_lines.is_empty()
+                    {
+                        state.interrupt_requested = false;
+                    }
                     set_r_interrupts_pending(false);
                 }
             }
@@ -1286,7 +1304,7 @@ mod unix_host {
     fn write_read_buffer(
         buffer: *mut c_uchar,
         buflen: c_int,
-        bytes: Vec<u8>,
+        mut input: ConsoleInput,
         state: &mut SharedState,
         signal_input_end: bool,
         output: &OutputSink,
@@ -1298,10 +1316,7 @@ mod unix_host {
         let buffer_len = buflen as usize;
         let target = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_len) };
 
-        if bytes.len() < buffer_len.saturating_sub(1) {
-            target[..bytes.len()].copy_from_slice(&bytes);
-            target[bytes.len()] = b'\n';
-            target[bytes.len() + 1] = 0;
+        if input.write_into(target) {
             if signal_input_end {
                 state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                 let _ = output.emit_input_end();
@@ -1309,10 +1324,7 @@ mod unix_host {
             }
             1
         } else {
-            let used = buffer_len - 1;
-            target[..used].copy_from_slice(&bytes[..used]);
-            target[used] = 0;
-            state.pending_fragment = Some(bytes[used..].to_vec());
+            state.pending_fragment = Some(input);
             state.pending_fragment_from_nested = signal_input_end;
             1
         }
@@ -1736,6 +1748,7 @@ mod unix_host {
 
 #[cfg(windows)]
 mod windows_host {
+    use crate::console_input::ConsoleInput;
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -1965,7 +1978,7 @@ mod windows_host {
     struct SharedState {
         pending_commands: VecDeque<PendingCommand>,
         active_submission_lines: VecDeque<Vec<u8>>,
-        pending_fragment: Option<Vec<u8>>,
+        pending_fragment: Option<ConsoleInput>,
         pending_fragment_from_nested: bool,
         pending_dialog_result: Option<DialogResult>,
         pending_width: Option<u16>,
@@ -2491,6 +2504,10 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.interrupt_requested = true;
+            // Cancel earlier submissions and replies without dropping parse requests.
+            state.pending_commands.retain(|command| {
+                matches!(command, PendingCommand::ParseStatus { .. })
+            });
             state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
             runtime.cv.notify_all();
         }
@@ -2797,6 +2814,23 @@ mod windows_host {
                 set_r_interrupts_pending(false);
             }
 
+            // Interrupt before handing R another fragment or line. The outer
+            // callback raises R's interrupt only after this lock is released.
+            if state.interrupt_requested {
+                state.interrupt_requested = false;
+                state.pending_fragment = None;
+                state.pending_fragment_from_nested = false;
+                state.active_submission_lines.clear();
+                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
+                state.wait_state = None;
+                if matches!(wait_kind, WaitKind::Nested(_)) {
+                    let _ = runtime.output.emit_input_end();
+                    let _ = runtime.output.emit_output_flush();
+                }
+                READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
+                return 0;
+            }
+
             if let Some((request_id, code)) = take_next_parse_request(&mut state) {
                 drop(state);
                 let status = parse_status(code);
@@ -2837,7 +2871,7 @@ mod windows_host {
                 return write_read_buffer(
                     buffer,
                     buflen,
-                    encode_windows_r_source_text(STARTUP_INTERRUPT_HANDLER_INPUT),
+                    encode_windows_r_source_text(STARTUP_INTERRUPT_HANDLER_INPUT).into(),
                     &mut state,
                     false,
                     &runtime.output,
@@ -2849,7 +2883,7 @@ mod windows_host {
                 return write_read_buffer(
                     buffer,
                     buflen,
-                    recovery_input,
+                    recovery_input.into(),
                     &mut state,
                     false,
                     &runtime.output,
@@ -2860,7 +2894,7 @@ mod windows_host {
                 return write_read_buffer(
                     buffer,
                     buflen,
-                    line.bytes,
+                    line.bytes.into(),
                     &mut state,
                     line.signal_input_end,
                     &runtime.output,
@@ -2873,16 +2907,6 @@ mod windows_host {
                     let _ = runtime.output.emit_input_end();
                     let _ = runtime.output.emit_output_flush();
                 }
-                return 0;
-            }
-
-            if state.interrupt_requested && matches!(wait_kind, WaitKind::Nested(_)) {
-                state.interrupt_requested = false;
-                state.top_level_recovery_pending = Some(TopLevelRecovery::RecoverFromInterrupt);
-                state.wait_state = None;
-                let _ = runtime.output.emit_input_end();
-                let _ = runtime.output.emit_output_flush();
-                READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
                 return 0;
             }
 
@@ -2969,7 +2993,13 @@ mod windows_host {
                         state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                     }
                     state.suppress_idle_event_pump = state.interrupt_requested;
-                    state.interrupt_requested = false;
+                    // R also reports not-busy between input refills. Preserve an
+                    // interrupt until the reader can discard the unread input.
+                    if state.pending_fragment.is_none()
+                        && state.active_submission_lines.is_empty()
+                    {
+                        state.interrupt_requested = false;
+                    }
                     set_r_interrupts_pending(false);
                 } else {
                     state.wait_state = None;
@@ -3166,7 +3196,7 @@ mod windows_host {
     fn write_read_buffer(
         buffer: *mut c_uchar,
         buflen: c_int,
-        bytes: Vec<u8>,
+        mut input: ConsoleInput,
         state: &mut SharedState,
         signal_input_end: bool,
         output: &OutputSink,
@@ -3178,10 +3208,7 @@ mod windows_host {
         let buffer_len = buflen as usize;
         let target = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_len) };
 
-        if bytes.len() < buffer_len.saturating_sub(1) {
-            target[..bytes.len()].copy_from_slice(&bytes);
-            target[bytes.len()] = b'\n';
-            target[bytes.len() + 1] = 0;
+        if input.write_into(target) {
             if signal_input_end {
                 state.top_level_recovery_pending = Some(TopLevelRecovery::ParseNull);
                 let _ = output.emit_input_end();
@@ -3189,10 +3216,7 @@ mod windows_host {
             }
             1
         } else {
-            let used = buffer_len - 1;
-            target[..used].copy_from_slice(&bytes[..used]);
-            target[used] = 0;
-            state.pending_fragment = Some(bytes[used..].to_vec());
+            state.pending_fragment = Some(input);
             state.pending_fragment_from_nested = signal_input_end;
             1
         }

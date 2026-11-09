@@ -204,7 +204,7 @@
     "test": "node --test tests/unit/*.test.cjs",
     "test:lsp": "node --test tests/lsp-startup.test.cjs tests/lsp-integration.test.cjs tests/lsp-lifecycle.test.cjs",
     "test:extension-host": "vscode-test",
-    "test:runtime": "node --test tests/runtime.test.cjs tests/submission-runtime.test.cjs",
+    "test:runtime": "node --test tests/runtime.test.cjs tests/submission-runtime.test.cjs tests/large-input-runtime.test.cjs",
     "test:package": "node --test tests/package.test.cjs",
     "vscode:prepublish": "npm run package:extension && npm run build:sidecar && npm run stage:sidecar",
     "build:sidecar": "node scripts/build-sidecar.js",
