@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { completionMatch } from "./completionMatch";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -512,15 +513,16 @@ export function rankCompletionEntries(entries: CompletionEntry[], query: string)
   const needle = query.toLowerCase();
   if (!needle) return entries;
   return entries
-    .map((entry, index) => ({ entry, index }))
-    .filter(({ entry }) => entry.label.toLowerCase().includes(needle))
+    .map((entry, index) => ({ entry, index, match: completionMatch(entry.label, query) }))
+    .filter(({ match }) => match !== undefined)
     .sort((a, b) => {
       const aLabel = a.entry.label.toLowerCase();
       const bLabel = b.entry.label.toLowerCase();
-      const aRank = aLabel === needle ? 0 : aLabel.startsWith(needle) ? 1 : 2;
-      const bRank = bLabel === needle ? 0 : bLabel.startsWith(needle) ? 1 : 2;
+      const aRank = aLabel === needle ? 0 : aLabel.startsWith(needle) ? 1 : aLabel.includes(needle) ? 2 : 3;
+      const bRank = bLabel === needle ? 0 : bLabel.startsWith(needle) ? 1 : bLabel.includes(needle) ? 2 : 3;
       return aRank - bRank ||
-        aLabel.indexOf(needle) - bLabel.indexOf(needle) ||
+        a.match![0] - b.match![0] ||
+        a.match!.at(-1)! - a.match![0] - (b.match!.at(-1)! - b.match![0]) ||
         aLabel.length - bLabel.length || a.index - b.index;
     })
     .map(({ entry }) => entry);
@@ -929,13 +931,26 @@ async function getLanguageServerCompletions(
     return { entries: [], isIncomplete: false };
   }
   try {
-    const result = await completionProvider.provideCompletionItems(
+    let result = await completionProvider.provideCompletionItems(
       doc,
       position,
       context.triggerCharacter
     );
 
-    const items = Array.isArray(result) ? result : result?.items || [];
+    let items = Array.isArray(result) ? result : result?.items || [];
+    // Some R language servers only return contiguous matches. If that lookup
+    // has no usable candidates, request at the first prefix character and
+    // apply our matcher to the returned candidates. Keep the real document and
+    // its replacement start intact; never rewrite code to manufacture results.
+    if (context.prefix.length > 1 &&
+        !items.some(item => isLanguageServerCompletionItem(context, item) &&
+          completionMatch(getCompletionLabel(item), context.prefix))) {
+      const firstCharacter = [...context.prefix][0];
+      result = await completionProvider.provideCompletionItems(doc,
+        new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
+        context.triggerCharacter);
+      items = Array.isArray(result) ? result : result?.items || [];
+    }
     
     const filteredItems = items.filter((item) =>
       isLanguageServerCompletionItem(context, item)
@@ -1060,7 +1075,7 @@ function filterCompletionEntries(
   const result: CompletionEntry[] = [];
   for (const entry of entries) {
     const label = entry.label;
-    if (normalizedPrefix && !label.toLowerCase().includes(normalizedPrefix)) {
+    if (normalizedPrefix && !completionMatch(label, normalizedPrefix)) {
       continue;
     }
     result.push(entry);

@@ -166,6 +166,17 @@
           "default": "tab",
           "description": "Show inline completions while typing or only when Tab is pressed. Applies only when r.console.completionUI is inline; it does not affect Quick Pick."
         },
+        "r.console.inlineCompletion.minCharacters": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "markdownDescription": "Start automatic suggestions after this many typed characters in the current completion prefix: `1` means the first character, `2` means the second. Applies only when `r.console.completionUI` is `inline` and `r.console.inlineCompletion.trigger` is `typing`. Explicit Tab requests and argument suggestions following an accepted function bypass this threshold."
+        },
+        "r.console.inlineCompletion.acceptOnEnter": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Accept the selected suggestion with Enter in inline completion mode. Disable to let Enter submit the current input while Tab accepts suggestions. Applies only when `r.console.completionUI` is `inline`."
+        },
         "r.console.autoMatch": {
           "type": "boolean",
           "default": true,

@@ -3,6 +3,8 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const completion = loadSource("src/Language/completion.ts", {
   vscode: {
+    QuickPickItemKind: { Separator: -1 },
+    Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
     CompletionItemKind: { Field: 4, Function: 2, Variable: 5, Property: 9, Module: 8 },
     SnippetString: class SnippetString {},
   },
@@ -1155,6 +1157,66 @@ test("shared typed ranking places exact matches before longer prefix matches", (
   ];
   assert.deepEqual(completion.rankCompletionEntries(entries, "library").map(e => e.label),
     ["library", "library.extra", "librarySuffix", "otherlibrary"]);
+});
+
+test("fuzzy ranking keeps exact, prefix, and contiguous matches ahead of abbreviations", async () => {
+  const entries = ["read.csv", "other_rdcsv", "rdcsvLong", "rdcsv", "reversed"].map(label => ({
+    label, insertText: label, source: "session",
+  }));
+  assert.deepEqual(completion.rankCompletionEntries(entries, "rdcsv").map(entry => entry.label),
+    ["rdcsv", "rdcsvLong", "other_rdcsv", "read.csv"]);
+  const context = completion.getCompletionContext("df$rdcsv", 8, "df$rdcsv");
+  const result = await completion.collectCompletionEntries(context, undefined, undefined,
+    { globalenv: { df: { names: ["read.csv", "wrong"] } } }, []);
+  assert.deepEqual(result.map(entry => entry.label), ["read.csv"], "candidate collection must retain fuzzy matches");
+});
+
+test("match highlighting uses original UTF-16 offsets after case conversion", () => {
+  const { completionMatch } = loadSource("src/Language/completionMatch.ts");
+  assert.deepEqual(completionMatch("İx", "x"), [1]);
+  assert.deepEqual(completionMatch("İx", "i\u0307"), [0]);
+  assert.deepEqual(completionMatch("read.csv", "rdcsv"), [0, 3, 5, 6, 7]);
+  assert.deepEqual(completionMatch("a😀value", "😀v"), [1, 2, 3]);
+  assert.equal(completionMatch("read.csv", "csvread"), undefined);
+});
+
+test("inline cache rebases safe prefix refinements and refuses changed replacement contexts", async () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: { Position },
+    "../../Language/completion": { ...completion,
+      needsLanguageServerCompletion: () => false,
+      collectCompletionEntries: async () => [
+        { label: "alpha", insertText: "alpha", source: "session" },
+        { label: "apricot", insertText: "apricot", source: "session" },
+        { label: "alternate", insertText: "alternate", source: "lsp", replaceStart: 0 },
+      ],
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const snapshot = (text, cursor = text.length) => {
+    const before = text.slice(0, cursor);
+    const lines = text.split("\n");
+    const cursorRow = before.split("\n").length - 1;
+    return { text, lines, cursorRow, cursorCol: before.split("\n").at(-1).length,
+      currentLine: lines[cursorRow], textBeforeCursor: before };
+  };
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const input = snapshot("x <- df$a");
+  await lang.handleAutocomplete({ input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
+    applyCompletion() {}, onInlineEntries() {} });
+  const refined = lang.refineInlineCompletion(snapshot("x <- df$al"));
+  const choices = refined.filter(entry => "insertText" in entry);
+  assert.deepEqual(choices.map(entry => entry.insertText), ["alpha"]);
+  assert.equal(choices[0].snapshotInput, "x <- df$al");
+  assert.equal(choices[0].snapshotCursor, 10);
+  assert.equal(choices[0].replaceStart, 8);
+  assert.equal(lang.refineInlineCompletion(snapshot("x <- xx$al")), undefined);
+  assert.equal(lang.refineInlineCompletion(snapshot("x <- df$")), undefined);
+  assert.equal(lang.refineInlineCompletion(snapshot("x <- df$al + 1", 10)), undefined);
+  assert.equal(lang.refineInlineCompletion(snapshot("other\nx <- df$al")), undefined);
+  lang.cancelCompletion();
+  assert.equal(lang.refineInlineCompletion(snapshot("x <- df$al")), undefined);
 });
 
 test("function argument completion awaits parameters before offering runtime variables", async () => {

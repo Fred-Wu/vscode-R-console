@@ -686,8 +686,12 @@ an explicit selection is retained on refresh.
 
 The `r.console.inlineCompletion.trigger` setting chooses automatic
 debounced suggestions or Tab activation. In Tab mode, editing refreshes an open
-list without opening a closed one. Tab or Enter accepts the selected suggestion,
+list without opening a closed one. `inlineCompletion.minCharacters` gates only
+automatic opening in inline/typing mode, counting the current completion prefix.
+The default is three characters; the minimum is one. Explicit Tab requests and
+argument suggestions following an accepted function bypass it. Tab or Enter accepts the selected suggestion,
 or requests fresh suggestions without submitting input if the visible results are stale.
+With `inlineCompletion.acceptOnEnter` disabled, Enter submits the input instead.
 Escape dismisses it, and clearing the input dismisses the list and invalidates
 outstanding requests. Backspace resets the suggestion selection and viewport.
 
@@ -707,8 +711,10 @@ positions exactly at the terminal's right edge remain in its final cell
 until xterm wraps on the next printable character. Suggestion rows are
 excluded from saved replay and restored terminal history.
 
-Each row can display the completion icon, label, match highlighting,
-description and detail. Group labels share the terminal background with
+Each candidate occupies one row with its icon, label, match highlighting and
+description. A separate row shows only the selected candidate's details. Compact
+panels omit headings, icons and details to retain usable choices in small terminals.
+Group labels share the terminal background with
 unselected suggestions. The active row has a continuous selection background.
 Colors use the `workbench.colorCustomizations`
 `editorSuggestWidget.highlightForeground` and
@@ -718,15 +724,26 @@ use colored terminal glyphs. The pseudoterminal inherits the configured terminal
 font and reads explicit color customizations through the configuration API.
 
 The completion controller manages a bounded, scrollable viewport with an
-in-box scrollbar. Up/Down and Page Up/Down navigate completion choices, moving
-the viewport when the selected item reaches a visible edge. Temporary SGR mouse
-reporting permits wheel navigation within the panel. Clicks on suggestions or
-their detail rows accept a completion, and scrollbar clicks move the viewport.
+in-box scrollbar. Up/Down changes selection and reveals the selected item.
+Page Up/Down, the footer's text triangles, wheel scrolling and thumb dragging
+move the viewport independently of selection. Clicking the scrollbar track pages
+towards the click. Temporary SGR button-motion reporting supports dragging,
+including movement and release outside the box. Only candidate rows accept a
+completion; details and navigation controls never do.
 Wheel reports outside the box invoke VS Code terminal page-scrolling commands.
 Wheel events over either the suggestion content or its scrollbar navigate
 the completion list.
 Cursor-position reports establish the panel's screen coordinates for mouse
 hit-testing. Mouse reporting is disabled when the panel closes.
+
+Inline edits synchronously filter cached candidates when only the same prefix
+has been extended, rebasing their input snapshots and edit ranges. Changed
+surrounding text invalidates reuse. Provider refreshes remain debounced; stale
+asynchronous results cannot replace current suggestions. The shared matcher
+ranks exact, prefix and contiguous matches before subsequence matches. When R's
+language server returns no usable candidates, a lookup at the prefix's first
+character supplies candidates for local abbreviation matching, without changing
+the console document.
 
 #### Completion Sources
 

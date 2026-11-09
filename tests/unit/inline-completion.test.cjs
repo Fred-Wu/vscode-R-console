@@ -9,7 +9,7 @@ after(() => widthTerminal.dispose());
 
 const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInput: "", snapshotCursor: 0, source: "session" });
 
-function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
+function createTerminal(t, columns = 80, rows = 24, trigger = "typing", settings = {}) {
   const scrollCommands = [];
   const { InputState } = loadSource("src/Terminal/inputState.ts");
   const { Renderer } = loadSource("src/Terminal/renderer.ts");
@@ -20,7 +20,7 @@ function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
       EventEmitter: class {}, window: {},
       commands: { executeCommand(command) { scrollCommands.push(command); return Promise.resolve(); } },
       workspace: { getConfiguration: () => ({ get: (key, fallback) =>
-        key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? trigger : fallback }) },
+        key in settings ? settings[key] : key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? trigger : fallback }) },
     },
   });
   const screen = new Terminal({ cols: columns, rows, allowProposedApi: true });
@@ -28,7 +28,7 @@ function createTerminal(t, columns = 80, rows = 24, trigger = "typing") {
     inputState: new InputState(), inlineCompletion: new InlineCompletion(unicode),
     mode: "ready", promptReady: true, dimensions: { columns, rows },
     inlineSuggestionRowCount: 0,
-    lang: { cancelCompletion() {}, updateInput() {} },
+    lang: { cancelCompletion() {}, updateInput() {}, refineInlineCompletion() {} },
     syntax: { setSource() {} },
     writeEmitter: { fire(text) { screen._core._writeBuffer.writeSync(text); } },
     ensureReadyPromptVisibleForInput() {},
@@ -88,7 +88,7 @@ test("clicking the visible suggestion still works after the panel shrinks", t =>
 });
 
 test("a panel that cannot fit releases Enter and mouse reporting", t => {
-  for (const [columns, rows] of [[19, 24], [80, 5]]) {
+  for (const [columns, rows] of [[11, 24], [80, 5]]) {
     const { terminal } = createTerminal(t, columns, rows);
     terminal.inputState.insertText("mea");
     terminal.inlineCompletion.set([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }], terminal.inlineCompletion.token);
@@ -458,6 +458,190 @@ test("inline completion navigates, clamps and accepts selected item", () => {
   assert.equal(state.visible, true);
 });
 
+test("scrollbar dragging moves the viewport independently, clamps, and releases outside the box", t => {
+  const { terminal } = createTerminal(t);
+  const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
+  const keys = new KeyProcessor();
+  terminal.inputState.insertText("a");
+  const choices = Array.from({ length: 100 }, (_, i) => ({
+    ...item("alpha" + i), snapshotInput: "a", snapshotCursor: 1,
+  }));
+  terminal.inlineCompletion.set(choices, terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const state = terminal.inlineCompletion;
+  const top = terminal.inlineBoxTop;
+  const col = state.renderedLeft + state.renderedWidth - 1;
+  const send = text => keys.parseInputChunk(text).forEach(action => terminal.applyKeyAction(action));
+  send(`\x1b[<0;${col};${top + 1}M`);
+  assert.ok(state.dragging);
+  send(`\x1b[<32;${col};${top + 5}M`);
+  assert.ok(state.scrollStart > 0);
+  assert.equal(state.current(), choices[0], "dragging does not change the selected candidate");
+  send(`\x1b[<32;1;${top + 40}M`);
+  assert.equal(state.scrollStart, state.totalRows - state.viewportRows);
+  assert.equal(state.hitTest(state.viewportRows, 8), choices[99]);
+  send("\x1b[<0;1;1m");
+  assert.equal(state.dragging, false);
+  assert.equal(terminal.accepted, undefined);
+  const lastStart = state.scrollStart;
+  send("\x1b[<32;1;1M");
+  assert.equal(state.scrollStart, lastStart, "movement after release cannot scroll");
+  terminal.applyKeyAction({ type: "arrow", dir: "down" });
+  assert.equal(state.current(), choices[1]);
+  assert.ok(state.hitTest(1, 8) === choices[1], "keyboard navigation reveals the selected candidate");
+});
+
+test("footer triangles page the list, preserve selection, and never accept a candidate", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  terminal.inlineCompletion.set(Array.from({ length: 40 }, (_, i) => item("alpha" + i)), terminal.inlineCompletion.token);
+  terminal.renderInput();
+  const state = terminal.inlineCompletion;
+  const buffer = screen.buffer.active;
+  const footer = Array.from({ length: 24 }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true));
+  const row = footer.findIndex(line => line.includes("◀ ▶")) + 1;
+  assert.ok(row > 0);
+  const nextCol = footer[row - 1].indexOf("▶") + 1;
+  const click = col => {
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row, col });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row, col });
+  };
+  click(nextCol);
+  assert.equal(state.scrollStart, state.viewportRows);
+  assert.equal(state.selected, 0);
+  click(nextCol - 2);
+  assert.equal(state.scrollStart, 0);
+  click(nextCol - 2);
+  assert.equal(state.scrollStart, 0, "disabled previous button stays at the start");
+  assert.equal(terminal.accepted, undefined);
+});
+
+test("provider refresh preserves browsing position and resize cancels an active drag", () => {
+  const state = new InlineCompletion(unicode);
+  const choices = Array.from({ length: 50 }, (_, i) => item("alpha" + i));
+  state.set(choices, state.token, "a");
+  state.lines(60, 10);
+  state.page(1);
+  state.lines(60, 10);
+  const start = state.scrollStart;
+  state.set(choices.map(choice => ({ ...choice })), state.invalidate(), "a");
+  state.lines(60, 10);
+  assert.equal(state.scrollStart, start, "an unchanged query must not snap back to the selection");
+  state.startScroll(state.thumbStart + 1);
+  assert.ok(state.dragging);
+  state.lines(25, 7);
+  assert.equal(state.dragging, false, "new geometry invalidates the old drag offset");
+  state.clear();
+  assert.equal(state.isScrollbar(1, 1), false);
+});
+
+test("compact panels fit narrow and short terminals without hiding choices or capturing invisible controls", t => {
+  for (const [columns, rows] of [[12, 6], [19, 8], [80, 6]]) {
+    const { terminal, screen } = createTerminal(t, columns, rows);
+    terminal.inputState.insertText("a");
+    terminal.inlineCompletion.set([{ label: "A long heading" }, ...Array.from({ length: 10 }, (_, i) => ({
+      ...item("alpha" + i), detail: "A long description",
+    }))], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    const state = terminal.inlineCompletion;
+    assert.ok(state.hasRenderedRows);
+    const buffer = screen.buffer.active;
+    const lines = Array.from({ length: rows }, (_, i) => buffer.getLine(buffer.baseY + i));
+    assert.ok(lines.some(line => line.translateToString(true).includes("alpha0")));
+    assert.ok(lines.some(line => line.translateToString(true).includes("◀ ▶")));
+    assert.ok(lines.every(line => !line.isWrapped));
+    assert.ok(terminal.renderer.renderedLineCount <= rows);
+    assert.equal(state.hitTest(1, state.renderedLeft + 4).label, "alpha0");
+  }
+});
+
+test("Enter acceptance is configurable while Tab continues to accept", t => {
+  for (const accept of ["enter", "tab"]) {
+    const { terminal } = createTerminal(t, 80, 24, "typing", { "inlineCompletion.acceptOnEnter": false });
+    terminal.inputState.insertText("mea");
+    const choice = { ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 };
+    terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
+    terminal.renderInput();
+    terminal.applyKeyAction({ type: accept });
+    assert.equal(terminal.accepted, accept === "tab" ? choice : undefined);
+    assert.equal(terminal.submitted, accept === "enter" ? "mea" : undefined);
+    assert.equal(terminal.inlineCompletion.visible, false);
+  }
+});
+
+test("typing threshold counts the current prefix, dismisses below it, and explicit Tab bypasses it", async t => {
+  const { terminal } = createTerminal(t, 80, 24, "typing", { "inlineCompletion.minCharacters": 3 });
+  const requests = [];
+  terminal.lang.handleAutocomplete = async request => {
+    requests.push(request.input.currentLine);
+    request.onInlineEntries([{ ...item("alpha"), snapshotInput: request.input.currentLine,
+      snapshotCursor: request.input.cursorCol, replaceStart: request.input.cursorCol - 3 }]);
+  };
+  terminal.applyKeyAction({ type: "text", text: "longObjectName$al" });
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  terminal.applyKeyAction({ type: "text", text: "p" });
+  assert.ok(terminal.inlineCompletionTimer);
+  await new Promise(resolve => setTimeout(resolve, 180));
+  assert.deepEqual(requests, ["longObjectName$alp"]);
+  assert.ok(terminal.inlineCompletion.visible);
+  terminal.applyKeyAction({ type: "backspace" });
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(terminal.inlineCompletionTimer, undefined);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.deepEqual(requests, ["longObjectName$alp", "longObjectName$al"]);
+  assert.ok(terminal.inlineCompletion.visible);
+});
+
+test("automatic suggestions start on the third character by default and respect explicit thresholds", t => {
+  for (const minimum of [undefined, 1, 2, 3, 0]) {
+    const settings = minimum === undefined ? {} : { "inlineCompletion.minCharacters": minimum };
+    const { terminal } = createTerminal(t, 80, 24, "typing", settings);
+    const expected = minimum >= 1 ? minimum : 3;
+    for (const [index, text] of [..."alp"].entries()) {
+      terminal.applyKeyAction({ type: "text", text });
+      assert.equal(Boolean(terminal.inlineCompletionTimer), index + 1 >= expected);
+    }
+    terminal.applyKeyAction({ type: "backspace" });
+    assert.equal(Boolean(terminal.inlineCompletionTimer), 2 >= expected);
+  }
+  const setting = require("../../package.json").contributes.configuration.properties["r.console.inlineCompletion.minCharacters"];
+  assert.equal(setting.minimum, 1, "zero is not an allowed setting");
+  assert.equal(setting.default, 3);
+});
+
+test("typing threshold does not affect manual mode or Quick Pick", t => {
+  for (const mode of ["inline", "quickPick"]) {
+    const { terminal } = createTerminal(t, 80, 24, "tab", {
+      completionUI: mode, "inlineCompletion.minCharacters": 99,
+    });
+    let requests = 0;
+    terminal.lang.handleAutocomplete = async () => { requests++; };
+    terminal.applyKeyAction({ type: "text", text: "a" });
+    assert.equal(terminal.inlineCompletionTimer, undefined);
+    terminal.applyKeyAction({ type: "tab" });
+    assert.equal(requests, 1);
+  }
+});
+
+test("cached refinements update the visible list before the provider debounce", t => {
+  const { terminal } = createTerminal(t, 80, 24, "typing", { "inlineCompletion.minCharacters": 1 });
+  terminal.inputState.insertText("a");
+  terminal.inlineCompletion.set([item("alpha"), item("apple")], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  let requested = false;
+  terminal.lang.handleAutocomplete = async () => { requested = true; };
+  const refined = { ...item("alpha"), snapshotInput: "al", snapshotCursor: 2 };
+  terminal.lang.refineInlineCompletion = input => {
+    assert.equal(input.currentLine, "al");
+    return [refined];
+  };
+  terminal.applyKeyAction({ type: "text", text: "l" });
+  assert.equal(terminal.inlineCompletion.current(), refined);
+  assert.equal(requested, false);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.accepted, refined, "rebased cached candidates can be accepted immediately");
+});
+
 test("old asynchronous completion results cannot reopen a dismissed list", () => {
   const state = new InlineCompletion(unicode);
   const token = state.token;
@@ -481,13 +665,16 @@ test("inline completion draws a border, shows picker metadata, and hides codicon
   assert.match(plain, /mtcars/);
   assert.match(plain, /variable/);
   assert.match(plain, /session/);
-  assert.match(plain, /{base}/);
+  assert.doesNotMatch(plain, /{base}/, "only the selected item's details occupy a row");
   assert.doesNotMatch(plain, /\$\(symbol-|> mtcars/);
   assert.match(lines.join(""), /\x1b\[38;5;75m/);
   assert.match(lines.join(""), /\x1b\[48;2;/);
   assert.match(plain, /● mtcars/);
   state.move(1);
   assert.equal(state.current().insertText, "$(symbol-function) mean");
+  const updated = state.lines(60, 9).join("\n");
+  assert.match(updated, /{base}/);
+  assert.doesNotMatch(updated, /session/);
 });
 
 test("inline scrolling follows selected completion and removes unsafe escapes", () => {
@@ -497,7 +684,7 @@ test("inline scrolling follows selected completion and removes unsafe escapes", 
   const lines = state.lines(40, 8);
   assert.equal(lines.length, 8);
   assert.ok(lines.some(line => line.includes("item14")));
-  assert.ok(lines.some(line => line.includes("of 20")));
+  assert.ok(lines.some(line => line.includes("/20")));
   state.clear();
   state.set([item("bad\x1b[31m red")], state.token);
   const plain = state.lines(40, 7).join("");
@@ -614,7 +801,7 @@ test("mouse hit testing maps displayed rows, including scrolled entries and deta
   state.lines(40, 8);
   assert.equal(state.hitTest(1, 8), undefined);
   assert.equal(state.hitTest(2, 8)?.label, "alpha");
-  assert.equal(state.hitTest(3, 8)?.label, "alpha");
+  assert.equal(state.hitTest(3, 8), undefined, "detail row is not an acceptance target");
 });
 
 test("scrollbar follows viewport and selection scrolls only at visible edges", () => {
@@ -638,7 +825,7 @@ test("scrollbar follows viewport and selection scrolls only at visible edges", (
 test("first and last choices reach scrollbar endpoints including headings and details", () => {
   for (const withDetails of [false, true]) {
     const state = new InlineCompletion(unicode);
-    const count = withDetails ? 6 : 10;
+    const count = 20;
     state.set([
       { label: "Functions" },
       ...Array.from({ length: count }, (_, i) => ({
@@ -649,8 +836,8 @@ test("first and last choices reach scrollbar endpoints including headings and de
     state.lines(60, 13);
     state.move(count - 1);
     const bottom = state.lines(60, 13).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    assert.ok(bottom[bottom.length - 3].endsWith("█│"), "thumb reaches the last content row");
-    if (withDetails) assert.ok(bottom.some(line => line.includes("detail5")));
+    assert.ok(bottom[bottom.length - (withDetails ? 4 : 3)].endsWith("█│"), "thumb reaches the last content row");
+    if (withDetails) assert.ok(bottom.some(line => line.includes("detail19")));
     state.move(-(count - 1));
     const top = state.lines(60, 13).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
     assert.ok(top[1].includes("Functions"), "returning to the first choice restores its heading");
@@ -747,7 +934,8 @@ test("scrollbar click changes navigation but cannot accept a suggestion", t => {
   terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: barCol });
   terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: barCol });
   assert.equal(terminal.accepted, undefined, "scrollbar is never an accept target");
-  assert.ok(terminal.inlineCompletion.selected > start, "track click scrolls to lower suggestion");
+  assert.equal(terminal.inlineCompletion.selected, start, "track click preserves selection");
+  assert.ok(terminal.inlineCompletion.scrollStart > 0, "track click scrolls the viewport");
   assert.equal(terminal.inlineCompletion.hitTest(8, barCol), undefined);
 });
 
@@ -829,7 +1017,8 @@ test("wheel over suggestion scrollbar navigates suggestions, not terminal histor
   const row = terminal.inlineBoxTop + 3;
   assert.ok(terminal.inlineCompletion.isScrollbar(3, scrollbarCol));
   terminal.applyKeyAction({ type: "wheel", dir: "down", col: scrollbarCol, row });
-  assert.equal(terminal.inlineCompletion.selected, 1);
+  assert.equal(terminal.inlineCompletion.selected, 0);
+  assert.equal(terminal.inlineCompletion.scrollStart, 3);
   assert.deepEqual(scrollCommands, []);
 });
 
@@ -938,11 +1127,12 @@ test("windowed clipping preserves supplementary characters and mixed Unicode cel
   }
 });
 
-test("completion popup keeps the input tail and caret visible while editing clipped wide text", t => {
+test("manually opened completion keeps the input tail and caret visible while editing clipped wide text", t => {
   for (const columns of [25, 27]) {
     const { terminal, screen } = createTerminal(t, columns, 7);
     const input = "漢".repeat(29) + "終";
     const entry = { ...item("candidate"), snapshotInput: input, snapshotCursor: input.length };
+    terminal.inlineCompletionExplicit = true;
     terminal.inputState.insertText(input);
     terminal.inlineCompletion.set([entry], terminal.inlineCompletion.token);
     terminal.renderInput();
