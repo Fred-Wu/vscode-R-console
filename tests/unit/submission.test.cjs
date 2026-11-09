@@ -553,6 +553,54 @@ test("failed later backend delivery restores only unsent blocks", async () => {
   assert.equal(terminal.inputState.text, "2");
 });
 
+for (const character of ["a", "\u00e9"]) {
+  test(`oversized ${character === "a" ? "ASCII" : "UTF-8"} expression stops its batch and restores unsent source`, async () => {
+    const { terminal, commands, history, output } = createTerminal();
+    const oversized = `x <- "${character.repeat(8 * 1024 * 1024 / Buffer.byteLength(character))}"`;
+    const source = `${oversized}\ny <- nchar(x)\n`;
+    await terminal.handleProgrammaticSubmission(source);
+
+    assert.deepEqual(commands, [], "neither the rejected assignment nor its dependent expression reaches R");
+    assert.deepEqual(history, [], "immediately rejected source remains available for retry, not history");
+    assert.ok(terminal.inputState.text === source, "the entire unsent batch is restored");
+    assert.equal(terminal.inputState.cursorPosition, source.length);
+    assert.equal(terminal.mode, "ready");
+    assert.equal(terminal.activeSubmission, null);
+    assert.equal(terminal.submissionPending, false);
+    assert.equal(terminal.awaitingExecutionStart, false);
+    assert.deepEqual(terminal.submissionQueue, []);
+    assert.match(output.join(""), /8 MiB backend frame limit/);
+    assert.match(output.join(""), /Unsent code restored for editing/);
+
+    terminal.inputState.text = 'x <- "fixed"\ny <- nchar(x)';
+    terminal.inputState.cursorToEnd();
+    await terminal.handleEnterKey();
+    assert.deepEqual(commands.map(c => c.code), ['x <- "fixed"']);
+    nextPrompt(terminal);
+    assert.deepEqual(commands.map(c => c.code), ['x <- "fixed"', "y <- nchar(x)"]);
+    assert.deepEqual(history, ['x <- "fixed"', "y <- nchar(x)"]);
+  });
+}
+
+test("queued oversized expression restores only unsent code and preserves the current draft", async () => {
+  const { terminal, commands } = createTerminal();
+  const oversized = `x <- "${"a".repeat(8 * 1024 * 1024)}"`;
+  await terminal.handleProgrammaticSubmission(`1\n${oversized}\ny <- nchar(x)\n`);
+  terminal.inputState.insertText("draft");
+  terminal.inputState.cursorPosition = 2;
+  nextPrompt(terminal);
+
+  assert.deepEqual(commands.map(c => c.code), ["1"]);
+  const restoredPrefix = `${oversized}\ny <- nchar(x)\n`;
+  assert.ok(terminal.inputState.text === restoredPrefix + "draft", "only unsent source is restored before the draft");
+  assert.equal(terminal.inputState.cursorPosition, restoredPrefix.length + 2);
+  assert.equal(terminal.mode, "ready");
+  assert.equal(terminal.activeSubmission, null);
+  assert.deepEqual(terminal.submissionQueue, []);
+  terminal.startNextSubmission();
+  assert.deepEqual(commands.map(c => c.code), ["1"], "dependent code remains cancelled");
+});
+
 test("rejected interrupt does not discard queued source", async () => {
   const { terminal } = createTerminal();
   await terminal.handleProgrammaticSubmission("1\n2\n");

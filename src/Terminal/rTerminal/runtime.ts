@@ -1096,29 +1096,12 @@ export function sendRuntimeReply(host: RuntimeHost, text: string): void {
 
 export function startRuntimeSubmission(host: RuntimeHost, task: Submission): void {
   const bytes = Buffer.byteLength(task.code, "utf8");
-  if (bytes > MAX_BACKEND_FRAME_BYTES) {
-    // R never receives this command and therefore will not send a new prompt.
-    host.submissionPending = false;
-    host.awaitingExecutionStart = false;
-    host.activeSubmission = null;
-    host.mode = "ready";
-    if (host.promptVisible) {
-      host.clearInputRender();
-      host.promptVisible = false;
-    }
-    host.pendingPromptToken = true;
-    handleRuntimeError(host, `${new BackendFrameSizeError(bytes).message}\n`);
-    if (host.submissionQueue.length > 0) {
-      host.startNextSubmission();
-    } else {
-      host.schedulePrompt();
-    }
-    return;
-  }
-  const sent = host.runtimeBackend?.sendSessionCommand(host.rProcess, {
+  const sizeError = bytes > MAX_BACKEND_FRAME_BYTES ? new BackendFrameSizeError(bytes) : undefined;
+  // A rejected expression must cancel and restore unsent work just like a delivery failure.
+  const sent = !sizeError && (host.runtimeBackend?.sendSessionCommand(host.rProcess, {
     type: "submit",
     code: task.code,
-  }) ?? false;
+  }) ?? false);
   if (!sent) {
     const restored = restoreSubmissionSource([task, ...host.submissionQueue], host.inputState.text,
       host.inputState.cursorPosition);
@@ -1134,7 +1117,7 @@ export function startRuntimeSubmission(host: RuntimeHost, task: Submission): voi
       host.promptVisible = false;
     }
     host.pendingPromptToken = true;
-    handleRuntimeError(host, "R submission was not sent. Unsent code restored for editing.\n");
+    handleRuntimeError(host, `${sizeError?.message ?? "R submission was not sent."} Unsent code restored for editing.\n`);
     host.schedulePrompt();
     return;
   }
