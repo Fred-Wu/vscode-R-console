@@ -299,14 +299,18 @@ The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 `127.0.0.1:0`, then writes JSON to the bootstrap file:
 
 ```json
-{"port":12345,"pid":67890}
+{"port":12345,"pid":67890,"protocolVersion":2}
 ```
 
-The TypeScript side polls that file, reads the port and pid, then connects to
+The TypeScript side polls that file, requires protocol version 2, reads the port and pid, then connects to
 the loopback server. Before exchanging session traffic, both peers prove
 possession of the session secret using HMAC-SHA256 and fresh nonces. The
 authentication implementation is in
 [`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
+
+The authenticated backend uses protocol version 2; v0.5.4 used version 1 without
+authentication. The extension also checks the live `backend-ready` version.
+This version is independent of vscode-R's `sess` integration protocol.
 
 ### 2.2 Reconnect Transport
 
@@ -840,7 +844,7 @@ The file is stored under extension storage:
 
 Each record contains:
 
-- runtime reconnect info: session id, port, authentication token, pid
+- runtime reconnect info: protocol version, session id, port, authentication token, pid
 - persisted terminal options: R path, R args, watcher settings, bracketed paste,
   cwd
 - UI replay state: replay buffer, dimensions, mode, prompt state, input text,
@@ -852,17 +856,41 @@ its console UI.
 
 ### 4.3 Registry Loading And Pruning
 
-On activation, `extension.ts` loads `persistent-sessions.json`.
+On activation, `extension.ts` loads `persistent-sessions.json` through
+`Runtime/persistentSessionRegistry.ts`.
 
-Records are validated before use. A record is kept only when:
+Records are validated individually before reconnecting. A record can reconnect only when:
 
-- its runtime reconnect info is structurally valid
+- its runtime reconnect info is structurally valid and uses protocol version 2
 - its terminal options are structurally valid
 - its UI replay state is structurally valid
 - its recorded backend pid is either absent or still alive
 
-Dead records are removed from the in-memory registry and the persisted file is
-rewritten.
+Dead authenticated records are pruned when the registry is saved. Incompatible
+records are retained alongside valid records; one invalid entry does not discard
+the whole registry. Unreadable or malformed registry files are not overwritten.
+
+Records are recognized as older sessions when they use protocol version 1 and
+have no `authToken`, or when both fields are absent (the v0.5.4 format), and their
+remaining structure is valid. Unknown versions are preserved without reconnecting
+or offering legacy shutdown. Activation shows a notice once per detected old
+session, tracked in workspace state. The notice explains that the protocol has
+changed and old sessions must be closed and restarted. It offers only **Close Old
+Session** and **Cancel**. Clicking Close confirms shutdown, with a picker by PID
+and startup directory only when multiple old sessions exist. There is no details
+page or second confirmation. Cancel leaves the sessions untouched. The session
+manager also provides this close action. It does not depend on editor focus and
+does not create a new console.
+
+`Runtime/legacySession.ts` implements this explicit cleanup path. It matches the
+saved PID and port to the session bootstrap file and checks the running backend:
+Windows checks its process name and start time against bootstrap creation;
+Linux/macOS check its executable and session bootstrap environment. These checks
+run after the user clicks Close. The connection must then report the old
+backend protocol and matching PID before receiving its sole command, `shutdown`.
+A modern authentication challenge is rejected, and no PID-based kill fallback
+is used. The record is removed only after the process exits; failed verification
+or shutdown retains it. Ordinary reconnection still requires authentication.
 
 ### 4.4 Creating A Console
 

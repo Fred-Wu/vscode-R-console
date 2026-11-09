@@ -115,7 +115,7 @@ test("runtime backend retries a transient closed handshake without trusting an i
       socket.write(frame(24, mac("rconsole-backend-server-v2", serverNonce, clientNonce)));
     });
   });
-  const info = { sessionId: "transient", port, authToken: token };
+  const info = { sessionId: "transient", port, authToken: token, protocolVersion: 2 };
   const state = { child: undefined, attachGeneration: 1, explicitClose: false, authToken: token };
   const socket = await backend.connectSocketWithRetry(state, info, 1);
   assert.ok(connections >= 2, "a prematurely closed socket must not permanently prevent reconnection");

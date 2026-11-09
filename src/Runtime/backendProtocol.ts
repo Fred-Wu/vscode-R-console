@@ -1,5 +1,17 @@
 const FRAME_HEADER_LEN = 12;
+export const BACKEND_PROTOCOL_VERSION = 2;
 export const MAX_BACKEND_FRAME_BYTES = 8 * 1024 * 1024;
+
+export class BackendProtocolVersionError extends Error {
+  constructor(version: unknown) {
+    super(`R Console protocol version ${version ?? "unknown"} is incompatible with version ${BACKEND_PROTOCOL_VERSION}. Close the old session and start a new R Console.`);
+    this.name = "BackendProtocolVersionError";
+  }
+}
+
+export function assertBackendProtocolVersion(version: unknown): void {
+  if (version !== BACKEND_PROTOCOL_VERSION) throw new BackendProtocolVersionError(version);
+}
 
 export class BackendFrameSizeError extends Error {
   constructor(bytes: number) {

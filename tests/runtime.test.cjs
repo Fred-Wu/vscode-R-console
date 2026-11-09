@@ -115,6 +115,9 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   const bootstrap = path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`);
   const sessionData = JSON.parse(fs.readFileSync(bootstrap, "utf8"));
   assert.equal(sessionData.authToken, undefined, "bootstrap must never disclose backend credentials");
+  assert.equal(sessionData.protocolVersion, 2);
+  assert.equal(backend.getReconnectInfo(session).protocolVersion, 2);
+  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, 2);
   assert.match(backend.getReconnectInfo(session).authToken, /^[0-9a-f]{64}$/);
   if (process.platform !== "win32") assert.equal(fs.statSync(bootstrap).mode & 0o777, 0o600);
   // Wrong and missing credentials must not replace the authenticated console.

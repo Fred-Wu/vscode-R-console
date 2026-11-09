@@ -10,6 +10,7 @@ All notable changes to R Console will be documented in this file.
 
 ### Fixed
 
+- Preserved older persistent-session records across the connection protocol update and added a one-time notice offering Close Old Session or Cancel.
 - Fixed missing argument suggestions after accepting a partial function name match in automatic inline completion, such as `libr` to `library()`.
 - Fixed code suggestions sometimes failing when typing or pressing Tab just after opening an R Console.
 - Improved the reliability of code submission in the R Console.

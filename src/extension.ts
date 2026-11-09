@@ -1,4 +1,3 @@
-import { randomUUID } from "crypto";
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
@@ -6,8 +5,6 @@ import { disposeConsoleLspOutputChannel } from "./Language/consoleLspClient";
 import { disposeHistoryWorker } from "./Terminal/history";
 import {
   RTerminal,
-  type PersistedRTerminalState,
-  type PersistedRTerminalOptions,
   resolveRTerminalOptions,
 } from "./Terminal/rTerminal";
 import {
@@ -18,10 +15,14 @@ import { disposeVscodeRIntegrationForRuntimeSession } from "./Runtime/VSCR";
 import {
   getPlatformRPathConfigEntry,
 } from "./Terminal/options";
-
-type TerminalContext =
-  | { kind: "panel" }
-  | { kind: "editor"; viewColumn: vscode.ViewColumn };
+import {
+  PersistentSessionRegistry,
+  getPersistedRuntimePid,
+  hasLivePersistedRuntime,
+  type PersistedConsoleRecord,
+  type TerminalContext,
+} from "./Runtime/persistentSessionRegistry";
+import { showLegacySessionNotice, manageLegacySessions } from "./Terminal/legacySessionNotice";
 
 type ConsoleRecord = {
   rTerminal: RTerminal;
@@ -30,16 +31,6 @@ type ConsoleRecord = {
   terminalName?: string;
   pid?: number;
   pidSubscription: vscode.Disposable;
-};
-
-type PersistedConsoleRecord = {
-  terminal: PersistedRTerminalState;
-  location: TerminalContext;
-  terminalName?: string;
-};
-
-type PersistentSessionState = {
-  sessions: PersistedConsoleRecord[];
 };
 
 type ManagedPersistentSession = {
@@ -51,7 +42,7 @@ type ManagedPersistentSession = {
 };
 
 type ManageAction = vscode.QuickPickItem & {
-  action: "attach" | "attachAll" | "detach" | "detachAll" | "close" | "closeAll" | "refresh";
+  action: "attach" | "attachAll" | "detach" | "detachAll" | "close" | "closeAll" | "refresh" | "legacy";
 };
 
 type ManagedSessionPick = vscode.QuickPickItem & {
@@ -71,7 +62,7 @@ const R_CONSOLE_ACTIVE_CONTEXT = "rConsole.consoleActive";
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_HEARTBEAT_MS = 5000;
 let extensionBaseUri: vscode.Uri | undefined;
-let persistentSessionFilePath: string | undefined;
+let persistentRegistry: PersistentSessionRegistry | undefined;
 let persistDebounceTimer: NodeJS.Timeout | undefined;
 let persistHeartbeatTimer: NodeJS.Timeout | undefined;
 let extensionHostDeactivating = false;
@@ -104,10 +95,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   extensionBaseUri = context.extensionUri;
   const sessionStorageUri = context.storageUri ?? context.globalStorageUri;
-  persistentSessionFilePath = vscode.Uri.joinPath(
-    sessionStorageUri,
-    "persistent-sessions.json"
-  ).fsPath;
+  persistentRegistry = new PersistentSessionRegistry(vscode.Uri.joinPath(
+    sessionStorageUri, "persistent-sessions.json"
+  ).fsPath);
   void fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true }).catch(() => {});
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
@@ -157,6 +147,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   disposeStalePersistentTerminalViews();
   syncTerminalRecordsFromWindow();
   setRConsoleActiveContext(vscode.window.activeTerminal);
+  void showLegacySessionNotice(context.workspaceState, persistentRegistry).catch(() => {});
 }
 
 async function initializePersistentSessionRegistry(): Promise<void> {
@@ -171,36 +162,7 @@ async function initializePersistentSessionRegistry(): Promise<void> {
 }
 
 async function loadPersistentSessionsFromDisk(): Promise<PersistedConsoleRecord[]> {
-  const records = new Map<string, PersistedConsoleRecord>();
-
-  if (persistentSessionFilePath) {
-    for (const entry of await readPersistentSessionFile(persistentSessionFilePath)) {
-      records.set(entry.terminal.runtime.sessionId, entry);
-    }
-  }
-
-  const liveRecords = [...records.values()].filter(hasLivePersistedRuntime);
-  if (liveRecords.length === 0) {
-    await removePersistentSessionFiles();
-  }
-  return liveRecords;
-}
-
-async function readPersistentSessionFile(filePath: string): Promise<PersistedConsoleRecord[]> {
-  try {
-    const raw = await fs.promises.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    const sessions = parsePersistentSessionState(parsed);
-    return sessions ? sessions.filter(hasLivePersistedRuntime) : [];
-  } catch {
-    return [];
-  }
-}
-
-async function removePersistentSessionFiles(): Promise<void> {
-  if (persistentSessionFilePath) {
-    await fs.promises.rm(persistentSessionFilePath, { force: true }).catch(() => {});
-  }
+  return await persistentRegistry?.load() ?? [];
 }
 
 function normalizeRExecutablePathForComparison(rPath: string): string {
@@ -235,175 +197,6 @@ function disposeStalePersistentTerminalViews(): void {
     ignoredTerminalCloseEvents.add(terminal);
     terminal.dispose();
   }
-}
-
-function getPersistedRuntimePid(state: PersistedRTerminalState): number | undefined {
-  const runtimePid = state.runtime.pid;
-  if (isPositiveInteger(runtimePid)) {
-    return runtimePid;
-  }
-
-  const backendChildPid = state.ui.backendChildPid;
-  return isPositiveInteger(backendChildPid) ? backendChildPid : undefined;
-}
-
-function hasLivePersistedRuntime(entry: PersistedConsoleRecord): boolean {
-  const pid = getPersistedRuntimePid(entry.terminal);
-  return typeof pid !== "number" || isProcessAlive(pid);
-}
-
-function isPersistedConsoleRecord(value: unknown): value is PersistedConsoleRecord {
-  if (!isObjectRecord(value)) {
-    return false;
-  }
-  if (!isPersistedRTerminalState(value.terminal)) {
-    return false;
-  }
-  if (!isPersistedTerminalContext(value.location)) {
-    return false;
-  }
-  if (value.terminalName !== undefined && typeof value.terminalName !== "string") {
-    return false;
-  }
-  return true;
-}
-
-function parsePersistentSessionState(value: unknown): PersistedConsoleRecord[] | undefined {
-  if (!isObjectRecord(value)) {
-    return undefined;
-  }
-  const sessions = Array.isArray(value.sessions) ? value.sessions : undefined;
-  if (!sessions || !sessions.every(isPersistedConsoleRecord)) {
-    return undefined;
-  }
-  return sessions;
-}
-
-function isPersistedRTerminalState(value: unknown): value is PersistedRTerminalState {
-  if (!isObjectRecord(value)) {
-    return false;
-  }
-  return (
-    isPersistedRTerminalOptions(value.options) &&
-    isRuntimeSessionReconnectInfo(value.runtime) &&
-    isPersistedUiSnapshot(value.ui)
-  );
-}
-
-function isPersistedRTerminalOptions(value: unknown): value is PersistedRTerminalOptions {
-  if (!isObjectRecord(value)) {
-    return false;
-  }
-  if (typeof value.rPath !== "string" || value.rPath.trim().length === 0) {
-    return false;
-  }
-  if (!Array.isArray(value.rArgs) || value.rArgs.some((entry) => typeof entry !== "string")) {
-    return false;
-  }
-  if (typeof value.bracketedPaste !== "boolean") {
-    return false;
-  }
-  if (value.cwd !== undefined && typeof value.cwd !== "string") {
-    return false;
-  }
-  return true;
-}
-
-function isRuntimeSessionReconnectInfo(
-  value: unknown
-): value is PersistedRTerminalState["runtime"] {
-  if (!isObjectRecord(value)) {
-    return false;
-  }
-  if (typeof value.sessionId !== "string" || value.sessionId.trim().length === 0) {
-    return false;
-  }
-  if (!isPositiveInteger(value.port) || typeof value.authToken !== "string" || !/^[0-9a-f]{64}$/.test(value.authToken)) {
-    return false;
-  }
-  if (value.pid !== undefined && !isPositiveInteger(value.pid)) {
-    return false;
-  }
-  return true;
-}
-
-function isPersistedUiSnapshot(value: unknown): value is PersistedRTerminalState["ui"] {
-  if (!isObjectRecord(value) || !isPersistedReplaySnapshot(value.replay)) {
-    return false;
-  }
-  if (!isPositiveInteger(value.replayColumns) || !isPositiveInteger(value.replayRows)) {
-    return false;
-  }
-  if (!["starting", "ready", "executing", "reply", "closed"].includes(String(value.mode))) {
-    return false;
-  }
-  if (!["main", "cont"].includes(String(value.promptKind))) {
-    return false;
-  }
-  if (
-    typeof value.promptReady !== "boolean" ||
-    typeof value.promptVisible !== "boolean" ||
-    typeof value.replyPromptText !== "string" ||
-    typeof value.pendingPromptToken !== "boolean" ||
-    typeof value.pendingInitialPromptGap !== "boolean" ||
-    typeof value.lastWriteEndedWithNewline !== "boolean" ||
-    typeof value.hasReceivedOutput !== "boolean" ||
-    typeof value.inputText !== "string" ||
-    !isNonNegativeInteger(value.inputCursorPosition)
-  ) {
-    return false;
-  }
-  if (value.backendChildPid !== undefined && !isPositiveInteger(value.backendChildPid)) {
-    return false;
-  }
-  return true;
-}
-
-function isPersistedReplaySnapshot(
-  value: unknown
-): value is PersistedRTerminalState["ui"]["replay"] {
-  if (!isObjectRecord(value)) {
-    return false;
-  }
-  if (!Array.isArray(value.lines) || value.lines.some((line) => typeof line !== "string")) {
-    return false;
-  }
-  return (
-    isNonNegativeInteger(value.finalRow) &&
-    isNonNegativeInteger(value.cursorRow) &&
-    isNonNegativeInteger(value.cursorCol)
-  );
-}
-
-function isPersistedTerminalContext(value: unknown): value is TerminalContext {
-  if (!isObjectRecord(value) || typeof value.kind !== "string") {
-    return false;
-  }
-  if (value.kind === "panel") {
-    return true;
-  }
-  return value.kind === "editor" && typeof value.viewColumn === "number";
-}
-
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function isObjectRecord(value: unknown): value is Record<string, any> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<void> {
@@ -529,7 +322,11 @@ function setRConsoleActiveContext(
 async function managePersistentSessions(context: vscode.ExtensionContext): Promise<void> {
   let sessions = await refreshManagedPersistentSessions();
   if (sessions.length === 0) {
-    void vscode.window.showInformationMessage("No persistent R console sessions are running.");
+    if (persistentRegistry?.legacySessions.length) {
+      await manageLegacySessions(persistentRegistry);
+    } else {
+      void vscode.window.showInformationMessage("No persistent R console sessions are running.");
+    }
     return;
   }
 
@@ -539,10 +336,19 @@ async function managePersistentSessions(context: vscode.ExtensionContext): Promi
       return;
     }
 
+    if (action.action === "legacy" && persistentRegistry) {
+      await manageLegacySessions(persistentRegistry);
+      return;
+    }
+
     if (action.action === "refresh") {
       sessions = await refreshManagedPersistentSessions();
       if (sessions.length === 0) {
-        void vscode.window.showInformationMessage("No persistent R console sessions are running.");
+        if (persistentRegistry?.legacySessions.length) {
+          await manageLegacySessions(persistentRegistry);
+        } else {
+          void vscode.window.showInformationMessage("No persistent R console sessions are running.");
+        }
         return;
       }
       continue;
@@ -664,6 +470,9 @@ async function pickManageAction(
   const detachedCount = sessions.filter((session) => !session.attached).length;
   const attachedCount = sessions.length - detachedCount;
   const actions: ManageAction[] = [];
+  if (persistentRegistry?.legacySessions.length) {
+    actions.push({ label: "Close Old Session...", description: "Sessions from before the security update", action: "legacy" });
+  }
 
   if (detachedCount > 0) {
     actions.push(
@@ -1397,7 +1206,7 @@ function startPersistentSessionRegistry(context: vscode.ExtensionContext): void 
 }
 
 function schedulePersistPersistentSessions(): void {
-  if (!persistentSessionFilePath || persistDebounceTimer) {
+  if (!persistentRegistry || persistDebounceTimer) {
     return;
   }
   persistDebounceTimer = setTimeout(() => {
@@ -1415,7 +1224,7 @@ function flushPersistPersistentSessions(): void {
 }
 
 function persistPersistentSessions(): void {
-  if (!persistentSessionFilePath) {
+  if (!persistentRegistry) {
     return;
   }
 
@@ -1443,31 +1252,5 @@ function persistPersistentSessions(): void {
     persistentSessionRecords.set(entry.terminal.runtime.sessionId, entry);
   }
 
-  if (persisted.length === 0) {
-    try {
-      fs.rmSync(persistentSessionFilePath, { force: true });
-    } catch {
-    }
-    return;
-  }
-
-  try {
-    fs.mkdirSync(path.dirname(persistentSessionFilePath), {
-      recursive: true,
-    });
-    const sessionState: PersistentSessionState = {
-      sessions: persisted,
-    };
-    const temporary = `${persistentSessionFilePath}.${randomUUID()}.tmp`;
-    try {
-      // Keep metadata private and never truncate the live registry on failure.
-      fs.writeFileSync(temporary, JSON.stringify(sessionState), {
-        encoding: "utf8", mode: 0o600, flag: "wx",
-      });
-      fs.renameSync(temporary, persistentSessionFilePath);
-    } finally {
-      try { fs.rmSync(temporary, { force: true }); } catch {}
-    }
-  } catch {
-  }
+  persistentRegistry.save(persisted);
 }

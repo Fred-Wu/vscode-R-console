@@ -535,7 +535,8 @@ mod unix_host {
     }
 
     fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
-        let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
+        let version = crate::protocol::PROTOCOL_VERSION;
+        let payload = format!("{{\"port\":{port},\"pid\":{pid},\"protocolVersion\":{version}}}");
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -2362,7 +2363,8 @@ mod windows_host {
     }
 
     fn write_session_bootstrap(session_file: &str, port: u16, pid: u32) -> io::Result<()> {
-        let payload = format!("{{\"port\":{port},\"pid\":{pid}}}");
+        let version = crate::protocol::PROTOCOL_VERSION;
+        let payload = format!("{{\"port\":{port},\"pid\":{pid},\"protocolVersion\":{version}}}");
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
