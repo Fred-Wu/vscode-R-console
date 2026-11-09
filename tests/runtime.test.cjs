@@ -189,8 +189,8 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   await submit('cat("AUTHENTICATED_CONSOLE_OK\\n")', "AUTHENTICATED_CONSOLE_OK");
   stage = "oversized outbound command";
   const beforeOversize = output.length;
-  assert.equal(backend.sendSessionCommand(session, { type: "submit", code: "x".repeat(8 * 1024 * 1024 + 1) }), false);
-  assert.match(output.slice(beforeOversize), /8 MiB backend frame limit.*Nothing was sent/);
+  assert.equal(backend.sendSessionCommand(session, { type: "submit", code: "x".repeat(16 * 1024 * 1024 + 1) }), false);
+  assert.match(output.slice(beforeOversize), /16 MiB backend frame limit.*Nothing was sent/);
   assert.equal(backend.canUseSessionCommands(session), true, "rejected commands must not disconnect R");
   await submit('cat("STILL_CONNECTED\\n")', "STILL_CONNECTED");
   stage = "large output";

@@ -1019,7 +1019,7 @@ test("sess admission preserves fragmented Unicode attach and coalesced following
 });
 
 test("Windows read-only named-pipe client cannot evict R or read session requests", {
-  skip: process.platform !== "win32", timeout: 15000,
+  skip: process.platform !== "win32", timeout: 45000,
 }, async (t) => {
   const { execFile } = require("node:child_process");
   const { promisify } = require("node:util");
@@ -1033,14 +1033,21 @@ test("Windows read-only named-pipe client cannot evict R or read session request
   await waitFor(() => proxy.getWorkspaceData());
   const original = proxy.rSocket;
   // Use a real read-only Windows handle; Node's net clients request duplex access.
+  // Bound the read separately from PowerShell startup so a slow CI launch cannot
+  // consume the admission-test budget, and a stalled read identifies its phase.
   const result = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `
     $ErrorActionPreference = 'Stop'
-    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:VRC_TEST_PIPE, [System.IO.Pipes.PipeDirection]::In)
+    [Console]::Error.WriteLine('Connecting read-only pipe client')
+    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:VRC_TEST_PIPE, [System.IO.Pipes.PipeDirection]::In, [System.IO.Pipes.PipeOptions]::Asynchronous)
     try {
       $pipe.Connect(3000)
-      [Console]::WriteLine($pipe.ReadByte())
+      [Console]::Error.WriteLine('Connected; waiting for admission rejection')
+      $buffer = [byte[]]::new(1)
+      $read = $pipe.ReadAsync($buffer, 0, 1)
+      if (!$read.Wait(7000)) { throw 'Read-only pipe client did not receive EOF after the admission deadline' }
+      if ($read.Result -eq 0) { [Console]::WriteLine(-1) } else { [Console]::WriteLine($buffer[0]) }
     } finally { $pipe.Dispose() }
-  `], { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, timeout: 10000 });
+  `], { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, timeout: 30000, windowsHide: true });
   assert.equal(result.stdout.trim(), "-1", "the read-only client must receive EOF without session bytes");
   assert.equal(proxy.rSocket, original);
   assert.equal(proxy.getSessionId(), attach.params.session_id);

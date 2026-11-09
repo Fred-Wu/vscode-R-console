@@ -394,7 +394,7 @@ Host capabilities are advertised through `backend-ready`:
 
 Rust emits console output and control events through the active protocol writer.
 Console output is streamed in 8 KiB chunks, including output received directly
-from R callbacks. The frontend accepts frames up to 8 MiB. Each output stream
+from R callbacks. The frontend accepts frames up to 16 MiB. Each output stream
 has its own UTF-8 decoder in the frontend, so characters split between frames
 are preserved.
 If no client is attached, `protocol.rs` queues frames in an output backlog.
@@ -434,7 +434,7 @@ begins after a request is sent to a ready R session.
 | Boundary | Bound or timing | Purpose and behavior |
 | --- | --- | --- |
 | Backend and console language-server authentication | 3 seconds; fixed-size challenge/proof messages; bounded pending clients | Bounds incomplete authentication. Backend read/write deadlines are cleared after authentication. |
-| Backend frames | 8 MiB per payload | Rejects excessive allocation before reading a payload. Oversized submitted commands are rejected before sending; output is streamed across frames. |
+| Backend frames | 16 MiB per payload | Rejects excessive allocation before reading a payload. Oversized submitted commands are rejected before sending; output is streamed across frames. |
 | Detached backend output | 1,000,000 bytes or 4,096 frames | Retains a rolling backlog until a frontend connects. |
 | Session proxy admission | 8 pending clients; 3 seconds to send attach | Bounds incomplete attachments. Active sessions are replaced only after an attach message, independently of these resource guards. |
 | Session proxy messages | 16 MiB per JSON line | Bounds a complete message. Forwarding follows writable stream backpressure. |
