@@ -309,11 +309,11 @@ export class InlineCompletion {
     // candidates themselves always occupy one row, so scrolling has one model.
     const showDetail = !compact && this.hasDetails;
 
-    // Include boundary headings/details at the endpoints; otherwise scroll only
-    // when selection leaves the visible viewport.
+    // Recheck selection visibility when capacity changes, even after a render
+    // consumed followSelection. Ordinary redraws preserve independent scrolling.
     const capacity = Math.min(rows.length, availableRows - 3 - Number(showDetail));
     const activeRow = compact ? this.selected : this.choiceRows[this.selected];
-    if (this.followSelection) {
+    if (this.followSelection || this.viewportRows !== capacity) {
       if (activeRow < this.scrollStart) this.scrollStart = activeRow;
       if (activeRow >= this.scrollStart + capacity) this.scrollStart = activeRow - capacity + 1;
       if (this.selected === 0) this.scrollStart = 0;

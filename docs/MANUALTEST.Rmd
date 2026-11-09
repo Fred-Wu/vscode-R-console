@@ -476,7 +476,8 @@ For inline completion, also check:
   click the `◀` / `▶` footer buttons. These should move the list without changing
   the selected suggestion or inserting text. Release a drag outside the box.
 - Press Up/Down after scrolling away from the selection: the selected item should
-  return into view. Resize during a drag and check that dragging ends cleanly.
+  return into view. Resize horizontally and vertically: the box and selection
+  should remain visible while they fit, and any active drag should end cleanly.
 - Shrink the terminal: a compact list should remain usable while enough room
   remains for one candidate and the footer. Only the selected item's details
   should appear when the panel has room for them.

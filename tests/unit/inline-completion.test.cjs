@@ -535,6 +535,76 @@ test("provider refresh preserves browsing position and resize cancels an active 
   assert.equal(state.isScrollbar(1, 1), false);
 });
 
+test("console resize keeps completion visible and keyboard or mouse accepts the visible selection", t => {
+  for (const [withDetails, accept] of [[false, "tab"], [true, "tab"], [false, "mouse"], [true, "mouse"]]) {
+    const { terminal, screen } = createTerminal(t, 80, 24);
+    terminal.inputState.insertText("entry");
+    const choices = Array.from({ length: 20 }, (_, i) => ({
+      ...item(`entry${String(i + 1).padStart(2, "0")}`),
+      snapshotInput: "entry", snapshotCursor: 5,
+      detail: withDetails ? `description ${i + 1}` : undefined,
+    }));
+    terminal.inlineCompletion.set(choices, terminal.inlineCompletion.token);
+    terminal.promptVisible = true;
+    terminal.rProcess = {};
+    terminal.isSessionProtocolActive = () => false;
+    terminal.syncReplayTerminalSize = () => screen.resize(terminal.dimensions.columns, terminal.dimensions.rows);
+    // Supply output history only; use the real resize, repaint, render, and
+    // keyboard handlers rather than changing terminal dimensions directly.
+    terminal.buildTerminalReplay = () => ({ lines: ["previous output", ""] });
+    terminal.renderInput();
+    for (let i = 0; i < 8; i++) terminal.applyKeyAction({ type: "arrow", dir: "down" });
+    assert.equal(terminal.inlineCompletion.current(), choices[8]);
+
+    const panel = terminal.inlineCompletion;
+    panel.startScroll(panel.thumbStart + 1);
+    assert.ok(panel.dragging);
+    for (const [columns, rows] of [[80, 9], [25, 9], [80, 9], [80, 24]]) {
+      terminal.setDimensions({ columns, rows });
+      assert.equal(panel.dragging, false);
+      assert.equal(terminal.promptVisible, true);
+      assert.equal(panel.current(), choices[8]);
+      const selectedRow = Array.from({ length: panel.viewportRows }, (_, i) => i + 1)
+        .find(row => panel.hitTest(row, panel.renderedLeft + 4) === choices[8]);
+      assert.ok(selectedRow, `the ninth suggestion remains visible at ${columns}x${rows}`);
+      const buffer = screen.buffer.active;
+      const lines = Array.from({ length: rows }, (_, i) => buffer.getLine(buffer.baseY + i).translateToString(true));
+      assert.ok(lines.some(line => line.includes("entry09")), "the selected suggestion is drawn on screen");
+      assert.equal(lines.filter(line => line.includes("╭")).length, 1, "resize draws exactly one completion box");
+      assert.ok(terminal.inlineBoxTop !== undefined, "mouse coordinates are established again");
+    }
+    if (accept === "tab") {
+      terminal.applyKeyAction({ type: "tab" });
+    } else {
+      const col = panel.renderedLeft + 4;
+      const panelRow = Array.from({ length: panel.viewportRows }, (_, i) => i + 1)
+        .find(row => panel.hitTest(row, col) === choices[8]);
+      const row = terminal.inlineBoxTop + panelRow;
+      terminal.applyKeyAction({ type: "mouse", pressed: true, row, col });
+      terminal.applyKeyAction({ type: "mouse", pressed: false, row, col });
+    }
+    assert.equal(terminal.accepted, choices[8]);
+  }
+});
+
+test("resize dismisses completion when the panel no longer fits", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("entry");
+  terminal.promptVisible = true;
+  terminal.rProcess = {};
+  terminal.isSessionProtocolActive = () => false;
+  terminal.syncReplayTerminalSize = () => screen.resize(terminal.dimensions.columns, terminal.dimensions.rows);
+  terminal.buildTerminalReplay = () => ({ lines: [""] });
+  terminal.inlineCompletion.set([item("entry")], terminal.inlineCompletion.token);
+  terminal.renderInput();
+  terminal.setDimensions({ columns: 11, rows: 9 });
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(terminal.inlineMouseReporting, false);
+  assert.equal(terminal.inputState.text, "entry");
+  terminal.applyKeyAction({ type: "enter" });
+  assert.equal(terminal.submitted, "entry");
+});
+
 test("compact panels fit narrow and short terminals without hiding choices or capturing invisible controls", t => {
   for (const [columns, rows] of [[12, 6], [19, 8], [80, 6]]) {
     const { terminal, screen } = createTerminal(t, columns, rows);

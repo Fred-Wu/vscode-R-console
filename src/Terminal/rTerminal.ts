@@ -750,7 +750,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.promptVisible = false;
     }
 
-    this.dismissInlineCompletion(false);
+    if (hadVisiblePrompt && this.mode === "ready" && this.promptReady && this.inlineCompletion.visible) {
+      this.inlineCompletion.endScroll();
+      this.inlinePressedChoice = undefined;
+      this.inlineBoxTop = undefined;
+      this.inlineSuggestionRowCount = 0;
+    } else {
+      this.dismissInlineCompletion(false);
+    }
     this.dimensions = dimensions;
 
     this.syncReplayTerminalSize();
@@ -2804,17 +2811,21 @@ export class RTerminal implements vscode.Pseudoterminal {
       // fresh prompt.
 
       if (restorePrompt) {
-        const plan = this.buildCurrentInputRenderPlan();
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
-        this.renderer.renderFreshWithCursor(
-          plan.lines,
-          plan.cursorRow,
-          plan.cursorCol,
-          this.dimensions.columns,
-          plan.sourceLineMap,
-          plan.promptKinds
-        );
+        if (this.inlineCompletion.visible) {
+          this.renderInput();
+        } else {
+          const plan = this.buildCurrentInputRenderPlan();
+          this.renderer.renderFreshWithCursor(
+            plan.lines,
+            plan.cursorRow,
+            plan.cursorCol,
+            this.dimensions.columns,
+            plan.sourceLineMap,
+            plan.promptKinds
+          );
+        }
         this.promptVisible = true;
       }
     });
