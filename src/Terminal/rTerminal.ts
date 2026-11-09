@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext } from "../Language/completion";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
   ANSI,
@@ -155,6 +155,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private inlinePressedChoice: CompletionPickItem | undefined;
   private inlineSuggestionRowCount = 0;
   private inlineCompletionTimer: ReturnType<typeof setTimeout> | undefined;
+  private inlineCompletionExplicit = false;
   private readonly inlineThemeDisposables: vscode.Disposable[] = [];
   private closeEmitter = new vscode.EventEmitter<number>();
   private nameEmitter = new vscode.EventEmitter<string>();
@@ -749,7 +750,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.promptVisible = false;
     }
 
-    this.dismissInlineCompletion(false);
+    if (hadVisiblePrompt && this.mode === "ready" && this.promptReady && this.inlineCompletion.visible) {
+      this.inlineCompletion.endScroll();
+      this.inlinePressedChoice = undefined;
+      this.inlineBoxTop = undefined;
+      this.inlineSuggestionRowCount = 0;
+    } else {
+      this.dismissInlineCompletion(false);
+    }
     this.dimensions = dimensions;
 
     this.syncReplayTerminalSize();
@@ -1111,12 +1119,36 @@ export class RTerminal implements vscode.Pseudoterminal {
       }
       return;
     }
+    if (action.type === "mouse-move") {
+      if (this.inlineCompletion.dragging && this.inlineBoxTop !== undefined) {
+        this.inlineCompletion.dragScroll(action.row - this.inlineBoxTop);
+        this.renderInput();
+      } else {
+        // Moving away from a pressed candidate must not accept it on release.
+        this.inlinePressedChoice = undefined;
+      }
+      return;
+    }
     if (action.type === "mouse") {
       const boxRow = this.inlineBoxTop === undefined ? -1 : action.row - this.inlineBoxTop;
+      if (!action.pressed && this.inlineCompletion.dragging) {
+        this.inlineCompletion.endScroll();
+        this.inlinePressedChoice = undefined;
+        return;
+      }
+      const page = this.inlineCompletion.pageButton(boxRow, action.col);
+      if (page !== undefined) {
+        this.inlinePressedChoice = undefined;
+        if (action.pressed) {
+          this.inlineCompletion.page(page);
+          this.renderInput();
+        }
+        return;
+      }
       if (this.inlineCompletion.isScrollbar(boxRow, action.col)) {
         this.inlinePressedChoice = undefined;
         if (action.pressed) {
-          this.inlineCompletion.scrollTo(boxRow);
+          this.inlineCompletion.startScroll(boxRow);
           this.renderInput();
         }
         return;
@@ -1141,7 +1173,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (this.inlineBoxTop !== undefined &&
           (this.inlineCompletion.contains(action.row - this.inlineBoxTop, action.col) ||
             this.inlineCompletion.isScrollbar(action.row - this.inlineBoxTop, action.col))) {
-        this.inlineCompletion.move(action.dir === "up" ? -1 : 1);
+        this.inlineCompletion.scroll(action.dir === "up" ? -3 : 3);
         this.renderInput();
       } else {
         // Terminal-wide SGR mouse reporting consumes ordinary wheel input.
@@ -1159,11 +1191,17 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       }
       if (action.type === "page") {
-        this.inlineCompletion.move(action.dir === "up" ? -8 : 8);
+        this.inlineCompletion.page(action.dir === "up" ? -1 : 1);
         this.renderInput();
         return;
       }
       if (action.type === "tab" || action.type === "enter") {
+        if (action.type === "enter" && !vscode.workspace.getConfiguration("r.console")
+          .get<boolean>("inlineCompletion.acceptOnEnter", true)) {
+          this.dismissInlineCompletion();
+          void this.handleEnterKey();
+          return;
+        }
         const item = this.inlineCompletion.current();
         const isCurrent = item?.snapshotInput === this.inputState.currentLine &&
           item.snapshotCursor === this.inputState.cursorCol;
@@ -2030,7 +2068,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private setInlineMouseReporting(active: boolean): void {
     if (Boolean(this.inlineMouseReporting) === active) return;
     this.inlineMouseReporting = active;
-    this.writeEmitter.fire(active ? "\x1b[?1006h\x1b[?1000h" : "\x1b[?1000l\x1b[?1006l");
+    this.writeEmitter.fire(active ? "\x1b[?1006h\x1b[?1002h" : "\x1b[?1002l\x1b[?1006l");
   }
 
   private dismissInlineCompletion(redraw = true): void {
@@ -2038,6 +2076,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.inlineCompletionTimer = undefined;
     const wasVisible = this.inlineCompletion.visible;
     this.inlineCompletion.clear();
+    this.inlineCompletionExplicit = false;
     this.inlineBoxTop = undefined;
     this.inlinePressedChoice = undefined;
     this.inlineSuggestionRowCount = 0;
@@ -2053,9 +2092,22 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.dismissInlineCompletion(false);
       return;
     }
-    if (this.inlineCompletionMode() !== "inline" ||
-        (!this.inlineCompletion.visible &&
-         vscode.workspace.getConfiguration("r.console").get<string>("inlineCompletion.trigger", "tab") !== "typing")) return;
+    if (this.inlineCompletionMode() !== "inline") return;
+    const settings = vscode.workspace.getConfiguration("r.console");
+    const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
+    if (!this.inlineCompletion.visible && !typing) return;
+    const input = this.getInputSnapshot();
+    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor);
+    const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
+    const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
+    if (typing && !this.inlineCompletionExplicit && (!context || [...context.prefix].length < minimum)) {
+      this.dismissInlineCompletion(false);
+      return;
+    }
+    const refined = this.lang.refineInlineCompletion(input);
+    if (refined) {
+      this.inlineCompletion.set(refined, this.inlineCompletion.token, context?.prefix ?? "");
+    }
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
     this.inlineCompletionTimer = setTimeout(() => {
       this.inlineCompletionTimer = undefined;
@@ -2071,6 +2123,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.dismissInlineCompletion();
       return;
     }
+    if (force) this.inlineCompletionExplicit = true;
     // Keep the existing panel visible while new results are collected.
     const token = this.inlineCompletion.invalidate();
     void this.lang.handleAutocomplete({
@@ -2120,6 +2173,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       newCursorCol
     );
     if (cursorInsideEmptyCall) {
+      // Continue the completion the user accepted, even with no argument typed.
+      this.inlineCompletionExplicit = true;
       this.scheduleInlineCompletion();
     }
     this.renderInput();
@@ -2756,17 +2811,21 @@ export class RTerminal implements vscode.Pseudoterminal {
       // fresh prompt.
 
       if (restorePrompt) {
-        const plan = this.buildCurrentInputRenderPlan();
         this.renderer.renderedLineCount = 1;
         this.renderer.cursorRowFromTop = 0;
-        this.renderer.renderFreshWithCursor(
-          plan.lines,
-          plan.cursorRow,
-          plan.cursorCol,
-          this.dimensions.columns,
-          plan.sourceLineMap,
-          plan.promptKinds
-        );
+        if (this.inlineCompletion.visible) {
+          this.renderInput();
+        } else {
+          const plan = this.buildCurrentInputRenderPlan();
+          this.renderer.renderFreshWithCursor(
+            plan.lines,
+            plan.cursorRow,
+            plan.cursorCol,
+            this.dimensions.columns,
+            plan.sourceLineMap,
+            plan.promptKinds
+          );
+        }
         this.promptVisible = true;
       }
     });

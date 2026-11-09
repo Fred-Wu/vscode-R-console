@@ -116,6 +116,8 @@ R Console also contributes its own settings:
 | -------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `r.console.completionUI` | `quickPick` | Show suggestions in Quick Pick (`quickPick`) or directly in the terminal (`inline`). |
 | `r.console.inlineCompletion.trigger` | `tab` | Show inline suggestions while typing (`typing`) or when pressing Tab (`tab`). Applies only when `r.console.completionUI` is `inline`; it does not affect Quick Pick. |
+| `r.console.inlineCompletion.minCharacters` | `3` | Start automatic suggestions after this many characters in the current completion prefix. Minimum: `1`. Applies only to `inline` + `typing`; Tab can request suggestions earlier. |
+| `r.console.inlineCompletion.acceptOnEnter` | `true` | Accept inline suggestions with Enter. Disable to submit input with Enter and accept suggestions with Tab. Applies only to `inline`. |
 | `r.console.historyScope` | `workspace` | Share history by workspace folder or use `global`. Applies when a console is created or reattached. |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
 | `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |

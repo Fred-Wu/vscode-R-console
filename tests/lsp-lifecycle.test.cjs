@@ -4,6 +4,27 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+const loadSource = require("./helpers/load-source.cjs");
+
+test("real R supplies abbreviation candidates with correct replacement ranges", { timeout: 60000 }, async t => {
+  class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
+  const completion = loadSource("src/Language/completion.ts", { vscode: {
+    Position, Range: class {}, SnippetString: class {},
+    CompletionItemKind: { Function: 3, Text: 1, Snippet: 15 },
+  } });
+  const { client } = createConsoleLsp(t);
+  for (const query of ["rdcsv", "utils::rdcsv"]) {
+    const context = completion.getCompletionContext(query, query.length, query);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => query },
+      new Position(0, query.length), undefined, [], [], client);
+    const entry = entries.find(entry => entry.label === "read.csv");
+    assert.ok(entry, query);
+    const pick = completion.toCompletionPick(entry, context);
+    assert.equal(pick.replaceStart, query.indexOf("rdcsv"));
+    assert.equal(pick.snapshotCursor, query.length);
+    assert.match(pick.insertText, /^read\.csv\(/);
+  }
+});
 
 function temporaryLibraries(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-lsp-libraries-"));

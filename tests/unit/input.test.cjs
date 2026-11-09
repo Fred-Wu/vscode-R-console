@@ -11,6 +11,16 @@ function loadHistoryStore(mocks = {}) {
 }
 
 const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
+
+test("mouse decoding preserves fragmented drag reports and releases outside the panel", () => {
+  const keys = new KeyProcessor();
+  assert.deepEqual(keys.parseInputChunk("\x1b[<32;12;"), []);
+  assert.deepEqual(keys.parseInputChunk("7M\x1b[<0;1;1m"), [
+    { type: "mouse-move", col: 12, row: 7 },
+    { type: "mouse", pressed: false, col: 1, row: 1 },
+  ]);
+  assert.deepEqual(keys.parseInputChunk("\x1b[<35;1;1M"), [], "unheld mouse movement is ignored");
+});
 const { InputState } = loadSource("src/Terminal/inputState.ts");
 const { HistoryManager, getHistoryPickerTogglePresentation, historyPickerText } =
   loadHistoryStore();

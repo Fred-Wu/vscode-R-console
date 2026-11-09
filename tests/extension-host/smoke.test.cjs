@@ -11,6 +11,9 @@ suite("Extension Host Smoke Test", () => {
 
     await extension.activate();
     assert.equal(extension.isActive, true);
+    const settings = vscode.workspace.getConfiguration("r.console");
+    assert.equal(settings.inspect("inlineCompletion.minCharacters")?.defaultValue, 3);
+    assert.equal(settings.inspect("inlineCompletion.acceptOnEnter")?.defaultValue, true);
 
     const commands = await vscode.commands.getCommands(true);
     for (const command of [
