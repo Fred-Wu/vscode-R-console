@@ -25,7 +25,7 @@ use windows_sys::Win32::{
 };
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 const MAX_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const FRAME_SERVER_CHALLENGE: u16 = 22;
 const FRAME_CLIENT_PROOF: u16 = 23;

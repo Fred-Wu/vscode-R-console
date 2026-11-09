@@ -11,6 +11,9 @@ import {
   type BackendControlEvent,
   type BackendDialogResult,
   BackendFrameSizeError,
+  BACKEND_PROTOCOL_VERSION,
+  BackendProtocolVersionError,
+  assertBackendProtocolVersion,
   MAX_BACKEND_FRAME_BYTES,
   encodeDialogResultFrame,
   encodeInterruptFrame,
@@ -54,6 +57,7 @@ type RuntimeSessionCommand =
     };
 
 export type RuntimeSessionReconnectInfo = {
+  protocolVersion: number;
   sessionId: string;
   port: number;
   authToken: string;
@@ -89,6 +93,7 @@ type BackendSessionState = {
 };
 
 type SessionBootstrapFile = {
+  protocolVersion?: number;
   port?: number;
   pid?: number;
 };
@@ -168,6 +173,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   }
 
   reconnect(info: RuntimeSessionReconnectInfo): RuntimeSessionHandle {
+    assertBackendProtocolVersion(info.protocolVersion);
     if (!/^[0-9a-f]{64}$/.test(info.authToken)) throw new Error("Session authentication unavailable.");
     const handle: RuntimeSessionHandle = {
       sessionId: info.sessionId,
@@ -460,7 +466,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return undefined;
     }
     this.refreshReconnectInfo(state);
-    const { sessionId, port, pid } = state.reconnectInfo;
+    const { sessionId, port, pid, protocolVersion } = state.reconnectInfo;
+    if (protocolVersion !== BACKEND_PROTOCOL_VERSION) return undefined;
     if (typeof port !== "number" || !Number.isFinite(port) || port <= 0 || !state.authToken) {
       return undefined;
     }
@@ -473,6 +480,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       port,
       pid,
       authToken: state.authToken,
+      protocolVersion,
     };
   }
 
@@ -508,6 +516,18 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
         if (parsed.error) {
           state.handlers?.onError?.(new Error(parsed.error));
+          return;
+        }
+
+        try {
+          for (const event of parsed.events) {
+            if (event.type === "backend-ready") assertBackendProtocolVersion(event.protocolVersion);
+          }
+        } catch (error) {
+          state.hostConnected = false;
+          socket.destroy();
+          this.resolvePendingParseRequests(state, 1);
+          state.handlers?.onError?.(error as Error);
           return;
         }
 
@@ -576,6 +596,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       Number.isFinite(reconnectInfo.port) &&
       reconnectInfo.port > 0
     ) {
+      assertBackendProtocolVersion(reconnectInfo.protocolVersion);
       return reconnectInfo as RuntimeSessionReconnectInfo;
     }
 
@@ -596,7 +617,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           if (!state.authToken) {
             throw new Error("Session authentication unavailable.");
           }
+          assertBackendProtocolVersion(parsed.protocolVersion);
           return {
+            protocolVersion: parsed.protocolVersion!,
             sessionId: reconnectInfo.sessionId,
             port: parsed.port,
             authToken: state.authToken,
@@ -606,7 +629,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
                 : undefined,
           };
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof BackendProtocolVersionError) throw error;
       }
       await new Promise((resolve) => setTimeout(resolve, SESSION_BOOTSTRAP_POLL_MS));
     }
@@ -626,6 +650,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     info: RuntimeSessionReconnectInfo,
     generation: number
   ): Promise<net.Socket> {
+    assertBackendProtocolVersion(info.protocolVersion);
     while (true) {
       if (state.attachGeneration !== generation || state.explicitClose) {
         throw new Error("backend reconnect was cancelled");
@@ -771,7 +796,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     }
 
     const token = state.authToken;
-    if (!token) return;
+    if (!token || reconnectInfo.protocolVersion !== BACKEND_PROTOCOL_VERSION) return;
     try {
       const socket = await this.connectSocket(port, token);
       await new Promise<void>((resolve) => {
@@ -794,7 +819,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     try {
       const raw = fs.readFileSync(state.sessionFilePath, "utf8");
       const parsed = JSON.parse(raw) as SessionBootstrapFile;
-      const resolved: Partial<RuntimeSessionReconnectInfo> = {};
+      const resolved: Partial<RuntimeSessionReconnectInfo> = { protocolVersion: parsed.protocolVersion };
       if (
         typeof parsed.port === "number" &&
         Number.isFinite(parsed.port) &&

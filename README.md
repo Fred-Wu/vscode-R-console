@@ -84,6 +84,8 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 - Close a session and stop its R process.
 - Restore a dropped console UI after workspace folder changes or an extension host reload.
 
+After a connection protocol update, a one-time notice offers to close older sessions that can no longer reconnect.
+
 ### Delete All Command History
 
 Use `R Console: Delete All Command History` from the Command Palette to delete all saved command history in the active R Console's history scope, including the on-disk history file.
