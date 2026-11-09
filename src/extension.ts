@@ -471,7 +471,7 @@ async function pickManageAction(
   const attachedCount = sessions.length - detachedCount;
   const actions: ManageAction[] = [];
   if (persistentRegistry?.legacySessions.length) {
-    actions.push({ label: "Close Old Session...", description: "Sessions from before the security update", action: "legacy" });
+    actions.push({ label: "Close Old Session...", description: "Sessions using an older connection protocol", action: "legacy" });
   }
 
   if (detachedCount > 0) {

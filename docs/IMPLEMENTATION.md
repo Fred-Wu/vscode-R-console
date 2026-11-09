@@ -861,7 +861,7 @@ On activation, `extension.ts` loads `persistent-sessions.json` through
 
 Records are validated individually before reconnecting. A record can reconnect only when:
 
-- its runtime reconnect info is structurally valid and uses protocol version 2
+- its runtime reconnect info is structurally valid and uses the current protocol version
 - its terminal options are structurally valid
 - its UI replay state is structurally valid
 - its recorded backend pid is either absent or still alive
@@ -870,14 +870,18 @@ Dead authenticated records are pruned when the registry is saved. Incompatible
 records are retained alongside valid records; one invalid entry does not discard
 the whole registry. Unreadable or malformed registry files are not overwritten.
 
-Records are recognized as older sessions when they use protocol version 1 and
-have no `authToken`, or when both fields are absent (the v0.5.4 format), and their
-remaining structure is valid. Unknown versions are preserved without reconnecting
-or offering legacy shutdown. Activation shows a notice once per detected old
+Records are recognized as older sessions when their protocol version is lower
+than the current version and their structure and credentials are valid. Records
+without both a version and an `authToken` use the v0.5.4 format and are treated as
+protocol 1. This fallback applies only to those historical records. Activation shows a notice once per detected old
 session, tracked in workspace state. The notice explains that the protocol has
 changed and old sessions must be closed and restarted. It offers only **Close Old
 Session** and **Cancel**. Clicking Close confirms shutdown, with a picker by PID
-and startup directory only when multiple old sessions exist. There is no details
+and startup directory only when multiple old sessions exist. The picker supports
+multiple selection with all old sessions preselected, including previously
+dismissed ones. Confirming closes the selected sessions; cancelling or clearing
+every selection closes none. A failure retains that session's record and does
+not prevent closing the other selected sessions. There is no details
 page or second confirmation. Cancel leaves the sessions untouched. The session
 manager also provides this close action. It does not depend on editor focus and
 does not create a new console.
@@ -888,8 +892,11 @@ Windows checks its process name and start time against bootstrap creation;
 Linux/macOS check its executable and session bootstrap environment. These checks
 run after the user clicks Close. The connection must then report the old
 backend protocol and matching PID before receiving its sole command, `shutdown`.
-A modern authentication challenge is rejected, and no PID-based kill fallback
-is used. The record is removed only after the process exits; failed verification
+Protocol 2 and later authenticate with the saved token before checking the greeting
+and sending shutdown. Protocol 1 alone uses unauthenticated shutdown. Later
+protocol changes must retain the authentication, greeting, session PID, and shutdown
+messages used by this cleanup path, or retain a compatible reader for older sessions.
+No PID-based kill fallback is used. The record is removed only after the process exits; failed verification
 or shutdown retains it. Ordinary reconnection still requires authentication.
 
 ### 4.4 Creating A Console

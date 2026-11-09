@@ -17,19 +17,28 @@ export type PersistedConsoleRecord = {
 
 export type LegacyConsoleRecord = Omit<PersistedConsoleRecord, "terminal"> & {
   terminal: Omit<PersistedRTerminalState, "runtime"> & {
-    runtime: Omit<PersistedRTerminalState["runtime"], "authToken" | "protocolVersion"> & { protocolVersion?: 1 };
+    runtime: Omit<PersistedRTerminalState["runtime"], "authToken" | "protocolVersion"> & {
+      protocolVersion?: number;
+      authToken?: string;
+    };
   };
 };
 
 export function isLegacyConsoleRecord(value: unknown): value is LegacyConsoleRecord {
   if (!isObjectRecord(value) || !isObjectRecord(value.terminal)) return false;
   const { options, runtime, ui } = value.terminal;
+  if (!isObjectRecord(runtime)) return false;
+  // Only v0.5.4 omitted both fields. Explicit versions drive all later upgrades.
+  const version = !Object.hasOwn(runtime, "protocolVersion") && !Object.hasOwn(runtime, "authToken")
+    ? 1 : runtime.protocolVersion;
+  if (!isPositiveInteger(version) || version >= BACKEND_PROTOCOL_VERSION) return false;
+  const credentialsValid = version === 1
+    ? !Object.hasOwn(runtime, "authToken")
+    : typeof runtime.authToken === "string" && /^[0-9a-f]{64}$/.test(runtime.authToken);
   return isPersistedRTerminalOptions(options) && isPersistedUiSnapshot(ui) &&
     isPersistedTerminalContext(value.location) &&
     (value.terminalName === undefined || typeof value.terminalName === "string") &&
-    isObjectRecord(runtime) && !Object.hasOwn(runtime, "authToken") &&
-    // v0.5.4 did not persist its protocol version or authentication credentials.
-    (!Object.hasOwn(runtime, "protocolVersion") || runtime.protocolVersion === 1) &&
+    credentialsValid &&
     typeof runtime.sessionId === "string" && runtime.sessionId.trim().length > 0 &&
     isPositiveInteger(runtime.port) && runtime.port <= 65535 &&
     (runtime.pid === undefined || isPositiveInteger(runtime.pid));

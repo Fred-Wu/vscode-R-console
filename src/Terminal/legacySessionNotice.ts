@@ -24,7 +24,7 @@ export async function showLegacySessionNotice(state: vscode.Memento, registry: P
   if (!unseen.length) return;
   // Remember detection even when the user dismisses the notification.
   await state.update(NOTICE_KEY, [...new Set([...seen, ...unseen.map((entry) => entry.terminal.runtime.sessionId)])]);
-  await manageLegacySessions(registry, unseen);
+  await manageLegacySessions(registry);
 }
 
 export async function manageLegacySessions(
@@ -34,21 +34,24 @@ export async function manageLegacySessions(
   if (!entries.length) return;
   const action = await vscode.window.showWarningMessage(MESSAGE, CLOSE, "Cancel");
   if (action !== CLOSE) return;
-  const selected = entries.length === 1 ? entries[0] : (await vscode.window.showQuickPick(
+  const selected = entries.length === 1 ? entries : (await vscode.window.showQuickPick(
     entries.map((entry) => ({
       label: label(entry), description: processDescription(entry),
       detail: `Saved startup directory: ${entry.terminal.options.cwd || "not recorded"}`,
+      picked: true,
       entry,
-    })), { placeHolder: "Select the old R Console session to close", ignoreFocusOut: true }
-  ))?.entry;
-  if (!selected) return;
+    })), { placeHolder: "Select the old R Console sessions to close", canPickMany: true, ignoreFocusOut: true }
+  ))?.map((item) => item.entry);
+  if (!selected?.length) return;
 
-  try {
-    await closeLegacySession(selected);
-    if (!registry.forgetLegacySession(selected)) {
-      throw new Error("The process has stopped, but its saved record could not be removed.");
+  for (const entry of selected) {
+    try {
+      await closeLegacySession(entry);
+      if (!registry.forgetLegacySession(entry)) {
+        throw new Error("The process has stopped, but its saved record could not be removed.");
+      }
+    } catch (error) {
+      void vscode.window.showErrorMessage(`Could not close ${label(entry)}: ${error instanceof Error ? error.message : String(error)}`);
     }
-  } catch (error) {
-    void vscode.window.showErrorMessage(`Could not close ${label(selected)}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

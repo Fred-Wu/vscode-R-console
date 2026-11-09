@@ -5,6 +5,7 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { encodeShutdownFrame, parseBackendFrames } from "./backendProtocol";
+import { authenticateBackendSocket } from "./backendAuthentication";
 import { getPersistedRuntimePid, isLegacyConsoleRecord, isProcessAlive, type LegacyConsoleRecord } from "./persistentSessionRegistry";
 
 const execute = promisify(execFile);
@@ -19,7 +20,7 @@ export type LegacyProcessStatus = {
 export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<LegacyProcessStatus> {
   const pid = getPersistedRuntimePid(entry.terminal);
   const unverified = (reason: string): LegacyProcessStatus => ({ state: "unverified", pid, reason });
-  if (!isLegacyConsoleRecord(entry)) return unverified("This is not a session from before authentication was introduced.");
+  if (!isLegacyConsoleRecord(entry)) return unverified("This is not a valid session using an older protocol version.");
   if (!pid) return unverified("The saved session does not identify its process.");
   if (!isProcessAlive(pid)) return { state: "stopped", pid };
   const { sessionId, port } = entry.terminal.runtime;
@@ -28,8 +29,9 @@ export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<
   try {
     const info = JSON.parse(await fs.promises.readFile(bootstrap, "utf8"));
     const stat = await fs.promises.stat(bootstrap);
-    if (info.pid !== pid || info.port !== port) {
-      return unverified("The session's connection file no longer matches its saved PID and port.");
+    if (info.pid !== pid || info.port !== port ||
+        (info.protocolVersion ?? 1) !== (entry.terminal.runtime.protocolVersion ?? 1)) {
+      return unverified("The session's connection file no longer matches its saved PID, port, and protocol version.");
     }
     if (process.platform === "win32") {
       // Numeric PID only; no user-controlled path or shell text is interpolated.
@@ -80,8 +82,12 @@ export async function closeLegacySession(entry: LegacyConsoleRecord): Promise<vo
   if (status.state === "stopped") return;
   if (status.state !== "verified") throw new Error(status.reason);
   const pid = status.pid!;
+  const { port, authToken, protocolVersion = 1 } = entry.terminal.runtime;
+  const socket = net.createConnection({ host: "127.0.0.1", port });
+  // Authentication and shutdown remain compatible across later protocol upgrades.
+  // Protocol 1 alone predates authentication; never retry without credentials.
+  if (protocolVersion >= 2) await authenticateBackendSocket(socket, authToken!);
   await new Promise<void>((resolve, reject) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port: entry.terminal.runtime.port });
     let carry: Buffer = Buffer.alloc(0);
     let bytes = 0;
     let ready = false;
@@ -106,11 +112,14 @@ export async function closeLegacySession(entry: LegacyConsoleRecord): Promise<vo
       if (bytes > 2 * 1024 * 1024) { finish(new Error("Unexpected old-session response.")); return; }
       const parsed = parseBackendFrames(chunk, carry);
       carry = parsed.carry;
-      // In particular, a modern authentication challenge is rejected here.
+      // Protocol 1 cannot accept an authentication challenge as session traffic.
       if (parsed.error) { finish(new Error("The endpoint is not a compatible old R Console session.")); return; }
       for (const event of parsed.events) {
         if (event.type === "backend-ready") {
-          ready = event.protocolVersion === 1 && event.backend === "embedded-r-host" && event.capabilities.includes("shutdown");
+          if (event.protocolVersion !== protocolVersion || event.backend !== "embedded-r-host" || !event.capabilities.includes("shutdown")) {
+            finish(new Error("The endpoint does not match the saved session protocol.")); return;
+          }
+          ready = true;
         } else if (event.type === "session-state") {
           if (event.pid !== pid) { finish(new Error("The endpoint belongs to a different process.")); return; }
           matchedPid = true;
@@ -123,6 +132,7 @@ export async function closeLegacySession(entry: LegacyConsoleRecord): Promise<vo
         socket.end(encodeShutdownFrame());
       }
     });
+    socket.resume();
   });
   const deadline = Date.now() + 5000;
   while (isProcessAlive(pid)) {

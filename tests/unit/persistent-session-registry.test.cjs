@@ -39,6 +39,25 @@ test("legacy-only records survive startup, heartbeat, and deactivation saves", a
   assert.deepEqual(read().sessions, [old]);
 });
 
+for (const currentVersion of [3, 4]) {
+  test(`protocol ${currentVersion} detects every older session for the same notice and close flow`, async t => {
+    const { PersistentSessionRegistry: UpgradedRegistry } = loadSource("src/Runtime/persistentSessionRegistry.ts", {
+      "./backendProtocol": { BACKEND_PROTOCOL_VERSION: currentVersion },
+    });
+    const old = [session({ legacy: true }), session({ legacy: true, protocolVersion: 1 }),
+      ...Array.from({ length: currentVersion - 2 }, (_, i) => session({ protocolVersion: i + 2 }))];
+    const current = session({ protocolVersion: currentVersion });
+    const damaged = session({ protocolVersion: 2, authToken: "invalid" });
+    const newer = session({ protocolVersion: currentVersion + 1 });
+    const { file, read } = fixture(t, { sessions: [...old, current, damaged, newer] });
+    const registry = new UpgradedRegistry(file);
+    assert.deepEqual(await registry.load(), [current]);
+    assert.deepEqual(registry.legacySessions, old);
+    assert.equal(registry.forgetLegacySession(old.at(-1)), true);
+    assert.deepEqual(read().sessions, [current, ...old.slice(0, -1), damaged, newer]);
+  });
+}
+
 test("only protocol 2 reconnects; old records are distinguished from unsupported or damaged records", async (t) => {
   const old = session({ legacy: true, protocolVersion: 1 });
   const historical = session({ legacy: true });

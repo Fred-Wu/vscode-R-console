@@ -8,6 +8,52 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 
+test("a future protocol upgrade closes a real authenticated protocol 2 session", { timeout: 30000 }, async t => {
+  const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
+  const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {
+    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 3 },
+  });
+  const { closeLegacySession } = loadSource("src/Runtime/legacySession.ts", { "./persistentSessionRegistry": registry });
+  const { session: savedSession } = require("./helpers/persistent-session.cjs");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-protocol-upgrade-"));
+  const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"], { encoding: "utf8" }).trim();
+  const rPath = path.join(rHome, "bin", process.platform === "win32" ? "R.exe" : "R");
+  const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(path.resolve(__dirname, "..")));
+  const handle = backend.start([rPath, "--vanilla", "--quiet"], { cwd: directory, env: { ...process.env, R_HOME: rHome } });
+  let pid;
+  t.after(async () => {
+    pid ??= backend.getPid(handle);
+    backend.close(handle);
+    backend.detach(handle);
+    if (pid && registry.isProcessAlive(pid)) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+    await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  let ready = false;
+  let failure;
+  backend.attach(handle, {
+    onControl: event => {
+      if (event.type === "prompt" || (event.type === "session-state" && event.wait.kind === "top-level")) ready = true;
+    },
+    onError: error => { failure = error; },
+  });
+  const deadline = Date.now() + 10000;
+  while (!ready) {
+    if (failure) throw failure;
+    assert.ok(Date.now() < deadline, "R must become ready before upgrade cleanup");
+    await delay(20, undefined, { signal: t.signal });
+  }
+  const runtime = backend.getReconnectInfo(handle);
+  assert.equal(runtime.protocolVersion, 2);
+  pid = runtime.pid;
+  const entry = savedSession({ ...runtime, cwd: directory });
+  assert.equal(registry.isLegacyConsoleRecord(entry), true);
+  backend.detach(handle);
+  await closeLegacySession(entry);
+  assert.equal(registry.isProcessAlive(pid), false);
+});
+
 test("real R evaluates, handles nested input and interrupts, reconnects, and shuts down", { timeout: 60000 }, async (t) => {
   const root = path.resolve(__dirname, "..");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-smoke-"));

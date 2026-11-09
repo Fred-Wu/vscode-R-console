@@ -84,7 +84,7 @@ Use `R Console: Manage Persistent Sessions...` to manage running R Console sessi
 - Close a session and stop its R process.
 - Restore a dropped console UI after workspace folder changes or an extension host reload.
 
-Sessions started with v0.5.4 or earlier cannot reconnect after the connection protocol update. Save important work and close those sessions before upgrading. If an old session is detected, a one-time notice offers **Close Old Session** or **Cancel**. If several old sessions exist, select one by its PID and saved startup directory. Cancel leaves them untouched. If the process cannot be verified, its saved record is kept and the process is not stopped.
+After a connection protocol update, a one-time notice offers to close older sessions that can no longer reconnect.
 
 ### Delete All Command History
 
