@@ -7,6 +7,10 @@ on:
       - main
     tags:
       - 'v*'
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       publish_marketplace:
