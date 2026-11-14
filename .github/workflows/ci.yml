@@ -2,9 +2,17 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/workflows/release.yml'
   push:
     # main and version tags run this workflow through release.yml.
     branches: [dev]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
   workflow_call:
 

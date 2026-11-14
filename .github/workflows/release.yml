@@ -7,6 +7,10 @@ on:
       - main
     tags:
       - 'v*'
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       publish_marketplace:
@@ -362,11 +366,14 @@ jobs:
           overwrite_files: true
 
   publish-marketplace:
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_marketplace)
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_marketplace)
     needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
@@ -391,7 +398,7 @@ jobs:
           path: release-artifacts
 
       - name: Publish VS Code Marketplace
-        run: npx @vscode/vsce publish --pat ${{ secrets.VSCE_PAT }} --skip-duplicate --packagePath ./release-artifacts/*.vsix
+        run: npx @vscode/vsce publish --oidc --skip-duplicate --packagePath ./release-artifacts/*.vsix
 
   publish-open-vsx:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_open_vsx)
