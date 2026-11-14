@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## Unreleased
+
+### Maintenance
+
+- Release workflow maintenance.
+
 ## [0.5.5] - 2026-11-09
 
 ### Added
