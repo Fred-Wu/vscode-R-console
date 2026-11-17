@@ -511,6 +511,10 @@ function parseBacktickIdentifier(code: string, pos: number): { token: Token; new
   pos += 1;
 
   while (pos < code.length) {
+    if (code[pos] === "\\" && pos + 1 < code.length) {
+      pos += 2;
+      continue;
+    }
     if (code[pos] === "`") {
       pos += 1;
       return {

@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const { once } = require("node:events");
 const fs = require("node:fs");
@@ -11,6 +11,66 @@ const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
+const completion = loadSource("src/Language/completion.ts", { vscode: {
+  CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Snippet: 14 },
+  SnippetString: class {},
+  Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+} });
+
+test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { complete } = createConsoleLsp(t);
+  for (const operator of ["::", ":::"]) {
+    const input = `lm <- function(wrong_argument) {}; stats${operator}lm(`;
+    const context = completion.getCompletionContext(input, input.length);
+    let runtimeRequests = 0;
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async doc => (await complete(doc.getText())).map(item => ({
+          ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
+        })),
+      }, async () => { runtimeRequests++; return []; });
+    assert.equal(runtimeRequests, 0, "namespace calls must not request session formals");
+    const parameters = entries.filter(entry => entry.detail === "parameter").map(entry => entry.label);
+    assert.ok(parameters.includes("formula"));
+    assert.ok(parameters.includes("data"));
+    assert.ok(!parameters.includes("wrong_argument"));
+  }
+});
+
+test("member argument probe inspects the actual R callable without executing bodies or defaults", async () => {
+  const setup = `
+    lm <- function(wrong_argument) NULL
+    obj <- list(lm = function(list_argument, missing, lazy = stop("default evaluated"), ...) stop("body called"),
+                primitive = sum, empty = function() NULL, field = 1)
+    methods::setClass("CompletionTest", slots = c(lm = "function"))
+    slot_obj <- methods::new("CompletionTest", lm = function(slot_argument) stop("body called"))
+    .args <- .fn <- "unchanged"
+  `;
+  for (const [expression, expected] of [
+    ["obj$lm", ["list_argument", "missing", "lazy"]],
+    ["slot_obj@lm", ["slot_argument"]],
+    ["obj$primitive", ["na.rm"]],
+    ["obj$empty", []], ["obj$field", []], ["unavailable$lm", []],
+  ]) {
+    const input = expression + "(";
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
+      undefined, async (probe, operator) => {
+        assert.equal(operator, "$");
+        // This is the existing session completion contract: evaluate the
+        // expression in R, then return its named list members.
+        const result = execFileSync("Rscript", ["--vanilla", "-e", setup, "-e", `
+          options(warn = 2)
+          value <- tryCatch(eval(parse(text = commandArgs(TRUE)[1]), .GlobalEnv), error = function(e) NULL)
+          stopifnot(identical(.args, "unchanged"), identical(.fn, "unchanged"))
+          cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
+        `, probe], { encoding: "utf8", timeout: 15000 });
+        return JSON.parse(result);
+      });
+    assert.deepEqual(entries.map(entry => entry.label), expected, expression);
+  }
+});
 
 function lspConnection(socket) {
   let buffer = Buffer.alloc(0);

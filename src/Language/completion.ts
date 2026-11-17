@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { completionMatch } from "./completionMatch";
+import { tokenizeForHighlighting } from "./parser";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -12,6 +13,7 @@ export type CompletionContext = {
   bracketQuote?: "\"" | "'";
   chainedBracket?: boolean;
   functionName?: string;
+  functionOperator?: "$" | "@" | "::" | ":::";
   dataObjectName?: string;
   snapshotInput: string;
   snapshotCursor: number;
@@ -119,7 +121,7 @@ type WorkspaceData = {
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
-const MEMBER_CHAIN_SEGMENT = "(?:`[^`]+`|[a-zA-Z._][a-zA-Z0-9._]*)";
+const MEMBER_CHAIN_SEGMENT = "(?:`(?:\\\\.|[^`\\\\])+`|[a-zA-Z._][a-zA-Z0-9._]*)";
 const BRACKET_CHAIN_SEGMENT = "(?:\\[[^\\[\\]]*\\]|\\[\\[[^\\[\\]]*\\]\\])";
 const MEMBER_OBJECT_SEGMENT = `(?:${MEMBER_CHAIN_SEGMENT}(?:${BRACKET_CHAIN_SEGMENT})*)`;
 const BRACKET_OBJECT_PATTERN = new RegExp(
@@ -151,6 +153,30 @@ const R_RESERVED_WORDS = new Set([
 const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
   `(${MEMBER_OBJECT_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_OBJECT_SEGMENT})*)\\s*$`
 );
+const CALLABLE_PATTERN = `${MEMBER_CHAIN_SEGMENT}(?:\\s*(:::{0,1}|[$@])\\s*${MEMBER_CHAIN_SEGMENT})*`;
+const CALLABLE_TAIL_PATTERN = new RegExp(`(${CALLABLE_PATTERN})\\s*$`);
+const CALLABLE_EXPRESSION_PATTERN = new RegExp(`^${CALLABLE_PATTERN}$`);
+
+/** Find the enclosing call across lines and completed nested arguments. */
+function getEnclosingCall(text: string): { name: string; operator?: CompletionContext["functionOperator"] } | undefined {
+  const quoted = new Map(tokenizeForHighlighting(text)
+    .filter(token => token.kind === "string" || token.kind === "comment" || token.value.startsWith("`"))
+    .map(token => [token.position, token.value.length]));
+  const stack: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const length = quoted.get(i);
+    if (length) { i += length - 1; continue; }
+    if ("([{".includes(text[i])) stack.push(i);
+    else if (")]}".includes(text[i])) stack.pop();
+  }
+  const opening = stack.at(-1);
+  if (opening === undefined || text[opening] !== "(") return undefined;
+  const before = text.slice(0, opening);
+  const match = CALLABLE_TAIL_PATTERN.exec(before);
+  // Do not mistake a suffix of an unsupported callable expression for a global function.
+  if (!match || /[$@:]\s*$/.test(before.slice(0, match.index))) return undefined;
+  return { name: match[1], operator: match[2] as CompletionContext["functionOperator"] };
+}
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
@@ -325,16 +351,16 @@ export function getCompletionContext(
     };
   }
 
-  const callMatch = /([a-zA-Z._][a-zA-Z0-9._]*)\([^()]*$/.exec(beforeCursor);
-  if (callMatch) {
-    const argsPart = beforeCursor.slice(beforeCursor.lastIndexOf("(") + 1);
-    const argPrefixMatch = /([a-zA-Z0-9._]*)$/.exec(argsPart);
+  const call = getEnclosingCall(textForDataContext);
+  if (call) {
+    const argPrefixMatch = /([a-zA-Z0-9._]*)$/.exec(beforeCursor);
     const prefix = argPrefixMatch ? argPrefixMatch[1] : "";
     return {
       kind: "argument",
       prefix,
       replaceStart: beforeCursor.length - prefix.length,
-      functionName: callMatch[1],
+      functionName: call.name,
+      functionOperator: call.operator,
       dataObjectName,
       snapshotInput,
       snapshotCursor,
@@ -384,6 +410,11 @@ export async function collectCompletionEntries(
     context.kind === "member"
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
       : Promise.resolve([]);
+  const memberArguments = context.kind === "argument" &&
+    (context.functionOperator === "$" || context.functionOperator === "@");
+  const runtimeArgumentItemsRequest = memberArguments
+    ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions)
+    : Promise.resolve([]);
   const includeLspItems =
     needsLanguageServerCompletion(context) && !!doc && !!position;
   const rawLspItemsRequest =
@@ -409,12 +440,17 @@ export async function collectCompletionEntries(
           context,
           requestRuntimeMemberCompletions
         );
-  const [runtimeMemberItems, rawLspResult, columnItems] = await Promise.all([
+  const [runtimeMemberItems, rawLspResult, columnItems, runtimeArgumentItems] = await Promise.all([
     runtimeMemberItemsRequest,
     rawLspItemsRequest,
     columnItemsRequest,
+    runtimeArgumentItemsRequest,
   ]);
-  const rawLspItems = rawLspResult.entries;
+  // The LSP can resolve obj@lm as the unrelated global lm. Member formals must
+  // come from the active session, even when that session cannot currently reply.
+  const rawLspItems = memberArguments
+    ? rawLspResult.entries.filter(entry => !isArgumentCompletionEntry(entry))
+    : rawLspResult.entries;
   const lspItems =
     isGlobalSymbolContext(context)
       ? filterShadowedWorkspaceEntries(
@@ -428,6 +464,7 @@ export async function collectCompletionEntries(
     ...sessionItems,
     ...runtimeMemberItems,
     ...columnItems,
+    ...runtimeArgumentItems,
   ]);
 
   if (context.kind === "bracket") {
@@ -450,6 +487,7 @@ export async function collectCompletionEntries(
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
     return asCompletionEntries(dedupeCompletionEntries([
+      ...filterCompletionEntries(runtimeArgumentItems, context.prefix),
       ...columnFiltered,
       ...lspFiltered,
       ...sessionFiltered,
@@ -659,10 +697,7 @@ function getCompletionGroup(
   if (context.kind === "package") {
     return "Package Members";
   }
-  if (
-    entry.source === "lsp" &&
-    isArgumentCompletionEntry(entry)
-  ) {
+  if (isArgumentCompletionEntry(entry)) {
     return "Arguments";
   }
   if (kind === vscode.CompletionItemKind.Field || kind === vscode.CompletionItemKind.Property) {
@@ -692,7 +727,7 @@ function isDataCompletionContext(context: CompletionContext): boolean {
 }
 
 function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): boolean {
-  return (
+  return kind !== undefined && (
     kind === vscode.CompletionItemKind.Function ||
     kind === vscode.CompletionItemKind.Method ||
     kind === vscode.CompletionItemKind.Constructor
@@ -904,10 +939,11 @@ async function getRuntimeMemberCompletions(
         const isFunction =
           item.type === "closure" ||
           item.type === "builtin" ||
+          item.type === "special" ||
           /^\s*function\s*\(/.test(item.str || "");
         return {
           label: item.name,
-          insertText: quoteRNameIfNeeded(item.name),
+          insertText: quoteRNameIfNeeded(item.name) + (isFunction ? "()" : ""),
           kind: isFunction
             ? vscode.CompletionItemKind.Function
             : vscode.CompletionItemKind.Field,
@@ -915,6 +951,31 @@ async function getRuntimeMemberCompletions(
           source: "session" as const,
         };
       });
+  } catch {
+    return [];
+  }
+}
+
+async function getRuntimeArgumentCompletions(
+  context: CompletionContext,
+  request?: RuntimeMemberCompletionRequester
+): Promise<CompletionEntry[]> {
+  if (!request || !context.functionName) return [];
+  try {
+    // Reuse the session's list-member completion request. Only inspect names of
+    // formals: never call the function or evaluate its default argument values.
+    const items = await request(
+      `base::local({ .fn <- ${context.functionName}; ` +
+      `.args <- if (base::is.function(.fn)) base::names(base::formals(base::args(.fn))) else NULL; ` +
+      `stats::setNames(base::as.list(.args), .args) })`, "$"
+    );
+    return (items ?? []).filter(item => item.name && item.name !== "...").map(item => ({
+      label: item.name,
+      insertText: `${quoteRNameIfNeeded(item.name)} = `,
+      kind: vscode.CompletionItemKind.Variable,
+      detail: "parameter",
+      source: "session",
+    }));
   } catch {
     return [];
   }
@@ -959,7 +1020,7 @@ async function getLanguageServerCompletions(
     return {
       entries: filteredItems.map((item) => ({
         label: stripSnippetSyntax(getCompletionLabel(item)),
-        insertText: getCompletionInsertText(item),
+        insertText: getCompletionInsertText(item, context),
         kind: item.kind,
         detail: item.detail,
         source: "lsp",
@@ -1037,7 +1098,7 @@ function stripSnippetSyntax(text: string): string {
   return result;
 }
 
-function getCompletionInsertText(item: vscode.CompletionItem): string {
+function getCompletionInsertText(item: vscode.CompletionItem, context: CompletionContext): string {
   let text: string;
 
   if (typeof item.insertText === "string") {
@@ -1049,6 +1110,8 @@ function getCompletionInsertText(item: vscode.CompletionItem): string {
   }
 
   const result = stripSnippetSyntax(text);
+  if (context.kind === "package" && isCallableCompletionKind(item.kind) &&
+      CALLABLE_EXPRESSION_PATTERN.test(result)) return result + "()";
   return result;
 }
 

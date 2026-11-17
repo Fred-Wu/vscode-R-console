@@ -5,9 +5,104 @@ const completion = loadSource("src/Language/completion.ts", {
   vscode: {
     QuickPickItemKind: { Separator: -1 },
     Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
-    CompletionItemKind: { Field: 4, Function: 2, Variable: 5, Property: 9, Module: 8 },
+    CompletionItemKind: { Method: 1, Field: 4, Function: 2, Variable: 5, Property: 9, Module: 8, Text: 0, Snippet: 14 },
     SnippetString: class SnippetString {},
   },
+});
+
+test("runtime member completion adds calls only for callable members", async () => {
+  for (const operator of ["$", "@"]) {
+    const input = `obj${operator}`;
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
+      undefined, async (expression, trigger) => {
+        assert.equal(expression, "obj");
+        assert.equal(trigger, operator);
+        return [
+          { name: "fun", type: "closure" }, { name: "primitive", type: "builtin" },
+          { name: "special", type: "special" }, { name: "a b", str: "function (x)" },
+          { name: "field", type: "double" }, { name: "unknown" },
+        ];
+      });
+    assert.deepEqual(entries.map(entry => entry.insertText),
+      ["fun()", "primitive()", "special()", "`a b`()", "field", "unknown"]);
+  }
+});
+
+test("namespace completion normalizes bare callable names and preserves existing calls", async () => {
+  for (const operator of ["::", ":::"]) {
+    const input = `pkg${operator}`;
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => [
+          { label: "bare", kind: 2 }, { label: "method", kind: 1 },
+          { label: "call", kind: 2, insertText: "call()" },
+          { label: "snippet", kind: 2, insertText: "snippet($0)" },
+          { label: "defaults", kind: 2, insertText: "defaults(${1:x})" },
+          { label: "a(b", kind: 2, insertText: "`a(b`" },
+          { label: "field", kind: 4 }, { label: "variable", kind: 5 }, { label: "unknown" },
+        ],
+      });
+    assert.deepEqual(entries.map(entry => entry.insertText),
+      ["bare()", "method()", "call()", "snippet()", "defaults(x)", "`a(b`()", "field", "variable", "unknown"]);
+  }
+});
+
+test("argument context preserves qualified calls across nested arguments and lines", () => {
+  for (const [input, name, operator] of [
+    ["library(", "library", undefined],
+    ["stats::lm(", "stats::lm", "::"], ["stats:::lm(", "stats:::lm", ":::"],
+    ["obj$lm(", "obj$lm", "$"], ["obj@lm(", "obj@lm", "@"],
+    ["obj$nested@`a b` (", "obj$nested@`a b`", "@"],
+    ["obj$`a\\`b`(", "obj$`a\\`b`", "$"],
+    ['obj$fun(inner("("), # )\n  arg', "obj$fun", "$"],
+    ["outer(obj$fun(", "obj$fun", "$"],
+    ["obj$fun(inner(), ar", "obj$fun", "$"],
+  ]) {
+    const line = input.split("\n").at(-1);
+    const context = completion.getCompletionContext(line, line.length, input);
+    assert.equal(context.kind, "argument", input);
+    assert.equal(context.functionName, name, input);
+    assert.equal(context.functionOperator, operator, input);
+  }
+});
+
+test("session member formals replace unrelated LSP arguments and remain in the Arguments group", async () => {
+  for (const operator of ["$", "@"]) {
+    const input = `obj${operator}lm(`;
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => [
+          { label: "formula", insertText: "formula = ", kind: 5, detail: "parameter" },
+          { label: "data", kind: 5 },
+        ],
+      }, async (expression, trigger) => {
+        assert.ok(expression.includes(`.fn <- obj${operator}lm;`));
+        assert.equal(trigger, "$");
+        return [{ name: "member_arg" }, { name: "a b" }, { name: "..." }];
+      });
+    assert.deepEqual(entries.map(entry => entry.insertText), ["member_arg = ", "`a b` = ", "data"]);
+    const picks = completion.toCompletionQuickPickItems(entries, context);
+    assert.equal(picks[0].label, "Arguments");
+    assert.equal(picks[1].insertText, "member_arg = ");
+  }
+});
+
+test("missing session formals never fall back to arguments of a same-name global function", async () => {
+  const input = "obj@lm(";
+  const context = completion.getCompletionContext(input, input.length);
+  for (const request of [undefined, async () => undefined, async () => [], async () => { throw Error("disconnected"); }]) {
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => [
+          { label: "formula", insertText: "formula = ", kind: 5, detail: "parameter" },
+          { label: "value", insertText: "value", kind: 5, detail: "value for formula" },
+        ],
+      }, request);
+    assert.deepEqual(entries, []);
+  }
 });
 
 test("same-name functions keep their selected package through the picker without changing inserted text", async () => {

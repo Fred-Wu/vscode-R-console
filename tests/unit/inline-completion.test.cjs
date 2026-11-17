@@ -278,6 +278,68 @@ test("accepting a partial function name match respects manual completion mode", 
   assert.equal(requests[0].input.textBeforeCursor, "library(");
 });
 
+for (const operator of ["$", "@", "::", ":::"]) {
+  test(`qualified function acceptance reuses argument suggestions and existing parentheses (${operator})`, async t => {
+    const completion = loadSource("src/Language/completion.ts", { vscode: {
+      CompletionItemKind: { Function: 2, Field: 4, Variable: 5 },
+      SnippetString: class {},
+    } });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    for (const mode of ["typing", "tab"]) {
+      for (const suffix of ["", "()", " (existing)", "("]) {
+        const { terminal } = createTerminal(t, 80, 24, mode);
+        delete terminal.applyCompletion;
+        terminal.lang.recordCompletion = () => {};
+        const prefix = `obj${operator}fu`;
+        const input = prefix + suffix;
+        terminal.inputState.insertText(input);
+        terminal.inputState.cursorPosition = prefix.length;
+        const context = completion.getCompletionContext(input, prefix.length);
+        const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+          { line: 0, character: prefix.length }, undefined, [], [],
+          { provideCompletionItems: async () => [{ label: "fun", kind: 2 }] },
+          async () => [{ name: "fun", type: "closure" }]);
+        const choice = completion.toCompletionPick(entries[0], context);
+        terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
+        const requests = [];
+        terminal.lang.handleAutocomplete = async request => { requests.push(request); };
+        terminal.applyKeyAction({ type: "tab" });
+        assert.equal(terminal.inputState.text, `obj${operator}fun${suffix || "()"}`);
+        assert.equal(terminal.inputState.textBeforeCursor, `obj${operator}fun${suffix.startsWith(" ") ? " " : ""}(`);
+        assert.equal(terminal.submitted, undefined);
+        t.mock.timers.tick(150);
+        assert.equal(requests.length, mode === "typing" ? 1 : 0);
+        if (mode === "tab") terminal.applyKeyAction({ type: "tab" });
+        assert.equal(requests.length, 1);
+        assert.equal(requests[0].input.textBeforeCursor, terminal.inputState.textBeforeCursor);
+      }
+    }
+  });
+}
+
+test("Escape cancels qualified argument requests before and after they start", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const started of [false, true]) {
+    const { terminal } = createTerminal(t);
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    terminal.inputState.insertText("obj@fu");
+    terminal.inlineCompletion.set([{
+      ...item("fun"), insertText: "fun()", replaceStart: 4, snapshotInput: "obj@fu", snapshotCursor: 6,
+    }], terminal.inlineCompletion.token);
+    let publish;
+    terminal.lang.handleAutocomplete = async request => { publish = request.onInlineEntries; };
+    terminal.applyKeyAction({ type: "tab" });
+    if (started) t.mock.timers.tick(150);
+    terminal.applyKeyAction({ type: "escape" });
+    t.mock.timers.tick(150);
+    if (started) publish([{ ...item("late = "), snapshotInput: "obj@fun()", snapshotCursor: 8 }]);
+    else assert.equal(publish, undefined);
+    assert.equal(terminal.inlineCompletion.visible, false);
+    assert.equal(terminal.inputState.text, "obj@fun()");
+  }
+});
+
 test("dismissal cancels argument suggestions scheduled after accepting a partial function name match", async t => {
   const { terminal } = createTerminal(t);
   delete terminal.applyCompletion;

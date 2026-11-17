@@ -469,6 +469,25 @@ automatically. Dismiss completion immediately after accepting the match to
 check that it cancels pending argument suggestions. In manual trigger mode,
 argument suggestions should wait for an explicit completion request.
 
+Repeat with `stats::lm`, `stats:::lm`, and these session-only callables:
+
+```{r qualified-completion-setup}
+completion_obj <- list(lm = function(member_arg, optional = 1) NULL, field = 1)
+methods::setClass("CompletionExample", slots = c(lm = "function"))
+completion_slot <- methods::new("CompletionExample", lm = function(slot_arg) NULL)
+```
+
+- Complete `completion_obj$l` and `completion_slot@l`: insert `lm()`, put the
+  cursor inside, and offer `member_arg` / `slot_arg`, respectively. Namespace
+  `lm()` calls should offer `formula` and `data` instead.
+- Completing `completion_obj$f` must insert `field` without parentheses.
+- Put the cursor after the partial name in `completion_obj$l()` and
+  `completion_obj$l (123)`, then request and accept completion. Preserve the
+  existing parentheses and arguments, placing the cursor just inside the call.
+- Repeat in manual Tab mode: arguments must wait for another Tab. In typing
+  mode, Escape after accepting the function must cancel argument suggestions,
+  including delayed results.
+
 For inline completion, also check:
 
 - Type `rdcsv` and `utils::rdcsv`: `read.csv` should be offered and inserted correctly.

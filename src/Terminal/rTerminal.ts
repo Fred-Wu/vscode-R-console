@@ -2159,15 +2159,19 @@ export class RTerminal implements vscode.Pseudoterminal {
     const currentLine = this.inputState.currentLine;
     const before = currentLine.slice(0, selection.replaceStart);
     const after = currentLine.slice(this.inputState.cursorCol);
-    const newLine = `${before}${selection.insertText}${after}`;
+    const cursorInsideEmptyCall = selection.insertText.endsWith("()");
+    const existingCall = cursorInsideEmptyCall ? /^[ \t]*\(/.exec(after) : null;
+    const insertText = existingCall ? selection.insertText.slice(0, -2) : selection.insertText;
+    const newLine = `${before}${insertText}${after}`;
 
     const lines = this.inputState.lines;
     lines[this.inputState.cursorRow] = newLine;
 
-    const cursorInsideEmptyCall = selection.insertText.endsWith("()") ? 1 : 0;
-    const newCursorCol = before.length + selection.insertText.length - cursorInsideEmptyCall;
+    const newCursorCol = before.length + insertText.length +
+      (existingCall ? existingCall[0].length : cursorInsideEmptyCall ? -1 : 0);
     this.inputState.text = lines.join("\n");
-    this.lang.recordCompletion(this.inputState.text, selectionStart, selection);
+    this.lang.recordCompletion(this.inputState.text, selectionStart,
+      existingCall ? { ...selection, insertText } : selection);
     this.inputState.cursorPosition = this.inputState.translateRowColToIndex(
       this.inputState.cursorRow,
       newCursorCol
