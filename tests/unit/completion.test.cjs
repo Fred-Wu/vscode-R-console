@@ -1357,6 +1357,48 @@ test("incomplete package completion re-queries until a complete result arrives",
   await request;
 });
 
+test("empty namespace suggestions are alphabetical instead of following provider order", async () => {
+  const labels = ["setorderv", "set", "rowwiseDT", "fdroplevels", "frankv", "as.IDate"];
+  for (const operator of ["::", ":::"]) {
+    const input = `data.table${operator}`;
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => labels.map(label => ({ label, kind: 2, sortText: `4-${label}` })),
+      });
+    const picks = completion.toCompletionQuickPickItems(completion.rankCompletionEntries(entries, ""), context);
+    assert.equal(picks[0].label, "Package Members");
+    assert.deepEqual(picks.slice(1).map(item => item.insertText),
+      ["as.IDate()", "fdroplevels()", "frankv()", "rowwiseDT()", "set()", "setorderv()"]);
+    assert.deepEqual(entries.map(entry => entry.label), labels, "sorting must not mutate cached candidates");
+  }
+});
+
+test("alphabetical sorting stays inside completion groups and preserves their priority", () => {
+  const context = completion.getCompletionContext("fun(", 4);
+  const entries = [
+    { label: "zeta", detail: "parameter", source: "lsp", kind: 5 },
+    { label: "zvar", source: "session", kind: 5 },
+    { label: "zfun", source: "lsp", kind: 2 },
+    { label: "afun", source: "lsp", kind: 2 },
+    { label: "alpha", detail: "parameter", source: "lsp", kind: 5 },
+    { label: "avar", source: "session", kind: 5 },
+  ].map(entry => Object.freeze({ ...entry, insertText: entry.label }));
+  const picks = completion.toCompletionQuickPickItems(
+    completion.rankCompletionEntries(Object.freeze(entries), ""), context);
+  assert.deepEqual(picks.map(item => item.insertText ?? item.label), [
+    "Arguments", "alpha", "zeta", "Runtime Variables", "avar", "zvar", "Functions", "afun", "zfun",
+  ]);
+});
+
+test("equal-quality matches use alphabetical order independently of provider order", () => {
+  const entries = ["set", "fob", "Foa", "fo", "xfo"].map(label => ({ label, insertText: label, source: "lsp" }));
+  for (const candidates of [entries, [...entries].reverse()]) {
+    assert.deepEqual(completion.rankCompletionEntries(candidates, "fo").map(entry => entry.label),
+      ["fo", "Foa", "fob", "xfo"]);
+  }
+});
+
 test("shared typed ranking places exact matches before longer prefix matches", () => {
   const entries = [
     { label: "library.extra", insertText: "library.extra", source: "lsp" },

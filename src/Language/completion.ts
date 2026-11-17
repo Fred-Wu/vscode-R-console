@@ -511,10 +511,17 @@ export function needsLanguageServerCompletion(context: CompletionContext): boole
   );
 }
 
-/** Use the same typed-query filtering and ranking for Quick Pick and inline results. */
+const COMPLETION_LABEL_COLLATOR = new Intl.Collator("en", { sensitivity: "base" });
+
+function compareCompletionLabels(a: CompletionEntry, b: CompletionEntry): number {
+  return COMPLETION_LABEL_COLLATOR.compare(a.label, b.label) ||
+    (a.label < b.label ? -1 : a.label > b.label ? 1 : 0);
+}
+
+/** Sort within the existing display groups, with typed-query relevance first. */
 export function rankCompletionEntries(entries: CompletionEntry[], query: string): CompletionEntry[] {
   const needle = query.toLowerCase();
-  if (!needle) return entries;
+  if (!needle) return [...entries].sort(compareCompletionLabels);
   return entries
     .map((entry, index) => ({ entry, index, match: completionMatch(entry.label, query) }))
     .filter(({ match }) => match !== undefined)
@@ -526,7 +533,7 @@ export function rankCompletionEntries(entries: CompletionEntry[], query: string)
       return aRank - bRank ||
         a.match![0] - b.match![0] ||
         a.match!.at(-1)! - a.match![0] - (b.match!.at(-1)! - b.match![0]) ||
-        aLabel.length - bLabel.length || a.index - b.index;
+        aLabel.length - bLabel.length || compareCompletionLabels(a.entry, b.entry) || a.index - b.index;
     })
     .map(({ entry }) => entry);
 }
