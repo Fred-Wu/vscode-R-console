@@ -105,6 +105,47 @@ test("missing session formals never fall back to arguments of a same-name global
   }
 });
 
+test("member value completion keeps variables but never requests or inserts parameter names", async () => {
+  for (const operator of ["$", "@"]) {
+    for (const tail of ["first = fir", "1 + fir", '"fir', "# fir", "`fir", 'r"--(fir']) {
+      const input = `obj${operator}fun(${tail}`;
+      const context = completion.getCompletionContext(input, input.length);
+      let requests = 0;
+      const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+        { line: 0, character: input.length }, { globalenv: { first_value: {} } }, [], [], {
+          provideCompletionItems: async () => [
+            { label: "first", insertText: "first = ", kind: 5, detail: "parameter" },
+          ],
+        }, async () => { requests++; return [{ name: "first" }]; });
+      assert.equal(requests, 0, input);
+      assert.ok(entries.some(entry => entry.insertText === "first_value"), input);
+      assert.ok(entries.every(entry => entry.detail !== "parameter" && !entry.insertText.endsWith(" = ")), input);
+    }
+  }
+});
+
+test("completion passes supplied argument tags without copying user expressions into the runtime probe", async () => {
+  const input = "obj$fun(first = stop('do not execute'), sec, third = system('do not execute'))";
+  const cursor = input.indexOf("sec") + 3;
+  const context = completion.getCompletionContext(input, cursor);
+  await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+    async expression => {
+      assert.ok(expression.includes("base::quote(.fn(first = NULL, third = NULL))"));
+      assert.ok(!expression.includes("do not execute"));
+      return [];
+    });
+});
+
+test("call detection stays responsive with long quoted member chains", { timeout: 3000 }, () => {
+  // The former suffix regex takes several seconds at this size. Keep a generous
+  // bound for loaded CI machines while catching its quadratic backtracking.
+  const input = 'x <- "' + "a$".repeat(30000) + '"; obj$fun(';
+  const start = performance.now();
+  const context = completion.getCompletionContext(input, input.length);
+  assert.equal(context.functionName, "obj$fun");
+  assert.ok(performance.now() - start < 1500);
+});
+
 test("same-name functions keep their selected package through the picker without changing inserted text", async () => {
   const context = completion.getCompletionContext("filt", 4);
   const entries = await completion.collectCompletionEntries(

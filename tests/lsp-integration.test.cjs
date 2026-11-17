@@ -42,33 +42,48 @@ test("member argument probe inspects the actual R callable without executing bod
   const setup = `
     lm <- function(wrong_argument) NULL
     obj <- list(lm = function(list_argument, missing, lazy = stop("default evaluated"), ...) stop("body called"),
-                primitive = sum, empty = function() NULL, field = 1)
+                primitive = sum, empty = function() NULL, field = 1,
+                quoted = function(\`a b\`, remaining) stop("body called"),
+                dots = function(first, ..., after) stop("body called"))
     methods::setClass("CompletionTest", slots = c(lm = "function"))
     slot_obj <- methods::new("CompletionTest", lm = function(slot_argument) stop("body called"))
     .args <- .fn <- "unchanged"
   `;
-  for (const [expression, expected] of [
+  for (const [expression, expected, argumentsBefore = "", argumentsAfter = ""] of [
     ["obj$lm", ["list_argument", "missing", "lazy"]],
     ["slot_obj@lm", ["slot_argument"]],
     ["obj$primitive", ["na.rm"]],
     ["obj$empty", []], ["obj$field", []], ["unavailable$lm", []],
+    ["obj$lm", ["missing", "lazy"], 'list_argument = stop("value evaluated"), '],
+    ["obj$lm", ["missing", "lazy"], 'li = stop("value evaluated"), '],
+    ["obj$lm", ["missing", "lazy"], 'stop("value evaluated"), '],
+    ["obj$lm", ["missing", "lazy"], ', '],
+    ["obj$lm", ["missing"], 'lazy = stop("value evaluated"), stop("value evaluated"), '],
+    ["obj$lm", ["list_argument", "lazy"], '', ', missing = stop("value evaluated"))'],
+    ["obj$lm", [], 'list_argument = 1, li'],
+    ["obj$quoted", ["remaining"], '`a b` = stop("value evaluated"), '],
+    ["obj$quoted", ["remaining"], '"a b" = stop("value evaluated"), '],
+    ["obj$dots", ["after"], '1, 2, '],
+    ["obj$dots", ["first", "after"], 'af = 1, '],
+    ["obj$dots", ["first"], 'after = 1, '],
+    ["obj$primitive", [], 'na.rm = TRUE, '],
   ]) {
-    const input = expression + "(";
-    const context = completion.getCompletionContext(input, input.length);
+    const input = expression + "(" + argumentsBefore + argumentsAfter;
+    const context = completion.getCompletionContext(input, input.length - argumentsAfter.length);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
       undefined, async (probe, operator) => {
         assert.equal(operator, "$");
         // This is the existing session completion contract: evaluate the
         // expression in R, then return its named list members.
         const result = execFileSync("Rscript", ["--vanilla", "-e", setup, "-e", `
-          options(warn = 2)
+          options(warn = 2, warnPartialMatchArgs = TRUE)
           value <- tryCatch(eval(parse(text = commandArgs(TRUE)[1]), .GlobalEnv), error = function(e) NULL)
           stopifnot(identical(.args, "unchanged"), identical(.fn, "unchanged"))
           cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
         `, probe], { encoding: "utf8", timeout: 15000 });
         return JSON.parse(result);
       });
-    assert.deepEqual(entries.map(entry => entry.label), expected, expression);
+    assert.deepEqual(entries.map(entry => entry.label), expected, input);
   }
 });
 

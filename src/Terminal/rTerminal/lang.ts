@@ -91,7 +91,8 @@ export class RTermLang {
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
-      input.textBeforeCursor
+      input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length)
     ) ?? (force
       ? {
           kind: "default" as const,
@@ -371,16 +372,17 @@ export class RTermLang {
             ...lines.slice(0, latestInput.cursorRow),
             currentLine.slice(0, cursorCol),
           ].join("\n");
+          const nextInputText = lines.join("\n");
           const nextContext = context.kind === "package"
             ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
-            : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor);
+            : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
+                nextInputText.slice(fullTextBeforeCursor.length));
           if (!nextContext) {
             return;
           }
           if (prefix.length > 0) {
             nextContext.triggerCharacter = undefined;
           }
-          const nextInputText = lines.join("\n");
           let refreshedRefinedSessionData: WorkspaceData | undefined;
           const refinedWorkspaceDataRequest = this.shouldRequestWorkspaceData(nextContext)
             ? this.options.requestWorkspaceData?.()
@@ -480,8 +482,10 @@ export class RTermLang {
   refineInlineCompletion(input: InputSnapshot): import("../../Language/completion").CompletionQuickPickItem[] | undefined {
     this.completionRequestId++;
     const cached = this.inlineCache;
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor);
-    if (!cached || !context) return undefined;
+    if (!cached) return undefined;
+    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
+    if (!context) return undefined;
     const old = cached.context;
     if (context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
         input.cursorRow !== cached.input.cursorRow || !context.prefix.startsWith(old.prefix) ||

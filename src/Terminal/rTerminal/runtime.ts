@@ -224,10 +224,6 @@ export function getCachedRuntimeWorkspaceData(
   return vscodeRIntegration(host).getCachedWorkspaceData();
 }
 
-export function refreshRuntimeWorkspaceData(host: RuntimeHost): void {
-  vscodeRIntegration(host).refreshWorkspaceData();
-}
-
 export function getRuntimeVscodeRDisplayPid(host: RuntimeHost): number | undefined {
   return vscodeRIntegration(host).getDisplayPid();
 }

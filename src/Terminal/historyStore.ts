@@ -547,7 +547,7 @@ export class HistoryStore extends HistoryBuffer {
             // A nonexistent file cannot contain a partial append. Otherwise,
             // retain enough information to verify a safe rollback on retry.
             if ((rollbackError as NodeJS.ErrnoException).code !== "ENOENT") {
-              const current = fs.statSync(this.historyFile);
+              fs.statSync(this.historyFile);
               this.needsRecovery = true;
             }
           }
@@ -672,7 +672,7 @@ export class HistoryStore extends HistoryBuffer {
         .map((match) => match.index!);
       const end = raw.lastIndexOf("\n") + 1;
       const preserve = boundaries.length === existing.length;
-      const oldRecords = existing.map((entry, index) =>
+      const oldRecords = existing.map((_entry, index) =>
         preserve ? raw.slice(boundaries[index], index + 1 < boundaries.length ? boundaries[index + 1] : end) : "");
       const removed = existing.filter((entry, index) => {
         const timestamp = /^# time:[^\n]*submitted-at: ([0-9.]+)/m.exec(oldRecords[index]);

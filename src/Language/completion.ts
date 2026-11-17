@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { completionMatch } from "./completionMatch";
-import { tokenizeForHighlighting } from "./parser";
+import { getEnclosingCall } from "./parser";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -14,6 +14,8 @@ export type CompletionContext = {
   chainedBracket?: boolean;
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
+  // Source tags from the lexer, available only at an argument-name position.
+  suppliedArguments?: string[];
   dataObjectName?: string;
   snapshotInput: string;
   snapshotCursor: number;
@@ -154,29 +156,7 @@ const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
   `(${MEMBER_OBJECT_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_OBJECT_SEGMENT})*)\\s*$`
 );
 const CALLABLE_PATTERN = `${MEMBER_CHAIN_SEGMENT}(?:\\s*(:::{0,1}|[$@])\\s*${MEMBER_CHAIN_SEGMENT})*`;
-const CALLABLE_TAIL_PATTERN = new RegExp(`(${CALLABLE_PATTERN})\\s*$`);
 const CALLABLE_EXPRESSION_PATTERN = new RegExp(`^${CALLABLE_PATTERN}$`);
-
-/** Find the enclosing call across lines and completed nested arguments. */
-function getEnclosingCall(text: string): { name: string; operator?: CompletionContext["functionOperator"] } | undefined {
-  const quoted = new Map(tokenizeForHighlighting(text)
-    .filter(token => token.kind === "string" || token.kind === "comment" || token.value.startsWith("`"))
-    .map(token => [token.position, token.value.length]));
-  const stack: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    const length = quoted.get(i);
-    if (length) { i += length - 1; continue; }
-    if ("([{".includes(text[i])) stack.push(i);
-    else if (")]}".includes(text[i])) stack.pop();
-  }
-  const opening = stack.at(-1);
-  if (opening === undefined || text[opening] !== "(") return undefined;
-  const before = text.slice(0, opening);
-  const match = CALLABLE_TAIL_PATTERN.exec(before);
-  // Do not mistake a suffix of an unsupported callable expression for a global function.
-  if (!match || /[$@:]\s*$/.test(before.slice(0, match.index))) return undefined;
-  return { name: match[1], operator: match[2] as CompletionContext["functionOperator"] };
-}
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
@@ -271,7 +251,8 @@ function detectDataContext(beforeCursor: string): string | undefined {
 export function getCompletionContext(
   inputBuffer: string,
   cursorPosition: number,
-  fullTextBeforeCursor?: string
+  fullTextBeforeCursor?: string,
+  textAfterCursor = inputBuffer.slice(cursorPosition)
 ): CompletionContext | undefined {
   const snapshotInput = inputBuffer;
   const snapshotCursor = cursorPosition;
@@ -351,7 +332,7 @@ export function getCompletionContext(
     };
   }
 
-  const call = getEnclosingCall(textForDataContext);
+  const call = getEnclosingCall(textForDataContext + textAfterCursor, textForDataContext.length);
   if (call) {
     const argPrefixMatch = /([a-zA-Z0-9._]*)$/.exec(beforeCursor);
     const prefix = argPrefixMatch ? argPrefixMatch[1] : "";
@@ -361,6 +342,7 @@ export function getCompletionContext(
       replaceStart: beforeCursor.length - prefix.length,
       functionName: call.name,
       functionOperator: call.operator,
+      suppliedArguments: call.suppliedArguments,
       dataObjectName,
       snapshotInput,
       snapshotCursor,
@@ -960,13 +942,18 @@ async function getRuntimeArgumentCompletions(
   context: CompletionContext,
   request?: RuntimeMemberCompletionRequester
 ): Promise<CompletionEntry[]> {
-  if (!request || !context.functionName) return [];
+  if (!request || !context.functionName || !context.suppliedArguments) return [];
   try {
-    // Reuse the session's list-member completion request. Only inspect names of
-    // formals: never call the function or evaluate its default argument values.
+    // Let R match exact/partial names, positional arguments and formals after
+    // dots. Only source tags enter the synthetic call: values are never evaluated.
+    const supplied = context.suppliedArguments.map(tag => `${tag ? `${tag} = ` : ""}NULL`).join(", ");
     const items = await request(
       `base::local({ .fn <- ${context.functionName}; ` +
-      `.args <- if (base::is.function(.fn)) base::names(base::formals(base::args(.fn))) else NULL; ` +
+      `.args <- if (base::is.function(.fn)) { ` +
+      `.def <- base::args(.fn); ` +
+      `.used <- base::names(base::suppressWarnings(base::match.call(` +
+      `definition = .def, call = base::quote(.fn(${supplied})), expand.dots = FALSE))); ` +
+      `base::setdiff(base::names(base::formals(.def)), .used) } else NULL; ` +
       `stats::setNames(base::as.list(.args), .args) })`, "$"
     );
     return (items ?? []).filter(item => item.name && item.name !== "...").map(item => ({

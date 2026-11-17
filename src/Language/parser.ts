@@ -90,6 +90,103 @@ interface Token {
   type: TokenType;
   value: string;
   position: number;
+  closed?: boolean;
+}
+
+export type CallCompletionContext = {
+  name: string;
+  operator?: "$" | "@" | "::" | ":::";
+  // R source tags; an empty tag denotes a positional argument. Undefined
+  // means the cursor is in a value, comment, or another non-name position.
+  suppliedArguments?: string[];
+};
+
+/** Inspect syntax without evaluating argument expressions or searching source
+ * text for a callable suffix. Each token is visited a constant number of times. */
+export function getEnclosingCall(code: string, cursor = code.length): CallCompletionContext | undefined {
+  const allTokens = tokenize(code);
+  const inComment = allTokens.some(token => token.type === TokenType.Comment &&
+    token.position < cursor && cursor <= token.position + token.value.length);
+  const tokens = allTokens.filter(token => token.type !== TokenType.Comment &&
+    token.type !== TokenType.Newline && token.type !== TokenType.EOF);
+  const stack: { opening: string; index: number }[] = [];
+  for (let index = 0; index < tokens.length && tokens[index].position < cursor; index++) {
+    const token = tokens[index];
+    if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
+      for (const opening of token.value.slice(0, cursor - token.position)) {
+        stack.push({ opening, index });
+      }
+    } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace || token.type === TokenType.RightBracket) {
+      for (const closing of token.value.slice(0, cursor - token.position)) {
+        const expected = closing === ")" ? "(" : closing === "}" ? "{" : "[";
+        if (stack.pop()?.opening !== expected) return undefined;
+      }
+    }
+  }
+  const frame = stack.at(-1);
+  if (frame?.opening !== "(") return undefined;
+  let start = frame.index - 1;
+  const last = tokens[start];
+  if (last?.type !== TokenType.Identifier) return undefined;
+  let operator: CallCompletionContext["operator"];
+  while (start >= 1) {
+    const previous = tokens[start - 1];
+    if (previous.type !== TokenType.Operator ||
+        !["$", "@", "::", ":::"].includes(previous.value)) break;
+    if (tokens[start - 2]?.type !== TokenType.Identifier) return undefined;
+    operator ??= previous.value as CallCompletionContext["operator"];
+    start -= 2;
+  }
+  // Inspect only this call's top-level arguments, including those after the
+  // cursor. Nested commas and equals signs belong to their own expressions.
+  const supplied: string[] = [];
+  let namePosition = false;
+  let hasDots = false;
+  let argumentStart = frame.index + 1;
+  let argumentOffset = tokens[frame.index].position + 1;
+  const collectArgument = (end: number, endOffset: number): void => {
+    const first = tokens[argumentStart];
+    if (argumentOffset <= cursor && cursor <= endOffset) {
+      namePosition = argumentStart === end || (
+        argumentStart + 1 === end && first.type === TokenType.Identifier &&
+        !first.value.startsWith("`") && first.value !== "..." &&
+        first.position < cursor && first.position + first.value.length === cursor
+      );
+    } else {
+      const second = tokens[argumentStart + 1];
+      const named = argumentStart + 1 < end &&
+        (first.type === TokenType.Identifier || first.type === TokenType.String) &&
+        second.type === TokenType.Operator && second.value === "=";
+      supplied.push(named ? first.value : "");
+      // Forwarded dots cannot be matched without inspecting the caller's frame.
+      hasDots ||= argumentStart + 1 === end && first.value === "...";
+    }
+  };
+  const nested: string[] = [];
+  for (let index = argumentStart; index <= tokens.length; index++) {
+    const token = tokens[index];
+    if (!token || (nested.length === 0 && token.type === TokenType.RightParen)) {
+      collectArgument(index, token?.position ?? code.length);
+      break;
+    }
+    if (nested.length === 0 && token.type === TokenType.Comma) {
+      collectArgument(index, token.position);
+      argumentStart = index + 1;
+      argumentOffset = token.position + 1;
+    } else if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
+      nested.push(...token.value);
+    } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace || token.type === TokenType.RightBracket) {
+      for (const closing of token.value) {
+        const expected = closing === ")" ? "(" : closing === "}" ? "{" : "[";
+        if (nested.pop() !== expected) return undefined;
+      }
+    }
+  }
+  return {
+    name: code.slice(tokens[start].position, last.position + last.value.length),
+    operator,
+    suppliedArguments: namePosition && !inComment && !hasDots ? supplied : undefined,
+  };
 }
 
 export type HighlightTokenKind =
@@ -454,54 +551,18 @@ function parseRawString(
   pos: number
 ): { token: Token; newPos: number } | null {
   const start = pos;
-  pos += 1;
-
-  const quote = code[pos];
-  pos += 1;
-
-  let delimiter = "";
-  if (pos < code.length) {
-    const delim = code[pos];
-    if (delim === "(" || delim === "[" || delim === "{") {
-      delimiter = delim;
-      pos += 1;
-    } else if (delim === "-") {
-      let dashes = "";
-      while (pos < code.length && code[pos] === "-") {
-        dashes += "-";
-        pos += 1;
-      }
-      delimiter = dashes;
-    }
-  }
-
-  const closeDelim =
-    delimiter === "(" ? ")" : delimiter === "[" ? "]" : delimiter === "{" ? "}" : delimiter;
-
-  while (pos < code.length) {
-    if (delimiter) {
-      if (code[pos] === closeDelim) {
-        const remaining = code.slice(pos);
-        if (remaining.startsWith(closeDelim + quote)) {
-          pos += closeDelim.length + 1;
-          return {
-            token: { type: TokenType.RawString, value: code.slice(start, pos), position: start },
-            newPos: pos,
-          };
-        }
-      }
-    } else if (code[pos] === quote) {
-      pos += 1;
-      return {
-        token: { type: TokenType.RawString, value: code.slice(start, pos), position: start },
-        newPos: pos,
-      };
-    }
-    pos += 1;
-  }
-
+  const quote = code[pos + 1];
+  pos += 2;
+  const dashStart = pos;
+  while (code[pos] === "-") pos++;
+  const delimiter = code[pos];
+  if (delimiter !== "(" && delimiter !== "[" && delimiter !== "{") return null;
+  const closing = (delimiter === "(" ? ")" : delimiter === "[" ? "]" : "}") +
+    code.slice(dashStart, pos) + quote;
+  const end = code.indexOf(closing, pos + 1);
+  pos = end < 0 ? code.length : end + closing.length;
   return {
-    token: { type: TokenType.RawString, value: code.slice(start, pos), position: start },
+    token: { type: TokenType.RawString, value: code.slice(start, pos), position: start, closed: end >= 0 },
     newPos: pos,
   };
 }
@@ -660,7 +721,7 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
         break;
       }
       case TokenType.RawString:
-        if (!isRawStringClosed(token.value)) {
+        if (!token.closed) {
           return "incomplete";
         }
         break;
@@ -791,35 +852,6 @@ function isDefinitelyCompleteToken(token: Token): boolean {
     default:
       return false;
   }
-}
-
-function isRawStringClosed(value: string): boolean {
-  if (value.length < 3) {
-    return false;
-  }
-
-  const quote = value[1];
-  if (value.length >= 4) {
-    const delim = value[2];
-    if (delim === "(") {
-      return value.endsWith(`)${quote}`);
-    }
-    if (delim === "[") {
-      return value.endsWith(`]${quote}`);
-    }
-    if (delim === "{") {
-      return value.endsWith(`}${quote}`);
-    }
-    if (delim === "-") {
-      let dashes = 0;
-      for (let i = 2; i < value.length && value[i] === "-"; i += 1) {
-        dashes += 1;
-      }
-      return value.endsWith(`${"-".repeat(dashes)}${quote}`);
-    }
-  }
-
-  return value.endsWith(quote);
 }
 
 function isAwaitingBody(tokens: Token[]): boolean {
