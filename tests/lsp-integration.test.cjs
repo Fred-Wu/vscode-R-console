@@ -38,6 +38,46 @@ test("qualified namespace arguments use the real LSP despite a same-name local f
   }
 });
 
+test("multiline arguments use parsed call identities and selected packages in the real LSP", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { client } = createConsoleLsp(t);
+  for (const [input, parameter, selectedPackage] of [
+    ["filter <- function(wrong_argument) {}; outer(filter # keep selected package\n())", "sides", "stats"],
+    ["lm <- function(wrong_argument) {}; outer(stats::lm # comment\n())", "formula"],
+    ["lm <- function(wrong_argument) {}; outer(stats:::lm\n())", "formula"],
+    ["local_fn <- function(local_arg) {}; outer(local_fn # comment\n())", "local_arg"],
+  ]) {
+    client.updateInput("");
+    client.updateInput(input);
+    if (selectedPackage) {
+      client.recordCompletion(input, input.lastIndexOf("filter"), { insertText: "filter", packageName: selectedPackage });
+    }
+    const cursor = input.lastIndexOf("(") + 1;
+    const before = input.slice(0, cursor);
+    const context = completion.getCompletionContext("())", 1, before, input.slice(cursor));
+    let parameters = [];
+    const deadline = Date.now() + 10000;
+    do {
+      const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+        { line: 1, character: 1 }, undefined, [input.split("\n")[0]], [], {
+          provideCompletionItems: async (doc, position, trigger) => {
+            const result = await client.provideCompletionItems(doc, position, trigger);
+            return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
+              ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
+            }));
+          },
+        });
+      parameters = entries.filter(entry => entry.detail === "parameter").map(entry => entry.label);
+      if (parameters.includes(parameter)) break;
+      // Local definitions become available when languageserver's asynchronous
+      // parser finishes. This also applies to ordinary single-line calls.
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    assert.ok(parameters.includes(parameter), input);
+    assert.ok(!parameters.includes("wrong_argument"), input);
+  }
+});
+
 test("member argument probe inspects the actual R callable without executing bodies or defaults", async () => {
   const setup = `
     lm <- function(wrong_argument) NULL
@@ -64,6 +104,8 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$lm", [], 'list_argument = 1, li'],
     ["obj$quoted", ["remaining"], '`a b` = stop("value evaluated"), '],
     ["obj$quoted", ["remaining"], '"a b" = stop("value evaluated"), '],
+    ["obj$quoted", ["remaining"], 'r"---(a b)---" = stop("value evaluated"), '],
+    ["obj$positional", ["first", "second"], 'r"(third)" = stop("value evaluated"), '],
     ["obj$dots", ["after"], '1, 2, '],
     ["obj$dots", ["first", "after"], 'af = 1, '],
     ["obj$dots", ["first"], 'after = 1, '],
@@ -79,6 +121,18 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$dots", ["after"], '1, ', ', 2)'],
     ["(obj\n$positional", ["first"], 'fi', ', 2))'],
     ["obj$ # continuation\npositional", ["first"], 'fi', ', 2)'],
+    ["stop('pipe evaluated') |> obj$positional", ["second", "third"]],
+    ["1 |> obj$positional", ["third"], '2, '],
+    ["1 |> obj$positional", [], 'fi', ', second = 2, third = 3)'],
+    ["1 |> obj$positional", ["second"], '', ', third = 3)'],
+    ["1 |> obj$positional", ["first", "third"], 'second = _, '],
+    ["1 |> obj$positional", ["first", "second"], '', ', third = _)'],
+    ["1 |> obj$positional", ["first", "second"], 'r"(third)" = _, '],
+    ["1 |> obj$positional", ["third"], '2 |> identity(x = _), '],
+    ["stop('pipe evaluated') %>% obj$positional", ["second", "third"]],
+    ["1 %>% obj$positional", ["first", "third"], 'second = ., '],
+    ["1 %>% obj$positional", ["third"], 'identity(.), '],
+    ["1 %>% obj$positional", ["second", "third"], '., '],
   ]) {
     const input = expression + "(" + argumentsBefore + argumentsAfter;
     const context = completion.getCompletionContext(input, input.length - argumentsAfter.length);
@@ -131,6 +185,73 @@ test("completion call boundaries agree with the R parser across newlines", async
     const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
       async () => [{ name: "first" }]);
     assert.equal(entries.some(entry => entry.detail === "parameter"), expected, input);
+  }
+});
+
+test("argument probes agree with native R calls across pipe and argument combinations", async () => {
+  const cases = [];
+  const probes = [];
+  for (const pipe of ["", "1 |> ", "1 %>% "]) {
+    for (const fn of ["positional", "dots", "return", "toString", "constructor"]) {
+      const argumentsList = [
+        "§", "1, §", "first = 1, §", "fi = 1, §", "§, third = 3",
+        "third = 3, §", 'r"(third)" = 3, §', "§, 2", "1, §, 3",
+        "§, , third = 3", "first = 1, second = 2, third = 3, §",
+        "1, 2, §", "after = 1, §", "af = 1, §",
+      ];
+      if (pipe === "1 |> ") argumentsList.push("third = _, §", "§, second = _", "2 |> identity(x = _), §");
+      if (pipe === "1 %>% ") argumentsList.push("third = ., §", "§, second = .", "identity(.), §", "., §");
+      for (const args of argumentsList) {
+        const marked = `${pipe}obj$${fn}(${args})`;
+        const cursor = marked.indexOf("§");
+        const input = marked.replace("§", "");
+        let probe;
+        await completion.collectCompletionEntries(completion.getCompletionContext(input, cursor),
+          undefined, undefined, undefined, [], [], undefined, async expression => {
+            probe = expression;
+            return [];
+          });
+        assert.ok(probe, marked);
+        cases.push({ call: marked.replace("§", ".cursor_marker"), fn });
+        probes.push(probe);
+      }
+    }
+  }
+  // Evaluate harmless test functions whose bodies only return match.call().
+  // This lets R and magrittr perform the real pipe transformations; the
+  // implementation's reconstructed calls are checked against that oracle.
+  const results = JSON.parse(execFileSync("Rscript", ["--vanilla", "-e", `
+    library(magrittr)
+    capture <- function(call, definition) {
+      values <- as.list(call)
+      # Explicit empty slots still occupy positions in the editable source.
+      for (i in seq_along(values)[-1L]) {
+        if (identical(values[[i]], quote(expr = ))) values[i] <- list(NULL)
+      }
+      match.call(definition, as.call(values), expand.dots = FALSE)
+    }
+    obj <- list(
+      positional = function(first, second, third) capture(sys.call(), sys.function()),
+      dots = function(first, ..., after) capture(sys.call(), sys.function()),
+      return = function(first, second, third) capture(sys.call(), sys.function()),
+      toString = function(first, second, third) capture(sys.call(), sys.function()),
+      constructor = function(first, second, third) capture(sys.call(), sys.function()))
+    inputs <- jsonlite::fromJSON(file("stdin"), simplifyVector = FALSE)
+    result <- lapply(seq_along(inputs$cases), function(i) {
+      case <- inputs$cases[[i]]
+      expected <- tryCatch({
+        matched <- as.list(eval(parse(text = case$call)))[-1L]
+        used <- names(matched)[!vapply(matched, identical, logical(1), as.name(".cursor_marker"))]
+        setdiff(names(formals(obj[[case$fn]])), c(used, "..."))
+      }, error = function(e) character())
+      actual <- tryCatch(setdiff(names(eval(parse(text = inputs$probes[[i]]))), "..."), error = function(e) character())
+      list(expected = as.list(expected), actual = as.list(actual))
+    })
+    cat(jsonlite::toJSON(result, auto_unbox = TRUE))
+  `], { input: JSON.stringify({ cases, probes }), encoding: "utf8", timeout: 15000 }));
+  assert.equal(results.length, cases.length);
+  for (const [index, result] of results.entries()) {
+    assert.deepEqual(result.actual, result.expected, cases[index].call);
   }
 });
 

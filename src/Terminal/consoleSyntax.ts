@@ -315,7 +315,7 @@ export class ConsoleSyntax implements RendererLineHighlighter {
         }
 
         const current = stack[stack.length - 1];
-        const depth = current === char ? Math.max(stack.length - 1, 0) : Math.max(stack.length - 1, 0);
+        const depth = Math.max(stack.length - 1, 0);
         const ansi = this.theme.resolveBracketPairAnsi(depth);
         if (ansi) {
           row[cursor] = ansi;

@@ -223,6 +223,21 @@ for (workspace in server$workspaces$values()) {
     record_cached_package_fingerprints(workspace)
 }
 
+console_call_identity <- function(source) {
+    if (!is.character(source) || length(source) != 1L) return(NULL)
+    parsed <- tryCatch(parse(text = source, keep.source = FALSE), error = function(e) NULL)
+    if (length(parsed) != 1L) return(NULL)
+    head <- parsed[[1L]]
+    if (is.symbol(head)) return(list(token = as.character(head), package = NULL, accessor = ""))
+    if (is.call(head) && length(head) == 3L &&
+        (identical(head[[1L]], quote(`::`)) || identical(head[[1L]], quote(`:::`))) &&
+        is.symbol(head[[2L]]) && is.symbol(head[[3L]])) {
+        return(list(token = as.character(head[[3L]]), package = as.character(head[[2L]]),
+                    accessor = as.character(head[[1L]])))
+    }
+    NULL
+}
+
 server$request_handlers[["textDocument/completion"]] <- function(self, id, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -241,6 +256,30 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
         point,
         self$ClientCapabilities$textDocument$completion
     )
+    call <- console_call_identity(params$rConsoleCall)
+    if (!is.null(call)) {
+        detected <- document$detect_call(point)
+        if (!identical(call$token, detected$token) ||
+            !identical(call$package, detected$package) ||
+            !identical(call$accessor, detected$accessor)) {
+            # Resolve parameters with the same workspace/provider as ordinary
+            # completion, using the lexer-selected head without rewriting code
+            # or evaluating the user's function or argument expressions.
+            token <- document$detect_token(point, forward = FALSE)$token
+            arguments <- c(
+                languageserver:::arg_completion(uri, workspace, point, token, call$token,
+                    call$package, exported_only = call$accessor != ":::"),
+                languageserver:::arg_value_completion(uri, workspace, document, point, token,
+                    call$token, call$package, exported_only = call$accessor != ":::")
+            )
+            other <- Filter(function(item) !(identical(item$detail, "parameter") ||
+                (is.character(item$detail) && startsWith(item$detail, "value for "))), reply$result$items)
+            items <- c(arguments, other)
+            nmax <- languageserver:::lsp_settings$get("max_completions")
+            reply$result$items <- head(items, nmax)
+            reply$result$isIncomplete <- isTRUE(reply$result$isIncomplete) || length(items) > nmax
+        }
+    }
     record_cached_package_fingerprints(workspace)
     self$deliver(reply)
 }

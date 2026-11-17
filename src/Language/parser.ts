@@ -66,7 +66,6 @@ enum TokenType {
   In,
   Next,
   Break,
-  Return,
 
   Operator,
 
@@ -100,6 +99,42 @@ export type CallCompletionContext = {
   // means the cursor is in a value, comment, or another non-name position.
   argumentTags?: (string | null)[];
 };
+
+function continuesCallLine(lineBreak: boolean, parent: string | undefined, previous?: Token): boolean {
+  return !lineBreak || parent === "(" || parent === "[" || previous?.type === TokenType.Operator;
+}
+
+/** Map callable-name ends to their opening parentheses in one lexical pass.
+ * A newline inside a brace or at top level ends the statement; comments do
+ * not change that rule. Used by both insertion and LSP package projection. */
+export function getCallOpenings(code: string): Map<number, number> {
+  const openings = new Map<number, number>();
+  const stack: string[] = [];
+  let previous: Token | undefined;
+  let lineBreak = false;
+  for (const token of tokenize(code)) {
+    if (token.type === TokenType.Comment) continue;
+    if (token.type === TokenType.Newline) {
+      lineBreak = true;
+      continue;
+    }
+    if (token.type === TokenType.LeftParen && previous?.type === TokenType.Identifier &&
+        continuesCallLine(lineBreak, stack.at(-1), previous)) {
+      openings.set(previous.position + previous.value.length, token.position);
+    }
+    if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
+      stack.push(...token.value);
+    } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace || token.type === TokenType.RightBracket) {
+      for (const closing of token.value) {
+        const expected = closing === ")" ? "(" : closing === "}" ? "{" : "[";
+        if (stack.pop() !== expected) return openings;
+      }
+    }
+    previous = token;
+    lineBreak = false;
+  }
+  return openings;
+}
 
 /** Inspect syntax without evaluating argument expressions or searching source
  * text for a callable suffix. Each token is visited a constant number of times. */
@@ -136,8 +171,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   // starts a statement context even when it is itself inside parentheses.
   const parent = stack.at(-2)?.opening;
   const continuesLine = (index: number): boolean =>
-    !lineBreaks.has(index) || parent === "(" || parent === "[" ||
-    tokens[index - 1]?.type === TokenType.Operator;
+    continuesCallLine(lineBreaks.has(index), parent, tokens[index - 1]);
   let start = frame.index - 1;
   const last = tokens[start];
   if (last?.type !== TokenType.Identifier || !continuesLine(frame.index)) return undefined;
@@ -154,12 +188,21 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   // Inspect only this call's top-level arguments, including those after the
   // cursor. Nested commas and equals signs belong to their own expressions.
   const argumentTags: (string | null)[] = [];
+  const pipe = tokens[start - 1]?.type === TokenType.Operator && continuesLine(start)
+    ? tokens[start - 1].value : undefined;
+  const piped = pipe === "|>" || pipe === "%>%";
+  let hasPipePlaceholder = false;
   let namePosition = false;
   let hasDots = false;
   let argumentStart = frame.index + 1;
   let argumentOffset = tokens[frame.index].position + 1;
   const collectArgument = (end: number, endOffset: number): void => {
     const first = tokens[argumentStart];
+    const second = tokens[argumentStart + 1];
+    const named = argumentStart + 1 < end &&
+      (first.type === TokenType.Identifier || first.type === TokenType.String || first.type === TokenType.RawString) &&
+      second.type === TokenType.Operator && second.value === "=";
+    const valueStart = argumentStart + (named ? 2 : 0);
     if (argumentOffset <= cursor && cursor <= endOffset) {
       argumentTags.push(null);
       namePosition = argumentStart === end || (
@@ -168,10 +211,12 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
         first.position < cursor && first.position + first.value.length === cursor
       );
     } else {
-      const second = tokens[argumentStart + 1];
-      const named = argumentStart + 1 < end &&
-        (first.type === TokenType.Identifier || first.type === TokenType.String) &&
-        second.type === TokenType.Operator && second.value === "=";
+      // Only a supplied direct placeholder replaces implicit insertion. A
+      // prefix in the cursor slot will be replaced by the selected argument.
+      // In magrittr, nested uses such as f(g(.)) still insert a first argument.
+      const value = tokens[valueStart];
+      hasPipePlaceholder ||= piped && valueStart + 1 === end && value?.type === TokenType.Identifier &&
+        (pipe === "|>" ? value.value === "_" : value.value === "." || value.value === "`.`");
       argumentTags.push(named ? first.value : "");
       // Forwarded dots cannot be matched without inspecting the caller's frame.
       hasDots ||= argumentStart + 1 === end && first.value === "...";
@@ -197,6 +242,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
       }
     }
   }
+  if (piped && !hasPipePlaceholder) argumentTags.unshift("");
   return {
     name: code.slice(tokens[start].position, last.position + last.value.length),
     operator,
@@ -220,18 +266,17 @@ export interface HighlightToken {
   position: number;
 }
 
-const KEYWORDS: Record<string, TokenType> = {
-  function: TokenType.Function,
-  if: TokenType.If,
-  else: TokenType.Else,
-  for: TokenType.For,
-  while: TokenType.While,
-  repeat: TokenType.Repeat,
-  in: TokenType.In,
-  next: TokenType.Next,
-  break: TokenType.Break,
-  return: TokenType.Return,
-};
+const KEYWORDS = new Map<string, TokenType>([
+  ["function", TokenType.Function],
+  ["if", TokenType.If],
+  ["else", TokenType.Else],
+  ["for", TokenType.For],
+  ["while", TokenType.While],
+  ["repeat", TokenType.Repeat],
+  ["in", TokenType.In],
+  ["next", TokenType.Next],
+  ["break", TokenType.Break],
+]);
 
 const NUMERIC_CONSTANTS = new Set([
   "TRUE",
@@ -464,7 +509,6 @@ export function tokenizeForHighlighting(code: string): HighlightToken[] {
         case TokenType.In:
         case TokenType.Next:
         case TokenType.Break:
-        case TokenType.Return:
           return { kind: "keyword", value: token.value, position: token.position };
         case TokenType.Operator:
           return {
@@ -649,7 +693,7 @@ function parseIdentifier(code: string, pos: number): { token: Token; newPos: num
     };
   }
 
-  const keywordType = KEYWORDS[value];
+  const keywordType = KEYWORDS.get(value);
   return {
     token: { type: keywordType ?? TokenType.Identifier, value, position: start },
     newPos: pos,

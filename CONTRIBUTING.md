@@ -68,7 +68,7 @@ npm run test:package
 The extension host smoke test runs on VS Code 1.101.0 and current stable, installs
 declared extension dependencies, activates R Console, and checks its core commands
 are registered.
-The language server tests require R's `languageserver` package and exercise
+The language server tests require R's `languageserver` and `magrittr` packages and exercise
 startup, authenticated connections, and completion during session updates and
 server restarts. They run the production R server with a simulated VS Code host.
 Set `R_TEST_EXECUTABLE` to choose the R executable for these lifecycle tests;

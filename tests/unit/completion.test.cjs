@@ -253,6 +253,21 @@ test("a selected function without a call is qualified once its parentheses are t
   assert.equal(selections.project("stats::filter()").document.getText(), "stats::filter()");
 });
 
+test("package selections respect call continuations and qualification across comments", () => {
+  for (const [input, expected] of [
+    ["outer(filter # comment\n(1))", "outer(stats::filter # comment\n(1))"],
+    ["x[filter\n(1)]", "x[stats::filter\n(1)]"],
+    ["filter\n(1)", "filter\n(1)"],
+    ["outer({ filter\n(1) })", "outer({ filter\n(1) })"],
+    ["outer(obj$ # comment\nfilter(1))", "outer(obj$ # comment\nfilter(1))"],
+    ["dplyr:: # comment\nfilter(1)", "dplyr:: # comment\nfilter(1)"],
+  ]) {
+    const selections = new VirtualRDocument("test");
+    select(selections, input, input.indexOf("filter"), "filter", "stats");
+    assert.equal(selections.project(input).document.getText(), expected, input);
+  }
+});
+
 test("the LSP client sends qualified input and maps both completion range formats back", async (t) => {
   class Range {
     constructor(start, end) { Object.assign(this, { start, end }); }
@@ -1353,6 +1368,12 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
   assert.equal(lang.refineInlineCompletion(snapshot("other\nx <- df$al")), undefined);
   lang.cancelCompletion();
   assert.equal(lang.refineInlineCompletion(snapshot("x <- df$al")), undefined);
+
+  const argumentInput = snapshot("obj$fun(TRU");
+  await lang.handleAutocomplete({ input: argumentInput, getCurrentInput: () => argumentInput,
+    getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries() {} });
+  assert.equal(lang.refineInlineCompletion(snapshot("obj$fun(TRUE")), undefined,
+    "a literal cannot reuse cached argument-name candidates");
 });
 
 test("function argument completion awaits parameters before offering runtime variables", async () => {

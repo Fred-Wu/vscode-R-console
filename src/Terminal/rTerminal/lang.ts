@@ -479,15 +479,16 @@ export class RTermLang {
   /** Reuse candidates only for a refinement of the same replacement span.
    * Rebuild edit snapshots before exposing them: an old LSP edit must never be
    * accepted against a different line, suffix, object, or multiline context. */
-  refineInlineCompletion(input: InputSnapshot): import("../../Language/completion").CompletionQuickPickItem[] | undefined {
+  refineInlineCompletion(input: InputSnapshot, context?: CompletionContext): import("../../Language/completion").CompletionQuickPickItem[] | undefined {
     this.completionRequestId++;
     const cached = this.inlineCache;
     if (!cached) return undefined;
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+    context ??= getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
     if (!context) return undefined;
     const old = cached.context;
     if (context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
+        (context.argumentTags === undefined) !== (old.argumentTags === undefined) ||
         input.cursorRow !== cached.input.cursorRow || !context.prefix.startsWith(old.prefix) ||
         input.textBeforeCursor.slice(0, input.textBeforeCursor.length - context.prefix.length) !==
           cached.input.textBeforeCursor.slice(0, cached.input.textBeforeCursor.length - old.prefix.length) ||

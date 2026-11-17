@@ -27,6 +27,7 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
+import { getEnclosingCall } from "./parser";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -295,9 +296,18 @@ export class ConsoleLspClient implements CompletionProvider {
               triggerKind: vscode.CompletionTriggerKind.Invoke,
               triggerCharacter: undefined,
             };
-        const params = client.code2ProtocolConverter.asCompletionParams(
-          projection.document, projection.toServerPosition(position), context
-        );
+        const serverPosition = projection.toServerPosition(position);
+        const text = projection.document.getText();
+        const call = text.includes("(")
+          ? getEnclosingCall(text, projection.document.offsetAt(serverPosition)) : undefined;
+        // Carry the parsed callable identity across the protocol. The R
+        // server's line-local token lookup cannot see a name before a newline.
+        // Member formals remain the responsibility of the active R session.
+        const params = {
+          ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
+          ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"
+            ? { rConsoleCall: call.name } : {}),
+        };
         const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client) {
           continue;

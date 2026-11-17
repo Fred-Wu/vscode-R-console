@@ -45,6 +45,9 @@ test("call context tracks only arguments of the enclosing call on both sides of 
     ["obj$fun(fi|, 2)", "obj$fun", [null, ""]],
     ["obj$fun(1, se|, 3)", "obj$fun", ["", null, ""]],
     ["obj$fun(fi|, , third = 3)", "obj$fun", [null, "", "third"]],
+    ["obj$return(return = 1, ne|)", "obj$return", ["return", null]],
+    ["base::toString(x = 1, wi|)", "base::toString", ["x", null]],
+    ["obj$constructor(hasOwnProperty = 1, ne|)", "obj$constructor", ["hasOwnProperty", null]],
   ]) {
     const cursor = marked.indexOf("|");
     const context = parser.getEnclosingCall(marked.replace("|", ""), cursor);
@@ -105,4 +108,47 @@ test("raw literals use matching brackets, dash delimiters and quotes", async () 
     assert.equal(tokens[1].value, "next_value");
   }
   assert.equal(await parser.isExpressionCompleteAsync('r"--(not closed--"'), false);
+});
+
+test("call openings distinguish continuations from separate statements and literals", () => {
+  for (const [input, expected] of [
+    ["obj$fun (1)", true], ["outer(obj$fun\n(1))", true],
+    ["outer(obj$fun # comment\n(1))", true], ["x[obj$fun\r\n(1)]", true],
+    ["outer(obj[[1]]$`a b` # comment\n(1))", true],
+    ["obj$fun\n(1)", false], ["{ obj$fun # comment\n(1) }", false],
+    ["outer({ obj$fun\n(1) })", false], ['"obj$fun (1)"', false],
+    ["# obj$fun (1)", false], ['r"(obj$fun (1))"', false],
+  ]) {
+    const nameEnd = input.includes("`a b`") ? input.indexOf("`a b`") + 5 : input.indexOf("fun") + 3;
+    const opening = parser.getCallOpenings(input).get(nameEnd);
+    assert.equal(opening !== undefined, expected, input);
+    if (expected) assert.equal(input[opening], "(");
+  }
+});
+
+test("argument tags include pipe inputs and preserve raw-string names", () => {
+  for (const [marked, tags] of [
+    ["1 |> obj$fun(§)", ["", null]],
+    ["x |> obj$fun(1, se§)", ["", "", null]],
+    ["x |> obj$fun(second = _, fi§)", ["second", null]],
+    ["x |> obj$fun(fi§, second = _)", [null, "second"]],
+    ["x |> obj$fun(2 |> other(x = _), th§)", ["", "", null]],
+    ["x |> obj$fun(other(fi§))", [null]],
+    ["x |> obj$fun(first = `_`, se§)", ["", "first", null]],
+    ['x |> obj$fun(r"--(third)--" = _, fi§)', ['r"--(third)--"', null]],
+    ['obj$fun(r"(third)" = 1, fi§)', ['r"(third)"', null]],
+    ["x %>% obj$fun(§)", ["", null]],
+    ["x %>% obj$fun(second = ., fi§)", ["second", null]],
+    ["x %>% obj$fun(., se§)", ["", null]],
+    ["x %>% obj$fun(`.`, se§)", ["", null]],
+    ["x %>% obj$fun(other(.), th§)", ["", "", null]],
+    ["x %>% obj$fun(.§)", ["", null]],
+    ['obj$fun("x |> obj$fun", se§)', ["", null]],
+    ["x |> previous(); obj$fun(fi§)", [null]],
+    ["x |> # continuation\n obj$fun(fi§)", ["", null]],
+  ]) {
+    const cursor = marked.indexOf("§");
+    const context = parser.getEnclosingCall(marked.replace("§", ""), cursor);
+    assert.deepEqual(context?.argumentTags, tags, marked);
+  }
 });

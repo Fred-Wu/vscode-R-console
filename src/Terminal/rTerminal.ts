@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem, getCompletionContext } from "../Language/completion";
+import { getCallOpenings } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
   ANSI,
@@ -2105,7 +2106,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.dismissInlineCompletion(false);
       return;
     }
-    const refined = this.lang.refineInlineCompletion(input);
+    const refined = this.lang.refineInlineCompletion(input, context);
     if (refined) {
       this.inlineCompletion.set(refined, this.inlineCompletion.token, context?.prefix ?? "");
     }
@@ -2157,26 +2158,30 @@ export class RTerminal implements vscode.Pseudoterminal {
     const selectionStart = this.inputState.translateRowColToIndex(
       this.inputState.cursorRow, selection.replaceStart
     );
-    const currentLine = this.inputState.currentLine;
-    const before = currentLine.slice(0, selection.replaceStart);
-    const after = currentLine.slice(this.inputState.cursorCol);
+    const input = this.inputState.text;
+    const cursor = this.inputState.cursorPosition;
+    const before = input.slice(0, selectionStart);
+    const after = input.slice(cursor);
     const cursorInsideEmptyCall = selection.insertText.endsWith("()");
-    const existingCall = cursorInsideEmptyCall ? /^[ \t]*\(/.exec(after) : null;
-    const insertText = existingCall ? selection.insertText.slice(0, -2) : selection.insertText;
-    const newLine = `${before}${insertText}${after}`;
-
-    const lines = this.inputState.lines;
-    lines[this.inputState.cursorRow] = newLine;
-
-    const newCursorCol = before.length + insertText.length +
-      (existingCall ? existingCall[0].length : cursorInsideEmptyCall ? -1 : 0);
-    this.inputState.text = lines.join("\n");
-    this.lang.recordCompletion(this.inputState.text, selectionStart,
-      existingCall ? { ...selection, insertText } : selection);
-    this.inputState.cursorPosition = this.inputState.translateRowColToIndex(
-      this.inputState.cursorRow,
-      newCursorCol
-    );
+    let insertText = selection.insertText;
+    let nextInput = before + insertText + after;
+    let nextCursor = selectionStart + insertText.length - Number(cursorInsideEmptyCall);
+    // Most acceptances have no existing call. Only parse when the suffix can
+    // contain one, and inspect the completed name so empty prefixes work too.
+    if (cursorInsideEmptyCall && after.includes("(")) {
+      const callable = insertText.slice(0, -2);
+      const candidate = before + callable + after;
+      const opening = getCallOpenings(candidate).get(selectionStart + callable.length);
+      if (opening !== undefined) {
+        insertText = callable;
+        nextInput = candidate;
+        nextCursor = opening + 1;
+      }
+    }
+    this.inputState.text = nextInput;
+    this.lang.recordCompletion(nextInput, selectionStart, { ...selection, insertText });
+    this.inputState.cursorPosition = nextCursor;
+    this.inputState.preferredColumn = null;
     if (cursorInsideEmptyCall) {
       // Continue the completion the user accepted, even with no argument typed.
       this.inlineCompletionExplicit = true;

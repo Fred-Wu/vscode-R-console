@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { tokenizeForHighlighting } from "./parser";
+import { getCallOpenings, tokenizeForHighlighting } from "./parser";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 
@@ -49,9 +49,9 @@ export class VirtualRDocument {
   project(content: string) {
     // Picker previews must not change the selections saved with the actual input.
     const visible = new VirtualRDocument(this.id, content);
-    const insertions = this.getSelections(content).filter((selection) =>
-      /^\s*\(/.test(content.slice(selection.start + selection.name.length))
-    );
+    const selections = this.getSelections(content);
+    const openings = selections.length ? getCallOpenings(content) : undefined;
+    const insertions = selections.filter((selection) => openings?.has(selection.start + selection.name.length));
     const parts: string[] = [];
     let previous = 0;
     for (const selection of insertions) {
@@ -96,16 +96,17 @@ export class VirtualRDocument {
       oldEnd--;
       newEnd--;
     }
-    const tokens = new Map(tokenizeForHighlighting(content).map((token) => [token.position, token]));
+    const meaningful = tokenizeForHighlighting(content).filter(token => token.kind !== "comment");
+    const tokens = new Map(meaningful.map((token, index) => [token.position, { token, previous: meaningful[index - 1] }]));
     return this.selections.flatMap((selection) => {
       if (oldEnd <= selection.start) {
         selection = { ...selection, start: selection.start + newEnd - oldEnd };
       } else if (start < selection.start + selection.name.length) {
         return [];
       }
-      const token = tokens.get(selection.start);
+      const { token, previous } = tokens.get(selection.start) ?? {};
       return token?.value === selection.name && (token.kind === "identifier" || token.kind === "function") &&
-        !/[$@:]\s*$/.test(content.slice(0, selection.start)) ? [selection] : [];
+        !(previous?.kind === "operator" && ["$", "@", "::", ":::"].includes(previous.value)) ? [selection] : [];
     });
   }
 

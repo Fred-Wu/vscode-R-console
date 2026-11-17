@@ -340,6 +340,73 @@ test("Escape cancels qualified argument requests before and after they start", t
   }
 });
 
+test("accepting a callable preserves multiline calls and places the caret after their opener", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const prefix of ["fu", ""]) {
+      for (const separator of [" ", "\n  ", " # comment\n  ", "\n # another comment\n  "]) {
+        for (const mode of ["typing", "tab"]) {
+          const { terminal } = createTerminal(t, 80, 24, mode);
+          delete terminal.applyCompletion;
+          const records = [], requests = [];
+          terminal.lang.recordCompletion = (...args) => records.push(args);
+          terminal.lang.handleAutocomplete = request => { requests.push(request); };
+          const before = `outer(obj${operator}`;
+          const input = before + prefix + separator + "(123))";
+          terminal.inputState.insertText(input);
+          terminal.inputState.cursorPosition = before.length + prefix.length;
+          terminal.inlineCompletion.set([{
+            ...item("fun"), insertText: "fun()", replaceStart: before.length,
+            snapshotInput: terminal.inputState.currentLine, snapshotCursor: terminal.inputState.cursorCol,
+          }], terminal.inlineCompletion.token);
+          terminal.applyKeyAction({ type: "tab" });
+          const expected = before + "fun" + separator + "(123))";
+          assert.equal(terminal.inputState.text, expected, input);
+          assert.equal(terminal.inputState.textBeforeCursor, before + "fun" + separator + "(");
+          assert.equal(records[0][2].insertText, "fun");
+          t.mock.timers.tick(150);
+          assert.equal(requests.length, mode === "typing" ? 1 : 0);
+        }
+      }
+    }
+  }
+});
+
+test("callable insertion keeps top-level and brace-separated expressions distinct", t => {
+  for (const input of ["obj$fu\n(123)", "outer({ obj$fu # comment\n(123) })"]) {
+    const { terminal } = createTerminal(t, 80, 24, "tab");
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    terminal.inputState.insertText(input);
+    terminal.inputState.cursorPosition = input.indexOf("fu") + 2;
+    terminal.applyCompletion({ ...item("fun"), insertText: "fun()", replaceStart: input.indexOf("fu") });
+    assert.equal(terminal.inputState.text, input.replace("fu", "fun()"));
+    assert.equal(terminal.inputState.textBeforeCursor, input.slice(0, input.indexOf("fu")) + "fun(");
+  }
+});
+
+test("callable insertion handles quoted names, return and subscripted objects", t => {
+  for (const [input, insertText] of [
+    ["obj$ret(123)", "return()"],
+    ["outer(obj$ab # comment\n(123))", "`a b`()"],
+    ["outer(obj[[1]]$fu # comment\n(123))", "fun()"],
+    ['setup <- "😀"\nouter(obj$ab # comment\n(123))', "`a b`()"],
+  ]) {
+    const { terminal } = createTerminal(t, 80, 24, "tab");
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    const start = input.lastIndexOf("$") + 1;
+    const end = start + /^[a-z]+/.exec(input.slice(start))[0].length;
+    terminal.inputState.insertText(input);
+    terminal.inputState.cursorPosition = end;
+    terminal.applyCompletion({ ...item("callable"), insertText,
+      replaceStart: start - (input.lastIndexOf("\n", end - 1) + 1) });
+    const expected = input.slice(0, start) + insertText.slice(0, -2) + input.slice(end);
+    assert.equal(terminal.inputState.text, expected);
+    assert.equal(terminal.inputState.cursorPosition, expected.indexOf("(123)") + 1);
+  }
+});
+
 test("dismissal cancels argument suggestions scheduled after accepting a partial function name match", async t => {
   const { terminal } = createTerminal(t);
   delete terminal.applyCompletion;
