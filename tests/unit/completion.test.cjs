@@ -90,6 +90,64 @@ test("session member formals replace unrelated LSP arguments and remain in the A
   }
 });
 
+test("Unicode member and argument prefixes preserve the object and full replacement span", () => {
+  for (const name of ["éobj", "变量", "𐐀obj"]) {
+    const memberInput = `${name}$éfu`;
+    const member = completion.getCompletionContext(memberInput, memberInput.length);
+    assert.equal(member.objectName, name);
+    assert.equal(member.prefix, "éfu");
+    assert.equal(member.replaceStart, name.length + 1);
+    const argumentInput = `${name}$éfun(𐐀ar`;
+    const argument = completion.getCompletionContext(argumentInput, argumentInput.length);
+    assert.equal(argument.functionName, `${name}$éfun`);
+    assert.equal(argument.prefix, "𐐀ar");
+    assert.equal(argument.replaceStart, argumentInput.indexOf("𐐀ar"));
+    assert.deepEqual(argument.argumentTags, [null]);
+  }
+});
+
+test("member completion sends token-derived objects and keeps line-relative replacement spans", async () => {
+  for (const [input, objectName, prefix] of [
+    ["obj $ nested @ sl", "obj$nested", "sl"],
+    ["obj$ # comment\n nested$fi", "obj$nested", "fi"],
+    ["outer(obj\n$nested$fi", "obj$nested", "fi"],
+    ["𐐀obj$ # comment\n éfi", "𐐀obj", "éfi"],
+    ["`a[b`$fi", "`a[b`", "fi"],
+    ["df[obj$fi", "obj", "fi"],
+    ["obj$`a\\`b`$fi", "obj$`a\\`b`", "fi"],
+  ]) {
+    const line = input.split("\n").at(-1);
+    const context = completion.getCompletionContext(line, line.length, input);
+    assert.equal(context.kind, "member", input);
+    assert.equal(context.prefix, prefix, input);
+    assert.equal(context.replaceStart, line.length - prefix.length, input);
+    assert.equal(context.chainedBracket, false, input);
+    let requests = 0;
+    await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+      async expression => { requests++; assert.equal(expression, objectName, input); return []; });
+    assert.equal(requests, 1, input);
+  }
+});
+
+test("subscript member detection preserves base-object lookup without evaluating indices", async () => {
+  const input = "obj[[stop('must not execute')]]$fi";
+  const context = completion.getCompletionContext(input, input.length);
+  assert.equal(context.kind, "member");
+  assert.equal(context.chainedBracket, true);
+  await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+    async expression => { assert.equal(expression, "obj"); return []; });
+});
+
+test("member-like text in literals and comments does not request runtime members", async () => {
+  for (const input of ['"obj$fi', 'r"(obj$fi)', "# obj$fi", "obj$ # fi", "obj$`fi"]) {
+    const context = completion.getCompletionContext(input, input.length);
+    assert.notEqual(context?.kind, "member", input);
+    if (!context) continue;
+    await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+      async () => { assert.fail(`unexpected runtime lookup for ${input}`); });
+  }
+});
+
 test("missing session formals never fall back to arguments of a same-name global function", async () => {
   const input = "obj@lm(";
   const context = completion.getCompletionContext(input, input.length);

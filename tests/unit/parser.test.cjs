@@ -74,6 +74,70 @@ test("call context suppresses argument names in values, literals, comments and e
   }
 });
 
+test("Unicode callables and argument tags retain complete identifiers and UTF-16 offsets", () => {
+  for (const name of ["éobj$fun", "obj$éfun", "élm", "变量$函数", "𐐀obj$𐐀fun", "Ⅰobj$fun١"]) {
+    const input = `${name}(éarg = 1, 𐐀arg = 2, se)`;
+    const cursor = input.length - 1;
+    const context = parser.getEnclosingCall(input, cursor);
+    assert.equal(context?.name, name, input);
+    assert.deepEqual(context.argumentTags, ["éarg", "𐐀arg", null], input);
+    assert.equal(parser.getCallOpenings(input).get(name.length), name.length, input);
+    const token = parser.tokenizeForHighlighting(input).find(token => token.value === "𐐀arg");
+    assert.equal(token.position, input.indexOf("𐐀arg"), input);
+  }
+  for (const input of ["obj$\u0301fun(", "\u0301obj$fun(", "😀fun("]) {
+    assert.equal(parser.getEnclosingCall(input), undefined, input);
+  }
+});
+
+test("member context reads complete chains and balanced subscripts from tokens", () => {
+  for (const [input, objectName, baseObject, operator, prefix, hasSubscript] of [
+    ["obj$fi", "obj", "obj", "$", "fi", false],
+    ["obj@", "obj", "obj", "@", "", false],
+    ["obj $ nested @ sl", "obj$nested", "obj", "@", "sl", false],
+    ["outer(éobj$𐐀fun$é", "éobj$𐐀fun", "éobj", "$", "é", false],
+    ["`a[b`$fi", "`a[b`", "`a[b`", "$", "fi", false],
+    ["obj$`a\\` b`@sl", "obj$`a\\` b`", "obj", "@", "sl", false],
+    ["obj[[1]][2]$fi", "obj[[1]][2]", "obj", "$", "fi", true],
+    ["obj[x[1]]$fi", "obj[x[1]]", "obj", "$", "fi", true],
+    ["obj[[x[1]]]$fi", "obj[[x[1]]]", "obj", "$", "fi", true],
+    ['obj[["]"]]$fi', 'obj[["]"]]', "obj", "$", "fi", true],
+    ['obj[r"(])"]$fi', 'obj[r"(])"]', "obj", "$", "fi", true],
+    ["obj[if (x) y else z]$fi", "obj[if (x) y else z]", "obj", "$", "fi", true],
+    ["obj$nested[fn(x[[1]])]@sl", "obj$nested[fn(x[[1]])]", "obj", "@", "sl", true],
+    ["obj$ # comment\n nested$fi", "obj$nested", "obj", "$", "fi", false],
+    ["outer(obj\n$nested$fi", "obj$nested", "obj", "$", "fi", false],
+    ["obj$ # comment\n", "obj", "obj", "$", "", false],
+  ]) {
+    assert.deepEqual(parser.getMemberCompletionContext(input), {
+      objectName, baseObject, operator, prefix, hasSubscript, replaceStart: input.length - prefix.length,
+    }, input);
+  }
+});
+
+test("member detection refuses literals, comments and unsupported or broken object expressions", () => {
+  for (const input of [
+    '"obj$fi', '"obj$fi"', 'r"--(obj$fi)--"', "# obj$fi", "obj$ # fi", "obj$`fi",
+    "obj$`escaped\\`", "`obj$fi", "obj$fi ", "obj\n$fi", "outer({ obj\n$fi",
+    "obj[[1]$fi", "obj[[x[1]]$fi", "obj[1)$fi", "obj]$fi", "obj$$fi", "obj$@fi",
+    "factory()$fi", "factory()$nested$fi", "factory()[1]$fi", "pkg::obj$fi",
+    "123obj$fi", "😀obj$fi", "obj$\u0301nested$fi",
+  ]) {
+    assert.equal(parser.getMemberCompletionContext(input), undefined, input);
+  }
+});
+
+test("callable names use the same identifier and accessor tokens as member detection", () => {
+  for (const input of ["fun", "éfun", "𐐀fun", "pkg::fun", "pkg:::fun", "obj$fun", "obj@fun",
+    "pkg :: `a b`", "obj$`a\\`b`", "obj$`a(b`"]) {
+    assert.equal(parser.isCallableName(input), true, input);
+  }
+  for (const input of ["", "fun()", "obj[1]", "obj$", "obj$$fun", "fun arg", "# fun", '"fun"',
+    "`unfinished", "`escaped\\`", "obj$`escaped\\`", "obj$fun # comment"]) {
+    assert.equal(parser.isCallableName(input), false, input);
+  }
+});
+
 test("call context respects statement newlines and nested continuation", () => {
   for (const input of [
     "obj$fun\n(fi)", "obj$fun # end of statement\n(fi)",

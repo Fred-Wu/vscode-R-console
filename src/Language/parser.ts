@@ -102,8 +102,125 @@ export type CallCompletionContext = {
   argumentTags?: (string | null)[];
 };
 
-function continuesCallLine(lineBreak: boolean, parent: string | undefined, previous?: Token): boolean {
+function continuesExpressionLine(lineBreak: boolean, parent: string | undefined, previous?: Token): boolean {
   return !lineBreak || parent === "(" || parent === "[" || previous?.type === TokenType.Operator;
+}
+
+function isMemberAccessor(token: Token | undefined): boolean {
+  return token?.type === TokenType.Operator && (token.value === "$" || token.value === "@");
+}
+
+function isNameAccessor(token: Token | undefined): boolean {
+  return isMemberAccessor(token) ||
+    (token?.type === TokenType.Operator && (token.value === "::" || token.value === ":::"));
+}
+
+function isCompleteIdentifier(token: Token | undefined): boolean {
+  return token?.type === TokenType.Identifier && token.closed !== false;
+}
+
+/** A bare or qualified name, without a call, subscript, or other expression. */
+export function isCallableName(code: string): boolean {
+  const tokens = tokenize(code).filter(token => token.type !== TokenType.EOF && token.type !== TokenType.Newline);
+  return tokens.length % 2 === 1 && tokens.every((token, index) =>
+    index % 2 === 0 ? isCompleteIdentifier(token) : isNameAccessor(token));
+}
+
+export type MemberCompletionContext = {
+  objectName: string;
+  baseObject: string;
+  operator: "$" | "@";
+  prefix: string;
+  replaceStart: number;
+  hasSubscript: boolean;
+};
+
+/** Inspect the source before the cursor. Walk backwards over names, accessors
+ * and balanced subscripts; never evaluate an expression or accept its suffix. */
+export function getMemberCompletionContext(code: string): MemberCompletionContext | undefined {
+  if (!code.includes("$") && !code.includes("@")) return undefined;
+  const tokens: Token[] = [];
+  const continuations: boolean[] = [];
+  const subscriptOpenings = new Map<number, number>();
+  const stack: { opening: string; index: number }[] = [];
+  let lineBreak = false;
+  for (const token of tokenize(code)) {
+    if (token.type === TokenType.EOF) break;
+    if (token.type === TokenType.Comment) {
+      if (token.position + token.value.length === code.length) return undefined;
+      continue;
+    }
+    if (token.type === TokenType.Newline) {
+      lineBreak = true;
+      continue;
+    }
+    const index = tokens.length;
+    continuations.push(continuesExpressionLine(lineBreak, stack.at(-1)?.opening, tokens.at(-1)));
+    tokens.push(token);
+    lineBreak = false;
+    if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
+      for (const opening of token.value) stack.push({ opening, index });
+    } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace || token.type === TokenType.RightBracket) {
+      let openingIndex = -1;
+      for (const closing of token.value) {
+        const expected = closing === ")" ? "(" : closing === "}" ? "{" : "[";
+        const frame = stack.pop();
+        if (frame?.opening !== expected) return undefined;
+        openingIndex = frame.index;
+      }
+      if (token.type === TokenType.RightBracket && stack.at(-1)?.index !== openingIndex) {
+        subscriptOpenings.set(index, openingIndex);
+      }
+    }
+  }
+  let index = tokens.length - 1;
+  const last = tokens[index];
+  let prefix = "";
+  let replaceStart = code.length;
+  if (isCompleteIdentifier(last) && !last.value.startsWith("`") &&
+      last.position + last.value.length === code.length) {
+    if (!continuations[index]) return undefined;
+    prefix = last.value;
+    replaceStart = last.position;
+    index--;
+  }
+  const accessor = tokens[index];
+  if (!isMemberAccessor(accessor) || !continuations[index]) return undefined;
+  index--;
+  const objectParts: string[] = [];
+  let hasSubscript = false;
+  while (index >= 0) {
+    while (tokens[index]?.type === TokenType.RightBracket) {
+      const opening = subscriptOpenings.get(index);
+      if (opening === undefined || !continuations[opening]) return undefined;
+      hasSubscript = true;
+      objectParts.push(code.slice(tokens[opening].position, tokens[index].position + tokens[index].value.length));
+      index = opening - 1;
+    }
+    if (!isCompleteIdentifier(tokens[index])) return undefined;
+    objectParts.push(tokens[index].value);
+    if (!isMemberAccessor(tokens[index - 1])) break;
+    if (!continuations[index] || !continuations[index - 1]) return undefined;
+    objectParts.push(tokens[index - 1].value);
+    index -= 2;
+  }
+  const first = tokens[index];
+  if (!first) return undefined;
+  const preceding = tokens[index - 1];
+  if (isNameAccessor(preceding) || (preceding &&
+      preceding.position + preceding.value.length === first.position &&
+      (preceding.type === TokenType.Unknown || preceding.type === TokenType.Number ||
+       preceding.type === TokenType.Identifier))) return undefined;
+  return {
+    // Separators outside subscripts may rely on the enclosing call for line
+    // continuation. Normalize them so the runtime can parse the object alone.
+    objectName: objectParts.reverse().join(""),
+    baseObject: first.value,
+    operator: accessor.value as "$" | "@",
+    prefix,
+    replaceStart,
+    hasSubscript,
+  };
 }
 
 /** Map callable-name ends to their opening parentheses in one lexical pass.
@@ -121,7 +238,7 @@ export function getCallOpenings(code: string): Map<number, number> {
       continue;
     }
     if (token.type === TokenType.LeftParen && previous?.type === TokenType.Identifier &&
-        continuesCallLine(lineBreak, stack.at(-1), previous)) {
+        continuesExpressionLine(lineBreak, stack.at(-1), previous)) {
       openings.set(previous.position + previous.value.length, token.position);
     }
     if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
@@ -173,20 +290,23 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   // starts a statement context even when it is itself inside parentheses.
   const parent = stack.at(-2)?.opening;
   const continuesLine = (index: number): boolean =>
-    continuesCallLine(lineBreaks.has(index), parent, tokens[index - 1]);
+    continuesExpressionLine(lineBreaks.has(index), parent, tokens[index - 1]);
   let start = frame.index - 1;
   const last = tokens[start];
   if (last?.type !== TokenType.Identifier || !continuesLine(frame.index)) return undefined;
   let operator: CallCompletionContext["operator"];
   while (start >= 1) {
     const previous = tokens[start - 1];
-    if (previous.type !== TokenType.Operator ||
-        !["$", "@", "::", ":::"].includes(previous.value)) break;
+    if (!isNameAccessor(previous)) break;
     if (tokens[start - 2]?.type !== TokenType.Identifier ||
         !continuesLine(start) || !continuesLine(start - 1)) return undefined;
     operator ??= previous.value as CallCompletionContext["operator"];
     start -= 2;
   }
+  // Never reinterpret the ASCII suffix of an unsupported token as a callable.
+  const preceding = tokens[start - 1];
+  if (preceding?.type === TokenType.Unknown &&
+      preceding.position + preceding.value.length === tokens[start].position) return undefined;
   // Inspect only this call's top-level arguments, including those after the
   // cursor. Nested commas and equals signs belong to their own expressions.
   const argumentTags: (string | null)[] = [];
@@ -334,7 +454,7 @@ function tokenize(code: string): Token[] {
   let pos = 0;
 
   while (pos < code.length) {
-    const ch = code[pos];
+    const ch = String.fromCodePoint(code.codePointAt(pos)!);
 
     if (ch === " " || ch === "\t" || ch === "\r") {
       pos += 1;
@@ -476,7 +596,7 @@ function tokenize(code: string): Token[] {
     }
 
     tokens.push({ type: TokenType.Unknown, value: ch, position: pos });
-    pos += 1;
+    pos += ch.length;
   }
 
   tokens.push({ type: TokenType.EOF, value: "", position: pos });
@@ -573,12 +693,13 @@ function isIdentStart(ch: string): boolean {
     (ch >= "a" && ch <= "z") ||
     (ch >= "A" && ch <= "Z") ||
     ch === "." ||
-    ch === "_"
+    ch === "_" ||
+    (ch > "\x7f" && /[\p{L}\p{Nl}]/u.test(ch))
   );
 }
 
 function isIdentChar(ch: string): boolean {
-  return isIdentStart(ch) || isDigit(ch);
+  return isIdentStart(ch) || isDigit(ch) || (ch > "\x7f" && /\p{Nd}/u.test(ch));
 }
 
 function parseString(code: string, pos: number, quote: string): { token: Token; newPos: number } {
@@ -640,7 +761,7 @@ function parseBacktickIdentifier(code: string, pos: number): { token: Token; new
     if (code[pos] === "`") {
       pos += 1;
       return {
-        token: { type: TokenType.Identifier, value: code.slice(start, pos), position: start },
+        token: { type: TokenType.Identifier, value: code.slice(start, pos), position: start, closed: true },
         newPos: pos,
       };
     }
@@ -648,7 +769,7 @@ function parseBacktickIdentifier(code: string, pos: number): { token: Token; new
   }
 
   return {
-    token: { type: TokenType.Identifier, value: code.slice(start, pos), position: start },
+    token: { type: TokenType.Identifier, value: code.slice(start, pos), position: start, closed: false },
     newPos: pos,
   };
 }
@@ -683,8 +804,10 @@ function parseNumber(code: string, pos: number): { token: Token; newPos: number 
 function parseIdentifier(code: string, pos: number): { token: Token; newPos: number } {
   const start = pos;
 
-  while (pos < code.length && isIdentChar(code[pos])) {
-    pos += 1;
+  while (pos < code.length) {
+    const ch = String.fromCodePoint(code.codePointAt(pos)!);
+    if (!isIdentChar(ch)) break;
+    pos += ch.length;
   }
 
   const value = code.slice(start, pos);

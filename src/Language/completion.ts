@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { completionMatch } from "./completionMatch";
-import { getEnclosingCall, type CallCompletionContext } from "./parser";
+import { getEnclosingCall, getMemberCompletionContext, isCallableName, type CallCompletionContext } from "./parser";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -125,9 +125,7 @@ type WorkspaceData = {
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
-const MEMBER_CHAIN_SEGMENT = "(?:`(?:\\\\.|[^`\\\\])+`|[a-zA-Z._][a-zA-Z0-9._]*)";
 const BRACKET_CHAIN_SEGMENT = "(?:\\[[^\\[\\]]*\\]|\\[\\[[^\\[\\]]*\\]\\])";
-const MEMBER_OBJECT_SEGMENT = `(?:${MEMBER_CHAIN_SEGMENT}(?:${BRACKET_CHAIN_SEGMENT})*)`;
 const BRACKET_OBJECT_PATTERN = new RegExp(
   `([a-zA-Z._][a-zA-Z0-9._]*(?:${BRACKET_CHAIN_SEGMENT})*)\\s*(\\[\\[?)([^\\]]*)$`
 );
@@ -154,11 +152,6 @@ const R_RESERVED_WORDS = new Set([
   "NA_complex_",
   "NA_character_",
 ]);
-const MEMBER_CHAIN_TAIL_PATTERN = new RegExp(
-  `(${MEMBER_OBJECT_SEGMENT}(?:\\s*[$@]\\s*${MEMBER_OBJECT_SEGMENT})*)\\s*$`
-);
-const CALLABLE_PATTERN = `${MEMBER_CHAIN_SEGMENT}(?:\\s*(:::{0,1}|[$@])\\s*${MEMBER_CHAIN_SEGMENT})*`;
-const CALLABLE_EXPRESSION_PATTERN = new RegExp(`^${CALLABLE_PATTERN}$`);
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
@@ -263,6 +256,26 @@ export function getCompletionContext(
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
   const dataObjectName = detectDataContext(textForDataContext);
 
+  const member = getMemberCompletionContext(textForDataContext);
+  if (member) {
+    const { operator, prefix } = member;
+    const isBracketChainMember = operator === "$" && member.hasSubscript;
+    const baseObject = isBracketChainMember ? member.baseObject : undefined;
+    const isPlaceholderMember = !!baseObject && isPipePlaceholder(baseObject) && !!dataObjectName;
+    return {
+      kind: "member",
+      prefix,
+      replaceStart: member.replaceStart - (textForDataContext.length - beforeCursor.length),
+      triggerCharacter: prefix.length === 0 ? operator : undefined,
+      objectName: isPlaceholderMember ? dataObjectName : baseObject ?? member.objectName,
+      operator,
+      chainedBracket: isBracketChainMember,
+      dataObjectName: isPlaceholderMember ? dataObjectName : undefined,
+      snapshotInput,
+      snapshotCursor,
+    };
+  }
+
   const bracketMatch = BRACKET_OBJECT_PATTERN.exec(beforeCursor);
   if (bracketMatch) {
     const bracketObject = bracketMatch[1];
@@ -291,34 +304,6 @@ export function getCompletionContext(
     };
   }
 
-  const memberMatch = /([$@])([a-zA-Z0-9._]*)$/.exec(beforeCursor);
-  if (memberMatch) {
-    const operator = memberMatch[1] as "$" | "@";
-    const prefix = memberMatch[2] || "";
-    const objectExprRaw = beforeCursor.slice(0, beforeCursor.length - prefix.length - 1);
-    const chainMatch = MEMBER_CHAIN_TAIL_PATTERN.exec(objectExprRaw);
-    const objectExpr = chainMatch?.[1];
-    if (objectExpr) {
-      const isBracketChainMember = operator === "$" && objectExpr.includes("[");
-      const baseObject = isBracketChainMember
-        ? /^[a-zA-Z._][a-zA-Z0-9._]*/.exec(objectExpr)?.[0]
-        : undefined;
-      const isPlaceholderMember = !!baseObject && isPipePlaceholder(baseObject) && !!dataObjectName;
-      return {
-        kind: "member",
-        prefix,
-        replaceStart: beforeCursor.length - prefix.length,
-        triggerCharacter: prefix.length === 0 ? operator : undefined,
-        objectName: isPlaceholderMember ? dataObjectName : baseObject ?? objectExpr,
-        operator,
-        chainedBracket: isBracketChainMember,
-        dataObjectName: isPlaceholderMember ? dataObjectName : undefined,
-        snapshotInput,
-        snapshotCursor,
-      };
-    }
-  }
-
   const packageMatch = /([a-zA-Z0-9._]+):::{0,1}([a-zA-Z0-9._]*)$/.exec(
     beforeCursor
   );
@@ -336,7 +321,7 @@ export function getCompletionContext(
 
   const call = getEnclosingCall(textForDataContext + textAfterCursor, textForDataContext.length);
   if (call) {
-    const argPrefixMatch = /([a-zA-Z0-9._]*)$/.exec(beforeCursor);
+    const argPrefixMatch = /([\p{L}\p{Nl}\p{Nd}._]*)$/u.exec(beforeCursor);
     const prefix = argPrefixMatch ? argPrefixMatch[1] : "";
     return {
       kind: "argument",
@@ -946,20 +931,25 @@ async function getRuntimeArgumentCompletions(
 ): Promise<CompletionEntry[]> {
   if (!request || !context.functionName || !context.argumentTags) return [];
   try {
-    // Let R match exact/partial names, positional arguments and formals after
-    // dots. Preserve the cursor's positional slot with TRUE; all other values
-    // are NULL. Excluding that marker after matching keeps its formal available
-    // without shifting later positional arguments. User values are never evaluated.
+    // A completion inserts a name, which R matches before positional values on
+    // either side of the cursor. Check each candidate as a named argument rather
+    // than reserving a positional slot. Only match syntax: values, defaults and
+    // the function body are never evaluated. All candidates share one request.
     const supplied = context.argumentTags.map(tag =>
       tag === null ? "TRUE" : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
+    const cursorSlot = context.argumentTags.indexOf(null) + 2;
     const items = await request(
       `base::local({ .fn <- (${context.functionName}); ` +
       `.args <- if (base::is.function(.fn)) { ` +
       `.def <- base::args(.fn); ` +
-      `.matched <- base::as.list(base::suppressWarnings(base::match.call(` +
-      `definition = .def, call = base::quote(.fn(${supplied})), expand.dots = FALSE)))[-1L]; ` +
-      `.used <- base::names(.matched)[!base::vapply(.matched, base::identical, base::logical(1), TRUE)]; ` +
-      `base::setdiff(base::names(base::formals(.def)), .used) } else NULL; ` +
+      `.call <- base::as.list(base::quote(.fn(${supplied}))); ` +
+      `if (base::is.null(base::names(.call))) base::names(.call) <- base::rep("", base::length(.call)); ` +
+      `.candidates <- base::setdiff(base::names(base::formals(.def)), base::c("...", base::names(.call))); ` +
+      `.candidates[base::vapply(.candidates, function(.name) { ` +
+      `.candidate <- .call; base::names(.candidate)[${cursorSlot}L] <- .name; ` +
+      `base::tryCatch({ base::suppressWarnings(base::match.call(` +
+      `definition = .def, call = base::as.call(.candidate), expand.dots = FALSE)); TRUE }, ` +
+      `error = function(e) FALSE) }, base::logical(1))] } else NULL; ` +
       `stats::setNames(base::as.list(.args), .args) })`, "$"
     );
     return (items ?? []).filter(item => item.name && item.name !== "...").map(item => ({
@@ -1104,7 +1094,7 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
 
   const result = stripSnippetSyntax(text);
   if (context.kind === "package" && isCallableCompletionKind(item.kind) &&
-      CALLABLE_EXPRESSION_PATTERN.test(result)) return result + "()";
+      isCallableName(result)) return result + "()";
   return result;
 }
 

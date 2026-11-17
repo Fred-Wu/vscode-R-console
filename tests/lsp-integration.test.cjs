@@ -131,6 +131,26 @@ test("multiline fuzzy arguments retain call identity and the original replacemen
   }
 });
 
+test("Unicode call identity never substitutes a same-suffix global function", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { client, instances } = createConsoleLsp(t);
+  for (const name of ["élm", "𐐀lm"]) {
+    const input = `${name} <- function(correct_argument) {}; outer(${name}\n())`;
+    const position = { line: 1, character: 1 };
+    let parameters;
+    const deadline = Date.now() + 10000;
+    do {
+      const result = await client.provideCompletionItems({ getText: () => input }, position);
+      parameters = (Array.isArray(result) ? result : result?.items ?? [])
+        .filter(item => item.detail === "parameter").map(item => item.label);
+      if (parameters.includes("correct_argument")) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    assert.deepEqual(parameters, ["correct_argument"], input);
+    assert.equal(instances.at(-1).requests.at(-1).params.rConsoleCall, name);
+  }
+});
+
 test("fuzzy fallback does not turn values, comments or member calls into LSP argument positions", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { client, instances } = createConsoleLsp(t);
@@ -172,51 +192,63 @@ test("member argument probe inspects the actual R callable without executing bod
                 positional = function(first, second, third) stop("body called"))
     methods::setClass("CompletionTest", slots = c(lm = "function"))
     slot_obj <- methods::new("CompletionTest", lm = function(slot_argument) stop("body called"))
+    éobj <- list(lm = function(correct_argument) stop("body called"))
+    obj$élm <- function(correct_argument) stop("body called")
+    𐐀obj <- list(lm = function(correct_argument) stop("body called"))
+    obj$unicode <- function(éarg, 𐐀arg, remaining) stop("body called")
+    obj$pair <- function(first, second) stop("body called")
     .args <- .fn <- "unchanged"
   `;
   for (const [expression, expected, argumentsBefore = "", argumentsAfter = ""] of [
     ["obj$lm", ["list_argument", "missing", "lazy"]],
+    ["éobj$lm", ["correct_argument"]],
+    ["obj$élm", ["correct_argument"]],
+    ["𐐀obj$lm", ["correct_argument"]],
+    ["obj$unicode", ["remaining"], 'éarg = stop("value evaluated"), 𐐀arg = stop("value evaluated"), '],
+    ["obj$pair", ["second"], "se", ', stop("value evaluated"))'],
+    ["obj$pair", ["first", "second"], "", ', stop("value evaluated"))'],
+    ["obj$pair", ["first", "second"], 'stop("value evaluated"), '],
     ["slot_obj@lm", ["slot_argument"]],
     ["obj$primitive", ["na.rm"]],
     ["obj$empty", []], ["obj$field", []], ["unavailable$lm", []],
     ["obj$lm", ["missing", "lazy"], 'list_argument = stop("value evaluated"), '],
-    ["obj$lm", ["missing", "lazy"], 'li = stop("value evaluated"), '],
-    ["obj$lm", ["missing", "lazy"], 'stop("value evaluated"), '],
-    ["obj$lm", ["missing", "lazy"], ', '],
-    ["obj$lm", ["missing"], 'lazy = stop("value evaluated"), stop("value evaluated"), '],
+    ["obj$lm", ["list_argument", "missing", "lazy"], 'li = stop("value evaluated"), '],
+    ["obj$lm", ["list_argument", "missing", "lazy"], 'stop("value evaluated"), '],
+    ["obj$lm", ["list_argument", "missing", "lazy"], ', '],
+    ["obj$lm", ["list_argument", "missing"], 'lazy = stop("value evaluated"), stop("value evaluated"), '],
     ["obj$lm", ["list_argument", "lazy"], '', ', missing = stop("value evaluated"))'],
     ["obj$lm", [], 'list_argument = 1, li'],
     ["obj$quoted", ["remaining"], '`a b` = stop("value evaluated"), '],
     ["obj$quoted", ["remaining"], '"a b" = stop("value evaluated"), '],
     ["obj$quoted", ["remaining"], 'r"---(a b)---" = stop("value evaluated"), '],
     ["obj$positional", ["first", "second"], 'r"(third)" = stop("value evaluated"), '],
-    ["obj$dots", ["after"], '1, 2, '],
+    ["obj$dots", ["first", "after"], '1, 2, '],
     ["obj$dots", ["first", "after"], 'af = 1, '],
     ["obj$dots", ["first"], 'after = 1, '],
     ["obj$primitive", [], 'na.rm = TRUE, '],
     ["obj$positional", ["first"], 'fi', ', stop("value evaluated"))'],
-    ["obj$positional", ["first", "third"], '', ', stop("value evaluated"))'],
+    ["obj$positional", ["first", "second", "third"], '', ', stop("value evaluated"))'],
     ["obj$positional", ["second"], 'stop("value evaluated"), se', ', stop("value evaluated"))'],
-    ["obj$positional", ["second"], 'first = stop("value evaluated"), ', ', stop("value evaluated"))'],
-    ["obj$positional", ["first"], '', ', , third = stop("value evaluated"))'],
-    ["obj$positional", ["second"], '', ', fir = stop("value evaluated"), stop("value evaluated"))'],
+    ["obj$positional", ["second", "third"], 'first = stop("value evaluated"), ', ', stop("value evaluated"))'],
+    ["obj$positional", ["first", "second"], '', ', , third = stop("value evaluated"))'],
+    ["obj$positional", ["second", "third"], '', ', fir = stop("value evaluated"), stop("value evaluated"))'],
     ["obj$positional", [], '1, 2, 3, '],
     ["obj$dots", ["first", "after"], '', ', 1, 2)'],
-    ["obj$dots", ["after"], '1, ', ', 2)'],
+    ["obj$dots", ["first", "after"], '1, ', ', 2)'],
     ["(obj\n$positional", ["first"], 'fi', ', 2))'],
     ["obj$ # continuation\npositional", ["first"], 'fi', ', 2)'],
-    ["stop('pipe evaluated') |> obj$positional", ["second", "third"]],
-    ["1 |> obj$positional", ["third"], '2, '],
+    ["stop('pipe evaluated') |> obj$positional", ["first", "second", "third"]],
+    ["1 |> obj$positional", ["first", "second", "third"], '2, '],
     ["1 |> obj$positional", [], 'fi', ', second = 2, third = 3)'],
-    ["1 |> obj$positional", ["second"], '', ', third = 3)'],
+    ["1 |> obj$positional", ["first", "second"], '', ', third = 3)'],
     ["1 |> obj$positional", ["first", "third"], 'second = _, '],
     ["1 |> obj$positional", ["first", "second"], '', ', third = _)'],
     ["1 |> obj$positional", ["first", "second"], 'r"(third)" = _, '],
-    ["1 |> obj$positional", ["third"], '2 |> identity(x = _), '],
-    ["stop('pipe evaluated') %>% obj$positional", ["second", "third"]],
+    ["1 |> obj$positional", ["first", "second", "third"], '2 |> identity(x = _), '],
+    ["stop('pipe evaluated') %>% obj$positional", ["first", "second", "third"]],
     ["1 %>% obj$positional", ["first", "third"], 'second = ., '],
-    ["1 %>% obj$positional", ["third"], 'identity(.), '],
-    ["1 %>% obj$positional", ["second", "third"], '., '],
+    ["1 %>% obj$positional", ["first", "second", "third"], 'identity(.), '],
+    ["1 %>% obj$positional", ["first", "second", "third"], '., '],
   ]) {
     const input = expression + "(" + argumentsBefore + argumentsAfter;
     const context = completion.getCompletionContext(input, input.length - argumentsAfter.length);
@@ -296,14 +328,15 @@ test("argument probes agree with native R calls across pipe and argument combina
             return [];
           });
         assert.ok(probe, marked);
-        cases.push({ call: marked.replace("§", ".cursor_marker"), fn });
+        cases.push({ call: marked, fn });
         probes.push(probe);
       }
     }
   }
   // Evaluate harmless test functions whose bodies only return match.call().
-  // This lets R and magrittr perform the real pipe transformations; the
-  // implementation's reconstructed calls are checked against that oracle.
+  // Insert each candidate by name into the original source and let R and
+  // magrittr match it. A positional cursor marker would hide the very argument
+  // rematching this test must exercise.
   const results = JSON.parse(execFileSync("Rscript", ["--vanilla", "-e", `
     library(magrittr)
     capture <- function(call, definition) {
@@ -323,11 +356,11 @@ test("argument probes agree with native R calls across pipe and argument combina
     inputs <- jsonlite::fromJSON(file("stdin"), simplifyVector = FALSE)
     result <- lapply(seq_along(inputs$cases), function(i) {
       case <- inputs$cases[[i]]
-      expected <- tryCatch({
-        matched <- as.list(eval(parse(text = case$call)))[-1L]
-        used <- names(matched)[!vapply(matched, identical, logical(1), as.name(".cursor_marker"))]
-        setdiff(names(formals(obj[[case$fn]])), c(used, "..."))
-      }, error = function(e) character())
+      candidates <- setdiff(names(formals(obj[[case$fn]])), "...")
+      expected <- candidates[vapply(candidates, function(name) {
+        call <- sub("§", paste0(name, " = .cursor_marker"), case$call, fixed = TRUE)
+        tryCatch({ eval(parse(text = call)); TRUE }, error = function(e) FALSE)
+      }, logical(1))]
       actual <- tryCatch(setdiff(names(eval(parse(text = inputs$probes[[i]]))), "..."), error = function(e) character())
       list(expected = as.list(expected), actual = as.list(actual))
     })
