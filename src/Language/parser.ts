@@ -93,6 +93,8 @@ interface Token {
 }
 
 export type CallCompletionContext = {
+  // Callable source reconstructed from tokens, without inter-token whitespace
+  // or comments. Quoted identifiers retain their spelling and escapes.
   name: string;
   operator?: "$" | "@" | "::" | ":::";
   // R source tags; "" denotes a positional argument and null the cursor's slot. Undefined
@@ -244,7 +246,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   }
   if (piped && !hasPipePlaceholder) argumentTags.unshift("");
   return {
-    name: code.slice(tokens[start].position, last.position + last.value.length),
+    name: tokens.slice(start, frame.index).map(token => token.value).join(""),
     operator,
     argumentTags: namePosition && !inComment && !hasDots ? argumentTags : undefined,
   };

@@ -86,15 +86,28 @@ test("call context respects statement newlines and nested continuation", () => {
     ["(obj$fun\n(fi))", "obj$fun"],
     ["outer(obj$fun # continuation\n(fi))", "obj$fun"],
     ["x[obj$fun\n(fi)]", "obj$fun"],
-    ["obj$ # member continuation\nfun(fi)", "obj$ # member continuation\nfun"],
-    ["(obj\n$fun(fi))", "obj\n$fun"],
-    ["stats::\nlm(fi)", "stats::\nlm"],
+    ["obj$ # member continuation\nfun(fi)", "obj$fun"],
+    ["(obj\n$fun(fi))", "obj$fun"],
+    ["stats::\nlm(fi)", "stats::lm"],
     ["{ obj$fun\nother$fun(fi) }", "other$fun"],
     ["(obj$fun\r\n(fi))", "obj$fun"],
   ]) {
     const context = parser.getEnclosingCall(input, input.indexOf("fi") + 2);
     assert.equal(context?.name, name, input);
     assert.deepEqual(context.argumentTags, [null], input);
+  }
+});
+
+test("call identities normalize token separators without changing quoted names", () => {
+  for (const [input, expected] of [
+    ["outer(stats::\nlm())", "stats::lm"],
+    ["outer(stats\n::lm())", "stats::lm"],
+    ["outer(`stats` # package\n::: # accessor\n`lm`())", "`stats`:::`lm`"],
+    ["outer(obj $ `a # b` @ `c\\` d`())", "obj$`a # b`@`c\\` d`"],
+  ]) {
+    const call = parser.getEnclosingCall(input, input.lastIndexOf("(") + 1);
+    assert.equal(call?.name, expected, input);
+    assert.deepEqual(call.argumentTags, [null], input);
   }
 });
 

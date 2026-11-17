@@ -262,7 +262,8 @@ export class ConsoleLspClient implements CompletionProvider {
   async provideCompletionItems(
     doc: vscode.TextDocument,
     position: vscode.Position,
-    triggerCharacter?: string
+    triggerCharacter?: string,
+    contextPosition: vscode.Position = position
   ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const client = await this.ensureClient();
@@ -299,10 +300,12 @@ export class ConsoleLspClient implements CompletionProvider {
         const serverPosition = projection.toServerPosition(position);
         const text = projection.document.getText();
         const call = text.includes("(")
-          ? getEnclosingCall(text, projection.document.offsetAt(serverPosition)) : undefined;
+          ? getEnclosingCall(text, projection.document.offsetAt(projection.toServerPosition(contextPosition))) : undefined;
         // Carry the parsed callable identity across the protocol. The R
         // server's line-local token lookup cannot see a name before a newline.
         // Member formals remain the responsibility of the active R session.
+        // Fuzzy lookups move position within a prefix, but call eligibility
+        // must still be determined at the user's original cursor.
         const params = {
           ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
           ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"

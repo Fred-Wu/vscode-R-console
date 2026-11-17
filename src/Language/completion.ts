@@ -91,7 +91,9 @@ export interface CompletionProvider {
   provideCompletionItems(
     doc: vscode.TextDocument,
     position: vscode.Position,
-    triggerCharacter?: string
+    triggerCharacter?: string,
+    // Keep the user's cursor when position is moved to broaden matching.
+    contextPosition?: vscode.Position
   ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined>;
 }
 
@@ -1000,7 +1002,7 @@ async function getLanguageServerCompletions(
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter);
+        context.triggerCharacter, position);
       items = Array.isArray(result) ? result : result?.items || [];
     }
     

@@ -45,6 +45,9 @@ test("multiline arguments use parsed call identities and selected packages in th
     ["filter <- function(wrong_argument) {}; outer(filter # keep selected package\n())", "sides", "stats"],
     ["lm <- function(wrong_argument) {}; outer(stats::lm # comment\n())", "formula"],
     ["lm <- function(wrong_argument) {}; outer(stats:::lm\n())", "formula"],
+    ["lm <- function(wrong_argument) {}; outer(stats::\nlm # continuation\n())", "formula"],
+    ["lm <- function(wrong_argument) {}; outer(stats\n::lm # continuation\n())", "formula"],
+    ["lm <- function(wrong_argument) {}; outer(`stats` # package\n::: # accessor\n`lm`\n())", "formula"],
     ["local_fn <- function(local_arg) {}; outer(local_fn # comment\n())", "local_arg"],
   ]) {
     client.updateInput("");
@@ -54,12 +57,15 @@ test("multiline arguments use parsed call identities and selected packages in th
     }
     const cursor = input.lastIndexOf("(") + 1;
     const before = input.slice(0, cursor);
-    const context = completion.getCompletionContext("())", 1, before, input.slice(cursor));
+    const linesBefore = before.split("\n");
+    const row = linesBefore.length - 1;
+    const column = linesBefore.at(-1).length;
+    const context = completion.getCompletionContext(input.split("\n")[row], column, before, input.slice(cursor));
     let parameters = [];
     const deadline = Date.now() + 10000;
     do {
       const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-        { line: 1, character: 1 }, undefined, [input.split("\n")[0]], [], {
+        { line: row, character: column }, undefined, linesBefore.slice(0, -1), [], {
           provideCompletionItems: async (doc, position, trigger) => {
             const result = await client.provideCompletionItems(doc, position, trigger);
             return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
@@ -75,6 +81,84 @@ test("multiline arguments use parsed call identities and selected packages in th
     } while (Date.now() < deadline);
     assert.ok(parameters.includes(parameter), input);
     assert.ok(!parameters.includes("wrong_argument"), input);
+  }
+});
+
+test("multiline fuzzy arguments retain call identity and the original replacement span", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { client, instances } = createConsoleLsp(t);
+  for (const [head, prefix, parameter, selectedPackage] of [
+    ["stats::lm", "sgk", "singular.ok"],
+    ["stats:::lm", "sgk", "singular.ok"],
+    ["lm", "sgk", "singular.ok", "stats"],
+    ["local_fn", "zzlprzz", "zzlocal_parameterzz"],
+  ]) {
+    const input = `local_fn <- function(zzlocal_parameterzz) {}; outer(${head} # continuation\n(${prefix}))`;
+    client.updateInput("");
+    client.updateInput(input);
+    if (selectedPackage) {
+      client.recordCompletion(input, input.lastIndexOf(head), { insertText: head, packageName: selectedPackage });
+    }
+    const column = 1 + prefix.length;
+    const before = input.slice(0, input.lastIndexOf("\n") + 1 + column);
+    const context = completion.getCompletionContext(input.split("\n")[1], column, before, "))");
+    let entry;
+    const deadline = Date.now() + 10000;
+    do {
+      const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+        { line: 1, character: column }, undefined, [input.split("\n")[0]], [], {
+          provideCompletionItems: async (...args) => {
+            const result = await client.provideCompletionItems(...args);
+            return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
+              ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
+            }));
+          },
+        });
+      entry = entries.find(item => item.label === parameter && item.detail === "parameter");
+      if (entry) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    assert.ok(entry, input);
+    const pick = completion.toCompletionPick(entry, context);
+    assert.equal(pick.replaceStart, 1, input);
+    assert.equal(pick.snapshotCursor, column, input);
+    assert.equal(pick.insertText, `${parameter} = `, input);
+    const requests = instances.at(-1).requests.filter(request => request.params?.position).slice(-2);
+    assert.equal(requests[0].params.position.character, column);
+    assert.equal(requests[1].params.position.character, 2);
+    assert.equal(requests[1].params.rConsoleCall, requests[0].params.rConsoleCall);
+    assert.ok(requests[1].params.rConsoleCall);
+  }
+});
+
+test("fuzzy fallback does not turn values, comments or member calls into LSP argument positions", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { client, instances } = createConsoleLsp(t);
+  for (const [head, tail] of [
+    ["stats::lm", "method = sgk"],
+    ["stats::lm", '"sgk"'],
+    ["stats::lm", "# sgk\n"],
+    ["obj$lm", "sgk"],
+  ]) {
+    const input = `outer(${head} # continuation\n(${tail}))`;
+    const cursor = input.indexOf("sgk") + 3;
+    const before = input.slice(0, cursor);
+    const column = before.split("\n").at(-1).length;
+    const context = completion.getCompletionContext(input.split("\n")[1], column, before, input.slice(cursor));
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 1, character: column }, undefined, [input.split("\n")[0]], [], {
+        provideCompletionItems: async (...args) => {
+          const result = await client.provideCompletionItems(...args);
+          return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
+            ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
+          }));
+        },
+      });
+    const requests = instances.at(-1).requests.filter(request => request.params?.position).slice(-2);
+    assert.equal(requests[0].params.position.character, column, input);
+    assert.equal(requests[1].params.position.character, column - 2, input);
+    assert.ok(requests.every(request => request.params.rConsoleCall === undefined), input);
+    assert.ok(entries.every(entry => entry.detail !== "parameter"), input);
   }
 });
 
