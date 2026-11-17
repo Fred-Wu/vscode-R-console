@@ -30,24 +30,26 @@ test("native parsing distinguishes incomplete input from errors and falls back o
 });
 
 test("call context tracks only arguments of the enclosing call on both sides of the cursor", () => {
-  for (const [marked, name, supplied] of [
-    ["obj$fun(|)", "obj$fun", []],
-    ["obj$fun(first = inner(a = 1, b = 2), se|)", "obj$fun", ["first"]],
-    ["obj$fun(inner(a = 1, b = 2), se|)", "obj$fun", [""]],
-    ["obj$fun(, se|)", "obj$fun", [""]],
-    ["obj$fun(`a b` = 1, 'a\\'b' = 2, se|)", "obj$fun", ["`a b`", "'a\\'b'"]],
-    ["obj$fun(fi|, second = stop('never evaluate'), third = {a; b})", "obj$fun", ["second", "third"]],
-    ["obj$fun(first = 1,\n se|,\n third = 3)", "obj$fun", ["first", "third"]],
-    ["obj$fun(other$fn(x = 1, se|), first = 2)", "other$fn", ["x"]],
-    ['obj$fun(r"---(a, b = ) # )---", se|)', "obj$fun", [""]],
-    ["obj$fun(x[[1]][c(1, 2)], se|)", "obj$fun", [""]],
-    ["obj$fun(x %(% y, se|)", "obj$fun", [""]],
-    ["obj$fun # ignored (\n (se|)", "obj$fun", []],
+  for (const [marked, name, tags] of [
+    ["obj$fun(|)", "obj$fun", [null]],
+    ["obj$fun(first = inner(a = 1, b = 2), se|)", "obj$fun", ["first", null]],
+    ["obj$fun(inner(a = 1, b = 2), se|)", "obj$fun", ["", null]],
+    ["obj$fun(, se|)", "obj$fun", ["", null]],
+    ["obj$fun(`a b` = 1, 'a\\'b' = 2, se|)", "obj$fun", ["`a b`", "'a\\'b'", null]],
+    ["obj$fun(fi|, second = stop('never evaluate'), third = {a; b})", "obj$fun", [null, "second", "third"]],
+    ["obj$fun(first = 1,\n se|,\n third = 3)", "obj$fun", ["first", null, "third"]],
+    ["obj$fun(other$fn(x = 1, se|), first = 2)", "other$fn", ["x", null]],
+    ['obj$fun(r"---(a, b = ) # )---", se|)', "obj$fun", ["", null]],
+    ["obj$fun(x[[1]][c(1, 2)], se|)", "obj$fun", ["", null]],
+    ["obj$fun(x %(% y, se|)", "obj$fun", ["", null]],
+    ["obj$fun(fi|, 2)", "obj$fun", [null, ""]],
+    ["obj$fun(1, se|, 3)", "obj$fun", ["", null, ""]],
+    ["obj$fun(fi|, , third = 3)", "obj$fun", [null, "", "third"]],
   ]) {
     const cursor = marked.indexOf("|");
     const context = parser.getEnclosingCall(marked.replace("|", ""), cursor);
     assert.equal(context?.name, name, marked);
-    assert.deepEqual(context.suppliedArguments, supplied, marked);
+    assert.deepEqual(context.argumentTags, tags, marked);
   }
 });
 
@@ -62,10 +64,34 @@ test("call context suppresses argument names in values, literals, comments and e
     const cursor = marked.indexOf("|");
     const context = parser.getEnclosingCall(marked.replace("|", ""), cursor);
     assert.equal(context?.name, "obj$fun", marked);
-    assert.equal(context.suppliedArguments, undefined, marked);
+    assert.equal(context.argumentTags, undefined, marked);
   }
   for (const input of ["obj[[1]]$fun(", "obj$fun()[[1]](", "x] obj$fun("]) {
     assert.equal(parser.getEnclosingCall(input), undefined, input);
+  }
+});
+
+test("call context respects statement newlines and nested continuation", () => {
+  for (const input of [
+    "obj$fun\n(fi)", "obj$fun # end of statement\n(fi)",
+    "{ obj$fun\n(fi) }", "outer({ obj$fun\n(fi) })",
+    "obj\n$fun(fi)", "obj$nested\n$fun(fi)", "stats\n::lm(fi)",
+  ]) {
+    assert.equal(parser.getEnclosingCall(input, input.indexOf("fi") + 2), undefined, input);
+  }
+  for (const [input, name] of [
+    ["(obj$fun\n(fi))", "obj$fun"],
+    ["outer(obj$fun # continuation\n(fi))", "obj$fun"],
+    ["x[obj$fun\n(fi)]", "obj$fun"],
+    ["obj$ # member continuation\nfun(fi)", "obj$ # member continuation\nfun"],
+    ["(obj\n$fun(fi))", "obj\n$fun"],
+    ["stats::\nlm(fi)", "stats::\nlm"],
+    ["{ obj$fun\nother$fun(fi) }", "other$fun"],
+    ["(obj$fun\r\n(fi))", "obj$fun"],
+  ]) {
+    const context = parser.getEnclosingCall(input, input.indexOf("fi") + 2);
+    assert.equal(context?.name, name, input);
+    assert.deepEqual(context.argumentTags, [null], input);
   }
 });
 

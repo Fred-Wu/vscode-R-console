@@ -44,7 +44,8 @@ test("member argument probe inspects the actual R callable without executing bod
     obj <- list(lm = function(list_argument, missing, lazy = stop("default evaluated"), ...) stop("body called"),
                 primitive = sum, empty = function() NULL, field = 1,
                 quoted = function(\`a b\`, remaining) stop("body called"),
-                dots = function(first, ..., after) stop("body called"))
+                dots = function(first, ..., after) stop("body called"),
+                positional = function(first, second, third) stop("body called"))
     methods::setClass("CompletionTest", slots = c(lm = "function"))
     slot_obj <- methods::new("CompletionTest", lm = function(slot_argument) stop("body called"))
     .args <- .fn <- "unchanged"
@@ -67,6 +68,17 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$dots", ["first", "after"], 'af = 1, '],
     ["obj$dots", ["first"], 'after = 1, '],
     ["obj$primitive", [], 'na.rm = TRUE, '],
+    ["obj$positional", ["first"], 'fi', ', stop("value evaluated"))'],
+    ["obj$positional", ["first", "third"], '', ', stop("value evaluated"))'],
+    ["obj$positional", ["second"], 'stop("value evaluated"), se', ', stop("value evaluated"))'],
+    ["obj$positional", ["second"], 'first = stop("value evaluated"), ', ', stop("value evaluated"))'],
+    ["obj$positional", ["first"], '', ', , third = stop("value evaluated"))'],
+    ["obj$positional", ["second"], '', ', fir = stop("value evaluated"), stop("value evaluated"))'],
+    ["obj$positional", [], '1, 2, 3, '],
+    ["obj$dots", ["first", "after"], '', ', 1, 2)'],
+    ["obj$dots", ["after"], '1, ', ', 2)'],
+    ["(obj\n$positional", ["first"], 'fi', ', 2))'],
+    ["obj$ # continuation\npositional", ["first"], 'fi', ', 2)'],
   ]) {
     const input = expression + "(" + argumentsBefore + argumentsAfter;
     const context = completion.getCompletionContext(input, input.length - argumentsAfter.length);
@@ -84,6 +96,41 @@ test("member argument probe inspects the actual R callable without executing bod
         return JSON.parse(result);
       });
     assert.deepEqual(entries.map(entry => entry.label), expected, input);
+  }
+});
+
+test("completion call boundaries agree with the R parser across newlines", async () => {
+  const cases = [
+    ["obj$fun\n(fi)", false],
+    ["obj$fun # end of statement\n(fi)", false],
+    ["{ obj$fun\n(fi) }", false],
+    ["outer({ obj$fun\n(fi) })", false],
+    ["(obj$fun\n(fi))", true],
+    ["outer(obj$fun # continuation\n(fi))", true],
+    ["x[obj$fun\n(fi)]", true],
+    ["obj$ # member continuation\nfun(fi)", true],
+    ["(obj\n$fun(fi))", true],
+  ];
+  const nativeCalls = JSON.parse(execFileSync("Rscript", ["--vanilla", "-e", `
+    has_call <- function(x) {
+      if (!(is.call(x) || is.expression(x))) return(FALSE)
+      if (is.call(x) && identical(x[[1]], quote(obj$fun))) return(TRUE)
+      any(vapply(as.list(x), has_call, logical(1)))
+    }
+    inputs <- jsonlite::fromJSON(commandArgs(TRUE)[1])
+    cat(jsonlite::toJSON(vapply(inputs, function(input) has_call(parse(text = input)), logical(1))))
+  `, JSON.stringify(cases.map(([input]) => input))], { encoding: "utf8", timeout: 15000 }));
+  for (const [index, [input, expected]] of cases.entries()) {
+    assert.equal(nativeCalls[index], expected, input);
+    const cursor = input.indexOf("fi") + 2;
+    const before = input.slice(0, cursor);
+    const row = before.split("\n").length - 1;
+    const context = completion.getCompletionContext(input.split("\n")[row],
+      before.split("\n").at(-1).length, before, input.slice(cursor));
+    assert.equal(context.kind === "argument", expected, input);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+      async () => [{ name: "first" }]);
+    assert.equal(entries.some(entry => entry.detail === "parameter"), expected, input);
   }
 });
 

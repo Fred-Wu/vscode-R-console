@@ -79,7 +79,7 @@ test("session member formals replace unrelated LSP arguments and remain in the A
           { label: "data", kind: 5 },
         ],
       }, async (expression, trigger) => {
-        assert.ok(expression.includes(`.fn <- obj${operator}lm;`));
+        assert.ok(expression.includes(`.fn <- (obj${operator}lm);`));
         assert.equal(trigger, "$");
         return [{ name: "member_arg" }, { name: "a b" }, { name: "..." }];
       });
@@ -130,7 +130,7 @@ test("completion passes supplied argument tags without copying user expressions 
   const context = completion.getCompletionContext(input, cursor);
   await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
     async expression => {
-      assert.ok(expression.includes("base::quote(.fn(first = NULL, third = NULL))"));
+      assert.ok(expression.includes("base::quote(.fn(first = NULL, TRUE, third = NULL))"));
       assert.ok(!expression.includes("do not execute"));
       return [];
     });

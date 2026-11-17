@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { completionMatch } from "./completionMatch";
-import { getEnclosingCall } from "./parser";
+import { getEnclosingCall, type CallCompletionContext } from "./parser";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -15,7 +15,7 @@ export type CompletionContext = {
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
   // Source tags from the lexer, available only at an argument-name position.
-  suppliedArguments?: string[];
+  argumentTags?: CallCompletionContext["argumentTags"];
   dataObjectName?: string;
   snapshotInput: string;
   snapshotCursor: number;
@@ -342,7 +342,7 @@ export function getCompletionContext(
       replaceStart: beforeCursor.length - prefix.length,
       functionName: call.name,
       functionOperator: call.operator,
-      suppliedArguments: call.suppliedArguments,
+      argumentTags: call.argumentTags,
       dataObjectName,
       snapshotInput,
       snapshotCursor,
@@ -942,17 +942,21 @@ async function getRuntimeArgumentCompletions(
   context: CompletionContext,
   request?: RuntimeMemberCompletionRequester
 ): Promise<CompletionEntry[]> {
-  if (!request || !context.functionName || !context.suppliedArguments) return [];
+  if (!request || !context.functionName || !context.argumentTags) return [];
   try {
     // Let R match exact/partial names, positional arguments and formals after
-    // dots. Only source tags enter the synthetic call: values are never evaluated.
-    const supplied = context.suppliedArguments.map(tag => `${tag ? `${tag} = ` : ""}NULL`).join(", ");
+    // dots. Preserve the cursor's positional slot with TRUE; all other values
+    // are NULL. Excluding that marker after matching keeps its formal available
+    // without shifting later positional arguments. User values are never evaluated.
+    const supplied = context.argumentTags.map(tag =>
+      tag === null ? "TRUE" : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
     const items = await request(
-      `base::local({ .fn <- ${context.functionName}; ` +
+      `base::local({ .fn <- (${context.functionName}); ` +
       `.args <- if (base::is.function(.fn)) { ` +
       `.def <- base::args(.fn); ` +
-      `.used <- base::names(base::suppressWarnings(base::match.call(` +
-      `definition = .def, call = base::quote(.fn(${supplied})), expand.dots = FALSE))); ` +
+      `.matched <- base::as.list(base::suppressWarnings(base::match.call(` +
+      `definition = .def, call = base::quote(.fn(${supplied})), expand.dots = FALSE)))[-1L]; ` +
+      `.used <- base::names(.matched)[!base::vapply(.matched, base::identical, base::logical(1), TRUE)]; ` +
       `base::setdiff(base::names(base::formals(.def)), .used) } else NULL; ` +
       `stats::setNames(base::as.list(.args), .args) })`, "$"
     );

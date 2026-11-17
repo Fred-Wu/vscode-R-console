@@ -96,19 +96,26 @@ interface Token {
 export type CallCompletionContext = {
   name: string;
   operator?: "$" | "@" | "::" | ":::";
-  // R source tags; an empty tag denotes a positional argument. Undefined
+  // R source tags; "" denotes a positional argument and null the cursor's slot. Undefined
   // means the cursor is in a value, comment, or another non-name position.
-  suppliedArguments?: string[];
+  argumentTags?: (string | null)[];
 };
 
 /** Inspect syntax without evaluating argument expressions or searching source
  * text for a callable suffix. Each token is visited a constant number of times. */
 export function getEnclosingCall(code: string, cursor = code.length): CallCompletionContext | undefined {
-  const allTokens = tokenize(code);
-  const inComment = allTokens.some(token => token.type === TokenType.Comment &&
-    token.position < cursor && cursor <= token.position + token.value.length);
-  const tokens = allTokens.filter(token => token.type !== TokenType.Comment &&
-    token.type !== TokenType.Newline && token.type !== TokenType.EOF);
+  const tokens: Token[] = [];
+  const lineBreaks = new Set<number>();
+  let inComment = false;
+  for (const token of tokenize(code)) {
+    if (token.type === TokenType.Comment) {
+      inComment ||= token.position < cursor && cursor <= token.position + token.value.length;
+    } else if (token.type === TokenType.Newline) {
+      lineBreaks.add(tokens.length);
+    } else if (token.type !== TokenType.EOF) {
+      tokens.push(token);
+    }
+  }
   const stack: { opening: string; index: number }[] = [];
   for (let index = 0; index < tokens.length && tokens[index].position < cursor; index++) {
     const token = tokens[index];
@@ -125,21 +132,28 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   }
   const frame = stack.at(-1);
   if (frame?.opening !== "(") return undefined;
+  // Parentheses and subscripts allow continuation across newlines; a brace
+  // starts a statement context even when it is itself inside parentheses.
+  const parent = stack.at(-2)?.opening;
+  const continuesLine = (index: number): boolean =>
+    !lineBreaks.has(index) || parent === "(" || parent === "[" ||
+    tokens[index - 1]?.type === TokenType.Operator;
   let start = frame.index - 1;
   const last = tokens[start];
-  if (last?.type !== TokenType.Identifier) return undefined;
+  if (last?.type !== TokenType.Identifier || !continuesLine(frame.index)) return undefined;
   let operator: CallCompletionContext["operator"];
   while (start >= 1) {
     const previous = tokens[start - 1];
     if (previous.type !== TokenType.Operator ||
         !["$", "@", "::", ":::"].includes(previous.value)) break;
-    if (tokens[start - 2]?.type !== TokenType.Identifier) return undefined;
+    if (tokens[start - 2]?.type !== TokenType.Identifier ||
+        !continuesLine(start) || !continuesLine(start - 1)) return undefined;
     operator ??= previous.value as CallCompletionContext["operator"];
     start -= 2;
   }
   // Inspect only this call's top-level arguments, including those after the
   // cursor. Nested commas and equals signs belong to their own expressions.
-  const supplied: string[] = [];
+  const argumentTags: (string | null)[] = [];
   let namePosition = false;
   let hasDots = false;
   let argumentStart = frame.index + 1;
@@ -147,6 +161,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   const collectArgument = (end: number, endOffset: number): void => {
     const first = tokens[argumentStart];
     if (argumentOffset <= cursor && cursor <= endOffset) {
+      argumentTags.push(null);
       namePosition = argumentStart === end || (
         argumentStart + 1 === end && first.type === TokenType.Identifier &&
         !first.value.startsWith("`") && first.value !== "..." &&
@@ -157,7 +172,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
       const named = argumentStart + 1 < end &&
         (first.type === TokenType.Identifier || first.type === TokenType.String) &&
         second.type === TokenType.Operator && second.value === "=";
-      supplied.push(named ? first.value : "");
+      argumentTags.push(named ? first.value : "");
       // Forwarded dots cannot be matched without inspecting the caller's frame.
       hasDots ||= argumentStart + 1 === end && first.value === "...";
     }
@@ -185,7 +200,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   return {
     name: code.slice(tokens[start].position, last.position + last.value.length),
     operator,
-    suppliedArguments: namePosition && !inComment && !hasDots ? supplied : undefined,
+    argumentTags: namePosition && !inComment && !hasDots ? argumentTags : undefined,
   };
 }
 
@@ -666,34 +681,26 @@ interface ParserState {
 }
 
 export async function isExpressionCompleteAsync(code: string, nativeParse?: NativeParseCallback): Promise<boolean> {
-  const result = await getExpressionCompletenessAsync(code, nativeParse);
-  return result.isComplete;
-}
-
-async function getExpressionCompletenessAsync(
-  code: string,
-  nativeParse?: NativeParseCallback
-): Promise<{ isComplete: boolean; localClassification: LocalParseClassification }> {
   const sanitized = stripCommentLines(code);
   const trimmed = sanitized.trim();
   if (!trimmed) {
-    return { isComplete: true, localClassification: "complete" };
+    return true;
   }
 
   const localClassification = classifyExpressionHeuristic(sanitized);
   if (localClassification === "incomplete") {
-    return { isComplete: false, localClassification };
+    return false;
   }
 
   if (nativeParse) {
     try {
       const status = await nativeParse(sanitized);
-      return { isComplete: status !== 2, localClassification };
+      return status !== 2;
     } catch {
     }
   }
 
-  return { isComplete: localClassification === "complete", localClassification };
+  return localClassification === "complete";
 }
 
 function classifyExpressionHeuristic(code: string): LocalParseClassification {
