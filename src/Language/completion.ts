@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { completionMatch } from "./completionMatch";
-import { getEnclosingCall, getMemberCompletionContext, isCallableName, type CallCompletionContext } from "./parser";
+import { getEnclosingCall, getQualifiedCompletionContext, isCallableName, type CallCompletionContext } from "./parser";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -256,16 +256,27 @@ export function getCompletionContext(
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
   const dataObjectName = detectDataContext(textForDataContext);
 
-  const member = getMemberCompletionContext(textForDataContext);
+  const member = getQualifiedCompletionContext(textForDataContext);
   if (member) {
     const { operator, prefix } = member;
+    const replaceStart = member.replaceStart - (textForDataContext.length - beforeCursor.length);
+    if (operator === "::" || operator === ":::") {
+      return {
+        kind: "package",
+        prefix,
+        replaceStart,
+        triggerCharacter: ":",
+        snapshotInput,
+        snapshotCursor,
+      };
+    }
     const isBracketChainMember = operator === "$" && member.hasSubscript;
     const baseObject = isBracketChainMember ? member.baseObject : undefined;
     const isPlaceholderMember = !!baseObject && isPipePlaceholder(baseObject) && !!dataObjectName;
     return {
       kind: "member",
       prefix,
-      replaceStart: member.replaceStart - (textForDataContext.length - beforeCursor.length),
+      replaceStart,
       triggerCharacter: prefix.length === 0 ? operator : undefined,
       objectName: isPlaceholderMember ? dataObjectName : baseObject ?? member.objectName,
       operator,
@@ -299,21 +310,6 @@ export function getCompletionContext(
       chainedBracket: bracketObject !== baseObject || isPlaceholderBracket,
       dataObjectName: effectiveDataObject,
       operator: undefined,
-      snapshotInput,
-      snapshotCursor,
-    };
-  }
-
-  const packageMatch = /([a-zA-Z0-9._]+):::{0,1}([a-zA-Z0-9._]*)$/.exec(
-    beforeCursor
-  );
-  if (packageMatch) {
-    const prefix = packageMatch[2] || "";
-    return {
-      kind: "package",
-      prefix,
-      replaceStart: beforeCursor.length - prefix.length,
-      triggerCharacter: ":",
       snapshotInput,
       snapshotCursor,
     };

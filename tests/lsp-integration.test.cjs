@@ -17,6 +17,79 @@ const completion = loadSource("src/Language/completion.ts", { vscode: {
   Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
 } });
 
+test("typing and accepting functions opens real argument suggestions without another keystroke", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { createTerminal } = require("./helpers/inline-terminal.cjs");
+  const { client } = createConsoleLsp(t);
+  // The helper's host adapter returns protocol kinds; emulate VS Code's enum
+  // conversion while retaining the production client and real R server.
+  const provide = client.provideCompletionItems.bind(client);
+  client.provideCompletionItems = async (...args) => {
+    const result = await provide(...args);
+    const items = (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
+      ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
+    }));
+    return { items, isIncomplete: result?.isIncomplete === true };
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      Uri: { parse: value => ({ toString: () => value }) },
+      CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Snippet: 14 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
+  });
+  const requestMemberCompletions = async (expression, operator) => JSON.parse(execFileSync(
+    "Rscript", ["--vanilla", "-e", `
+      obj <- list(lm = function(member_arg) stop("must not execute"))
+      methods::setClass("InlineCompletionTest", slots = c(lm = "function"))
+      slot_obj <- methods::new("InlineCompletionTest", lm = function(slot_arg) stop("must not execute"))
+      value <- eval(parse(text = commandArgs(TRUE)[1]), .GlobalEnv)
+      slots <- identical(commandArgs(TRUE)[2], "@")
+      nms <- if (slots) methods::slotNames(value) else names(value)
+      cat(jsonlite::toJSON(lapply(nms, function(n) list(name = n,
+        type = typeof(if (slots) methods::slot(value, n) else value[[n]]))), auto_unbox = TRUE))
+    `, expression, operator], { encoding: "utf8", timeout: 15000 }));
+  const waitFor = async (predicate, label) => {
+    const deadline = Date.now() + 10000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, label);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  };
+  for (const [typed, insertText, argument] of [
+    ["lib", "library()", "package"],
+    ["stats::", "lm()", "formula"], ["stats:::", "lm()", "formula"],
+    ["obj$", "lm()", "member_arg"], ["slot_obj@", "lm()", "slot_arg"],
+  ]) {
+    client.updateInput("");
+    const { terminal, screen } = createTerminal(t);
+    delete terminal.applyCompletion;
+    terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+    const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
+    for (const text of typed) terminal.applyKeyAction({ type: "text", text });
+    await waitFor(() => terminal.inlineCompletion.visible, `automatic popup after ${typed}`);
+    if (typed !== "lib") {
+      for (const text of "lm") terminal.applyKeyAction({ type: "text", text });
+    }
+    await waitFor(() => choices().some(item => item.insertText === insertText), `function popup after ${typed}`);
+    terminal.inlineCompletion.move(choices().findIndex(item => item.insertText === insertText) - terminal.inlineCompletion.selected);
+    terminal.applyKeyAction({ type: "tab" });
+    const expected = typed === "lib" ? "library()" : typed + insertText;
+    assert.equal(terminal.inputState.text, expected);
+    assert.equal(terminal.inputState.textBeforeCursor, expected.slice(0, -1));
+    assert.equal(terminal.submitted, undefined);
+    await waitFor(() => choices().some(item => item.insertText === `${argument} = `), `argument popup after ${expected}`);
+    assert.equal(terminal.inputState.text, expected, "argument popup must not insert or execute anything");
+    const buffer = screen.buffer.active;
+    const visible = Array.from({ length: 24 }, (_, row) => buffer.getLine(buffer.baseY + row).translateToString(true)).join("\n");
+    assert.ok(visible.includes("Arguments"), expected);
+    terminal.dismissInlineCompletion(false);
+    terminal.lang.cancelCompletion();
+  }
+});
+
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { complete } = createConsoleLsp(t);

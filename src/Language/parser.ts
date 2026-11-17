@@ -126,10 +126,10 @@ export function isCallableName(code: string): boolean {
     index % 2 === 0 ? isCompleteIdentifier(token) : isNameAccessor(token));
 }
 
-export type MemberCompletionContext = {
+export type QualifiedCompletionContext = {
   objectName: string;
   baseObject: string;
-  operator: "$" | "@";
+  operator: "$" | "@" | "::" | ":::";
   prefix: string;
   replaceStart: number;
   hasSubscript: boolean;
@@ -137,8 +137,8 @@ export type MemberCompletionContext = {
 
 /** Inspect the source before the cursor. Walk backwards over names, accessors
  * and balanced subscripts; never evaluate an expression or accept its suffix. */
-export function getMemberCompletionContext(code: string): MemberCompletionContext | undefined {
-  if (!code.includes("$") && !code.includes("@")) return undefined;
+export function getQualifiedCompletionContext(code: string): QualifiedCompletionContext | undefined {
+  if (!code.includes("$") && !code.includes("@") && !code.includes("::")) return undefined;
   const tokens: Token[] = [];
   const continuations: boolean[] = [];
   const subscriptOpenings = new Map<number, number>();
@@ -185,12 +185,14 @@ export function getMemberCompletionContext(code: string): MemberCompletionContex
     index--;
   }
   const accessor = tokens[index];
-  if (!isMemberAccessor(accessor) || !continuations[index]) return undefined;
+  if (!isNameAccessor(accessor) || !continuations[index]) return undefined;
+  const namespace = accessor.value === "::" || accessor.value === ":::";
   index--;
   const objectParts: string[] = [];
   let hasSubscript = false;
   while (index >= 0) {
     while (tokens[index]?.type === TokenType.RightBracket) {
+      if (namespace) return undefined;
       const opening = subscriptOpenings.get(index);
       if (opening === undefined || !continuations[opening]) return undefined;
       hasSubscript = true;
@@ -200,6 +202,7 @@ export function getMemberCompletionContext(code: string): MemberCompletionContex
     if (!isCompleteIdentifier(tokens[index])) return undefined;
     objectParts.push(tokens[index].value);
     if (!isMemberAccessor(tokens[index - 1])) break;
+    if (namespace) return undefined;
     if (!continuations[index] || !continuations[index - 1]) return undefined;
     objectParts.push(tokens[index - 1].value);
     index -= 2;
@@ -216,7 +219,7 @@ export function getMemberCompletionContext(code: string): MemberCompletionContex
     // continuation. Normalize them so the runtime can parse the object alone.
     objectName: objectParts.reverse().join(""),
     baseObject: first.value,
-    operator: accessor.value as "$" | "@",
+    operator: accessor.value as QualifiedCompletionContext["operator"],
     prefix,
     replaceStart,
     hasSubscript,

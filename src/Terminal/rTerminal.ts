@@ -2102,7 +2102,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       input.text.slice(input.textBeforeCursor.length));
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    if (typing && !this.inlineCompletionExplicit && (!context || [...context.prefix].length < minimum)) {
+    const qualified = context?.kind === "member" || context?.kind === "package";
+    if (typing && !this.inlineCompletionExplicit && !qualified && (!context || [...context.prefix].length < minimum)) {
       this.dismissInlineCompletion(false);
       return;
     }

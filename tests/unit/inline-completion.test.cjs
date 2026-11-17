@@ -9,46 +9,7 @@ after(() => widthTerminal.dispose());
 
 const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInput: "", snapshotCursor: 0, source: "session" });
 
-function createTerminal(t, columns = 80, rows = 24, trigger = "typing", settings = {}) {
-  const scrollCommands = [];
-  const { InputState } = loadSource("src/Terminal/inputState.ts");
-  const { Renderer } = loadSource("src/Terminal/renderer.ts");
-  const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
-  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
-    "./rTerminal/lang": {},
-    vscode: {
-      EventEmitter: class {}, window: {},
-      commands: { executeCommand(command) { scrollCommands.push(command); return Promise.resolve(); } },
-      workspace: { getConfiguration: () => ({ get: (key, fallback) =>
-        key in settings ? settings[key] : key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? trigger : fallback }) },
-    },
-  });
-  const screen = new Terminal({ cols: columns, rows, allowProposedApi: true });
-  const terminal = Object.assign(Object.create(RTerminal.prototype), {
-    inputState: new InputState(), inlineCompletion: new InlineCompletion(unicode),
-    mode: "ready", promptReady: true, dimensions: { columns, rows },
-    inlineSuggestionRowCount: 0,
-    lang: { cancelCompletion() {}, updateInput() {}, refineInlineCompletion() {} },
-    syntax: { setSource() {} },
-    writeEmitter: { fire(text) { screen._core._writeBuffer.writeSync(text); } },
-    ensureReadyPromptVisibleForInput() {},
-    withTerminalStateCaptureSuppressed(callback) { callback(); },
-    applyCompletion(selection) { this.accepted = selection; },
-    handleEnterKey() { this.submitted = this.inputState.text; },
-  });
-  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text), undefined,
-    text => [...text].reduce((sum, char) => sum + unicode.wcwidth(char.codePointAt(0)), 0));
-  terminal.renderer.setContinuationPrompt("   ");
-  const keys = new KeyProcessor();
-  screen.onData(data => {
-    for (const action of keys.parseInputChunk(data)) terminal.applyKeyAction(action);
-  });
-  t.after(() => {
-    terminal.dismissInlineCompletion(false);
-    screen.dispose();
-  });
-  return { terminal, screen, scrollCommands };
-}
+const { createTerminal } = require("../helpers/inline-terminal.cjs");
 
 test("multiline input and suggestions share the viewport across redraw and dismissal", t => {
   const { terminal, screen } = createTerminal(t, 80, 12);
@@ -776,19 +737,86 @@ test("typing threshold counts the current prefix, dismisses below it, and explic
     request.onInlineEntries([{ ...item("alpha"), snapshotInput: request.input.currentLine,
       snapshotCursor: request.input.cursorCol, replaceStart: request.input.cursorCol - 3 }]);
   };
-  terminal.applyKeyAction({ type: "text", text: "longObjectName$al" });
+  terminal.applyKeyAction({ type: "text", text: "al" });
   assert.equal(terminal.inlineCompletionTimer, undefined);
   terminal.applyKeyAction({ type: "text", text: "p" });
   assert.ok(terminal.inlineCompletionTimer);
   await new Promise(resolve => setTimeout(resolve, 180));
-  assert.deepEqual(requests, ["longObjectName$alp"]);
+  assert.deepEqual(requests, ["alp"]);
   assert.ok(terminal.inlineCompletion.visible);
   terminal.applyKeyAction({ type: "backspace" });
   assert.equal(terminal.inlineCompletion.visible, false);
   assert.equal(terminal.inlineCompletionTimer, undefined);
   terminal.applyKeyAction({ type: "tab" });
-  assert.deepEqual(requests, ["longObjectName$alp", "longObjectName$al"]);
+  assert.deepEqual(requests, ["alp", "al"]);
   assert.ok(terminal.inlineCompletion.visible);
+});
+
+test("qualified operators open suggestions in typing mode and keep filtering below the threshold", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    const { terminal } = createTerminal(t, 80, 24, "typing", { "inlineCompletion.minCharacters": 99 });
+    terminal.inputState.insertText("obj");
+    const requests = [];
+    terminal.lang.handleAutocomplete = request => {
+      requests.push(request.input.text);
+      request.onInlineEntries([{ ...item("alpha"), replaceStart: 3 + operator.length,
+        snapshotInput: request.input.currentLine, snapshotCursor: request.input.cursorCol }]);
+    };
+    for (const text of operator) terminal.applyKeyAction({ type: "text", text });
+    assert.ok(terminal.inlineCompletionTimer, operator);
+    t.mock.timers.tick(150);
+    assert.deepEqual(requests, [`obj${operator}`]);
+    assert.equal(terminal.inlineCompletion.visible, true, operator);
+    for (const text of "al") {
+      terminal.applyKeyAction({ type: "text", text });
+      t.mock.timers.tick(150);
+      assert.equal(terminal.inlineCompletion.visible, true, operator);
+    }
+    assert.deepEqual(requests, [`obj${operator}`, `obj${operator}a`, `obj${operator}al`]);
+    terminal.applyKeyAction({ type: "backspace" });
+    t.mock.timers.tick(150);
+    assert.equal(requests.at(-1), `obj${operator}a`);
+    terminal.applyKeyAction({ type: "text", text: "l" });
+    terminal.applyKeyAction({ type: "escape" });
+    t.mock.timers.tick(150);
+    assert.equal(requests.length, 4, "Escape cancels the scheduled qualified lookup");
+    assert.equal(terminal.inlineCompletion.visible, false);
+  }
+});
+
+test("qualified operators preserve manual Tab mode and Quick Pick", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const [mode, trigger] of [["inline", "tab"], ["quickPick", "typing"]]) {
+      const { terminal } = createTerminal(t, 80, 24, trigger, { completionUI: mode });
+      const requests = [];
+      terminal.lang.handleAutocomplete = request => { requests.push(request); };
+      terminal.applyKeyAction({ type: "text", text: `obj${operator}` });
+      t.mock.timers.tick(150);
+      assert.equal(requests.length, 0, `${mode}/${trigger}/${operator}`);
+      terminal.applyKeyAction({ type: "tab" });
+      assert.equal(requests.length, 1);
+    }
+  }
+});
+
+test("operators in literals and comments and a single colon do not trigger suggestions", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const prefix of ['"obj', "'obj", '`obj', 'r"(obj', "# obj"]) {
+      const { terminal } = createTerminal(t);
+      terminal.inputState.insertText(prefix);
+      let requests = 0;
+      terminal.lang.handleAutocomplete = () => { requests++; };
+      for (const text of operator) terminal.applyKeyAction({ type: "text", text });
+      t.mock.timers.tick(150);
+      assert.equal(requests, 0, prefix + operator);
+    }
+  }
+  const { terminal } = createTerminal(t);
+  terminal.applyKeyAction({ type: "text", text: "stats:" });
+  assert.equal(terminal.inlineCompletionTimer, undefined);
 });
 
 test("automatic suggestions start on the third character by default and respect explicit thresholds", t => {

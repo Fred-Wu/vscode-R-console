@@ -109,7 +109,7 @@ test("member context reads complete chains and balanced subscripts from tokens",
     ["outer(obj\n$nested$fi", "obj$nested", "obj", "$", "fi", false],
     ["obj$ # comment\n", "obj", "obj", "$", "", false],
   ]) {
-    assert.deepEqual(parser.getMemberCompletionContext(input), {
+    assert.deepEqual(parser.getQualifiedCompletionContext(input), {
       objectName, baseObject, operator, prefix, hasSubscript, replaceStart: input.length - prefix.length,
     }, input);
   }
@@ -123,7 +123,27 @@ test("member detection refuses literals, comments and unsupported or broken obje
     "factory()$fi", "factory()$nested$fi", "factory()[1]$fi", "pkg::obj$fi",
     "123obj$fi", "😀obj$fi", "obj$\u0301nested$fi",
   ]) {
-    assert.equal(parser.getMemberCompletionContext(input), undefined, input);
+    assert.equal(parser.getQualifiedCompletionContext(input), undefined, input);
+  }
+});
+
+test("namespace completion uses lexical context and respects statement boundaries", () => {
+  for (const [input, prefix] of [
+    ["stats::", ""], ["stats:::", ""], ["stats::lm", "lm"],
+    ["stats :: lm", "lm"], ["`stats`:::lm", "lm"],
+    ["stats:: # continuation\n", ""], ["outer(stats\n::lm", "lm"],
+  ]) {
+    const context = parser.getQualifiedCompletionContext(input);
+    assert.ok(context, input);
+    assert.equal(context.prefix, prefix, input);
+    assert.equal(context.replaceStart, input.length - prefix.length, input);
+    assert.equal(context.operator, input.includes(":::") ? ":::" : "::", input);
+  }
+  for (const input of [
+    '"stats::', 'r"(stats::', "# stats::", "stats:: # comment", "`stats::",
+    "stats:", "stats::::", "stats\n::", "obj$stats::", "obj[1]::",
+  ]) {
+    assert.equal(parser.getQualifiedCompletionContext(input), undefined, input);
   }
 });
 
