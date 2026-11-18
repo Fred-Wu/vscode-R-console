@@ -3,6 +3,28 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const parser = loadSource("src/Language/parser.ts");
 
+test("completion parsing closes unfinished delimiters without mistaking literal text for syntax", () => {
+  const definition = 'g <- function(`a b`, normal) NULL\n';
+  for (const [input, suffix] of [
+    [definition + 'g(`a b` = 1, ', ')'],
+    ['{\n' + definition + 'g(`a b` = 1, ', ')}'],
+    ['{\n' + definition + 'g(`a b` = 1, )', '}'],
+    ['{\n' + definition + 'g(`a b` = 1, # misleading ) }', '\n)}'],
+    ['{\n' + definition + 'g(`a b` = "[)}", ', ')}'],
+    ['{\n' + definition + 'g(normal = "fir', '")}'],
+    ['{\n' + definition + 'g(normal = "fir\\', '\\")}'],
+    ['{\n' + definition + 'g(normal = r"--[fir', ']--")}'],
+    ['{\n' + definition + 'g(`unfinished', '`)}'],
+    ['{\n' + definition + 'g(x[[1]', '])}'],
+    [definition + 'g()', ''],
+    ['{ g <- \\(x) NULL; g(', ')}'],
+  ]) assert.equal(parser.getCompletionParseSuffix(input), suffix, input);
+  for (const input of ['g(', '"function(x) {"', '# function(x) {',
+    definition + 'g(]', definition + '}']) {
+    assert.equal(parser.getCompletionParseSuffix(input), undefined, input);
+  }
+});
+
 test("expression completeness handles R syntax and balanced square brackets", async () => {
   for (const code of ["", "# comment", "x[1]", "x[[1]]", "x[x[1]]", '"[not a bracket]"',
     "`a b`", 'r"(a # [ string)"', "function(x) { x + 1 }", "\\(x) x + 1", "x |> sum()"] ) {

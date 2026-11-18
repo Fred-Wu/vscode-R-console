@@ -323,6 +323,65 @@ test("local quoted formals retain unused arguments and reject supplied names", {
   assert.deepEqual(await parameters("f(│, normal = 1)"), ["`a b` = ", "`a\\`b` = "]);
 });
 
+test("unfinished multiline definitions complete immediately without executing or changing input", { timeout: 90000 }, async t => {
+  const { client, instances } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const cases = [
+    ['{\n  g <- function(`a b`, normal) NULL\n  g(`a b` = 1, │', ["normal"]],
+    ['{\n  g <- function(`a b`, renamed) NULL\n  g(`a b` = 1, │', ["renamed"]],
+    ['{\n  g <- function(`a b`, renamed) NULL\n  g(`a b` = 1, │)\n}', ["renamed"]],
+    ['{\n  g <- function(`a b`, normal) stop("body evaluated")\n  g(`a b` = 1, │ # misleading ) }', ["normal"]],
+    ['g <- function(`a b`, normal = stop("default evaluated")) NULL\ng(`a b` = 1, │', ["normal"]],
+    ['{\n  g <- function(`a b`, normal) NULL\n  g(│', ["`a b`", "normal"]],
+    ['{\n  g <- function(`a b`, normal) NULL\n  g(`a b` = 1, normal = 2, │', []],
+    ['{\n  g(`a b` = 1, │', []],
+  ];
+  for (const [marked, expected] of cases) {
+    const text = marked.replace("│", "");
+    const before = marked.slice(0, marked.indexOf("│"));
+    const position = { line: before.split("\n").length - 1, character: before.split("\n").at(-1).length };
+    // One request per edit: polling would conceal a stale asynchronous parse.
+    const result = await client.provideCompletionItems({ getText: () => text }, position);
+    assert.deepEqual((result.items ?? result).filter(item => item.detail === "parameter").map(item => item.label), expected, marked);
+    const request = instances.at(-1).requests.at(-1);
+    assert.deepEqual({ ...request.params.position }, position);
+    assert.equal([...client.syncedDocuments.values()].at(-1).document.getText(), text);
+  }
+
+  const provide = client.provideCompletionItems.bind(client);
+  client.provideCompletionItems = async (...args) => {
+    const result = await provide(...args);
+    return { items: (result.items ?? result).map(item => ({ ...item,
+      kind: item.kind === undefined ? undefined : item.kind - 1 })), isIncomplete: result.isIncomplete };
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      Uri: { parse: value => ({ toString: () => value }) },
+      CompletionItemKind: { Text: 0, Function: 2, Variable: 5, Snippet: 14 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
+  });
+  const { terminal } = require("./helpers/inline-terminal.cjs").createTerminal(t);
+  delete terminal.applyCompletion;
+  terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
+    requestMemberCompletions: async () => { assert.fail("unsubmitted definitions must not query the runtime"); } });
+  const input = cases[0][0].replace("│", "");
+  terminal.applyKeyAction({ type: "text", text: input });
+  const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
+  const deadline = Date.now() + 10000;
+  while (!choices().some(item => item.insertText === "normal = ")) {
+    assert.ok(Date.now() < deadline, "unfinished block must automatically show normal = ");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(terminal.inputState.text, input, "parse-only delimiters must not enter the console");
+  assert.deepEqual(choices().filter(item => item.detail === "parameter").map(item => item.insertText), ["normal = "]);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.inputState.text, input + "normal = ");
+  assert.equal(terminal.inputState.textBeforeCursor, input + "normal = ");
+  assert.equal(terminal.submitted, undefined);
+});
+
 test("accepting a console-defined function opens its live arguments and values", { timeout: 90000 }, async t => {
   const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
   const provide = client.provideCompletionItems.bind(client);

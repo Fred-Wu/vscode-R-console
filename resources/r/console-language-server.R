@@ -280,6 +280,23 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     }, items)
 }
 
+# Keep one parse of the current completion input. An unfinished enclosing block
+# otherwise makes languageserver discard every local definition. Parsing a
+# delimiter-completed copy does not run definitions, defaults, or user code.
+console_completion_parse <- local({
+    cache <- NULL
+    function(uri, document, suffix) {
+        content <- strsplit(paste0(paste(document$content, collapse = "\n"), suffix), "\n", fixed = TRUE)[[1L]]
+        if (is.null(cache) || !identical(cache$uri, uri) || !identical(cache$content, content)) {
+            parsed <- languageserver:::parse_document(uri, content)
+            parsed$xml_doc <- tryCatch(xml2::read_xml(parsed$xml_data), error = function(e) NULL)
+            cache <<- list(uri = uri, content = content, parsed = parsed)
+        }
+        cache$parsed$version <- document$version
+        cache$parsed
+    }
+})
+
 server$request_handlers[["textDocument/completion"]] <- function(self, id, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -287,6 +304,12 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     document <- workspace$documents$get(uri)
     if (is.null(document)) {
         return(self$deliver(languageserver:::Response$new(id = id, result = NULL)))
+    }
+
+    if (is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L) {
+        previous_parse <- document$parse_data
+        on.exit(document$update_parse_data(previous_parse), add = TRUE)
+        document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix))
     }
 
     point <- document$from_lsp_position(params$position)

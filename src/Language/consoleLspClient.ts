@@ -27,7 +27,7 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
-import { getEnclosingCall, getPipeCompletionContext } from "./parser";
+import { getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./parser";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -310,6 +310,7 @@ export class ConsoleLspClient implements CompletionProvider {
         const call = text.includes("(")
           ? getEnclosingCall(text, contextOffset) : undefined;
         const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
+        const parseSuffix = getCompletionParseSuffix(text);
         // Carry the parsed callable identity across the protocol. The R
         // server's line-local token lookup cannot see a name before a newline.
         // Member formals remain the responsibility of the active R session.
@@ -317,6 +318,7 @@ export class ConsoleLspClient implements CompletionProvider {
         // must still be determined at the user's original cursor.
         const params = {
           ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
+          ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
           ...((call?.argumentTags || call?.argumentValue) && call.operator !== "$" && call.operator !== "@"
             ? { rConsoleCall: call.name } : {}),
           ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"

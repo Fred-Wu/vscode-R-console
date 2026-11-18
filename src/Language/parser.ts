@@ -135,6 +135,36 @@ export function isCompletionInLiteral(code: string, cursor = code.length): boole
       (token.type === TokenType.Identifier && token.value.startsWith("`"))));
 }
 
+/** Finish only open delimiters for parsing local definitions during completion.
+ * The suffix is never inserted into the console or evaluated. */
+export function getCompletionParseSuffix(code: string): string | undefined {
+  if (!code.includes("function") && !code.includes("\\")) return undefined;
+  const tokens = tokenize(code);
+  if (!tokens.some(token => token.type === TokenType.Function ||
+      (token.type === TokenType.Operator && token.value === "\\"))) return undefined;
+  const closing: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+  const stack: string[] = [];
+  let suffix = "";
+  for (const token of tokens) {
+    if ([TokenType.LeftParen, TokenType.LeftBracket, TokenType.LeftBrace].includes(token.type)) {
+      for (const opening of token.value) stack.push(closing[opening]);
+    } else if ([TokenType.RightParen, TokenType.RightBracket, TokenType.RightBrace].includes(token.type)) {
+      for (const ending of token.value) if (stack.pop() !== ending) return undefined;
+    } else if (token.closed === false) {
+      if (token.type === TokenType.RawString) {
+        const opening = /^[rR](["'])(-*)([([{])/.exec(token.value)!;
+        suffix = closing[opening[3]] + opening[2] + opening[1];
+      } else {
+        const trailingSlashes = /\\+$/.exec(token.value)?.[0].length ?? 0;
+        suffix = (trailingSlashes % 2 ? "\\" : "") + token.value[0];
+      }
+    } else if (token.type === TokenType.Comment && token.position + token.value.length === code.length) {
+      suffix = "\n";
+    }
+  }
+  return suffix + stack.reverse().join("");
+}
+
 function completionPrefix(tokens: Token[], start: number, end: number, cursor: number):
   { prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" } | undefined {
   const before = tokens.slice(start, end).filter(token => token.position < cursor);

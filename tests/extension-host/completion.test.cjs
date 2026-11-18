@@ -14,8 +14,11 @@ suite("Completion in the VS Code extension host", () => {
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
       requestMemberCompletions: async () => [],
     });
-    const snapshot = text => ({ text, currentLine: text, lines: [text], cursorRow: 0,
-      cursorCol: text.length, textBeforeCursor: text });
+    const snapshot = text => {
+      const lines = text.split("\n");
+      return { text, currentLine: lines.at(-1), lines, cursorRow: lines.length - 1,
+        cursorCol: lines.at(-1).length, textBeforeCursor: text };
+    };
     const complete = async text => {
       const input = snapshot(text);
       let items;
@@ -36,6 +39,10 @@ suite("Completion in the VS Code extension host", () => {
       assert.ok(values.every(item => item.detail !== "parameter"));
       const filtered = lang.refineInlineCompletion(snapshot('stats::cor(method = "sp'));
       assert.deepEqual(filtered.filter(item => "insertText" in item).map(item => item.insertText), ["spearman"]);
+      const unfinished = '{\n  g <- function(`a b`, normal) NULL\n  g(`a b` = 1, ';
+      const remaining = await complete(unfinished);
+      assert.deepEqual(remaining.filter(item => item.detail === "parameter").map(item => item.insertText), ["normal = "]);
+      assert.equal(remaining.find(item => item.detail === "parameter").replaceStart, snapshot(unfinished).cursorCol);
       const collator = new Intl.Collator("en", { sensitivity: "base" });
       for (const operator of ["::", ":::"]) {
         const items = await complete(`data.table${operator}`);
