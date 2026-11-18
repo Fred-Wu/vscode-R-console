@@ -92,8 +92,8 @@ interface Token {
   closed?: boolean;
 }
 
-// Retain only the latest completion input. Re-lex from the token before an edit
-// so appended identifiers, operators, comments and literals cannot go stale.
+// Retain only the latest completion input. Adjacent tokens can merge after an
+// edit (notably r + a quote + a raw-string delimiter, or an exponent's sign).
 let completionTokenCache: { code: string; tokens: Token[] } | undefined;
 
 function completionTokens(code: string): Token[] {
@@ -109,7 +109,12 @@ function completionTokens(code: string): Token[] {
       if (previous.tokens[mid].position < common) low = mid + 1;
       else high = mid;
     }
-    const index = Math.max(0, low - 1);
+    let index = Math.max(0, low - 1);
+    while (index > 0 && previous.tokens[index].type !== TokenType.Newline &&
+        previous.tokens[index - 1].type !== TokenType.Newline &&
+        previous.tokens[index - 1].position + previous.tokens[index - 1].value.length === previous.tokens[index].position) {
+      index--;
+    }
     const offset = Math.min(common, previous.tokens[index].position);
     tokens = previous.tokens.slice(0, index).concat(tokenize(code.slice(offset)).map(token =>
       ({ ...token, position: token.position + offset })));

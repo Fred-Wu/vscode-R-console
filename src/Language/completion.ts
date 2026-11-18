@@ -616,7 +616,7 @@ export function toCompletionPick(
   return {
     label: `${icon} ${entry.label || '""'}`,
     description,
-    detail: entry.detail ? stripSnippetSyntax(entry.detail) : undefined,
+    detail: entry.detail,
     insertText: entry.insertText,
     isCallable: isCallableCompletionKind(entry.kind),
     replaceStart: entry.replaceStart ?? context.replaceStart,
@@ -994,11 +994,7 @@ async function getRuntimeMemberCompletions(
     return items
       .filter((item) => typeof item.name === "string" && item.name.length > 0)
       .map((item) => {
-        const isFunction =
-          item.type === "closure" ||
-          item.type === "builtin" ||
-          item.type === "special" ||
-          /^\s*function\s*\(/.test(item.str || "");
+        const isFunction = isSessionFunction(item);
         return {
           label: item.name,
           insertText: quoteRNameIfNeeded(item.name) + (isFunction ? "()" : ""),
@@ -1117,7 +1113,7 @@ async function getLanguageServerCompletions(
     
     return {
       entries: filteredItems.map((item) => ({
-        label: stripSnippetSyntax(getCompletionLabel(item)),
+        label: getCompletionLabel(item),
         insertText: getCompletionInsertText(item, context),
         kind: item.kind,
         detail: item.detail,
@@ -1205,6 +1201,11 @@ function stripSnippetSyntax(text: string): string {
 }
 
 function getCompletionInsertText(item: vscode.CompletionItem, context: CompletionContext): string {
+  // Value labels are literal R strings, including dollar signs and braces.
+  // Quote them for both named and positional insertion before snippet handling.
+  if (item.detail?.startsWith("value for ")) {
+    return quoteCompletionValue(getCompletionLabel(item), context.argumentValue?.quote);
+  }
   let text: string;
 
   if (typeof item.insertText === "string") {
@@ -1215,10 +1216,8 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
     text = getCompletionLabel(item);
   }
 
-  const result = stripSnippetSyntax(text);
-  if (context.argumentValue && item.detail?.startsWith("value for ")) {
-    return quoteCompletionValue(getCompletionLabel(item), context.argumentValue.quote);
-  }
+  const result = item.detail === "parameter" && !(item.insertText instanceof vscode.SnippetString)
+    ? text : stripSnippetSyntax(text);
   if (context.kind === "package" && isCallableCompletionKind(item.kind) &&
       isCallableName(result)) return result + "()";
   return result;
@@ -1321,7 +1320,7 @@ function dedupeCompletionEntries(
 export function getCompletionIdentityKey(entry: CompletionEntry): string {
   return [
     entry.label.toLowerCase(),
-    entry.detail ? stripSnippetSyntax(entry.detail) : "",
+    entry.detail ?? "",
     getCompletionDescription(entry),
   ].join("\u0000");
 }

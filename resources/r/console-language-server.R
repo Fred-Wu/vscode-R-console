@@ -238,7 +238,32 @@ console_call_identity <- function(source) {
     NULL
 }
 
-# Inspect assignments in the cursor's lexical scope. Parse syntax only: neither
+console_source_expression <- function(node) {
+    leaves <- xml2::xml_find_all(node, ".//*[not(*) and not(self::COMMENT)]")
+    lines <- as.integer(xml2::xml_attr(leaves, "line1"))
+    ends <- as.integer(xml2::xml_attr(leaves, "line2"))
+    separators <- c("", ifelse(lines[-1L] > head(ends, -1L), "\n", " "))
+    tryCatch(parse(text = paste0(separators, xml2::xml_text(leaves), collapse = ""))[[1L]],
+        error = function(e) NULL)
+}
+
+console_source_formals <- function(expression) {
+    if (missing(expression)) return(NULL)
+    # R normalizes rightward assignments and lambdas in the parsed AST.
+    while (is.call(expression) && is.symbol(expression[[1L]]) &&
+        as.character(expression[[1L]]) %in% c("(", "<-", "<<-", "=")) {
+        expression <- expression[[if (identical(expression[[1L]], quote(`(`))) 2L else 3L]]
+    }
+    if (is.call(expression) && identical(expression[[1L]], quote(`function`))) expression[[2L]] else NULL
+}
+
+console_source_name <- function(node) {
+    spelling <- xml2::xml_text(node)
+    symbol <- if (startsWith(spelling, "`")) tryCatch(parse(text = spelling)[[1L]], error = function(e) NULL) else as.name(spelling)
+    if (is.symbol(symbol)) as.character(symbol) else NULL
+}
+
+# Inspect bindings in the cursor's lexical scope. Parse syntax only: neither
 # defaults nor function bodies are evaluated, including wrapped/chained RHSs.
 console_source_function <- function(document, point, name) {
     xdoc <- document$parse_data$xml_doc
@@ -255,30 +280,36 @@ console_source_function <- function(document, point, name) {
     }
     selected <- NULL
     depth <- -1L
+    # A formal shadows outer bindings even when it has no known function
+    # default. Assignments later in the same scope may supersede that default.
+    for (scope in xml2::xml_find_all(xdoc, "//expr[FUNCTION or OP-LAMBDA]")) {
+        if (!contains(scope)) next
+        scope_depth <- length(xml2::xml_find_all(scope, "ancestor::expr[FUNCTION or OP-LAMBDA]")) + 1L
+        if (scope_depth < depth) next
+        formal <- Filter(function(node) identical(console_source_name(node), name),
+            as.list(xml2::xml_find_all(scope, "SYMBOL_FORMALS")))
+        if (!length(formal)) next
+        # Parse only this default, not the enclosing body or other defaults.
+        default <- xml2::xml_find_first(formal[[1L]],
+            "following-sibling::*[1][self::EQ_FORMALS]/following-sibling::expr[1]")
+        selected <- list(formals = if (inherits(default, "xml_missing")) NULL else
+            console_source_formals(console_source_expression(default)))
+        depth <- scope_depth
+    }
     assignments <- xml2::xml_find_all(xdoc, "//*[LEFT_ASSIGN or EQ_ASSIGN or RIGHT_ASSIGN]")
     for (node in assignments) {
         rightward <- length(xml2::xml_find_all(node, "RIGHT_ASSIGN")) > 0L
         target <- xml2::xml_find_first(node, if (rightward) "expr[last()]/SYMBOL" else "expr[1]/SYMBOL")
         if (inherits(target, "xml_missing") || !before(target)) next
-        spelling <- xml2::xml_text(target)
-        symbol <- if (startsWith(spelling, "`")) tryCatch(parse(text = spelling)[[1L]], error = function(e) NULL) else as.name(spelling)
-        if (!is.symbol(symbol) || !identical(as.character(symbol), name)) next
+        if (!identical(console_source_name(target), name)) next
         scopes <- xml2::xml_find_all(node, "ancestor::expr[FUNCTION or OP-LAMBDA]")
-        if (length(scopes) < depth || !all(vapply(scopes, contains, logical(1)))) next
-        leaves <- xml2::xml_find_all(node, ".//*[not(*) and not(self::COMMENT)]")
-        lines <- as.integer(xml2::xml_attr(leaves, "line1"))
-        ends <- as.integer(xml2::xml_attr(leaves, "line2"))
-        separators <- c("", ifelse(lines[-1L] > head(ends, -1L), "\n", " "))
-        expression <- tryCatch(parse(text = paste0(separators, xml2::xml_text(leaves), collapse = ""))[[1L]],
-            error = function(e) NULL)
-        # R normalizes rightward assignments and lambdas in the parsed AST.
-        while (is.call(expression) && is.symbol(expression[[1L]]) &&
-            as.character(expression[[1L]]) %in% c("(", "<-", "<<-", "=")) {
-            expression <- expression[[if (identical(expression[[1L]], quote(`(`))) 2L else 3L]]
-        }
-        definition <- if (is.call(expression) && identical(expression[[1L]], quote(`function`))) expression else NULL
-        selected <- list(formals = if (!is.null(definition)) definition[[2L]] else NULL)
-        depth <- length(scopes)
+        assignment <- xml2::xml_text(xml2::xml_find_first(node, "LEFT_ASSIGN | EQ_ASSIGN | RIGHT_ASSIGN"))
+        # Superassignment skips the current frame. In particular it cannot
+        # replace a same-name formal or local assignment in that frame.
+        binding_depth <- max(0L, length(scopes) - as.integer(assignment %in% c("<<-", "->>")))
+        if (binding_depth < depth || !all(vapply(scopes, contains, logical(1)))) next
+        selected <- list(formals = console_source_formals(console_source_expression(node)))
+        depth <- binding_depth
     }
     selected
 }
@@ -320,8 +351,9 @@ console_value_argument <- function(formal_names, tag, tags) {
 }
 
 console_valid_argument_items <- function(items, tags, call, uri, workspace, point, signature = NULL) {
+    is_value <- function(item) is.character(item$detail) && startsWith(item$detail, "value for ")
     if (is.null(call) || is.null(tags) ||
-        !any(vapply(items, function(item) identical(item$detail, "parameter"), logical(1)))) return(items)
+        !any(vapply(items, function(item) identical(item$detail, "parameter") || is_value(item), logical(1)))) return(items)
     # Ask the same provider for the complete signature, including local source
     # definitions and dots. Defaults and function bodies are never evaluated.
     if (is.null(signature)) signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
@@ -339,7 +371,15 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
         error = function(e) NULL)
     if (is.null(syntax)) return(items)
     if (is.null(names(syntax))) names(syntax) <- rep("", length(syntax))
+    # Values insert an unnamed argument. Match its actual destination once,
+    # rather than offering defaults from already-bound or later parameters.
+    positional <- tryCatch(suppressWarnings(match.call(definition = definition,
+        call = as.call(syntax), expand.dots = FALSE)), error = function(e) NULL)
+    positional <- as.list(positional)[-1L]
+    value_name <- names(positional)[vapply(positional, identical, logical(1), TRUE)]
     Filter(function(item) {
+        if (is_value(item)) return(length(value_name) == 1L &&
+            identical(item$detail, paste0("value for ", value_name)))
         if (!identical(item$detail, "parameter")) return(TRUE)
         name <- console_argument_name(item)
         if (name == "..." || name %in% names(syntax)) return(FALSE)

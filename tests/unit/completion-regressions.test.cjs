@@ -91,7 +91,9 @@ test("completion lexical snapshots remain correct after arbitrary edits and curs
 });
 
 test("incremental lexing handles token boundaries that change while typing", () => {
-  for (const code of ['r"(foo)"', 'r"---(foo)---"', '1e+3', 'stats:::lm(', 'x[[1]]', 'df %>% f(']) {
+  for (const code of ['r"(foo)"', 'r"---(foo)---"', 'r"(say "hello)"; lib',
+    'r"---(say "stats::lm()---"; fun(', "R'--[say 'df[[x]] ]--'; fun(",
+    '1e+3', 'stats:::lm(', 'x[[1]]', 'df %>% f(']) {
     for (let cursor = 1; cursor <= code.length; cursor++) {
       const input = code.slice(0, cursor), shared = parser.getCompletionSyntax(input);
       assert.equal(shared.inLiteral, parser.isCompletionInLiteral(input), input);
@@ -99,6 +101,24 @@ test("incremental lexing handles token boundaries that change while typing", () 
       assert.deepEqual(shared.member, parser.getQualifiedCompletionContext(input), input);
       assert.deepEqual(shared.bracket, parser.getBracketCompletionContext(input), input);
     }
+  }
+});
+
+test("raw-string edits keep automatic completion outside the literal", () => {
+  const code = 'r"(say "stats::lm() and df[[x]])"; lib';
+  for (let cursor = 1; cursor <= code.length; cursor++) {
+    const input = code.slice(0, cursor);
+    const context = completion.getCompletionContext(input, cursor);
+    if (parser.isCompletionInLiteral(input) && context) {
+      assert.equal(context.suppressAutomatic, true, input);
+      assert.notEqual(context.kind, "package", input);
+      assert.notEqual(context.kind, "bracket", input);
+    }
+  }
+  assert.equal(completion.getCompletionContext(code, code.length).suppressAutomatic, false);
+  // Inserting/removing the delimiter changes the interpretation of earlier tokens.
+  for (const input of ['r"text"; lib', 'r"(text"; lib', 'r"(text)"; lib', 'r"text"; lib']) {
+    assert.equal(parser.getCompletionSyntax(input).inLiteral, parser.isCompletionInLiteral(input), input);
   }
 });
 

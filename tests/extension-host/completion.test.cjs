@@ -25,7 +25,7 @@ suite("Completion in the VS Code extension host", () => {
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
         getWorkspaceData: () => session, applyCompletion() {},
         onInlineEntries: result => { items = result; } });
-      assert.ok(items?.length, `completion results for ${text}`);
+      assert.ok(Array.isArray(items), `completion results for ${text}`);
       return items.filter(item => "insertText" in item);
     };
     try {
@@ -52,6 +52,15 @@ suite("Completion in the VS Code extension host", () => {
       }
       const wrapped = await complete('f <- (function(new_arg) NULL)\nf(', session);
       assert.deepEqual(wrapped.filter(item => item.detail === "parameter").map(item => item.insertText), ['new_arg = ']);
+      for (const [formal, expected] of [['f = function(inner_arg) NULL', ['inner_arg = ']], ['f', []]]) {
+        const items = await complete(`f <- function(outer_arg) NULL\ng <- function(${formal}) { f(`, session);
+        assert.deepEqual(items.filter(item => item.detail === 'parameter').map(item => item.insertText), expected);
+      }
+      const exhausted = await complete('f <- function(method = c("one", "two")) NULL\nf(method = "one", ');
+      assert.ok(exhausted.every(item => !item.detail?.startsWith('value for ')));
+      const literalValues = await complete('f <- function(`$1` = c("$2", "${3:text}")) NULL\nf(`$1` = "');
+      assert.deepEqual(literalValues.map(item => item.insertText), ['$2', '${3:text}']);
+      assert.ok(literalValues.every(item => item.detail === 'value for $1'));
       const partial = await complete('stats::cor(met = "sp');
       assert.ok(partial.some(item => item.insertText === 'spearman' && item.isCallable === false));
       for (const operator of ['|>', '%>%']) {

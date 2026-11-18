@@ -1135,6 +1135,88 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
   }
 });
 
+test("formal bindings shadow outer functions without evaluating their defaults", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const [marked, expected] of [
+    ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) { f(│) }', ['inner_arg']],
+    ['f <- function(outer_arg) NULL\ng <- function(f) { f(│) }', []],
+    ['f <- function(outer_arg) NULL\ng <- function(f = stop("must not evaluate")) { f(│) }', []],
+    ['g <- function(f = (function(inner_arg) NULL)) { f(│) }', ['inner_arg']],
+    ['g <- \\(f = \\(inner_arg) NULL) { f(│) }', ['inner_arg']],
+    ['g <- function(`a b` = function(inner_arg) NULL) { `a b`(│) }', ['inner_arg']],
+    ['g <- function(f = function(default_arg) NULL) { f <- function(assigned_arg) NULL; f(│) }', ['assigned_arg']],
+    ['g <- function(f = function(default_arg) NULL) { f(│); f <- function(later_arg) NULL }', ['default_arg']],
+    ['g <- function(f = function(local_arg) NULL) { f <<- function(parent_arg) NULL; f(│) }', ['local_arg']],
+    ['g <- function(f = function(local_arg) NULL) { function(parent_arg) NULL ->> f; f(│) }', ['local_arg']],
+    ['g <- function() { f <- function(local_arg) NULL; f <<- function(parent_arg) NULL; f(│) }', ['local_arg']],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f <<- function(new_arg) NULL; f(│) } }', ['new_arg']],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function(f = function(inner_arg) NULL) { f(│) } }', ['inner_arg']],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f(│) } }', ['outer_arg']],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function(f) { f(│) } }', []],
+    ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) NULL; f(│)', ['outer_arg']],
+    ['g <- function(f = function(inner_arg) NULL) {\n f(│', ['inner_arg']],
+  ]) {
+    const text = marked.replace('│', ''), before = marked.split('│')[0], lines = before.split('\n');
+    const result = await client.provideCompletionItems({ getText: () => text },
+      { line: lines.length - 1, character: lines.at(-1).length });
+    assert.equal(result.rConsoleLocalFunction, true, marked);
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, marked);
+  }
+});
+
+test("positional value suggestions match only the receiving argument", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const [definition, call, expected] of [
+    ['function(method = c("one", "two")) NULL', 'f(method = "one", │)', []],
+    ['function(method = c("one", "two")) NULL', 'f(│, method = "one")', []],
+    ['function(method = c("one", "two")) NULL', 'f("one", │)', []],
+    ['function(method = c("one", "two")) NULL', 'f(met = "one", │)', []],
+    ['function(method = c("one", "two")) NULL', '"one" |> f(│)', []],
+    ['function(method = c("one", "two")) NULL', 'f(│)', ['one', 'two']],
+    ['function(first = "first_value", second = "second_value") NULL', 'f(│)', ['first_value']],
+    ['function(first = "first_value", second = "second_value") NULL', 'f(1, │)', ['second_value']],
+    ['function(first = "first_value", second = "second_value") NULL', 'f(│, first = 1)', ['second_value']],
+    ['function(..., method = "named_only") NULL', 'f(│)', []],
+    ['function(method = "already_used", ...) NULL', 'f(method = "already_used", │)', []],
+    ['function(method = "still_available") NULL', 'f(method = "still│")', ['still_available']],
+  ]) {
+    const text = `f <- ${definition}\n${call.replace('│', '')}`;
+    const result = await client.provideCompletionItems({ getText: () => text }, { line: 1, character: call.indexOf('│') });
+    assert.deepEqual(result.items.filter(item => item.detail?.startsWith('value for ')).map(item => item.label), expected, call);
+  }
+  // Package signatures use the same positional matching as source definitions.
+  const text = 'stats::cor(x = 1, y = 2, use = "everything", method = "pearson", )';
+  const result = await client.provideCompletionItems({ getText: () => text }, { line: 0, character: text.length - 1 });
+  assert.deepEqual(result.items.filter(item => item.detail?.startsWith('value for ')), []);
+});
+
+test("literal argument names and values are never interpreted as snippet placeholders", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const provider = { provideCompletionItems: async (...args) => {
+    const result = await client.provideCompletionItems(...args);
+    return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+  } };
+  for (const [marked, expected] of [
+    ['f <- function(pattern = c("$1", "${2:text}")) NULL\nf(│)', ['pattern = ', '"$1"', '"${2:text}"']],
+    ['f <- function(pattern = c("$1", "${2:text}")) NULL\nf(pattern = "│")', ['$1', '${2:text}']],
+    ['f <- function(pattern = c("$1", "${2:text}")) NULL\nf(pattern = "$│")', ['$1', '${2:text}']],
+    ['f <- function(`$1`) NULL\nf(│)', ['`$1` = ']],
+    ['f <- function(`$1` = "$2") NULL\nf(`$1` = "│")', ['$2']],
+  ]) {
+    const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
+    const position = { line: 1, character: before.split('\n').at(-1).length };
+    const context = completion.getCompletionContext(lines[1], position.character, before, text.slice(before.length));
+    const entries = (await completion.collectCompletionEntries(context, { getText: () => text }, position,
+      undefined, lines.slice(0, 1), [], provider)).filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '));
+    assert.deepEqual(entries.map(item => item.insertText), expected, marked);
+    assert.ok(entries.every(item => item.label.includes('$') || item.label === 'pattern'), marked);
+    for (const entry of entries) {
+      const pick = completion.toCompletionPick(entry, context);
+      assert.equal(pick.detail, entry.detail, 'literal parameter names also survive in displayed details');
+    }
+  }
+});
+
 test("source-only pipe functions survive filtering and native-pipe parse recovery", { timeout: 90000 }, async t => {
   const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const marked of [
