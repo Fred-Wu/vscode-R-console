@@ -572,7 +572,7 @@ test("typing publishes an empty list when matches or the completion context disa
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions: async () => undefined });
   lang.ensureConsoleLspStarted = async () => undefined;
   lang.getOrOpenCompletionDocument = async () => undefined;
   const panel = new InlineCompletion(unicode);

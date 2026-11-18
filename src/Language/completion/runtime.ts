@@ -157,14 +157,14 @@ export async function getRuntimeDataCompletions(
 export async function getRuntimeMemberCompletions(
   context: CompletionContext,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
-): Promise<CompletionEntry[]> {
+): Promise<CompletionEntry[] | undefined> {
   if (
     context.kind !== "member" ||
     !context.objectName ||
     !context.operator ||
     !requestRuntimeMemberCompletions
   ) {
-    return [];
+    return undefined;
   }
 
   try {
@@ -172,11 +172,8 @@ export async function getRuntimeMemberCompletions(
       context.objectName,
       context.operator
     );
-    if (!items || items.length === 0) {
-      return [];
-    }
     return items
-      .filter((item) => typeof item.name === "string" && item.name.length > 0)
+      ?.filter((item) => typeof item.name === "string" && item.name.length > 0)
       .map((item) => {
         const isFunction = isSessionFunction(item);
         return {
@@ -190,7 +187,7 @@ export async function getRuntimeMemberCompletions(
         };
       });
   } catch {
-    return [];
+    return undefined;
   }
 }
 

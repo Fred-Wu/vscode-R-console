@@ -55,12 +55,19 @@ export async function collectCompletionEntries(
     !context.bracketArgumentName && !!requestRuntimeMemberCompletions;
   const [runtimeMemberItems, runtimeDataItems, runtimeArgumentItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
-      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([]),
+      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve(undefined),
     probeSubscript ? getRuntimeDataCompletions(context, requestRuntimeMemberCompletions) :
     !includeColumns || nativeFields ? Promise.resolve([]) : cachedColumnItems.length > 0
       ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions),
     useRuntimeArguments ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([] as CompletionEntries),
   ]);
+  if (context.kind === "member") {
+    // A successful live lookup is authoritative even when it is empty or no
+    // name matches. Cached fields are only a fallback for an unavailable probe.
+    const entries = nativeMembers ? rawLspResult.entries : runtimeMemberItems ?? sessionItems;
+    return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
+      rawLspResult.isIncomplete);
+  }
   const resolvedDataItems = probeSubscript && !(runtimeDataItems as CompletionEntries).subscriptResolved
     ? cachedColumnItems : runtimeDataItems;
   const dataItems = nativeFields ? resolvedDataItems.filter(entry => entry.kind !== vscode.CompletionItemKind.Field) : resolvedDataItems;
@@ -82,7 +89,6 @@ export async function collectCompletionEntries(
   const fallbackBufferItems = filterShadowedBufferEntries(bufferItems, [
     ...lspItems,
     ...sessionItems,
-    ...runtimeMemberItems,
     ...dataItems,
     ...runtimeArgumentItems,
   ]);
@@ -111,22 +117,6 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),
     ]), rawLspResult.isIncomplete);
-  }
-
-  if (context.kind === "member") {
-    if (nativeMembers) return asCompletionEntries(filterCompletionEntries(lspItems, context.prefix), rawLspResult.isIncomplete);
-    const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
-    const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
-    if (runtimeFiltered.length > 0) {
-      return asCompletionEntries(
-        dedupeCompletionEntries(runtimeFiltered),
-        rawLspResult.isIncomplete
-      );
-    }
-    return asCompletionEntries(
-      dedupeCompletionEntries(sessionFiltered),
-      rawLspResult.isIncomplete
-    );
   }
 
   const defaultColumnFiltered = filterCompletionEntries(dataItems, context.prefix);

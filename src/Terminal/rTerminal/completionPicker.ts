@@ -5,7 +5,6 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { rebaseCompletionEnds } from "../../Language/completion/refinement";
-import { dedupeCompletionEntries } from "../../Language/completion/candidates";
 import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
@@ -162,10 +161,7 @@ export async function pickCompletion({
       if (!active || !nextEntries || !isCurrent()) return;
       if (currentRequest === request) {
         // LSP edits target the preview, but acceptance edits the actual input.
-        const originalEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
-        sourceEntries = context.kind === "package"
-          ? originalEntries
-          : dedupeCompletionEntries([...baselineEntries, ...originalEntries]);
+        sourceEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
         // Typing may have refined a complete baseline while this request was

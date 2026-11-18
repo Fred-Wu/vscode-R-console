@@ -484,6 +484,23 @@ test("named subscript values and resolved empty results do not invent cached col
   }
 });
 
+test("successful live member lookups supersede stale cached fields even without matches", async () => {
+  const session = { globalenv: { obj: { names: ['alpha'], slots: ['alpha'] } } };
+  for (const text of ['obj$', 'obj$al', 'obj@al']) {
+    for (const reply of [[], [{ name: 'beta' }]]) {
+      const context = completion.getCompletionContext(text, text.length);
+      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+        session, [], [], undefined, async () => reply);
+      assert.deepEqual(entries.map(entry => entry.label), text === 'obj$' ? reply.map(item => item.name) : [], text);
+    }
+  }
+  for (const request of [undefined, async () => undefined, async () => { throw new Error('unavailable'); }]) {
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext('obj$al', 6),
+      undefined, undefined, session, [], [], undefined, request);
+    assert.deepEqual(entries.map(entry => entry.label), ['alpha']);
+  }
+});
+
 test("subscript supplements preserve symbols and fields supplied by the R provider", async () => {
   for (const text of ['DT[.', 'DT[, keyby = .']) {
     const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),

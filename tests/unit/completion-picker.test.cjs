@@ -146,6 +146,18 @@ test('an authoritative empty delayed response clears staged Quick Pick entries',
   assert.deepEqual(picker.labels(), []);
 });
 
+test('refined Quick Pick replies replace stale candidates and their edits', async t => {
+  for (const reply of [[], [{ label: 'alpha', insertText: 'alpha()', source: 'lsp', kind: 5, replaceEnd: 2 }]]) {
+    const picker = await openPicker(t, 'a', entries(['alpha'], true), async () => reply);
+    await picker.type('al');
+    assert.deepEqual(picker.labels(), reply.map(entry => entry.insertText));
+    if (reply.length) {
+      assert.equal(picker.pick.items.find(item => 'insertText' in item).replaceEnd, 1,
+        'the refreshed edit is rebased from the preview onto the original input');
+    }
+  }
+});
+
 test('Quick Pick refreshes ambient symbols when an empty contextual slot becomes typed', async t => {
   for (const text of ['lst[[', 'lst[', 'fun(', 'fun(arg = ', 'with(lst, ']) {
     const session = { globalenv: { index: { type: 'character' } } };
