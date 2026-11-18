@@ -606,6 +606,397 @@ test("footer triangles page the list, preserve selection, and never accept a can
   assert.equal(terminal.accepted, undefined);
 });
 
+test("group buttons jump and select without inserting, then Tab accepts the selected group", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const grouped = ["Variables", "Functions", "Packages"].flatMap(group => [
+    { label: group }, ...Array.from({ length: 15 }, (_, i) => ({
+      ...item(`${group}${i}`), snapshotInput: "a", snapshotCursor: 1,
+    })),
+  ]);
+  const state = terminal.inlineCompletion;
+  state.set(grouped, state.token);
+  terminal.renderInput();
+  const button = state.groupTargets.find(target => target.group === 1);
+  const headerRow = terminal.inlineBoxTop + button.row;
+  const header = screen.buffer.active.getLine(screen.buffer.active.baseY + headerRow - 1).translateToString(true);
+  assert.ok(header.includes("│Vars││Fns││Pkgs│"));
+  const top = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop - 1).translateToString(true);
+  assert.match(top.trim(), /^╭─+╮$/, "the panel keeps its own uninterrupted top border");
+  assert.equal(state.groupTargets[0].from, state.renderedLeft + 2, "buttons sit directly beside the panel edge");
+  const buttonTop = screen.buffer.active.getLine(screen.buffer.active.baseY + headerRow - 2).translateToString(true);
+  const buttonBottom = screen.buffer.active.getLine(screen.buffer.active.baseY + headerRow).translateToString(true);
+  assert.ok(buttonTop.includes("│╭────╮╭───╮╭────╮"));
+  assert.ok(buttonBottom.includes("│╰────╯╰───╯╰────╯"));
+  const col = header.indexOf("Fns") + 1;
+  assert.equal(state.groupButton(button.row, col), 1);
+  assert.equal(state.hitTest(1, col), undefined);
+  assert.equal(state.isScrollbar(1, state.renderedLeft + state.renderedWidth - 1), false);
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: headerRow, col });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row: headerRow, col });
+  assert.equal(state.current().label, "Functions0");
+  assert.equal(state.scrollStart, 16, "the group's heading starts the viewport");
+  assert.equal(terminal.inputState.text, "a");
+  assert.equal(terminal.accepted, undefined);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.accepted.label, "Functions0");
+});
+
+test("clicking a short final group puts its heading at the top without earlier suggestions", t => {
+  for (const count of [1, 3]) {
+    const { terminal, screen } = createTerminal(t);
+    terminal.inputState.insertText("a");
+    const first = Array.from({ length: 20 }, (_, i) => item("variable" + i));
+    const last = Array.from({ length: count }, (_, i) => ({ ...item("field" + i), snapshotInput: "a", snapshotCursor: 1 }));
+    const entries = [{ label: "Variables" }, ...first, { label: "Fields" }, ...last];
+    const state = terminal.inlineCompletion;
+    state.set(entries, state.token);
+    terminal.renderInput();
+    const button = state.groupTargets.find(target => target.group === 1);
+    const row = terminal.inlineBoxTop + 1;
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: button.from });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: button.from });
+    const assertTop = () => {
+      const lines = state.lines(terminal.dimensions.columns, 20);
+      assert.ok(lines[state.scrollbarTop].includes("Fields"));
+      const visible = state.renderedTargets.filter(target => target !== undefined)
+        .map(target => state.items[state.choiceIndexes[target]].label);
+      assert.deepEqual(visible, last.map(entry => entry.label));
+      assert.equal(state.current().label, "field0");
+    };
+    assertTop();
+    terminal.renderInput();
+    const heading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+    assert.ok(heading.includes("Fields"), "the terminal displays the final group's heading immediately below its buttons");
+    assert.equal(terminal.inputState.text, "a");
+    assert.equal(terminal.accepted, undefined);
+    state.set([{ label: "Variables" }, item("newVariable"), ...first,
+      { label: "Fields" }, ...last], state.invalidate());
+    assertTop();
+    terminal.dimensions.columns = 25;
+    assertTop();
+    terminal.dimensions.columns = 80;
+    assertTop();
+    state.scroll(-1);
+    const upward = state.lines(80, 20);
+    assert.ok(upward[state.scrollbarTop].includes("Variables"), "scrolling upward can still reach earlier suggestions");
+    state.activateGroup(1);
+    assertTop();
+    state.activateGroup(0);
+    assert.equal(state.lines(80, 20)[state.scrollbarTop].includes("Variables"), true);
+    state.invalidate(true);
+    assert.equal(state.scrollAnchorGroup, undefined, "a new input resets the explicit jump");
+  }
+});
+
+test("completion displays ten suggestions excluding headings, group controls and details", t => {
+  for (const grouped of [false, true]) {
+    const { terminal } = createTerminal(t, 80, 40);
+    terminal.inputState.insertText("a");
+    const groups = grouped ? ["Fields", "Functions", "Packages"] : ["Package Members"];
+    const entries = groups.flatMap(group => [{ label: group },
+      ...Array.from({ length: grouped ? 6 : 40 }, (_, i) => ({ ...item(`${group}${i}`), detail: "details" }))]);
+    const state = terminal.inlineCompletion;
+    state.set(entries, state.token);
+    terminal.renderInput();
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    state.page(1);
+    terminal.renderInput();
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    state.move(1000);
+    terminal.renderInput();
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    assert.ok(state.renderedTargets.includes(state.selected));
+  }
+});
+
+test("group buttons wrap without arrows and reach every group in narrow and Unicode layouts", () => {
+  for (const width of [12, 25, 45, 80]) {
+    const state = new InlineCompletion(unicode);
+    const names = ["Runtime Variables", "Runtime Functions", "列名称😀", "Packages", "Functions", "Recent Input"];
+    state.set(names.flatMap(name => [{ label: name }, ...Array.from({ length: 12 }, (_, i) => item(name + i))]), state.token);
+    const lines = state.lines(width, 30, 8);
+    assert.ok(lines.every(line => state.cellWidth(line.replace(/\x1b\[[0-9;]*m/g, "")) < width));
+    for (const target of state.groupTargets) {
+      assert.equal(state.groupButton(target.row, target.from), target.group);
+      assert.equal(state.groupButton(target.row, target.to - 1), target.group);
+      assert.equal(state.hitTest(target.row, target.from), undefined);
+    }
+    assert.equal(state.groupTargets.length, names.length, `all groups reachable at width ${width}`);
+    assert.ok(lines.slice(1, state.scrollbarTop).every(line => !/[◀▶<>]/.test(line)), "no top arrows");
+    assert.ok(lines.at(-2).includes("◀"), "footer scrolling controls remain");
+    const target = state.groupTargets.find(target => target.group === names.length - 1);
+    state.activateGroup(target.group);
+    state.lines(width, 30, 8);
+    assert.equal(state.current().label, names.at(-1) + "0");
+    assert.ok(state.renderedTargets.includes(state.selected));
+  }
+});
+
+test("group controls and scrollbar remain separate after resizing and result refresh", () => {
+  const state = new InlineCompletion(unicode);
+  const entries = ["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 30 }, (_, i) => item(group + i))]);
+  state.set(entries, state.token);
+  state.lines(80, 20);
+  state.activateGroup(1);
+  state.lines(80, 20);
+  const selected = state.current();
+  const col = state.renderedLeft + state.renderedWidth - 1;
+  assert.equal(state.isScrollbar(1, col), false);
+  assert.equal(state.isScrollbar(state.scrollbarTop, col), true);
+  state.startScroll(state.bodyTop + state.thumbStart);
+  assert.ok(state.dragging);
+  state.dragScroll(1000);
+  state.lines(80, 20);
+  assert.equal(state.scrollStart, state.maxScrollStart);
+  assert.equal(state.current(), selected, "scrolling after a group jump preserves selection");
+  state.lines(20, 6);
+  assert.equal(state.dragging, false);
+  assert.ok(state.renderedTargets.includes(state.selected));
+  state.set(entries.map(entry => ({ ...entry })), state.invalidate());
+  state.lines(80, 20);
+  assert.equal(state.current().label, selected.label);
+  state.set([{ label: "Functions" }, item("only_match")], state.invalidate(), "only");
+  state.lines(80, 20);
+  assert.deepEqual(state.groupTargets, []);
+  assert.equal(state.groupButton(1, 5), undefined);
+  assert.equal(state.hitTest(2, 5).label, "only_match");
+  state.clear();
+  assert.equal(state.groupButton(1, 5), undefined);
+});
+
+test("separate button boxes have no inner padding or gaps and retain click targets", () => {
+  const state = new InlineCompletion(unicode);
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 20 }, (_, i) => item(group + i))]), state.token);
+  let lines = state.lines(80, 20);
+  assert.equal(state.scrollbarTop, 4);
+  assert.equal(state.groupTargets[0].to, state.groupTargets[1].from);
+  assert.equal(state.groupButton(1, state.groupTargets[0].to - 1), 0);
+  assert.equal(state.groupButton(1, state.groupTargets[0].to), 1);
+  const plain = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  assert.match(plain[0], /^╭─+╮$/);
+  assert.ok(plain[1].startsWith("│╭────╮╭───╮"));
+  assert.ok(plain[2].startsWith("││Vars││Fns│"));
+  assert.ok(plain[3].startsWith("│╰────╯╰───╯"));
+  assert.ok(plain[4].includes("Variables"));
+  assert.ok(!lines.join("").includes("\x1b[53;4m"));
+  assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+  lines = state.lines(80, 8);
+  const target = state.groupTargets[1];
+  assert.equal(target.row, 2);
+  assert.ok(lines[target.row].includes("Fns"));
+  assert.equal(state.groupButton(target.row, target.from), 1);
+  assert.ok(lines.length <= 8);
+  state.activateGroup(1);
+  lines = state.lines(80, 8);
+  assert.ok(lines[state.scrollbarTop].includes("Functions"));
+  assert.equal(state.current().label, "Functions0");
+});
+
+test("group header offsets preserve scrollbar dragging and mouse acceptance", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const state = terminal.inlineCompletion;
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 30 }, (_, i) => ({ ...item(group + i), snapshotInput: "a", snapshotCursor: 1 }))]), state.token);
+  terminal.renderInput();
+  const col = state.renderedLeft + state.renderedWidth - 1;
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: terminal.inlineBoxTop + 1, col });
+  assert.equal(state.dragging, false, "header row is not scrollbar track");
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: terminal.inlineBoxTop + state.bodyTop, col });
+  assert.equal(state.dragging, true);
+  terminal.applyKeyAction({ type: "mouse-move", row: terminal.inlineBoxTop + 100, col });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row: 1, col: 1 });
+  assert.equal(state.scrollStart, state.maxScrollStart);
+  assert.equal(terminal.accepted, undefined);
+  const candidateRow = state.renderedTargets.findIndex(target => target === 59);
+  assert.ok(candidateRow > 1);
+  const row = terminal.inlineBoxTop + candidateRow;
+  const candidateCol = state.renderedLeft + 5;
+  const screenLine = screen.buffer.active.getLine(screen.buffer.active.baseY + row - 1).translateToString(true);
+  assert.ok(screenLine.includes("Functions29"));
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: candidateCol });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: candidateCol });
+  assert.equal(terminal.accepted.label, "Functions29");
+});
+
+test("scrollbar drag survives changing heading counts in the ten-suggestion viewport", () => {
+  const state = new InlineCompletion(unicode);
+  state.set(["Fields", "Functions", "Packages", "Other"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 6 }, (_, i) => item(group + i))]), state.token);
+  state.lines(80, 30);
+  state.startScroll(state.bodyTop + state.thumbStart);
+  assert.equal(state.dragging, true);
+  const capacities = new Set();
+  for (let row = state.bodyTop; row < 20; row++) {
+    state.dragScroll(row);
+    state.lines(80, 30);
+    capacities.add(state.viewportRows);
+    assert.equal(state.dragging, true);
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+  }
+  assert.ok(capacities.size > 1, "the drag crosses windows with different numbers of headings");
+  assert.equal(state.scrollStart, state.maxScrollStart);
+});
+
+test("abbreviated group buttons highlight the scrolled group while its heading stays visible", () => {
+  const state = new InlineCompletion(unicode);
+  const colors = { matchForeground: "\x1b[38;5;123m", selectedBackground: "\x1b[48;5;123m" };
+  const names = ["Runtime Variables", "Runtime Functions", "Packages"];
+  const buttons = ["Vars", "R.Fns", "Pkgs"];
+  state.set(names.flatMap(group => [{ label: group },
+    ...Array.from({ length: 30 }, (_, i) => item(group + i))]), state.token);
+  state.lines(80, 20, 1, colors);
+  const selected = state.current();
+  for (const start of [1, 15, 30, 31, 32, 50, 62, 70, 31, 0]) {
+    state.scroll(start - state.scrollStart);
+    const lines = state.lines(80, 20, 1, colors);
+    const group = Math.floor(start / 31);
+    const plain = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const header = lines.slice(1, state.scrollbarTop).join("");
+    assert.ok(header.includes(colors.matchForeground + buttons[group]), `active button at row ${start}`);
+    assert.equal(header.split(colors.matchForeground).length - 1, 1, "only the visible group is highlighted");
+    assert.ok(!header.includes(colors.selectedBackground), "button highlighting uses text color only");
+    assert.ok(plain[state.scrollbarTop].includes(names[group]), `sticky heading at row ${start}`);
+    assert.equal(state.hitTest(state.scrollbarTop, 5), undefined, "headings cannot accept suggestions");
+    assert.equal(state.current(), selected, "scrolling never changes selection");
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    assert.ok(lines.length <= 20);
+    if (start === 30) assert.ok(plain.some(line => line.includes(names[1])), "the next group keeps its own heading at the boundary");
+  }
+});
+
+test("scrolling highlights wrapped buttons and preserves single-group headings", () => {
+  const state = new InlineCompletion(unicode);
+  const names = ["Runtime Variables", "Runtime Functions", "Packages", "Functions", "Fields", "Recent Input"];
+  state.set(names.flatMap(group => [{ label: group },
+    ...Array.from({ length: 20 }, (_, i) => item(group + i))]), state.token);
+  state.lines(25, 20);
+  state.scroll(85);
+  let lines = state.lines(25, 20);
+  const fieldsButton = state.groupTargets.find(target => target.group === 4);
+  assert.ok(fieldsButton.row > 1);
+  assert.ok(lines[fieldsButton.row].includes("Flds"));
+  assert.ok(lines[state.scrollbarTop].includes("Fields"));
+  state.set([{ label: "Package Members" }, ...Array.from({ length: 30 }, (_, i) => item("member" + i))], state.invalidate());
+  state.lines(80, 20);
+  state.scroll(5);
+  lines = state.lines(80, 20);
+  assert.deepEqual(state.groupTargets, []);
+  assert.ok(lines[1].includes("Package Members"));
+  assert.equal(state.hitTest(1, 5), undefined);
+  assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+  lines = state.lines(20, 4);
+  assert.equal(lines.length, 4, "a minimal panel still has room for a suggestion");
+  assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 1);
+});
+
+test("mouse wheel and footer scrolling update the pinned heading and active button", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const state = terminal.inlineCompletion;
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 20 }, (_, i) => item(group + i))]), state.token);
+  terminal.renderInput();
+  for (let i = 0; i < 8; i++) terminal.applyKeyAction({ type: "wheel", dir: "down",
+    row: terminal.inlineBoxTop + state.bodyTop, col: state.renderedLeft + 5 });
+  const heading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+  assert.ok(heading.includes("Functions"));
+  assert.equal(state.current().label, "Variables0");
+  for (let i = 0; i < 3; i++) {
+    const row = terminal.inlineBoxTop + state.renderedTargets.length - 2;
+    const col = state.renderedLeft + state.renderedWidth - 4;
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row, col });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row, col });
+  }
+  const returnedHeading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+  assert.ok(returnedHeading.includes("Variables"));
+  assert.equal(terminal.inputState.text, "a");
+  assert.equal(terminal.accepted, undefined);
+});
+
+test("pinned headings keep the scrollbar origin stable during dragging", () => {
+  const state = new InlineCompletion(unicode);
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 80 }, (_, i) => item(group + i))]), state.token);
+  state.lines(80, 20);
+  const top = state.scrollbarTop;
+  state.startScroll(top);
+  state.dragScroll(top + 1);
+  let lines = state.lines(80, 20);
+  const start = state.scrollStart;
+  assert.ok(start > 0);
+  assert.ok(lines[top].includes("Variables"));
+  for (let i = 0; i < 3; i++) {
+    state.dragScroll(top + 1);
+    lines = state.lines(80, 20);
+    assert.equal(state.scrollStart, start, "the same mouse position must not jump between pinned and original headings");
+    assert.equal(state.scrollbarTop, top);
+    assert.equal(state.dragging, true);
+  }
+  state.dragScroll(1000);
+  lines = state.lines(80, 20);
+  assert.ok(lines[top].includes("Functions"));
+  assert.equal(state.scrollStart, state.maxScrollStart);
+  assert.equal(state.isScrollbar(top, state.renderedLeft + state.renderedWidth - 1), true);
+});
+
+test("button text follows the selection bar across groups as well as independent scrolling", () => {
+  const state = new InlineCompletion(unicode);
+  const colors = { matchForeground: "\x1b[38;5;123m", selectedBackground: "\x1b[48;5;123m" };
+  state.set(["Variables", "Functions", "Fields"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 4 }, (_, i) => item(group + i))]), state.token);
+  const check = button => {
+    const lines = state.lines(80, 25, 1, colors);
+    const header = lines.slice(1, state.scrollbarTop).join("");
+    assert.ok(header.includes(colors.matchForeground + button));
+    assert.equal(header.split(colors.matchForeground).length - 1, 1);
+    assert.ok(!header.includes(colors.selectedBackground));
+    return lines;
+  };
+  check("Vars");
+  state.move(4);
+  const lines = check("Fns");
+  assert.ok(lines[state.scrollbarTop].includes("Variables"), "selection can enter the next group before its heading reaches the top");
+  state.move(4);
+  check("Flds");
+  state.move(-4);
+  check("Fns");
+  state.scroll(-100);
+  check("Vars");
+  assert.equal(state.current().label, "Functions0", "wheel scrolling does not move the selection bar");
+  state.move(1);
+  check("Fns");
+  state.activateGroup(2);
+  check("Flds");
+});
+
+test("wrapped group buttons accept mouse clicks on later header rows", t => {
+  const { terminal, screen } = createTerminal(t, 25, 24);
+  terminal.inputState.insertText("a");
+  const state = terminal.inlineCompletion;
+  state.set(["Variables", "Runtime Functions", "Packages", "Functions", "Fields", "Recent Input"].flatMap(group => [
+    { label: group }, ...Array.from({ length: 10 }, (_, i) => ({ ...item(group + i), snapshotInput: "a", snapshotCursor: 1 })),
+  ]), state.token);
+  terminal.renderInput();
+  const target = state.groupTargets.find(target => target.group === 4);
+  assert.ok(target.row > 1);
+  const row = terminal.inlineBoxTop + target.row;
+  const header = screen.buffer.active.getLine(screen.buffer.active.baseY + row - 1).translateToString(true);
+  assert.ok(header.includes("Flds"));
+  assert.equal(state.isScrollbar(target.row, state.renderedLeft + state.renderedWidth - 1), false);
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: target.from });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: target.from });
+  assert.equal(state.current().label, "Fields0");
+  const heading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+  assert.ok(heading.includes("Fields"));
+  assert.equal(terminal.accepted, undefined);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.accepted.label, "Fields0");
+});
+
 test("provider refresh preserves browsing position and resize cancels an active drag", () => {
   const state = new InlineCompletion(unicode);
   const choices = Array.from({ length: 50 }, (_, i) => item("alpha" + i));
@@ -711,7 +1102,7 @@ test("compact panels fit narrow and short terminals without hiding choices or ca
     assert.ok(lines.some(line => line.translateToString(true).includes("◀ ▶")));
     assert.ok(lines.every(line => !line.isWrapped));
     assert.ok(terminal.renderer.renderedLineCount <= rows);
-    assert.equal(state.hitTest(1, state.renderedLeft + 4).label, "alpha0");
+    assert.equal(state.hitTest(state.bodyTop, state.renderedLeft + 4).label, "alpha0");
   }
 });
 

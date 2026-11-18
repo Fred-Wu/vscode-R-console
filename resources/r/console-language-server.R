@@ -286,6 +286,18 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
             reply$result$isIncomplete <- isTRUE(reply$result$isIncomplete) || length(items) > nmax
         }
     }
+    # The provider returns all formals, including names already entered in this
+    # call. Use lexer-selected tags so missing values and tags after the cursor
+    # work too. Parse quoted names without evaluating any argument expressions.
+    tags <- Filter(function(tag) is.character(tag) && length(tag) == 1L && nzchar(tag), params$rConsoleArgumentTags)
+    if (length(tags)) {
+        supplied <- vapply(tags, function(tag) tryCatch(
+            names(as.list(parse(text = paste0(".fn(", tag, " = NULL)"))[[1L]]))[2L],
+            error = function(e) ""
+        ), character(1))
+        reply$result$items <- Filter(function(item) !identical(item$detail, "parameter") ||
+            !(item$label %in% supplied), reply$result$items)
+    }
     if (isTRUE(params$rConsolePipe)) {
         token <- params$rConsolePrefix
         nmax <- languageserver:::lsp_settings$get("max_completions")

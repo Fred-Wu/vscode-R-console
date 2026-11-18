@@ -313,6 +313,8 @@ export class ConsoleLspClient implements CompletionProvider {
           ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
           ...((call?.argumentTags || call?.argumentValue) && call.operator !== "$" && call.operator !== "@"
             ? { rConsoleCall: call.name } : {}),
+          ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"
+            ? { rConsoleArgumentTags: call.argumentTags } : {}),
           ...(call?.argumentValue && call.operator !== "$" && call.operator !== "@" ? {
             rConsoleArgument: call.argumentValue.name,
             rConsolePrefix: call.argumentValue.prefix.slice(0,

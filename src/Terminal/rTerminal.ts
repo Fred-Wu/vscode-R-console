@@ -1138,6 +1138,15 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.inlinePressedChoice = undefined;
         return;
       }
+      const group = this.inlineCompletion.groupButton(boxRow, action.col);
+      if (group !== undefined) {
+        this.inlinePressedChoice = undefined;
+        if (action.pressed) {
+          this.inlineCompletion.activateGroup(group);
+          this.renderInput();
+        }
+        return;
+      }
       const page = this.inlineCompletion.pageButton(boxRow, action.col);
       if (page !== undefined) {
         this.inlinePressedChoice = undefined;
@@ -2733,7 +2742,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.inlineCompletion.setQuery(/[A-Za-z._][\w.]*$/.exec(inputPrefix)?.[0] ?? "");
     // Keep the active input's physical rows visible when possible by
     // reducing the completion height before resorting to windowing.
-    const availableRows = Math.min(13, this.dimensions.rows - 2, Math.max(5,
+    const availableRows = Math.min(this.dimensions.rows - 2, Math.max(5,
       this.dimensions.rows - plan.renderedRowCount - 1));
     const colors = resolveInlineCompletionColors(isLight, overrides);
     let suggestions = this.mode === "ready" ? this.inlineCompletion.lines(

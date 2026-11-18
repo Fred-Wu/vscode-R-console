@@ -94,6 +94,20 @@ test("typing and accepting functions opens real argument suggestions without ano
     const buffer = screen.buffer.active;
     const visible = Array.from({ length: 24 }, (_, row) => buffer.getLine(buffer.baseY + row).translateToString(true)).join("\n");
     assert.ok(visible.includes("Arguments"), expected);
+    if (typed === "lib") {
+      terminal.applyKeyAction({ type: "tab" });
+      assert.equal(terminal.inputState.textBeforeCursor, "library(package = ");
+      terminal.applyKeyAction({ type: "text", text: ", " });
+      await waitFor(() => choices().some(item => item.insertText === "help = " &&
+        item.snapshotInput === terminal.inputState.currentLine), "next argument after accepting package");
+      assert.ok(!choices().some(item => item.insertText === "package = "), "accepted names must not be offered again");
+      assert.equal(terminal.inlineCompletion.current().insertText, "help = ");
+      terminal.applyKeyAction({ type: "tab" });
+      terminal.applyKeyAction({ type: "text", text: ", " });
+      await waitFor(() => choices().some(item => item.insertText === "pos = " &&
+        item.snapshotInput === terminal.inputState.currentLine), "next argument after accepting help");
+      assert.equal(terminal.inlineCompletion.current().insertText, "pos = ");
+    }
     terminal.dismissInlineCompletion(false);
     terminal.lang.cancelCompletion();
   }
@@ -187,6 +201,37 @@ test("typing and accepting functions opens real argument suggestions without ano
   assert.equal(piped.inputState.textBeforeCursor, '"file.csv" |> read.csv(');
   await waitFor(() => pipeChoices().some(item => item.detail === "parameter"), "arguments after accepting a piped function");
   piped.dismissInlineCompletion(false);
+});
+
+test("real LSP excludes supplied argument names while retaining signature order", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { client } = createConsoleLsp(t);
+  for (const [marked, first, excluded] of [
+    ["library(package = , │)", "help", ["package"]],
+    ["library(package = 'stats', │)", "help", ["package"]],
+    ["base::library(package = , │)", "help", ["package"]],
+    ["library(`package` = , │)", "help", ["package"]],
+    ['library("package" = , │)', "help", ["package"]],
+    ['library("\\u0070ackage" = , │)', "help", ["package"]],
+    ["library(package = ,\n  │)", "help", ["package"]],
+    ["library(package = , help = , │)", "pos", ["package", "help"]],
+    ["library(│, package = )", "help", ["package"]],
+    ["library(package = inner(help = 1), │)", "help", ["package"]],
+    ["library(help = inner(package = 1), │)", "package", ["help"]],
+    ["library(pack│)", "package", []],
+    ["library(packages = , │)", "package", []],
+    ["stats::lm(data = , │)", "formula", ["data"]],
+  ]) {
+    const cursor = marked.indexOf("│");
+    const text = marked.replace("│", "");
+    const before = text.slice(0, cursor).split("\n");
+    const result = await client.provideCompletionItems({ getText: () => text },
+      { line: before.length - 1, character: before.at(-1).length });
+    const parameters = (Array.isArray(result) ? result : result?.items ?? [])
+      .filter(item => item.detail === "parameter").map(item => item.label);
+    assert.equal(parameters[0], first, marked);
+    for (const name of excluded) assert.ok(!parameters.includes(name), `${marked}: exclude ${name}`);
+  }
 });
 
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {

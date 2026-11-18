@@ -526,6 +526,8 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | With `data.table` installed, type `popup_dt[, │]` | Show columns; accepting `alpha` inserts bare `alpha`; accepting `a b` inserts a backtick-quoted name. |
 | With `data.table` installed, type `popup_dt[[│]]` | Accepting `alpha` inserts `"alpha"`, not a bare symbol. |
 | Manually type `library(│)` | Arguments appear without first accepting a function completion. |
+| Accept `package = ` in `library()`, then type `, ` | Omit `package` from argument suggestions and highlight `help`; after accepting `help = ` and typing another comma, highlight `pos`. |
+| Type `library(package = , │)` or `library(│, package = )` | Exclude the supplied `package` name even with an empty value or when it follows the cursor. |
 | Manually type `stats::cor(x, │)` | Arguments appear for the new position, including `method`. |
 | Manually type `stats::cor(↵  x, │)` | Arguments appear on the continuation line. |
 | Type `stats::cor(method = │)` | Offer `pearson`, `kendall`, and `spearman`; accepting a value inserts a quoted string, not another argument name. |
@@ -555,6 +557,20 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | Repeat with `completionUI = quickPick` | No inline pop-ups; explicit completion opens Quick Pick. |
 
 For inline completion, also check:
+
+| Test | Expected behavior |
+| --- | --- |
+| Open a top-level completion list containing several groups; click `Vars`, `R.Fns`, `Pkgs`, or `Fns` at the top | Keep separate rounded button boxes with no inner padding, gaps, or left inset; no blank row above the buttons; keep the panel's own top border separate. Clicking a button jumps to its group; Tab accepts the suggestion. |
+| Reduce the terminal height while group buttons are visible | Keep the buttons compact and clickable. |
+| Scroll partway through a group using the wheel, scrollbar, or footer arrows | Keep its full heading above the visible suggestions and highlight its top button; selection stays unchanged. |
+| Scroll across a group boundary and back | Update the pinned heading and highlighted button to the group at the top of the visible list. |
+| Open a grouped list, then narrow the terminal | Show buttons without top arrows; wrap buttons onto additional rows when needed. |
+| Move the selection bar across groups with Up/Down, then scroll with the wheel | Highlight the selected group's button text during keyboard navigation; highlight the visible group's button text during scrolling; use no button background. |
+| Click the last group's button when it contains only one to three suggestions | Put that group's heading at the top, with its suggestions below; do not fill the space with earlier groups. |
+| Open `stats::` in a sufficiently tall terminal | Show 10 suggestions; headings, details, and controls do not count toward 10. |
+| Jump groups, then use the wheel, scrollbar, footer arrows, and Up/Down | Scrolling and selection remain usable; group controls never accept a suggestion. |
+| Resize a grouped list to a narrow or short terminal | Controls fit; fewer suggestions appear when necessary; the selected suggestion stays visible. |
+| Filter a grouped list down to one group | Remove the group-jump row and update mouse targets correctly. |
 
 - Type `rdcsv` and `utils::rdcsv`: `read.csv` should be offered and inserted correctly.
 - With many suggestions, scroll the wheel, drag the scrollbar to both ends, and

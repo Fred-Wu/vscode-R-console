@@ -369,6 +369,7 @@ test("the LSP client sends qualified input and maps both completion range format
       }
       assert.equal(method, "completion");
       assert.equal(params.text, "stats::filter() + dplyr::filter(si)");
+      assert.deepEqual(params.rConsoleArgumentTags, [null], "the current argument stays eligible for completion");
       assert.deepEqual(params.position, new Position(0, 34));
       const range = new Range(new Position(0, 32), new Position(0, 34));
       return { isIncomplete: false, items: [
