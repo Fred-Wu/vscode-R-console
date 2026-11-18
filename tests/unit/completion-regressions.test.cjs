@@ -284,3 +284,37 @@ test("native pipe parse repairs finish only the destination without duplicating 
     assert.equal(parser.getCompletionParseInsertion(marked.replace("│", ""), marked.indexOf("│")), undefined, marked);
   }
 });
+
+test("Unicode identifiers replace the whole prefix at top level", async () => {
+  for (const prefix of ["α", "αfoo", "变量", "变量foo", "𐐀foo"]) {
+    const text = `x <- ${prefix}`;
+    const context = completion.getCompletionContext(text, text.length);
+    assert.equal(context?.prefix, prefix);
+    assert.equal(context.replaceStart, 5);
+    const name = prefix + "bar";
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { [name]: {} } }, []);
+    const pick = completion.toCompletionPick(entries[0], context);
+    assert.equal(text.slice(0, pick.replaceStart) + pick.insertText, `x <- \`${name}\``);
+  }
+});
+
+test("native bare callable edits enter an existing call and request arguments", t => {
+  for (const [marked, inserted] of [['obj$fu│n(123)', 'fun'], ['obj$fu│(123)', '`fun$1`'],
+    ['outer(obj$fu│ # comment\n (123))', 'fun']]) {
+    const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+    const context = completion.getCompletionContext(text.split('\n')[0], cursor, text.slice(0, cursor), text.slice(cursor));
+    const { terminal } = createTerminal(t);
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    let requestedArguments = false;
+    terminal.scheduleInlineCompletion = () => { requestedArguments = true; };
+    terminal.inputState.text = text;
+    terminal.inputState.cursorPosition = cursor;
+    terminal.applyCompletion(completion.toCompletionPick({ label: inserted, insertText: inserted,
+      kind: 2, source: 'lsp' }, context));
+    assert.equal(terminal.inputState.text, text.slice(0, context.replaceStart) + inserted + text.slice(context.replaceEnd ?? cursor));
+    assert.equal(terminal.inputState.text.slice(terminal.inputState.cursorPosition, terminal.inputState.cursorPosition + 3), '123');
+    assert.equal(requestedArguments, true);
+  }
+});

@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem, getCompletionContext } from "../Language/completion";
-import { getCallOpenings } from "../Language/parser";
+import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
   ANSI,
@@ -2182,26 +2182,29 @@ export class RTerminal implements vscode.Pseudoterminal {
       cursor + selection.replaceEnd - this.inputState.cursorCol;
     const after = input.slice(replacementEnd);
     const cursorInsideEmptyCall = selection.isCallable === true && selection.insertText.endsWith("()");
+    let entersCall = cursorInsideEmptyCall;
     let insertText = selection.insertText;
     let nextInput = before + insertText + after;
     let nextCursor = selectionStart + insertText.length - Number(cursorInsideEmptyCall);
     // Most acceptances have no existing call. Only parse when the suffix can
     // contain one, and inspect the completed name so empty prefixes work too.
-    if (cursorInsideEmptyCall && after.includes("(")) {
-      const callable = insertText.slice(0, -2);
+    if (selection.isCallable === true && after.includes("(")) {
+      const callable = cursorInsideEmptyCall ? insertText.slice(0, -2) : insertText;
       const candidate = before + callable + after;
-      const opening = getCallOpenings(candidate).get(selectionStart + callable.length);
+      const opening = isCallableName(callable)
+        ? getCallOpenings(candidate).get(selectionStart + callable.length) : undefined;
       if (opening !== undefined) {
         insertText = callable;
         nextInput = candidate;
         nextCursor = opening + 1;
+        entersCall = true;
       }
     }
     this.inputState.text = nextInput;
     this.lang.recordCompletion(nextInput, selectionStart, { ...selection, insertText });
     this.inputState.cursorPosition = nextCursor;
     this.inputState.preferredColumn = null;
-    if (cursorInsideEmptyCall || / =\s*$/.test(selection.insertText)) {
+    if (entersCall || / =\s*$/.test(selection.insertText)) {
       // Continue the completion the user accepted, even with no argument typed.
       this.inlineCompletionExplicit = true;
       this.scheduleInlineCompletion();

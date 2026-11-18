@@ -88,7 +88,7 @@ export async function pickCompletion({
     let active = true;
     let prefillTimer: ReturnType<typeof setTimeout> | undefined;
     let request = 0;
-    let blankContextRefined = false;
+    let refinedPrefix: string | undefined;
     let baselineEntries = initialEntries;
     let baselineIncomplete = initialEntries.isIncomplete === true;
     let sourceEntries = initialEntries;
@@ -101,33 +101,24 @@ export async function pickCompletion({
     });
     setQuickPickItems(pick, sourceEntries, "");
     void delayedEntries?.then((nextEntries) => {
-      if (!active || !nextEntries?.length || !isCurrent()) {
-        return;
-      }
-      if (request !== 0) {
+      if (!active || !nextEntries || !isCurrent()) {
         return;
       }
       baselineEntries = nextEntries;
       baselineIncomplete = nextEntries.isIncomplete === true;
+      if (refinedPrefix !== undefined) return;
       sourceEntries = nextEntries;
       sourceIncomplete = baselineIncomplete;
-      setQuickPickItems(pick, sourceEntries, pick.value);
+      void changeValue(pick.value).catch(() => undefined);
     }).catch(() => undefined);
-    pick.onDidChangeValue((value) => void (async () => {
+    const changeValue = async (value: string): Promise<void> => {
       const refinesBlankContext =
         context.prefix.length === 0 &&
         ((context.kind === "default" && (force || !!context.dataObjectName)) ||
           context.kind === "argument" ||
           (context.kind === "bracket" && !!context.dataObjectName));
-      if (value.length === 0 && refinesBlankContext) {
-        blankContextRefined = false;
-        request += 1;
-        sourceEntries = baselineEntries;
-        setQuickPickItems(pick, sourceEntries, value);
-        return;
-      }
-
-      if (context.kind === "package" && value.length === 0) {
+      if (value.length === 0) {
+        refinedPrefix = undefined;
         request += 1;
         sourceEntries = baselineEntries;
         sourceIncomplete = baselineIncomplete;
@@ -139,21 +130,24 @@ export async function pickCompletion({
         value.length > 0 &&
         refinesBlankContext;
       setQuickPickItems(pick, sourceEntries, value);
-      if (context.kind === "package" && value.length > 0 && sourceIncomplete) {
+      if (sourceIncomplete || (refinedPrefix !== undefined && !value.startsWith(refinedPrefix)) ||
+          (refinedPrefix === undefined && context.kind !== "package" && !value.startsWith(context.prefix))) {
+        refinedPrefix = value;
         const currentRequest = ++request;
         await requestRefinedEntries(value, currentRequest);
         return;
       }
       if (refinesEmptyContext) {
-        if (blankContextRefined) {
+        if (refinedPrefix !== undefined && value.startsWith(refinedPrefix)) {
           return;
         }
-        blankContextRefined = true;
+        refinedPrefix = [...value][0];
         const currentRequest = ++request;
-        await requestRefinedEntries(value[0], currentRequest);
+        await requestRefinedEntries(refinedPrefix, currentRequest);
         return;
       }
-    })().catch(() => undefined));
+    };
+    pick.onDidChangeValue(value => void changeValue(value).catch(() => undefined));
     const requestRefinedEntries = async (
       value: string,
       currentRequest: number
@@ -181,7 +175,7 @@ export async function pickCompletion({
         nextContext.triggerCharacter = undefined;
       }
       const nextEntries = await collect(nextContext, nextInputText, lines, cursorCol);
-      if (!nextEntries || !isCurrent()) return;
+      if (!active || !nextEntries || !isCurrent()) return;
       if (currentRequest === request) {
         // LSP edits target the preview, but acceptance edits the actual input.
         const originalEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
@@ -190,6 +184,11 @@ export async function pickCompletion({
           : mergeCompletionEntries(baselineEntries, originalEntries);
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
+        // Typing may have refined a complete baseline while this request was
+        // pending. A truncated reply cannot cover that newer query locally.
+        if (sourceIncomplete && pick.value !== value && pick.value.startsWith(value)) {
+          await changeValue(pick.value);
+        }
       }
     };
     pick.onDidAccept(() => {

@@ -429,5 +429,3 @@ export function isNameAccessor(token: Token | undefined): boolean {
 export function isCompleteIdentifier(token: Token | undefined): boolean {
   return token?.type === TokenType.Identifier && token.closed !== false;
 }
-
-/** A bare or qualified name, without a call, subscript, or other expression. */

@@ -1392,6 +1392,7 @@ test("native member inference owns edits, callable snippets and empty source obj
     ['obj <- list()\nobj$│', []],
     ['obj <- list(alpha = 1)\nobj$missing│', []],
     ['obj <- list(`fun$1` = function(x) NULL)\nobj$fu│', ['`fun$1`()']],
+    ['obj <- list(fun = function(x) NULL)\nobj$fu│n(123)', ['fun']],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     const before = text.slice(0, cursor).split('\n');
@@ -1411,6 +1412,19 @@ test("native member inference owns edits, callable snippets and empty source obj
     if (expected[0] === 'alpha') {
       const pick = completion.toCompletionPick(entries[0], context);
       assert.equal(line.slice(0, pick.replaceStart) + pick.insertText + line.slice(pick.replaceEnd), 'obj$alpha');
+    }
+    if (expected[0] === 'fun') {
+      const { terminal } = require('./helpers/inline-terminal.cjs').createTerminal(t);
+      delete terminal.applyCompletion;
+      terminal.lang.recordCompletion = () => {};
+      let requests = 0;
+      terminal.scheduleInlineCompletion = () => { requests++; };
+      terminal.inputState.text = text;
+      terminal.inputState.cursorPosition = cursor;
+      terminal.applyCompletion(completion.toCompletionPick(entries[0], context));
+      assert.equal(terminal.inputState.text, text);
+      assert.equal(terminal.inputState.text.slice(terminal.inputState.cursorPosition), '123)');
+      assert.equal(requests, 1);
     }
   }
 });

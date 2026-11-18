@@ -11,7 +11,6 @@ import {
   getCompletionContext,
   rankCompletionEntries,
   isCompletionPickItem,
-  needsLanguageServerCompletion,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
@@ -116,16 +115,13 @@ export class RTermLang {
 
       const latestInput = getCurrentInput();
       if (
+        latestInput.text !== input.text || latestInput.cursorRow !== input.cursorRow ||
         latestInput.currentLine !== context.snapshotInput ||
         latestInput.cursorCol !== context.snapshotCursor
       ) {
         return;
       }
 
-      const needsLsp = needsLanguageServerCompletion(context);
-      const needsStagedEntries = needsLsp || (
-        context.kind === "bracket" && !!context.dataObjectName
-      );
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
       let refreshedSessionData: WorkspaceData | undefined;
       void workspaceDataRequest?.then((data) => {
@@ -133,12 +129,8 @@ export class RTermLang {
       }).catch(() => undefined);
 
       let completionProvider: CompletionProvider | undefined;
-      const completionProviderRequest = needsLsp
-        ? this.ensureConsoleLspStarted()
-        : Promise.resolve(undefined);
-      const documentRequest = needsLsp
-        ? this.getOrOpenCompletionDocument(latestInput.text)
-        : Promise.resolve(undefined);
+      const completionProviderRequest = this.ensureConsoleLspStarted();
+      const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
         completionProvider = await completionProviderRequest;
         if (!this.isCurrentCompletionRequest(requestId)) {
@@ -170,8 +162,7 @@ export class RTermLang {
       })();
       // Argument candidates must await LSP parameters; early session-only
       // results would select an unrelated runtime variable.
-      const stagedEntries = needsStagedEntries &&
-        context.kind === "default"
+      const stagedEntries = context.kind === "default"
         ? await collectCompletionEntries(
             context,
             undefined,
@@ -236,11 +227,8 @@ export class RTermLang {
             refreshedRefinedSessionData = data ?? getWorkspaceData();
           }).catch(() => undefined);
 
-          const nextNeedsLsp = needsLanguageServerCompletion(nextContext);
-          const nextDocumentRequest = nextNeedsLsp
-            ? this.getOrOpenCompletionDocument(nextInputText)
-            : Promise.resolve(undefined);
-          if (nextNeedsLsp && !completionProvider) {
+          const nextDocumentRequest = this.getOrOpenCompletionDocument(nextInputText);
+          if (!completionProvider) {
             completionProvider = await this.ensureConsoleLspStarted();
           }
           const nextDocument = await nextDocumentRequest;
@@ -275,6 +263,7 @@ export class RTermLang {
 
       const currentInput = getCurrentInput();
       if (
+        currentInput.text !== latestInput.text || currentInput.cursorRow !== latestInput.cursorRow ||
         currentInput.currentLine !== selection.snapshotInput ||
         currentInput.cursorCol !== selection.snapshotCursor
       ) {

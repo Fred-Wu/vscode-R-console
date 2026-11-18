@@ -112,7 +112,7 @@ export function getCompletionContext(
     };
   }
 
-  const wordMatch = /([a-zA-Z._][a-zA-Z0-9._]*)$/.exec(beforeCursor);
+  const wordMatch = /([\p{L}\p{Nl}._][\p{L}\p{Nl}\p{Nd}._]*)$/u.exec(beforeCursor);
 
   if (!wordMatch) {
     if (dataObjectName) {

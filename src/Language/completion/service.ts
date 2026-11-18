@@ -22,7 +22,7 @@ export async function collectCompletionEntries(
       (isSessionFunctionCall(context, sessionData) &&
         !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator)));
   const includeLspItems =
-    needsLanguageServerCompletion(context) && !!doc && !!position;
+    !!doc && !!position;
   const rawLspItemsRequest =
     !includeLspItems
       ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, memberResolved: false, nativeArguments: false })
@@ -141,10 +141,6 @@ export async function collectCompletionEntries(
     ],
     context.prefix
   )), rawLspResult.isIncomplete);
-}
-
-export function needsLanguageServerCompletion(_context: CompletionContext): boolean {
-  return true;
 }
 
 function asCompletionEntries(

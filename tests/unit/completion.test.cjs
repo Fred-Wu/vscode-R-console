@@ -754,7 +754,6 @@ test("language-server completion starts before a fresh workspace request finishe
         snapshotInput: input,
         snapshotCursor: cursor,
       }),
-      needsLanguageServerCompletion: () => true,
       collectCompletionEntries: async (
         _context,
         _document,
@@ -838,7 +837,6 @@ test("member and package completions do not refresh workspace data", async () =>
     vscode: { Position: TestPosition },
     "../../Language/completion": {
       getCompletionContext: (input) => contexts.get(input),
-      needsLanguageServerCompletion: (context) => context.kind === "package",
       collectCompletionEntries: async () => [],
       getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
@@ -927,7 +925,6 @@ test("F7 refinement starts language-server completion before workspace refresh f
             snapshotInput: input,
             snapshotCursor: cursor,
           },
-      needsLanguageServerCompletion: () => true,
       collectCompletionEntries: async (context) => {
         if (context.prefix === "f") {
           refinedCompletionStarted = true;
@@ -1022,7 +1019,6 @@ test("package completion filters locally without repeated language-server reques
         snapshotInput: "stats::",
         snapshotCursor: 7,
       }),
-      needsLanguageServerCompletion: () => true,
       collectCompletionEntries: async () => {
         completionCalls += 1;
         return [{
@@ -1408,7 +1404,6 @@ test("incomplete package completion re-queries until a complete result arrives",
         snapshotInput: "stats::",
         snapshotCursor: 7,
       }),
-      needsLanguageServerCompletion: () => true,
       collectCompletionEntries: async (context) => {
         completionCalls += 1;
         const entries = [{
@@ -1601,7 +1596,6 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: { Position },
     "../../Language/completion": { ...completion,
-      needsLanguageServerCompletion: () => false,
       collectCompletionEntries: async () => [
         { label: "alpha", insertText: "alpha", source: "session" },
         { label: "apricot", insertText: "apricot", source: "session" },
@@ -1667,7 +1661,7 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
       detail: text === "fun(" ? "parameter" : text === "fun(method = " ? "value for method" : "df" }));
     const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
       vscode: { Position, window: { createQuickPick: () => pick } },
-      "../../Language/completion": { ...completion, needsLanguageServerCompletion: () => false,
+      "../../Language/completion": { ...completion,
         collectCompletionEntries: async () => entries },
       "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
       "../../Language/virtualRDocument": { VirtualRDocument: class {} },
@@ -1714,7 +1708,6 @@ test("function argument completion awaits parameters before offering runtime var
         kind: "argument", prefix: "na", replaceStart: 5,
         snapshotInput: "mean(na", snapshotCursor: 7,
       }),
-      needsLanguageServerCompletion: () => true,
       collectCompletionEntries: async (_context, document) => {
         if (!document) {
           stagedCalls++;
