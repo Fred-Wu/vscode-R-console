@@ -412,6 +412,7 @@ jobs:
     environment: open-vsx
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
@@ -436,6 +437,4 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Publish Open VSX Registry
-        env:
-          OVSX_PAT: ${{ secrets.OPEN_VSX_TOKEN }}
-        run: ./node_modules/.bin/ovsx publish --skip-duplicate --packagePath ./release-artifacts/*.vsix
+        run: ./node_modules/.bin/ovsx publish --trusted-publishing --skip-duplicate --packagePath ./release-artifacts/*.vsix

@@ -53,9 +53,16 @@ trusted build artifact in a reviewed commit before reusing it in another release
 Changes to the Windows manifest, build script, or icon require a Windows runtime version bump.
 
 Open VSX publishes on version-tag pushes and explicit manual runs from `main`.
-For repository-side enforcement, store `OPEN_VSX_TOKEN` as a secret of the
-`open-vsx` GitHub environment, restrict its deployment refs to the `main` branch
-and `v*` tags, and remove the repository-level copy after migration.
+The publish job exchanges its GitHub Actions identity for a short-lived Open VSX token.
+Restrict the `open-vsx` GitHub repository environment to branch `main` and tags
+matching `v*`. In Open VSX, register a GitHub Actions trusted publisher for
+`RConsole.vsc-r-console` with owner `Fred-Wu`, repository `vscode-R-console`,
+workflow filename `release.yml`, and environment `open-vsx` before the first
+trusted publish. [Open VSX Trusted Publishers](https://open-vsx.org/user-settings/trusted-publishers)
+
+After a successful trusted publish, remove any old `OPEN_VSX_TOKEN` entries
+from GitHub repository secrets and the `open-vsx` repository environment.
+Revoke the old token in Open VSX if it was dedicated to this workflow.
 
 ## Implementation and Testing
 
