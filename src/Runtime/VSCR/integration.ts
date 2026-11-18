@@ -21,7 +21,6 @@ export interface VscodeRSessionIntegration {
   getDisplayPid(): number | undefined;
   getCachedWorkspaceData(): WorkspaceData | undefined;
   requestWorkspaceData(): Promise<WorkspaceData | undefined>;
-  refreshWorkspaceData(): void;
   requestMemberCompletions(
     expression: string,
     operator: "$" | "@"
@@ -59,8 +58,6 @@ export abstract class BaseVscodeRSessionIntegration
   async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
     return undefined;
   }
-
-  refreshWorkspaceData(): void {}
 
   async requestMemberCompletions(
     _expression: string,

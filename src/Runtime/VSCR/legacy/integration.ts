@@ -90,10 +90,6 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return await this.watcher.requestWorkspaceData();
   }
 
-  override refreshWorkspaceData(): void {
-    this.watcher.refresh();
-  }
-
   override async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"

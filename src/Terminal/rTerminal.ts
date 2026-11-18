@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem, getCompletionContext } from "../Language/completion";
+import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
   ANSI,
@@ -648,6 +649,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.escPendingClear = false;
     this.expandForEdit();
     this.inputState.insertText(` ${this.pipeOperator} `);
+    this.scheduleInlineCompletion();
     this.renderInput();
   }
 
@@ -1134,6 +1136,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       if (!action.pressed && this.inlineCompletion.dragging) {
         this.inlineCompletion.endScroll();
         this.inlinePressedChoice = undefined;
+        return;
+      }
+      const group = this.inlineCompletion.groupButton(boxRow, action.col);
+      if (group !== undefined) {
+        this.inlinePressedChoice = undefined;
+        if (action.pressed) {
+          this.inlineCompletion.activateGroup(group);
+          this.renderInput();
+        }
         return;
       }
       const page = this.inlineCompletion.pageButton(boxRow, action.col);
@@ -2097,14 +2108,17 @@ export class RTerminal implements vscode.Pseudoterminal {
     const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
     if (!this.inlineCompletion.visible && !typing) return;
     const input = this.getInputSnapshot();
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor);
+    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
+    this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    if (typing && !this.inlineCompletionExplicit && (!context || [...context.prefix].length < minimum)) {
+    if (context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
+        !context?.autoTrigger && (!context || [...context.prefix].length < minimum))) {
       this.dismissInlineCompletion(false);
       return;
     }
-    const refined = this.lang.refineInlineCompletion(input);
+    const refined = this.lang.refineInlineCompletion(input, context);
     if (refined) {
       this.inlineCompletion.set(refined, this.inlineCompletion.token, context?.prefix ?? "");
     }
@@ -2133,7 +2147,12 @@ export class RTerminal implements vscode.Pseudoterminal {
       force,
       applyCompletion: selection => this.applyCompletion(selection),
       onInlineEntries: items => {
-        if (this.mode !== "ready" || !this.inlineCompletion.set(items, token, this.getInputSnapshot().currentLine.slice(0, this.inputState.cursorCol).match(/[A-Za-z._][\w.]*$/)?.[0] ?? "")) return;
+        if (this.mode !== "ready" || this.inlineCompletionMode() !== "inline" ||
+            token !== this.inlineCompletion.token) return;
+        const input = this.getInputSnapshot();
+        const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+          input.text.slice(input.textBeforeCursor.length));
+        if (!this.inlineCompletion.set(items, token, context?.prefix ?? "")) return;
         this.renderInput();
       },
     });
@@ -2156,23 +2175,36 @@ export class RTerminal implements vscode.Pseudoterminal {
     const selectionStart = this.inputState.translateRowColToIndex(
       this.inputState.cursorRow, selection.replaceStart
     );
-    const currentLine = this.inputState.currentLine;
-    const before = currentLine.slice(0, selection.replaceStart);
-    const after = currentLine.slice(this.inputState.cursorCol);
-    const newLine = `${before}${selection.insertText}${after}`;
-
-    const lines = this.inputState.lines;
-    lines[this.inputState.cursorRow] = newLine;
-
-    const cursorInsideEmptyCall = selection.insertText.endsWith("()") ? 1 : 0;
-    const newCursorCol = before.length + selection.insertText.length - cursorInsideEmptyCall;
-    this.inputState.text = lines.join("\n");
-    this.lang.recordCompletion(this.inputState.text, selectionStart, selection);
-    this.inputState.cursorPosition = this.inputState.translateRowColToIndex(
-      this.inputState.cursorRow,
-      newCursorCol
-    );
-    if (cursorInsideEmptyCall) {
+    const input = this.inputState.text;
+    const cursor = this.inputState.cursorPosition;
+    const before = input.slice(0, selectionStart);
+    const replacementEnd = selection.replaceEnd === undefined ? cursor :
+      cursor + selection.replaceEnd - this.inputState.cursorCol;
+    const after = input.slice(replacementEnd);
+    const cursorInsideEmptyCall = selection.isCallable === true && selection.insertText.endsWith("()");
+    let entersCall = cursorInsideEmptyCall;
+    let insertText = selection.insertText;
+    let nextInput = before + insertText + after;
+    let nextCursor = selectionStart + insertText.length - Number(cursorInsideEmptyCall);
+    // Most acceptances have no existing call. Only parse when the suffix can
+    // contain one, and inspect the completed name so empty prefixes work too.
+    if (selection.isCallable === true && after.includes("(")) {
+      const callable = cursorInsideEmptyCall ? insertText.slice(0, -2) : insertText;
+      const candidate = before + callable + after;
+      const opening = isCallableName(callable)
+        ? getCallOpenings(candidate).get(selectionStart + callable.length) : undefined;
+      if (opening !== undefined) {
+        insertText = callable;
+        nextInput = candidate;
+        nextCursor = opening + 1;
+        entersCall = true;
+      }
+    }
+    this.inputState.text = nextInput;
+    this.lang.recordCompletion(nextInput, selectionStart, { ...selection, insertText });
+    this.inputState.cursorPosition = nextCursor;
+    this.inputState.preferredColumn = null;
+    if (entersCall || / =\s*$/.test(selection.insertText)) {
       // Continue the completion the user accepted, even with no argument typed.
       this.inlineCompletionExplicit = true;
       this.scheduleInlineCompletion();
@@ -2717,11 +2749,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     const isLight = vscode.window.activeColorTheme?.kind === vscode.ColorThemeKind?.Light;
     const overrides = vscode.workspace.getConfiguration("workbench")
       .get<Record<string, unknown>>("colorCustomizations", {});
-    const inputPrefix = this.inputState.currentLine.slice(0, this.inputState.cursorCol);
-    this.inlineCompletion.setQuery(/[A-Za-z._][\w.]*$/.exec(inputPrefix)?.[0] ?? "");
     // Keep the active input's physical rows visible when possible by
     // reducing the completion height before resorting to windowing.
-    const availableRows = Math.min(13, this.dimensions.rows - 2, Math.max(5,
+    const availableRows = Math.min(this.dimensions.rows - 2, Math.max(5,
       this.dimensions.rows - plan.renderedRowCount - 1));
     const colors = resolveInlineCompletionColors(isLight, overrides);
     let suggestions = this.mode === "ready" ? this.inlineCompletion.lines(

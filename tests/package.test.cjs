@@ -27,6 +27,7 @@ test("VSIX contains the extension, R scripts, and exactly the staged runtime", a
   });
   for (const name of ["dist/extension.js", "dist/historyWorker.js", "package.json", "package.nls.json", "changelog.md",
     "resources/r/console-profile.R", "resources/r/console-language-server.R",
+    "resources/r/completion-source.R", "resources/r/completion-arguments.R", "resources/r/completion-provider.R",
     "resources/r/VSCR/legacy.R"]) {
     assert.ok(entries.get(`extension/${name}`)?.uncompressedSize > 0, name);
   }

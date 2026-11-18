@@ -32,7 +32,15 @@ function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
         asCloseTextDocumentParams: (doc) => ({ textDocument: identifier(doc) }),
         asCompletionParams: (doc, position, context) => ({ textDocument: identifier(doc), position, context }),
       };
-      this.protocol2CodeConverter = { asCompletionResult: async (result) => result };
+      this.protocol2CodeConverter = { asCompletionResult: async (result) => {
+        for (const item of Array.isArray(result) ? result : result?.items ?? []) {
+          if (item.textEdit) {
+            item.range = new Range(item.textEdit.range.start, item.textEdit.range.end);
+            item.insertText = item.insertTextFormat === 2 ? { value: item.textEdit.newText } : item.textEdit.newText;
+          }
+        }
+        return result;
+      } };
     }
     isRunning() { return this.running; }
     async start() {

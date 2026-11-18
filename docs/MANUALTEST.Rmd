@@ -455,6 +455,82 @@ Expected:
 
 ## 12. Completion And Session Watcher
 
+### Completion source contract
+
+Check both inline and Quick Pick. `│` marks the cursor. Assert the allowed
+items **and the absence of unrelated items**, including with session variables
+and recent commands populated.
+
+R's [completion documentation](https://www.stat.ethz.ch/R-manual/R-devel/library/utils/html/rcompgen.html)
+distinguishes basic symbol lookup from contextual completion and suppresses
+basic lookup for empty tokens. Member, namespace, argument, package, help,
+and filename completion have separate rules. The console applies that boundary
+to its session and recent-input supplements as well as the language server.
+
+| Cursor context | Console contract |
+| --- | --- |
+| `obj$│`, `obj@│`, including chains | Members or slots of the receiver; no unrelated history names. |
+| `pkg::│`, `pkg:::│` | Symbols from the requested namespace; no session or history additions. |
+| `f(│)`, `f(x, │)` | Available argument names, including `...` for variadic functions, and declared choices; contextual data fields where applicable. No ambient symbols on an empty token. |
+| `f(arg = │)` | Declared values and applicable data fields; no argument tags or ambient symbols. |
+| `f(arg = va│)`, `f(va│)` | Matching expression symbols; argument tags only at an argument-name position. |
+| `f(arg = "│")` | Declared literal choices only; no variable/function names. |
+| `base::atan2(1, 2, │)` | No suggestions when a known fixed signature is exhausted. Unknown signatures and `...` must not be classified as exhausted. |
+| `lst[[│]]`, `lst[│]`, `df[, │]` | Receiver names for the applicable dimension and available subscript-method arguments; no ambient symbol dump. |
+| `lst[[ind│]]` | Matching index variables/history and receiver names; preserve the console's restriction on generic LSP symbols in `[[`. |
+| `lst[["│"]]` | Literal receiver names only. |
+| `x[x│]`, `DT[D│]` | Matching expression symbols remain eligible, including the receiver. No type/name blacklist. |
+| `DT[, │]`, `DT[, .N, │]` for a data.table | Fields and unused arguments read from the installed method (`by`, `keyby`, `.SDcols`, etc.) in separate groups. |
+| `DT[, keyby = │]` | Values supplied by the R provider; no argument-name insertions or guessed field/special-symbol lists. |
+| Named subscript values | Preserve native provider inference and matching visible symbols; method formals alone do not describe value semantics. |
+| `DT[, fca│]` with data.table attached | Matching visible functions, including `fcase`; do not dump all functions into an empty slot. |
+| Custom S3/S4 subscript method | Inspect the applicable receiver method for arguments; never execute the method, defaults or index expressions. S4 inference uses receiver class and `ANY` for unknown index types. |
+| Data-mask expression, empty token | Relevant fields and call arguments; no ambient symbol dump. |
+| Data-mask expression, typed token | Matching fields and expression symbols. |
+| `df \|> print(│)`, `stats::filter(df, │)` | Function arguments; passing a frame does not establish a data mask. |
+| Pipe destination | Callable candidates; member/namespace operators switch to their own contexts. |
+| Ordinary typed expression | Matching language-server, session, and recent-input symbols. |
+| Comment, raw string, unsupported literal context | No generic code suggestions. |
+
+The [R indexing reference](https://stat.ethz.ch/R-manual/R-devel/library/base/html/Extract.html)
+allows computed indices and class-specific methods;
+[data.table](https://rdatatable.gitlab.io/data.table/reference/data.table.html)
+also permits table/list indices and evaluates expressions against columns.
+Consequently a receiver-name or atomic-type blacklist is incorrect.
+[dplyr's programming guide](https://dplyr.tidyverse.org/articles/programming.html)
+distinguishes data masking from tidy selection; field inference must follow
+the active scope, not a completed earlier call. A pipe inserts an argument; it does not itself
+create a data mask ([R pipe semantics](https://stat.ethz.ch/R-manual/R-devel/library/base/html/pipeOp.html)).
+
+Console-specific choices include explicit top-level browsing, callable discovery
+at an empty pipe destination, filtering already supplied arguments, and the
+restricted generic LSP source in `[[`. These are product rules, not requirements
+imposed by R. Native member/value information from
+[languageserver](https://github.com/REditorSupport/languageserver/blob/master/R/completion.R)
+takes precedence over runtime fallback. Specialized installed-package, dataset,
+help, and filename suggestions depend on provider support; generic history
+items are not substitutes for those providers. This matrix does not promise
+inference for arbitrary user-defined evaluation methods.
+
+The reference completer intentionally retains `...` as a variadic indicator and
+does not remove supplied arguments. Our supplied-argument/exhaustion filtering,
+restricted `[[` sources, grouped presentation, and sorting are console policies,
+not R requirements. Forwarded `...` has unknown contents: keep remaining argument
+names available without counting it as a known positional argument or evaluating the caller.
+The table above specifies console behavior, not full parity with `utils` completion.
+
+Subscript arguments are read from installed receiver methods rather than a
+fixed package option list. The supplement does not encode package-specific
+argument roles, mutually exclusive options, or special-symbol scopes. Those
+belong to the R provider. R's reference completer supplies visible names for
+typed tokens but does not enumerate a special-symbol list at an empty subscript.
+Method discovery needs the live receiver; unavailable runtime metadata falls
+back to known fields without inventing signatures. Named method values require
+native inference: a formal argument name alone does not tell us whether its
+value is a column expression, a string, or another option.
+
+### Session checks
+
 Before running the setup below, open a fresh R Console, immediately type
 `stats::l`, and press Tab. Repeat with inline suggestions triggered by typing.
 Suggestions should include `lm` on the first request. The `R Console Language
@@ -469,7 +545,128 @@ automatically. Dismiss completion immediately after accepting the match to
 check that it cancels pending argument suggestions. In manual trigger mode,
 argument suggestions should wait for an explicit completion request.
 
+Repeat with `stats::lm`, `stats:::lm`, and these session-only callables:
+
+```{r qualified-completion-setup}
+completion_obj <- list(lm = function(member_arg, optional = 1) NULL, field = 1)
+methods::setClass("CompletionExample", slots = c(lm = "function"))
+completion_slot <- methods::new("CompletionExample", lm = function(slot_arg) NULL)
+```
+
+- Complete `completion_obj$l` and `completion_slot@l`: insert `lm()`, put the
+  cursor inside, and offer `member_arg` / `slot_arg`, respectively. Namespace
+  `lm()` calls should offer `formula` and `data` instead.
+- Completing `completion_obj$f` must insert `field` without parentheses.
+- Put the cursor after the partial name in `completion_obj$l()` and
+  `completion_obj$l (123)`, then request and accept completion. Preserve the
+  existing parentheses and arguments, placing the cursor just inside the call.
+- Repeat in manual Tab mode: arguments must wait for another Tab. In typing
+  mode, Escape after accepting the function must cancel argument suggestions,
+  including delayed results.
+
+In a fresh console, execute `print <- function(x, custom_arg) NULL`, then repeat
+these checks in inline and Quick Pick modes. The `│` marks the cursor; leave the
+test input unsubmitted.
+
+| Input | Expected |
+| --- | --- |
+| `print(data.frame(a = 1), │)` | Offer only `custom_arg`; the positional value already fills `x`, just as an explicit `x =` would. |
+| `print(x = data.frame(a = 1), │)` | Offer only `custom_arg`; the explicitly supplied `x` cannot be offered again. |
+| `{ print <- function(x, source_arg) NULL; print(data.frame(a = 1), │) }` | Offer only `source_arg`, with no filled `x`, live `custom_arg`, or inferred package-method arguments. |
+| `{ print <- function(x, source_arg) NULL; print(x = data.frame(a = 1), │) }` | Offer only `source_arg`. |
+| `{ print <- get("identity"); print(data.frame(a = 1), │) }` | The source binding has an unknown signature; do not borrow live or package argument names. |
+| `base::print(data.frame(a = 1), │)` | Keep package-method arguments such as `digits`; do not use the session's `custom_arg`. |
+
+### Automatic Completion Cases
+
+Settings: `completionUI = inline`, `inlineCompletion.trigger = typing`,
+`inlineCompletion.minCharacters = 3`, `autoMatch = true`.
+`│` marks the cursor; `↵` means a newline. Do not type these markers.
+
+```{r automatic-completion-setup}
+popup_df <- data.frame(alpha = 1:3, beta = 4:6)
+popup_df[["a b"]] <- 7:9
+popup_obj <- list(data = popup_df,
+                 choose = function(method = c("alpha", "beta"), other = "wrong_value") NULL)
+popup_nested <- list(popup_df)
+if (requireNamespace("data.table", quietly = TRUE)) {
+  popup_dt <- data.table::as.data.table(popup_df)
+}
+```
+
+| Test | Expected behavior |
+| --- | --- |
+| Type `lib`, accept `library()` | Insert `library(│)`; argument suggestions open without another keypress. |
+| Type `stats::│` | Exported package members appear automatically. |
+| Type `stats:::│` | Package members, including internal functions, appear automatically. |
+| Accept `lm()` from either namespace list | Insert one pair of parentheses; place the cursor inside; offer `formula`, `data`, and other arguments. |
+| Type `completion_obj$│` | Show `lm` and `field`; accepting `lm` inserts `lm(│)` and offers `member_arg` and `optional`. |
+| Type `completion_slot@│` | Show `lm`; accepting it inserts `lm(│)` and offers `slot_arg`. |
+| Accept `field` from `completion_obj$│` | Insert `field` without parentheses. |
+| Complete `completion_obj$l│(123)` | Preserve `(123)`; place the cursor immediately after `(`; no duplicate parentheses. |
+| Type `popup_df[│]` | Names appear automatically; accepting `alpha` produces `popup_df["alpha"]`. |
+| Type `popup_df[, │]` | Column names appear automatically; accepting `alpha` produces `popup_df[, "alpha"]`. |
+| Type `popup_df[[│]]` | Element names appear automatically; accepting `alpha` produces `popup_df[["alpha"]]`. |
+| Run `index <- "beta"`; type `popup_df[[ind│]]` | Offer `index` as an index expression; exclude unrelated package/global LSP matches such as `find` and `cbind`. Matching element names remain available. |
+| Type `popup_df[["│"]]` or `popup_df[['│']]` | Show names including `a b`; insert inside the existing quotes without duplicating them. |
+| Type `popup_df[, "│"]` | Column names appear; accepting `a b` produces `popup_df[, "a b"]`. |
+| Type `popup_obj$data[[│]]` | Show names from `popup_obj$data`, including `alpha`, `beta`, and `a b`. |
+| Type `popup_nested[[1]][[│]]` | Show names from the first nested object; accepting `alpha` inserts `"alpha"`. |
+| Type `popup_obj$data[[↵  │]]` | Names appear on the continuation line; accepting one preserves the newline and brackets. |
+| With `data.table` installed, type `popup_dt[, │]` | Show columns; accepting `alpha` inserts bare `alpha`; accepting `a b` inserts a backtick-quoted name. |
+| With `data.table` installed, type `popup_dt[[│]]` | Accepting `alpha` inserts `"alpha"`, not a bare symbol. |
+| Type `data.frame(│)` or `data.frame(..., row.names = NULL, │)` | Keep `...` in Arguments to indicate additional arguments; accepting it inserts bare `...`, without ` = `. Supplied named arguments remain excluded. Repeat with a source-defined and session-only variadic function. |
+| Manually type `library(│)` | Arguments appear without first accepting a function completion. |
+| Accept `package = ` in `library()`, then type `, ` | Omit `package` from argument suggestions and highlight `help`; after accepting `help = ` and typing another comma, highlight `pos`. |
+| Type `library(package = , │)` or `library(│, package = )` | Exclude the supplied `package` name even with an empty value or when it follows the cursor. |
+| Manually type `stats::cor(x, │)` | Arguments appear for the new position, including `method`. |
+| Type `base::atan2(1, 2, │)` or `base::atan2(y = 1, x = 2, │)` | No suggestions: the fixed signature is exhausted; runtime variables/functions must not reopen the list. Repeat with `1 \|> base::atan2(2, │)` and a session-defined two-argument function. |
+| Type `base::Sys.time(│)`, then compare `base::list(1, 2, ind│)` with `index` defined | The known zero-argument function has no suggestions; the variadic function retains matching expression suggestions once a token is typed. Unknown signatures must not be treated as exhausted. |
+| Manually type `stats::cor(↵  x, │)` | Arguments appear on the continuation line. |
+| Type `stats::cor(method = │)` | Offer `pearson`, `kendall`, and `spearman`; accepting a value inserts a quoted string, not another argument name. |
+| Type `stats::cor(method = "│")` or `stats::cor(method = '│')` | Offer known values; preserve the existing quotes when accepting one. |
+| Type `stats::cor(method = popup_df[["│"]])` | Show the data frame's names only; outer-call parameters and method choices must not leak into the subscript. |
+| Type `stats::cor(method = sp│)` | Offer `spearman`; accepting it replaces `sp` with `"spearman"`. |
+| Accept `method = ` from `stats::cor(x, │)` | Known values appear automatically without another keypress. |
+| Type `popup_obj$choose(method = │)` | Offer `alpha` and `beta`; do not offer `wrong_value` from `other`. |
+| Type `subset(popup_df, │)` | Show columns alongside applicable function arguments. |
+| Type `popup_df \|> subset(│)` | Show columns alongside applicable function arguments. |
+| Type `popup_df \|> │` or `popup_df %>% │` | Function suggestions appear automatically. |
+| Run **Insert Pipe Operator** after `popup_df` | Insert the configured pipe and open function suggestions. |
+| Type `"file.csv" \|> rdcsv`, accept `read.csv()` | Insert `read.csv(│)` after the pipe and automatically show arguments. |
+| Type the first one or two characters in an open contextual list | Keep the list open and filter candidates below the ordinary three-character threshold. |
+| Type bare `li`, then `lib` | No automatic list for `li`; suggestions appear at `lib`. |
+| Open `stats::│`, or `data.table::│` when installed | Separate functions, variables, and other available kinds into groups; show group buttons when multiple groups exist. Suggestions are alphabetical within each group. |
+| Type `data.table::set│`, then repeat with `:::` and in Quick Pick | Exact matches precede prefix matches; equally strong matches are alphabetical (`setattr` before `setDT`), not ordered by name length. Filtering and clearing preserve groups. |
+| With data.table attached, type `test[, .│]`, navigate to a function, then type `N` | Select the first suggestion in the displayed grouped list and scroll back to the beginning; do not retain the old function selection. Explicit navigation survives asynchronous updates only while the query stays unchanged. |
+| Open `stats::lm(│)` | Arguments start with `formula`, `data`, `subset`, `weights`, in signature order. |
+| Run `order_df <- data.frame(zebra = 1, alpha = 2, beta = 3)`; open `order_df$│`, `order_df[│]`, `order_df[[│]]`, or `order_df[, │]` | Columns remain `zebra`, `alpha`, `beta`, in object order. |
+| Open `subset(order_df, │)` or `order_df \|> subset(│)` | Columns retain object order; function arguments retain signature order. |
+| Type `b` in any of those column lists | Matching columns remain `zebra`, `beta`, in object order. |
+| Run `order_obj <- list(choose = function(method = c("zebra", "alpha", "beta")) NULL)`; open `order_obj$choose(method = │)` | Values remain `zebra`, `alpha`, `beta`, in declared order. |
+| Press Escape immediately after a trigger, then wait | Cancel the pending request; no delayed pop-up. |
+| Press Escape after a list appears | Close it; late results do not reopen it. |
+| Type `# popup_df[[│`, `"popup_df[[│`, or `fun("abc│` | No automatic pop-up inside comments or unrelated strings. |
+| Type `(│)`, `if (│)`, `x <- │`, or `fun(x = 1 + │)` | No empty-prefix contextual pop-up. |
+| Move the cursor into brackets or recall an input from history | No automatic pop-up from navigation alone. |
+| Repeat the trigger cases with `inlineCompletion.trigger = tab` | No automatic pop-ups; Tab requests suggestions. Function and parameter acceptance wait for another Tab before follow-up suggestions. |
+| Repeat with `completionUI = quickPick` | No inline pop-ups; explicit completion opens Quick Pick. |
+
 For inline completion, also check:
+
+| Test | Expected behavior |
+| --- | --- |
+| Open a top-level completion list containing several groups; click `Vars`, `R.Fns`, `Pkgs`, or `Fns` at the top | Keep separate rounded button boxes with no inner padding, gaps, or left inset; no blank row above the buttons; keep the panel's own top border separate. Clicking a button jumps to its group; Tab accepts the suggestion. |
+| Reduce the terminal height while group buttons are visible | Keep the buttons compact and clickable. |
+| Scroll partway through a group using the wheel, scrollbar, or footer arrows | Keep its full heading above the visible suggestions and highlight its top button; selection stays unchanged. |
+| Scroll across a group boundary and back | Update the pinned heading and highlighted button to the group at the top of the visible list. |
+| Open a grouped list, then narrow the terminal | Show buttons without top arrows; wrap buttons onto additional rows when needed. |
+| Move the selection bar across groups with Up/Down, then scroll with the wheel | Highlight the selected group's button text during keyboard navigation; highlight the visible group's button text during scrolling; use no button background. |
+| Click the last group's button when it contains only one to three suggestions | Put that group's heading at the top, with its suggestions below; do not fill the space with earlier groups. |
+| Open `stats::` in a sufficiently tall terminal | Show 10 suggestions; headings, details, and controls do not count toward 10. |
+| Jump groups, then use the wheel, scrollbar, footer arrows, and Up/Down | Scrolling and selection remain usable; group controls never accept a suggestion. |
+| Resize a grouped list to a narrow or short terminal | Controls fit; fewer suggestions appear when necessary; the selected suggestion stays visible. |
+| Filter a grouped list down to one group | Remove the group-jump row and update mouse targets correctly. |
 
 - Type `rdcsv` and `utils::rdcsv`: `read.csv` should be offered and inserted correctly.
 - With many suggestions, scroll the wheel, drag the scrollbar to both ends, and
@@ -482,7 +679,7 @@ For inline completion, also check:
   remains for one candidate and the footer. Only the selected item's details
   should appear when the panel has room for them.
 - Set `r.console.inlineCompletion.minCharacters` to `3` in inline/typing mode.
-  `df_test$al` should not open automatically; `df_test$alp` should. Tab should
+  Bare `li` should not open automatically; `lib` should. Tab should
   still open suggestions below the threshold. Manual mode and Quick Pick should
   be unaffected. The default is `3`; `1` starts at the first typed character.
 - Disable `r.console.inlineCompletion.acceptOnEnter`: Enter should submit the

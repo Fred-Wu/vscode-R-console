@@ -1,17 +1,16 @@
+import { pickCompletion } from "./completionPicker";
+import { refineCompletionEntries } from "../../Language/completion/refinement";
 import * as vscode from "vscode";
 import {
   type CompletionEntries,
   type CompletionContext,
-  type CompletionEntry,
   type CompletionProvider,
   type RuntimeMemberCompletionRequester,
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
-  getCompletionIdentityKey,
   rankCompletionEntries,
   isCompletionPickItem,
-  needsLanguageServerCompletion,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
@@ -91,7 +90,8 @@ export class RTermLang {
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
-      input.textBeforeCursor
+      input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length)
     ) ?? (force
       ? {
           kind: "default" as const,
@@ -101,7 +101,7 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
-    if (!context) {
+    if (!context || context.suppressAutomatic) {
       onInlineEntries?.([]);
       return;
     }
@@ -115,16 +115,13 @@ export class RTermLang {
 
       const latestInput = getCurrentInput();
       if (
+        latestInput.text !== input.text || latestInput.cursorRow !== input.cursorRow ||
         latestInput.currentLine !== context.snapshotInput ||
         latestInput.cursorCol !== context.snapshotCursor
       ) {
         return;
       }
 
-      const needsLsp = needsLanguageServerCompletion(context);
-      const needsStagedEntries = needsLsp || (
-        context.kind === "bracket" && !!context.dataObjectName
-      );
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
       let refreshedSessionData: WorkspaceData | undefined;
       void workspaceDataRequest?.then((data) => {
@@ -132,12 +129,8 @@ export class RTermLang {
       }).catch(() => undefined);
 
       let completionProvider: CompletionProvider | undefined;
-      const completionProviderRequest = needsLsp
-        ? this.ensureConsoleLspStarted()
-        : Promise.resolve(undefined);
-      const documentRequest = needsLsp
-        ? this.getOrOpenCompletionDocument(latestInput.text)
-        : Promise.resolve(undefined);
+      const completionProviderRequest = this.ensureConsoleLspStarted();
+      const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
         completionProvider = await completionProviderRequest;
         if (!this.isCurrentCompletionRequest(requestId)) {
@@ -169,8 +162,7 @@ export class RTermLang {
       })();
       // Argument candidates must await LSP parameters; early session-only
       // results would select an unrelated runtime variable.
-      const stagedEntries = needsStagedEntries &&
-        context.kind !== "package" && context.kind !== "argument"
+      const stagedEntries = context.kind === "default"
         ? await collectCompletionEntries(
             context,
             undefined,
@@ -211,7 +203,7 @@ export class RTermLang {
           if (current.text !== latestInput.text || current.cursorRow !== latestInput.cursorRow ||
               current.cursorCol !== context.snapshotCursor) return;
           this.inlineCache = { input: latestInput, context, entries: results };
-          onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix), context));
+          onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix, context), context));
         };
         if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries);
         if (opensBeforeFullResults) {
@@ -222,165 +214,11 @@ export class RTermLang {
         return;
       }
 
-      const completionPlaceHolder = "R console completions";
-      const shouldPrefillQuickPick =
-        context.prefix.length > 0 &&
-        context.kind !== "package" &&
-        context.kind !== "member";
-      const prefillQuickPick = (pick: vscode.QuickPick<vscode.QuickPickItem>): void => {
-        if (!shouldPrefillQuickPick) {
-          return;
-        }
-        setTimeout(() => { if (pick.value.length === 0) { pick.value = context.prefix; } }, 0);
-      };
-      const searchValue = (value: string): string => {
-        if (context.kind === "package" && value.length > 0 && !value.startsWith(context.prefix)) {
-          return context.prefix + value;
-        }
-        return value;
-      };
-      const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
-        rankCompletionEntries(sourceEntries, searchValue(value));
-      const mergeCompletionEntries = (
-        firstEntries: CompletionEntry[],
-        secondEntries: CompletionEntry[]
-      ): CompletionEntry[] => {
-        const seen = new Set<string>();
-        const merged: CompletionEntry[] = [];
-        const entries = [...firstEntries, ...secondEntries];
-        for (const entry of entries) {
-          const key = getCompletionIdentityKey(entry);
-          if (seen.has(key)) {
-            continue;
-          }
-          seen.add(key);
-          merged.push(entry);
-        }
-        return merged;
-      };
-      const quickPickContext = (value: string) => ({
-        ...context,
-        prefix: searchValue(value),
-        snapshotInput: latestInput.currentLine,
-        snapshotCursor: latestInput.cursorCol,
-      });
-      const toGroupedItems = (
-        sourceEntries: CompletionEntry[],
-        value: string
-      ): vscode.QuickPickItem[] => toCompletionQuickPickItems(
-        filterEntries(sourceEntries, value),
-        quickPickContext(value)
-      );
-      const setQuickPickItems = (
-        pick: vscode.QuickPick<vscode.QuickPickItem>,
-        sourceEntries: CompletionEntry[],
-        value: string
-      ): void => {
-        const items = toGroupedItems(sourceEntries, value);
-        pick.items = items;
-        const firstCompletion = items.find(isCompletionPickItem);
-        if (firstCompletion) {
-          pick.activeItems = [firstCompletion];
-        }
-      };
-      const showCompletionQuickPick = async (
-        initialEntries: CompletionEntries,
-        delayedEntries?: typeof fullEntriesPromise
-      ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
-        const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
-        let active = true;
-        let request = 0;
-        let blankContextRefined = false;
-        let baselineEntries = initialEntries;
-        let baselineIncomplete = initialEntries.isIncomplete === true;
-        let sourceEntries = initialEntries;
-        let sourceIncomplete = baselineIncomplete;
-        Object.assign(pick, {
-          matchOnDescription: false,
-          matchOnDetail: false,
-          sortByLabel: false,
-          placeholder: completionPlaceHolder,
-        });
-        setQuickPickItems(pick, sourceEntries, "");
-        void delayedEntries?.then((nextEntries) => {
-          if (!active || !nextEntries?.length || !this.isCurrentCompletionRequest(requestId)) {
-            return;
-          }
-          if (request !== 0) {
-            return;
-          }
-          baselineEntries = nextEntries;
-          baselineIncomplete = nextEntries.isIncomplete === true;
-          sourceEntries = nextEntries;
-          sourceIncomplete = baselineIncomplete;
-          setQuickPickItems(pick, sourceEntries, pick.value);
-        }).catch(() => undefined);
-        pick.onDidChangeValue((value) => void (async () => {
-          const refinesBlankContext =
-            context.prefix.length === 0 &&
-            ((context.kind === "default" && (force || !!context.dataObjectName)) ||
-              context.kind === "argument" ||
-              (context.kind === "bracket" && !!context.dataObjectName));
-          if (value.length === 0 && refinesBlankContext) {
-            blankContextRefined = false;
-            request += 1;
-            sourceEntries = baselineEntries;
-            setQuickPickItems(pick, sourceEntries, value);
-            return;
-          }
-
-          if (context.kind === "package" && value.length === 0) {
-            request += 1;
-            sourceEntries = baselineEntries;
-            sourceIncomplete = baselineIncomplete;
-            setQuickPickItems(pick, sourceEntries, value);
-            return;
-          }
-
-          const refinesEmptyContext =
-            value.length > 0 &&
-            refinesBlankContext;
-          setQuickPickItems(pick, sourceEntries, value);
-          if (context.kind === "package" && value.length > 0 && sourceIncomplete) {
-            const currentRequest = ++request;
-            await requestRefinedEntries(value, currentRequest);
-            return;
-          }
-          if (refinesEmptyContext) {
-            if (blankContextRefined) {
-              return;
-            }
-            blankContextRefined = true;
-            const currentRequest = ++request;
-            await requestRefinedEntries(value[0], currentRequest);
-            return;
-          }
-        })().catch(() => undefined));
-        const requestRefinedEntries = async (
-          value: string,
-          currentRequest: number
-        ): Promise<void> => {
-          const prefix = context.kind === "package" && !value.startsWith(context.prefix)
-            ? context.prefix + value
-            : value;
-          const cursorCol = context.replaceStart + prefix.length;
-          const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
-          const lines = [...latestInput.lines];
-          lines[latestInput.cursorRow] = currentLine;
-          const fullTextBeforeCursor = [
-            ...lines.slice(0, latestInput.cursorRow),
-            currentLine.slice(0, cursorCol),
-          ].join("\n");
-          const nextContext = context.kind === "package"
-            ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
-            : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor);
-          if (!nextContext) {
-            return;
-          }
-          if (prefix.length > 0) {
-            nextContext.triggerCharacter = undefined;
-          }
-          const nextInputText = lines.join("\n");
+      const selection = await pickCompletion({
+        context, latestInput, initialEntries,
+        delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
+        force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
+        collect: async (nextContext, nextInputText, lines, cursorCol) => {
           let refreshedRefinedSessionData: WorkspaceData | undefined;
           const refinedWorkspaceDataRequest = this.shouldRequestWorkspaceData(nextContext)
             ? this.options.requestWorkspaceData?.()
@@ -389,11 +227,8 @@ export class RTermLang {
             refreshedRefinedSessionData = data ?? getWorkspaceData();
           }).catch(() => undefined);
 
-          const nextNeedsLsp = needsLanguageServerCompletion(nextContext);
-          const nextDocumentRequest = nextNeedsLsp
-            ? this.getOrOpenCompletionDocument(nextInputText)
-            : Promise.resolve(undefined);
-          if (nextNeedsLsp && !completionProvider) {
+          const nextDocumentRequest = this.getOrOpenCompletionDocument(nextInputText);
+          if (!completionProvider) {
             completionProvider = await this.ensureConsoleLspStarted();
           }
           const nextDocument = await nextDocumentRequest;
@@ -415,45 +250,9 @@ export class RTermLang {
             this.options.requestMemberCompletions,
             nextInputText
           );
-          if (!this.isCurrentCompletionRequest(requestId)) {
-            return;
-          }
-          if (currentRequest === request) {
-            sourceEntries = context.kind === "package"
-              ? nextEntries
-              : mergeCompletionEntries(baselineEntries, nextEntries);
-            sourceIncomplete = nextEntries.isIncomplete === true;
-            setQuickPickItems(pick, sourceEntries, pick.value);
-          }
-        };
-        pick.onDidAccept(() => {
-          const item = pick.selectedItems[0];
-          if (!isCompletionPickItem(item)) {
-            return;
-          }
-          active = false;
-          request += 1;
-          resolve(item);
-          pick.hide();
-        });
-        pick.onDidHide(() => {
-          const cancelled = active;
-          active = false;
-          request += 1;
-          pick.dispose();
-          if (cancelled) {
-            resolve(undefined);
-          }
-        });
-        pick.show();
-        prefillQuickPick(pick);
+          return nextEntries;
+        },
       });
-      let selection: vscode.QuickPickItem | undefined;
-      if (opensBeforeFullResults) {
-        selection = await showCompletionQuickPick(initialEntries, fullEntriesPromise);
-      } else {
-        selection = await showCompletionQuickPick(initialEntries);
-      }
 
       if (!isCompletionPickItem(selection)) {
         return;
@@ -464,6 +263,7 @@ export class RTermLang {
 
       const currentInput = getCurrentInput();
       if (
+        currentInput.text !== latestInput.text || currentInput.cursorRow !== latestInput.cursorRow ||
         currentInput.currentLine !== selection.snapshotInput ||
         currentInput.cursorCol !== selection.snapshotCursor
       ) {
@@ -477,21 +277,16 @@ export class RTermLang {
   /** Reuse candidates only for a refinement of the same replacement span.
    * Rebuild edit snapshots before exposing them: an old LSP edit must never be
    * accepted against a different line, suffix, object, or multiline context. */
-  refineInlineCompletion(input: InputSnapshot): import("../../Language/completion").CompletionQuickPickItem[] | undefined {
+  refineInlineCompletion(input: InputSnapshot, context?: CompletionContext): import("../../Language/completion").CompletionQuickPickItem[] | undefined {
     this.completionRequestId++;
     const cached = this.inlineCache;
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor);
-    if (!cached || !context) return undefined;
-    const old = cached.context;
-    if (context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
-        input.cursorRow !== cached.input.cursorRow || !context.prefix.startsWith(old.prefix) ||
-        input.textBeforeCursor.slice(0, input.textBeforeCursor.length - context.prefix.length) !==
-          cached.input.textBeforeCursor.slice(0, cached.input.textBeforeCursor.length - old.prefix.length) ||
-        input.text.slice(input.textBeforeCursor.length) !== cached.input.text.slice(cached.input.textBeforeCursor.length)) {
-      return undefined;
-    }
-    const safeEntries = cached.entries.filter(entry => entry.replaceStart === undefined || entry.replaceStart === old.replaceStart);
-    return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix), context);
+    if (!cached) return undefined;
+    context ??= getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
+    if (!context) return undefined;
+    const safeEntries = refineCompletionEntries(cached, input, context);
+    if (!safeEntries) return undefined;
+    return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix, context), context);
   }
 
   cancelCompletion(): void {

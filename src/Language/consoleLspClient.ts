@@ -25,8 +25,10 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
 } from "vscode-languageclient/node";
-import type { CompletionPickItem, CompletionProvider } from "./completion";
+import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
+import { getEnclosingCall } from "./completion/contextParser";
+import { createCompletionParams } from "./completion/protocol";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -258,11 +260,18 @@ export class ConsoleLspClient implements CompletionProvider {
     return this.disposePromise;
   }
 
+  getCallContext(doc: vscode.TextDocument, position: vscode.Position) {
+    const projection = this.inputDocument.project(doc.getText());
+    return getEnclosingCall(projection.document.getText(),
+      projection.document.offsetAt(projection.toServerPosition(position)));
+  }
+
   async provideCompletionItems(
     doc: vscode.TextDocument,
     position: vscode.Position,
-    triggerCharacter?: string
-  ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined> {
+    triggerCharacter?: string,
+    contextPosition: vscode.Position = position
+  ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const client = await this.ensureClient();
       if (!client) {
@@ -295,14 +304,27 @@ export class ConsoleLspClient implements CompletionProvider {
               triggerKind: vscode.CompletionTriggerKind.Invoke,
               triggerCharacter: undefined,
             };
-        const params = client.code2ProtocolConverter.asCompletionParams(
-          projection.document, projection.toServerPosition(position), context
-        );
+        const serverPosition = projection.toServerPosition(position);
+        const params = createCompletionParams(client, projection, serverPosition, contextPosition, context);
         const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client) {
           continue;
         }
-        const completions = await client.protocol2CodeConverter.asCompletionResult(result);
+        const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
+        // VS Code's converter preserves standard LSP fields only. Carry this
+        // source decision separately so an empty signature stays authoritative.
+        if (completions && (result as { rConsoleLocalFunction?: boolean } | null)?.rConsoleLocalFunction === true) {
+          completions.rConsoleLocalFunction = true;
+        }
+        if (completions && (result as { rConsoleMemberResolved?: boolean } | null)?.rConsoleMemberResolved === true) {
+          completions.rConsoleMemberResolved = true;
+        }
+        if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
+          completions.rConsoleNativeArguments = true;
+        }
+        if (completions && (result as { rConsoleArgumentsExhausted?: boolean } | null)?.rConsoleArgumentsExhausted === true) {
+          completions.rConsoleArgumentsExhausted = true;
+        }
         const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
           projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
         );

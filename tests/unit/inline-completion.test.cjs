@@ -9,46 +9,59 @@ after(() => widthTerminal.dispose());
 
 const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInput: "", snapshotCursor: 0, source: "session" });
 
-function createTerminal(t, columns = 80, rows = 24, trigger = "typing", settings = {}) {
-  const scrollCommands = [];
-  const { InputState } = loadSource("src/Terminal/inputState.ts");
-  const { Renderer } = loadSource("src/Terminal/renderer.ts");
-  const { KeyProcessor } = loadSource("src/Terminal/keyProcessor.ts");
-  const { RTerminal } = loadSource("src/Terminal/rTerminal.ts", {
-    "./rTerminal/lang": {},
-    vscode: {
-      EventEmitter: class {}, window: {},
-      commands: { executeCommand(command) { scrollCommands.push(command); return Promise.resolve(); } },
-      workspace: { getConfiguration: () => ({ get: (key, fallback) =>
-        key in settings ? settings[key] : key === "completionUI" ? "inline" : key === "inlineCompletion.trigger" ? trigger : fallback }) },
-    },
-  });
-  const screen = new Terminal({ cols: columns, rows, allowProposedApi: true });
-  const terminal = Object.assign(Object.create(RTerminal.prototype), {
-    inputState: new InputState(), inlineCompletion: new InlineCompletion(unicode),
-    mode: "ready", promptReady: true, dimensions: { columns, rows },
-    inlineSuggestionRowCount: 0,
-    lang: { cancelCompletion() {}, updateInput() {}, refineInlineCompletion() {} },
-    syntax: { setSource() {} },
-    writeEmitter: { fire(text) { screen._core._writeBuffer.writeSync(text); } },
-    ensureReadyPromptVisibleForInput() {},
-    withTerminalStateCaptureSuppressed(callback) { callback(); },
-    applyCompletion(selection) { this.accepted = selection; },
-    handleEnterKey() { this.submitted = this.inputState.text; },
-  });
-  terminal.renderer = new Renderer(text => terminal.writeEmitter.fire(text), undefined,
-    text => [...text].reduce((sum, char) => sum + unicode.wcwidth(char.codePointAt(0)), 0));
-  terminal.renderer.setContinuationPrompt("   ");
-  const keys = new KeyProcessor();
-  screen.onData(data => {
-    for (const action of keys.parseInputChunk(data)) terminal.applyKeyAction(action);
-  });
-  t.after(() => {
-    terminal.dismissInlineCompletion(false);
-    screen.dispose();
-  });
-  return { terminal, screen, scrollCommands };
-}
+const { createTerminal } = require("../helpers/inline-terminal.cjs");
+
+test("pending inline results cannot reopen the panel after switching to Quick Pick", t => {
+  const settings = { completionUI: "inline" };
+  const { terminal } = createTerminal(t, 80, 24, "typing", settings);
+  terminal.inputState.insertText("mea");
+  let publish;
+  terminal.lang.handleAutocomplete = ({ onInlineEntries }) => { publish = onInlineEntries; };
+  terminal.requestInlineCompletion(true);
+  settings.completionUI = "quickPick";
+  publish([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }]);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(Boolean(terminal.inlineMouseReporting), false);
+  assert.equal(terminal.inputState.text, "mea");
+});
+
+test("inline selection follows the shared ranking including R identifier case", () => {
+  const { rankCompletionEntries, toCompletionQuickPickItems } = loadSource('src/Language/completion.ts', { vscode: {
+    QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Function: 2, Field: 4, Variable: 5 },
+  } });
+  const panel = new InlineCompletion(unicode);
+  const entries = ['Alpha', 'alpha'].map(label => ({ label, insertText: label, source: 'session', kind: 5 }));
+  for (const [query, expected] of [['alpha', 'alpha'], ['Alpha', 'Alpha'], ['ALPHA', 'Alpha']]) {
+    const context = { kind: 'default', prefix: query, replaceStart: 0, snapshotInput: query, snapshotCursor: query.length };
+    panel.set(toCompletionQuickPickItems(rankCompletionEntries(entries, query, context), context), panel.token, query);
+    assert.equal(panel.current().insertText, expected);
+    assert.equal(panel.selected, 0);
+  }
+});
+
+test("data-context refinements start at the first suggestion instead of retaining a fuzzy function", () => {
+  const panel = new InlineCompletion(unicode);
+  const field = item('$(symbol-field) col.name');
+  const fn = item('$(symbol-function) as.numeric');
+  const choices = [{ label: 'Fields' }, field, { label: 'Functions' }, fn];
+  panel.set([{ label: 'Functions' }, fn], panel.token, '.');
+  panel.set(choices, panel.token, '.N');
+  assert.equal(panel.current(), field);
+  assert.equal(panel.selected, 0);
+
+  panel.move(1);
+  panel.set(choices, panel.invalidate(), '.N');
+  assert.equal(panel.current(), fn, 'same-query updates preserve explicit navigation');
+  panel.set(choices, panel.invalidate(), '.n');
+  assert.equal(panel.current(), field, 'editing the query clears manual selection');
+  panel.set(choices, panel.invalidate(), '.n');
+  assert.equal(panel.current(), field, 'later results do not revive the old manual selection');
+
+  panel.clear();
+  panel.set([{ label: 'Functions' }, fn], panel.token, '.N');
+  panel.set(choices, panel.token, '.N');
+  assert.equal(panel.current(), field, 'automatically selected partial results do not override the final list order');
+});
 
 test("multiline input and suggestions share the viewport across redraw and dismissal", t => {
   const { terminal, screen } = createTerminal(t, 80, 12);
@@ -222,7 +235,7 @@ for (const accept of ["enter", "tab", "mouse"]) {
     terminal.lang.recordCompletion = (...args) => recorded.push(args);
     terminal.inputState.insertText("libr");
     const choice = {
-      ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+      ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
       source: "lsp", packageName: "base",
     };
     terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
@@ -264,7 +277,7 @@ test("accepting a partial function name match respects manual completion mode", 
   terminal.lang.recordCompletion = () => {};
   terminal.inputState.insertText("libr");
   terminal.inlineCompletion.set([{
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   }], terminal.inlineCompletion.token);
   const requests = [];
   terminal.lang.handleAutocomplete = async request => { requests.push(request); };
@@ -278,13 +291,142 @@ test("accepting a partial function name match respects manual completion mode", 
   assert.equal(requests[0].input.textBeforeCursor, "library(");
 });
 
+for (const operator of ["$", "@", "::", ":::"]) {
+  test(`qualified function acceptance reuses argument suggestions and existing parentheses (${operator})`, async t => {
+    const completion = loadSource("src/Language/completion.ts", { vscode: {
+      CompletionItemKind: { Function: 2, Field: 4, Variable: 5 },
+      SnippetString: class {},
+    } });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    for (const mode of ["typing", "tab"]) {
+      for (const suffix of ["", "()", " (existing)", "("]) {
+        const { terminal } = createTerminal(t, 80, 24, mode);
+        delete terminal.applyCompletion;
+        terminal.lang.recordCompletion = () => {};
+        const prefix = `obj${operator}fu`;
+        const input = prefix + suffix;
+        terminal.inputState.insertText(input);
+        terminal.inputState.cursorPosition = prefix.length;
+        const context = completion.getCompletionContext(input, prefix.length);
+        const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+          { line: 0, character: prefix.length }, undefined, [], [],
+          { provideCompletionItems: async () => [{ label: "fun", kind: 2 }] },
+          async () => [{ name: "fun", type: "closure" }]);
+        const choice = completion.toCompletionPick(entries[0], context);
+        terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
+        const requests = [];
+        terminal.lang.handleAutocomplete = async request => { requests.push(request); };
+        terminal.applyKeyAction({ type: "tab" });
+        assert.equal(terminal.inputState.text, `obj${operator}fun${suffix || "()"}`);
+        assert.equal(terminal.inputState.textBeforeCursor, `obj${operator}fun${suffix.startsWith(" ") ? " " : ""}(`);
+        assert.equal(terminal.submitted, undefined);
+        t.mock.timers.tick(150);
+        assert.equal(requests.length, mode === "typing" ? 1 : 0);
+        if (mode === "tab") terminal.applyKeyAction({ type: "tab" });
+        assert.equal(requests.length, 1);
+        assert.equal(requests[0].input.textBeforeCursor, terminal.inputState.textBeforeCursor);
+      }
+    }
+  });
+}
+
+test("Escape cancels qualified argument requests before and after they start", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const started of [false, true]) {
+    const { terminal } = createTerminal(t);
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    terminal.inputState.insertText("obj@fu");
+    terminal.inlineCompletion.set([{
+      ...item("fun"), insertText: "fun()", isCallable: true, replaceStart: 4, snapshotInput: "obj@fu", snapshotCursor: 6,
+    }], terminal.inlineCompletion.token);
+    let publish;
+    terminal.lang.handleAutocomplete = async request => { publish = request.onInlineEntries; };
+    terminal.applyKeyAction({ type: "tab" });
+    if (started) t.mock.timers.tick(150);
+    terminal.applyKeyAction({ type: "escape" });
+    t.mock.timers.tick(150);
+    if (started) publish([{ ...item("late = "), snapshotInput: "obj@fun()", snapshotCursor: 8 }]);
+    else assert.equal(publish, undefined);
+    assert.equal(terminal.inlineCompletion.visible, false);
+    assert.equal(terminal.inputState.text, "obj@fun()");
+  }
+});
+
+test("accepting a callable preserves multiline calls and places the caret after their opener", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const prefix of ["fu", ""]) {
+      for (const separator of [" ", "\n  ", " # comment\n  ", "\n # another comment\n  "]) {
+        for (const mode of ["typing", "tab"]) {
+          const { terminal } = createTerminal(t, 80, 24, mode);
+          delete terminal.applyCompletion;
+          const records = [], requests = [];
+          terminal.lang.recordCompletion = (...args) => records.push(args);
+          terminal.lang.handleAutocomplete = request => { requests.push(request); };
+          const before = `outer(obj${operator}`;
+          const input = before + prefix + separator + "(123))";
+          terminal.inputState.insertText(input);
+          terminal.inputState.cursorPosition = before.length + prefix.length;
+          terminal.inlineCompletion.set([{
+            ...item("fun"), insertText: "fun()", isCallable: true, replaceStart: before.length,
+            snapshotInput: terminal.inputState.currentLine, snapshotCursor: terminal.inputState.cursorCol,
+          }], terminal.inlineCompletion.token);
+          terminal.applyKeyAction({ type: "tab" });
+          const expected = before + "fun" + separator + "(123))";
+          assert.equal(terminal.inputState.text, expected, input);
+          assert.equal(terminal.inputState.textBeforeCursor, before + "fun" + separator + "(");
+          assert.equal(records[0][2].insertText, "fun");
+          t.mock.timers.tick(150);
+          assert.equal(requests.length, mode === "typing" ? 1 : 0);
+        }
+      }
+    }
+  }
+});
+
+test("callable insertion keeps top-level and brace-separated expressions distinct", t => {
+  for (const input of ["obj$fu\n(123)", "outer({ obj$fu # comment\n(123) })"]) {
+    const { terminal } = createTerminal(t, 80, 24, "tab");
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    terminal.inputState.insertText(input);
+    terminal.inputState.cursorPosition = input.indexOf("fu") + 2;
+    terminal.applyCompletion({ ...item("fun"), insertText: "fun()", isCallable: true, replaceStart: input.indexOf("fu") });
+    assert.equal(terminal.inputState.text, input.replace("fu", "fun()"));
+    assert.equal(terminal.inputState.textBeforeCursor, input.slice(0, input.indexOf("fu")) + "fun(");
+  }
+});
+
+test("callable insertion handles quoted names, return and subscripted objects", t => {
+  for (const [input, insertText] of [
+    ["obj$ret(123)", "return()"],
+    ["outer(obj$ab # comment\n(123))", "`a b`()"],
+    ["outer(obj[[1]]$fu # comment\n(123))", "fun()"],
+    ['setup <- "😀"\nouter(obj$ab # comment\n(123))', "`a b`()"],
+  ]) {
+    const { terminal } = createTerminal(t, 80, 24, "tab");
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    const start = input.lastIndexOf("$") + 1;
+    const end = start + /^[a-z]+/.exec(input.slice(start))[0].length;
+    terminal.inputState.insertText(input);
+    terminal.inputState.cursorPosition = end;
+    terminal.applyCompletion({ ...item("callable"), insertText, isCallable: true,
+      replaceStart: start - (input.lastIndexOf("\n", end - 1) + 1) });
+    const expected = input.slice(0, start) + insertText.slice(0, -2) + input.slice(end);
+    assert.equal(terminal.inputState.text, expected);
+    assert.equal(terminal.inputState.cursorPosition, expected.indexOf("(123)") + 1);
+  }
+});
+
 test("dismissal cancels argument suggestions scheduled after accepting a partial function name match", async t => {
   const { terminal } = createTerminal(t);
   delete terminal.applyCompletion;
   terminal.lang.recordCompletion = () => {};
   terminal.inputState.insertText("libr");
   terminal.inlineCompletion.set([{
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   }], terminal.inlineCompletion.token);
   let requests = 0;
   terminal.lang.handleAutocomplete = async () => { requests++; };
@@ -304,7 +446,7 @@ test("typing after accepting a partial function name match refreshes the pending
   terminal.lang.recordCompletion = () => {};
   terminal.inputState.insertText("libr");
   terminal.inlineCompletion.set([{
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   }], terminal.inlineCompletion.token);
   const requests = [];
   terminal.lang.handleAutocomplete = async request => { requests.push(request); };
@@ -339,7 +481,7 @@ test("Quick Pick function acceptance keeps argument completion manual", t => {
   terminal.inlineCompletionMode = () => "quickPick";
   terminal.inputState.insertText("libr");
   terminal.applyCompletion({
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   });
   assert.equal(terminal.inputState.textBeforeCursor, "library(");
   assert.equal(terminal.inlineCompletionTimer, undefined);
@@ -430,7 +572,7 @@ test("typing publishes an empty list when matches or the completion context disa
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions: async () => undefined });
   lang.ensureConsoleLspStarted = async () => undefined;
   lang.getOrOpenCompletionDocument = async () => undefined;
   const panel = new InlineCompletion(unicode);
@@ -514,6 +656,397 @@ test("footer triangles page the list, preserve selection, and never accept a can
   click(nextCol - 2);
   assert.equal(state.scrollStart, 0, "disabled previous button stays at the start");
   assert.equal(terminal.accepted, undefined);
+});
+
+test("group buttons jump and select without inserting, then Tab accepts the selected group", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const grouped = ["Variables", "Functions", "Packages"].flatMap(group => [
+    { label: group }, ...Array.from({ length: 15 }, (_, i) => ({
+      ...item(`${group}${i}`), snapshotInput: "a", snapshotCursor: 1,
+    })),
+  ]);
+  const state = terminal.inlineCompletion;
+  state.set(grouped, state.token);
+  terminal.renderInput();
+  const button = state.groupTargets.find(target => target.group === 1);
+  const headerRow = terminal.inlineBoxTop + button.row;
+  const header = screen.buffer.active.getLine(screen.buffer.active.baseY + headerRow - 1).translateToString(true);
+  assert.ok(header.includes("│Vars││Fns││Pkgs│"));
+  const top = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop - 1).translateToString(true);
+  assert.match(top.trim(), /^╭─+╮$/, "the panel keeps its own uninterrupted top border");
+  assert.equal(state.groupTargets[0].from, state.renderedLeft + 2, "buttons sit directly beside the panel edge");
+  const buttonTop = screen.buffer.active.getLine(screen.buffer.active.baseY + headerRow - 2).translateToString(true);
+  const buttonBottom = screen.buffer.active.getLine(screen.buffer.active.baseY + headerRow).translateToString(true);
+  assert.ok(buttonTop.includes("│╭────╮╭───╮╭────╮"));
+  assert.ok(buttonBottom.includes("│╰────╯╰───╯╰────╯"));
+  const col = header.indexOf("Fns") + 1;
+  assert.equal(state.groupButton(button.row, col), 1);
+  assert.equal(state.hitTest(1, col), undefined);
+  assert.equal(state.isScrollbar(1, state.renderedLeft + state.renderedWidth - 1), false);
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: headerRow, col });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row: headerRow, col });
+  assert.equal(state.current().label, "Functions0");
+  assert.equal(state.scrollStart, 16, "the group's heading starts the viewport");
+  assert.equal(terminal.inputState.text, "a");
+  assert.equal(terminal.accepted, undefined);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.accepted.label, "Functions0");
+});
+
+test("clicking a short final group puts its heading at the top without earlier suggestions", t => {
+  for (const count of [1, 3]) {
+    const { terminal, screen } = createTerminal(t);
+    terminal.inputState.insertText("a");
+    const first = Array.from({ length: 20 }, (_, i) => item("variable" + i));
+    const last = Array.from({ length: count }, (_, i) => ({ ...item("field" + i), snapshotInput: "a", snapshotCursor: 1 }));
+    const entries = [{ label: "Variables" }, ...first, { label: "Fields" }, ...last];
+    const state = terminal.inlineCompletion;
+    state.set(entries, state.token);
+    terminal.renderInput();
+    const button = state.groupTargets.find(target => target.group === 1);
+    const row = terminal.inlineBoxTop + 1;
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: button.from });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: button.from });
+    const assertTop = () => {
+      const lines = state.lines(terminal.dimensions.columns, 20);
+      assert.ok(lines[state.scrollbarTop].includes("Fields"));
+      const visible = state.renderedTargets.filter(target => target !== undefined)
+        .map(target => state.items[state.choiceIndexes[target]].label);
+      assert.deepEqual(visible, last.map(entry => entry.label));
+      assert.equal(state.current().label, "field0");
+    };
+    assertTop();
+    terminal.renderInput();
+    const heading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+    assert.ok(heading.includes("Fields"), "the terminal displays the final group's heading immediately below its buttons");
+    assert.equal(terminal.inputState.text, "a");
+    assert.equal(terminal.accepted, undefined);
+    state.set([{ label: "Variables" }, item("newVariable"), ...first,
+      { label: "Fields" }, ...last], state.invalidate());
+    assertTop();
+    terminal.dimensions.columns = 25;
+    assertTop();
+    terminal.dimensions.columns = 80;
+    assertTop();
+    state.scroll(-1);
+    const upward = state.lines(80, 20);
+    assert.ok(upward[state.scrollbarTop].includes("Variables"), "scrolling upward can still reach earlier suggestions");
+    state.activateGroup(1);
+    assertTop();
+    state.activateGroup(0);
+    assert.equal(state.lines(80, 20)[state.scrollbarTop].includes("Variables"), true);
+    state.invalidate(true);
+    assert.equal(state.scrollAnchorGroup, undefined, "a new input resets the explicit jump");
+  }
+});
+
+test("completion displays ten suggestions excluding headings, group controls and details", t => {
+  for (const grouped of [false, true]) {
+    const { terminal } = createTerminal(t, 80, 40);
+    terminal.inputState.insertText("a");
+    const groups = grouped ? ["Fields", "Functions", "Packages"] : ["Package Members"];
+    const entries = groups.flatMap(group => [{ label: group },
+      ...Array.from({ length: grouped ? 6 : 40 }, (_, i) => ({ ...item(`${group}${i}`), detail: "details" }))]);
+    const state = terminal.inlineCompletion;
+    state.set(entries, state.token);
+    terminal.renderInput();
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    state.page(1);
+    terminal.renderInput();
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    state.move(1000);
+    terminal.renderInput();
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    assert.ok(state.renderedTargets.includes(state.selected));
+  }
+});
+
+test("group buttons wrap without arrows and reach every group in narrow and Unicode layouts", () => {
+  for (const width of [12, 25, 45, 80]) {
+    const state = new InlineCompletion(unicode);
+    const names = ["Runtime Variables", "Runtime Functions", "列名称😀", "Packages", "Functions", "Recent Input"];
+    state.set(names.flatMap(name => [{ label: name }, ...Array.from({ length: 12 }, (_, i) => item(name + i))]), state.token);
+    const lines = state.lines(width, 30, 8);
+    assert.ok(lines.every(line => state.cellWidth(line.replace(/\x1b\[[0-9;]*m/g, "")) < width));
+    for (const target of state.groupTargets) {
+      assert.equal(state.groupButton(target.row, target.from), target.group);
+      assert.equal(state.groupButton(target.row, target.to - 1), target.group);
+      assert.equal(state.hitTest(target.row, target.from), undefined);
+    }
+    assert.equal(state.groupTargets.length, names.length, `all groups reachable at width ${width}`);
+    assert.ok(lines.slice(1, state.scrollbarTop).every(line => !/[◀▶<>]/.test(line)), "no top arrows");
+    assert.ok(lines.at(-2).includes("◀"), "footer scrolling controls remain");
+    const target = state.groupTargets.find(target => target.group === names.length - 1);
+    state.activateGroup(target.group);
+    state.lines(width, 30, 8);
+    assert.equal(state.current().label, names.at(-1) + "0");
+    assert.ok(state.renderedTargets.includes(state.selected));
+  }
+});
+
+test("group controls and scrollbar remain separate after resizing and result refresh", () => {
+  const state = new InlineCompletion(unicode);
+  const entries = ["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 30 }, (_, i) => item(group + i))]);
+  state.set(entries, state.token);
+  state.lines(80, 20);
+  state.activateGroup(1);
+  state.lines(80, 20);
+  const selected = state.current();
+  const col = state.renderedLeft + state.renderedWidth - 1;
+  assert.equal(state.isScrollbar(1, col), false);
+  assert.equal(state.isScrollbar(state.scrollbarTop, col), true);
+  state.startScroll(state.bodyTop + state.thumbStart);
+  assert.ok(state.dragging);
+  state.dragScroll(1000);
+  state.lines(80, 20);
+  assert.equal(state.scrollStart, state.maxScrollStart);
+  assert.equal(state.current(), selected, "scrolling after a group jump preserves selection");
+  state.lines(20, 6);
+  assert.equal(state.dragging, false);
+  assert.ok(state.renderedTargets.includes(state.selected));
+  state.set(entries.map(entry => ({ ...entry })), state.invalidate());
+  state.lines(80, 20);
+  assert.equal(state.current().label, selected.label);
+  state.set([{ label: "Functions" }, item("only_match")], state.invalidate(), "only");
+  state.lines(80, 20);
+  assert.deepEqual(state.groupTargets, []);
+  assert.equal(state.groupButton(1, 5), undefined);
+  assert.equal(state.hitTest(2, 5).label, "only_match");
+  state.clear();
+  assert.equal(state.groupButton(1, 5), undefined);
+});
+
+test("separate button boxes have no inner padding or gaps and retain click targets", () => {
+  const state = new InlineCompletion(unicode);
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 20 }, (_, i) => item(group + i))]), state.token);
+  let lines = state.lines(80, 20);
+  assert.equal(state.scrollbarTop, 4);
+  assert.equal(state.groupTargets[0].to, state.groupTargets[1].from);
+  assert.equal(state.groupButton(1, state.groupTargets[0].to - 1), 0);
+  assert.equal(state.groupButton(1, state.groupTargets[0].to), 1);
+  const plain = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  assert.match(plain[0], /^╭─+╮$/);
+  assert.ok(plain[1].startsWith("│╭────╮╭───╮"));
+  assert.ok(plain[2].startsWith("││Vars││Fns│"));
+  assert.ok(plain[3].startsWith("│╰────╯╰───╯"));
+  assert.ok(plain[4].includes("Variables"));
+  assert.ok(!lines.join("").includes("\x1b[53;4m"));
+  assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+  lines = state.lines(80, 8);
+  const target = state.groupTargets[1];
+  assert.equal(target.row, 2);
+  assert.ok(lines[target.row].includes("Fns"));
+  assert.equal(state.groupButton(target.row, target.from), 1);
+  assert.ok(lines.length <= 8);
+  state.activateGroup(1);
+  lines = state.lines(80, 8);
+  assert.ok(lines[state.scrollbarTop].includes("Functions"));
+  assert.equal(state.current().label, "Functions0");
+});
+
+test("group header offsets preserve scrollbar dragging and mouse acceptance", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const state = terminal.inlineCompletion;
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 30 }, (_, i) => ({ ...item(group + i), snapshotInput: "a", snapshotCursor: 1 }))]), state.token);
+  terminal.renderInput();
+  const col = state.renderedLeft + state.renderedWidth - 1;
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: terminal.inlineBoxTop + 1, col });
+  assert.equal(state.dragging, false, "header row is not scrollbar track");
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row: terminal.inlineBoxTop + state.bodyTop, col });
+  assert.equal(state.dragging, true);
+  terminal.applyKeyAction({ type: "mouse-move", row: terminal.inlineBoxTop + 100, col });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row: 1, col: 1 });
+  assert.equal(state.scrollStart, state.maxScrollStart);
+  assert.equal(terminal.accepted, undefined);
+  const candidateRow = state.renderedTargets.findIndex(target => target === 59);
+  assert.ok(candidateRow > 1);
+  const row = terminal.inlineBoxTop + candidateRow;
+  const candidateCol = state.renderedLeft + 5;
+  const screenLine = screen.buffer.active.getLine(screen.buffer.active.baseY + row - 1).translateToString(true);
+  assert.ok(screenLine.includes("Functions29"));
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: candidateCol });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: candidateCol });
+  assert.equal(terminal.accepted.label, "Functions29");
+});
+
+test("scrollbar drag survives changing heading counts in the ten-suggestion viewport", () => {
+  const state = new InlineCompletion(unicode);
+  state.set(["Fields", "Functions", "Packages", "Other"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 6 }, (_, i) => item(group + i))]), state.token);
+  state.lines(80, 30);
+  state.startScroll(state.bodyTop + state.thumbStart);
+  assert.equal(state.dragging, true);
+  const capacities = new Set();
+  for (let row = state.bodyTop; row < 20; row++) {
+    state.dragScroll(row);
+    state.lines(80, 30);
+    capacities.add(state.viewportRows);
+    assert.equal(state.dragging, true);
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+  }
+  assert.ok(capacities.size > 1, "the drag crosses windows with different numbers of headings");
+  assert.equal(state.scrollStart, state.maxScrollStart);
+});
+
+test("abbreviated group buttons highlight the scrolled group while its heading stays visible", () => {
+  const state = new InlineCompletion(unicode);
+  const colors = { matchForeground: "\x1b[38;5;123m", selectedBackground: "\x1b[48;5;123m" };
+  const names = ["Runtime Variables", "Runtime Functions", "Packages"];
+  const buttons = ["Vars", "R.Fns", "Pkgs"];
+  state.set(names.flatMap(group => [{ label: group },
+    ...Array.from({ length: 30 }, (_, i) => item(group + i))]), state.token);
+  state.lines(80, 20, 1, colors);
+  const selected = state.current();
+  for (const start of [1, 15, 30, 31, 32, 50, 62, 70, 31, 0]) {
+    state.scroll(start - state.scrollStart);
+    const lines = state.lines(80, 20, 1, colors);
+    const group = Math.floor(start / 31);
+    const plain = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const header = lines.slice(1, state.scrollbarTop).join("");
+    assert.ok(header.includes(colors.matchForeground + buttons[group]), `active button at row ${start}`);
+    assert.equal(header.split(colors.matchForeground).length - 1, 1, "only the visible group is highlighted");
+    assert.ok(!header.includes(colors.selectedBackground), "button highlighting uses text color only");
+    assert.ok(plain[state.scrollbarTop].includes(names[group]), `sticky heading at row ${start}`);
+    assert.equal(state.hitTest(state.scrollbarTop, 5), undefined, "headings cannot accept suggestions");
+    assert.equal(state.current(), selected, "scrolling never changes selection");
+    assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+    assert.ok(lines.length <= 20);
+    if (start === 30) assert.ok(plain.some(line => line.includes(names[1])), "the next group keeps its own heading at the boundary");
+  }
+});
+
+test("scrolling highlights wrapped buttons and preserves single-group headings", () => {
+  const state = new InlineCompletion(unicode);
+  const names = ["Runtime Variables", "Runtime Functions", "Packages", "Functions", "Fields", "Recent Input"];
+  state.set(names.flatMap(group => [{ label: group },
+    ...Array.from({ length: 20 }, (_, i) => item(group + i))]), state.token);
+  state.lines(25, 20);
+  state.scroll(85);
+  let lines = state.lines(25, 20);
+  const fieldsButton = state.groupTargets.find(target => target.group === 4);
+  assert.ok(fieldsButton.row > 1);
+  assert.ok(lines[fieldsButton.row].includes("Flds"));
+  assert.ok(lines[state.scrollbarTop].includes("Fields"));
+  state.set([{ label: "Package Members" }, ...Array.from({ length: 30 }, (_, i) => item("member" + i))], state.invalidate());
+  state.lines(80, 20);
+  state.scroll(5);
+  lines = state.lines(80, 20);
+  assert.deepEqual(state.groupTargets, []);
+  assert.ok(lines[1].includes("Package Members"));
+  assert.equal(state.hitTest(1, 5), undefined);
+  assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 10);
+  lines = state.lines(20, 4);
+  assert.equal(lines.length, 4, "a minimal panel still has room for a suggestion");
+  assert.equal(state.renderedTargets.filter(target => target !== undefined).length, 1);
+});
+
+test("mouse wheel and footer scrolling update the pinned heading and active button", t => {
+  const { terminal, screen } = createTerminal(t);
+  terminal.inputState.insertText("a");
+  const state = terminal.inlineCompletion;
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 20 }, (_, i) => item(group + i))]), state.token);
+  terminal.renderInput();
+  for (let i = 0; i < 8; i++) terminal.applyKeyAction({ type: "wheel", dir: "down",
+    row: terminal.inlineBoxTop + state.bodyTop, col: state.renderedLeft + 5 });
+  const heading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+  assert.ok(heading.includes("Functions"));
+  assert.equal(state.current().label, "Variables0");
+  for (let i = 0; i < 3; i++) {
+    const row = terminal.inlineBoxTop + state.renderedTargets.length - 2;
+    const col = state.renderedLeft + state.renderedWidth - 4;
+    terminal.applyKeyAction({ type: "mouse", pressed: true, row, col });
+    terminal.applyKeyAction({ type: "mouse", pressed: false, row, col });
+  }
+  const returnedHeading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+  assert.ok(returnedHeading.includes("Variables"));
+  assert.equal(terminal.inputState.text, "a");
+  assert.equal(terminal.accepted, undefined);
+});
+
+test("pinned headings keep the scrollbar origin stable during dragging", () => {
+  const state = new InlineCompletion(unicode);
+  state.set(["Variables", "Functions"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 80 }, (_, i) => item(group + i))]), state.token);
+  state.lines(80, 20);
+  const top = state.scrollbarTop;
+  state.startScroll(top);
+  state.dragScroll(top + 1);
+  let lines = state.lines(80, 20);
+  const start = state.scrollStart;
+  assert.ok(start > 0);
+  assert.ok(lines[top].includes("Variables"));
+  for (let i = 0; i < 3; i++) {
+    state.dragScroll(top + 1);
+    lines = state.lines(80, 20);
+    assert.equal(state.scrollStart, start, "the same mouse position must not jump between pinned and original headings");
+    assert.equal(state.scrollbarTop, top);
+    assert.equal(state.dragging, true);
+  }
+  state.dragScroll(1000);
+  lines = state.lines(80, 20);
+  assert.ok(lines[top].includes("Functions"));
+  assert.equal(state.scrollStart, state.maxScrollStart);
+  assert.equal(state.isScrollbar(top, state.renderedLeft + state.renderedWidth - 1), true);
+});
+
+test("button text follows the selection bar across groups as well as independent scrolling", () => {
+  const state = new InlineCompletion(unicode);
+  const colors = { matchForeground: "\x1b[38;5;123m", selectedBackground: "\x1b[48;5;123m" };
+  state.set(["Variables", "Functions", "Fields"].flatMap(group => [{ label: group },
+    ...Array.from({ length: 4 }, (_, i) => item(group + i))]), state.token);
+  const check = button => {
+    const lines = state.lines(80, 25, 1, colors);
+    const header = lines.slice(1, state.scrollbarTop).join("");
+    assert.ok(header.includes(colors.matchForeground + button));
+    assert.equal(header.split(colors.matchForeground).length - 1, 1);
+    assert.ok(!header.includes(colors.selectedBackground));
+    return lines;
+  };
+  check("Vars");
+  state.move(4);
+  const lines = check("Fns");
+  assert.ok(lines[state.scrollbarTop].includes("Variables"), "selection can enter the next group before its heading reaches the top");
+  state.move(4);
+  check("Flds");
+  state.move(-4);
+  check("Fns");
+  state.scroll(-100);
+  check("Vars");
+  assert.equal(state.current().label, "Functions0", "wheel scrolling does not move the selection bar");
+  state.move(1);
+  check("Fns");
+  state.activateGroup(2);
+  check("Flds");
+});
+
+test("wrapped group buttons accept mouse clicks on later header rows", t => {
+  const { terminal, screen } = createTerminal(t, 25, 24);
+  terminal.inputState.insertText("a");
+  const state = terminal.inlineCompletion;
+  state.set(["Variables", "Runtime Functions", "Packages", "Functions", "Fields", "Recent Input"].flatMap(group => [
+    { label: group }, ...Array.from({ length: 10 }, (_, i) => ({ ...item(group + i), snapshotInput: "a", snapshotCursor: 1 })),
+  ]), state.token);
+  terminal.renderInput();
+  const target = state.groupTargets.find(target => target.group === 4);
+  assert.ok(target.row > 1);
+  const row = terminal.inlineBoxTop + target.row;
+  const header = screen.buffer.active.getLine(screen.buffer.active.baseY + row - 1).translateToString(true);
+  assert.ok(header.includes("Flds"));
+  assert.equal(state.isScrollbar(target.row, state.renderedLeft + state.renderedWidth - 1), false);
+  terminal.applyKeyAction({ type: "mouse", pressed: true, row, col: target.from });
+  terminal.applyKeyAction({ type: "mouse", pressed: false, row, col: target.from });
+  assert.equal(state.current().label, "Fields0");
+  const heading = screen.buffer.active.getLine(screen.buffer.active.baseY + terminal.inlineBoxTop + state.scrollbarTop - 1).translateToString(true);
+  assert.ok(heading.includes("Fields"));
+  assert.equal(terminal.accepted, undefined);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.accepted.label, "Fields0");
 });
 
 test("provider refresh preserves browsing position and resize cancels an active drag", () => {
@@ -621,7 +1154,7 @@ test("compact panels fit narrow and short terminals without hiding choices or ca
     assert.ok(lines.some(line => line.translateToString(true).includes("◀ ▶")));
     assert.ok(lines.every(line => !line.isWrapped));
     assert.ok(terminal.renderer.renderedLineCount <= rows);
-    assert.equal(state.hitTest(1, state.renderedLeft + 4).label, "alpha0");
+    assert.equal(state.hitTest(state.bodyTop, state.renderedLeft + 4).label, "alpha0");
   }
 });
 
@@ -647,19 +1180,86 @@ test("typing threshold counts the current prefix, dismisses below it, and explic
     request.onInlineEntries([{ ...item("alpha"), snapshotInput: request.input.currentLine,
       snapshotCursor: request.input.cursorCol, replaceStart: request.input.cursorCol - 3 }]);
   };
-  terminal.applyKeyAction({ type: "text", text: "longObjectName$al" });
+  terminal.applyKeyAction({ type: "text", text: "al" });
   assert.equal(terminal.inlineCompletionTimer, undefined);
   terminal.applyKeyAction({ type: "text", text: "p" });
   assert.ok(terminal.inlineCompletionTimer);
   await new Promise(resolve => setTimeout(resolve, 180));
-  assert.deepEqual(requests, ["longObjectName$alp"]);
+  assert.deepEqual(requests, ["alp"]);
   assert.ok(terminal.inlineCompletion.visible);
   terminal.applyKeyAction({ type: "backspace" });
   assert.equal(terminal.inlineCompletion.visible, false);
   assert.equal(terminal.inlineCompletionTimer, undefined);
   terminal.applyKeyAction({ type: "tab" });
-  assert.deepEqual(requests, ["longObjectName$alp", "longObjectName$al"]);
+  assert.deepEqual(requests, ["alp", "al"]);
   assert.ok(terminal.inlineCompletion.visible);
+});
+
+test("qualified operators open suggestions in typing mode and keep filtering below the threshold", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    const { terminal } = createTerminal(t, 80, 24, "typing", { "inlineCompletion.minCharacters": 99 });
+    terminal.inputState.insertText("obj");
+    const requests = [];
+    terminal.lang.handleAutocomplete = request => {
+      requests.push(request.input.text);
+      request.onInlineEntries([{ ...item("alpha"), replaceStart: 3 + operator.length,
+        snapshotInput: request.input.currentLine, snapshotCursor: request.input.cursorCol }]);
+    };
+    for (const text of operator) terminal.applyKeyAction({ type: "text", text });
+    assert.ok(terminal.inlineCompletionTimer, operator);
+    t.mock.timers.tick(150);
+    assert.deepEqual(requests, [`obj${operator}`]);
+    assert.equal(terminal.inlineCompletion.visible, true, operator);
+    for (const text of "al") {
+      terminal.applyKeyAction({ type: "text", text });
+      t.mock.timers.tick(150);
+      assert.equal(terminal.inlineCompletion.visible, true, operator);
+    }
+    assert.deepEqual(requests, [`obj${operator}`, `obj${operator}a`, `obj${operator}al`]);
+    terminal.applyKeyAction({ type: "backspace" });
+    t.mock.timers.tick(150);
+    assert.equal(requests.at(-1), `obj${operator}a`);
+    terminal.applyKeyAction({ type: "text", text: "l" });
+    terminal.applyKeyAction({ type: "escape" });
+    t.mock.timers.tick(150);
+    assert.equal(requests.length, 4, "Escape cancels the scheduled qualified lookup");
+    assert.equal(terminal.inlineCompletion.visible, false);
+  }
+});
+
+test("qualified operators preserve manual Tab mode and Quick Pick", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const [mode, trigger] of [["inline", "tab"], ["quickPick", "typing"]]) {
+      const { terminal } = createTerminal(t, 80, 24, trigger, { completionUI: mode });
+      const requests = [];
+      terminal.lang.handleAutocomplete = request => { requests.push(request); };
+      terminal.applyKeyAction({ type: "text", text: `obj${operator}` });
+      t.mock.timers.tick(150);
+      assert.equal(requests.length, 0, `${mode}/${trigger}/${operator}`);
+      terminal.applyKeyAction({ type: "tab" });
+      assert.equal(requests.length, 1);
+    }
+  }
+});
+
+test("operators in literals and comments and a single colon do not trigger suggestions", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const prefix of ['"obj', "'obj", '`obj', 'r"(obj', "# obj"]) {
+      const { terminal } = createTerminal(t);
+      terminal.inputState.insertText(prefix);
+      let requests = 0;
+      terminal.lang.handleAutocomplete = () => { requests++; };
+      for (const text of operator) terminal.applyKeyAction({ type: "text", text });
+      t.mock.timers.tick(150);
+      assert.equal(requests, 0, prefix + operator);
+    }
+  }
+  const { terminal } = createTerminal(t);
+  terminal.applyKeyAction({ type: "text", text: "stats:" });
+  assert.equal(terminal.inlineCompletionTimer, undefined);
 });
 
 test("automatic suggestions start on the third character by default and respect explicit thresholds", t => {
@@ -965,7 +1565,7 @@ test("typed matches use theme foreground, selected text has a continuous backgro
   assert.ok(!selected.includes("\x1b[7m"), "do not invert icon or matched foreground");
 });
 
-test("function arguments remain selected ahead of an exact runtime variable", () => {
+test("inline selection respects displayed group order and explicit navigation", () => {
   const panel = new InlineCompletion(unicode);
   const argument = { ...item("data = "), insertText: "data = " };
   const variable = { ...item("data"), source: "session" };
@@ -975,14 +1575,14 @@ test("function arguments remain selected ahead of an exact runtime variable", ()
     { label: "Runtime Variables" }, variable,
   ];
   panel.set(choices, panel.token, "data");
-  assert.equal(panel.current(), argument, "argument group takes precedence over an exact runtime match");
-  panel.move(1);
+  assert.equal(panel.current(), choices[1], "start at the first displayed field");
+  panel.move(2);
   assert.equal(panel.current(), variable);
   panel.set(choices, panel.token, "data");
   assert.equal(panel.current(), variable, "retain an explicit user selection during updates");
   panel.invalidate(true);
   panel.set(choices, panel.token, "data");
-  assert.equal(panel.current(), argument, "edits reset selection to the function argument");
+  assert.equal(panel.current(), choices[1], "edits reset selection to the first suggestion");
   const ordinary = new InlineCompletion(unicode);
   ordinary.set([{ label: "Runtime Variables" }, variable], ordinary.token, "data");
   assert.equal(ordinary.current(), variable, "normal completion without arguments is unchanged");
@@ -1247,4 +1847,29 @@ test("splitting a highlighted token preserves its style below the completion pan
   assert.equal(prefix.getFgColor(), 2);
   assert.equal(suffix.getFgColorMode(), prefix.getFgColorMode());
   assert.equal(suffix.getFgColor(), prefix.getFgColor());
+});
+
+test("namespace kind groups produce clickable buttons and survive filtering", () => {
+  const completion = loadSource('src/Language/completion.ts', { vscode: {
+    QuickPickItemKind: { Separator: -1 },
+    CompletionItemKind: { Function: 2, Variable: 5, Field: 4, Constant: 20 },
+  } });
+  const entries = [['setDT', 2], ['.N', 5], ['setattr', 2]]
+    .map(([label, kind]) => ({ label, kind, source: 'lsp', insertText: label }));
+  const state = new InlineCompletion(unicode);
+  for (const prefix of ['', 'set', '']) {
+    const input = 'data.table::' + prefix, context = completion.getCompletionContext(input, input.length);
+    const picks = completion.toCompletionQuickPickItems(completion.rankCompletionEntries(entries, prefix, context), context);
+    state.set(picks, state.token, prefix);
+    state.lines(80, 30, 8);
+    assert.equal(state.groupTargets.length, prefix ? 0 : 2);
+    assert.deepEqual(state.items.filter(item => 'insertText' in item).map(item => item.insertText),
+      prefix ? ['setattr', 'setDT'] : ['setattr', 'setDT', '.N']);
+    if (!prefix) {
+      const variables = state.groupTargets[1];
+      assert.equal(state.groupButton(variables.row, variables.from), 1);
+      state.activateGroup(1);
+      assert.equal(state.current().insertText, '.N');
+    }
+  }
 });

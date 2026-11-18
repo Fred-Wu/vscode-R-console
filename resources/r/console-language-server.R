@@ -223,26 +223,14 @@ for (workspace in server$workspaces$values()) {
     record_cached_package_fingerprints(workspace)
 }
 
-server$request_handlers[["textDocument/completion"]] <- function(self, id, params) {
-    textDocument <- params$textDocument
-    uri <- languageserver:::uri_escape_unicode(textDocument$uri)
-    workspace <- self$get_workspace(uri)
-    document <- workspace$documents$get(uri)
-    if (is.null(document)) {
-        return(self$deliver(languageserver:::Response$new(id = id, result = NULL)))
-    }
-
-    point <- document$from_lsp_position(params$position)
-    reply <- languageserver:::completion_reply(
-        id,
-        uri,
-        workspace,
-        document,
-        point,
-        self$ClientCapabilities$textDocument$completion
-    )
-    record_cached_package_fingerprints(workspace)
-    self$deliver(reply)
+# Source dedicated completion adapters beside this entry point.
+console_script <- if (sys.nframe() > 0L) sys.frame(1)$ofile else NULL
+if (is.null(console_script)) {
+    console_script <- sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE)[[1L]])
+}
+console_resource_dir <- dirname(console_script)
+for (resource in c("completion-source.R", "completion-arguments.R", "completion-provider.R")) {
+    source(file.path(console_resource_dir, resource), local = TRUE)
 }
 
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
