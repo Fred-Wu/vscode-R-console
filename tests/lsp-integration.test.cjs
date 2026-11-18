@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { spawn, execFileSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const { once } = require("node:events");
 const fs = require("node:fs");
@@ -9,6 +9,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { runRJson } = require("./helpers/run-r-json.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
@@ -40,8 +41,10 @@ test("typing and accepting functions opens real argument suggestions without ano
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
   });
-  const requestMemberCompletions = async (expression, operator) => JSON.parse(execFileSync(
-    "Rscript", ["--vanilla", "-e", `
+  let memberProbeError;
+  const requestMemberCompletions = async (expression, operator) => {
+    try {
+      return runRJson(`
       df <- data.frame(zebra = 0, alpha = 1, beta = 2, check.names = FALSE)
       df[["a b"]] <- 2
       obj <- list(lm = function(member_arg) stop("must not execute"), data = df,
@@ -50,15 +53,21 @@ test("typing and accepting functions opens real argument suggestions without ano
       dt <- data.table::as.data.table(df)
       methods::setClass("InlineCompletionTest", slots = c(lm = "function"))
       slot_obj <- methods::new("InlineCompletionTest", lm = function(slot_arg) stop("must not execute"))
-      value <- eval(parse(text = commandArgs(TRUE)[1]), .GlobalEnv)
-      slots <- identical(commandArgs(TRUE)[2], "@")
+      value <- eval(parse(text = inputs$expression), .GlobalEnv)
+      slots <- identical(inputs$operator, "@")
       nms <- if (slots) methods::slotNames(value) else names(value)
       cat(jsonlite::toJSON(lapply(nms, function(n) list(name = n,
         type = typeof(if (slots) methods::slot(value, n) else value[[n]]))), auto_unbox = TRUE))
-    `, expression, operator], { encoding: "utf8", timeout: 15000 }));
+    `, { expression, operator });
+    } catch (error) {
+      memberProbeError = error;
+      throw error;
+    }
+  };
   const waitFor = async (predicate, label) => {
     const deadline = Date.now() + 10000;
     while (!predicate()) {
+      assert.ifError(memberProbeError);
       assert.ok(Date.now() < deadline, label);
       await new Promise(resolve => setTimeout(resolve, 20));
     }
@@ -351,7 +360,16 @@ test("multiline fuzzy arguments retain call identity and the original replacemen
 test("Unicode call identity never substitutes a same-suffix global function", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { client, instances } = createConsoleLsp(t);
-  for (const name of ["élm", "𐐀lm"]) {
+  const names = ["élm", "𐐀lm", "`𐐀lm`"];
+  // R's acceptance of unquoted Unicode names depends on its native parser.
+  // Quoted names must work everywhere; rejected names must never become lm.
+  const validNames = runRJson(`
+    cat(jsonlite::toJSON(lapply(inputs, function(name)
+      tryCatch(is.symbol(parse(text = name)[[1L]]), error = function(e) FALSE)), auto_unbox = TRUE))
+  `, names);
+  assert.equal(validNames[0], true, "R must accept the accented name");
+  assert.equal(validNames[2], true, "R must accept the quoted supplementary name");
+  for (const [index, name] of names.entries()) {
     const input = `${name} <- function(correct_argument) {}; outer(${name}\n())`;
     const position = { line: 1, character: 1 };
     let parameters;
@@ -360,12 +378,19 @@ test("Unicode call identity never substitutes a same-suffix global function", { 
       const result = await client.provideCompletionItems({ getText: () => input }, position);
       parameters = (Array.isArray(result) ? result : result?.items ?? [])
         .filter(item => item.detail === "parameter").map(item => item.label);
-      if (parameters.includes("correct_argument")) break;
+      if (validNames[index] ? parameters.includes("correct_argument") : parameters.length === 0) break;
       await new Promise(resolve => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
-    assert.deepEqual(parameters, ["correct_argument"], input);
+    assert.deepEqual(parameters, validNames[index] ? ["correct_argument"] : [], input);
     assert.equal(instances.at(-1).requests.at(-1).params.rConsoleCall, name);
   }
+  // Exercise parse rejection on every platform, even where unquoted
+  // supplementary characters are accepted by R.
+  const instance = instances.at(-1);
+  const result = await instance.sendRequest("textDocument/completion", {
+    ...instance.requests.at(-1).params, rConsoleCall: "not a valid name",
+  });
+  assert.ok(result.items.every(item => item.detail !== "parameter" && !item.detail?.startsWith("value for ")));
 });
 
 test("fuzzy fallback does not turn values, comments or member calls into LSP argument positions", { timeout: 90000 }, async t => {
@@ -415,8 +440,8 @@ test("member argument probe inspects the actual R callable without executing bod
     slot_obj <- methods::new("CompletionTest", lm = function(slot_argument) stop("body called"))
     éobj <- list(lm = function(correct_argument) stop("body called"))
     obj$élm <- function(correct_argument) stop("body called")
-    𐐀obj <- list(lm = function(correct_argument) stop("body called"))
-    obj$unicode <- function(éarg, 𐐀arg, remaining) stop("body called")
+    \`𐐀obj\` <- list(lm = function(correct_argument) stop("body called"))
+    obj$unicode <- function(éarg, \`𐐀arg\`, remaining) stop("body called")
     obj$pair <- function(first, second) stop("body called")
     .args <- .fn <- "unchanged"
   `;
@@ -424,8 +449,8 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$lm", ["list_argument", "missing", "lazy"]],
     ["éobj$lm", ["correct_argument"]],
     ["obj$élm", ["correct_argument"]],
-    ["𐐀obj$lm", ["correct_argument"]],
-    ["obj$unicode", ["remaining"], 'éarg = stop("value evaluated"), 𐐀arg = stop("value evaluated"), '],
+    ["`𐐀obj`$lm", ["correct_argument"]],
+    ["obj$unicode", ["remaining"], 'éarg = stop("value evaluated"), `𐐀arg` = stop("value evaluated"), '],
     ["obj$pair", ["second"], "se", ', stop("value evaluated"))'],
     ["obj$pair", ["first", "second"], "", ', stop("value evaluated"))'],
     ["obj$pair", ["first", "second"], 'stop("value evaluated"), '],
@@ -478,13 +503,12 @@ test("member argument probe inspects the actual R callable without executing bod
         assert.equal(operator, "$");
         // This is the existing session completion contract: evaluate the
         // expression in R, then return its named list members.
-        const result = execFileSync("Rscript", ["--vanilla", "-e", setup, "-e", `
+        return runRJson(setup + `
           options(warn = 2, warnPartialMatchArgs = TRUE)
-          value <- tryCatch(eval(parse(text = commandArgs(TRUE)[1]), .GlobalEnv), error = function(e) NULL)
+          value <- tryCatch(eval(parse(text = inputs), .GlobalEnv), error = function(e) NULL)
           stopifnot(identical(.args, "unchanged"), identical(.fn, "unchanged"))
           cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
-        `, probe], { encoding: "utf8", timeout: 15000 });
-        return JSON.parse(result);
+        `, probe);
       });
     assert.deepEqual(entries.map(entry => entry.label), expected, input);
   }
@@ -502,15 +526,14 @@ test("completion call boundaries agree with the R parser across newlines", async
     ["obj$ # member continuation\nfun(fi)", true],
     ["(obj\n$fun(fi))", true],
   ];
-  const nativeCalls = JSON.parse(execFileSync("Rscript", ["--vanilla", "-e", `
+  const nativeCalls = runRJson(`
     has_call <- function(x) {
       if (!(is.call(x) || is.expression(x))) return(FALSE)
       if (is.call(x) && identical(x[[1]], quote(obj$fun))) return(TRUE)
       any(vapply(as.list(x), has_call, logical(1)))
     }
-    inputs <- jsonlite::fromJSON(commandArgs(TRUE)[1])
     cat(jsonlite::toJSON(vapply(inputs, function(input) has_call(parse(text = input)), logical(1))))
-  `, JSON.stringify(cases.map(([input]) => input))], { encoding: "utf8", timeout: 15000 }));
+  `, cases.map(([input]) => input));
   for (const [index, [input, expected]] of cases.entries()) {
     assert.equal(nativeCalls[index], expected, input);
     const cursor = input.indexOf("fi") + 2;
@@ -558,7 +581,7 @@ test("argument probes agree with native R calls across pipe and argument combina
   // Insert each candidate by name into the original source and let R and
   // magrittr match it. A positional cursor marker would hide the very argument
   // rematching this test must exercise.
-  const results = JSON.parse(execFileSync("Rscript", ["--vanilla", "-e", `
+  const results = runRJson(`
     library(magrittr)
     capture <- function(call, definition) {
       values <- as.list(call)
@@ -574,7 +597,6 @@ test("argument probes agree with native R calls across pipe and argument combina
       return = function(first, second, third) capture(sys.call(), sys.function()),
       toString = function(first, second, third) capture(sys.call(), sys.function()),
       constructor = function(first, second, third) capture(sys.call(), sys.function()))
-    inputs <- jsonlite::fromJSON(file("stdin"), simplifyVector = FALSE)
     result <- lapply(seq_along(inputs$cases), function(i) {
       case <- inputs$cases[[i]]
       candidates <- setdiff(names(formals(obj[[case$fn]])), "...")
@@ -586,7 +608,7 @@ test("argument probes agree with native R calls across pipe and argument combina
       list(expected = as.list(expected), actual = as.list(actual))
     })
     cat(jsonlite::toJSON(result, auto_unbox = TRUE))
-  `], { input: JSON.stringify({ cases, probes }), encoding: "utf8", timeout: 15000 }));
+  `, { cases, probes });
   assert.equal(results.length, cases.length);
   for (const [index, result] of results.entries()) {
     assert.deepEqual(result.actual, result.expected, cases[index].call);

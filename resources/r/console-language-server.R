@@ -257,7 +257,13 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
         self$ClientCapabilities$textDocument$completion
     )
     call <- console_call_identity(params$rConsoleCall)
-    if (!is.null(call)) {
+    if (is.null(call) && !is.null(params$rConsoleCall)) {
+        # A name accepted by the frontend lexer may be invalid in R's locale
+        # (notably unquoted supplementary Unicode characters on Windows).
+        # Never retain arguments from a suffix detected as a different call.
+        reply$result$items <- Filter(function(item) !(identical(item$detail, "parameter") ||
+            (is.character(item$detail) && startsWith(item$detail, "value for "))), reply$result$items)
+    } else if (!is.null(call)) {
         detected <- document$detect_call(point)
         value_mode <- is.character(params$rConsoleArgument) && length(params$rConsoleArgument) == 1L
         if (value_mode || !identical(call$token, detected$token) ||
