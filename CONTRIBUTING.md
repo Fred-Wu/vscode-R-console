@@ -53,6 +53,7 @@ For the same checks as CI, with Node.js 24, Rust, and R on `PATH`:
 
 ```bash
 npm ci
+npm run audit:dependencies
 npm run package:extension
 npm test
 npm run test:lsp
@@ -84,6 +85,26 @@ and macOS. Releases must pass the same workflow before packaging or publishing.
 The separate runtime build workflow retains checks for all six target platforms.
 Native graphics, interactive VS Code UI behavior, and external package integrations
 remain covered by the manual checklist.
+
+### Temporary dependency audit exception
+
+`npm run audit:dependencies` checks all dependencies and fails on findings at any
+severity, except the reviewed development-only VSCE dependency chain for
+[GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf).
+As of 2026-11-18, picomatch has no patched release. npm's suggested downgrade to
+VSCE 3.9.2 would remove the `--oidc` support used for Marketplace publishing.
+
+The advisory concerns denial of service from malicious repeated extglob patterns.
+VSCE's file collector uses fixed `**` and `node_modules/**` patterns during
+packaging. This dependency is not part of the extension's runtime dependency tree.
+The exception is restricted to the reviewed package versions, installation paths,
+and development-only lockfile entries, including findings inherited from this
+single advisory. Other advisories, production dependencies, changed versions or
+paths, and audit errors still fail CI. Each use of the exception emits a warning.
+
+When an upstream fix is available, update the dependency lockfile and remove the
+exception from `scripts/audit-dependencies.js` (or restore the direct
+`npm audit --audit-level=low` check). Do not extend the exception to other findings.
 
 - [Implementation notes](docs/IMPLEMENTATION.md)
 - [Manual test checklist](docs/MANUALTEST.Rmd)

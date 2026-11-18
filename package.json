@@ -212,6 +212,7 @@
     "REditorSupport.r"
   ],
   "scripts": {
+    "audit:dependencies": "node scripts/audit-dependencies.js",
     "test": "node --test tests/unit/*.test.cjs",
     "test:lsp": "node --test tests/lsp-startup.test.cjs tests/lsp-integration.test.cjs tests/lsp-lifecycle.test.cjs",
     "test:extension-host": "vscode-test",

@@ -49,7 +49,7 @@ jobs:
       - run: npm ci
       - name: Audit npm dependencies
         if: runner.os == 'Linux'
-        run: npm audit --audit-level=low
+        run: npm run audit:dependencies
       - name: Build and stage runtime
         run: |
           npm run build:sidecar
