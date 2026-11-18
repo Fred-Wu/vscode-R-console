@@ -27,7 +27,7 @@ console_source_name <- function(node) {
 # Inspect bindings in the cursor's lexical scope. Parse syntax only: neither
 # defaults nor function bodies are evaluated, including wrapped/chained RHSs.
 console_source_function <- function(document, point, name) {
-    xdoc <- document$parse_data$xml_doc
+    xdoc <- languageserver:::parse_data_xml(document$parse_data)
     if (is.null(xdoc)) return(NULL)
     row <- point$row + 1L
     col <- point$col + 1L

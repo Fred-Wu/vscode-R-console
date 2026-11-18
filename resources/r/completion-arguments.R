@@ -18,6 +18,13 @@ console_call_identity <- function(source) {
     NULL
 }
 
+console_is_argument_item <- function(item) {
+    !is.null(item$data$parameter) ||
+        isTRUE(grepl("(parameter|argument_value)$", item$data$type)) ||
+        identical(item$detail, "parameter") ||
+        (is.character(item$detail) && startsWith(item$detail, "value for "))
+}
+
 console_argument_name <- function(item) {
     if (!is.null(item$data$uri)) {
         parsed <- tryCatch(parse(text = item$label)[[1L]], error = function(e) NULL)

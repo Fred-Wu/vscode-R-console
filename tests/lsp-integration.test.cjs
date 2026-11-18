@@ -1516,6 +1516,49 @@ test("live function arguments survive native S3 inference while source and packa
   }
 });
 
+test("source bindings inside blocks override inferred S3 signatures and live functions", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const provider = {
+    getCallContext: client.getCallContext.bind(client),
+    provideCompletionItems: async (...args) => {
+      const result = await client.provideCompletionItems(...args);
+      return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+    },
+  };
+  for (const [marked, expected, expectedProbes] of [
+    ['print(data.frame(a=1), │)', ['x = ', 'custom_arg = '], 1],
+    ['print(x=data.frame(a=1), │)', ['custom_arg = '], 1],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['x = ', 'source_arg = '], 0],
+    ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = '], 0],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), sou│) }', ['source_arg = '], 0],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), source_arg=1, │) }', [], 0],
+    ['{ print <- function() NULL; print(data.frame(a=1), │) }', [], 0],
+    ['{ print <- get("identity"); print(data.frame(a=1), │) }', [], 0],
+    ['g <- function(print) { print(data.frame(a=1), │) }', [], 0],
+    ['{ print <- function(x, mode=c("auto", "manual")) NULL; print(data.frame(a=1), mode="aut│") }', ['auto'], 0],
+  ]) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(text, cursor),
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 0, character: cursor },
+      { globalenv: { print: { type: 'closure' } } }, [], [], provider, async expression => {
+        probes++;
+        return runRJson(`
+          print <- function(x, custom_arg) NULL
+          value <- eval(parse(text = inputs))
+          cat(jsonlite::toJSON(lapply(names(value), function(name)
+            list(name = name, type = typeof(value[[name]]))), auto_unbox = TRUE))
+        `, expression);
+      });
+    const argumentsAndValues = entries.filter(item => item.role === 'argument' || item.role === 'value' ||
+      item.detail === 'parameter' || item.detail?.startsWith('value for '));
+    assert.deepEqual(argumentsAndValues.map(item => item.insertText), expected, marked);
+    if (!expected.length) assert.deepEqual(entries, [], marked);
+    assert.equal(probes, expectedProbes, marked);
+  }
+});
+
 test("source-defined member arguments use native inference without a live-session probe", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const [line, expected] of [['obj$fun(', 'arg = '], ['obj$choose(mode = "a', 'auto']]) {

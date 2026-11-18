@@ -32,9 +32,13 @@ console_supplement_completion <- function(reply, self, params) {
         isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")) ||
             (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
-    source <- if (native_arguments || is.null(call) || !is.null(call$package)) NULL else if (member_call) {
-        console_member_function(uri, workspace, document, point)
+    source <- if (is.null(call) || !is.null(call$package)) NULL else if (member_call) {
+        if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
     } else console_source_function(document, point, call$token)
+    # Native S3 inference can still select a package generic when a binding in
+    # a brace block or enclosing function shadows it. Resolve lexical bindings
+    # first, including unknown signatures, before trusting that inference.
+    native_arguments <- native_arguments && is.null(source)
     signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
     if (!is.null(source)) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
@@ -58,8 +62,7 @@ console_supplement_completion <- function(reply, self, params) {
         # A name accepted by the frontend lexer may be invalid in R's locale
         # (notably unquoted supplementary Unicode characters on Windows).
         # Never retain arguments from a suffix detected as a different call.
-        reply$result$items <- Filter(function(item) !(identical(item$detail, "parameter") ||
-            (is.character(item$detail) && startsWith(item$detail, "value for "))), reply$result$items)
+        reply$result$items <- Filter(function(item) !console_is_argument_item(item), reply$result$items)
     } else if (!native_arguments && !is.null(call) && (!member_call || !is.null(source))) {
         detected <- document$detect_call(point)
         value_mode <- is.character(params$rConsoleArgument) && length(params$rConsoleArgument) == 1L
@@ -94,8 +97,7 @@ console_supplement_completion <- function(reply, self, params) {
                     params$rConsoleArgument, params$rConsoleValueTags)
                 arguments <- Filter(function(item) nzchar(name) && identical(item$detail, paste0("value for ", name)), arguments)
             }
-            other <- Filter(function(item) !(identical(item$detail, "parameter") ||
-                (is.character(item$detail) && startsWith(item$detail, "value for "))), reply$result$items)
+            other <- Filter(function(item) !console_is_argument_item(item), reply$result$items)
             items <- c(arguments, other)
             nmax <- languageserver:::lsp_settings$get("max_completions")
             reply$result$items <- head(items, nmax)

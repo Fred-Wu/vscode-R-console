@@ -129,6 +129,18 @@ suite("Completion in the VS Code extension host", () => {
       assert.ok(qualifiedPrint.some(item => item.insertText === 'digits = '));
       assert.ok(qualifiedPrint.every(item => item.insertText !== 'old_arg = '));
       assert.equal(runtimeProbes, probesBeforeShadow + 1, 'qualified calls must not probe a session namesake');
+      for (const [marked, expected] of [
+        ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['x = ', 'source_arg = ']],
+        ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = ']],
+        ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), source_arg=1, │) }', []],
+        ['g <- function(print) { print(data.frame(a=1), │) }', []],
+      ]) {
+        const text = marked.replace('│', '');
+        const items = await complete(text, shadowPrint, marked.indexOf('│'));
+        assert.deepEqual(items.map(item => item.insertText), expected, marked);
+        assert.equal(runtimeProbes, probesBeforeShadow + 1,
+          'lexical bindings must supersede native S3 metadata without probing the session');
+      }
       const probesBeforeNative = runtimeProbes;
       const memberText = 'obj <- list(alpha = 1)\nobj$alpha';
       const memberCursor = memberText.length - 4;
