@@ -25,23 +25,35 @@ export const R_RESERVED_WORDS = new Set([
   "NA_character_",
 ]);
 
+// R backticked names accept byte escapes but reject Unicode escapes.
+export function escapeRControls(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, char => {
+    if (char === "\r") return "\\r";
+    if (char === "\n") return "\\n";
+    if (char === "\t") return "\\t";
+    return Array.from(Buffer.from(char, "utf8"), byte =>
+      "\\x" + byte.toString(16).padStart(2, "0")).join("");
+  });
+}
+
+function escapeRLiteral(value: string, quote: string): string {
+  return escapeRControls(value.replaceAll("\\", "\\\\").replaceAll(quote, "\\" + quote));
+}
+
+export function backtickRName(name: string): string {
+  return "`" + escapeRLiteral(name, "`") + "`";
+}
+
 export function quoteRNameIfNeeded(name: string): string {
   if (R_SYNTACTIC_NAME_PATTERN.test(name) && !R_RESERVED_WORDS.has(name)) {
     return name;
   }
-  return `\`${name.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\``;
+  return backtickRName(name);
 }
 
 export function getFieldInsertText(name: string, context: CompletionContext, bare = false): string {
-  if (context.kind !== "bracket") {
-    return quoteRNameIfNeeded(name);
-  }
-  if (context.bracketQuote) {
-    const quotePattern = context.bracketQuote === "\"" ? /"/g : /'/g;
-    return name.replace(/\\/g, "\\\\").replace(quotePattern, `\\${context.bracketQuote}`);
-  }
-  if (context.bracketOperator === "[[" || !bare) {
-    return `"${name.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+  if (context.kind === "bracket" && (context.bracketQuote || context.bracketOperator === "[[" || !bare)) {
+    return quoteCompletionValue(name, context.bracketQuote);
   }
   return quoteRNameIfNeeded(name);
 }
@@ -67,8 +79,7 @@ export function isGlobalSymbolContext(context: CompletionContext): boolean {
 
 export function quoteCompletionValue(value: string, existingQuote?: "\"" | "'"): string {
   const quote = existingQuote ?? '"';
-  const escaped = value.replace(/\\/g, "\\\\").replaceAll(quote, `\\${quote}`)
-    .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+  const escaped = escapeRLiteral(value, quote);
   return existingQuote ? escaped : quote + escaped + quote;
 }
 

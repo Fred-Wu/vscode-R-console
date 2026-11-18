@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
-import { quoteRNameIfNeeded, getFieldInsertText, quoteCompletionValue } from "./candidates";
+import { backtickRName, quoteRNameIfNeeded, getFieldInsertText, quoteCompletionValue } from "./candidates";
 import { subscriptArgumentExpression } from "./subscript";
 import { allowsSymbolCompletions } from "./policy";
 
@@ -17,7 +17,7 @@ export function isSessionFunctionCall(context: CompletionContext, data: Workspac
   if (!context.functionName.startsWith("`")) return false;
   return Object.entries(globals).some(([name, item]) => isSessionFunction(item) &&
     (context.functionName === name ||
-      context.functionName === `\`${name.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\``));
+      context.functionName === backtickRName(name)));
 }
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
