@@ -1284,3 +1284,24 @@ test("empty runtime values survive both session completion transports", async ()
     assert.ok(completion.toCompletionPick(values[0], context).label.endsWith('""'), 'empty choice has a visible label');
   }
 });
+
+test("complex defaults cannot suppress source argument completions", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const expression of ['c(base::identity("never evaluate"))',
+    'c((function() stop("never evaluate"))())', 'c("known", base::stop("never evaluate"))',
+    'c(I("known"), , base::stop("never evaluate"))']) {
+    const text = `f <- function(x = ${expression}, good) NULL\nf()`;
+    const result = await client.provideCompletionItems({ getText: () => text }, { line: 1, character: 2 });
+    assert.ok(result, expression);
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), ['x', 'good'], expression);
+    assert.deepEqual(result.items.filter(item => item.detail === 'value for x').map(item => item.label),
+      expression.includes('"known"') ? ['known'] : [], expression);
+    const symbols = await client.provideCompletionItems({ getText: () => text.replace('f()', 'f(lib)') },
+      { line: 1, character: 5 });
+    assert.ok(symbols?.items.some(item => item.label === 'library'), 'ordinary symbol completion is preserved');
+    const values = await client.provideCompletionItems({ getText: () => text.replace('f()', 'f(x = "")') },
+      { line: 1, character: 7 });
+    assert.deepEqual(values?.items.filter(item => item.detail === 'value for x').map(item => item.label),
+      expression.includes('"known"') ? ['known'] : [], 'quoted values use the same safe extraction');
+  }
+});

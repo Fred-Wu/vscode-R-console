@@ -43,6 +43,18 @@ test("comment stripping preserves strings, inline comments, and line endings", (
     'x <- "first\n# inside string\nlast"');
 });
 
+test("unfinished quoted tokens remain incomplete when their final quote is escaped", async () => {
+  for (const input of ['`', '`name\\`', '"text\\"', "'text\\'"]) {
+    let nativeCalls = 0;
+    assert.equal(await parser.isExpressionCompleteAsync(input), false, input);
+    assert.equal(await parser.isExpressionCompleteAsync(input, async () => { nativeCalls++; return 1; }), false, input);
+    assert.equal(nativeCalls, 0, 'the lexer already knows the token is unfinished');
+  }
+  for (const input of ['`name\\``', '"text\\""', "'text\\''"]) {
+    assert.equal(await parser.isExpressionCompleteAsync(input), true, input);
+  }
+});
+
 test("native parsing distinguishes incomplete input from errors and falls back on failure", async () => {
   assert.equal(await parser.isExpressionCompleteAsync("x", async () => 2), false);
   assert.equal(await parser.isExpressionCompleteAsync("x", async () => 3), true);

@@ -331,6 +331,21 @@ console_source_signature <- function(source, uri) {
     })
 }
 
+# Read literal choices without inspecting a computed call head as a scalar
+# name. Defaults such as c(pkg::fun()) and c((function() ...)()) are valid R
+# syntax, but cannot supply known values and must never be evaluated.
+console_default_values <- function(expression) {
+    if (missing(expression)) return(NULL)
+    if (is.character(expression)) return(expression)
+    if (!is.call(expression) || !identical(expression[[1L]], quote(c))) return(NULL)
+    unlist(lapply(as.list(expression)[-1L], function(value) {
+        if (is.character(value)) return(value)
+        if (is.call(value) && identical(value[[1L]], quote(I)) && length(value) > 1L &&
+            is.character(value[[2L]])) return(value[[2L]])
+        NULL
+    }), use.names = FALSE)
+}
+
 # Use the whole call's tags so exact matches can disambiguate a partial tag.
 # TRUE marks the cursor's argument; all other values are inert NULL syntax.
 console_value_argument <- function(formal_names, tag, tags) {
@@ -432,16 +447,24 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     }
 
     point <- document$from_lsp_position(params$position)
+    call <- console_call_identity(params$rConsoleCall)
+    source <- if (!is.null(call) && is.null(call$package)) console_source_function(document, point, call$token) else NULL
+    completion_document <- document
+    if (!is.null(source)) {
+        # The source signature below is authoritative. Skip the upstream
+        # argument provider, which both duplicates that work and can fail on
+        # computed default expressions. Keep its ordinary symbol completions.
+        completion_document <- as.list(document)
+        completion_document$detect_call <- function(point) list(token = "")
+    }
     reply <- languageserver:::completion_reply(
         id,
         uri,
         workspace,
-        document,
+        completion_document,
         point,
         self$ClientCapabilities$textDocument$completion
     )
-    call <- console_call_identity(params$rConsoleCall)
-    source <- if (!is.null(call) && is.null(call$package)) console_source_function(document, point, call$token) else NULL
     signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
     if (!is.null(source)) reply$result$rConsoleLocalFunction <- TRUE
     if (is.null(call) && !is.null(params$rConsoleCall)) {
@@ -463,7 +486,7 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
             arguments <- if (!is.null(source)) {
                 parameters <- if (!value_mode) Filter(function(item) languageserver:::match_with(item$label, token), signature) else list()
                 values <- unlist(lapply(names(source$formals), function(name) {
-                    defaults <- languageserver:::extract_default_values(source$formals[[name]])
+                    defaults <- console_default_values(source$formals[[name]])
                     if (is.null(defaults)) return(list())
                     lapply(defaults[languageserver:::match_with(defaults, token)], function(value) {
                         list(label = value, kind = languageserver:::CompletionItemKind$Value,

@@ -1146,21 +1146,10 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
 
   for (const token of tokens) {
     switch (token.type) {
-      case TokenType.String: {
-        const value = token.value;
-        const quote = value[0];
-        if (value.length < 2 || value[value.length - 1] !== quote) {
-          return "incomplete";
-        }
-        break;
-      }
+      case TokenType.String:
       case TokenType.RawString:
-        if (!token.closed) {
-          return "incomplete";
-        }
-        break;
       case TokenType.Identifier:
-        if (token.value.startsWith("`") && !token.value.endsWith("`")) {
+        if (token.closed === false) {
           return "incomplete";
         }
         break;

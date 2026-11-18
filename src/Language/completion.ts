@@ -447,9 +447,12 @@ export async function collectCompletionEntries(
     consoleInputText ?? doc?.getText() ?? "",
     recentConsoleEntries
   );
-  const cachedColumnItems = getDataColumnCompletions(context, sessionData);
+  // Quoted argument values accept only declared values. A live column probe
+  // cannot contribute here and may wait on an unrelated busy R session.
+  const includeColumns = !context.argumentValue?.quote;
+  const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
   const columnItemsRequest =
-    cachedColumnItems.length > 0
+    !includeColumns || cachedColumnItems.length > 0
       ? Promise.resolve(cachedColumnItems)
       : getRuntimeDataColumnCompletions(
           context,

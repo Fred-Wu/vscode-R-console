@@ -13,6 +13,19 @@ const contextAt = marked => {
   return completion.getCompletionContext(text, cursor);
 };
 
+test("quoted argument values do not request irrelevant runtime columns", async () => {
+  const text = 'df |> choose(method = "a")';
+  const context = contextAt('df |> choose(method = "a│")');
+  assert.equal(context.dataObjectName, 'df');
+  let columnRequests = 0;
+  const entries = await completion.collectCompletionEntries(context, { getText: () => text },
+    { line: 0, character: context.snapshotCursor }, undefined, [], [], {
+      provideCompletionItems: async () => [{ label: 'auto', kind: 11, detail: 'value for method' }],
+    }, async () => { columnRequests++; return []; });
+  assert.equal(columnRequests, 0);
+  assert.deepEqual(entries.map(entry => entry.insertText), ['auto']);
+});
+
 test("subscript options do not change the indexing dimensions", () => {
   for (const marked of ["df[│, drop = FALSE]", "df[drop = FALSE, │]",
     'df[│, "drop" = FALSE]', "df[[│, exact = TRUE]]", "df[[exact = TRUE, │]]"]) {
