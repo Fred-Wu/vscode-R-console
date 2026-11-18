@@ -120,7 +120,7 @@ R Console also contributes its own settings:
 | `r.console.inlineCompletion.acceptOnEnter` | `true` | Accept inline suggestions with Enter. Disable to submit input with Enter and accept suggestions with Tab. Applies only to `inline`. |
 | `r.console.historyScope` | `workspace` | Share history by workspace folder or use `global`. Applies when a console is created or reattached. |
 | `r.console.autoMatch`    | `true`      | Auto-insert matching brackets and quotes                                                                                      |
-| `r.console.tabSize`      | `2`         | Indentation width                                                                                                             |
+| `r.console.tabSize`      | `2`         | Number of spaces per indentation level (a non-negative integer). Set to `0` for zero-width indentation. |
 | `r.console.pipeOperator` | <code>&#124;&gt;</code> | Pipe operator inserted by`R Console: Insert Pipe Operator` / `Ctrl+Alt+M`; supported values are <code>&#124;&gt;</code> and `%>%` |
 
 ## Dependency Model
