@@ -9,6 +9,7 @@ function fixture() {
     severity: "high",
   };
   const entries = [
+    ["ovsx", "node_modules/ovsx", "1.4.0", ["@vscode/vsce"]],
     ["@vscode/vsce", "node_modules/@vscode/vsce", "4.1.1", ["tinyglobby"]],
     ["tinyglobby", "node_modules/tinyglobby", "0.2.17", ["fdir", "picomatch"]],
     ["fdir", "node_modules/tinyglobby/node_modules/fdir", "6.5.0", ["picomatch"]],
@@ -19,7 +20,7 @@ function fixture() {
       auditReportVersion: 2,
       vulnerabilities: Object.fromEntries(entries.map(([name, nodePath, , via]) =>
         [name, { name, severity: "high", nodes: [nodePath], via }])),
-      metadata: { vulnerabilities: { total: 4 } },
+      metadata: { vulnerabilities: { total: entries.length } },
     },
     lock: { packages: Object.fromEntries(entries.map(([, nodePath, version]) =>
       [nodePath, { version, dev: true }])) },
@@ -29,7 +30,7 @@ function fixture() {
 test("allows the reviewed advisory and its inherited VSCE findings", () => {
   const { report, lock } = fixture();
   assert.deepEqual(assessAudit(report, lock), {
-    allowed: ["@vscode/vsce", "tinyglobby", "fdir", "picomatch"], blocked: [],
+    allowed: ["ovsx", "@vscode/vsce", "tinyglobby", "fdir", "picomatch"], blocked: [],
   });
 });
 
@@ -38,7 +39,13 @@ test("a second advisory in picomatch blocks the entire affected chain", () => {
   report.vulnerabilities.picomatch.via.push({
     name: "picomatch", url: "https://github.com/advisories/another-advisory", severity: "low",
   });
-  assert.equal(assessAudit(report, lock).blocked.length, 4);
+  assert.equal(assessAudit(report, lock).blocked.length, 5);
+});
+
+test("only the reviewed VSCE finding can be inherited by ovsx", () => {
+  const { report, lock } = fixture();
+  report.vulnerabilities.ovsx.via = ["picomatch"];
+  assert.deepEqual(assessAudit(report, lock).blocked, ["ovsx"]);
 });
 
 test("an unrelated low-severity finding remains blocking", () => {
@@ -62,7 +69,7 @@ for (const [description, change] of [
   test(`does not except ${description}`, () => {
     const { report, lock } = fixture();
     change(report, lock, "node_modules/tinyglobby/node_modules/picomatch");
-    assert.equal(assessAudit(report, lock).blocked.length, 4);
+    assert.equal(assessAudit(report, lock).blocked.length, 5);
   });
 }
 

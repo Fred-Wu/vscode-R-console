@@ -132,6 +132,15 @@ jobs:
             exit 0
           fi
 
+          runtime_build_inputs=(scripts/build-sidecar.js scripts/sidecar-targets.js)
+          if [[ "${TARGET}" == win32-* ]]; then
+            runtime_build_inputs+=(sidecar/pty-host/build.rs images/Rlogo.ico)
+          fi
+          if ! git diff --quiet "${previous_tag}" HEAD -- "${runtime_build_inputs[@]}"; then
+            echo "R Console runtime build inputs changed without a version change for ${TARGET}." >&2
+            exit 1
+          fi
+
           # Even if the version is unchanged, never restore a backend whose
           # Rust implementation differs from the published binary.
           if ! git diff --quiet "${previous_tag}" HEAD -- sidecar/pty-host/src sidecar/pty-host/Cargo.toml sidecar/pty-host/Cargo.lock; then
@@ -139,14 +148,6 @@ jobs:
             exit 0
           fi
 
-          runtime_build_inputs=(scripts/build-sidecar.js scripts/sidecar-targets.js)
-          if [[ "${TARGET}" == win32-* ]]; then
-            runtime_build_inputs+=(images/Rlogo.ico)
-          fi
-          if ! git diff --quiet "${previous_tag}" HEAD -- "${runtime_build_inputs[@]}"; then
-            echo "R Console runtime build inputs changed without a version change for ${TARGET}." >&2
-            exit 1
-          fi
           if ! command -v unzip >/dev/null; then
             echo "unzip is required to restore the unchanged ${TARGET} runtime binary." >&2
             exit 1
@@ -165,11 +166,13 @@ jobs:
             executable="R_CONSOLE_HOST.exe"
           fi
 
-          if [[ -z "${vsix}" ]] || ! unzip -p "${vsix}" "extension/bundled/bin/${executable}" > "bundled/bin/${executable}"; then
-            rm -f "bundled/bin/${executable}"
+          candidate=".restore-sidecar/${executable}"
+          if [[ -z "${vsix}" ]] || ! unzip -p "${vsix}" "extension/bundled/bin/${executable}" > "${candidate}"; then
             echo "Could not restore ${executable} from the ${previous_tag} VSIX." >&2
             exit 1
           fi
+          node scripts/verify-restored-sidecar.js "${TARGET}" "${candidate}"
+          mv "${candidate}" "bundled/bin/${executable}"
           if [[ "${executable}" != *.exe ]]; then
             chmod 755 "bundled/bin/${executable}"
           fi
@@ -401,11 +404,15 @@ jobs:
         run: npx @vscode/vsce publish --oidc --skip-duplicate --packagePath ./release-artifacts/*.vsix
 
   publish-open-vsx:
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_open_vsx)
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_open_vsx)
     needs: package
     runs-on: ubuntu-latest
+    environment: open-vsx
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
@@ -426,7 +433,8 @@ jobs:
           merge-multiple: true
           path: release-artifacts
 
+      - name: Install locked Open VSX CLI
+        run: npm ci --ignore-scripts
+
       - name: Publish Open VSX Registry
-        env:
-          OVSX_PAT: ${{ secrets.OPEN_VSX_TOKEN }}
-        run: npx --yes ovsx publish --skip-duplicate --packagePath ./release-artifacts/*.vsix
+        run: ./node_modules/.bin/ovsx publish --trusted-publishing --skip-duplicate --packagePath ./release-artifacts/*.vsix

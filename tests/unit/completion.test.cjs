@@ -263,6 +263,22 @@ test("subscript member detection preserves base-object lookup without evaluating
     async expression => { assert.equal(expression, "obj"); return []; });
 });
 
+test("subscripted slot completion uses only slots inferred by the language server", async () => {
+  const input = "objects[[choose_index()]]@sl";
+  const context = completion.getCompletionContext(input, input.length);
+  assert.equal(context.kind, "member");
+  let liveRequests = 0;
+  const request = async () => { liveRequests++; return []; };
+  for (const labels of [[], ["slotName"]]) {
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, { globalenv: { objects: { slots: ["slotOnContainer"] } } },
+      [], [], { provideCompletionItems: async () =>
+        labels.map(label => ({ label, kind: 4, data: { type: "member" } })) }, request);
+    assert.deepEqual(entries.map(entry => entry.label), labels);
+  }
+  assert.equal(liveRequests, 0);
+});
+
 test("member-like text in literals and comments does not request runtime members", async () => {
   for (const input of ['"obj$fi', 'r"(obj$fi)', "# obj$fi", "obj$ # fi", "obj$`fi"]) {
     const context = completion.getCompletionContext(input, input.length);
