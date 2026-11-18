@@ -104,7 +104,7 @@ console_supplement_completion <- function(reply, self, params) {
     }
     # Validate each proposed name using R's matching rules. Positional values,
     # partial tags and pipe insertion can make an otherwise unused name invalid.
-    if ((!native_arguments && (!member_call || !is.null(source))) || !is.null(signature)) reply$result$items <- console_valid_argument_items(reply$result$items,
+    if (!isTRUE(source$unknown) && ((!native_arguments && (!member_call || !is.null(source))) || !is.null(signature))) reply$result$items <- console_valid_argument_items(reply$result$items,
         params$rConsoleArgumentTags, call, uri, workspace, point, signature)
     if (isTRUE(attr(reply$result$items, "arguments_exhausted"))) {
         reply$result$rConsoleArgumentsExhausted <- TRUE

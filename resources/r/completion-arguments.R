@@ -27,6 +27,9 @@ console_argument_name <- function(item) {
 }
 
 console_source_signature <- function(source, uri) {
+    # A lexical binding can shadow a package function without revealing its
+    # signature. NULL means unknown; list() means a known zero-argument function.
+    if (isTRUE(source$unknown)) return(NULL)
     lapply(names(source$formals), function(name) {
         spelling <- paste(deparse(as.name(name), backtick = TRUE), collapse = "")
         list(label = spelling, kind = languageserver:::CompletionItemKind$Variable,

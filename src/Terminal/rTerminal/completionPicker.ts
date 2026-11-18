@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
 import {
   type CompletionContext, type CompletionEntries, type CompletionEntry, type CompletionPickItem,
-  getCompletionContext, getCompletionIdentityKey, rankCompletionEntries, isCompletionPickItem,
+  getCompletionContext, rankCompletionEntries, isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { rebaseCompletionEnds } from "../../Language/completion/refinement";
+import { dedupeCompletionEntries } from "../../Language/completion/candidates";
 import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
@@ -38,23 +39,6 @@ export async function pickCompletion({
   };
   const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
     rankCompletionEntries(sourceEntries, searchValue(value), context);
-  const mergeCompletionEntries = (
-    firstEntries: CompletionEntry[],
-    secondEntries: CompletionEntry[]
-  ): CompletionEntry[] => {
-    const seen = new Set<string>();
-    const merged: CompletionEntry[] = [];
-    const entries = [...firstEntries, ...secondEntries];
-    for (const entry of entries) {
-      const key = getCompletionIdentityKey(entry);
-      if (seen.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      merged.push(entry);
-    }
-    return merged;
-  };
   const quickPickContext = (value: string) => ({
     ...context,
     prefix: searchValue(value),
@@ -181,7 +165,7 @@ export async function pickCompletion({
         const originalEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
         sourceEntries = context.kind === "package"
           ? originalEntries
-          : mergeCompletionEntries(baselineEntries, originalEntries);
+          : dedupeCompletionEntries([...baselineEntries, ...originalEntries]);
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
         // Typing may have refined a complete baseline while this request was

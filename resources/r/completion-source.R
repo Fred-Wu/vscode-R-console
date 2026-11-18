@@ -53,8 +53,9 @@ console_source_function <- function(document, point, name) {
         # Parse only this default, not the enclosing body or other defaults.
         default <- xml2::xml_find_first(formal[[1L]],
             "following-sibling::*[1][self::EQ_FORMALS]/following-sibling::expr[1]")
-        selected <- list(formals = if (inherits(default, "xml_missing")) NULL else
-            console_source_definition(console_source_expression(default))[[2L]])
+        definition <- if (inherits(default, "xml_missing")) NULL else
+            console_source_definition(console_source_expression(default))
+        selected <- list(formals = definition[[2L]], unknown = is.null(definition))
         depth <- scope_depth
     }
     assignments <- xml2::xml_find_all(xdoc, "//*[LEFT_ASSIGN or EQ_ASSIGN or RIGHT_ASSIGN]")
@@ -82,7 +83,7 @@ console_source_function <- function(document, point, name) {
         # literal, however, defaults and the body run after the binding exists,
         # so recursive calls use the new signature (also for rightward binds).
         if (contains(node) && is.null(definition)) next
-        selected <- list(formals = definition[[2L]])
+        selected <- list(formals = definition[[2L]], unknown = is.null(definition))
         depth <- binding_depth
     }
     selected

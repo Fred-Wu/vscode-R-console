@@ -767,7 +767,6 @@ test("language-server completion starts before a fresh workspace request finishe
         }
         return [];
       },
-      getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
       rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: () => [],
@@ -837,7 +836,6 @@ test("member and package completions do not refresh workspace data", async () =>
     "../../Language/completion": {
       getCompletionContext: (input) => contexts.get(input),
       collectCompletionEntries: async () => [],
-      getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
       rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: () => [],
@@ -930,7 +928,6 @@ test("F7 refinement starts language-server completion before workspace refresh f
         }
         return [];
       },
-      getCompletionIdentityKey: () => "",
       isCompletionPickItem: () => false,
       rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: () => [],
@@ -1026,7 +1023,6 @@ test("package completion filters locally without repeated language-server reques
           source: "lsp",
         }];
       },
-      getCompletionIdentityKey: (entry) => entry.label,
       isCompletionPickItem: () => false,
       rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: (entries) => entries,
@@ -1415,7 +1411,6 @@ test("incomplete package completion re-queries until a complete result arrives",
         }
         return entries;
       },
-      getCompletionIdentityKey: (entry) => entry.label,
       isCompletionPickItem: () => false,
       rankCompletionEntries: completion.rankCompletionEntries,
       toCompletionQuickPickItems: (entries) => entries,

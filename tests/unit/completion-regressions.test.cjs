@@ -76,6 +76,15 @@ test("data completion follows active lexical scopes and the current pipe", () =>
     ['dplyr::filter(df, │)', 'df'], ['df |> dplyr::filter(│)', 'df'],
     ['with(outer_df, df |> print(│))', 'outer_df'],
     ['with(outer_df, stats::filter(df, │))', 'outer_df'],
+    ['with(data = df, │)', 'df'], ['subset(x = df, │)', 'df'],
+    ['transform(`_data` = df, │)', 'df'], ['dplyr::filter(.data = df, │)', 'df'],
+    ['with(obj$data, │)', 'obj$data'], ['with(data = obj$data, │)', 'obj$data'],
+    ['with(expr = df, │)', undefined],
+    ['with(factory(), │)', undefined],
+    ['with(a + a, │)', undefined], ['with(data = factory(), df, │)', undefined],
+    ['with(expr = ignored, data = df, │)', 'df'],
+    ['with(obj $ # receiver\n data, │)', 'obj$data'],
+    ['with(`a $ b`, │)', '`a $ b`'], ['with(df[rows, ], │)', 'df'],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0];
     const lines = text.split('\n'), row = before.split('\n').length - 1;
@@ -357,7 +366,8 @@ test("unknown or unmatched argument prefixes are not treated as exhausted signat
 });
 
 test("outer-call parameters and literal choices cannot leak into other cursor contexts", async () => {
-  for (const text of ['plain', 'pkg::', 'obj$', 'outer(lst[', 'outer(lst[ind', 'outer(lst[[', 'outer(lst[["']) {
+  for (const text of ['plain', 'pkg::', 'obj$', 'outer(lst[', 'outer(lst[ind', 'outer(lst[[', 'outer(lst[["',
+    'outer(x + plain', 'outer(method = x + plain']) {
     const context = completion.getCompletionContext(text, text.length);
     const entries = await completion.collectCompletionEntries(context, { getText: () => text },
       { line: 0, character: text.length }, undefined, [], [], {

@@ -57,6 +57,18 @@ suite("Completion in the VS Code extension host", () => {
       }
       const exhaustedText = 'base::atan2(1,2, )';
       assert.deepEqual(await complete(exhaustedText, runtime, exhaustedText.length - 1), []);
+      for (const text of ['g <- function(f) { f(run',
+        'g <- function(atan2) { atan2(1,2, run']) {
+        const items = await complete(text, runtime);
+        assert.ok(items.some(item => item.insertText === 'runtime_function()'), text);
+        assert.ok(items.every(item => item.detail !== 'parameter'), text);
+      }
+      const arithmetic = await complete('stats::cor(method = x + pea');
+      assert.ok(arithmetic.every(item => !item.detail?.startsWith('value for ')));
+      for (const text of ['with(data = df, ', 'subset(x = df, ', 'transform(`_data` = df, ']) {
+        const items = await complete(text, { globalenv: { df: { names: ['alpha'] } } });
+        assert.ok(items.some(item => item.insertText === 'alpha'), text);
+      }
       const indexText = 'lst <- list(alpha = 10, beta = 20)\nindex <- "beta"\nlst[[ind]]';
       const indexItems = await complete(indexText, { globalenv: {
         lst: { names: ['alpha', 'beta'] }, index: { type: 'character' },

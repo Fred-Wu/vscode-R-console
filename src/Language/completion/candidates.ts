@@ -144,7 +144,7 @@ export function dedupeCompletionEntries(
   return result;
 }
 
-export function getCompletionIdentityKey(entry: CompletionEntry): string {
+function getCompletionIdentityKey(entry: CompletionEntry): string {
   return [
     entry.label,
     entry.detail ?? "",

@@ -1511,6 +1511,10 @@ test("exhausted fixed-arity calls suppress all completion sources", { timeout: 9
     ['base::list(1,2, run│)', false], ['unknown_function(1,2, run│)', false],
     ['base::unknown_function(1,2, run│)', false],
     ['f <- function(a,...) NULL\nf(1,2, run│)', false],
+    ['g <- function(f) { f(run│) }', false],
+    ['g <- function(atan2) { atan2(1,2, run│) }', false],
+    ['g <- function(f = stop("must not evaluate")) { f(run│) }', false],
+    ['f <- get("identity")\nf(run│)', false],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     const before = text.slice(0, cursor), lines = text.split('\n');
@@ -1603,7 +1607,8 @@ test("completion sources stay inside every R cursor context", { timeout: 90000 }
     assert.ok(entries.some(item => item.label === 'global_function'), marked);
     assert.ok(entries.every(item => [1, 2, 3].includes(item.kind)), marked);
   }
-  for (const marked of ['subset(df, │)', 'df |> subset(│)', 'with(df, │)']) {
+  for (const marked of ['subset(df, │)', 'df |> subset(│)', 'with(df, │)',
+    'subset(x = df, │)', 'with(data = df, │)', 'transform(`_data` = df, │)']) {
     const entries = await collect(marked);
     assert.deepEqual(labels(entries.filter(item => item.kind === 4)), ['zebra', 'alpha', 'beta'], marked);
     assert.ok(entries.some(item => item.role === 'argument'), marked);
@@ -1628,6 +1633,10 @@ test("completion sources stay inside every R cursor context", { timeout: 90000 }
   const value = await collect('base::atan2(y=glo│)');
   assert.ok(value.some(item => item.label === 'global_value'));
   assert.ok(value.every(item => item.role !== 'argument'));
+  for (const marked of ['stats::cor(method = x + pea│)', 'stats::cor(method = !pea│)',
+    'f <- function(method = c("pearson", "spearman")) NULL\nf(x + pea│)']) {
+    assert.ok((await collect(marked)).every(item => item.role !== 'value'), marked);
+  }
 });
 
 test("variadic completion retains dots after supplied arguments without leaking into values", { timeout: 90000 }, async t => {

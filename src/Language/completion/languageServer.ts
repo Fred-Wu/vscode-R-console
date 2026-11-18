@@ -109,6 +109,7 @@ function isLanguageServerCompletionItem(
       role !== "argument" && role !== "value" && role !== "member" &&
       !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
   if (role === "argument" && !context.argumentTags) return false;
+  if (role === "value" && !context.argumentTags && !context.argumentValue) return false;
   // Native call detection can still see an outer call while our cursor is in
   // its subscript or member expression. Its arguments do not belong there.
   if ((role === "argument" || role === "value") && context.kind !== "argument") return false;
