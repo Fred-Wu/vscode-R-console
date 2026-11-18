@@ -18,7 +18,7 @@ const COMPLETION_GROUP_ORDER = {
   bracket: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
   default: DEFAULT_COMPLETION_GROUP_ORDER,
   member: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
-  package: ["Package Members", "Functions", "Fields", "Recent Input", "Other"],
+  package: ["Functions", "Variables", "Fields", "Packages", "Other"],
 } as const satisfies Record<CompletionContext["kind"], readonly string[]>;
 
 const DATA_CONTEXT_GROUP_ORDER = [
@@ -36,7 +36,7 @@ const EXACT_MATCH_GROUP_ORDER = [
   "Runtime Variables",
   "Runtime Functions",
   "Functions",
-  "Package Members",
+  "Variables",
   "Packages",
   "Fields",
   "Arguments",
@@ -88,7 +88,7 @@ function rankSymbolEntries(entries: CompletionEntry[], query: string): Completio
         Number(b.entry.label === query) - Number(a.entry.label === query) ||
         a.match![0] - b.match![0] ||
         a.match!.at(-1)! - a.match![0] - (b.match!.at(-1)! - b.match![0]) ||
-        aLabel.length - bLabel.length || compareCompletionLabels(a.entry, b.entry) || a.index - b.index;
+        compareCompletionLabels(a.entry, b.entry) || a.index - b.index;
     })
     .map(({ entry }) => entry);
 }
@@ -223,8 +223,9 @@ function getCompletionGroup(
   if (entry.source === "buffer") {
     return "Recent Input";
   }
-  if (context.kind === "package") {
-    return "Package Members";
+  if (context.kind === "package" && kind !== undefined &&
+      (kind === vscode.CompletionItemKind.Variable || kind === vscode.CompletionItemKind.Constant)) {
+    return "Variables";
   }
   if (isArgumentCompletionEntry(entry)) {
     return "Arguments";

@@ -97,7 +97,7 @@ test("call context suppresses argument names in values, literals, comments and e
     'obj$fun("fir|st")', "obj$fun('fir|st')", 'obj$fun(r"--(fir|st)--")',
     "obj$fun(`fir|st`)", 'obj$fun("escaped\\"fir|st")',
     "obj$fun(# fir|\n)", "obj$fun(first |)", "obj$fun(|first = 1)",
-    "obj$fun(fir| = 1)", "obj$fun(..., fir|)",
+    "obj$fun(fir| = 1)",
   ]) {
     const cursor = marked.indexOf("|");
     const context = parser.getEnclosingCall(marked.replace("|", ""), cursor);
@@ -282,5 +282,17 @@ test("argument tags include pipe inputs and preserve raw-string names", () => {
     const cursor = marked.indexOf("§");
     const context = parser.getEnclosingCall(marked.replace("§", ""), cursor);
     assert.deepEqual(context?.argumentTags, tags, marked);
+  }
+});
+
+test("forwarded dots preserve argument-name positions without claiming known arity", () => {
+  for (const [marked, expected] of [
+    ['obj$fun(..., fir|)', ['...', null]],
+    ['fun(..., row.names = NULL, |)', ['...', 'row.names', null]],
+    ['fun(|, ...)', [null, '...']],
+  ]) {
+    const text = marked.replace('|', '');
+    const context = parser.getEnclosingCall(text, marked.indexOf('|'));
+    assert.deepEqual(context.argumentTags, expected, marked);
   }
 });

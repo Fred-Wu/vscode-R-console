@@ -30,7 +30,7 @@ console_source_signature <- function(source, uri) {
     lapply(names(source$formals), function(name) {
         spelling <- paste(deparse(as.name(name), backtick = TRUE), collapse = "")
         list(label = spelling, kind = languageserver:::CompletionItemKind$Variable,
-            detail = "parameter", insertText = paste0(spelling, " = "),
+            detail = "parameter", insertText = if (name == "...") "..." else paste0(spelling, " = "),
             data = list(type = "parameter", uri = uri))
     })
 }
@@ -76,6 +76,7 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     if (is.null(call) || is.null(tags)) return(items)
     # Ask the same provider for the complete signature, including local source
     # definitions and dots. Defaults and function bodies are never evaluated.
+    forwarded_dots <- "..." %in% unlist(tags, use.names = FALSE)
     known_signature <- !is.null(signature)
     if (is.null(signature)) signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
         call$package, exported_only = call$accessor != ":::")
@@ -91,8 +92,9 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     # An empty filtered parameter list is not evidence of exhaustion. Use the
     # full signature and count supplied slots (including implicit pipe input).
     # Unknown signatures and dots must retain ordinary expression completion.
+    supplied_count <- sum(vapply(tags, function(tag) !is.null(tag) && !identical(tag, "..."), logical(1)))
     if ((known_signature || length(formal_names) > 0L) && !"..." %in% formal_names &&
-        sum(vapply(tags, is.null, logical(1))) == 1L && length(tags) - 1L >= length(formal_names)) {
+        sum(vapply(tags, is.null, logical(1))) == 1L && supplied_count >= length(formal_names)) {
         return(structure(list(), arguments_exhausted = TRUE))
     }
     if (!length(formal_names)) return(items)
@@ -118,7 +120,9 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
             identical(item$detail, paste0("value for ", value_name)))
         if (!is_parameter(item)) return(TRUE)
         name <- console_argument_name(item)
-        if (name == "..." || name %in% names(syntax)) return(FALSE)
+        if (name == "...") return(TRUE)
+        if (name %in% names(syntax)) return(FALSE)
+        if (forwarded_dots) return(TRUE)
         candidate <- syntax
         names(candidate)[cursor_slot] <- name
         tryCatch({

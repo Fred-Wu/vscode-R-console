@@ -74,6 +74,8 @@ export function getCompletionContext(
       bracketQuote: bracket.quote,
       bracketDimension: bracket.dimension,
       bracketDimensions: bracket.dimensions,
+      bracketArgumentTags: bracket.argumentTags,
+      bracketArgumentName: bracket.argumentName,
       dataObjectName: effectiveDataObject,
       operator: undefined,
       snapshotInput,

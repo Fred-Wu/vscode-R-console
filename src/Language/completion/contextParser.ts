@@ -88,7 +88,7 @@ export type CallCompletionContext = {
   // or comments. Quoted identifiers retain their spelling and escapes.
   name: string;
   operator?: "$" | "@" | "::" | ":::";
-  // R source tags; "" denotes a positional argument and null the cursor's slot. Undefined
+  // R source tags; "" is positional, "..." is unknown forwarded dots, null is the cursor. Undefined
   // means the cursor is in a value, comment, or another non-name position.
   argumentTags?: (string | null)[];
   argumentValue?: { name: string; prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'";
@@ -104,6 +104,8 @@ export type BracketCompletionContext = {
   quote?: "\"" | "'";
   dimension: number;
   dimensions: number;
+  argumentTags: (string | null)[];
+  argumentName?: string;
 };
 
 /** Literal indices can be inspected without running index expressions. */
@@ -216,6 +218,8 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
   let dimension = 0;
   let dimensions = 0;
   let selected: ReturnType<typeof completionPrefix>;
+  const argumentTags: (string | null)[] = [];
+  let argumentName: string | undefined;
   const nested: string[] = [];
   for (let index = slotStart; index <= tokens.length; index++) {
     const token = tokens[index];
@@ -223,11 +227,16 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
     if (closes || (!nested.length && token.type === TokenType.Comma)) {
       const first = tokens[slotStart];
       const second = tokens[slotStart + 1];
-      const option = slotStart + 1 < index && second.type === TokenType.Operator && second.value === "=" &&
-        (first.type === TokenType.Identifier || first.type === TokenType.String) &&
-        first.value.replace(/^[`"']|[`"']$/g, "") === (opening.value === "[[" ? "exact" : "drop");
-      if (!option && slotOffset <= cursor && cursor <= (token?.position ?? code.length)) {
-        selected = completionPrefix(tokens, slotStart, index, cursor);
+      const named = slotStart + 1 < index && second.type === TokenType.Operator && second.value === "=" &&
+        (first.type === TokenType.Identifier || first.type === TokenType.String);
+      const name = named ? first.value.replace(/^[`"']|[`"']$/g, "") : undefined;
+      const option = name === (opening.value === "[[" ? "exact" : "drop");
+      const active = slotOffset <= cursor && cursor <= (token?.position ?? code.length);
+      argumentTags.push(active ? null : named ? first.value : slotStart + 1 === index && first.value === "..." ? "..." : "");
+      if (!option && active) {
+        selected = completionPrefix(tokens, slotStart + (named ? 2 : 0), index, cursor);
+        // Retain source spelling so quoted/escaped argument tags remain valid R.
+        argumentName = named ? first.value : undefined;
         dimension = dimensions;
       }
       if (!option) dimensions++;
@@ -243,7 +252,7 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
     }
   }
   if (!selected || (isCompletionInLiteral(code, cursor, sourceTokens) && !selected.quote)) return undefined;
-  return { objectName: object.objectName, operator: opening.value as "[" | "[[", ...selected, dimension, dimensions };
+  return { objectName: object.objectName, operator: opening.value as "[" | "[[", ...selected, dimension, dimensions, argumentTags, argumentName };
 }
 
 export function getPipeCompletionContext(code: string, all?: Token[]): { prefix: string; replaceStart: number } | undefined {
@@ -487,9 +496,11 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
       const value = tokens[valueStart];
       hasPipePlaceholder ||= piped && valueStart + 1 === end && value?.type === TokenType.Identifier &&
         (pipe === "|>" ? value.value === "_" : value.value === "." || value.value === "`.`");
-      argumentTags.push(named ? first.value : "");
-      // Forwarded dots cannot be matched without inspecting the caller's frame.
-      hasDots ||= argumentStart + 1 === end && first.value === "...";
+      const forwardedDots = argumentStart + 1 === end && first.value === "...";
+      argumentTags.push(named ? first.value : forwardedDots ? "..." : "");
+      // Keep argument-name completion available, but mark unknown forwarding
+      // so providers cannot infer positional consumption or exhaustion.
+      hasDots ||= forwardedDots;
     }
   };
   const nested: string[] = [];
@@ -516,7 +527,7 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
   return {
     name: tokens.slice(start, frame.index).map(token => token.value).join(""),
     operator,
-    argumentTags: namePosition && !inComment && !hasDots ? argumentTags : undefined,
+    argumentTags: namePosition && !inComment ? argumentTags : undefined,
     ...(argumentValue && !inComment ? { argumentValue: { ...argumentValue,
       ...(!hasDots ? { argumentTags } : {}) } } : {}),
   };

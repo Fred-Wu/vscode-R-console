@@ -471,15 +471,20 @@ to its session and recent-input supplements as well as the language server.
 | --- | --- |
 | `obj$│`, `obj@│`, including chains | Members or slots of the receiver; no unrelated history names. |
 | `pkg::│`, `pkg:::│` | Symbols from the requested namespace; no session or history additions. |
-| `f(│)`, `f(x, │)` | Available argument names and declared choices; contextual data fields where applicable. No ambient symbols on an empty token. |
+| `f(│)`, `f(x, │)` | Available argument names, including `...` for variadic functions, and declared choices; contextual data fields where applicable. No ambient symbols on an empty token. |
 | `f(arg = │)` | Declared values and applicable data fields; no argument tags or ambient symbols. |
 | `f(arg = va│)`, `f(va│)` | Matching expression symbols; argument tags only at an argument-name position. |
 | `f(arg = "│")` | Declared literal choices only; no variable/function names. |
 | `base::atan2(1, 2, │)` | No suggestions when a known fixed signature is exhausted. Unknown signatures and `...` must not be classified as exhausted. |
-| `lst[[│]]`, `lst[│]`, `df[, │]` | Receiver names for the applicable dimension; no ambient symbols, including the receiver itself. |
+| `lst[[│]]`, `lst[│]`, `df[, │]` | Receiver names for the applicable dimension and available subscript-method arguments; no ambient symbol dump. |
 | `lst[[ind│]]` | Matching index variables/history and receiver names; preserve the console's restriction on generic LSP symbols in `[[`. |
 | `lst[["│"]]` | Literal receiver names only. |
 | `x[x│]`, `DT[D│]` | Matching expression symbols remain eligible, including the receiver. No type/name blacklist. |
+| `DT[, │]`, `DT[, .N, │]` for a data.table | Fields and unused arguments read from the installed method (`by`, `keyby`, `.SDcols`, etc.) in separate groups. |
+| `DT[, keyby = │]` | Values supplied by the R provider; no argument-name insertions or guessed field/special-symbol lists. |
+| Named subscript values | Preserve native provider inference and matching visible symbols; method formals alone do not describe value semantics. |
+| `DT[, fca│]` with data.table attached | Matching visible functions, including `fcase`; do not dump all functions into an empty slot. |
+| Custom S3/S4 subscript method | Inspect the applicable receiver method for arguments; never execute the method, defaults or index expressions. S4 inference uses receiver class and `ANY` for unknown index types. |
 | Data-mask expression, empty token | Relevant fields and call arguments; no ambient symbol dump. |
 | Data-mask expression, typed token | Matching fields and expression symbols. |
 | `df \|> print(│)`, `stats::filter(df, │)` | Function arguments; passing a frame does not establish a data mask. |
@@ -506,6 +511,23 @@ takes precedence over runtime fallback. Specialized installed-package, dataset,
 help, and filename suggestions depend on provider support; generic history
 items are not substitutes for those providers. This matrix does not promise
 inference for arbitrary user-defined evaluation methods.
+
+The reference completer intentionally retains `...` as a variadic indicator and
+does not remove supplied arguments. Our supplied-argument/exhaustion filtering,
+restricted `[[` sources, grouped presentation, and sorting are console policies,
+not R requirements. Forwarded `...` has unknown contents: keep remaining argument
+names available without counting it as a known positional argument or evaluating the caller.
+The table above specifies console behavior, not full parity with `utils` completion.
+
+Subscript arguments are read from installed receiver methods rather than a
+fixed package option list. The supplement does not encode package-specific
+argument roles, mutually exclusive options, or special-symbol scopes. Those
+belong to the R provider. R's reference completer supplies visible names for
+typed tokens but does not enumerate a special-symbol list at an empty subscript.
+Method discovery needs the live receiver; unavailable runtime metadata falls
+back to known fields without inventing signatures. Named method values require
+native inference: a formal argument name alone does not tell us whether its
+value is a column expression, a string, or another option.
 
 ### Session checks
 
@@ -580,6 +602,7 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | Type `popup_obj$data[[↵  │]]` | Names appear on the continuation line; accepting one preserves the newline and brackets. |
 | With `data.table` installed, type `popup_dt[, │]` | Show columns; accepting `alpha` inserts bare `alpha`; accepting `a b` inserts a backtick-quoted name. |
 | With `data.table` installed, type `popup_dt[[│]]` | Accepting `alpha` inserts `"alpha"`, not a bare symbol. |
+| Type `data.frame(│)` or `data.frame(..., row.names = NULL, │)` | Keep `...` in Arguments to indicate additional arguments; accepting it inserts bare `...`, without ` = `. Supplied named arguments remain excluded. Repeat with a source-defined and session-only variadic function. |
 | Manually type `library(│)` | Arguments appear without first accepting a function completion. |
 | Accept `package = ` in `library()`, then type `, ` | Omit `package` from argument suggestions and highlight `help`; after accepting `help = ` and typing another comma, highlight `pos`. |
 | Type `library(package = , │)` or `library(│, package = )` | Exclude the supplied `package` name even with an empty value or when it follows the cursor. |
@@ -600,7 +623,9 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | Type `"file.csv" \|> rdcsv`, accept `read.csv()` | Insert `read.csv(│)` after the pipe and automatically show arguments. |
 | Type the first one or two characters in an open contextual list | Keep the list open and filter candidates below the ordinary three-character threshold. |
 | Type bare `li`, then `lib` | No automatic list for `li`; suggestions appear at `lib`. |
-| Open `stats::│`, or `data.table::│` when installed | Suggestions are alphabetical within each group; group order is preserved. |
+| Open `stats::│`, or `data.table::│` when installed | Separate functions, variables, and other available kinds into groups; show group buttons when multiple groups exist. Suggestions are alphabetical within each group. |
+| Type `data.table::set│`, then repeat with `:::` and in Quick Pick | Exact matches precede prefix matches; equally strong matches are alphabetical (`setattr` before `setDT`), not ordered by name length. Filtering and clearing preserve groups. |
+| With data.table attached, type `test[, .│]`, navigate to a function, then type `N` | Select the first suggestion in the displayed grouped list and scroll back to the beginning; do not retain the old function selection. Explicit navigation survives asynchronous updates only while the query stays unchanged. |
 | Open `stats::lm(│)` | Arguments start with `formula`, `data`, `subset`, `weights`, in signature order. |
 | Run `order_df <- data.frame(zebra = 1, alpha = 2, beta = 3)`; open `order_df$│`, `order_df[│]`, `order_df[[│]]`, or `order_df[, │]` | Columns remain `zebra`, `alpha`, `beta`, in object order. |
 | Open `subset(order_df, │)` or `order_df \|> subset(│)` | Columns retain object order; function arguments retain signature order. |

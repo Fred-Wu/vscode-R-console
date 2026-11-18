@@ -84,7 +84,7 @@ test("session member formals replace unrelated LSP arguments and remain in the A
         assert.equal(trigger, "$");
         return [{ name: "member_arg" }, { name: "a b" }, { name: "..." }];
       });
-    assert.deepEqual(entries.map(entry => entry.insertText), ["member_arg = ", "`a b` = "]);
+    assert.deepEqual(entries.map(entry => entry.insertText), ["member_arg = ", "`a b` = ", "..."]);
     const picks = completion.toCompletionQuickPickItems(entries, context);
     assert.equal(picks[0].label, "Arguments");
     assert.equal(picks[1].insertText, "member_arg = ");
@@ -1483,7 +1483,7 @@ test("empty namespace suggestions are alphabetical instead of following provider
         provideCompletionItems: async () => labels.map(label => ({ label, kind: 2, sortText: `4-${label}` })),
       });
     const picks = completion.toCompletionQuickPickItems(completion.rankCompletionEntries(entries, ""), context);
-    assert.equal(picks[0].label, "Package Members");
+    assert.equal(picks[0].label, "Functions");
     assert.deepEqual(picks.slice(1).map(item => item.insertText),
       ["as.IDate()", "fdroplevels()", "frankv()", "rowwiseDT()", "set()", "setorderv()"]);
     assert.deepEqual(entries.map(entry => entry.label), labels, "sorting must not mutate cached candidates");
@@ -1935,4 +1935,42 @@ test("native method parameters never appear inside an argument value", async () 
       ] }),
     });
   assert.ok(!entries.some(item => item.insertText === 'value = '));
+});
+
+test("namespace groups retain symbol kinds and alphabetical ordering within equal matches", () => {
+  const entries = [
+    ['setZ', 5], ['setDT', 2], ['setattr', 2], ['setAlpha', 5],
+    ['setField', 4], ['setOther', 7], ['set', 2], ['xset', 2],
+  ].map(([label, kind]) => Object.freeze({ label, kind, insertText: label, source: 'lsp' }));
+  for (const operator of ['::', ':::']) {
+    for (const candidates of [entries, [...entries].reverse()]) {
+      const input = `pkg${operator}set`, context = completion.getCompletionContext(input, input.length);
+      const picks = completion.toCompletionQuickPickItems(
+        completion.rankCompletionEntries(Object.freeze(candidates), context.prefix, context), context);
+      assert.deepEqual(picks.map(item => item.insertText ?? item.label), [
+        'Functions', 'set', 'setattr', 'setDT', 'xset',
+        'Variables', 'setAlpha', 'setZ', 'Fields', 'setField', 'Other', 'setOther',
+      ]);
+    }
+  }
+});
+
+test("equally strong typed symbol matches sort alphabetically instead of by length", () => {
+  for (const [input, source, kind] of [['set', 'session', 5], ['set', 'lsp', 2], ['pkg::set', 'lsp', 2]]) {
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = ['setZ', 'setattr', 'setDT', 'set'].map(label => ({ label, source, kind, insertText: label }));
+    assert.deepEqual(completion.rankCompletionEntries(entries, 'set', context).map(entry => entry.label),
+      ['set', 'setattr', 'setDT', 'setZ'], input);
+  }
+});
+
+test("dots remain a variadic argument indicator and never insert an equals sign", async () => {
+  for (const input of ['data.frame(', 'data.frame(row.names = NULL, ', 'data.frame(xxxx, ']) {
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => [{ label: '...', kind: 5, detail: 'parameter', insertText: '... = ' }],
+      });
+    assert.deepEqual(entries.map(item => item.insertText), ['...']);
+  }
 });

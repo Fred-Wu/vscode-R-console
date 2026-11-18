@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const loadSource = require('../helpers/load-source.cjs');
-const vscode = { QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Text: 0, Field: 4, Variable: 5 } };
+const vscode = { QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Text: 0, Function: 2, Field: 4, Variable: 5 } };
 const completion = loadSource('src/Language/completion.ts', { vscode });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const entries = (labels, incomplete = false) => Object.assign(labels.map(label => ({
@@ -163,5 +163,19 @@ test('Quick Pick refreshes ambient symbols when an empty contextual slot becomes
     assert.deepEqual(calls, ['i'], text);
     await picker.type('');
     assert.deepEqual(picker.labels(), [], text);
+  }
+});
+
+test('Quick Pick preserves namespace groups and ordering while refining and clearing', async t => {
+  const candidates = [['setDT', 2], ['setZ', 5], ['setattr', 2], ['setAlpha', 5]]
+    .map(([label, kind]) => ({ label, kind, source: 'lsp', insertText: label }));
+  for (const operator of ['::', ':::']) {
+    const picker = await openPicker(t, `pkg${operator}`, candidates, async () => candidates);
+    for (const query of ['', 'set', 'seta', '']) {
+      await picker.type(query);
+      assert.deepEqual(picker.pick.items.map(item => item.insertText ?? item.label),
+        query === 'seta' ? ['Functions', 'setattr', 'Variables', 'setAlpha'] :
+          ['Functions', 'setattr', 'setDT', 'Variables', 'setAlpha', 'setZ'], query);
+    }
   }
 });

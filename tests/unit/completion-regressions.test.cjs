@@ -444,3 +444,42 @@ test("empty-to-typed refinement refreshes newly eligible sources and then reuses
       input(nextText), nextContext).some(entry => entry.label === 'index'), text);
   }
 });
+
+test("subscript method metadata keeps names, values, quotes and supplied options distinct", () => {
+  for (const [marked, name, tags] of [
+    ['DT[, key│]', undefined, ['', null]],
+    ['DT[, keyby = al│]', 'keyby', ['', null]],
+    ['DT[, by = "al│"]', 'by', ['', null]],
+    ['DT[, `keyby` = al│]', '`keyby`', ['', null]],
+    ['obj["a\\\"b" = al│]', '"a\\\"b"', [null]],
+    ['DT[, │, by = alpha]', undefined, ['', null, 'by']],
+    ['obj[mode = "a,b", │]', undefined, ['mode', null]],
+    ['obj[..., │]', undefined, ['...', null]],
+    ['DT |> _[, │]', undefined, ['', null]],
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context.kind, 'bracket', marked);
+    assert.equal(context.bracketArgumentName, name, marked);
+    assert.deepEqual(context.bracketArgumentTags, tags, marked);
+  }
+});
+
+test("named subscript values and resolved empty results do not invent cached columns", async () => {
+  for (const marked of ['DT[, mult = │]', 'DT[, mult = "│"]', 'DT[, │]']) {
+    const context = contextAt(marked);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { DT: { class: ['data.table', 'data.frame'], names: ['alpha'] } } }, [], [], undefined,
+      async () => []);
+    assert.deepEqual(entries, [], marked);
+  }
+});
+
+test("subscript supplements preserve symbols and fields supplied by the R provider", async () => {
+  for (const text of ['DT[.', 'DT[, keyby = .']) {
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),
+      { getText: () => text }, { line: 0, character: text.length }, undefined, [], [], {
+        provideCompletionItems: async () => ['.N', '.SD'].map(label => ({ label, kind: 4, detail: '{data.table}' })),
+      }, async () => []);
+    assert.deepEqual(entries.map(e => e.label), ['.N', '.SD']);
+  }
+});

@@ -13,7 +13,12 @@ suite("Completion in the VS Code extension host", () => {
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, "../.."),
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
-      requestMemberCompletions: async () => { runtimeProbes++; return [{ name: "old_arg" }]; },
+      requestMemberCompletions: async expression => {
+        runtimeProbes++;
+        // This fixture has no live receiver. Preserve the cached-name fallback
+        // while retaining the stale argument fixture used by signature tests.
+        return expression.includes(".tagged <-") ? undefined : [{ name: "old_arg" }];
+      },
     });
     const snapshot = (text, cursor = text.length) => {
       const lines = text.split("\n"), before = text.slice(0, cursor);
@@ -21,6 +26,7 @@ suite("Completion in the VS Code extension host", () => {
       return { text, currentLine: lines[cursorRow], lines, cursorRow,
         cursorCol: before.split("\n").at(-1).length, textBeforeCursor: before };
     };
+    let lastGroupedItems;
     const complete = async (text, session, cursor = text.length, force = false) => {
       const input = snapshot(text, cursor);
       let items;
@@ -28,6 +34,7 @@ suite("Completion in the VS Code extension host", () => {
         getWorkspaceData: () => session, applyCompletion() {},
         onInlineEntries: result => { items = result; } });
       assert.ok(Array.isArray(items), `completion results for ${text}`);
+      lastGroupedItems = items;
       return items.filter(item => "insertText" in item);
     };
     try {
@@ -42,6 +49,12 @@ suite("Completion in the VS Code extension host", () => {
       const filtered = lang.refineInlineCompletion(snapshot('stats::cor(method = "sp'));
       assert.deepEqual(filtered.filter(item => "insertText" in item).map(item => item.insertText), ["spearman"]);
       const runtime = { globalenv: { runtime_function: { type: 'closure' } } };
+      for (const text of ['data.frame(', 'data.frame(..., row.names = NULL, ',
+        'f <- function(...) NULL\nf(1,2, ']) {
+        const dots = (await complete(text)).find(item => item.insertText === '...');
+        assert.ok(dots, `variadic indicator for ${text}`);
+        assert.equal(dots.isCallable, false);
+      }
       const exhaustedText = 'base::atan2(1,2, )';
       assert.deepEqual(await complete(exhaustedText, runtime, exhaustedText.length - 1), []);
       const indexText = 'lst <- list(alpha = 10, beta = 20)\nindex <- "beta"\nlst[[ind]]';
@@ -125,10 +138,94 @@ suite("Completion in the VS Code extension host", () => {
         } else {
           assert.ok(labels.some(label => label.startsWith(".")), "internal namespace candidates");
         }
-        assert.deepEqual(labels, [...labels].sort((a, b) => collator.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0)));
+        const groups = new Map();
+        let group;
+        for (const item of lastGroupedItems) {
+          if (!("insertText" in item)) { group = item.label; groups.set(group, []); }
+          else groups.get(group).push(item.label.replace(/^\$\([^)]+\) /, ""));
+        }
+        assert.ok(groups.has('Functions'), `function group for ${operator}`);
+        assert.ok(groups.has('Fields'), `native nonfunction group for ${operator}`);
+        if (operator === '::') assert.ok(groups.get('Functions').includes('setorderv'));
+        // The internal namespace is truncated by the server; the typed
+        // request below must still reach setorderv beyond that initial limit.
+        assert.ok(groups.get('Fields').includes('.N'));
+        for (const [group, names] of groups) {
+          assert.deepEqual(names, [...names].sort((a, b) => collator.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0)), group);
+        }
         const refined = await complete(`data.table${operator}set`);
         assert.ok(refined.some(item => item.insertText === "setorderv()"), "prefix request reaches candidates beyond the initial limit");
+        const prefixed = refined.map(item => item.label.replace(/^\$\([^)]+\) /, "")).filter(label => label.startsWith('set'));
+        assert.deepEqual(prefixed, [...prefixed].sort((a, b) => collator.compare(a, b)));
+        const cached = lang.refineInlineCompletion(snapshot(`data.table${operator}seta`));
+        assert.ok(cached.some(item => item.label === 'Functions' && !("insertText" in item)));
+        assert.ok(cached.some(item => item.insertText === 'setattr()'));
       }
+      const { Terminal } = require('@xterm/headless');
+      const { InlineCompletion } = loadSource('src/Terminal/inlineCompletion.ts');
+      const screen = new Terminal({ cols: 80, rows: 24 });
+      try {
+        const panel = new InlineCompletion(screen._core.unicodeService);
+        const session = { search: ['package:data.table', 'package:stats', 'package:base'], globalenv: {
+          test: { class: ['data.table', 'data.frame'], names: ['col.name'] },
+        } };
+        lang.updateSessionData(session);
+        const broad = await complete('test[, .', session);
+        panel.set(lastGroupedItems, panel.token, '.');
+        const functionIndex = broad.findIndex(item => item.isCallable);
+        assert.ok(functionIndex >= 0);
+        panel.move(functionIndex);
+        const narrowed = await complete('test[, .N', session);
+        assert.ok(narrowed.some(item => item.insertText === '.N'));
+        panel.set(lastGroupedItems, panel.invalidate(), '.N');
+        assert.equal(panel.current(), narrowed[0], 'new query starts at the first displayed suggestion');
+        assert.equal(panel.selected, 0);
+        panel.lines(80, 12);
+        assert.equal(panel.scrollStart, 0, 'the viewport returns to the beginning');
+      } finally {
+        screen.dispose();
+      }
+    } finally {
+      await lang.dispose();
+    }
+  });
+});
+
+suite("Subscript method completion in the VS Code extension host", () => {
+  test("live method arguments and fields retain separate groups", async () => {
+    const { runRJson } = require('../helpers/run-r-json.cjs');
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      'vscode-languageclient/node': require('vscode-languageclient/node'),
+    });
+    const lang = new RTermLang({
+      extensionPath: path.resolve(__dirname, '../..'),
+      rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
+      requestMemberCompletions: async expression => runRJson(`
+        DT <- data.table::data.table(zebra = 1, alpha = 2)
+        df <- as.data.frame(DT)
+        value <- eval(parse(text = inputs))
+        cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
+      `, expression),
+    });
+    const complete = async text => {
+      const input = { text, currentLine: text, lines: [text], cursorRow: 0,
+        cursorCol: text.length, textBeforeCursor: text };
+      let items;
+      await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+        getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries: result => { items = result; } });
+      assert.ok(Array.isArray(items));
+      return items;
+    };
+    try {
+      const items = await complete('DT[, ');
+      assert.deepEqual(items.filter(item => !('insertText' in item)).map(item => item.label),
+        ['Fields', 'Arguments']);
+      assert.deepEqual(items.filter(item => item.detail === 'DT').map(item => item.insertText), ['zebra', 'alpha']);
+      assert.ok(items.some(item => item.insertText === 'keyby = '));
+      const dataFrame = await complete('df[, ');
+      assert.ok(dataFrame.some(item => item.insertText === 'drop = '));
+      const value = await complete('DT[, keyby = al');
+      assert.ok(value.every(item => item.detail !== 'parameter'));
     } finally {
       await lang.dispose();
     }

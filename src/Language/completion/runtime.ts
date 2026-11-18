@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
 import { quoteRNameIfNeeded, getFieldInsertText, quoteCompletionValue } from "./candidates";
+import { subscriptArgumentExpression } from "./subscript";
 import { allowsSymbolCompletions } from "./policy";
 
 function isSessionFunction(item: GlobalEnvItem): boolean {
@@ -71,7 +72,7 @@ export function getDataColumnCompletions(
   context: CompletionContext,
   data: WorkspaceData | undefined
 ): CompletionEntry[] {
-  if (!context.dataObjectName || !data?.globalenv) {
+  if (!context.dataObjectName || !data?.globalenv || context.bracketArgumentName) {
     return [];
   }
 
@@ -100,11 +101,11 @@ function asStringArray(value: string | string[] | undefined): string[] {
   return value ? [value] : [];
 }
 
-export async function getRuntimeDataColumnCompletions(
+export async function getRuntimeDataCompletions(
   context: CompletionContext,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
-): Promise<CompletionEntry[]> {
-  if (!context.dataObjectName || !requestRuntimeMemberCompletions) {
+): Promise<CompletionEntries> {
+  if (!context.dataObjectName || !requestRuntimeMemberCompletions || context.bracketArgumentName) {
     return [];
   }
 
@@ -112,16 +113,25 @@ export async function getRuntimeDataColumnCompletions(
     if (context.kind === "bracket") {
       const items = await requestRuntimeMemberCompletions(
         `base::local({ .obj <- (${context.dataObjectName}); ` +
+        `.tagged <- function(.values, .prefix) stats::setNames(base::as.list(.values), if (base::length(.values)) base::paste0(.prefix, .values) else base::character()); ` +
         `.bare <- base::inherits(.obj, "data.table"); ` +
         `.nms <- if (.bare || ${context.bracketDimensions ?? 1}L == 1L) base::names(.obj) else ` +
-        `base::dimnames(.obj)[[${(context.bracketDimension ?? 0) + 1}L]]; ` +
-        `stats::setNames(base::as.list(.nms), base::paste0(if (.bare) "bare:" else "quoted:", .nms)) })`, "$"
+        `{ .dims <- base::dimnames(.obj); if (base::length(.dims) >= ${(context.bracketDimension ?? 0) + 1}L) .dims[[${(context.bracketDimension ?? 0) + 1}L]] else NULL }; ` +
+        `base::c(.tagged(.nms, if (.bare) "bare:" else "quoted:"), .tagged(${subscriptArgumentExpression(context)}, "argument:")) })`, "$"
       );
-      return (items ?? []).flatMap(item => {
-        const match = /^(bare|quoted):([\s\S]+)$/.exec(item.name);
-        return match ? [{ label: match[2], insertText: getFieldInsertText(match[2], context, match[1] === "bare"),
-          kind: vscode.CompletionItemKind.Field, detail: context.dataObjectName, source: "session" as const }] : [];
+      const entries: CompletionEntries = (items ?? []).flatMap(item => {
+        const match = /^(bare|quoted|argument):([\s\S]+)$/.exec(item.name);
+        if (!match) return [];
+        const [, type, name] = match;
+        return [{ label: name,
+          insertText: type === "argument" ? name === "..." ? "..." : quoteRNameIfNeeded(name) + " = "
+            : getFieldInsertText(name, context, type === "bare"),
+          kind: type === "argument" ? vscode.CompletionItemKind.Variable : vscode.CompletionItemKind.Field,
+          ...(type === "argument" ? { role: "argument" as const } : {}),
+          detail: type === "argument" ? "parameter" : context.dataObjectName, source: "session" as const }];
       });
+      if (items !== undefined) entries.subscriptResolved = true;
+      return entries;
     }
     const items = await requestRuntimeMemberCompletions(
       context.dataObjectName,
@@ -223,28 +233,31 @@ export async function getRuntimeArgumentCompletions(
     const supplied = context.argumentTags!.map(tag =>
       tag === null ? "TRUE" : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
     const cursorSlot = context.argumentTags!.indexOf(null) + 2;
+    const forwardedDots = context.argumentTags!.includes("...");
+    const suppliedCount = context.argumentTags!.filter(tag => tag !== null && tag !== "...").length;
     const items = await request(
       `base::local({ .fn <- (${context.functionName}); .exhausted <- FALSE; ` +
       `.args <- if (base::is.function(.fn)) { ` +
       `.def <- base::args(.fn); ` +
       `.formals <- base::names(base::formals(.def)); ` +
       `.exhausted <- !base::is.null(.def) && !("..." %in% .formals) && ` +
-      `${context.argumentTags!.length - 1}L >= base::length(.formals); ` +
+      `${suppliedCount}L >= base::length(.formals); ` +
       `.call <- base::as.list(base::quote(.fn(${supplied}))); ` +
       `if (base::is.null(base::names(.call))) base::names(.call) <- base::rep("", base::length(.call)); ` +
-      `.candidates <- base::setdiff(base::names(base::formals(.def)), base::c("...", base::names(.call))); ` +
+      `.candidates <- base::setdiff(base::names(base::formals(.def)), base::setdiff(base::names(.call), "...")); ` +
       `.candidates[base::vapply(.candidates, function(.name) { ` +
+      `if (.name == "..." || ${forwardedDots ? "TRUE" : "FALSE"}) return(TRUE); ` +
       `.candidate <- .call; base::names(.candidate)[${cursorSlot}L] <- .name; ` +
       `base::tryCatch({ base::suppressWarnings(base::match.call(` +
       `definition = .def, call = base::as.call(.candidate), expand.dots = FALSE)); TRUE }, ` +
       `error = function(e) FALSE) }, base::logical(1))] } else NULL; ` +
-      // Dots is never an insertable formal. Reserve it as a transport marker
-      // only when this known fixed signature has no remaining argument slot.
+      // A logical dots marker denotes exhaustion; ordinary dots candidates
+      // carry character values, keeping variadic signatures distinguishable.
       `if (.exhausted) stats::setNames(base::list(TRUE), "...") else stats::setNames(base::as.list(.args), .args) })`, "$"
     );
-    const entries: CompletionEntries = (items ?? []).filter(item => item.name && item.name !== "...").map(item => ({
+    const entries: CompletionEntries = (items ?? []).filter(item => item.name && !(item.name === "..." && item.type === "logical")).map(item => ({
       label: item.name,
-      insertText: `${quoteRNameIfNeeded(item.name)} = `,
+      insertText: item.name === "..." ? "..." : `${quoteRNameIfNeeded(item.name)} = `,
       kind: vscode.CompletionItemKind.Variable,
       detail: "parameter",
       source: "session",

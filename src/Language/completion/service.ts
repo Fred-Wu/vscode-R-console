@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
-import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getRuntimeArgumentCompletions, getDataColumnCompletions, getRuntimeDataColumnCompletions } from "./runtime";
+import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getRuntimeArgumentCompletions, getDataColumnCompletions, getRuntimeDataCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
@@ -51,13 +51,19 @@ export async function collectCompletionEntries(
   if (context.argumentTags && rawLspResult.argumentsExhausted && !useRuntimeArguments) return [];
   // Native results take precedence. Only probe the live session for facts the
   // language server could not infer; a busy R session cannot delay native members.
-  const [runtimeMemberItems, columnItems, runtimeArgumentItems] = await Promise.all([
+  const probeSubscript = context.kind === "bracket" && !context.bracketQuote &&
+    !context.bracketArgumentName && !!requestRuntimeMemberCompletions;
+  const [runtimeMemberItems, runtimeDataItems, runtimeArgumentItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([]),
+    probeSubscript ? getRuntimeDataCompletions(context, requestRuntimeMemberCompletions) :
     !includeColumns || nativeFields ? Promise.resolve([]) : cachedColumnItems.length > 0
-      ? Promise.resolve(cachedColumnItems) : getRuntimeDataColumnCompletions(context, requestRuntimeMemberCompletions),
+      ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions),
     useRuntimeArguments ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([] as CompletionEntries),
   ]);
+  const resolvedDataItems = probeSubscript && !(runtimeDataItems as CompletionEntries).subscriptResolved
+    ? cachedColumnItems : runtimeDataItems;
+  const dataItems = nativeFields ? resolvedDataItems.filter(entry => entry.kind !== vscode.CompletionItemKind.Field) : resolvedDataItems;
   if (runtimeArgumentItems.argumentsExhausted) return [];
   // Otherwise, member and user-defined signatures belong to the active session.
   // A same-name package function must not supply unrelated arguments, even
@@ -77,12 +83,12 @@ export async function collectCompletionEntries(
     ...lspItems,
     ...sessionItems,
     ...runtimeMemberItems,
-    ...columnItems,
+    ...dataItems,
     ...runtimeArgumentItems,
   ]);
 
   if (context.kind === "bracket") {
-    const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
+    const columnFiltered = filterCompletionEntries(dataItems, context.prefix);
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
@@ -96,7 +102,7 @@ export async function collectCompletionEntries(
   if (context.kind === "argument") {
     const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
-    const columnFiltered = filterCompletionEntries(columnItems, context.prefix);
+    const columnFiltered = filterCompletionEntries(dataItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
     return asCompletionEntries(dedupeCompletionEntries([
@@ -123,7 +129,7 @@ export async function collectCompletionEntries(
     );
   }
 
-  const defaultColumnFiltered = filterCompletionEntries(columnItems, context.prefix);
+  const defaultColumnFiltered = filterCompletionEntries(dataItems, context.prefix);
 
   return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(
     [

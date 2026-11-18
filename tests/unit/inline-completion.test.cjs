@@ -25,15 +25,42 @@ test("pending inline results cannot reopen the panel after switching to Quick Pi
   assert.equal(terminal.inputState.text, "mea");
 });
 
-test("exact inline selection respects R identifier case while allowing case-insensitive search", () => {
+test("inline selection follows the shared ranking including R identifier case", () => {
+  const { rankCompletionEntries, toCompletionQuickPickItems } = loadSource('src/Language/completion.ts', { vscode: {
+    QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Function: 2, Field: 4, Variable: 5 },
+  } });
   const panel = new InlineCompletion(unicode);
-  const choices = [item("Alpha"), item("alpha")];
-  panel.set(choices, panel.token, "alpha");
-  assert.equal(panel.current(), choices[1]);
-  panel.set(choices, panel.token, "Alpha");
-  assert.equal(panel.current(), choices[0]);
-  panel.set(choices, panel.token, "ALPHA");
-  assert.equal(panel.current(), choices[0]);
+  const entries = ['Alpha', 'alpha'].map(label => ({ label, insertText: label, source: 'session', kind: 5 }));
+  for (const [query, expected] of [['alpha', 'alpha'], ['Alpha', 'Alpha'], ['ALPHA', 'Alpha']]) {
+    const context = { kind: 'default', prefix: query, replaceStart: 0, snapshotInput: query, snapshotCursor: query.length };
+    panel.set(toCompletionQuickPickItems(rankCompletionEntries(entries, query, context), context), panel.token, query);
+    assert.equal(panel.current().insertText, expected);
+    assert.equal(panel.selected, 0);
+  }
+});
+
+test("data-context refinements start at the first suggestion instead of retaining a fuzzy function", () => {
+  const panel = new InlineCompletion(unicode);
+  const field = item('$(symbol-field) col.name');
+  const fn = item('$(symbol-function) as.numeric');
+  const choices = [{ label: 'Fields' }, field, { label: 'Functions' }, fn];
+  panel.set([{ label: 'Functions' }, fn], panel.token, '.');
+  panel.set(choices, panel.token, '.N');
+  assert.equal(panel.current(), field);
+  assert.equal(panel.selected, 0);
+
+  panel.move(1);
+  panel.set(choices, panel.invalidate(), '.N');
+  assert.equal(panel.current(), fn, 'same-query updates preserve explicit navigation');
+  panel.set(choices, panel.invalidate(), '.n');
+  assert.equal(panel.current(), field, 'editing the query clears manual selection');
+  panel.set(choices, panel.invalidate(), '.n');
+  assert.equal(panel.current(), field, 'later results do not revive the old manual selection');
+
+  panel.clear();
+  panel.set([{ label: 'Functions' }, fn], panel.token, '.N');
+  panel.set(choices, panel.token, '.N');
+  assert.equal(panel.current(), field, 'automatically selected partial results do not override the final list order');
 });
 
 test("multiline input and suggestions share the viewport across redraw and dismissal", t => {
@@ -1538,7 +1565,7 @@ test("typed matches use theme foreground, selected text has a continuous backgro
   assert.ok(!selected.includes("\x1b[7m"), "do not invert icon or matched foreground");
 });
 
-test("function arguments remain selected ahead of an exact runtime variable", () => {
+test("inline selection respects displayed group order and explicit navigation", () => {
   const panel = new InlineCompletion(unicode);
   const argument = { ...item("data = "), insertText: "data = " };
   const variable = { ...item("data"), source: "session" };
@@ -1548,14 +1575,14 @@ test("function arguments remain selected ahead of an exact runtime variable", ()
     { label: "Runtime Variables" }, variable,
   ];
   panel.set(choices, panel.token, "data");
-  assert.equal(panel.current(), argument, "argument group takes precedence over an exact runtime match");
-  panel.move(1);
+  assert.equal(panel.current(), choices[1], "start at the first displayed field");
+  panel.move(2);
   assert.equal(panel.current(), variable);
   panel.set(choices, panel.token, "data");
   assert.equal(panel.current(), variable, "retain an explicit user selection during updates");
   panel.invalidate(true);
   panel.set(choices, panel.token, "data");
-  assert.equal(panel.current(), argument, "edits reset selection to the function argument");
+  assert.equal(panel.current(), choices[1], "edits reset selection to the first suggestion");
   const ordinary = new InlineCompletion(unicode);
   ordinary.set([{ label: "Runtime Variables" }, variable], ordinary.token, "data");
   assert.equal(ordinary.current(), variable, "normal completion without arguments is unchanged");
@@ -1820,4 +1847,29 @@ test("splitting a highlighted token preserves its style below the completion pan
   assert.equal(prefix.getFgColor(), 2);
   assert.equal(suffix.getFgColorMode(), prefix.getFgColorMode());
   assert.equal(suffix.getFgColor(), prefix.getFgColor());
+});
+
+test("namespace kind groups produce clickable buttons and survive filtering", () => {
+  const completion = loadSource('src/Language/completion.ts', { vscode: {
+    QuickPickItemKind: { Separator: -1 },
+    CompletionItemKind: { Function: 2, Variable: 5, Field: 4, Constant: 20 },
+  } });
+  const entries = [['setDT', 2], ['.N', 5], ['setattr', 2]]
+    .map(([label, kind]) => ({ label, kind, source: 'lsp', insertText: label }));
+  const state = new InlineCompletion(unicode);
+  for (const prefix of ['', 'set', '']) {
+    const input = 'data.table::' + prefix, context = completion.getCompletionContext(input, input.length);
+    const picks = completion.toCompletionQuickPickItems(completion.rankCompletionEntries(entries, prefix, context), context);
+    state.set(picks, state.token, prefix);
+    state.lines(80, 30, 8);
+    assert.equal(state.groupTargets.length, prefix ? 0 : 2);
+    assert.deepEqual(state.items.filter(item => 'insertText' in item).map(item => item.insertText),
+      prefix ? ['setattr', 'setDT'] : ['setattr', 'setDT', '.N']);
+    if (!prefix) {
+      const variables = state.groupTargets[1];
+      assert.equal(state.groupButton(variables.row, variables.from), 1);
+      state.activateGroup(1);
+      assert.equal(state.current().insertText, '.N');
+    }
+  }
 });

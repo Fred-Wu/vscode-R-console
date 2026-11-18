@@ -13,6 +13,8 @@ export type CompletionContext = {
   bracketQuote?: "\"" | "'";
   bracketDimension?: number;
   bracketDimensions?: number;
+  bracketArgumentTags?: (string | null)[];
+  bracketArgumentName?: string;
   argumentValue?: CallCompletionContext["argumentValue"];
   pipe?: boolean;
   autoTrigger?: boolean;
@@ -41,6 +43,7 @@ export type CompletionEntry = {
 export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
   argumentsExhausted?: boolean;
+  subscriptResolved?: boolean;
 };
 
 export type CompletionPickItem = vscode.QuickPickItem & {

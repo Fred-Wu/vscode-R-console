@@ -263,9 +263,9 @@ test("real LSP validates positional, partial, quoted and piped argument candidat
     ["1 |> base::atan2(2, │)", []],
     ["1 |> base::atan2(x = _, │)", ["y"]],
     ["1 |> base::atan2(│)", ["y", "x"]],
-    ["base::sum(1, 2, │)", ["na.rm"]],
-    ["base::sum(na = 1, │)", ["na.rm"]],
-    ["base::sum(na.rm = TRUE, │)", []],
+    ["base::sum(1, 2, │)", ["...", "na.rm"]],
+    ["base::sum(na = 1, │)", ["...", "na.rm"]],
+    ["base::sum(na.rm = TRUE, │)", ["..."]],
   ]) {
     const cursor = marked.indexOf("│");
     const text = marked.replace("│", "");
@@ -408,7 +408,7 @@ test("current source signatures supersede older session definitions, including e
     ["{\n f <- function(new_arg) NULL\n f(zzzz│", []],
     ["{\n f <- function(new_arg) NULL\n f(new_arg = 1, │", []],
     ["{\n f <- function() NULL\n f(│", []],
-    ["{\n f <- function(...) NULL\n f(│", []],
+    ["{\n f <- function(...) NULL\n f(│", ["..."]],
     ['{\n f <- function(new_arg = stop("default evaluated")) stop("body evaluated")\n f(│', ["new_arg"]],
     ["{\n f <- function(`new arg`) NULL\n f(│", ["`new arg`"]],
     ['{\n f <- function(new_arg) NULL\n f(old_arg = "│")', []],
@@ -747,6 +747,9 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$dots", ["first", "after"], '1, 2, '],
     ["obj$dots", ["first", "after"], 'af = 1, '],
     ["obj$dots", ["first"], 'after = 1, '],
+    ["obj$dots", ["first"], '..., after = 1, '],
+    ["obj$positional", ["first", "second", "third"], '..., '],
+    ["obj$positional", [], '1, 2, 3, ..., '],
     ["obj$primitive", [], 'na.rm = TRUE, '],
     ["obj$positional", ["first"], 'fi', ', stop("value evaluated"))'],
     ["obj$positional", ["first", "second", "third"], '', ', stop("value evaluated"))'],
@@ -783,10 +786,14 @@ test("member argument probe inspects the actual R callable without executing bod
           options(warn = 2, warnPartialMatchArgs = TRUE)
           value <- tryCatch(eval(parse(text = inputs), .GlobalEnv), error = function(e) NULL)
           stopifnot(identical(.args, "unchanged"), identical(.fn, "unchanged"))
-          cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
+          cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
         `, probe);
       });
-    assert.deepEqual(entries.map(entry => entry.label), expected, input);
+    assert.deepEqual(entries.filter(entry => entry.label !== '...').map(entry => entry.label), expected, input);
+    const variadic = ['obj$lm', 'obj$dots', 'obj$primitive'].includes(expression);
+    const dots = entries.find(entry => entry.label === '...');
+    assert.equal(!!dots, variadic && !context.prefix, input);
+    if (dots) assert.equal(dots.insertText, '...');
   }
 });
 
@@ -1621,4 +1628,132 @@ test("completion sources stay inside every R cursor context", { timeout: 90000 }
   const value = await collect('base::atan2(y=glo│)');
   assert.ok(value.some(item => item.label === 'global_value'));
   assert.ok(value.every(item => item.role !== 'argument'));
+});
+
+test("variadic completion retains dots after supplied arguments without leaking into values", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const reference = runRJson(`
+    results <- lapply(inputs, function(line) {
+      utils:::.assignLinebuffer(line)
+      utils:::.assignEnd(nchar(line))
+      utils:::.guessTokenFromLine()
+      utils:::.completeToken()
+      utils:::.retrieveCompletions()
+    })
+    cat(jsonlite::toJSON(results))
+  `, ['data.frame(', 'data.frame(row.names = NULL, ', 'data.frame(..., row.names = NULL, ']);
+  for (const candidates of reference) assert.ok(candidates.includes('...'), 'R reference completer retains dots');
+  for (const [marked, expected] of [
+    ['data.frame(│)', true], ['base::data.frame(row.names = NULL, │)', true],
+    ['data.frame(xxxx, row.names = NULL, │)', true], ['data.frame(..., row.names = NULL, │)', true],
+    ['data.frame(.│)', true], ['data.frame(xxxx│)', false], ['data.frame(row.names = │)', false],
+    ['f <- function(first, ..., last) NULL\nf(first = 1, last = 2, │)', true],
+    ['f <- function(...) NULL\nf(1, 2, │)', true], ['base::atan2(1,2, │)', false],
+    ['base::atan2(..., │)', false], ['base::atan2(1,2,..., │)', false],
+  ]) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', ''), before = text.slice(0, cursor);
+    const lines = text.split('\n'), row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
+    const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text, uri: client.inputDocument.uri },
+      { line: row, character: col }, undefined, lines.slice(0, row), [], {
+        provideCompletionItems: async (...args) => {
+          const result = await client.provideCompletionItems(...args);
+          return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+        },
+      });
+    const dots = entries.find(entry => entry.label === '...');
+    assert.equal(!!dots, expected, marked);
+    if (dots) { assert.equal(dots.insertText, '...'); assert.equal(dots.role, 'argument'); }
+    if (marked.includes('row.names = NULL')) assert.ok(!entries.some(entry => entry.insertText === 'row.names = '), marked);
+    if (marked === 'base::atan2(..., │)') assert.deepEqual(entries.map(entry => entry.label), ['y', 'x']);
+    if (marked === 'base::atan2(1,2,..., │)') assert.deepEqual(entries, []);
+  }
+});
+
+test("subscript completion reads installed receiver methods without executing them", async () => {
+  const setup = `
+    suppressPackageStartupMessages(library(data.table))
+    DT <- data.table(zebra = 1, alpha = 2)
+    df <- as.data.frame(DT)
+    lst <- list(alpha = 1, beta = 2)
+    obj <- structure(list(alpha = 1), class = "completion_custom")
+    \`[.completion_custom\` <- function(x, i, mode = stop("default evaluated"), ...) stop("method evaluated")
+    variadic <- structure(list(alpha = 1), class = "completion_variadic")
+    \`[.completion_variadic\` <- function(...) stop("method evaluated")
+    methods::setClass("CompletionSubsetS4", slots = c(alpha = "numeric"))
+    methods::setMethod("[", c(x = "CompletionSubsetS4", i = "ANY", j = "ANY", drop = "ANY"),
+      function(x, i, j, ..., drop = TRUE) stop("S4 method evaluated"))
+    s4 <- methods::new("CompletionSubsetS4", alpha = 1)
+  `;
+  const collect = async marked => {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const context = completion.getCompletionContext(text, cursor);
+    assert.ok(context, marked);
+    return completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+      async expression => {
+        assert.ok(!expression.includes('user expression must not execute'), marked);
+        return runRJson(setup + `
+          value <- eval(parse(text = inputs))
+          cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
+        `, expression);
+      });
+  };
+  for (const marked of ['DT[, │]', 'DT[, .N, │]', 'DT |> _[, │]']) {
+    const entries = await collect(marked);
+    for (const name of ['by', 'keyby', '.SDcols']) assert.ok(entries.some(e => e.insertText === name + ' = '), marked + name);
+    assert.ok(entries.some(e => e.insertText === 'alpha' && e.kind === 4), marked);
+  }
+  for (const marked of ['DT[, by = │]', 'DT[, keyby = │]', 'DT[, by = "al│"]', 'DT[, `keyby` = al│]']) {
+    assert.deepEqual(await collect(marked), [], 'named values need provider inference: ' + marked);
+  }
+  const supplied = await collect('DT[, stop("user expression must not execute"), by = alpha, │]');
+  assert.ok(supplied.every(e => !['i', 'j', 'by'].includes(e.label)));
+  const dataFrame = await collect('df[, │]');
+  assert.ok(dataFrame.some(e => e.insertText === 'drop = '));
+  assert.ok(dataFrame.every(e => !['by', 'keyby'].includes(e.label)));
+  assert.ok((await collect('df[, , dr│]')).some(e => e.insertText === 'drop = '));
+  const custom = await collect('obj[│]');
+  assert.deepEqual(custom.filter(e => e.role === 'argument').map(e => e.label), ['i', 'mode', '...']);
+  assert.deepEqual((await collect('obj[..., │]')).filter(e => e.role === 'argument').map(e => e.label), ['i', 'mode', '...']);
+  assert.ok((await collect('variadic[│]')).some(e => e.insertText === '...'));
+  assert.ok((await collect('s4[│]')).some(e => e.insertText === 'drop = '));
+  assert.ok((await collect('obj[1, mode = TRUE, │]')).some(e => e.insertText === '...'));
+  assert.ok((await collect('lst[[│]]')).every(e => e.kind === 4));
+});
+
+test("subscript methods and visible functions combine through the real language server", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  await client.syncSessionState({ attachedPackages: ['data.table', 'stats', 'base'] });
+  const collect = async marked => {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const before = text.slice(0, cursor), lines = text.split('\n');
+    const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
+    const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
+    return completion.collectCompletionEntries(context, { getText: () => text, uri: client.inputDocument.uri },
+      { line: row, character: col }, undefined, lines.slice(0, row), [], {
+        provideCompletionItems: async (...args) => {
+          const result = await client.provideCompletionItems(...args);
+          return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+        },
+      }, async expression => runRJson(`
+        DT <- data.table::data.table(alpha = 1, beta = 2)
+        df <- as.data.frame(DT)
+        value <- eval(parse(text = inputs))
+        cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
+      `, expression));
+  };
+  for (const [marked, insertion] of [['DT[, fca│]', 'fcase()'], ['df[, mea│]', 'mean()']]) {
+    assert.ok((await collect(marked)).some(e => e.kind === 2 && e.insertText === insertion), marked);
+  }
+  assert.ok((await collect('DT[, keyb│]')).some(e => e.role === 'argument' && e.insertText === 'keyby = '));
+  const specials = await collect('DT[, .N│]');
+  assert.equal(specials.filter(e => e.label === '.N').length, 1);
+  assert.ok(specials.some(e => e.label === '.N' && e.source === 'lsp'));
+  // Follow R's visible-symbol provider; the console must not maintain a
+  // separate slot-specific blacklist of package exports.
+  assert.ok((await collect('DT[.S│]')).some(e => e.label === '.SD'));
+  const values = await collect('DT[, keyby = al│]');
+  assert.ok(values.every(e => e.role !== 'argument'));
+  const source = 'DT <- data.table::data.table(alpha = 1, beta = 2)\n';
+  assert.deepEqual(await collect(source + 'DT[, mult = "│"]'), []);
 });

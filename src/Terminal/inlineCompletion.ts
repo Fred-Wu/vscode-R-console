@@ -27,7 +27,7 @@ const DEFAULT_COLORS: InlineCompletionColors = {
 const GROUP_BUTTON_LABELS: Record<string, string> = {
   "Runtime Variables": "Vars", Variables: "Vars", "Runtime Functions": "R.Fns",
   Packages: "Pkgs", Functions: "Fns", Fields: "Flds", Arguments: "Args",
-  "Package Members": "Members", "Recent Input": "Recent", Other: "Other",
+  "Recent Input": "Recent", Other: "Other",
 };
 
 /** The terminal API cannot resolve VS Code ThemeColor values. Respect explicit
@@ -226,7 +226,10 @@ export class InlineCompletion {
     if (token !== this.generation) return false;
     const previous = this.current();
     const queryChanged = query !== this.resultQuery;
-    if (queryChanged) this.scrollAnchorGroup = undefined;
+    if (queryChanged) {
+      this.scrollAnchorGroup = undefined;
+      this.manuallySelected = false;
+    }
     this.resultQuery = query;
     this.items = items;
     this.query = query;
@@ -265,22 +268,11 @@ export class InlineCompletion {
         entry.insertText === previous.insertText &&
         entry.description === previous.description && entry.detail === previous.detail;
     });
-    let exact = -1;
-    if (query.length > 0) {
-      const lowerQuery = query.toLowerCase();
-      for (const [choice, index] of this.choiceIndexes.entries()) {
-        const label = items[index].label.replace(ICON, "");
-        if (label === query) { exact = choice; break; }
-        if (exact < 0 && label.toLowerCase() === lowerQuery) exact = choice;
-      }
-    }
-    const argumentHeading = items.findIndex(item => !isChoice(item) && item.label === "Arguments");
-    const firstArgument = argumentHeading < 0 ? -1 : this.choiceIndexes.indexOf(argumentHeading + 1);
+    // Ranking and grouping already determine the displayed order. Start there,
+    // preserving only explicit navigation while the same query is refreshed.
     this.selected = !this.resetSelectionOnUpdate && this.manuallySelected &&
-      matching !== undefined && matching >= 0 ? matching :
-      firstArgument >= 0 ? firstArgument :
-      this.resetSelectionOnUpdate ? 0 : exact >= 0 ? exact :
       matching !== undefined && matching >= 0 ? matching : 0;
+    if (matching !== this.selected) this.manuallySelected = false;
     this.followSelection ||= queryChanged || matching !== this.selected;
     this.highlightSelectedGroup ||= queryChanged || this.resetSelectionOnUpdate || matching !== this.selected;
     this.endScroll();

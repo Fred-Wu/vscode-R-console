@@ -184,6 +184,7 @@ function stripSnippetSyntax(text: string): string {
 }
 
 function getCompletionInsertText(item: vscode.CompletionItem, context: CompletionContext): string {
+  if (getCompletionRole(item) === "argument" && getCompletionLabel(item) === "...") return "...";
   // Value labels are literal R strings, including dollar signs and braces.
   // Quote them for both named and positional insertion before snippet handling.
   if (getCompletionRole(item) === "value" && !item.range) {
