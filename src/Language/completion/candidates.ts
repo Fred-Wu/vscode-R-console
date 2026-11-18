@@ -27,7 +27,7 @@ export const R_RESERVED_WORDS = new Set([
 
 // R backticked names accept byte escapes but reject Unicode escapes.
 export function escapeRControls(text: string): string {
-  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, char => {
+  return text.replace(/[\p{Cc}\p{Bidi_Control}\p{Zl}\p{Zp}]/gu, char => {
     if (char === "\r") return "\\r";
     if (char === "\n") return "\\n";
     if (char === "\t") return "\\t";

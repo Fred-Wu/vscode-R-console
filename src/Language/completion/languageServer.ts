@@ -214,13 +214,14 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
     ? stripSnippetSyntax(text) : text;
   const role = getCompletionRole(item);
   if (role === "member" || item.kind === vscode.CompletionItemKind.Field) {
-    if (escapeRControls(label) !== label) {
-      if (result === label) return getFieldInsertText(label, context, role === "scope");
-      // R's language server can emit Unicode escapes inside backticks, which R cannot parse.
-      if (!context.bracketQuote && result.startsWith("`")) {
-        if (result.endsWith("`")) return backtickRName(label);
-        if (isCallableCompletionKind(item.kind) && result.endsWith("`()")) return backtickRName(label) + "()";
-      }
+    if (result === label && escapeRControls(label) !== label) {
+      return getFieldInsertText(label, context, role === "scope");
+    }
+    // Some R locales encode even printable characters as Unicode escapes.
+    // Build backticked member names from the label so R can parse them.
+    if (!context.bracketQuote && result !== label && result.startsWith("`")) {
+      if (result.endsWith("`")) return backtickRName(label);
+      if (isCallableCompletionKind(item.kind) && result.endsWith("`()")) return backtickRName(label) + "()";
     }
     return escapeRControls(result);
   }
