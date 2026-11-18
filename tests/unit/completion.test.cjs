@@ -242,6 +242,22 @@ test("cached column completions work without LSP and quote non-syntactic names",
   }
 });
 
+test("unquoted subscripts retain variable indices while quoted subscripts suggest only names", async () => {
+  const workspace = { globalenv: { lst: { names: ["indigo", "beta"] }, index: { type: "integer" } } };
+  for (const operator of ["[", "[["]) {
+    for (const quote of ["", '"', "'"]) {
+      const input = `lst${operator}${quote}ind`;
+      const context = completion.getCompletionContext(input, input.length);
+      const entries = await completion.collectCompletionEntries(
+        context, undefined, undefined, workspace, [], ["index_from_history <- 1"]
+      );
+      assert.deepEqual(entries.map(entry => entry.insertText), quote
+        ? ["indigo"]
+        : ['"indigo"', "index", "index_from_history"], input);
+    }
+  }
+});
+
 class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }

@@ -457,8 +457,7 @@ export async function collectCompletionEntries(
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     return asCompletionEntries(dedupeCompletionEntries([
       ...columnFiltered,
-      ...(!context.bracketQuote && context.bracketOperator === "[" ? [...lspFiltered, ...sessionFiltered] : []),
-      ...(!context.bracketQuote && context.bracketOperator === "[" ? bufferFiltered : []),
+      ...(!context.bracketQuote ? [...lspFiltered, ...sessionFiltered, ...bufferFiltered] : []),
     ]), rawLspResult.isIncomplete);
   }
 
