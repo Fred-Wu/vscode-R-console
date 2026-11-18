@@ -183,7 +183,7 @@ for (const accept of ["enter", "tab", "mouse"]) {
     terminal.lang.recordCompletion = (...args) => recorded.push(args);
     terminal.inputState.insertText("libr");
     const choice = {
-      ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+      ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
       source: "lsp", packageName: "base",
     };
     terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
@@ -225,7 +225,7 @@ test("accepting a partial function name match respects manual completion mode", 
   terminal.lang.recordCompletion = () => {};
   terminal.inputState.insertText("libr");
   terminal.inlineCompletion.set([{
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   }], terminal.inlineCompletion.token);
   const requests = [];
   terminal.lang.handleAutocomplete = async request => { requests.push(request); };
@@ -286,7 +286,7 @@ test("Escape cancels qualified argument requests before and after they start", t
     terminal.lang.recordCompletion = () => {};
     terminal.inputState.insertText("obj@fu");
     terminal.inlineCompletion.set([{
-      ...item("fun"), insertText: "fun()", replaceStart: 4, snapshotInput: "obj@fu", snapshotCursor: 6,
+      ...item("fun"), insertText: "fun()", isCallable: true, replaceStart: 4, snapshotInput: "obj@fu", snapshotCursor: 6,
     }], terminal.inlineCompletion.token);
     let publish;
     terminal.lang.handleAutocomplete = async request => { publish = request.onInlineEntries; };
@@ -317,7 +317,7 @@ test("accepting a callable preserves multiline calls and places the caret after 
           terminal.inputState.insertText(input);
           terminal.inputState.cursorPosition = before.length + prefix.length;
           terminal.inlineCompletion.set([{
-            ...item("fun"), insertText: "fun()", replaceStart: before.length,
+            ...item("fun"), insertText: "fun()", isCallable: true, replaceStart: before.length,
             snapshotInput: terminal.inputState.currentLine, snapshotCursor: terminal.inputState.cursorCol,
           }], terminal.inlineCompletion.token);
           terminal.applyKeyAction({ type: "tab" });
@@ -340,7 +340,7 @@ test("callable insertion keeps top-level and brace-separated expressions distinc
     terminal.lang.recordCompletion = () => {};
     terminal.inputState.insertText(input);
     terminal.inputState.cursorPosition = input.indexOf("fu") + 2;
-    terminal.applyCompletion({ ...item("fun"), insertText: "fun()", replaceStart: input.indexOf("fu") });
+    terminal.applyCompletion({ ...item("fun"), insertText: "fun()", isCallable: true, replaceStart: input.indexOf("fu") });
     assert.equal(terminal.inputState.text, input.replace("fu", "fun()"));
     assert.equal(terminal.inputState.textBeforeCursor, input.slice(0, input.indexOf("fu")) + "fun(");
   }
@@ -360,7 +360,7 @@ test("callable insertion handles quoted names, return and subscripted objects", 
     const end = start + /^[a-z]+/.exec(input.slice(start))[0].length;
     terminal.inputState.insertText(input);
     terminal.inputState.cursorPosition = end;
-    terminal.applyCompletion({ ...item("callable"), insertText,
+    terminal.applyCompletion({ ...item("callable"), insertText, isCallable: true,
       replaceStart: start - (input.lastIndexOf("\n", end - 1) + 1) });
     const expected = input.slice(0, start) + insertText.slice(0, -2) + input.slice(end);
     assert.equal(terminal.inputState.text, expected);
@@ -374,7 +374,7 @@ test("dismissal cancels argument suggestions scheduled after accepting a partial
   terminal.lang.recordCompletion = () => {};
   terminal.inputState.insertText("libr");
   terminal.inlineCompletion.set([{
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   }], terminal.inlineCompletion.token);
   let requests = 0;
   terminal.lang.handleAutocomplete = async () => { requests++; };
@@ -394,7 +394,7 @@ test("typing after accepting a partial function name match refreshes the pending
   terminal.lang.recordCompletion = () => {};
   terminal.inputState.insertText("libr");
   terminal.inlineCompletion.set([{
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   }], terminal.inlineCompletion.token);
   const requests = [];
   terminal.lang.handleAutocomplete = async request => { requests.push(request); };
@@ -429,7 +429,7 @@ test("Quick Pick function acceptance keeps argument completion manual", t => {
   terminal.inlineCompletionMode = () => "quickPick";
   terminal.inputState.insertText("libr");
   terminal.applyCompletion({
-    ...item("library"), insertText: "library()", snapshotInput: "libr", snapshotCursor: 4,
+    ...item("library"), insertText: "library()", isCallable: true, snapshotInput: "libr", snapshotCursor: 4,
   });
   assert.equal(terminal.inputState.textBeforeCursor, "library(");
   assert.equal(terminal.inlineCompletionTimer, undefined);

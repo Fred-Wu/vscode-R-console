@@ -92,6 +92,75 @@ interface Token {
   closed?: boolean;
 }
 
+// Retain only the latest completion input. Re-lex from the token before an edit
+// so appended identifiers, operators, comments and literals cannot go stale.
+let completionTokenCache: { code: string; tokens: Token[] } | undefined;
+
+function completionTokens(code: string): Token[] {
+  const previous = completionTokenCache;
+  if (previous?.code === code) return previous.tokens;
+  let tokens: Token[];
+  if (previous) {
+    let common = 0;
+    while (common < code.length && common < previous.code.length && code[common] === previous.code[common]) common++;
+    let low = 0, high = previous.tokens.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (previous.tokens[mid].position < common) low = mid + 1;
+      else high = mid;
+    }
+    const index = Math.max(0, low - 1);
+    const offset = Math.min(common, previous.tokens[index].position);
+    tokens = previous.tokens.slice(0, index).concat(tokenize(code.slice(offset)).map(token =>
+      ({ ...token, position: token.position + offset })));
+  } else {
+    tokens = tokenize(code);
+  }
+  completionTokenCache = { code, tokens };
+  return tokens;
+}
+
+/** Share one lexical snapshot between completion's independent context checks. */
+export function getCompletionSyntax(code: string, cursor = code.length) {
+  let tokens: Token[] | undefined;
+  let prefixTokens: Token[] | undefined;
+  const all = (): Token[] => tokens ??= completionTokens(code);
+  const before = code.slice(0, cursor);
+  const prefix = (): Token[] => {
+    if (cursor === code.length) return all();
+    if (!prefixTokens) {
+      prefixTokens = all().filter(token => token.position < cursor);
+      const last = prefixTokens.at(-1);
+      if (last && last.position + last.value.length > cursor) {
+        prefixTokens.pop();
+        prefixTokens.push(...tokenize(code.slice(last.position, cursor)).filter(token => token.type !== TokenType.EOF)
+          .map(token => ({ ...token, position: token.position + last.position })));
+      }
+      prefixTokens.push({ type: TokenType.EOF, value: "", position: cursor });
+    }
+    return prefixTokens;
+  };
+  return {
+    get inLiteral() { return /["'`#]/.test(code) && isCompletionInLiteral(code, cursor, all()); },
+    get member() { return /[$@]|::/.test(before) ? getQualifiedCompletionContext(before, prefix()) : undefined; },
+    get bracket() { return code.includes("[") ? getBracketCompletionContext(code, cursor, all()) : undefined; },
+    get pipe() { return before.includes("|>") || before.includes("%>%") ? getPipeCompletionContext(before, prefix()) : undefined; },
+    get call() { return before.includes("(") ? getEnclosingCall(code, cursor, all()) : undefined; },
+  };
+}
+
+/** Make an unfinished native-pipe destination parseable without changing input
+ * or evaluating it. Its name and cursor remain at their original positions. */
+export function getCompletionParseInsertion(code: string, cursor: number): { offset: number; text: string } | undefined {
+  const pipe = getCompletionSyntax(code, cursor).pipe;
+  if (!pipe || !code.slice(0, pipe.replaceStart).trimEnd().endsWith("|>")) return undefined;
+  const name = completionTokens(code).find(token => token.type === TokenType.Identifier &&
+    token.position === pipe.replaceStart && token.position + token.value.length >= cursor);
+  const offset = name ? name.position + name.value.length : cursor;
+  if (name && getCallOpenings(code).has(offset)) return undefined;
+  return { offset, text: name ? "()" : "identity()" };
+}
+
 export type CallCompletionContext = {
   // Callable source reconstructed from tokens, without inter-token whitespace
   // or comments. Quoted identifiers retain their spelling and escapes.
@@ -100,7 +169,8 @@ export type CallCompletionContext = {
   // R source tags; "" denotes a positional argument and null the cursor's slot. Undefined
   // means the cursor is in a value, comment, or another non-name position.
   argumentTags?: (string | null)[];
-  argumentValue?: { name: string; prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" };
+  argumentValue?: { name: string; prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'";
+    argumentTags?: (string | null)[] };
 };
 
 export type BracketCompletionContext = {
@@ -126,9 +196,9 @@ function hasOnlyLiteralSubscripts(code: string): boolean {
   return depth === 0;
 }
 
-export function isCompletionInLiteral(code: string, cursor = code.length): boolean {
+export function isCompletionInLiteral(code: string, cursor = code.length, tokens?: Token[]): boolean {
   if (!/["'`#]/.test(code)) return false;
-  return tokenize(code).some(token => token.position < cursor &&
+  return (tokens ?? tokenize(code)).some(token => token.position < cursor &&
     (cursor < token.position + token.value.length ||
       (cursor === token.position + token.value.length && (token.closed === false || token.type === TokenType.Comment))) &&
     (token.type === TokenType.Comment || token.type === TokenType.String || token.type === TokenType.RawString ||
@@ -186,10 +256,15 @@ function completionPrefix(tokens: Token[], start: number, end: number, cursor: n
 }
 
 /** Find the active subscript slot using tokens, including closing brackets after the caret. */
-export function getBracketCompletionContext(code: string, cursor = code.length): BracketCompletionContext | undefined {
+export function getBracketCompletionContext(code: string, cursor = code.length, sourceTokens?: Token[]): BracketCompletionContext | undefined {
   if (!code.includes("[")) return undefined;
-  const tokens = tokenize(code).filter(token => token.type !== TokenType.Newline &&
-    token.type !== TokenType.Comment && token.type !== TokenType.EOF);
+  sourceTokens ??= tokenize(code);
+  // A lexer token can close both a nested single subscript and this subscript.
+  // Split closing brackets so each delimiter is handled at its own depth.
+  const tokens = sourceTokens.filter(token => token.type !== TokenType.Newline &&
+    token.type !== TokenType.Comment && token.type !== TokenType.EOF).flatMap(token =>
+      token.type === TokenType.RightBracket && token.value === "]]"
+        ? [{ ...token, value: "]" }, { ...token, value: "]", position: token.position + 1 }] : [token]);
   const stack: { opening: string; index: number }[] = [];
   for (let index = 0; index < tokens.length && tokens[index].position < cursor; index++) {
     const token = tokens[index];
@@ -206,24 +281,33 @@ export function getBracketCompletionContext(code: string, cursor = code.length):
   const opening = tokens[frame.index];
   const head = code.slice(0, opening.position);
   // Reuse member-object detection; the synthetic accessor is never evaluated.
-  const object = getQualifiedCompletionContext(head + "$");
+  const object = getQualifiedCompletionContext(head + "$", [
+    ...sourceTokens.filter(token => token.position < opening.position),
+    { type: TokenType.Operator, value: "$", position: opening.position },
+    { type: TokenType.EOF, value: "", position: opening.position + 1 },
+  ]);
   if (!object || !hasOnlyLiteralSubscripts(object.objectName)) return undefined;
   let slotStart = frame.index + 1;
   let slotOffset = opening.position + opening.value.length;
   let dimension = 0;
-  let dimensions = 1;
+  let dimensions = 0;
   let selected: ReturnType<typeof completionPrefix>;
   const nested: string[] = [];
   for (let index = slotStart; index <= tokens.length; index++) {
     const token = tokens[index];
     const closes = !token || (!nested.length && token.type === TokenType.RightBracket);
     if (closes || (!nested.length && token.type === TokenType.Comma)) {
-      if (slotOffset <= cursor && cursor <= (token?.position ?? code.length)) {
+      const first = tokens[slotStart];
+      const second = tokens[slotStart + 1];
+      const option = slotStart + 1 < index && second.type === TokenType.Operator && second.value === "=" &&
+        (first.type === TokenType.Identifier || first.type === TokenType.String) &&
+        first.value.replace(/^[`"']|[`"']$/g, "") === (opening.value === "[[" ? "exact" : "drop");
+      if (!option && slotOffset <= cursor && cursor <= (token?.position ?? code.length)) {
         selected = completionPrefix(tokens, slotStart, index, cursor);
-        dimension = dimensions - 1;
+        dimension = dimensions;
       }
+      if (!option) dimensions++;
       if (closes) break;
-      dimensions++;
       slotStart = index + 1;
       slotOffset = token.position + 1;
     } else if ([TokenType.LeftBracket, TokenType.LeftParen, TokenType.LeftBrace].includes(token.type)) {
@@ -234,13 +318,13 @@ export function getBracketCompletionContext(code: string, cursor = code.length):
       }
     }
   }
-  if (!selected || (isCompletionInLiteral(code, cursor) && !selected.quote)) return undefined;
+  if (!selected || (isCompletionInLiteral(code, cursor, sourceTokens) && !selected.quote)) return undefined;
   return { objectName: object.objectName, operator: opening.value as "[" | "[[", ...selected, dimension, dimensions };
 }
 
-export function getPipeCompletionContext(code: string): { prefix: string; replaceStart: number } | undefined {
+export function getPipeCompletionContext(code: string, all?: Token[]): { prefix: string; replaceStart: number } | undefined {
   if (!code.includes("|>") && !code.includes("%>%")) return undefined;
-  const all = tokenize(code);
+  all ??= tokenize(code);
   if (all.some(token => token.type === TokenType.Comment && token.position + token.value.length === code.length)) return undefined;
   const tokens = all.filter(token => token.type !== TokenType.Newline && token.type !== TokenType.EOF && token.type !== TokenType.Comment);
   const last = tokens.at(-1);
@@ -286,14 +370,14 @@ export type QualifiedCompletionContext = {
 
 /** Inspect the source before the cursor. Walk backwards over names, accessors
  * and balanced subscripts; never evaluate an expression or accept its suffix. */
-export function getQualifiedCompletionContext(code: string): QualifiedCompletionContext | undefined {
+export function getQualifiedCompletionContext(code: string, sourceTokens?: Token[]): QualifiedCompletionContext | undefined {
   if (!code.includes("$") && !code.includes("@") && !code.includes("::")) return undefined;
   const tokens: Token[] = [];
   const continuations: boolean[] = [];
   const subscriptOpenings = new Map<number, number>();
   const stack: { opening: string; index: number }[] = [];
   let lineBreak = false;
-  for (const token of tokenize(code)) {
+  for (const token of sourceTokens ?? tokenize(code)) {
     if (token.type === TokenType.EOF) break;
     if (token.type === TokenType.Comment) {
       if (token.position + token.value.length === code.length) return undefined;
@@ -409,11 +493,12 @@ export function getCallOpenings(code: string): Map<number, number> {
 
 /** Inspect syntax without evaluating argument expressions or searching source
  * text for a callable suffix. Each token is visited a constant number of times. */
-export function getEnclosingCall(code: string, cursor = code.length): CallCompletionContext | undefined {
+export function getEnclosingCall(code: string, cursor = code.length, sourceTokens?: Token[]): CallCompletionContext | undefined {
+  if (!code.includes("(")) return undefined;
   const tokens: Token[] = [];
   const lineBreaks = new Set<number>();
   let inComment = false;
-  for (const token of tokenize(code)) {
+  for (const token of sourceTokens ?? tokenize(code)) {
     if (token.type === TokenType.Comment) {
       inComment ||= token.position < cursor && cursor <= token.position + token.value.length;
     } else if (token.type === TokenType.Newline) {
@@ -526,7 +611,8 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
     name: tokens.slice(start, frame.index).map(token => token.value).join(""),
     operator,
     argumentTags: namePosition && !inComment && !hasDots ? argumentTags : undefined,
-    ...(argumentValue && !inComment ? { argumentValue } : {}),
+    ...(argumentValue && !inComment ? { argumentValue: { ...argumentValue,
+      ...(!hasDots ? { argumentTags } : {}) } } : {}),
   };
 }
 

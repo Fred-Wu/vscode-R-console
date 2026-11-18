@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import { completionMatch } from "./completionMatch";
-import { getBracketCompletionContext, getEnclosingCall, getPipeCompletionContext, getQualifiedCompletionContext,
-  isCallableName, isCompletionInLiteral, type CallCompletionContext } from "./parser";
+import { getCompletionSyntax, isCallableName, type CallCompletionContext } from "./parser";
 
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
@@ -88,6 +87,7 @@ const EXACT_MATCH_GROUP_ORDER = [
 export type CompletionPickItem = vscode.QuickPickItem & {
   packageName?: string;
   insertText: string;
+  isCallable?: boolean;
   replaceStart: number;
   replaceEnd?: number;
   snapshotInput: string;
@@ -283,10 +283,11 @@ export function getCompletionContext(
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
   const fullText = textForDataContext + textAfterCursor;
   const relativeOffset = textForDataContext.length - beforeCursor.length;
-  const inLiteral = isCompletionInLiteral(fullText, textForDataContext.length);
+  const syntax = getCompletionSyntax(fullText, textForDataContext.length);
+  const inLiteral = syntax.inLiteral;
   const dataObjectName = detectDataContext(textForDataContext);
 
-  const member = getQualifiedCompletionContext(textForDataContext);
+  const member = syntax.member;
   if (member) {
     const { operator, prefix } = member;
     const replaceStart = member.replaceStart - (textForDataContext.length - beforeCursor.length);
@@ -319,7 +320,7 @@ export function getCompletionContext(
     };
   }
 
-  const bracket = getBracketCompletionContext(fullText, textForDataContext.length);
+  const bracket = syntax.bracket;
   if (bracket && bracket.replaceStart >= relativeOffset) {
     const isPlaceholderBracket = isPipePlaceholder(bracket.objectName) && !!dataObjectName;
     const effectiveDataObject = isPlaceholderBracket ? dataObjectName : bracket.objectName;
@@ -343,13 +344,13 @@ export function getCompletionContext(
     };
   }
 
-  const pipe = getPipeCompletionContext(textForDataContext);
+  const pipe = syntax.pipe;
   if (pipe && !inLiteral) {
     return { kind: "default", pipe: true, autoTrigger: true, prefix: pipe.prefix,
       replaceStart: pipe.replaceStart - relativeOffset, snapshotInput, snapshotCursor };
   }
 
-  const call = getEnclosingCall(fullText, textForDataContext.length);
+  const call = syntax.call;
   if (call) {
     const argPrefixMatch = /([\p{L}\p{Nl}\p{Nd}._]*)$/u.exec(beforeCursor);
     const value = call.argumentValue && call.argumentValue.replaceStart >= relativeOffset ? call.argumentValue : undefined;
@@ -613,10 +614,11 @@ export function toCompletionPick(
   const icon = getCompletionIcon(entry.kind);
   const description = getCompletionDescription(entry);
   return {
-    label: `${icon} ${entry.label}`,
+    label: `${icon} ${entry.label || '""'}`,
     description,
     detail: entry.detail ? stripSnippetSyntax(entry.detail) : undefined,
     insertText: entry.insertText,
+    isCallable: isCallableCompletionKind(entry.kind),
     replaceStart: entry.replaceStart ?? context.replaceStart,
     ...(context.replaceEnd !== undefined ? { replaceEnd: context.replaceEnd } : {}),
     snapshotInput: context.snapshotInput,
@@ -1020,17 +1022,25 @@ async function getRuntimeArgumentCompletions(
   try {
     if (context.argumentValue) {
       const value = context.argumentValue;
+      const supplied = (value.argumentTags ?? [null]).map(tag =>
+        tag === null ? `${value.name} = TRUE` : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
       const items = await request(
         `base::local({ .fn <- (${context.functionName}); .vals <- NULL; ` +
         `if (base::is.function(.fn)) { .defs <- base::formals(base::args(.fn)); ` +
-        `.tag <- base::names(base::as.list(base::quote(.fn(${value.name} = NULL))))[2L]; ` +
-        `if (.tag %in% base::names(.defs)) { .expr <- .defs[[.tag]]; ` +
+        `.matched <- base::tryCatch(base::suppressWarnings(base::match.call(definition = base::args(.fn), ` +
+        `call = base::quote(.fn(${supplied})), expand.dots = FALSE)), error = function(e) NULL); ` +
+        `.matched <- base::as.list(.matched)[-1L]; ` +
+        `.tag <- base::names(.matched)[base::vapply(.matched, base::identical, base::logical(1), TRUE)]; ` +
+        `if (base::length(.tag) == 1L && .tag %in% base::names(.defs)` +
+        (value.argumentTags ? "" : ` && .tag == base::names(base::as.list(base::quote(.fn(${value.name} = NULL))))[2L]`) +
+        `) { .expr <- .defs[[.tag]]; ` +
         `.vals <- if (base::is.character(.expr)) .expr else if (base::is.call(.expr) && ` +
         `base::identical(.expr[[1L]], base::quote(c))) ` +
         `base::unlist(base::Filter(base::is.character, base::as.list(.expr)[-1L]), use.names = FALSE) else NULL } }; ` +
-        `stats::setNames(base::as.list(.vals), .vals) })`, "$"
+        `stats::setNames(base::as.list(.vals), if (base::length(.vals)) base::paste0("value:", .vals) else base::character()) })`, "$"
       );
-      return (items ?? []).map(item => ({ label: item.name, insertText: quoteCompletionValue(item.name, value.quote),
+      return (items ?? []).filter(item => item.name.startsWith("value:")).map(item => ({
+        label: item.name.slice(6), insertText: quoteCompletionValue(item.name.slice(6), value.quote),
         kind: vscode.CompletionItemKind.Value, detail: `value for ${value.name}`, source: "session" as const }));
     }
     // A completion inserts a name, which R matches before positional values on
@@ -1085,12 +1095,13 @@ async function getLanguageServerCompletions(
     let localFunction = result?.rConsoleLocalFunction === true;
 
     let items = Array.isArray(result) ? result : result?.items || [];
+    const usable = (item: vscode.CompletionItem): boolean => isLanguageServerCompletionItem(context, item, doc.uri?.toString());
     // Some R language servers only return contiguous matches. If that lookup
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
     // its replacement start intact; never rewrite code to manufacture results.
     if (context.prefix.length > 1 &&
-        !items.some(item => isLanguageServerCompletionItem(context, item) &&
+        !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
@@ -1101,7 +1112,7 @@ async function getLanguageServerCompletions(
     }
     
     const filteredItems = items.filter((item) =>
-      isLanguageServerCompletionItem(context, item)
+      usable(item)
     );
     
     return {
@@ -1146,7 +1157,8 @@ function getCompletionPackage(item: vscode.CompletionItem): string | undefined {
 
 function isLanguageServerCompletionItem(
   context: CompletionContext,
-  item: vscode.CompletionItem
+  item: vscode.CompletionItem,
+  documentUri?: string
 ): boolean {
   if (context.pipe && !isCallableCompletionKind(item.kind)) return false;
   if (context.argumentValue?.quote && !item.detail?.startsWith("value for ")) return false;
@@ -1155,7 +1167,11 @@ function isLanguageServerCompletionItem(
   }
 
   if (item.detail === "[workspace]") {
-    return false;
+    const data = (item as vscode.CompletionItem & { data?: { package?: string; context_uri?: string } }).data;
+    // Only definitions from this console's virtual document are authoritative.
+    // Other workspace/editor symbols must not leak into the console session.
+    return isCallableCompletionKind(item.kind) && data?.package === "_workspace_" &&
+      documentUri !== undefined && data.context_uri === documentUri;
   }
 
   if (

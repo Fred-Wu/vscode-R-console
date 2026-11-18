@@ -238,23 +238,95 @@ console_call_identity <- function(source) {
     NULL
 }
 
-console_valid_argument_items <- function(items, tags, call, uri, workspace, point) {
+# Inspect assignments in the cursor's lexical scope. Parse syntax only: neither
+# defaults nor function bodies are evaluated, including wrapped/chained RHSs.
+console_source_function <- function(document, point, name) {
+    xdoc <- document$parse_data$xml_doc
+    if (is.null(xdoc)) return(NULL)
+    row <- point$row + 1L
+    col <- point$col + 1L
+    before <- function(node) {
+        line <- as.integer(xml2::xml_attr(node, "line1"))
+        line < row || (line == row && as.integer(xml2::xml_attr(node, "col1")) <= col)
+    }
+    contains <- function(node) {
+        line <- as.integer(xml2::xml_attr(node, "line2"))
+        before(node) && (line > row || (line == row && as.integer(xml2::xml_attr(node, "col2")) >= col - 1L))
+    }
+    selected <- NULL
+    depth <- -1L
+    assignments <- xml2::xml_find_all(xdoc, "//*[LEFT_ASSIGN or EQ_ASSIGN or RIGHT_ASSIGN]")
+    for (node in assignments) {
+        rightward <- length(xml2::xml_find_all(node, "RIGHT_ASSIGN")) > 0L
+        target <- xml2::xml_find_first(node, if (rightward) "expr[last()]/SYMBOL" else "expr[1]/SYMBOL")
+        if (inherits(target, "xml_missing") || !before(target)) next
+        spelling <- xml2::xml_text(target)
+        symbol <- if (startsWith(spelling, "`")) tryCatch(parse(text = spelling)[[1L]], error = function(e) NULL) else as.name(spelling)
+        if (!is.symbol(symbol) || !identical(as.character(symbol), name)) next
+        scopes <- xml2::xml_find_all(node, "ancestor::expr[FUNCTION or OP-LAMBDA]")
+        if (length(scopes) < depth || !all(vapply(scopes, contains, logical(1)))) next
+        leaves <- xml2::xml_find_all(node, ".//*[not(*) and not(self::COMMENT)]")
+        lines <- as.integer(xml2::xml_attr(leaves, "line1"))
+        ends <- as.integer(xml2::xml_attr(leaves, "line2"))
+        separators <- c("", ifelse(lines[-1L] > head(ends, -1L), "\n", " "))
+        expression <- tryCatch(parse(text = paste0(separators, xml2::xml_text(leaves), collapse = ""))[[1L]],
+            error = function(e) NULL)
+        # R normalizes rightward assignments and lambdas in the parsed AST.
+        while (is.call(expression) && is.symbol(expression[[1L]]) &&
+            as.character(expression[[1L]]) %in% c("(", "<-", "<<-", "=")) {
+            expression <- expression[[if (identical(expression[[1L]], quote(`(`))) 2L else 3L]]
+        }
+        definition <- if (is.call(expression) && identical(expression[[1L]], quote(`function`))) expression else NULL
+        selected <- list(formals = if (!is.null(definition)) definition[[2L]] else NULL)
+        depth <- length(scopes)
+    }
+    selected
+}
+
+console_argument_name <- function(item) {
+    if (!is.null(item$data$uri)) {
+        parsed <- tryCatch(parse(text = item$label)[[1L]], error = function(e) NULL)
+        if (is.symbol(parsed)) return(as.character(parsed))
+    }
+    item$label
+}
+
+console_source_signature <- function(source, uri) {
+    lapply(names(source$formals), function(name) {
+        spelling <- paste(deparse(as.name(name), backtick = TRUE), collapse = "")
+        list(label = spelling, kind = languageserver:::CompletionItemKind$Variable,
+            detail = "parameter", insertText = paste0(spelling, " = "),
+            data = list(type = "parameter", uri = uri))
+    })
+}
+
+# Use the whole call's tags so exact matches can disambiguate a partial tag.
+# TRUE marks the cursor's argument; all other values are inert NULL syntax.
+console_value_argument <- function(formal_names, tag, tags) {
+    parsed <- tryCatch(parse(text = tag)[[1L]], error = function(e) NULL)
+    name <- if (is.symbol(parsed) || is.character(parsed)) as.character(parsed) else ""
+    if (is.null(tags)) return(if (name %in% formal_names) name else "")
+    supplied <- vapply(tags, function(value) {
+        if (is.null(value)) paste0(tag, " = TRUE") else if (nzchar(value)) paste0(value, " = NULL") else "NULL"
+    }, character(1))
+    definition <- function() NULL
+    formals(definition) <- as.pairlist(setNames(rep(list(NULL), length(formal_names)), formal_names))
+    matched <- tryCatch(suppressWarnings(match.call(definition,
+        parse(text = paste0(".fn(", paste(supplied, collapse = ", "), ")"))[[1L]], expand.dots = FALSE)),
+        error = function(e) NULL)
+    args <- as.list(matched)[-1L]
+    matched_name <- names(args)[vapply(args, identical, logical(1), TRUE)]
+    if (length(matched_name) == 1L && matched_name %in% formal_names) matched_name else ""
+}
+
+console_valid_argument_items <- function(items, tags, call, uri, workspace, point, signature = NULL) {
     if (is.null(call) || is.null(tags) ||
         !any(vapply(items, function(item) identical(item$detail, "parameter"), logical(1)))) return(items)
     # Ask the same provider for the complete signature, including local source
     # definitions and dots. Defaults and function bodies are never evaluated.
-    signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
+    if (is.null(signature)) signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
         call$package, exported_only = call$accessor != ":::")
-    argument_name <- function(item) {
-        # Source definitions expose source spelling (e.g. `a b`), whereas
-        # package signatures already expose the actual names from formals().
-        if (!is.null(item$data$uri)) {
-            parsed <- tryCatch(parse(text = item$label)[[1L]], error = function(e) NULL)
-            if (is.symbol(parsed)) return(as.character(parsed))
-        }
-        item$label
-    }
-    formal_names <- unique(vapply(signature, argument_name, character(1)))
+    formal_names <- unique(vapply(signature, console_argument_name, character(1)))
     if (!length(formal_names)) return(items)
     definition <- function() NULL
     formals(definition) <- as.pairlist(setNames(rep(list(NULL), length(formal_names)), formal_names))
@@ -269,7 +341,7 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     if (is.null(names(syntax))) names(syntax) <- rep("", length(syntax))
     Filter(function(item) {
         if (!identical(item$detail, "parameter")) return(TRUE)
-        name <- argument_name(item)
+        name <- console_argument_name(item)
         if (name == "..." || name %in% names(syntax)) return(FALSE)
         candidate <- syntax
         names(candidate)[cursor_slot] <- name
@@ -285,8 +357,15 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
 # delimiter-completed copy does not run definitions, defaults, or user code.
 console_completion_parse <- local({
     cache <- NULL
-    function(uri, document, suffix) {
-        content <- strsplit(paste0(paste(document$content, collapse = "\n"), suffix), "\n", fixed = TRUE)[[1L]]
+    function(uri, document, suffix, insertion = NULL) {
+        content <- document$content
+        if (is.list(insertion) && insertion$text %in% c("()", "identity()")) {
+            at <- document$from_lsp_position(insertion$position)
+            line <- content[[at$row + 1L]]
+            content[[at$row + 1L]] <- paste0(substr(line, 1L, at$col), insertion$text,
+                substring(line, at$col + 1L))
+        }
+        content <- strsplit(paste0(paste(content, collapse = "\n"), suffix), "\n", fixed = TRUE)[[1L]]
         if (is.null(cache) || !identical(cache$uri, uri) || !identical(cache$content, content)) {
             parsed <- languageserver:::parse_document(uri, content)
             parsed$xml_doc <- tryCatch(xml2::read_xml(parsed$xml_data), error = function(e) NULL)
@@ -309,7 +388,7 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     if (is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L) {
         previous_parse <- document$parse_data
         on.exit(document$update_parse_data(previous_parse), add = TRUE)
-        document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix))
+        document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix, params$rConsoleParseInsertion))
     }
 
     point <- document$from_lsp_position(params$position)
@@ -322,18 +401,9 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
         self$ClientCapabilities$textDocument$completion
     )
     call <- console_call_identity(params$rConsoleCall)
-    if (!is.null(call) && is.null(call$package)) {
-        xdoc <- document$parse_data$xml_doc
-        if (!is.null(xdoc)) {
-            # Use the provider's own scope lookup, independently of the number
-            # of candidates left after prefix and supplied-argument filtering.
-            xpath <- glue::glue(languageserver:::signature_xpath,
-                row = point$row + 1L, token_quote = languageserver:::xml_single_quote(call$token))
-            definitions <- languageserver:::xdoc_find_definitions(
-                xdoc, point$row + 1L, point$col + 1L, call$token, xpath)
-            if (length(definitions)) reply$result$rConsoleLocalFunction <- TRUE
-        }
-    }
+    source <- if (!is.null(call) && is.null(call$package)) console_source_function(document, point, call$token) else NULL
+    signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
+    if (!is.null(source)) reply$result$rConsoleLocalFunction <- TRUE
     if (is.null(call) && !is.null(params$rConsoleCall)) {
         # A name accepted by the frontend lexer may be invalid in R's locale
         # (notably unquoted supplementary Unicode characters on Windows).
@@ -343,23 +413,36 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     } else if (!is.null(call)) {
         detected <- document$detect_call(point)
         value_mode <- is.character(params$rConsoleArgument) && length(params$rConsoleArgument) == 1L
-        if (value_mode || !identical(call$token, detected$token) ||
+        if (!is.null(source) || value_mode || !identical(call$token, detected$token) ||
             !identical(call$package, detected$package) ||
             !identical(call$accessor, detected$accessor)) {
             # Resolve parameters with the same workspace/provider as ordinary
             # completion, using the lexer-selected head without rewriting code
             # or evaluating the user's function or argument expressions.
             token <- if (value_mode) params$rConsolePrefix else document$detect_token(point, forward = FALSE)$token
-            arguments <- c(
+            arguments <- if (!is.null(source)) {
+                parameters <- if (!value_mode) Filter(function(item) languageserver:::match_with(item$label, token), signature) else list()
+                values <- unlist(lapply(names(source$formals), function(name) {
+                    defaults <- languageserver:::extract_default_values(source$formals[[name]])
+                    if (is.null(defaults)) return(list())
+                    lapply(defaults[languageserver:::match_with(defaults, token)], function(value) {
+                        list(label = value, kind = languageserver:::CompletionItemKind$Value,
+                            detail = paste0("value for ", name), insertText = encodeString(value, quote = '\"'))
+                    })
+                }), recursive = FALSE)
+                c(parameters, values)
+            } else c(
                 if (!value_mode) languageserver:::arg_completion(uri, workspace, point, token, call$token,
                     call$package, exported_only = call$accessor != ":::"),
                 languageserver:::arg_value_completion(uri, workspace, document, point, token,
                     call$token, call$package, exported_only = call$accessor != ":::")
             )
             if (value_mode) {
-                tag <- tryCatch(parse(text = params$rConsoleArgument)[[1L]], error = function(e) NULL)
-                name <- if (is.symbol(tag) || is.character(tag)) as.character(tag) else ""
-                arguments <- Filter(function(item) identical(item$detail, paste0("value for ", name)), arguments)
+                value_signature <- if (!is.null(source)) signature else languageserver:::arg_completion(
+                    uri, workspace, point, "", call$token, call$package, exported_only = call$accessor != ":::")
+                name <- console_value_argument(vapply(value_signature, console_argument_name, character(1)),
+                    params$rConsoleArgument, params$rConsoleValueTags)
+                arguments <- Filter(function(item) nzchar(name) && identical(item$detail, paste0("value for ", name)), arguments)
             }
             other <- Filter(function(item) !(identical(item$detail, "parameter") ||
                 (is.character(item$detail) && startsWith(item$detail, "value for "))), reply$result$items)
@@ -372,7 +455,7 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     # Validate each proposed name using R's matching rules. Positional values,
     # partial tags and pipe insertion can make an otherwise unused name invalid.
     reply$result$items <- console_valid_argument_items(reply$result$items,
-        params$rConsoleArgumentTags, call, uri, workspace, point)
+        params$rConsoleArgumentTags, call, uri, workspace, point, signature)
     if (isTRUE(params$rConsolePipe)) {
         token <- params$rConsolePrefix
         nmax <- languageserver:::lsp_settings$get("max_completions")

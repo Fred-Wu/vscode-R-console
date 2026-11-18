@@ -1050,3 +1050,137 @@ test("real console languageserver authenticates, initializes and completes code"
   await lsp.request("shutdown", null); // R languageserver may serialize a void response as [].
   lsp.notify("exit", null);
 });
+
+test("subscript options and adjacent nested closers preserve native R indexing", async () => {
+  const setup = 'df <- data.frame(alpha = 1:2, beta = 3:4, row.names = c("row_one", "row_two")); cols <- 1:2;\n';
+  for (const [marked, expected] of [
+    ['df[[│, exact = TRUE]]', ['alpha', 'beta']],
+    ['df[│, drop = FALSE]', ['alpha', 'beta']],
+    ['df[drop = FALSE, │]', ['alpha', 'beta']],
+    ['df[│, cols[1]]', ['row_one', 'row_two']],
+    ['df[│, cols[[1]]]', ['row_one', 'row_two']],
+    ['df[, │, drop = FALSE]', ['alpha', 'beta']],
+  ]) {
+    const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+    const context = completion.getCompletionContext(text, cursor);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+      async expression => runRJson(setup + 'x <- eval(parse(text = inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression));
+    assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.label), expected, marked);
+    const selected = entries.find(item => item.label === expected[0]);
+    const code = text.slice(0, context.replaceStart) + selected.insertText + text.slice(cursor);
+    assert.equal(runRJson(setup + 'invisible(suppressWarnings(eval(parse(text=inputs)))); cat("true")', code), true, code);
+  }
+});
+
+test("partial argument values follow R matching in LSP and active-session probes", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const provide = async (...args) => {
+    const result = await client.provideCompletionItems(...args);
+    return { ...result, items: (result.items ?? result).map(item => ({ ...item, kind: item.kind - 1 })) };
+  };
+  const definitions = 'f <- function(method = c("spearman", "pearson"), metric = "other") stop("body evaluated")\n';
+  for (const runtime of [false, true]) {
+    for (const [call, expected] of [
+      ['f(meth = sp│)', ['spearman']], ['f(meth = "sp│")', ['spearman']],
+      ['f(met = sp│)', []], ['f(metric = stop("argument evaluated"), met = sp│)', ['spearman']],
+      ['f(method = "pearson", meth = sp│)', []],
+    ]) {
+      const marked = (runtime ? '' : definitions) + call;
+      const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
+      const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
+      const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
+      const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
+        runtime ? { globalenv: { f: { type: 'closure' } } } : undefined, lines.slice(0, position.line), [],
+        { provideCompletionItems: provide }, async expression => runRJson(definitions +
+          'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression));
+      assert.deepEqual(entries.filter(item => item.detail?.startsWith('value for ')).map(item => item.label), expected,
+        `${runtime ? 'runtime' : 'source'}: ${marked}`);
+    }
+  }
+  const result = await client.provideCompletionItems({ getText: () => 'stats::cor(met = sp)' }, { line: 0, character: 'stats::cor(met = sp'.length });
+  assert.ok(result.items.some(item => item.label === 'spearman'));
+  for (const tag of ['met', 'method']) {
+    const text = `f <- function(..., method = "spearman") NULL\nf(${tag} = "sp")`;
+    const result = await client.provideCompletionItems({ getText: () => text }, { line: 1, character: `f(${tag} = "sp`.length });
+    assert.equal(result.items.some(item => item.label === 'spearman'), tag === 'method', 'partial matching stops at dots');
+  }
+});
+
+test("source redefinitions remain authoritative through wrappers, chains and lexical scopes", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const provider = { provideCompletionItems: async (...args) => {
+    const result = await client.provideCompletionItems(...args);
+    return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+  } };
+  for (const [marked, expected] of [
+    ['f <- (function(new_arg) NULL)\nf(│)', ['new_arg']],
+    ['f <- g <- function(new_arg) NULL\nf(│)', ['new_arg']],
+    ['(function(new_arg) NULL) -> f\nf(│)', ['new_arg']],
+    ['f <- (function(new_arg = stop("default evaluated")) {\n stop("body evaluated")\n NULL\n})\nf(│)', ['new_arg']],
+    ['f <- (function() NULL)\nf(│)', []],
+    ['f <- (function() stop("must not execute"))()\nf(│)', []],
+    ['f <- function(outer_arg) NULL\ng <- function() { f <- (function(inner_arg) NULL); f(│) }', ['inner_arg']],
+    ['f <- function(outer_arg) NULL\ng <- function() { f <- (function(inner_arg) NULL) }; f(│)', ['outer_arg']],
+    ['f <- function(earlier) NULL; f(│); f <- function(later) NULL', ['earlier']],
+    ['f <- (function(method = c("new_value", "other")) NULL)\nf(meth = "new│")', ['new_value']],
+  ]) {
+    const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
+    const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
+    const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
+      { globalenv: { f: { type: 'closure' } } }, lines.slice(0, position.line), [], provider,
+      async () => [{ name: 'old_arg' }]);
+    assert.deepEqual(entries.filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '))
+      .map(item => item.label), expected, marked);
+  }
+});
+
+test("source-only pipe functions survive filtering and native-pipe parse recovery", { timeout: 90000 }, async t => {
+  const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const marked of [
+    'my_frob <- function(x) x\n1 %>% my_fr│',
+    'my_frob <- function(x) x\n1 |> my_fr│',
+    '{\n my_frob <- function(x) x\n 1 |> my_fr│',
+    '{\n my_frob <- function(x) x\n 1 |> my_fr│ }',
+    '{\n my_frob <- function(x) x\n 1 |> my_f│rob }',
+    'my_frob <- function(x) x\n1 |> my_fr│()',
+    'my_frob <- function(x) x\n"😀" |> my_fr│',
+    'my_frob <- function(x) x\n\t1 |> my_fr│',
+    'my_frob <- function(x) x\n1 |> │',
+  ]) {
+    const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
+    const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
+    const doc = { getText: () => text, uri: client.inputDocument.uri };
+    const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
+    const entries = await completion.collectCompletionEntries(context, doc, position, undefined,
+      lines.slice(0, position.line), [], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } });
+    assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
+    assert.equal([...client.syncedDocuments.values()].at(-1).document.getText(), text, 'repair stays out of the visible/LSP document');
+    assert.ok(instances.at(-1).requests.at(-1).params.position.character <= lines[position.line].length);
+  }
+});
+
+test("empty runtime values survive both session completion transports", async () => {
+  const { SessProxy } = loadSource('src/Runtime/VSCR/sess/sessProxy.ts');
+  const { SessionWatcher } = loadSource('src/Runtime/VSCR/legacy/sessionWatcher.ts');
+  const setup = 'choose <- function(mode = c("", "auto", "value:literal")) stop("body evaluated")\n';
+  const response = expression => runRJson(setup +
+    'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression);
+  const sess = Object.create(SessProxy.prototype);
+  sess.request = async (_method, params) => response(params.expr);
+  const legacy = Object.create(SessionWatcher.prototype);
+  legacy.postToSessionServer = async params => response(params.expr);
+  for (const transport of [sess, legacy]) {
+    const text = 'choose(mode = )';
+    const context = completion.getCompletionContext(text, text.length - 1);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { choose: { type: 'closure' } } }, [], [], undefined,
+      transport.requestMemberCompletions.bind(transport));
+    const values = entries.filter(item => item.detail === 'value for mode');
+    assert.deepEqual(values.map(item => item.insertText), ['""', '"auto"', '"value:literal"']);
+    assert.ok(completion.toCompletionPick(values[0], context).label.endsWith('""'), 'empty choice has a visible label');
+  }
+});

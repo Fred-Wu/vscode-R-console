@@ -27,7 +27,7 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
-import { getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./parser";
+import { getCompletionParseInsertion, getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./parser";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -311,6 +311,8 @@ export class ConsoleLspClient implements CompletionProvider {
           ? getEnclosingCall(text, contextOffset) : undefined;
         const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
         const parseSuffix = getCompletionParseSuffix(text);
+        const parseInsertion = parseSuffix !== undefined && pipe
+          ? getCompletionParseInsertion(text, contextOffset) : undefined;
         // Carry the parsed callable identity across the protocol. The R
         // server's line-local token lookup cannot see a name before a newline.
         // Member formals remain the responsibility of the active R session.
@@ -319,12 +321,16 @@ export class ConsoleLspClient implements CompletionProvider {
         const params = {
           ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
           ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
+          ...(parseInsertion ? { rConsoleParseInsertion: {
+            position: projection.document.positionAt(parseInsertion.offset), text: parseInsertion.text,
+          } } : {}),
           ...((call?.argumentTags || call?.argumentValue) && call.operator !== "$" && call.operator !== "@"
             ? { rConsoleCall: call.name } : {}),
           ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"
             ? { rConsoleArgumentTags: call.argumentTags } : {}),
           ...(call?.argumentValue && call.operator !== "$" && call.operator !== "@" ? {
             rConsoleArgument: call.argumentValue.name,
+            rConsoleValueTags: call.argumentValue.argumentTags,
             rConsolePrefix: call.argumentValue.prefix.slice(0,
               Math.max(0, projection.document.offsetAt(serverPosition) - call.argumentValue.replaceStart)),
           } : {}),

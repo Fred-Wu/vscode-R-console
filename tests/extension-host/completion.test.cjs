@@ -50,6 +50,14 @@ suite("Completion in the VS Code extension host", () => {
         const items = await complete(`{\n f <- ${definition} NULL\n f(`, session);
         assert.deepEqual(items.filter(item => item.detail === "parameter").map(item => item.insertText), expected);
       }
+      const wrapped = await complete('f <- (function(new_arg) NULL)\nf(', session);
+      assert.deepEqual(wrapped.filter(item => item.detail === "parameter").map(item => item.insertText), ['new_arg = ']);
+      const partial = await complete('stats::cor(met = "sp');
+      assert.ok(partial.some(item => item.insertText === 'spearman' && item.isCallable === false));
+      for (const operator of ['|>', '%>%']) {
+        const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
+        assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);
+      }
       const collator = new Intl.Collator("en", { sensitivity: "base" });
       for (const operator of ["::", ":::"]) {
         const items = await complete(`data.table${operator}`);
