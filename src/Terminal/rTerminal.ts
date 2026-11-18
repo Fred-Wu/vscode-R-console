@@ -649,6 +649,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.escPendingClear = false;
     this.expandForEdit();
     this.inputState.insertText(` ${this.pipeOperator} `);
+    this.scheduleInlineCompletion();
     this.renderInput();
   }
 
@@ -2102,8 +2103,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       input.text.slice(input.textBeforeCursor.length));
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    const qualified = context?.kind === "member" || context?.kind === "package";
-    if (typing && !this.inlineCompletionExplicit && !qualified && (!context || [...context.prefix].length < minimum)) {
+    if (context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
+        !context?.autoTrigger && (!context || [...context.prefix].length < minimum))) {
       this.dismissInlineCompletion(false);
       return;
     }
@@ -2183,7 +2184,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.lang.recordCompletion(nextInput, selectionStart, { ...selection, insertText });
     this.inputState.cursorPosition = nextCursor;
     this.inputState.preferredColumn = null;
-    if (cursorInsideEmptyCall) {
+    if (cursorInsideEmptyCall || / =\s*$/.test(selection.insertText)) {
       // Continue the completion the user accepted, even with no argument typed.
       this.inlineCompletionExplicit = true;
       this.scheduleInlineCompletion();

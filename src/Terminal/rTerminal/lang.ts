@@ -212,7 +212,7 @@ export class RTermLang {
           if (current.text !== latestInput.text || current.cursorRow !== latestInput.cursorRow ||
               current.cursorCol !== context.snapshotCursor) return;
           this.inlineCache = { input: latestInput, context, entries: results };
-          onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix), context));
+          onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix, context), context));
         };
         if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries);
         if (opensBeforeFullResults) {
@@ -241,7 +241,7 @@ export class RTermLang {
         return value;
       };
       const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
-        rankCompletionEntries(sourceEntries, searchValue(value));
+        rankCompletionEntries(sourceEntries, searchValue(value), context);
       const mergeCompletionEntries = (
         firstEntries: CompletionEntry[],
         secondEntries: CompletionEntry[]
@@ -496,7 +496,7 @@ export class RTermLang {
       return undefined;
     }
     const safeEntries = cached.entries.filter(entry => entry.replaceStart === undefined || entry.replaceStart === old.replaceStart);
-    return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix), context);
+    return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix, context), context);
   }
 
   cancelCompletion(): void {

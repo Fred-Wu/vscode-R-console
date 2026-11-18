@@ -27,7 +27,7 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
-import { getEnclosingCall } from "./parser";
+import { getEnclosingCall, getPipeCompletionContext } from "./parser";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -299,8 +299,11 @@ export class ConsoleLspClient implements CompletionProvider {
             };
         const serverPosition = projection.toServerPosition(position);
         const text = projection.document.getText();
+        const hasContext = text.includes("(") || text.includes("|>") || text.includes("%>%");
+        const contextOffset = hasContext ? projection.document.offsetAt(projection.toServerPosition(contextPosition)) : 0;
         const call = text.includes("(")
-          ? getEnclosingCall(text, projection.document.offsetAt(projection.toServerPosition(contextPosition))) : undefined;
+          ? getEnclosingCall(text, contextOffset) : undefined;
+        const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
         // Carry the parsed callable identity across the protocol. The R
         // server's line-local token lookup cannot see a name before a newline.
         // Member formals remain the responsibility of the active R session.
@@ -308,8 +311,15 @@ export class ConsoleLspClient implements CompletionProvider {
         // must still be determined at the user's original cursor.
         const params = {
           ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
-          ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"
+          ...((call?.argumentTags || call?.argumentValue) && call.operator !== "$" && call.operator !== "@"
             ? { rConsoleCall: call.name } : {}),
+          ...(call?.argumentValue && call.operator !== "$" && call.operator !== "@" ? {
+            rConsoleArgument: call.argumentValue.name,
+            rConsolePrefix: call.argumentValue.prefix.slice(0,
+              Math.max(0, projection.document.offsetAt(serverPosition) - call.argumentValue.replaceStart)),
+          } : {}),
+          ...(pipe ? { rConsolePipe: true, rConsolePrefix: pipe.prefix.slice(0,
+            Math.max(0, projection.document.offsetAt(serverPosition) - pipe.replaceStart)) } : {}),
         };
         const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client) {

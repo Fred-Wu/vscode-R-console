@@ -175,7 +175,7 @@ test("member value completion keeps variables but never requests or inserts para
             { label: "first", insertText: "first = ", kind: 5, detail: "parameter" },
           ],
         }, async () => { requests++; return [{ name: "first" }]; });
-      assert.equal(requests, 0, input);
+      assert.equal(requests, context.argumentValue ? 1 : 0, input);
       assert.ok(entries.some(entry => entry.insertText === "first_value"), input);
       assert.ok(entries.every(entry => entry.detail !== "parameter" && !entry.insertText.endsWith(" = ")), input);
     }
@@ -234,7 +234,7 @@ test("completion recognizes member, namespace, argument, and bracket contexts", 
 
 test("cached column completions work without LSP and quote non-syntactic names", async () => {
   const workspace = { search: [], loaded_namespaces: [], globalenv: { df: { names: ["a b", "alpha"] } } };
-  for (const [input, expected] of [["df[", "`a b`"], ["df[[", '"a b"'], ['df[["', "a b"]]) {
+  for (const [input, expected] of [["df[", '"a b"'], ["df[[", '"a b"'], ['df[["', "a b"]]) {
     const context = completion.getCompletionContext(input, input.length);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined, workspace, []);
     assert.equal(entries.find((entry) => entry.label === "a b").insertText, expected);
@@ -1374,7 +1374,7 @@ test("empty namespace suggestions are alphabetical instead of following provider
   }
 });
 
-test("alphabetical sorting stays inside completion groups and preserves their priority", () => {
+test("symbol groups are alphabetical while arguments retain signature order and group priority", () => {
   const context = completion.getCompletionContext("fun(", 4);
   const entries = [
     { label: "zeta", detail: "parameter", source: "lsp", kind: 5 },
@@ -1385,10 +1385,54 @@ test("alphabetical sorting stays inside completion groups and preserves their pr
     { label: "avar", source: "session", kind: 5 },
   ].map(entry => Object.freeze({ ...entry, insertText: entry.label }));
   const picks = completion.toCompletionQuickPickItems(
-    completion.rankCompletionEntries(Object.freeze(entries), ""), context);
+    completion.rankCompletionEntries(Object.freeze(entries), "", context), context);
   assert.deepEqual(picks.map(item => item.insertText ?? item.label), [
-    "Arguments", "alpha", "zeta", "Runtime Variables", "avar", "zvar", "Functions", "afun", "zfun",
+    "Arguments", "zeta", "alpha", "Runtime Variables", "avar", "zvar", "Functions", "afun", "zfun",
   ]);
+});
+
+test("argument and known-value filtering preserves declaration order", () => {
+  for (const detail of ["parameter", "value for method"]) {
+    const entries = ["zebra", "alpha", "beta"].map(label =>
+      Object.freeze({ label, insertText: label, source: "lsp", detail }));
+    const context = completion.getCompletionContext("fun(", 4);
+    for (const query of ["", "a", "b"]) {
+      assert.deepEqual(completion.rankCompletionEntries(Object.freeze(entries), query, context).map(e => e.label),
+        query === "b" ? ["zebra", "beta"] : ["zebra", "alpha", "beta"]);
+    }
+  }
+});
+
+test("data contexts retain column order while ordinary symbols remain alphabetical", async () => {
+  const names = ["zebra", "alpha", "beta"];
+  for (const input of ["df[", "df[[", "df[, ", "subset(df, ", "df |> subset("]) {
+    const context = completion.getCompletionContext(input, input.length, input);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { df: { names }, zvar: {}, avar: {} } }, []);
+    for (const query of ["", "a", "b"]) {
+      const ranked = completion.rankCompletionEntries(entries, query, context);
+      assert.deepEqual(ranked.filter(e => e.kind === 4).map(e => e.label),
+        query === "b" ? ["zebra", "beta"] : names, input);
+      const variables = ranked.filter(e => e.detail === "session").map(e => e.label);
+      assert.deepEqual(variables, [...variables].sort(), input);
+    }
+    assert.deepEqual(entries.filter(e => e.kind === 4).map(e => e.label), names);
+  }
+});
+
+test("dollar and slot members retain source order including callable members", async () => {
+  for (const operator of ["$", "@"]) {
+    const input = `obj${operator}`;
+    const context = completion.getCompletionContext(input, input.length);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
+      undefined, async () => [
+        { name: "zebra", type: "closure" }, { name: "alpha", type: "double" }, { name: "beta", type: "closure" },
+      ]);
+    for (const query of ["", "a", "b"]) {
+      assert.deepEqual(completion.rankCompletionEntries(entries, query, context).map(e => e.label),
+        query === "b" ? ["zebra", "beta"] : ["zebra", "alpha", "beta"]);
+    }
+  }
 });
 
 test("equal-quality matches use alphabetical order independently of provider order", () => {
@@ -1474,6 +1518,53 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
     getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries() {} });
   assert.equal(lang.refineInlineCompletion(snapshot("obj$fun(TRUE")), undefined,
     "a literal cannot reuse cached argument-name candidates");
+});
+
+test("inline refresh, cached filtering and Quick Pick preserve semantic order", async () => {
+  for (const text of ["df$", "obj@", "df[[", "df[, ", "subset(df, ", "df |> subset(",
+    "fun(", "fun(method = ", "pkg::", "pkg:::"]) {
+    let changeValue, hide;
+    const pick = { items: [], value: "", onDidChangeValue: listener => { changeValue = listener; },
+      onDidAccept() {}, onDidHide: listener => { hide = listener; },
+      show() {}, hide() { hide?.(); }, dispose() {} };
+    const entries = ["zebra", "alpha", "beta"].map(label => ({ label, insertText: label,
+      source: "session", kind: 4,
+      detail: text === "fun(" ? "parameter" : text === "fun(method = " ? "value for method" : "df" }));
+    const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+      vscode: { Position, window: { createQuickPick: () => pick } },
+      "../../Language/completion": { ...completion, needsLanguageServerCompletion: () => false,
+        collectCompletionEntries: async () => entries },
+      "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+      "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+    });
+    const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+    const snapshot = value => ({ text: value, currentLine: value, lines: [value], cursorRow: 0,
+      cursorCol: value.length, textBeforeCursor: value });
+    const input = snapshot(text);
+    const request = { input, getCurrentInput: () => input, getWorkspaceData: () => undefined, applyCompletion() {} };
+    const labels = items => items.filter(item => "insertText" in item).map(item => item.insertText);
+    const ordered = text.startsWith("pkg:") ? ["alpha", "beta", "zebra"] : ["zebra", "alpha", "beta"];
+    let published;
+    await lang.handleAutocomplete({ ...request, onInlineEntries: items => { published = items; } });
+    assert.deepEqual(labels(published), ordered, `inline: ${text}`);
+    assert.deepEqual(labels(lang.refineInlineCompletion(snapshot(text + "b"))), ordered.filter(label => label.includes("b")),
+      `cache: ${text}`);
+    const showing = lang.handleAutocomplete(request);
+    await new Promise(resolve => setImmediate(resolve));
+    try {
+      assert.equal(pick.sortByLabel, false);
+      assert.deepEqual(labels(pick.items), ordered, `Quick Pick: ${text}`);
+      pick.value = "b";
+      changeValue("b");
+      // Check both the immediate local filter and any asynchronous refresh.
+      assert.deepEqual(labels(pick.items), ordered.filter(label => label.includes("b")), text);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(labels(pick.items), ordered.filter(label => label.includes("b")), text);
+    } finally {
+      pick.hide();
+      await showing;
+    }
+  }
 });
 
 test("function argument completion awaits parameters before offering runtime variables", async () => {

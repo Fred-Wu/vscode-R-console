@@ -42,7 +42,12 @@ test("typing and accepting functions opens real argument suggestions without ano
   });
   const requestMemberCompletions = async (expression, operator) => JSON.parse(execFileSync(
     "Rscript", ["--vanilla", "-e", `
-      obj <- list(lm = function(member_arg) stop("must not execute"))
+      df <- data.frame(zebra = 0, alpha = 1, beta = 2, check.names = FALSE)
+      df[["a b"]] <- 2
+      obj <- list(lm = function(member_arg) stop("must not execute"), data = df,
+        choose = function(method = c("zebra", "alpha", "beta"), other = c("wrong_value")) stop("must not execute"))
+      nested <- list(df)
+      dt <- data.table::as.data.table(df)
       methods::setClass("InlineCompletionTest", slots = c(lm = "function"))
       slot_obj <- methods::new("InlineCompletionTest", lm = function(slot_arg) stop("must not execute"))
       value <- eval(parse(text = commandArgs(TRUE)[1]), .GlobalEnv)
@@ -81,6 +86,10 @@ test("typing and accepting functions opens real argument suggestions without ano
     assert.equal(terminal.inputState.textBeforeCursor, expected.slice(0, -1));
     assert.equal(terminal.submitted, undefined);
     await waitFor(() => choices().some(item => item.insertText === `${argument} = `), `argument popup after ${expected}`);
+    if (typed === "stats::" || typed === "stats:::") {
+      assert.deepEqual(choices().filter(item => item.detail === "parameter").slice(0, 4).map(item => item.insertText),
+        ["formula = ", "data = ", "subset = ", "weights = "], "lm arguments must retain signature order in the popup");
+    }
     assert.equal(terminal.inputState.text, expected, "argument popup must not insert or execute anything");
     const buffer = screen.buffer.active;
     const visible = Array.from({ length: 24 }, (_, row) => buffer.getLine(buffer.baseY + row).translateToString(true)).join("\n");
@@ -88,6 +97,96 @@ test("typing and accepting functions opens real argument suggestions without ano
     terminal.dismissInlineCompletion(false);
     terminal.lang.cancelCompletion();
   }
+
+  // Use the real provider, context collection, keyboard handling and renderer
+  // for each trigger. No completion candidate is injected into the panel.
+  for (const [marked, inserted, expected] of [
+    ["df[│]", '"alpha"', 'df["alpha"]'],
+    ["df[, │]", '"alpha"', 'df[, "alpha"]'],
+    ["df[[│]]", '"alpha"', 'df[["alpha"]]'],
+    ['df[["│"]]', "a b", 'df[["a b"]]'],
+    ["df[['│']]", "a b", "df[['a b']]"],
+    ['df[, "│"]', "a b", 'df[, "a b"]'],
+    ["df$│", "alpha", "df$alpha"],
+    ["obj$data[[│]]", '"alpha"', 'obj$data[["alpha"]]'],
+    ["nested[[1]][[│]]", '"alpha"', 'nested[[1]][["alpha"]]'],
+    ["dt[, │]", "alpha", "dt[, alpha]"],
+    ["dt[, │]", "`a b`", "dt[, `a b`]"],
+    ["dt[[│]]", '"alpha"', 'dt[["alpha"]]'],
+    ["outer(df[[\n  │]])", '"alpha"', 'outer(df[[\n  "alpha"]])'],
+    ["library(│)", "package = ", "library(package = )"],
+    ["stats::cor(x, │)", "method = ", "stats::cor(x, method = )"],
+    ["stats::cor(\n  x, │)", "method = ", "stats::cor(\n  x, method = )"],
+    ["stats::cor(method = │)", '"spearman"', 'stats::cor(method = "spearman")'],
+    ['stats::cor(method = "│")', "spearman", 'stats::cor(method = "spearman")'],
+    ["stats::cor(method = '│')", "spearman", "stats::cor(method = 'spearman')"],
+    ["stats::cor(method = sp│)", '"spearman"', 'stats::cor(method = "spearman")'],
+    ['stats::cor(`method` = "│")', "spearman", 'stats::cor(`method` = "spearman")'],
+    ["obj$choose(method = │)", '"alpha"', 'obj$choose(method = "alpha")'],
+    ["subset(df, │)", "alpha", "subset(df, alpha)"],
+    ["df |> subset(│)", "alpha", "df |> subset(alpha)"],
+    ["df |> │", undefined, undefined], ["df %>% │", undefined, undefined],
+  ]) {
+    client.updateInput("");
+    const { terminal } = createTerminal(t);
+    delete terminal.applyCompletion;
+    terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+    const cursor = marked.indexOf("│");
+    terminal.inputState.insertText(marked.replace("│", ""));
+    terminal.inputState.cursorPosition = cursor;
+    // Typing a separator exercises the ordinary edit-to-popup path.
+    const quoted = /["']$/.test(marked.slice(0, cursor));
+    const prefix = marked.slice(0, cursor).endsWith("sp");
+    if (quoted || prefix) {
+      terminal.inputState.deleteBeforeCursor();
+      terminal.applyKeyAction({ type: "text", text: marked[cursor - 1] });
+    } else {
+      terminal.applyKeyAction({ type: "text", text: " " });
+    }
+    const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
+    await waitFor(() => inserted ? choices().some(item => item.insertText === inserted) : choices().length > 0,
+      `automatic real-provider suggestions for ${marked}`);
+    if (/^(df(?:\[|\$)|dt\[|obj\$data\[|nested\[|outer\(df\[|subset\(df,|df \|> subset\()/.test(marked)) {
+      assert.deepEqual(choices().filter(item => / (zebra|alpha|beta|a b)$/.test(item.label)).map(item => item.label.replace(/^\$\([^)]+\) /, "")),
+        ["zebra", "alpha", "beta", "a b"], `column order: ${marked}`);
+    }
+    if (marked === "obj$choose(method = │)") {
+      assert.deepEqual(choices().filter(item => item.detail === "value for method").map(item => item.insertText),
+        ['"zebra"', '"alpha"', '"beta"'], "declared value order");
+    }
+    if (marked.includes("method =")) {
+      assert.ok(choices().every(item => !item.insertText.endsWith(" = ")), marked);
+      assert.ok(choices().every(item => !item.insertText.includes("wrong_value")), marked);
+    }
+    if (inserted) {
+      terminal.inlineCompletion.move(choices().findIndex(item => item.insertText === inserted) - terminal.inlineCompletion.selected);
+      terminal.applyKeyAction({ type: "tab" });
+      // Keep the separator typed above; quote prefixes need no extra space.
+      const accepted = quoted || prefix ? expected : expected.slice(0, cursor) + " " + expected.slice(cursor);
+      assert.equal(terminal.inputState.text, accepted, marked);
+      if (marked === "stats::cor(x, │)") {
+        await waitFor(() => choices().some(item => item.insertText === '"pearson"'),
+          "accepting method = must automatically open known values");
+      }
+    } else {
+      assert.ok(choices().every(item => item.insertText.endsWith("()")), marked);
+    }
+    terminal.dismissInlineCompletion(false);
+    terminal.lang.cancelCompletion();
+  }
+
+  client.updateInput("");
+  const { terminal: piped } = createTerminal(t);
+  delete piped.applyCompletion;
+  piped.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+  piped.applyKeyAction({ type: "text", text: '"file.csv" |> rdcsv' });
+  const pipeChoices = () => piped.inlineCompletion.items.filter(item => "insertText" in item);
+  await waitFor(() => pipeChoices().some(item => item.insertText === "read.csv()"), "fuzzy pipe function completion");
+  piped.inlineCompletion.move(pipeChoices().findIndex(item => item.insertText === "read.csv()") - piped.inlineCompletion.selected);
+  piped.applyKeyAction({ type: "tab" });
+  assert.equal(piped.inputState.textBeforeCursor, '"file.csv" |> read.csv(');
+  await waitFor(() => pipeChoices().some(item => item.detail === "parameter"), "arguments after accepting a piped function");
+  piped.dismissInlineCompletion(false);
 });
 
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {
@@ -250,7 +349,11 @@ test("fuzzy fallback does not turn values, comments or member calls into LSP arg
     const requests = instances.at(-1).requests.filter(request => request.params?.position).slice(-2);
     assert.equal(requests[0].params.position.character, column, input);
     assert.equal(requests[1].params.position.character, column - 2, input);
-    assert.ok(requests.every(request => request.params.rConsoleCall === undefined), input);
+    if (tail.startsWith("method =")) {
+      assert.ok(requests.every(request => request.params.rConsoleCall === head && request.params.rConsoleArgument === "method"), input);
+    } else {
+      assert.ok(requests.every(request => request.params.rConsoleCall === undefined), input);
+    }
     assert.ok(entries.every(entry => entry.detail !== "parameter"), input);
   }
 });

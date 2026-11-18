@@ -259,19 +259,25 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     call <- console_call_identity(params$rConsoleCall)
     if (!is.null(call)) {
         detected <- document$detect_call(point)
-        if (!identical(call$token, detected$token) ||
+        value_mode <- is.character(params$rConsoleArgument) && length(params$rConsoleArgument) == 1L
+        if (value_mode || !identical(call$token, detected$token) ||
             !identical(call$package, detected$package) ||
             !identical(call$accessor, detected$accessor)) {
             # Resolve parameters with the same workspace/provider as ordinary
             # completion, using the lexer-selected head without rewriting code
             # or evaluating the user's function or argument expressions.
-            token <- document$detect_token(point, forward = FALSE)$token
+            token <- if (value_mode) params$rConsolePrefix else document$detect_token(point, forward = FALSE)$token
             arguments <- c(
-                languageserver:::arg_completion(uri, workspace, point, token, call$token,
+                if (!value_mode) languageserver:::arg_completion(uri, workspace, point, token, call$token,
                     call$package, exported_only = call$accessor != ":::"),
                 languageserver:::arg_value_completion(uri, workspace, document, point, token,
                     call$token, call$package, exported_only = call$accessor != ":::")
             )
+            if (value_mode) {
+                tag <- tryCatch(parse(text = params$rConsoleArgument)[[1L]], error = function(e) NULL)
+                name <- if (is.symbol(tag) || is.character(tag)) as.character(tag) else ""
+                arguments <- Filter(function(item) identical(item$detail, paste0("value for ", name)), arguments)
+            }
             other <- Filter(function(item) !(identical(item$detail, "parameter") ||
                 (is.character(item$detail) && startsWith(item$detail, "value for "))), reply$result$items)
             items <- c(arguments, other)
@@ -279,6 +285,18 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
             reply$result$items <- head(items, nmax)
             reply$result$isIncomplete <- isTRUE(reply$result$isIncomplete) || length(items) > nmax
         }
+    }
+    if (isTRUE(params$rConsolePipe)) {
+        token <- params$rConsolePrefix
+        nmax <- languageserver:::lsp_settings$get("max_completions")
+        scope <- languageserver:::scope_completion(uri, workspace, token, point, TRUE, nmax)
+        symbols <- languageserver:::workspace_completion(workspace, token, snippet_support = TRUE, limit = nmax, uri = uri)
+        candidates <- c(scope, symbols)
+        functions <- Filter(function(item) identical(item$kind, languageserver:::CompletionItemKind$Function), candidates)
+        reply$result$items <- head(functions, nmax)
+        reply$result$isIncomplete <- length(functions) > nmax || isTRUE(attr(scope, "truncated")) ||
+            isTRUE(attr(symbols, "truncated")) ||
+            isTRUE(reply$result$isIncomplete)
     }
     record_cached_package_fingerprints(workspace)
     self$deliver(reply)

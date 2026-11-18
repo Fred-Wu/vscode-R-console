@@ -488,6 +488,72 @@ completion_slot <- methods::new("CompletionExample", lm = function(slot_arg) NUL
   mode, Escape after accepting the function must cancel argument suggestions,
   including delayed results.
 
+### Automatic Completion Cases
+
+Settings: `completionUI = inline`, `inlineCompletion.trigger = typing`,
+`inlineCompletion.minCharacters = 3`, `autoMatch = true`.
+`│` marks the cursor; `↵` means a newline. Do not type these markers.
+
+```{r automatic-completion-setup}
+popup_df <- data.frame(alpha = 1:3, beta = 4:6)
+popup_df[["a b"]] <- 7:9
+popup_obj <- list(data = popup_df,
+                 choose = function(method = c("alpha", "beta"), other = "wrong_value") NULL)
+popup_nested <- list(popup_df)
+if (requireNamespace("data.table", quietly = TRUE)) {
+  popup_dt <- data.table::as.data.table(popup_df)
+}
+```
+
+| Test | Expected behavior |
+| --- | --- |
+| Type `lib`, accept `library()` | Insert `library(│)`; argument suggestions open without another keypress. |
+| Type `stats::│` | Exported package members appear automatically. |
+| Type `stats:::│` | Package members, including internal functions, appear automatically. |
+| Accept `lm()` from either namespace list | Insert one pair of parentheses; place the cursor inside; offer `formula`, `data`, and other arguments. |
+| Type `completion_obj$│` | Show `lm` and `field`; accepting `lm` inserts `lm(│)` and offers `member_arg` and `optional`. |
+| Type `completion_slot@│` | Show `lm`; accepting it inserts `lm(│)` and offers `slot_arg`. |
+| Accept `field` from `completion_obj$│` | Insert `field` without parentheses. |
+| Complete `completion_obj$l│(123)` | Preserve `(123)`; place the cursor immediately after `(`; no duplicate parentheses. |
+| Type `popup_df[│]` | Names appear automatically; accepting `alpha` produces `popup_df["alpha"]`. |
+| Type `popup_df[, │]` | Column names appear automatically; accepting `alpha` produces `popup_df[, "alpha"]`. |
+| Type `popup_df[[│]]` | Element names appear automatically; accepting `alpha` produces `popup_df[["alpha"]]`. |
+| Type `popup_df[["│"]]` or `popup_df[['│']]` | Show names including `a b`; insert inside the existing quotes without duplicating them. |
+| Type `popup_df[, "│"]` | Column names appear; accepting `a b` produces `popup_df[, "a b"]`. |
+| Type `popup_obj$data[[│]]` | Show names from `popup_obj$data`, including `alpha`, `beta`, and `a b`. |
+| Type `popup_nested[[1]][[│]]` | Show names from the first nested object; accepting `alpha` inserts `"alpha"`. |
+| Type `popup_obj$data[[↵  │]]` | Names appear on the continuation line; accepting one preserves the newline and brackets. |
+| With `data.table` installed, type `popup_dt[, │]` | Show columns; accepting `alpha` inserts bare `alpha`; accepting `a b` inserts a backtick-quoted name. |
+| With `data.table` installed, type `popup_dt[[│]]` | Accepting `alpha` inserts `"alpha"`, not a bare symbol. |
+| Manually type `library(│)` | Arguments appear without first accepting a function completion. |
+| Manually type `stats::cor(x, │)` | Arguments appear for the new position, including `method`. |
+| Manually type `stats::cor(↵  x, │)` | Arguments appear on the continuation line. |
+| Type `stats::cor(method = │)` | Offer `pearson`, `kendall`, and `spearman`; accepting a value inserts a quoted string, not another argument name. |
+| Type `stats::cor(method = "│")` or `stats::cor(method = '│')` | Offer known values; preserve the existing quotes when accepting one. |
+| Type `stats::cor(method = sp│)` | Offer `spearman`; accepting it replaces `sp` with `"spearman"`. |
+| Accept `method = ` from `stats::cor(x, │)` | Known values appear automatically without another keypress. |
+| Type `popup_obj$choose(method = │)` | Offer `alpha` and `beta`; do not offer `wrong_value` from `other`. |
+| Type `subset(popup_df, │)` | Show columns alongside applicable function arguments. |
+| Type `popup_df \|> subset(│)` | Show columns alongside applicable function arguments. |
+| Type `popup_df \|> │` or `popup_df %>% │` | Function suggestions appear automatically. |
+| Run **Insert Pipe Operator** after `popup_df` | Insert the configured pipe and open function suggestions. |
+| Type `"file.csv" \|> rdcsv`, accept `read.csv()` | Insert `read.csv(│)` after the pipe and automatically show arguments. |
+| Type the first one or two characters in an open contextual list | Keep the list open and filter candidates below the ordinary three-character threshold. |
+| Type bare `li`, then `lib` | No automatic list for `li`; suggestions appear at `lib`. |
+| Open `stats::│`, or `data.table::│` when installed | Suggestions are alphabetical within each group; group order is preserved. |
+| Open `stats::lm(│)` | Arguments start with `formula`, `data`, `subset`, `weights`, in signature order. |
+| Run `order_df <- data.frame(zebra = 1, alpha = 2, beta = 3)`; open `order_df$│`, `order_df[│]`, `order_df[[│]]`, or `order_df[, │]` | Columns remain `zebra`, `alpha`, `beta`, in object order. |
+| Open `subset(order_df, │)` or `order_df \|> subset(│)` | Columns retain object order; function arguments retain signature order. |
+| Type `b` in any of those column lists | Matching columns remain `zebra`, `beta`, in object order. |
+| Run `order_obj <- list(choose = function(method = c("zebra", "alpha", "beta")) NULL)`; open `order_obj$choose(method = │)` | Values remain `zebra`, `alpha`, `beta`, in declared order. |
+| Press Escape immediately after a trigger, then wait | Cancel the pending request; no delayed pop-up. |
+| Press Escape after a list appears | Close it; late results do not reopen it. |
+| Type `# popup_df[[│`, `"popup_df[[│`, or `fun("abc│` | No automatic pop-up inside comments or unrelated strings. |
+| Type `(│)`, `if (│)`, `x <- │`, or `fun(x = 1 + │)` | No empty-prefix contextual pop-up. |
+| Move the cursor into brackets or recall an input from history | No automatic pop-up from navigation alone. |
+| Repeat the trigger cases with `inlineCompletion.trigger = tab` | No automatic pop-ups; Tab requests suggestions. Function and parameter acceptance wait for another Tab before follow-up suggestions. |
+| Repeat with `completionUI = quickPick` | No inline pop-ups; explicit completion opens Quick Pick. |
+
 For inline completion, also check:
 
 - Type `rdcsv` and `utils::rdcsv`: `read.csv` should be offered and inserted correctly.
@@ -501,7 +567,7 @@ For inline completion, also check:
   remains for one candidate and the footer. Only the selected item's details
   should appear when the panel has room for them.
 - Set `r.console.inlineCompletion.minCharacters` to `3` in inline/typing mode.
-  `df_test$al` should not open automatically; `df_test$alp` should. Tab should
+  Bare `li` should not open automatically; `lib` should. Tab should
   still open suggestions below the threshold. Manual mode and Quick Pick should
   be unaffected. The default is `3`; `1` starts at the first typed character.
 - Disable `r.console.inlineCompletion.acceptOnEnter`: Enter should submit the

@@ -100,7 +100,123 @@ export type CallCompletionContext = {
   // R source tags; "" denotes a positional argument and null the cursor's slot. Undefined
   // means the cursor is in a value, comment, or another non-name position.
   argumentTags?: (string | null)[];
+  argumentValue?: { name: string; prefix: string; replaceStart: number; quote?: "\"" | "'" };
 };
+
+export type BracketCompletionContext = {
+  objectName: string;
+  operator: "[" | "[[";
+  prefix: string;
+  replaceStart: number;
+  quote?: "\"" | "'";
+  dimension: number;
+  dimensions: number;
+};
+
+/** Literal indices can be inspected without running index expressions. */
+function hasOnlyLiteralSubscripts(code: string): boolean {
+  let depth = 0;
+  for (const token of tokenize(code)) {
+    if (token.type === TokenType.LeftBracket) depth += token.value.length;
+    else if (token.type === TokenType.RightBracket) depth -= token.value.length;
+    else if (depth && token.type !== TokenType.Number && token.type !== TokenType.String &&
+      token.type !== TokenType.RawString && token.type !== TokenType.Comma && token.type !== TokenType.Newline) return false;
+  }
+  return depth === 0;
+}
+
+export function isCompletionInLiteral(code: string, cursor = code.length): boolean {
+  if (!/["'`#]/.test(code)) return false;
+  return tokenize(code).some(token => token.position < cursor &&
+    (cursor < token.position + token.value.length ||
+      (cursor === token.position + token.value.length && (token.closed === false || token.type === TokenType.Comment))) &&
+    (token.type === TokenType.Comment || token.type === TokenType.String || token.type === TokenType.RawString ||
+      (token.type === TokenType.Identifier && token.value.startsWith("`"))));
+}
+
+function completionPrefix(tokens: Token[], start: number, end: number, cursor: number):
+  { prefix: string; replaceStart: number; quote?: "\"" | "'" } | undefined {
+  const before = tokens.slice(start, end).filter(token => token.position < cursor);
+  if (!before.length) return start === end ? { prefix: "", replaceStart: cursor } : undefined;
+  if (before.length !== 1) return undefined;
+  const token = before[0];
+  if (token.type === TokenType.Identifier && !token.value.startsWith("`") && token.value !== "..." &&
+      token.position + token.value.length === cursor) {
+    return { prefix: token.value, replaceStart: token.position };
+  }
+  if (token.type === TokenType.String && (cursor < token.position + token.value.length || token.closed === false)) {
+    const prefix = token.value.slice(1, cursor - token.position).replace(/\\([\\"'nrt])/g,
+      (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
+    return { prefix, replaceStart: token.position + 1, quote: token.value[0] as "\"" | "'" };
+  }
+  return undefined;
+}
+
+/** Find the active subscript slot using tokens, including closing brackets after the caret. */
+export function getBracketCompletionContext(code: string, cursor = code.length): BracketCompletionContext | undefined {
+  if (!code.includes("[")) return undefined;
+  const tokens = tokenize(code).filter(token => token.type !== TokenType.Newline &&
+    token.type !== TokenType.Comment && token.type !== TokenType.EOF);
+  const stack: { opening: string; index: number }[] = [];
+  for (let index = 0; index < tokens.length && tokens[index].position < cursor; index++) {
+    const token = tokens[index];
+    if ([TokenType.LeftBracket, TokenType.LeftParen, TokenType.LeftBrace].includes(token.type)) {
+      for (const opening of token.value) stack.push({ opening, index });
+    } else if ([TokenType.RightBracket, TokenType.RightParen, TokenType.RightBrace].includes(token.type)) {
+      for (const closing of token.value) {
+        if (stack.pop()?.opening !== ({ "]": "[", ")": "(", "}": "{" }[closing])) return undefined;
+      }
+    }
+  }
+  const frame = stack.at(-1);
+  if (frame?.opening !== "[") return undefined;
+  const opening = tokens[frame.index];
+  const head = code.slice(0, opening.position);
+  // Reuse member-object detection; the synthetic accessor is never evaluated.
+  const object = getQualifiedCompletionContext(head + "$");
+  if (!object || !hasOnlyLiteralSubscripts(object.objectName)) return undefined;
+  let slotStart = frame.index + 1;
+  let slotOffset = opening.position + opening.value.length;
+  let dimension = 0;
+  let dimensions = 1;
+  let selected: ReturnType<typeof completionPrefix>;
+  const nested: string[] = [];
+  for (let index = slotStart; index <= tokens.length; index++) {
+    const token = tokens[index];
+    const closes = !token || (!nested.length && token.type === TokenType.RightBracket);
+    if (closes || (!nested.length && token.type === TokenType.Comma)) {
+      if (slotOffset <= cursor && cursor <= (token?.position ?? code.length)) {
+        selected = completionPrefix(tokens, slotStart, index, cursor);
+        dimension = dimensions - 1;
+      }
+      if (closes) break;
+      dimensions++;
+      slotStart = index + 1;
+      slotOffset = token.position + 1;
+    } else if ([TokenType.LeftBracket, TokenType.LeftParen, TokenType.LeftBrace].includes(token.type)) {
+      nested.push(...token.value);
+    } else if ([TokenType.RightBracket, TokenType.RightParen, TokenType.RightBrace].includes(token.type)) {
+      for (const closing of token.value) {
+        if (nested.pop() !== ({ "]": "[", ")": "(", "}": "{" }[closing])) return undefined;
+      }
+    }
+  }
+  if (!selected || (isCompletionInLiteral(code, cursor) && !selected.quote)) return undefined;
+  return { objectName: object.objectName, operator: opening.value as "[" | "[[", ...selected, dimension, dimensions };
+}
+
+export function getPipeCompletionContext(code: string): { prefix: string; replaceStart: number } | undefined {
+  if (!code.includes("|>") && !code.includes("%>%")) return undefined;
+  const all = tokenize(code);
+  if (all.some(token => token.type === TokenType.Comment && token.position + token.value.length === code.length)) return undefined;
+  const tokens = all.filter(token => token.type !== TokenType.Newline && token.type !== TokenType.EOF && token.type !== TokenType.Comment);
+  const last = tokens.at(-1);
+  const hasPrefix = last?.type === TokenType.Identifier && !last.value.startsWith("`") &&
+    last.position + last.value.length === code.length;
+  const pipe = tokens.at(hasPrefix ? -2 : -1);
+  if (pipe?.type !== TokenType.Operator || (pipe.value !== "|>" && pipe.value !== "%>%")) return undefined;
+  return { prefix: hasPrefix ? last.value : "", replaceStart: hasPrefix ? last.position : code.length };
+}
 
 function continuesExpressionLine(lineBreak: boolean, parent: string | undefined, previous?: Token): boolean {
   return !lineBreak || parent === "(" || parent === "[" || previous?.type === TokenType.Operator;
@@ -318,6 +434,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
   const piped = pipe === "|>" || pipe === "%>%";
   let hasPipePlaceholder = false;
   let namePosition = false;
+  let argumentValue: CallCompletionContext["argumentValue"];
   let hasDots = false;
   let argumentStart = frame.index + 1;
   let argumentOffset = tokens[frame.index].position + 1;
@@ -330,6 +447,10 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
     const valueStart = argumentStart + (named ? 2 : 0);
     if (argumentOffset <= cursor && cursor <= endOffset) {
       argumentTags.push(null);
+      if (named && cursor >= second.position + 1) {
+        const value = completionPrefix(tokens, valueStart, end, cursor);
+        if (value) argumentValue = { name: first.value, ...value };
+      }
       namePosition = argumentStart === end || (
         argumentStart + 1 === end && first.type === TokenType.Identifier &&
         !first.value.startsWith("`") && first.value !== "..." &&
@@ -372,6 +493,7 @@ export function getEnclosingCall(code: string, cursor = code.length): CallComple
     name: tokens.slice(start, frame.index).map(token => token.value).join(""),
     operator,
     argumentTags: namePosition && !inComment && !hasDots ? argumentTags : undefined,
+    ...(argumentValue && !inComment ? { argumentValue } : {}),
   };
 }
 
@@ -714,7 +836,7 @@ function parseString(code: string, pos: number, quote: string): { token: Token; 
     if (ch === quote) {
       pos += 1;
       return {
-        token: { type: TokenType.String, value: code.slice(start, pos), position: start },
+        token: { type: TokenType.String, value: code.slice(start, pos), position: start, closed: true },
         newPos: pos,
       };
     }
@@ -726,7 +848,7 @@ function parseString(code: string, pos: number, quote: string): { token: Token; 
   }
 
   return {
-    token: { type: TokenType.String, value: code.slice(start, pos), position: start },
+    token: { type: TokenType.String, value: code.slice(start, pos), position: start, closed: false },
     newPos: pos,
   };
 }
