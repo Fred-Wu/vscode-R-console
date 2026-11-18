@@ -81,7 +81,7 @@ The package test inspects the generated VSIX for the current platform.
 
 CI runs on every pull request and pushes to `main` and `dev` on Linux, Windows,
 and macOS. Releases must pass the same workflow before packaging or publishing.
-The separate runtime build workflow retains checks for all six target platforms.
+The runtime build workflow checks all six target platforms when relevant files change in pull requests or pushes to `main` and `dev`.
 Native graphics, interactive VS Code UI behavior, and external package integrations
 remain covered by the manual checklist.
 

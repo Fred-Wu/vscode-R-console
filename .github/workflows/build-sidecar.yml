@@ -4,6 +4,8 @@ on:
   workflow_call:
   workflow_dispatch:
   push:
+    # Feature branches are checked by pull_request; releases build in release.yml.
+    branches: [main, dev]
     paths:
       - "sidecar/pty-host/**"
       - "package.json"
