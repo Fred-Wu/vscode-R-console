@@ -49,13 +49,14 @@ test("newly cached namespaces are fingerprinted before completion is returned", 
     path.join(__dirname, "../../resources/r/console-language-server.R"),
     "utf8"
   );
-  const start = script.indexOf('server$request_handlers[["textDocument/completion"]]');
-  const end = script.indexOf('server$request_handlers[["rConsole/syncSessionState"]]', start);
+  const adapter = fs.readFileSync(path.join(__dirname, "../../resources/r/completion-provider.R"), "utf8");
+  const start = adapter.indexOf('server$request_handlers[["textDocument/completion"]]');
+  const end = adapter.length;
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
-  const handler = script.slice(start, end);
+  const handler = adapter.slice(start, end);
 
-  const reply = handler.indexOf("languageserver:::completion_reply");
+  const reply = handler.indexOf("console_supplement_completion(reply, self, params)");
   const record = handler.indexOf("record_cached_package_fingerprints(workspace)");
   const deliver = handler.indexOf("self$deliver(reply)");
   assert.ok(reply >= 0);

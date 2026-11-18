@@ -9,18 +9,20 @@ suite("Completion in the VS Code extension host", () => {
     const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
       "vscode-languageclient/node": require("vscode-languageclient/node"),
     });
+    let runtimeProbes = 0;
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, "../.."),
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
-      requestMemberCompletions: async () => [{ name: "old_arg" }],
+      requestMemberCompletions: async () => { runtimeProbes++; return [{ name: "old_arg" }]; },
     });
-    const snapshot = text => {
-      const lines = text.split("\n");
-      return { text, currentLine: lines.at(-1), lines, cursorRow: lines.length - 1,
-        cursorCol: lines.at(-1).length, textBeforeCursor: text };
+    const snapshot = (text, cursor = text.length) => {
+      const lines = text.split("\n"), before = text.slice(0, cursor);
+      const cursorRow = before.split("\n").length - 1;
+      return { text, currentLine: lines[cursorRow], lines, cursorRow,
+        cursorCol: before.split("\n").at(-1).length, textBeforeCursor: before };
     };
-    const complete = async (text, session) => {
-      const input = snapshot(text);
+    const complete = async (text, session, cursor = text.length) => {
+      const input = snapshot(text, cursor);
       let items;
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
         getWorkspaceData: () => session, applyCompletion() {},
@@ -71,6 +73,26 @@ suite("Completion in the VS Code extension host", () => {
         const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
         assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);
       }
+      const probesBeforeNative = runtimeProbes;
+      const memberText = 'obj <- list(alpha = 1)\nobj$alpha';
+      const memberCursor = memberText.length - 4;
+      const memberItems = await complete(memberText, undefined, memberCursor);
+      const member = memberItems.find(item => item.insertText === 'alpha');
+      assert.ok(member);
+      assert.equal(member.replaceStart, 4);
+      assert.equal(member.replaceEnd, 9);
+      const refinedMemberText = memberText.replace('obj$alpha', 'obj$allpha');
+      const refinedMember = lang.refineInlineCompletion(snapshot(refinedMemberText, memberCursor + 1))
+        .find(item => item.insertText === 'alpha');
+      assert.equal(refinedMember.replaceEnd, 10);
+      const callable = await complete('obj <- list(`fun$1` = function(arg) NULL)\nobj$fu');
+      assert.ok(callable.some(item => item.insertText === '`fun$1`()'));
+      const emptyMembers = await complete('obj <- list()\nobj$');
+      assert.equal(emptyMembers.length, 0);
+      const constructor = await complete('Thing <- R6::R6Class("Thing", public = list(initialize = function(value, other) NULL))\nThing$new(value=1, ');
+      assert.ok(constructor.some(item => item.insertText === 'other = '));
+      assert.ok(constructor.every(item => item.insertText !== 'value = '));
+      assert.equal(runtimeProbes, probesBeforeNative, 'native results must survive the real converter without runtime probes');
       const collator = new Intl.Collator("en", { sensitivity: "base" });
       for (const operator of ["::", ":::"]) {
         const items = await complete(`data.table${operator}`);

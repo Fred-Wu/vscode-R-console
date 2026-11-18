@@ -661,7 +661,7 @@ test("Unicode call identity never substitutes a same-suffix global function", { 
   assert.ok(result.items.every(item => item.detail !== "parameter" && !item.detail?.startsWith("value for ")));
 });
 
-test("fuzzy fallback does not turn values, comments or member calls into LSP argument positions", { timeout: 90000 }, async t => {
+test("fuzzy fallback preserves value, comment and member-call identities", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { client, instances } = createConsoleLsp(t);
   for (const [head, tail] of [
@@ -689,6 +689,8 @@ test("fuzzy fallback does not turn values, comments or member calls into LSP arg
     assert.equal(requests[1].params.position.character, column - 2, input);
     if (tail.startsWith("method =")) {
       assert.ok(requests.every(request => request.params.rConsoleCall === head && request.params.rConsoleArgument === "method"), input);
+    } else if (head === "obj$lm") {
+      assert.ok(requests.every(request => request.params.rConsoleCall === head), input);
     } else {
       assert.ok(requests.every(request => request.params.rConsoleCall === undefined), input);
     }
@@ -1125,6 +1127,13 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
     ['f <- function(outer_arg) NULL\ng <- function() { f <- (function(inner_arg) NULL); f(│) }', ['inner_arg']],
     ['f <- function(outer_arg) NULL\ng <- function() { f <- (function(inner_arg) NULL) }; f(│)', ['outer_arg']],
     ['f <- function(earlier) NULL; f(│); f <- function(later) NULL', ['earlier']],
+    ['f <- function(earlier) NULL; f <- { f(│); function(later) NULL }', ['earlier']],
+    ['f <- function(earlier) NULL; f <- f(│)', ['earlier']],
+    ['f <- function(earlier) NULL; f <- (g <- f(│))', ['earlier']],
+    ['f <- function(recursive_arg) { f(│) }', ['recursive_arg']],
+    ['(function(recursive_arg) { f(│) }) -> f', ['recursive_arg']],
+    ['f <- function(earlier) NULL; f <- function() { f(│) }', []],
+    ['f <- function(earlier) NULL; f <- (function() { f(│) })()', ['earlier']],
     ['f <- (function(method = c("new_value", "other")) NULL)\nf(meth = "new│")', ['new_value']],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
@@ -1158,12 +1167,42 @@ test("formal bindings shadow outer functions without evaluating their defaults",
     ['g <- function(f = function(outer_arg) NULL) { h <- function(f) { f(│) } }', []],
     ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) NULL; f(│)', ['outer_arg']],
     ['g <- function(f = function(inner_arg) NULL) {\n f(│', ['inner_arg']],
+    ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL }) { f(│) }', ['outer_arg']],
+    ['f <- function(outer_arg) NULL; g <- function(x = f <- function(lazy_arg) NULL) { f(│) }', ['outer_arg']],
+    ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL; f(│) }) NULL', ['lazy_arg']],
+    ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL }, y = f(│)) NULL', ['outer_arg']],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = before.split('\n');
     const result = await client.provideCompletionItems({ getText: () => text },
       { line: lines.length - 1, character: lines.at(-1).length });
     assert.equal(result.rConsoleLocalFunction, true, marked);
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, marked);
+  }
+});
+
+test("source bindings do not escape quoted, lazy or locally evaluated arguments", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const tail of [
+    'quote(f <- function(hidden_arg) NULL); f(│)',
+    'substitute({ f <- function(hidden_arg) NULL }); f(│)',
+    'expression(f <- function(hidden_arg) NULL); f(│)',
+    'alist(f <- function(hidden_arg) NULL); f(│)',
+    'local({ f <- function(hidden_arg) NULL }); f(│)',
+    'base::local({ f <- function(hidden_arg) NULL }); f(│)',
+    'ignore <- function(...) NULL; ignore(f <- function(hidden_arg) NULL); f(│)',
+    'ignore <- function(x, y) y; ignore({ f <- function(hidden_arg) NULL }, f(│))',
+    'local({ f <- function(inner_arg) NULL; f(│) })',
+    'base::local({ f <- function(inner_arg) NULL; f(│) })',
+  ]) {
+    const marked = 'f <- function(outer_arg) NULL; ' + tail;
+    // Execute only these controlled fixtures to derive the expected binding
+    // from R itself. The completion server must inspect their syntax only.
+    const expected = runRJson('cat(jsonlite::toJSON(eval(parse(text=inputs)), auto_unbox=FALSE))',
+      marked.replace('f(│)', 'names(formals(f))'));
+    const text = marked.replace('│', '');
+    const result = await client.provideCompletionItems({ getText: () => text },
+      { line: 0, character: marked.indexOf('│') });
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, tail);
   }
 });
 
@@ -1303,5 +1342,130 @@ test("complex defaults cannot suppress source argument completions", { timeout: 
       { line: 1, character: 7 });
     assert.deepEqual(values?.items.filter(item => item.detail === 'value for x').map(item => item.label),
       expression.includes('"known"') ? ['known'] : [], 'quoted values use the same safe extraction');
+  }
+});
+
+test("runtime literal choices match source extraction without evaluating defaults", async () => {
+  for (const expression of ['c(I("known"), , base::stop("never evaluate"))',
+    'c("known", base::identity("never evaluate"))', 'c((function() stop("never evaluate"))())']) {
+    const text = 'f(x = "")';
+    const context = completion.getCompletionContext(text, text.length - 2);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { f: { type: 'closure' } } }, [], [], undefined, async probe => runRJson(
+        `f <- function(x = ${expression}) stop("body evaluated")\n` +
+        'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', probe));
+    assert.deepEqual(entries.map(item => item.insertText), expression.includes('"known"') ? ['known'] : [], expression);
+  }
+});
+
+test("runtime column probes use the active data scope without executing input", async () => {
+  const setup = 'old_df <- data.frame(old_column = 1); new_df <- data.frame(new_column = 1); obj <- list(data = new_df)\n';
+  for (const [marked, expected] of [
+    ['with(old_df, x)\nnew_fun(│)', []],
+    ['old_df |> identity()\nnew_df |> subset(│)', ['new_column']],
+    ['old_df |> subset(new_df, │)', ['old_column']],
+    ['old_df %>% subset(., │)', ['old_column']],
+    ['with(old_df, subset(new_df, │))', ['new_column']],
+    ['with(new_df, text = ")", │)', ['new_column']],
+    ['obj$data |> subset(│)', ['new_column']],
+    ['with(old_df, stop("must not execute") |> subset(│))', []],
+  ]) {
+    const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
+    const row = before.split('\n').length - 1;
+    const context = completion.getCompletionContext(lines[row], before.split('\n').at(-1).length,
+      before, text.slice(before.length));
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
+      async expression => {
+        probes++;
+        return runRJson(setup + 'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression);
+      });
+    assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.label), expected, marked);
+    assert.equal(probes, expected.length ? 1 : 0, 'unrelated or unsafe expressions must not be probed');
+  }
+});
+
+test("native member inference owns edits, callable snippets and empty source objects", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const [marked, expected] of [
+    ['obj <- list(alpha = 1, beta = 2)\nobj$al│pha', ['alpha']],
+    ['obj <- list()\nobj$│', []],
+    ['obj <- list(alpha = 1)\nobj$missing│', []],
+    ['obj <- list(`fun$1` = function(x) NULL)\nobj$fu│', ['`fun$1`()']],
+  ]) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const before = text.slice(0, cursor).split('\n');
+    const position = { line: before.length - 1, character: before.at(-1).length };
+    const line = text.split('\n')[position.line];
+    const context = completion.getCompletionContext(line, position.character, text.slice(0, cursor), text.slice(cursor));
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, position,
+      { globalenv: { obj: { names: ['stale'] } } }, text.split('\n').slice(0, position.line), [],
+      { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } }, async () => { probes++; return [{ name: 'stale' }]; });
+    assert.deepEqual(entries.map(item => item.insertText), expected, marked);
+    assert.equal(probes, 0, 'native source inference must not probe the active R session');
+    if (expected[0] === 'alpha') {
+      const pick = completion.toCompletionPick(entries[0], context);
+      assert.equal(line.slice(0, pick.replaceStart) + pick.insertText + line.slice(pick.replaceEnd), 'obj$alpha');
+    }
+  }
+});
+
+test("native S3 arguments retain their resolved method and presentation role", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const text = 'df <- data.frame(alpha = 1)\nsubset(df, )';
+  const position = { line: 1, character: 11 };
+  const context = completion.getCompletionContext('subset(df, )', 11, text.slice(0, text.length - 1), ')');
+  const entries = await completion.collectCompletionEntries(context,
+    { getText: () => text, uri: client.inputDocument.uri }, position, undefined, [text.split('\n')[0]], [],
+    { provideCompletionItems: async (...args) => {
+      const result = await client.provideCompletionItems(...args);
+      return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+    } });
+  assert.deepEqual(entries.filter(item => item.role === 'argument').map(item => item.label), ['subset', 'select', 'drop']);
+  assert.ok(entries.find(item => item.label === 'drop').detail.includes('drop = FALSE'));
+});
+
+test("source-defined member arguments use native inference without a live-session probe", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const [line, expected] of [['obj$fun(', 'arg = '], ['obj$choose(mode = "a', 'auto']]) {
+    const first = 'obj <- list(fun = function(arg) NULL, choose = function(mode = c("auto", "manual")) NULL)';
+    const text = first + '\n' + line;
+    const context = completion.getCompletionContext(line, line.length, text);
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: line.length }, undefined, [first], [],
+      { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } }, async () => { probes++; return [{ name: 'stale' }]; });
+    assert.ok(entries.some(item => item.insertText === expected), line);
+    assert.equal(probes, 0);
+  }
+});
+
+test("native constructor signatures exclude supplied arguments without runtime fallbacks", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const [line, expected] of [
+    ['Thing$new(', ['value', 'other']],
+    ['Thing$new(value=1, ', ['other']],
+    ['Thing$new(value=1, other=2, ', []],
+  ]) {
+    const first = 'Thing <- R6::R6Class("Thing", public = list(initialize = function(value, other = 1) NULL))';
+    const text = first + '\n' + line;
+    const context = completion.getCompletionContext(line, line.length, text);
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: line.length }, undefined, [first], [],
+      { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } }, async () => { probes++; return [{ name: 'stale' }]; });
+    assert.deepEqual(entries.filter(item => item.role === 'argument').map(item => item.label), expected, line);
+    assert.equal(probes, 0);
   }
 });

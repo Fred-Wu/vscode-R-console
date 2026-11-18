@@ -11,6 +11,20 @@ const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInpu
 
 const { createTerminal } = require("../helpers/inline-terminal.cjs");
 
+test("pending inline results cannot reopen the panel after switching to Quick Pick", t => {
+  const settings = { completionUI: "inline" };
+  const { terminal } = createTerminal(t, 80, 24, "typing", settings);
+  terminal.inputState.insertText("mea");
+  let publish;
+  terminal.lang.handleAutocomplete = ({ onInlineEntries }) => { publish = onInlineEntries; };
+  terminal.requestInlineCompletion(true);
+  settings.completionUI = "quickPick";
+  publish([{ ...item("mean"), snapshotInput: "mea", snapshotCursor: 3 }]);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  assert.equal(Boolean(terminal.inlineMouseReporting), false);
+  assert.equal(terminal.inputState.text, "mea");
+});
+
 test("exact inline selection respects R identifier case while allowing case-insensitive search", () => {
   const panel = new InlineCompletion(unicode);
   const choices = [item("Alpha"), item("alpha")];

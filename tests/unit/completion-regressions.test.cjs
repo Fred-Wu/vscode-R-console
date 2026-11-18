@@ -26,6 +26,59 @@ test("quoted argument values do not request irrelevant runtime columns", async (
   assert.deepEqual(entries.map(entry => entry.insertText), ['auto']);
 });
 
+test("large inputs retain the active data context after many completed calls", () => {
+  const history = 'with(old_data, value)\n'.repeat(5000);
+  for (const [line, expected] of [['lib', undefined], ['with(current_data, va', 'current_data'],
+    ['with(outer_data, with(inner_data, value), va', 'outer_data']]) {
+    const context = completion.getCompletionContext(line, line.length, history + line);
+    assert.equal(context.dataObjectName, expected);
+  }
+});
+
+test("data completion follows active lexical scopes and the current pipe", () => {
+  for (const [marked, expected] of [
+    ['with(old_df, x)\nnew_fun(│)', undefined],
+    ['with(old_df, x); new_fun(│)', undefined],
+    ['old_df |> identity()\nnew_df |> subset(│)', 'new_df'],
+    ['old_df %>% identity(); new_df %>% subset(│)', 'new_df'],
+    ['new_df |> subset(x) |> transform(│)', 'new_df'],
+    ['with(outer_df, subset(inner_df, │))', 'inner_df'],
+    ['subset(outer_df, with(inner_df, │))', 'inner_df'],
+    ['with(df, text = ")", │)', 'df'],
+    ['with(df, # )\n│)', 'df'],
+    ['"with(old_df, "; fun(│)', undefined],
+    ['# old_df |>\nnew_df |> subset(│)', 'new_df'],
+    ['fun(old_df |> identity(), new_df |> subset(│))', 'new_df'],
+    ['fun(old_df |> identity(), new_fun(│))', undefined],
+    ['old_df |> identity(); new_df |> _[│]', 'new_df'],
+    ['old_df %>% identity(); new_df %>% .[│]', 'new_df'],
+    ['with(df, { first <- 1; nested(│) })', 'df'],
+    ['with(df, { "not ) a delimiter"; nested(│) })', 'df'],
+    ['with(df, x)\n(│)', undefined],
+    ['with(df, x)\n{ nested(│) }', undefined],
+    ['with\n(df, │)', undefined],
+    ['base::with(df, │)', 'df'],
+    ['with(`a b`, │)', '`a b`'],
+    ['obj$data |> subset(│)', 'obj$data'],
+    ['obj$data[x + │]', 'obj$data'],
+    ['df[rows, ] |> subset(│)', 'df'],
+    ['with(outer_df, factory() |> subset(│))', undefined],
+    ['outer_df |> fun(factory() |> subset(│))', undefined],
+    ['with(outer_df, factory()[x + │])', undefined],
+    ['old_df |> subset(new_df, │)', 'old_df'],
+    ['old_df %>% subset(., │)', 'old_df'],
+    ['old_df |> base::subset(new_df, │)', 'old_df'],
+    ['old_df |> fun(subset(new_df, │))', 'new_df'],
+    ['old_df |> subset(new_df |> subset(│))', 'new_df'],
+  ]) {
+    const text = marked.replace('│', ''), before = marked.split('│')[0];
+    const lines = text.split('\n'), row = before.split('\n').length - 1;
+    const context = completion.getCompletionContext(lines[row], before.split('\n').at(-1).length,
+      before, text.slice(before.length));
+    assert.equal(context?.dataObjectName, expected, marked);
+  }
+});
+
 test("subscript options do not change the indexing dimensions", () => {
   for (const marked of ["df[│, drop = FALSE]", "df[drop = FALSE, │]",
     'df[│, "drop" = FALSE]', "df[[│, exact = TRUE]]", "df[[exact = TRUE, │]]"]) {

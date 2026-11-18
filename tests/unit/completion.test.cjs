@@ -157,7 +157,7 @@ test("local source completions publish without waiting for superseded runtime ar
   }
 });
 
-test("session argument lookups stay concurrent with LSP and await the live signature", async () => {
+test("session argument fallbacks wait for LSP and then await the live signature", async () => {
   const input = "f(";
   let releaseLsp, releaseRuntime;
   const lsp = new Promise(resolve => { releaseLsp = resolve; });
@@ -172,9 +172,10 @@ test("session argument lookups stay concurrent with LSP and await the live signa
       settled = true;
       return entries;
     });
-  assert.deepEqual(started.sort(), ["lsp", "runtime"]);
+  assert.deepEqual(started, ["lsp"]);
   releaseLsp([{ label: "wrong_arg", detail: "parameter", kind: 5 }]);
   await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(started, ["lsp", "runtime"]);
   assert.equal(settled, false, "a session function still needs its runtime signature");
   releaseRuntime([{ name: "live_arg" }]);
   const entries = await pending;
@@ -1080,7 +1081,7 @@ test("package completion filters locally without repeated language-server reques
 });
 
 
-test("runtime column completion starts while language-server completion is pending", async () => {
+test("runtime column completion runs only after the language server cannot supply fields", async () => {
   let resolveLsp;
   const lspResult = new Promise((resolve) => {
     resolveLsp = resolve;
@@ -1117,10 +1118,11 @@ test("runtime column completion starts while language-server completion is pendi
   );
 
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(runtimeStarted, true);
+  assert.equal(runtimeStarted, false);
 
   resolveLsp([]);
   const entries = await request;
+  assert.equal(runtimeStarted, true);
   assert.ok(entries.some((entry) => entry.label === "alpha"));
 });
 
@@ -1883,4 +1885,58 @@ test("language-server state sync failures do not reject terminal workspace updat
     search: [], loaded_namespaces: [], globalenv: {}, libraryPaths: ["/new"],
   }), true);
   await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("native scope fields suppress data-mask runtime probes", async () => {
+  const input = 'with(df, al';
+  let probes = 0;
+  const context = completion.getCompletionContext(input, input.length);
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, undefined, [], [], {
+      provideCompletionItems: async () => [{ label: 'alpha', kind: 4, detail: '[scope]', data: { type: 'scope' } }],
+    }, async () => { probes++; return [{ name: 'also_stale' }]; });
+  assert.deepEqual(entries.map(item => item.label), ['alpha']);
+  assert.equal(probes, 0);
+});
+
+test("native member snippets preserve escaped dollars, braces and backslashes", async () => {
+  const input = 'obj$';
+  const names = ['fun$1', 'fun${2:text}', 'fun\\path', 'fun}name'];
+  const entries = await completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length }, undefined, [], [], {
+      provideCompletionItems: async () => names.map(label => {
+        const literal = '`' + label.replace(/\\/g, '\\\\') + '`';
+        return { label, kind: 1, data: { type: 'member' },
+          insertText: new SnippetString(literal.replace(/[\\$}]/g, '\\$&') + '($0)') };
+      }),
+    });
+  assert.deepEqual(entries.map(item => item.insertText), names.map(name => '`' + name.replace(/\\/g, '\\\\') + '`()'));
+});
+
+test("cached native replacement ends move with the typed prefix", () => {
+  const { refineCompletionEntries, rebaseCompletionEnds } = loadSource('src/Language/completion/refinement.ts');
+  const before = 'obj$alpha';
+  const after = 'obj$allpha';
+  const context = completion.getCompletionContext(before, 5);
+  const refinedContext = completion.getCompletionContext(after, 6);
+  const entries = [{ label: 'alpha', insertText: 'alpha', source: 'lsp', replaceStart: 4, replaceEnd: 9 }];
+  const refined = refineCompletionEntries({ context, entries,
+    input: { text: before, textBeforeCursor: before.slice(0, 5), cursorRow: 0 } },
+    { text: after, textBeforeCursor: after.slice(0, 6), cursorRow: 0 }, refinedContext);
+  const pick = completion.toCompletionPick(refined[0], refinedContext);
+  assert.equal(after.slice(0, pick.replaceStart) + pick.insertText + after.slice(pick.replaceEnd), 'obj$alpha');
+  const preview = rebaseCompletionEnds(refined, -1);
+  assert.equal(preview[0].replaceEnd, 9, 'picker preview edits must map back to the actual input');
+  assert.equal(entries[0].replaceEnd, 9, 'cache entries stay immutable');
+});
+
+test("native method parameters never appear inside an argument value", async () => {
+  const input = 'obj$new(value = va';
+  const entries = await completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length }, undefined, [], [], {
+      provideCompletionItems: async () => ({ rConsoleNativeArguments: true, items: [
+        { label: 'value', kind: 5, detail: 'new(value)', insertText: 'value = ', data: { type: 'member', parameter: 'value' } },
+      ] }),
+    });
+  assert.ok(!entries.some(item => item.insertText === 'value = '));
 });

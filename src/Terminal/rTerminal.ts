@@ -2147,7 +2147,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       force,
       applyCompletion: selection => this.applyCompletion(selection),
       onInlineEntries: items => {
-        if (this.mode !== "ready" || token !== this.inlineCompletion.token) return;
+        if (this.mode !== "ready" || this.inlineCompletionMode() !== "inline" ||
+            token !== this.inlineCompletion.token) return;
         const input = this.getInputSnapshot();
         const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
           input.text.slice(input.textBeforeCursor.length));

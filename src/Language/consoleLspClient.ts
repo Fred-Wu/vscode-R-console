@@ -27,7 +27,8 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
-import { getCompletionParseInsertion, getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./parser";
+import { getEnclosingCall } from "./completion/contextParser";
+import { createCompletionParams } from "./completion/protocol";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -304,39 +305,7 @@ export class ConsoleLspClient implements CompletionProvider {
               triggerCharacter: undefined,
             };
         const serverPosition = projection.toServerPosition(position);
-        const text = projection.document.getText();
-        const hasContext = text.includes("(") || text.includes("|>") || text.includes("%>%");
-        const contextOffset = hasContext ? projection.document.offsetAt(projection.toServerPosition(contextPosition)) : 0;
-        const call = text.includes("(")
-          ? getEnclosingCall(text, contextOffset) : undefined;
-        const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
-        const parseSuffix = getCompletionParseSuffix(text);
-        const parseInsertion = parseSuffix !== undefined && pipe
-          ? getCompletionParseInsertion(text, contextOffset) : undefined;
-        // Carry the parsed callable identity across the protocol. The R
-        // server's line-local token lookup cannot see a name before a newline.
-        // Member formals remain the responsibility of the active R session.
-        // Fuzzy lookups move position within a prefix, but call eligibility
-        // must still be determined at the user's original cursor.
-        const params = {
-          ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
-          ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
-          ...(parseInsertion ? { rConsoleParseInsertion: {
-            position: projection.document.positionAt(parseInsertion.offset), text: parseInsertion.text,
-          } } : {}),
-          ...((call?.argumentTags || call?.argumentValue) && call.operator !== "$" && call.operator !== "@"
-            ? { rConsoleCall: call.name } : {}),
-          ...(call?.argumentTags && call.operator !== "$" && call.operator !== "@"
-            ? { rConsoleArgumentTags: call.argumentTags } : {}),
-          ...(call?.argumentValue && call.operator !== "$" && call.operator !== "@" ? {
-            rConsoleArgument: call.argumentValue.name,
-            rConsoleValueTags: call.argumentValue.argumentTags,
-            rConsolePrefix: call.argumentValue.prefix.slice(0,
-              Math.max(0, projection.document.offsetAt(serverPosition) - call.argumentValue.replaceStart)),
-          } : {}),
-          ...(pipe ? { rConsolePipe: true, rConsolePrefix: pipe.prefix.slice(0,
-            Math.max(0, projection.document.offsetAt(serverPosition) - pipe.replaceStart)) } : {}),
-        };
+        const params = createCompletionParams(client, projection, serverPosition, contextPosition, context);
         const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client) {
           continue;
@@ -346,6 +315,12 @@ export class ConsoleLspClient implements CompletionProvider {
         // source decision separately so an empty signature stays authoritative.
         if (completions && (result as { rConsoleLocalFunction?: boolean } | null)?.rConsoleLocalFunction === true) {
           completions.rConsoleLocalFunction = true;
+        }
+        if (completions && (result as { rConsoleMemberResolved?: boolean } | null)?.rConsoleMemberResolved === true) {
+          completions.rConsoleMemberResolved = true;
+        }
+        if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
+          completions.rConsoleNativeArguments = true;
         }
         const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
           projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
