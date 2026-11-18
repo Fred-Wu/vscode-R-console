@@ -322,6 +322,18 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
         self$ClientCapabilities$textDocument$completion
     )
     call <- console_call_identity(params$rConsoleCall)
+    if (!is.null(call) && is.null(call$package)) {
+        xdoc <- document$parse_data$xml_doc
+        if (!is.null(xdoc)) {
+            # Use the provider's own scope lookup, independently of the number
+            # of candidates left after prefix and supplied-argument filtering.
+            xpath <- glue::glue(languageserver:::signature_xpath,
+                row = point$row + 1L, token_quote = languageserver:::xml_single_quote(call$token))
+            definitions <- languageserver:::xdoc_find_definitions(
+                xdoc, point$row + 1L, point$col + 1L, call$token, xpath)
+            if (length(definitions)) reply$result$rConsoleLocalFunction <- TRUE
+        }
+    }
     if (is.null(call) && !is.null(params$rConsoleCall)) {
         # A name accepted by the frontend lexer may be invalid in R's locale
         # (notably unquoted supplementary Unicode characters on Windows).

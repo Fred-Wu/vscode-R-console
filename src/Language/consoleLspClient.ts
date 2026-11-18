@@ -25,7 +25,7 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
 } from "vscode-languageclient/node";
-import type { CompletionPickItem, CompletionProvider } from "./completion";
+import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
 import { getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./parser";
 
@@ -270,7 +270,7 @@ export class ConsoleLspClient implements CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string,
     contextPosition: vscode.Position = position
-  ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined> {
+  ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const client = await this.ensureClient();
       if (!client) {
@@ -335,7 +335,12 @@ export class ConsoleLspClient implements CompletionProvider {
         if (this.client !== client) {
           continue;
         }
-        const completions = await client.protocol2CodeConverter.asCompletionResult(result);
+        const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
+        // VS Code's converter preserves standard LSP fields only. Carry this
+        // source decision separately so an empty signature stays authoritative.
+        if (completions && (result as { rConsoleLocalFunction?: boolean } | null)?.rConsoleLocalFunction === true) {
+          completions.rConsoleLocalFunction = true;
+        }
         const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
           projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
         );

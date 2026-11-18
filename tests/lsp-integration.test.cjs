@@ -382,6 +382,49 @@ test("unfinished multiline definitions complete immediately without executing or
   assert.equal(terminal.submitted, undefined);
 });
 
+test("current source signatures supersede older session definitions, including empty results", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const provider = {
+    getCallContext: client.getCallContext.bind(client),
+    provideCompletionItems: async (...args) => {
+      const result = await client.provideCompletionItems(...args);
+      return { ...result, items: (result.items ?? result).map(item => ({ ...item,
+        kind: item.kind === undefined ? undefined : item.kind - 1 })) };
+    },
+  };
+  const session = { globalenv: { f: { type: "closure" } } };
+  const request = async expression => runRJson(`
+    f <- function(old_arg = "old_value") stop("body evaluated")
+    value <- eval(parse(text = inputs), .GlobalEnv)
+    cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
+  `, expression);
+  for (const [marked, expected] of [
+    ["{\n f <- function(new_arg) NULL\n f(│", ["new_arg"]],
+    ["f <- function(new_arg) NULL\nf(│)", ["new_arg"]],
+    ["{\n f <- function(new_argument) NULL\n f(nwrg│", ["new_argument"]],
+    ["{\n f <- function(new_arg) NULL\n f(zzzz│", []],
+    ["{\n f <- function(new_arg) NULL\n f(new_arg = 1, │", []],
+    ["{\n f <- function() NULL\n f(│", []],
+    ["{\n f <- function(...) NULL\n f(│", []],
+    ['{\n f <- function(new_arg = stop("default evaluated")) stop("body evaluated")\n f(│', ["new_arg"]],
+    ["{\n f <- function(`new arg`) NULL\n f(│", ["`new arg`"]],
+    ['{\n f <- function(new_arg) NULL\n f(old_arg = "│")', []],
+    ["f(│", ["old_arg"]],
+    ["{\n g <- function(new_arg) NULL\n f(│", ["old_arg"]],
+  ]) {
+    const text = marked.replace("│", "");
+    const before = marked.slice(0, marked.indexOf("│"));
+    const lines = text.split("\n");
+    const position = { line: before.split("\n").length - 1, character: before.split("\n").at(-1).length };
+    const context = completion.getCompletionContext(lines[position.line], position.character, before,
+      text.slice(before.length));
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
+      session, lines.slice(0, position.line), [], provider, request);
+    assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.label), expected, marked);
+    assert.ok(!entries.some(item => item.label === "old_value"), marked);
+  }
+});
+
 test("accepting a console-defined function opens its live arguments and values", { timeout: 90000 }, async t => {
   const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
   const provide = client.provideCompletionItems.bind(client);

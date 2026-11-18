@@ -12,18 +12,18 @@ suite("Completion in the VS Code extension host", () => {
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, "../.."),
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
-      requestMemberCompletions: async () => [],
+      requestMemberCompletions: async () => [{ name: "old_arg" }],
     });
     const snapshot = text => {
       const lines = text.split("\n");
       return { text, currentLine: lines.at(-1), lines, cursorRow: lines.length - 1,
         cursorCol: lines.at(-1).length, textBeforeCursor: text };
     };
-    const complete = async text => {
+    const complete = async (text, session) => {
       const input = snapshot(text);
       let items;
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
-        getWorkspaceData: () => undefined, applyCompletion() {},
+        getWorkspaceData: () => session, applyCompletion() {},
         onInlineEntries: result => { items = result; } });
       assert.ok(items?.length, `completion results for ${text}`);
       return items.filter(item => "insertText" in item);
@@ -43,6 +43,13 @@ suite("Completion in the VS Code extension host", () => {
       const remaining = await complete(unfinished);
       assert.deepEqual(remaining.filter(item => item.detail === "parameter").map(item => item.insertText), ["normal = "]);
       assert.equal(remaining.find(item => item.detail === "parameter").replaceStart, snapshot(unfinished).cursorCol);
+      // The actual language-client converter must retain source precedence,
+      // including a zero-argument signature with no parameter items to inspect.
+      const session = { globalenv: { f: { type: "closure" } } };
+      for (const [definition, expected] of [["function(new_arg)", ["new_arg = "]], ["function()", []]]) {
+        const items = await complete(`{\n f <- ${definition} NULL\n f(`, session);
+        assert.deepEqual(items.filter(item => item.detail === "parameter").map(item => item.insertText), expected);
+      }
       const collator = new Intl.Collator("en", { sensitivity: "base" });
       for (const operator of ["::", ":::"]) {
         const items = await complete(`data.table${operator}`);

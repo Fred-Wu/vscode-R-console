@@ -97,6 +97,11 @@ export type CompletionPickItem = vscode.QuickPickItem & {
 
 export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
+export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[]) & {
+  // Applies even when filtering leaves no arguments or the definition has none.
+  rConsoleLocalFunction?: boolean;
+};
+
 export interface CompletionProvider {
   // A selected package function can be qualified in the LSP projection while
   // its name remains unqualified in the visible console input.
@@ -107,7 +112,7 @@ export interface CompletionProvider {
     triggerCharacter?: string,
     // Keep the user's cursor when position is moved to broaden matching.
     contextPosition?: vscode.Position
-  ): Promise<vscode.CompletionList | vscode.CompletionItem[] | undefined>;
+  ): Promise<CompletionResult | undefined>;
 }
 
 export type RuntimeMemberCompletionRequester = (
@@ -422,7 +427,7 @@ export async function collectCompletionEntries(
     needsLanguageServerCompletion(context) && !!doc && !!position;
   const rawLspItemsRequest =
     !includeLspItems
-      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false })
+      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false })
       : getLanguageServerCompletions(
           context,
           doc,
@@ -443,17 +448,21 @@ export async function collectCompletionEntries(
           context,
           requestRuntimeMemberCompletions
         );
-  const [runtimeMemberItems, rawLspResult, columnItems, runtimeArgumentItems] = await Promise.all([
+  const [runtimeMemberItems, rawLspResult, columnItems, requestedRuntimeArguments] = await Promise.all([
     runtimeMemberItemsRequest,
     rawLspItemsRequest,
     columnItemsRequest,
     runtimeArgumentItemsRequest,
   ]);
-  // Member and user-defined function signatures belong to the active session.
+  // A source definition visible at the cursor supersedes an older session
+  // function, including when it has no remaining parameters or known values.
+  const useRuntimeArguments = runtimeArguments && !rawLspResult.rConsoleLocalFunction;
+  const runtimeArgumentItems = useRuntimeArguments ? requestedRuntimeArguments : [];
+  // Otherwise, member and user-defined signatures belong to the active session.
   // A same-name package function must not supply unrelated arguments, even
   // when the session cannot currently reply or the function has no formals.
   const rawLspItems = rawLspResult.entries.filter(entry => {
-    if (runtimeArguments && isArgumentCompletionEntry(entry)) return false;
+    if (useRuntimeArguments && isArgumentCompletionEntry(entry)) return false;
     if (context.kind === "argument" && !context.argumentTags && entry.detail === "parameter") return false;
     return !context.pipe || isCallableCompletionKind(entry.kind);
   });
@@ -1063,7 +1072,7 @@ async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
   }
@@ -1073,6 +1082,7 @@ async function getLanguageServerCompletions(
       position,
       context.triggerCharacter
     );
+    let localFunction = result?.rConsoleLocalFunction === true;
 
     let items = Array.isArray(result) ? result : result?.items || [];
     // Some R language servers only return contiguous matches. If that lookup
@@ -1086,6 +1096,7 @@ async function getLanguageServerCompletions(
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
         context.triggerCharacter, position);
+      localFunction ||= result?.rConsoleLocalFunction === true;
       items = Array.isArray(result) ? result : result?.items || [];
     }
     
@@ -1104,6 +1115,7 @@ async function getLanguageServerCompletions(
         packageName: getCompletionPackage(item),
       })),
       isIncomplete: !Array.isArray(result) && result?.isIncomplete === true,
+      rConsoleLocalFunction: localFunction,
     };
   } catch {
     return { entries: [], isIncomplete: false };
