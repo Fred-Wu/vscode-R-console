@@ -223,10 +223,9 @@ export async function getRuntimeArgumentCompletions(
         label: item.name.slice(6), insertText: quoteCompletionValue(item.name.slice(6), value.quote),
         kind: vscode.CompletionItemKind.Value, detail: `value for ${value.name}`, source: "session" as const }));
     }
-    // A completion inserts a name, which R matches before positional values on
-    // either side of the cursor. Check each candidate as a named argument rather
-    // than reserving a positional slot. Only match syntax: values, defaults and
-    // the function body are never evaluated. All candidates share one request.
+    // Treat supplied positional values as filled, then validate each remaining
+    // name with R's matching rules. Only syntax is matched: values, defaults
+    // and the function body are never evaluated. All candidates share one request.
     const supplied = context.argumentTags!.map(tag =>
       tag === null ? "TRUE" : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
     const cursorSlot = context.argumentTags!.indexOf(null) + 2;
@@ -241,7 +240,11 @@ export async function getRuntimeArgumentCompletions(
       `${suppliedCount}L >= base::length(.formals); ` +
       `.call <- base::as.list(base::quote(.fn(${supplied}))); ` +
       `if (base::is.null(base::names(.call))) base::names(.call) <- base::rep("", base::length(.call)); ` +
-      `.candidates <- base::setdiff(base::names(base::formals(.def)), base::setdiff(base::names(.call), "...")); ` +
+      `.matched <- if (${forwardedDots ? "FALSE" : "TRUE"}) base::tryCatch(base::as.list(base::suppressWarnings(` +
+      `base::match.call(definition = .def, call = base::as.call(.call), expand.dots = FALSE)))[-1L], ` +
+      `error = function(e) NULL) else NULL; ` +
+      `.used <- base::names(.matched)[!base::vapply(.matched, base::identical, base::logical(1), TRUE)]; ` +
+      `.candidates <- base::setdiff(.formals, base::setdiff(base::c(base::names(.call), .used), "...")); ` +
       `.candidates[base::vapply(.candidates, function(.name) { ` +
       `if (.name == "..." || ${forwardedDots ? "TRUE" : "FALSE"}) return(TRUE); ` +
       `.candidate <- .call; base::names(.candidate)[${cursorSlot}L] <- .name; ` +

@@ -254,7 +254,7 @@ test("real LSP validates positional, partial, quoted and piped argument candidat
   for (const [marked, expected] of [
     ["base::atan2(1, 2, │)", []],
     ["atan2(1, 2, │)", []],
-    ["base::atan2(1, │)", ["y", "x"]],
+    ["base::atan2(1, │)", ["x"]],
     ["base::atan2(│, x = 2)", ["y"]],
     ["base::atan2(`x` = stop('must not run'), │)", ["y"]],
     ['base::atan2("x" = , │)', ["y"]],
@@ -262,7 +262,7 @@ test("real LSP validates positional, partial, quoted and piped argument candidat
     ['stats::cor(x = 1, y = 2, u = "everything", │)', ["method"]],
     ["1 |> base::atan2(2, │)", []],
     ["1 |> base::atan2(x = _, │)", ["y"]],
-    ["1 |> base::atan2(│)", ["y", "x"]],
+    ["1 |> base::atan2(│)", ["x"]],
     ["base::sum(1, 2, │)", ["...", "na.rm"]],
     ["base::sum(na = 1, │)", ["...", "na.rm"]],
     ["base::sum(na.rm = TRUE, │)", ["..."]],
@@ -298,7 +298,7 @@ test("argument validation uses the local signature without evaluating defaults o
     ["atan2(1, 2, │)", []],
     ["atan2(fir = 1, │)", ["second"]],
     ["atan2(│, second = stop('argument evaluated'))", ["first"]],
-    ["atan2(1, │)", ["first", "second"]],
+    ["atan2(1, │)", ["second"]],
   ]) assert.deepEqual(await parameters(marked), expected, marked);
 });
 
@@ -727,24 +727,24 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$élm", ["correct_argument"]],
     ["`𐐀obj`$lm", ["correct_argument"]],
     ["obj$unicode", ["remaining"], 'éarg = stop("value evaluated"), `𐐀arg` = stop("value evaluated"), '],
-    ["obj$pair", ["second"], "se", ', stop("value evaluated"))'],
-    ["obj$pair", ["first", "second"], "", ', stop("value evaluated"))'],
-    ["obj$pair", ["first", "second"], 'stop("value evaluated"), '],
+    ["obj$pair", [], "se", ', stop("value evaluated"))'],
+    ["obj$pair", ["first"], "", ', stop("value evaluated"))'],
+    ["obj$pair", ["second"], 'stop("value evaluated"), '],
     ["slot_obj@lm", ["slot_argument"]],
     ["obj$primitive", ["na.rm"]],
     ["obj$empty", []], ["obj$field", []], ["unavailable$lm", []],
     ["obj$lm", ["missing", "lazy"], 'list_argument = stop("value evaluated"), '],
-    ["obj$lm", ["list_argument", "missing", "lazy"], 'li = stop("value evaluated"), '],
-    ["obj$lm", ["list_argument", "missing", "lazy"], 'stop("value evaluated"), '],
-    ["obj$lm", ["list_argument", "missing", "lazy"], ', '],
-    ["obj$lm", ["list_argument", "missing"], 'lazy = stop("value evaluated"), stop("value evaluated"), '],
+    ["obj$lm", ["missing", "lazy"], 'li = stop("value evaluated"), '],
+    ["obj$lm", ["missing", "lazy"], 'stop("value evaluated"), '],
+    ["obj$lm", ["missing", "lazy"], ', '],
+    ["obj$lm", ["missing"], 'lazy = stop("value evaluated"), stop("value evaluated"), '],
     ["obj$lm", ["list_argument", "lazy"], '', ', missing = stop("value evaluated"))'],
     ["obj$lm", [], 'list_argument = 1, li'],
     ["obj$quoted", ["remaining"], '`a b` = stop("value evaluated"), '],
     ["obj$quoted", ["remaining"], '"a b" = stop("value evaluated"), '],
     ["obj$quoted", ["remaining"], 'r"---(a b)---" = stop("value evaluated"), '],
     ["obj$positional", ["first", "second"], 'r"(third)" = stop("value evaluated"), '],
-    ["obj$dots", ["first", "after"], '1, 2, '],
+    ["obj$dots", ["after"], '1, 2, '],
     ["obj$dots", ["first", "after"], 'af = 1, '],
     ["obj$dots", ["first"], 'after = 1, '],
     ["obj$dots", ["first"], '..., after = 1, '],
@@ -752,28 +752,28 @@ test("member argument probe inspects the actual R callable without executing bod
     ["obj$positional", [], '1, 2, 3, ..., '],
     ["obj$primitive", [], 'na.rm = TRUE, '],
     ["obj$positional", ["first"], 'fi', ', stop("value evaluated"))'],
-    ["obj$positional", ["first", "second", "third"], '', ', stop("value evaluated"))'],
+    ["obj$positional", ["first", "third"], '', ', stop("value evaluated"))'],
     ["obj$positional", ["second"], 'stop("value evaluated"), se', ', stop("value evaluated"))'],
-    ["obj$positional", ["second", "third"], 'first = stop("value evaluated"), ', ', stop("value evaluated"))'],
-    ["obj$positional", ["first", "second"], '', ', , third = stop("value evaluated"))'],
-    ["obj$positional", ["second", "third"], '', ', fir = stop("value evaluated"), stop("value evaluated"))'],
+    ["obj$positional", ["second"], 'first = stop("value evaluated"), ', ', stop("value evaluated"))'],
+    ["obj$positional", ["first"], '', ', , third = stop("value evaluated"))'],
+    ["obj$positional", ["second"], '', ', fir = stop("value evaluated"), stop("value evaluated"))'],
     ["obj$positional", [], '1, 2, 3, '],
     ["obj$dots", ["first", "after"], '', ', 1, 2)'],
-    ["obj$dots", ["first", "after"], '1, ', ', 2)'],
+    ["obj$dots", ["after"], '1, ', ', 2)'],
     ["(obj\n$positional", ["first"], 'fi', ', 2))'],
     ["obj$ # continuation\npositional", ["first"], 'fi', ', 2)'],
-    ["stop('pipe evaluated') |> obj$positional", ["first", "second", "third"]],
-    ["1 |> obj$positional", ["first", "second", "third"], '2, '],
+    ["stop('pipe evaluated') |> obj$positional", ["second", "third"]],
+    ["1 |> obj$positional", ["third"], '2, '],
     ["1 |> obj$positional", [], 'fi', ', second = 2, third = 3)'],
-    ["1 |> obj$positional", ["first", "second"], '', ', third = 3)'],
+    ["1 |> obj$positional", ["second"], '', ', third = 3)'],
     ["1 |> obj$positional", ["first", "third"], 'second = _, '],
     ["1 |> obj$positional", ["first", "second"], '', ', third = _)'],
     ["1 |> obj$positional", ["first", "second"], 'r"(third)" = _, '],
-    ["1 |> obj$positional", ["first", "second", "third"], '2 |> identity(x = _), '],
-    ["stop('pipe evaluated') %>% obj$positional", ["first", "second", "third"]],
+    ["1 |> obj$positional", ["third"], '2 |> identity(x = _), '],
+    ["stop('pipe evaluated') %>% obj$positional", ["second", "third"]],
     ["1 %>% obj$positional", ["first", "third"], 'second = ., '],
-    ["1 %>% obj$positional", ["first", "second", "third"], 'identity(.), '],
-    ["1 %>% obj$positional", ["first", "second", "third"], '., '],
+    ["1 %>% obj$positional", ["third"], 'identity(.), '],
+    ["1 %>% obj$positional", ["second", "third"], '., '],
   ]) {
     const input = expression + "(" + argumentsBefore + argumentsAfter;
     const context = completion.getCompletionContext(input, input.length - argumentsAfter.length);
@@ -861,9 +861,10 @@ test("argument probes agree with native R calls across pipe and argument combina
     }
   }
   // Evaluate harmless test functions whose bodies only return match.call().
-  // Insert each candidate by name into the original source and let R and
-  // magrittr match it. A positional cursor marker would hide the very argument
-  // rematching this test must exercise.
+  // Let R and magrittr identify the arguments already bound by the actual
+  // call, reserving the cursor slot. Remaining candidates must also form valid
+  // named calls. Completion deliberately excludes names R could only reuse
+  // by rematching an existing positional value.
   const results = runRJson(`
     library(magrittr)
     capture <- function(call, definition) {
@@ -883,6 +884,11 @@ test("argument probes agree with native R calls across pipe and argument combina
     result <- lapply(seq_along(inputs$cases), function(i) {
       case <- inputs$cases[[i]]
       candidates <- setdiff(names(formals(obj[[case$fn]])), "...")
+      current <- tryCatch(eval(parse(text = sub("§", ".cursor_marker", case$call, fixed = TRUE))),
+        error = function(e) NULL)
+      current <- as.list(current)[-1L]
+      occupied <- setdiff(names(current)[!vapply(current, identical, logical(1), quote(.cursor_marker))], "...")
+      candidates <- setdiff(candidates, occupied)
       expected <- candidates[vapply(candidates, function(name) {
         call <- sub("§", paste0(name, " = .cursor_marker"), case$call, fixed = TRUE)
         tryCatch({ eval(parse(text = call)); TRUE }, error = function(e) FALSE)
@@ -1526,9 +1532,9 @@ test("source bindings inside blocks override inferred S3 signatures and live fun
     },
   };
   for (const [marked, expected, expectedProbes] of [
-    ['print(data.frame(a=1), │)', ['x = ', 'custom_arg = '], 1],
+    ['print(data.frame(a=1), │)', ['custom_arg = '], 1],
     ['print(x=data.frame(a=1), │)', ['custom_arg = '], 1],
-    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['x = ', 'source_arg = '], 0],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['source_arg = '], 0],
     ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = '], 0],
     ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), sou│) }', ['source_arg = '], 0],
     ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), source_arg=1, │) }', [], 0],

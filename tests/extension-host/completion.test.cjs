@@ -130,7 +130,7 @@ suite("Completion in the VS Code extension host", () => {
       assert.ok(qualifiedPrint.every(item => item.insertText !== 'old_arg = '));
       assert.equal(runtimeProbes, probesBeforeShadow + 1, 'qualified calls must not probe a session namesake');
       for (const [marked, expected] of [
-        ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['x = ', 'source_arg = ']],
+        ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['source_arg = ']],
         ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = ']],
         ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), source_arg=1, │) }', []],
         ['g <- function(print) { print(data.frame(a=1), │) }', []],

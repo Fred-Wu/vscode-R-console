@@ -570,9 +570,9 @@ test input unsubmitted.
 
 | Input | Expected |
 | --- | --- |
-| `print(data.frame(a = 1), │)` | Offer both `x` and `custom_arg`. Inserting a named `x` lets R match the existing positional value to `custom_arg`. |
+| `print(data.frame(a = 1), │)` | Offer only `custom_arg`; the positional value already fills `x`, just as an explicit `x =` would. |
 | `print(x = data.frame(a = 1), │)` | Offer only `custom_arg`; the explicitly supplied `x` cannot be offered again. |
-| `{ print <- function(x, source_arg) NULL; print(data.frame(a = 1), │) }` | Offer `x` and `source_arg`, with no live `custom_arg` or inferred package-method arguments. |
+| `{ print <- function(x, source_arg) NULL; print(data.frame(a = 1), │) }` | Offer only `source_arg`, with no filled `x`, live `custom_arg`, or inferred package-method arguments. |
 | `{ print <- function(x, source_arg) NULL; print(x = data.frame(a = 1), │) }` | Offer only `source_arg`. |
 | `{ print <- get("identity"); print(data.frame(a = 1), │) }` | The source binding has an unknown signature; do not borrow live or package argument names. |
 | `base::print(data.frame(a = 1), │)` | Keep package-method arguments such as `digits`; do not use the session's `custom_arg`. |

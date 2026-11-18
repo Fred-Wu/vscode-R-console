@@ -125,13 +125,18 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
         call = as.call(syntax), expand.dots = FALSE)), error = function(e) NULL)
     positional <- as.list(positional)[-1L]
     value_name <- names(positional)[vapply(positional, identical, logical(1), TRUE)]
+    # Treat supplied positional values as filled arguments for completion.
+    # R permits named insertion to rematch them, but that is not a useful
+    # default suggestion. Forwarded dots have unknown contents and bindings.
+    supplied_names <- if (forwarded_dots) character() else
+        setdiff(names(positional)[!vapply(positional, identical, logical(1), TRUE)], "...")
     Filter(function(item) {
         if (is_value(item)) return(length(value_name) == 1L &&
             identical(item$detail, paste0("value for ", value_name)))
         if (!is_parameter(item)) return(TRUE)
         name <- console_argument_name(item)
         if (name == "...") return(TRUE)
-        if (name %in% names(syntax)) return(FALSE)
+        if (name %in% c(names(syntax), supplied_names)) return(FALSE)
         if (forwarded_dots) return(TRUE)
         candidate <- syntax
         names(candidate)[cursor_slot] <- name
