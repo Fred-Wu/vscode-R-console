@@ -5,7 +5,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { session } = require("../helpers/persistent-session.cjs");
-const { PersistentSessionRegistry } = loadSource("src/Runtime/persistentSessionRegistry.ts");
+const { PersistentSessionRegistry, getPersistentSessionRegistryPath } = loadSource("src/Runtime/persistentSessionRegistry.ts");
 
 function fixture(t, content) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-upgrade-test-"));
@@ -14,6 +14,51 @@ function fixture(t, content) {
   fs.writeFileSync(file, typeof content === "string" ? content : JSON.stringify(content));
   return { file, registry: new PersistentSessionRegistry(file), read: () => JSON.parse(fs.readFileSync(file, "utf8")) };
 }
+
+test("workspace sessions keep their existing registry path", async () => {
+  const storagePath = path.join(os.tmpdir(), "workspace-storage");
+  assert.equal(await getPersistentSessionRegistryPath({ storageUri: { fsPath: storagePath } }),
+    path.join(storagePath, "persistent-sessions.json"));
+});
+
+test("folderless windows preserve separate sessions across saves and reloads", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-folderless-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const stateA = new Map();
+  const stateB = new Map();
+  const context = (state) => ({
+    globalStorageUri: { fsPath: directory },
+    workspaceState: {
+      get: (key) => state.get(key),
+      update: async (key, value) => { state.set(key, value); },
+    },
+  });
+  const [fileA, fileB] = await Promise.all([
+    getPersistentSessionRegistryPath(context(stateA)),
+    getPersistentSessionRegistryPath(context(stateB)),
+  ]);
+  assert.notEqual(fileA, fileB);
+  const registryA = new PersistentSessionRegistry(fileA);
+  const registryB = new PersistentSessionRegistry(fileB);
+  assert.deepEqual(await registryA.load(), []);
+  assert.deepEqual(await registryB.load(), []);
+  const sessionsA = [session(), session()];
+  const sessionsB = [session()];
+  assert.equal(registryA.save(sessionsA), true);
+  assert.equal(registryB.save(sessionsB), true);
+
+  // New contexts reuse persisted state, as after an extension host reload.
+  const reloadedFileA = await getPersistentSessionRegistryPath(context(new Map(stateA)));
+  const reloadedFileB = await getPersistentSessionRegistryPath(context(new Map(stateB)));
+  assert.equal(reloadedFileA, fileA);
+  assert.equal(reloadedFileB, fileB);
+  assert.deepEqual(await new PersistentSessionRegistry(reloadedFileA).load(), sessionsA);
+  assert.deepEqual(await new PersistentSessionRegistry(reloadedFileB).load(), sessionsB);
+
+  // Closing all sessions in B must not remove A's reconnect records.
+  assert.equal(registryB.save([]), true);
+  assert.deepEqual(await new PersistentSessionRegistry(fileA).load(), sessionsA);
+});
 
 test("an upgrade retains old records while authenticated sessions remain reconnectable", async (t) => {
   const old = session({ legacy: true });
