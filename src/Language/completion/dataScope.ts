@@ -4,15 +4,16 @@
 import { TokenType, continuesExpressionLine, isNameAccessor, isCompleteIdentifier, type Token } from "../lexer";
 import type { QualifiedCompletionContext } from "./contextParser";
 
-const DATA_MASK_FUNCTIONS = new Set([
-  "with", "subset", "transform", "within", "mutate", "filter", "select",
-  "summarize", "summarise", "arrange", "group_by",
-]);
+const DATA_MASK_PACKAGES: Record<string, string> = {
+  with: "base", subset: "base", transform: "base", within: "base",
+  mutate: "dplyr", filter: "dplyr", select: "dplyr", summarize: "dplyr",
+  summarise: "dplyr", arrange: "dplyr", group_by: "dplyr",
+};
 
 /** Resolve only active data scopes. Completed calls and earlier statements
  * cannot contribute columns; delimiters in literals and comments are inert. */
 export function getDataCompletionObject(code: string, sourceTokens: Token[], getQualifiedCompletionContext: (code: string, tokens: Token[]) => QualifiedCompletionContext | undefined): string | undefined {
-  type Frame = { opening?: string; index: number; call?: string; pipe?: number; pipeInput?: number };
+  type Frame = { opening?: string; index: number; masksData?: boolean; pipe?: number; pipeInput?: number };
   const frames: Frame[] = [{ index: -1 }];
   const tokens: Token[] = [];
   let lineBreak = false;
@@ -36,10 +37,15 @@ export function getDataCompletionObject(code: string, sourceTokens: Token[], get
         ? previous.value : undefined;
       let head = index - 1;
       if (call) while (head >= 2 && isNameAccessor(tokens[head - 1]) && isCompleteIdentifier(tokens[head - 2])) head -= 2;
+      const accessor = tokens[index - 2];
+      const qualified = isNameAccessor(accessor);
+      const masksData = !!call && Object.hasOwn(DATA_MASK_PACKAGES, call) &&
+        (!qualified || ((accessor.value === "::" || accessor.value === ":::") &&
+          head === index - 3 && tokens[head].value === DATA_MASK_PACKAGES[call]));
       const operator = tokens[head - 1];
       const pipeInput = call && operator?.type === TokenType.Operator && (operator.value === "|>" || operator.value === "%>%")
         ? frame.pipe : undefined;
-      for (const opening of token.value) frames.push({ opening, index, call, pipeInput });
+      for (const opening of token.value) frames.push({ opening, index, masksData, pipeInput });
     } else if ([TokenType.RightParen, TokenType.RightBracket, TokenType.RightBrace].includes(token.type)) {
       for (const closing of token.value) {
         if (frames.length === 1 || frames.pop()?.opening !== ({ ")": "(", "]": "[", "}": "{" }[closing])) return undefined;
@@ -58,13 +64,18 @@ export function getDataCompletionObject(code: string, sourceTokens: Token[], get
     // index expressions just to produce suggestions.
     return object?.hasSubscript ? object.baseObject : object?.objectName;
   };
+  const ordinaryCallPipes = new Set<number>();
   for (const frame of frames.reverse()) {
-    if (frame.pipe !== undefined) {
+    if (frame.pipe !== undefined && !ordinaryCallPipes.has(frame.pipe)) {
       return objectBefore(frame.pipe);
     }
     // A direct pipe target receives its data before explicitly written
     // arguments. A nested data-mask call can establish its own object instead.
-    if (frame.pipeInput !== undefined) return objectBefore(frame.pipeInput);
+    if (frame.pipeInput !== undefined) {
+      if (frame.masksData) return objectBefore(frame.pipeInput);
+      // Passing an object as the first argument does not expose its columns.
+      ordinaryCallPipes.add(frame.pipeInput);
+    }
     if (frame.opening === "[") {
       const previous = tokens[frame.index - 1];
       const placeholder = previous?.type === TokenType.Identifier &&
@@ -73,7 +84,7 @@ export function getDataCompletionObject(code: string, sourceTokens: Token[], get
       const object = objectBefore(tokens[frame.index].position);
       return object;
     }
-    if (frame.call && DATA_MASK_FUNCTIONS.has(frame.call)) {
+    if (frame.masksData) {
       const argument = tokens[frame.index + 1];
       if (argument?.type === TokenType.Identifier && argument.closed !== false &&
           tokens[frame.index + 2]?.type === TokenType.Comma) return argument.value;

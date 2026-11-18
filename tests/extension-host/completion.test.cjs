@@ -21,10 +21,10 @@ suite("Completion in the VS Code extension host", () => {
       return { text, currentLine: lines[cursorRow], lines, cursorRow,
         cursorCol: before.split("\n").at(-1).length, textBeforeCursor: before };
     };
-    const complete = async (text, session, cursor = text.length) => {
+    const complete = async (text, session, cursor = text.length, force = false) => {
       const input = snapshot(text, cursor);
       let items;
-      await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+      await lang.handleAutocomplete({ input, force, getCurrentInput: () => input,
         getWorkspaceData: () => session, applyCompletion() {},
         onInlineEntries: result => { items = result; } });
       assert.ok(Array.isArray(items), `completion results for ${text}`);
@@ -49,6 +49,19 @@ suite("Completion in the VS Code extension host", () => {
         lst: { names: ['alpha', 'beta'] }, index: { type: 'character' },
       } }, indexText.length - 2);
       assert.deepEqual(indexItems.map(item => item.insertText), ['index']);
+      const indexSession = { globalenv: {
+        lst: { names: ['alpha', 'beta'] }, index: { type: 'character' },
+        unrelated_function: { type: 'closure' },
+      } };
+      const emptyIndex = await complete('lst[[', indexSession);
+      assert.deepEqual(emptyIndex.map(item => item.insertText), ['"alpha"', '"beta"']);
+      assert.equal(lang.refineInlineCompletion(snapshot('lst[[ind')), undefined,
+        'typing in an empty index must request newly eligible symbols');
+      assert.deepEqual((await complete('lst[[ind', indexSession)).map(item => item.insertText), ['index']);
+      for (const text of ['base::atan2(y = ', '# unrelated', '"unrelated', '# ', '"', 'r"--(']) {
+        assert.deepEqual(await complete(text, indexSession, text.length, true), [], text);
+      }
+
       const unfinished = '{\n  g <- function(`a b`, normal) NULL\n  g(`a b` = 1, ';
       const remaining = await complete(unfinished);
       assert.deepEqual(remaining.filter(item => item.detail === "parameter").map(item => item.insertText), ["normal = "]);

@@ -14,8 +14,8 @@ const contextAt = marked => {
 };
 
 test("quoted argument values do not request irrelevant runtime columns", async () => {
-  const text = 'df |> choose(method = "a")';
-  const context = contextAt('df |> choose(method = "a│")');
+  const text = 'df |> subset(method = "a")';
+  const context = contextAt('df |> subset(method = "a│")');
   assert.equal(context.dataObjectName, 'df');
   let columnRequests = 0;
   const entries = await completion.collectCompletionEntries(context, { getText: () => text },
@@ -70,6 +70,12 @@ test("data completion follows active lexical scopes and the current pipe", () =>
     ['old_df |> base::subset(new_df, │)', 'old_df'],
     ['old_df |> fun(subset(new_df, │))', 'new_df'],
     ['old_df |> subset(new_df |> subset(│))', 'new_df'],
+    ['df |> print(│)', undefined], ['df %>% mean(│)', undefined],
+    ['df |> stats::filter(│)', undefined], ['df |> obj$filter(│)', undefined],
+    ['stats::filter(df, │)', undefined], ['obj$filter(df, │)', undefined],
+    ['dplyr::filter(df, │)', 'df'], ['df |> dplyr::filter(│)', 'df'],
+    ['with(outer_df, df |> print(│))', 'outer_df'],
+    ['with(outer_df, stats::filter(df, │))', 'outer_df'],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0];
     const lines = text.split('\n'), row = before.split('\n').length - 1;
@@ -361,5 +367,80 @@ test("outer-call parameters and literal choices cannot leak into other cursor co
         ],
       });
     assert.ok(entries.every(entry => entry.role !== 'argument' && entry.role !== 'value'), text);
+  }
+});
+
+
+test("empty contextual tokens never enumerate ambient symbols or history", async () => {
+  for (const marked of [
+    'lst[[│]]', 'lst[│]', 'lst[, │]', 'lst[[1]][[│]]', 'obj$data[[│]]',
+    '`a b`[[│]]', '变量[[│]]', 'fun(│)', 'fun(x, │)', 'fun(arg = │)',
+    'with(lst, │)', 'with(lst, { 1 + │ })', 'lst |> subset(│)',
+  ]) {
+    const context = contextAt(marked), text = marked.replace('│', '');
+    const globalenv = new Proxy({ lst: { type: 'list', names: ['alpha', 'lst'] } }, {
+      ownKeys() { assert.fail('empty contextual tokens must not enumerate the session: ' + marked); },
+    });
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text },
+      { line: 0, character: context.snapshotCursor }, { globalenv }, [], ['history_value <- 1'], {
+        provideCompletionItems: async () => [
+          { label: 'unrelated_function', kind: 2 }, { label: 'unrelated_variable', kind: 5 },
+          { label: 'alpha', kind: 4, data: { type: 'scope' } },
+          { label: 'arg', kind: 5, detail: 'parameter', insertText: 'arg = ' },
+        ],
+      });
+    assert.ok(entries.some(entry => entry.label === 'alpha'), marked);
+    assert.ok(entries.every(entry => entry.kind === 4 || entry.role === 'argument'), marked);
+    assert.equal(entries.some(entry => entry.role === 'argument'), !!context.argumentTags, marked);
+  }
+});
+
+test("typed indices preserve expression variables including self references", async () => {
+  for (const [marked, name, type] of [
+    ['lst[[ind│]]', 'index', 'character'], ['lst[ind│]', 'index', 'integer'],
+    ['x[x│]', 'x', 'double'], ['DT[D│]', 'DT', 'list'],
+  ]) {
+    const entries = await completion.collectCompletionEntries(contextAt(marked), undefined, undefined,
+      { globalenv: { [name]: { type } } }, [], ['index_history <- 1']);
+    assert.ok(entries.some(entry => entry.label === name && entry.kind === 5), marked);
+    if (name === 'index') assert.ok(entries.some(entry => entry.label === 'index_history'), marked);
+  }
+});
+
+test("member chains never guess fields from unrelated current or recent input", async () => {
+  for (const marked of ['lst[[1]]$│', 'lst[[1]]$al│', 'obj$│', 'obj@│']) {
+    const entries = await completion.collectCompletionEntries(contextAt(marked), undefined, undefined,
+      undefined, [], ['alpha_unrelated <- 1'], undefined, async () => [{ name: 'alpha' }], 'alpha_unrelated');
+    assert.deepEqual(entries.map(entry => entry.label), ['alpha'], marked);
+  }
+});
+
+test("literal and comment contexts cannot request generic code completions", async () => {
+  for (const marked of ['# │', '"│', 'r"--(│', '# glo│', '"glo│', 'r"--(glo│', 'fun(# glo│', 'fun(r"--(glo│']) {
+    const context = contextAt(marked);
+    assert.equal(context.suppressAutomatic, true, marked);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => marked },
+      { line: 0, character: context.snapshotCursor }, { globalenv: { global_value: {} } }, [], ['global_history'], {
+        provideCompletionItems: async () => { assert.fail('no code request inside ' + marked); },
+      }, async () => { assert.fail('no runtime probe inside ' + marked); });
+    assert.deepEqual(entries, [], marked);
+  }
+});
+
+test("empty-to-typed refinement refreshes newly eligible sources and then reuses typed results", async () => {
+  const { refineCompletionEntries } = loadSource('src/Language/completion/refinement.ts');
+  const input = text => ({ text, textBeforeCursor: text, cursorRow: 0 });
+  for (const text of ['lst[[', 'lst[', 'fun(', 'fun(arg = ', 'with(lst, ']) {
+    const context = completion.getCompletionContext(text, text.length);
+    const session = { globalenv: { index: { type: 'character' } } };
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, session, []);
+    assert.ok(!entries.some(entry => entry.label === 'index'), text);
+    const typedText = text + 'ind', typedContext = completion.getCompletionContext(typedText, typedText.length);
+    assert.equal(refineCompletionEntries({ input: input(text), context, entries }, input(typedText), typedContext), undefined);
+    const typedEntries = await completion.collectCompletionEntries(typedContext, undefined, undefined, session, []);
+    assert.ok(typedEntries.some(entry => entry.label === 'index'), text);
+    const nextText = typedText + 'e', nextContext = completion.getCompletionContext(nextText, nextText.length);
+    assert.ok(refineCompletionEntries({ input: input(typedText), context: typedContext, entries: typedEntries },
+      input(nextText), nextContext).some(entry => entry.label === 'index'), text);
   }
 });

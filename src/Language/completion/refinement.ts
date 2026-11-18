@@ -1,3 +1,4 @@
+import { allowsSymbolCompletions } from "./policy";
 import type { CompletionContext, CompletionEntries, CompletionEntry } from "./types";
 
 // Structural input contract shared by terminal snapshots and picker previews.
@@ -21,7 +22,8 @@ export function refineCompletionEntries(
   input: CompletionInput, context: CompletionContext
 ): CompletionEntries | undefined {
   const old = cached.context;
-  if (context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
+  if (allowsSymbolCompletions(context) !== allowsSymbolCompletions(old) ||
+      context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
       (context.argumentTags === undefined) !== (old.argumentTags === undefined) ||
       input.cursorRow !== cached.input.cursorRow || !context.prefix.startsWith(old.prefix) ||
       input.textBeforeCursor.slice(0, input.textBeforeCursor.length - context.prefix.length) !==

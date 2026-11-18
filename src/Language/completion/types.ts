@@ -17,7 +17,6 @@ export type CompletionContext = {
   pipe?: boolean;
   autoTrigger?: boolean;
   suppressAutomatic?: boolean;
-  chainedBracket?: boolean;
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
   // Source tags from the lexer, available only at an argument-name position.

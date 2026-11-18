@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry } from "./types";
 import { R_RESERVED_WORDS } from "./candidates";
+import { allowsSymbolCompletions } from "./policy";
 
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;
 const BACKTICKED_R_NAME_PATTERN = /`(?:\\.|[^`\\])*`/g;
@@ -9,22 +10,11 @@ export function getConsoleBufferCompletions(
   currentInputText: string,
   recentConsoleEntries: string[]
 ): CompletionEntry[] {
-  if (
-    (context.prefix.length === 0 &&
-      !((context.kind === "bracket" || context.kind === "member") && context.chainedBracket)) ||
-    (context.kind !== "default" &&
-      context.kind !== "argument" &&
-      context.kind !== "bracket" &&
-      !(context.kind === "member" && context.chainedBracket))
-  ) {
-    return [];
-  }
+  if (!allowsSymbolCompletions(context) || !context.prefix || context.pipe) return [];
 
   const result: CompletionEntry[] = [];
   const seen = new Set<string>();
-  const sources = context.prefix.length === 0
-    ? [currentInputText]
-    : [currentInputText, ...[...recentConsoleEntries].reverse()];
+  const sources = [currentInputText, ...[...recentConsoleEntries].reverse()];
 
   for (const sourceText of sources) {
     const matches = sourceText
@@ -37,8 +27,6 @@ export function getConsoleBufferCompletions(
     for (const label of matches) {
       if (
         label === context.prefix ||
-        (context.kind === "member" &&
-          (label === context.objectName || label === context.dataObjectName)) ||
         R_RESERVED_WORDS.has(label) ||
         seen.has(label)
       ) {

@@ -3,7 +3,7 @@ import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionP
 import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getRuntimeArgumentCompletions, getDataColumnCompletions, getRuntimeDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
-import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry, isCallableCompletionKind } from "./candidates";
+import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
 
 export async function collectCompletionEntries(
   context: CompletionContext,
@@ -16,6 +16,7 @@ export async function collectCompletionEntries(
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string
 ): Promise<CompletionEntries> {
+  if (context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
   const runtimeArguments = context.kind === "argument" &&
     (context.functionOperator === "$" || context.functionOperator === "@" ||
@@ -61,12 +62,9 @@ export async function collectCompletionEntries(
   // Otherwise, member and user-defined signatures belong to the active session.
   // A same-name package function must not supply unrelated arguments, even
   // when the session cannot currently reply or the function has no formals.
-  const rawLspItems = rawLspResult.entries.filter(entry => {
-    if (useRuntimeArguments && isArgumentCompletionEntry(entry)) return false;
-    if (context.kind === "argument" && !context.argumentTags &&
-        (entry.role === "argument" || entry.detail === "parameter")) return false;
-    return !context.pipe || isCallableCompletionKind(entry.kind);
-  });
+  const rawLspItems = useRuntimeArguments
+    ? rawLspResult.entries.filter(entry => !isArgumentCompletionEntry(entry))
+    : rawLspResult.entries;
   const lspItems =
     isGlobalSymbolContext(context)
       ? filterShadowedWorkspaceEntries(
@@ -113,13 +111,6 @@ export async function collectCompletionEntries(
     if (nativeMembers) return asCompletionEntries(filterCompletionEntries(lspItems, context.prefix), rawLspResult.isIncomplete);
     const runtimeFiltered = filterCompletionEntries(runtimeMemberItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
-    const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
-    if (context.chainedBracket && bufferFiltered.length > 0) {
-      return asCompletionEntries(
-        dedupeCompletionEntries([...runtimeFiltered, ...sessionFiltered, ...bufferFiltered]),
-        rawLspResult.isIncomplete
-      );
-    }
     if (runtimeFiltered.length > 0) {
       return asCompletionEntries(
         dedupeCompletionEntries(runtimeFiltered),
@@ -127,7 +118,7 @@ export async function collectCompletionEntries(
       );
     }
     return asCompletionEntries(
-      dedupeCompletionEntries([...sessionFiltered, ...bufferFiltered]),
+      dedupeCompletionEntries(sessionFiltered),
       rawLspResult.isIncomplete
     );
   }

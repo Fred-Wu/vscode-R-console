@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionProvider } from "./types";
+import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { isCallableName } from "./contextParser";
 import { quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
@@ -103,6 +104,11 @@ function isLanguageServerCompletionItem(
   documentUri?: string
 ): boolean {
   const role = getCompletionRole(item);
+  if (context.suppressAutomatic) return false;
+  if (context.kind !== "member" && context.kind !== "package" && !allowsSymbolCompletions(context) &&
+      role !== "argument" && role !== "value" && role !== "member" &&
+      !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
+  if (role === "argument" && !context.argumentTags) return false;
   // Native call detection can still see an outer call while our cursor is in
   // its subscript or member expression. Its arguments do not belong there.
   if ((role === "argument" || role === "value") && context.kind !== "argument") return false;

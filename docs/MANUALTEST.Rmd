@@ -455,6 +455,60 @@ Expected:
 
 ## 12. Completion And Session Watcher
 
+### Completion source contract
+
+Check both inline and Quick Pick. `│` marks the cursor. Assert the allowed
+items **and the absence of unrelated items**, including with session variables
+and recent commands populated.
+
+R's [completion documentation](https://www.stat.ethz.ch/R-manual/R-devel/library/utils/html/rcompgen.html)
+distinguishes basic symbol lookup from contextual completion and suppresses
+basic lookup for empty tokens. Member, namespace, argument, package, help,
+and filename completion have separate rules. The console applies that boundary
+to its session and recent-input supplements as well as the language server.
+
+| Cursor context | Console contract |
+| --- | --- |
+| `obj$│`, `obj@│`, including chains | Members or slots of the receiver; no unrelated history names. |
+| `pkg::│`, `pkg:::│` | Symbols from the requested namespace; no session or history additions. |
+| `f(│)`, `f(x, │)` | Available argument names and declared choices; contextual data fields where applicable. No ambient symbols on an empty token. |
+| `f(arg = │)` | Declared values and applicable data fields; no argument tags or ambient symbols. |
+| `f(arg = va│)`, `f(va│)` | Matching expression symbols; argument tags only at an argument-name position. |
+| `f(arg = "│")` | Declared literal choices only; no variable/function names. |
+| `base::atan2(1, 2, │)` | No suggestions when a known fixed signature is exhausted. Unknown signatures and `...` must not be classified as exhausted. |
+| `lst[[│]]`, `lst[│]`, `df[, │]` | Receiver names for the applicable dimension; no ambient symbols, including the receiver itself. |
+| `lst[[ind│]]` | Matching index variables/history and receiver names; preserve the console's restriction on generic LSP symbols in `[[`. |
+| `lst[["│"]]` | Literal receiver names only. |
+| `x[x│]`, `DT[D│]` | Matching expression symbols remain eligible, including the receiver. No type/name blacklist. |
+| Data-mask expression, empty token | Relevant fields and call arguments; no ambient symbol dump. |
+| Data-mask expression, typed token | Matching fields and expression symbols. |
+| `df \|> print(│)`, `stats::filter(df, │)` | Function arguments; passing a frame does not establish a data mask. |
+| Pipe destination | Callable candidates; member/namespace operators switch to their own contexts. |
+| Ordinary typed expression | Matching language-server, session, and recent-input symbols. |
+| Comment, raw string, unsupported literal context | No generic code suggestions. |
+
+The [R indexing reference](https://stat.ethz.ch/R-manual/R-devel/library/base/html/Extract.html)
+allows computed indices and class-specific methods;
+[data.table](https://rdatatable.gitlab.io/data.table/reference/data.table.html)
+also permits table/list indices and evaluates expressions against columns.
+Consequently a receiver-name or atomic-type blacklist is incorrect.
+[dplyr's programming guide](https://dplyr.tidyverse.org/articles/programming.html)
+distinguishes data masking from tidy selection; field inference must follow
+the active scope, not a completed earlier call. A pipe inserts an argument; it does not itself
+create a data mask ([R pipe semantics](https://stat.ethz.ch/R-manual/R-devel/library/base/html/pipeOp.html)).
+
+Console-specific choices include explicit top-level browsing, callable discovery
+at an empty pipe destination, filtering already supplied arguments, and the
+restricted generic LSP source in `[[`. These are product rules, not requirements
+imposed by R. Native member/value information from
+[languageserver](https://github.com/REditorSupport/languageserver/blob/master/R/completion.R)
+takes precedence over runtime fallback. Specialized installed-package, dataset,
+help, and filename suggestions depend on provider support; generic history
+items are not substitutes for those providers. This matrix does not promise
+inference for arbitrary user-defined evaluation methods.
+
+### Session checks
+
 Before running the setup below, open a fresh R Console, immediately type
 `stats::l`, and press Tab. Repeat with inline suggestions triggered by typing.
 Suggestions should include `lm` on the first request. The `R Console Language
@@ -531,7 +585,7 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | Type `library(package = , │)` or `library(│, package = )` | Exclude the supplied `package` name even with an empty value or when it follows the cursor. |
 | Manually type `stats::cor(x, │)` | Arguments appear for the new position, including `method`. |
 | Type `base::atan2(1, 2, │)` or `base::atan2(y = 1, x = 2, │)` | No suggestions: the fixed signature is exhausted; runtime variables/functions must not reopen the list. Repeat with `1 \|> base::atan2(2, │)` and a session-defined two-argument function. |
-| Type `base::Sys.time(│)`, then compare `base::list(1, 2, │)` | The known zero-argument function has no suggestions; the variadic function retains expression suggestions. Unknown signatures must not be treated as exhausted. |
+| Type `base::Sys.time(│)`, then compare `base::list(1, 2, ind│)` with `index` defined | The known zero-argument function has no suggestions; the variadic function retains matching expression suggestions once a token is typed. Unknown signatures must not be treated as exhausted. |
 | Manually type `stats::cor(↵  x, │)` | Arguments appear on the continuation line. |
 | Type `stats::cor(method = │)` | Offer `pearson`, `kendall`, and `spearman`; accepting a value inserts a quoted string, not another argument name. |
 | Type `stats::cor(method = "│")` or `stats::cor(method = '│')` | Offer known values; preserve the existing quotes when accepting one. |

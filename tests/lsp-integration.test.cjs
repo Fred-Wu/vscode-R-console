@@ -675,6 +675,7 @@ test("fuzzy fallback preserves value, comment and member-call identities", { tim
     const before = input.slice(0, cursor);
     const column = before.split("\n").at(-1).length;
     const context = completion.getCompletionContext(input.split("\n")[1], column, before, input.slice(cursor));
+    const previousRequests = instances.at(-1)?.requests.length ?? 0;
     const entries = await completion.collectCompletionEntries(context, { getText: () => input },
       { line: 1, character: column }, undefined, [input.split("\n")[0]], [], {
         provideCompletionItems: async (...args) => {
@@ -684,6 +685,11 @@ test("fuzzy fallback preserves value, comment and member-call identities", { tim
           }));
         },
       });
+    if (context.suppressAutomatic) {
+      assert.deepEqual(entries, [], input);
+      assert.equal(instances.at(-1)?.requests.length ?? 0, previousRequests, 'literal/comment context must not query code completions');
+      continue;
+    }
     const requests = instances.at(-1).requests.filter(request => request.params?.position).slice(-2);
     assert.equal(requests[0].params.position.character, column, input);
     assert.equal(requests[1].params.position.character, column - 2, input);
@@ -1494,10 +1500,10 @@ test("exhausted fixed-arity calls suppress all completion sources", { timeout: 9
     ['base::Sys.time(│)', true], ['Sys.time(│)', true],
     ['f <- function() NULL\nf(│)', true],
     ['f <- function(a,b) NULL\nf(1,2, │)', true],
-    ['base::atan2(1, │)', false], ['base::atan2(1, x=│)', false],
-    ['base::list(1,2, │)', false], ['unknown_function(1,2, │)', false],
-    ['base::unknown_function(1,2, │)', false],
-    ['f <- function(a,...) NULL\nf(1,2, │)', false],
+    ['base::atan2(1, run│)', false], ['base::atan2(1, x=run│)', false],
+    ['base::list(1,2, run│)', false], ['unknown_function(1,2, run│)', false],
+    ['base::unknown_function(1,2, run│)', false],
+    ['f <- function(a,...) NULL\nf(1,2, run│)', false],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     const before = text.slice(0, cursor), lines = text.split('\n');
@@ -1535,10 +1541,10 @@ test("runtime argument exhaustion preserves variadic and unknown signatures", as
   const session = { globalenv: { f: { type: 'closure' }, runtime_function: { type: 'closure' } } };
   for (const [definition, marked, exhausted] of [
     ['function(a,b) NULL', 'f(1,2, │)', true],
-    ['function(a,b) NULL', 'f(1, │)', false],
+    ['function(a,b) NULL', 'f(1, run│)', false],
     ['function() NULL', 'f(│)', true],
-    ['function(a,...) NULL', 'f(1,2, │)', false],
-    ['function(...) NULL', 'f(1,2, │)', false],
+    ['function(a,...) NULL', 'f(1,2, run│)', false],
+    ['function(...) NULL', 'f(1,2, run│)', false],
     ['function(a,b) NULL', 'obj$f(1,2, │)', true],
   ]) {
     const text = marked.replace('│', ''), cursor = marked.indexOf('│');
@@ -1549,7 +1555,7 @@ test("runtime argument exhaustion preserves variadic and unknown signatures", as
     if (exhausted) assert.equal(entries.length, 0, marked);
     else assert.ok(entries.some(entry => entry.label === 'runtime_function'), marked);
   }
-  const unknown = await completion.collectCompletionEntries(completion.getCompletionContext('f(1,2, ', 7),
+  const unknown = await completion.collectCompletionEntries(completion.getCompletionContext('f(1,2, run', 10),
     undefined, undefined, session, [], [], undefined, async () => undefined);
   assert.ok(unknown.some(entry => entry.label === 'runtime_function'));
 });
@@ -1594,18 +1600,25 @@ test("completion sources stay inside every R cursor context", { timeout: 90000 }
     const entries = await collect(marked);
     assert.deepEqual(labels(entries.filter(item => item.kind === 4)), ['zebra', 'alpha', 'beta'], marked);
     assert.ok(entries.some(item => item.role === 'argument'), marked);
+    assert.ok(entries.every(item => item.role === 'argument' || item.role === 'value' || item.kind === 4), marked);
   }
   for (const marked of ['df[│]', 'df[, │]', 'df[[│]]']) {
     const entries = await collect(marked);
     assert.deepEqual(labels(entries.filter(item => item.kind === 4)), ['zebra', 'alpha', 'beta'], marked);
-    assert.ok(entries.every(item => item.source !== 'lsp' || item.role === 'member' || item.role === 'scope'), marked);
+    assert.ok(entries.every(item => item.kind === 4), marked);
+  }
+  for (const marked of ['df |> print(│)', 'df |> stats::filter(│)', 'stats::filter(df, │)']) {
+    const entries = await collect(marked);
+    assert.ok(!entries.some(item => item.kind === 4), marked);
+    assert.ok(!entries.some(item => item.label.startsWith('global_')), marked);
   }
   const ordinary = labels(await collect('global_│'));
   for (const name of ['global_function', 'global_value', 'global_history']) assert.ok(ordinary.includes(name));
   const args = await collect('base::atan2(y=1, │)');
   assert.ok(args.some(item => item.insertText === 'x = '));
   assert.ok(args.every(item => item.insertText !== 'y = '));
-  const value = await collect('base::atan2(y=│)');
+  assert.deepEqual(await collect('base::atan2(y=│)'), []);
+  const value = await collect('base::atan2(y=glo│)');
   assert.ok(value.some(item => item.label === 'global_value'));
   assert.ok(value.every(item => item.role !== 'argument'));
 });

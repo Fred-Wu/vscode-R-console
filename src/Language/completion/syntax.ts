@@ -52,7 +52,6 @@ export function getCompletionContext(
       triggerCharacter: prefix.length === 0 ? operator : undefined,
       objectName: isPlaceholderMember ? dataObjectName : baseObject ?? member.objectName,
       operator,
-      chainedBracket: isBracketChainMember,
       dataObjectName: isPlaceholderMember ? dataObjectName : undefined,
       snapshotInput,
       snapshotCursor,
@@ -75,7 +74,6 @@ export function getCompletionContext(
       bracketQuote: bracket.quote,
       bracketDimension: bracket.dimension,
       bracketDimensions: bracket.dimensions,
-      chainedBracket: bracket.objectName.includes("[") || isPlaceholderBracket,
       dataObjectName: effectiveDataObject,
       operator: undefined,
       snapshotInput,
@@ -115,7 +113,7 @@ export function getCompletionContext(
   const wordMatch = /([\p{L}\p{Nl}._][\p{L}\p{Nl}\p{Nd}._]*)$/u.exec(beforeCursor);
 
   if (!wordMatch) {
-    if (dataObjectName) {
+    if (dataObjectName || inLiteral) {
       return {
         kind: "default",
         suppressAutomatic: inLiteral,

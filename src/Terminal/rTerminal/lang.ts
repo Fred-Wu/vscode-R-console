@@ -101,7 +101,7 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
-    if (!context) {
+    if (!context || context.suppressAutomatic) {
       onInlineEntries?.([]);
       return;
     }

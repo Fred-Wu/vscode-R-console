@@ -93,8 +93,11 @@ test("nested bracket completion queries the complete object instead of an unrela
       return [{ name: "quoted:correct" }];
     });
   assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.insertText), ['"correct"']);
-  assert.ok(entries.some(item => item.insertText === "data" && item.kind === 5),
-    "global variables remain available as index expressions");
+  assert.deepEqual(entries.map(item => item.insertText), ['"correct"']);
+  const typed = await completion.collectCompletionEntries(contextAt("obj$data[[da│]]"), undefined, undefined,
+    { globalenv: { data: { type: "integer" } } }, []);
+  assert.ok(typed.some(item => item.insertText === "data" && item.kind === 5),
+    "typed index expressions retain matching variables");
 });
 
 test("named values and pipe destinations have distinct completion contexts", () => {

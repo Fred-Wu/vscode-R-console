@@ -145,3 +145,23 @@ test('an authoritative empty delayed response clears staged Quick Pick entries',
   await tick();
   assert.deepEqual(picker.labels(), []);
 });
+
+test('Quick Pick refreshes ambient symbols when an empty contextual slot becomes typed', async t => {
+  for (const text of ['lst[[', 'lst[', 'fun(', 'fun(arg = ', 'with(lst, ']) {
+    const session = { globalenv: { index: { type: 'character' } } };
+    const context = completion.getCompletionContext(text, text.length);
+    const initial = await completion.collectCompletionEntries(context, undefined, undefined, session, []);
+    const calls = [];
+    const picker = await openPicker(t, text, initial, async next => {
+      calls.push(next.prefix);
+      return completion.collectCompletionEntries(next, undefined, undefined, session, []);
+    });
+    assert.deepEqual(picker.labels(), [], text);
+    await picker.type('i');
+    assert.deepEqual(picker.labels(), ['index'], text);
+    await picker.type('in');
+    assert.deepEqual(calls, ['i'], text);
+    await picker.type('');
+    assert.deepEqual(picker.labels(), [], text);
+  }
+});

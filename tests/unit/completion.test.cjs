@@ -84,7 +84,7 @@ test("session member formals replace unrelated LSP arguments and remain in the A
         assert.equal(trigger, "$");
         return [{ name: "member_arg" }, { name: "a b" }, { name: "..." }];
       });
-    assert.deepEqual(entries.map(entry => entry.insertText), ["member_arg = ", "`a b` = ", "data"]);
+    assert.deepEqual(entries.map(entry => entry.insertText), ["member_arg = ", "`a b` = "]);
     const picks = completion.toCompletionQuickPickItems(entries, context);
     assert.equal(picks[0].label, "Arguments");
     assert.equal(picks[1].insertText, "member_arg = ");
@@ -225,7 +225,6 @@ test("member completion sends token-derived objects and keeps line-relative repl
     assert.equal(context.kind, "member", input);
     assert.equal(context.prefix, prefix, input);
     assert.equal(context.replaceStart, line.length - prefix.length, input);
-    assert.equal(context.chainedBracket, false, input);
     let requests = 0;
     await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
       async expression => { requests++; assert.equal(expression, objectName, input); return []; });
@@ -237,7 +236,6 @@ test("subscript member detection preserves base-object lookup without evaluating
   const input = "obj[[stop('must not execute')]]$fi";
   const context = completion.getCompletionContext(input, input.length);
   assert.equal(context.kind, "member");
-  assert.equal(context.chainedBracket, true);
   await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
     async expression => { assert.equal(expression, "obj"); return []; });
 });
@@ -280,7 +278,8 @@ test("member value completion keeps variables but never requests or inserts para
           ],
         }, async () => { requests++; return [{ name: "first" }]; });
       assert.equal(requests, context.argumentValue ? 1 : 0, input);
-      assert.ok(entries.some(entry => entry.insertText === "first_value"), input);
+      assert.equal(entries.some(entry => entry.insertText === "first_value"),
+        !context.suppressAutomatic && !context.argumentValue?.quote, input);
       assert.ok(entries.every(entry => entry.detail !== "parameter" && !entry.insertText.endsWith(" = ")), input);
     }
   }
@@ -1676,8 +1675,12 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
     let published;
     await lang.handleAutocomplete({ ...request, onInlineEntries: items => { published = items; } });
     assert.deepEqual(labels(published), ordered, `inline: ${text}`);
-    assert.deepEqual(labels(lang.refineInlineCompletion(snapshot(text + "b"))), ordered.filter(label => label.includes("b")),
-      `cache: ${text}`);
+    const refined = lang.refineInlineCompletion(snapshot(text + "b"));
+    if (["df$", "obj@", "pkg::", "pkg:::"].includes(text)) {
+      assert.deepEqual(labels(refined), ordered.filter(label => label.includes("b")), `cache: ${text}`);
+    } else {
+      assert.equal(refined, undefined, `first typed token must fetch newly eligible symbols: ${text}`);
+    }
     const showing = lang.handleAutocomplete(request);
     await new Promise(resolve => setImmediate(resolve));
     try {

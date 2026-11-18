@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
 import { quoteRNameIfNeeded, getFieldInsertText, quoteCompletionValue } from "./candidates";
+import { allowsSymbolCompletions } from "./policy";
 
 function isSessionFunction(item: GlobalEnvItem): boolean {
   return item.type === "closure" || item.type === "builtin" || item.type === "special" ||
@@ -9,7 +10,11 @@ function isSessionFunction(item: GlobalEnvItem): boolean {
 
 export function isSessionFunctionCall(context: CompletionContext, data: WorkspaceData | undefined): boolean {
   if (context.functionOperator || !context.functionName) return false;
-  return Object.entries(data?.globalenv ?? {}).some(([name, item]) => isSessionFunction(item) &&
+  const globals = data?.globalenv;
+  if (!globals) return false;
+  if (Object.hasOwn(globals, context.functionName)) return isSessionFunction(globals[context.functionName]);
+  if (!context.functionName.startsWith("`")) return false;
+  return Object.entries(globals).some(([name, item]) => isSessionFunction(item) &&
     (context.functionName === name ||
       context.functionName === `\`${name.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\``));
 }
@@ -43,7 +48,7 @@ export function getSessionCompletions(
     }));
   }
 
-  if (context.kind === "package") {
+  if (!allowsSymbolCompletions(context)) {
     return [];
   }
 
