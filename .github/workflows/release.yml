@@ -390,8 +390,9 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install locked Marketplace CLI
+        # This job can request publishing credentials; do not run dependency install scripts.
+        run: npm ci --ignore-scripts
 
       - name: Download VSIX artifacts
         uses: actions/download-artifact@v8
@@ -401,7 +402,7 @@ jobs:
           path: release-artifacts
 
       - name: Publish VS Code Marketplace
-        run: npx @vscode/vsce publish --oidc --skip-duplicate --packagePath ./release-artifacts/*.vsix
+        run: ./node_modules/.bin/vsce publish --oidc --skip-duplicate --packagePath ./release-artifacts/*.vsix
 
   publish-open-vsx:
     if: >-
