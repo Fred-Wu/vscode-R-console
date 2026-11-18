@@ -41,6 +41,14 @@ suite("Completion in the VS Code extension host", () => {
       assert.ok(values.every(item => item.detail !== "parameter"));
       const filtered = lang.refineInlineCompletion(snapshot('stats::cor(method = "sp'));
       assert.deepEqual(filtered.filter(item => "insertText" in item).map(item => item.insertText), ["spearman"]);
+      const runtime = { globalenv: { runtime_function: { type: 'closure' } } };
+      const exhaustedText = 'base::atan2(1,2, )';
+      assert.deepEqual(await complete(exhaustedText, runtime, exhaustedText.length - 1), []);
+      const indexText = 'lst <- list(alpha = 10, beta = 20)\nindex <- "beta"\nlst[[ind]]';
+      const indexItems = await complete(indexText, { globalenv: {
+        lst: { names: ['alpha', 'beta'] }, index: { type: 'character' },
+      } }, indexText.length - 2);
+      assert.deepEqual(indexItems.map(item => item.insertText), ['index']);
       const unfinished = '{\n  g <- function(`a b`, normal) NULL\n  g(`a b` = 1, ';
       const remaining = await complete(unfinished);
       assert.deepEqual(remaining.filter(item => item.detail === "parameter").map(item => item.insertText), ["normal = "]);

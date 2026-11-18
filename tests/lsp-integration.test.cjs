@@ -1483,3 +1483,129 @@ test("native constructor signatures exclude supplied arguments without runtime f
     assert.equal(probes, 0);
   }
 });
+
+test("exhausted fixed-arity calls suppress all completion sources", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const session = { globalenv: { runtime_function: { type: 'closure' }, runtime_value: { type: 'double' } } };
+  for (const [marked, exhausted] of [
+    ['base::atan2(1,2, │)', true], ['base::atan2(y=1,x=2, │)', true],
+    ['base::atan2(1, │, 2)', true], ['1 |> base::atan2(2, │)', true],
+    ['base::atan2(1,2, run│)', true],
+    ['base::Sys.time(│)', true], ['Sys.time(│)', true],
+    ['f <- function() NULL\nf(│)', true],
+    ['f <- function(a,b) NULL\nf(1,2, │)', true],
+    ['base::atan2(1, │)', false], ['base::atan2(1, x=│)', false],
+    ['base::list(1,2, │)', false], ['unknown_function(1,2, │)', false],
+    ['base::unknown_function(1,2, │)', false],
+    ['f <- function(a,...) NULL\nf(1,2, │)', false],
+  ]) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const before = text.slice(0, cursor), lines = text.split('\n');
+    const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
+    const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, session,
+      lines.slice(0, row), ['recent_symbol'], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } });
+    if (exhausted) assert.equal(entries.length, 0, marked);
+    else assert.ok(entries.some(item => item.label === 'runtime_function'), marked);
+  }
+});
+
+test("unquoted list indices prioritize matching index variables", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const text = 'lst <- list(alpha = 10, beta = 20)\nindex <- "beta"\nlst[[ind]]';
+  const line = text.split('\n').at(-1), col = line.indexOf(']]');
+  const context = completion.getCompletionContext(line, col, text.slice(0, -2), ']]');
+  const session = { globalenv: { lst: { names: ['alpha', 'beta'] }, index: { type: 'character' } } };
+  const entries = await completion.collectCompletionEntries(context, { getText: () => text, uri: client.inputDocument.uri },
+    { line: 2, character: col }, session, text.split('\n').slice(0, 2), [], {
+      provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      },
+    });
+  assert.deepEqual(entries.map(item => item.label), ['index']);
+  assert.equal(entries[0].insertText, 'index');
+});
+
+test("runtime argument exhaustion preserves variadic and unknown signatures", async () => {
+  const session = { globalenv: { f: { type: 'closure' }, runtime_function: { type: 'closure' } } };
+  for (const [definition, marked, exhausted] of [
+    ['function(a,b) NULL', 'f(1,2, │)', true],
+    ['function(a,b) NULL', 'f(1, │)', false],
+    ['function() NULL', 'f(│)', true],
+    ['function(a,...) NULL', 'f(1,2, │)', false],
+    ['function(...) NULL', 'f(1,2, │)', false],
+    ['function(a,b) NULL', 'obj$f(1,2, │)', true],
+  ]) {
+    const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, cursor),
+      undefined, undefined, session, [], [], undefined, async expression => runRJson(
+        `f <- ${definition}; obj <- list(f=f); value <- eval(parse(text=inputs)); ` +
+        'cat(jsonlite::toJSON(lapply(names(value), function(n) list(name=n, type=typeof(value[[n]]))), auto_unbox=TRUE))', expression));
+    if (exhausted) assert.equal(entries.length, 0, marked);
+    else assert.ok(entries.some(entry => entry.label === 'runtime_function'), marked);
+  }
+  const unknown = await completion.collectCompletionEntries(completion.getCompletionContext('f(1,2, ', 7),
+    undefined, undefined, session, [], [], undefined, async () => undefined);
+  assert.ok(unknown.some(entry => entry.label === 'runtime_function'));
+});
+
+test("completion sources stay inside every R cursor context", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const session = { globalenv: {
+    global_function: { type: 'closure' }, global_value: { type: 'double' },
+    df: { class: ['data.frame'], names: ['zebra', 'alpha', 'beta'] },
+    object: { names: ['alpha', 'beta'] }, slot_object: { slots: ['slot_alpha', 'slot_beta'] },
+  } };
+  const collect = async marked => {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const before = text.slice(0, cursor), lines = text.split('\n');
+    const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
+    const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
+    return completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, session,
+      lines.slice(0, row), ['global_history'], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } });
+  };
+  const labels = entries => entries.map(item => item.label);
+  for (const [marked, expected] of [
+    ['object$│', ['alpha', 'beta']], ['slot_object@│', ['slot_alpha', 'slot_beta']],
+    ['df[["│"]]', ['zebra', 'alpha', 'beta']], ['df[, "│"]', ['zebra', 'alpha', 'beta']],
+    ['stats::cor(method = df[["│"]])', ['zebra', 'alpha', 'beta']],
+    ['stats::cor(method = "│")', ['pearson', 'kendall', 'spearman']],
+  ]) assert.deepEqual(labels(await collect(marked)), expected, marked);
+  for (const marked of ['base::ata│', 'base:::ata│']) {
+    const entries = await collect(marked);
+    assert.ok(entries.some(item => item.insertText === 'atan2()'), marked);
+    assert.ok(entries.every(item => item.source === 'lsp'), marked);
+  }
+  for (const marked of ['df |> │', 'df %>% │']) {
+    const entries = await collect(marked);
+    assert.ok(entries.some(item => item.label === 'global_function'), marked);
+    assert.ok(entries.every(item => [1, 2, 3].includes(item.kind)), marked);
+  }
+  for (const marked of ['subset(df, │)', 'df |> subset(│)', 'with(df, │)']) {
+    const entries = await collect(marked);
+    assert.deepEqual(labels(entries.filter(item => item.kind === 4)), ['zebra', 'alpha', 'beta'], marked);
+    assert.ok(entries.some(item => item.role === 'argument'), marked);
+  }
+  for (const marked of ['df[│]', 'df[, │]', 'df[[│]]']) {
+    const entries = await collect(marked);
+    assert.deepEqual(labels(entries.filter(item => item.kind === 4)), ['zebra', 'alpha', 'beta'], marked);
+    assert.ok(entries.every(item => item.source !== 'lsp' || item.role === 'member' || item.role === 'scope'), marked);
+  }
+  const ordinary = labels(await collect('global_│'));
+  for (const name of ['global_function', 'global_value', 'global_history']) assert.ok(ordinary.includes(name));
+  const args = await collect('base::atan2(y=1, │)');
+  assert.ok(args.some(item => item.insertText === 'x = '));
+  assert.ok(args.every(item => item.insertText !== 'y = '));
+  const value = await collect('base::atan2(y=│)');
+  assert.ok(value.some(item => item.label === 'global_value'));
+  assert.ok(value.every(item => item.role !== 'argument'));
+});

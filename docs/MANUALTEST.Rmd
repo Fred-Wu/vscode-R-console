@@ -518,6 +518,7 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | Type `popup_df[│]` | Names appear automatically; accepting `alpha` produces `popup_df["alpha"]`. |
 | Type `popup_df[, │]` | Column names appear automatically; accepting `alpha` produces `popup_df[, "alpha"]`. |
 | Type `popup_df[[│]]` | Element names appear automatically; accepting `alpha` produces `popup_df[["alpha"]]`. |
+| Run `index <- "beta"`; type `popup_df[[ind│]]` | Offer `index` as an index expression; exclude unrelated package/global LSP matches such as `find` and `cbind`. Matching element names remain available. |
 | Type `popup_df[["│"]]` or `popup_df[['│']]` | Show names including `a b`; insert inside the existing quotes without duplicating them. |
 | Type `popup_df[, "│"]` | Column names appear; accepting `a b` produces `popup_df[, "a b"]`. |
 | Type `popup_obj$data[[│]]` | Show names from `popup_obj$data`, including `alpha`, `beta`, and `a b`. |
@@ -529,9 +530,12 @@ if (requireNamespace("data.table", quietly = TRUE)) {
 | Accept `package = ` in `library()`, then type `, ` | Omit `package` from argument suggestions and highlight `help`; after accepting `help = ` and typing another comma, highlight `pos`. |
 | Type `library(package = , │)` or `library(│, package = )` | Exclude the supplied `package` name even with an empty value or when it follows the cursor. |
 | Manually type `stats::cor(x, │)` | Arguments appear for the new position, including `method`. |
+| Type `base::atan2(1, 2, │)` or `base::atan2(y = 1, x = 2, │)` | No suggestions: the fixed signature is exhausted; runtime variables/functions must not reopen the list. Repeat with `1 \|> base::atan2(2, │)` and a session-defined two-argument function. |
+| Type `base::Sys.time(│)`, then compare `base::list(1, 2, │)` | The known zero-argument function has no suggestions; the variadic function retains expression suggestions. Unknown signatures must not be treated as exhausted. |
 | Manually type `stats::cor(↵  x, │)` | Arguments appear on the continuation line. |
 | Type `stats::cor(method = │)` | Offer `pearson`, `kendall`, and `spearman`; accepting a value inserts a quoted string, not another argument name. |
 | Type `stats::cor(method = "│")` or `stats::cor(method = '│')` | Offer known values; preserve the existing quotes when accepting one. |
+| Type `stats::cor(method = popup_df[["│"]])` | Show the data frame's names only; outer-call parameters and method choices must not leak into the subscript. |
 | Type `stats::cor(method = sp│)` | Offer `spearman`; accepting it replaces `sp` with `"spearman"`. |
 | Accept `method = ` from `stats::cor(x, │)` | Known values appear automatically without another keypress. |
 | Type `popup_obj$choose(method = │)` | Offer `alpha` and `beta`; do not offer `wrong_value` from `other`. |

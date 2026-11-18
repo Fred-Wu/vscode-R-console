@@ -41,6 +41,7 @@ export type CompletionEntry = {
 
 export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
+  argumentsExhausted?: boolean;
 };
 
 export type CompletionPickItem = vscode.QuickPickItem & {
@@ -61,6 +62,7 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
   rConsoleLocalFunction?: boolean;
   rConsoleMemberResolved?: boolean;
   rConsoleNativeArguments?: boolean;
+  rConsoleArgumentsExhausted?: boolean;
 };
 
 export interface CompletionProvider {

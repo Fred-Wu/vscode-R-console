@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionContext, CompletionEntry, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
+import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
 import { quoteRNameIfNeeded, getFieldInsertText, quoteCompletionValue } from "./candidates";
 
 function isSessionFunction(item: GlobalEnvItem): boolean {
@@ -182,7 +182,7 @@ export async function getRuntimeMemberCompletions(
 export async function getRuntimeArgumentCompletions(
   context: CompletionContext,
   request?: RuntimeMemberCompletionRequester
-): Promise<CompletionEntry[]> {
+): Promise<CompletionEntries> {
   if (!request || !context.functionName || (!context.argumentTags && !context.argumentValue)) return [];
   try {
     if (context.argumentValue) {
@@ -219,9 +219,12 @@ export async function getRuntimeArgumentCompletions(
       tag === null ? "TRUE" : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
     const cursorSlot = context.argumentTags!.indexOf(null) + 2;
     const items = await request(
-      `base::local({ .fn <- (${context.functionName}); ` +
+      `base::local({ .fn <- (${context.functionName}); .exhausted <- FALSE; ` +
       `.args <- if (base::is.function(.fn)) { ` +
       `.def <- base::args(.fn); ` +
+      `.formals <- base::names(base::formals(.def)); ` +
+      `.exhausted <- !base::is.null(.def) && !("..." %in% .formals) && ` +
+      `${context.argumentTags!.length - 1}L >= base::length(.formals); ` +
       `.call <- base::as.list(base::quote(.fn(${supplied}))); ` +
       `if (base::is.null(base::names(.call))) base::names(.call) <- base::rep("", base::length(.call)); ` +
       `.candidates <- base::setdiff(base::names(base::formals(.def)), base::c("...", base::names(.call))); ` +
@@ -230,15 +233,19 @@ export async function getRuntimeArgumentCompletions(
       `base::tryCatch({ base::suppressWarnings(base::match.call(` +
       `definition = .def, call = base::as.call(.candidate), expand.dots = FALSE)); TRUE }, ` +
       `error = function(e) FALSE) }, base::logical(1))] } else NULL; ` +
-      `stats::setNames(base::as.list(.args), .args) })`, "$"
+      // Dots is never an insertable formal. Reserve it as a transport marker
+      // only when this known fixed signature has no remaining argument slot.
+      `if (.exhausted) stats::setNames(base::list(TRUE), "...") else stats::setNames(base::as.list(.args), .args) })`, "$"
     );
-    return (items ?? []).filter(item => item.name && item.name !== "...").map(item => ({
+    const entries: CompletionEntries = (items ?? []).filter(item => item.name && item.name !== "...").map(item => ({
       label: item.name,
       insertText: `${quoteRNameIfNeeded(item.name)} = `,
       kind: vscode.CompletionItemKind.Variable,
       detail: "parameter",
       source: "session",
     }));
+    if (items?.some(item => item.name === "..." && item.type === "logical")) entries.argumentsExhausted = true;
+    return entries;
   } catch {
     return [];
   }

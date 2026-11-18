@@ -73,13 +73,28 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     is_value <- function(item) is.character(item$detail) && startsWith(item$detail, "value for ")
     is_parameter <- function(item) identical(item$detail, "parameter") ||
         (!is.null(item$data$parameter) && identical(item$kind, languageserver:::CompletionItemKind$Variable))
-    if (is.null(call) || is.null(tags) ||
-        !any(vapply(items, function(item) is_parameter(item) || is_value(item), logical(1)))) return(items)
+    if (is.null(call) || is.null(tags)) return(items)
     # Ask the same provider for the complete signature, including local source
     # definitions and dots. Defaults and function bodies are never evaluated.
+    known_signature <- !is.null(signature)
     if (is.null(signature)) signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
         call$package, exported_only = call$accessor != ":::")
     formal_names <- unique(vapply(signature, console_argument_name, character(1)))
+    if (!known_signature && !length(formal_names) && !call$accessor %in% c("$", "@")) {
+        # No parameter items can mean either an unknown callable or a known
+        # zero-argument package function. Consult cached signature metadata.
+        declaration <- languageserver:::call_with_optional_uri(workspace$get_signature,
+            call$token, call$package, exported_only = call$accessor != ":::", uri = uri)
+        known_signature <- is.character(declaration) && length(declaration) == 1L &&
+            grepl("\\(\\s*\\)$", trimws(declaration))
+    }
+    # An empty filtered parameter list is not evidence of exhaustion. Use the
+    # full signature and count supplied slots (including implicit pipe input).
+    # Unknown signatures and dots must retain ordinary expression completion.
+    if ((known_signature || length(formal_names) > 0L) && !"..." %in% formal_names &&
+        sum(vapply(tags, is.null, logical(1))) == 1L && length(tags) - 1L >= length(formal_names)) {
+        return(structure(list(), arguments_exhausted = TRUE))
+    }
     if (!length(formal_names)) return(items)
     definition <- function() NULL
     formals(definition) <- as.pairlist(setNames(rep(list(NULL), length(formal_names)), formal_names))

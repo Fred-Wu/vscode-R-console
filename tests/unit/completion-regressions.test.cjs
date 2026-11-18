@@ -318,3 +318,48 @@ test("native bare callable edits enter an existing call and request arguments", 
     assert.equal(requestedArguments, true);
   }
 });
+
+test("subscript context excludes generic LSP symbols but preserves native fields and index variables", async () => {
+  for (const [text, expected] of [
+    ['lst[[ind', ['"indigo"', 'index']],
+    ['lst[["ind', ['indigo']],
+    ['lst[ind', ['"indigo"', 'find', 'index']],
+  ]) {
+    const context = completion.getCompletionContext(text, text.length);
+    let requests = 0;
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text },
+      { line: 0, character: text.length }, { globalenv: { index: { type: 'integer' } } }, [], [], {
+        provideCompletionItems: async () => {
+          requests++;
+          return [{ label: 'indigo', kind: 4, data: { type: 'member' },
+            insertText: context.bracketQuote ? 'indigo' : '"indigo"' },
+          { label: 'find', kind: 2, insertText: 'find', detail: '{base}' }];
+        },
+      });
+    assert.deepEqual(entries.map(item => item.insertText), expected, text);
+    assert.equal(requests, 1, 'restricted contexts must not broaden to unrelated global symbols');
+  }
+});
+
+test("unknown or unmatched argument prefixes are not treated as exhausted signatures", async () => {
+  const text = 'unknown_function(1,2, run';
+  const context = completion.getCompletionContext(text, text.length);
+  const session = { globalenv: { runtime_function: { type: 'closure' } } };
+  const entries = await completion.collectCompletionEntries(context, { getText: () => text },
+    { line: 0, character: text.length }, session, [], [], { provideCompletionItems: async () => ({ items: [] }) });
+  assert.ok(entries.some(entry => entry.label === 'runtime_function'));
+});
+
+test("outer-call parameters and literal choices cannot leak into other cursor contexts", async () => {
+  for (const text of ['plain', 'pkg::', 'obj$', 'outer(lst[', 'outer(lst[ind', 'outer(lst[[', 'outer(lst[["']) {
+    const context = completion.getCompletionContext(text, text.length);
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text },
+      { line: 0, character: text.length }, undefined, [], [], {
+        provideCompletionItems: async () => [
+          { label: 'plain', kind: 5, detail: 'parameter', insertText: 'plain = ' },
+          { label: 'plain', kind: 11, detail: 'value for method', insertText: '"plain"' },
+        ],
+      });
+    assert.ok(entries.every(entry => entry.role !== 'argument' && entry.role !== 'value'), text);
+  }
+});

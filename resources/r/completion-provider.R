@@ -106,6 +106,11 @@ console_supplement_completion <- function(reply, self, params) {
     # partial tags and pipe insertion can make an otherwise unused name invalid.
     if ((!native_arguments && (!member_call || !is.null(source))) || !is.null(signature)) reply$result$items <- console_valid_argument_items(reply$result$items,
         params$rConsoleArgumentTags, call, uri, workspace, point, signature)
+    if (isTRUE(attr(reply$result$items, "arguments_exhausted"))) {
+        reply$result$rConsoleArgumentsExhausted <- TRUE
+        reply$result$items <- list()
+        reply$result$isIncomplete <- FALSE
+    }
     if (isTRUE(params$rConsolePipe)) {
         token <- params$rConsolePrefix
         nmax <- languageserver:::lsp_settings$get("max_completions")

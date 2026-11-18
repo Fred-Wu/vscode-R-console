@@ -10,7 +10,7 @@ export async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; memberResolved?: boolean; nativeArguments?: boolean }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; memberResolved?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
   }
@@ -23,6 +23,7 @@ export async function getLanguageServerCompletions(
     let localFunction = result?.rConsoleLocalFunction === true;
     let memberResolved = result?.rConsoleMemberResolved === true;
     let nativeArguments = result?.rConsoleNativeArguments === true;
+    let argumentsExhausted = result?.rConsoleArgumentsExhausted === true;
 
     let items = Array.isArray(result) ? result : result?.items || [];
     const usable = (item: vscode.CompletionItem): boolean => isLanguageServerCompletionItem(context, item, doc.uri?.toString());
@@ -30,7 +31,7 @@ export async function getLanguageServerCompletions(
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
     // its replacement start intact; never rewrite code to manufacture results.
-    if (context.prefix.length > 1 && !memberResolved &&
+    if (context.prefix.length > 1 && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];
@@ -40,6 +41,7 @@ export async function getLanguageServerCompletions(
       localFunction ||= result?.rConsoleLocalFunction === true;
       memberResolved ||= result?.rConsoleMemberResolved === true;
       nativeArguments ||= result?.rConsoleNativeArguments === true;
+      argumentsExhausted ||= result?.rConsoleArgumentsExhausted === true;
       items = Array.isArray(result) ? result : result?.items || [];
     }
 
@@ -63,6 +65,7 @@ export async function getLanguageServerCompletions(
       rConsoleLocalFunction: localFunction,
       memberResolved,
       nativeArguments,
+      argumentsExhausted,
     };
   } catch {
     return { entries: [], isIncomplete: false };
@@ -89,15 +92,28 @@ function getCompletionPackage(item: vscode.CompletionItem): string | undefined {
   return /^\{([A-Za-z][A-Za-z0-9.]*)\}$/.exec(item.detail ?? "")?.[1];
 }
 
+function restrictsBracketSymbols(context: CompletionContext): boolean {
+  return context.kind === "bracket" &&
+    (context.bracketOperator === "[[" || !!context.bracketQuote || !context.prefix);
+}
+
 function isLanguageServerCompletionItem(
   context: CompletionContext,
   item: vscode.CompletionItem,
   documentUri?: string
 ): boolean {
+  const role = getCompletionRole(item);
+  // Native call detection can still see an outer call while our cursor is in
+  // its subscript or member expression. Its arguments do not belong there.
+  if ((role === "argument" || role === "value") && context.kind !== "argument") return false;
   if (context.pipe && !isCallableCompletionKind(item.kind)) return false;
-  if (context.argumentValue?.quote && getCompletionRole(item) !== "value") return false;
-  if (context.kind === "member" && getCompletionRole(item) !== "member") return false;
-  if (context.bracketQuote && getCompletionRole(item) !== "member" && getCompletionRole(item) !== "value") return false;
+  if (context.argumentValue?.quote && role !== "value") return false;
+  if (context.kind === "member" && role !== "member") return false;
+  // Double-bracket indices and empty/quoted subscript slots used to exclude
+  // generic LSP symbols. Preserve that boundary while allowing native fields
+  // and literal index values inferred from this receiver.
+  if (restrictsBracketSymbols(context) &&
+      role !== "member" && !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }

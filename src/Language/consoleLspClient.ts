@@ -322,6 +322,9 @@ export class ConsoleLspClient implements CompletionProvider {
         if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
           completions.rConsoleNativeArguments = true;
         }
+        if (completions && (result as { rConsoleArgumentsExhausted?: boolean } | null)?.rConsoleArgumentsExhausted === true) {
+          completions.rConsoleArgumentsExhausted = true;
+        }
         const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
           projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
         );

@@ -25,7 +25,7 @@ export async function collectCompletionEntries(
     !!doc && !!position;
   const rawLspItemsRequest =
     !includeLspItems
-      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, memberResolved: false, nativeArguments: false })
+      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, memberResolved: false, nativeArguments: false, argumentsExhausted: false })
       : getLanguageServerCompletions(
           context,
           doc,
@@ -47,6 +47,7 @@ export async function collectCompletionEntries(
   const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
   const useRuntimeArguments = runtimeArguments && !rawLspResult.rConsoleLocalFunction && !rawLspResult.nativeArguments &&
     !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter");
+  if (context.argumentTags && rawLspResult.argumentsExhausted && !useRuntimeArguments) return [];
   // Native results take precedence. Only probe the live session for facts the
   // language server could not infer; a busy R session cannot delay native members.
   const [runtimeMemberItems, columnItems, runtimeArgumentItems] = await Promise.all([
@@ -54,8 +55,9 @@ export async function collectCompletionEntries(
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([]),
     !includeColumns || nativeFields ? Promise.resolve([]) : cachedColumnItems.length > 0
       ? Promise.resolve(cachedColumnItems) : getRuntimeDataColumnCompletions(context, requestRuntimeMemberCompletions),
-    useRuntimeArguments ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([]),
+    useRuntimeArguments ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([] as CompletionEntries),
   ]);
+  if (runtimeArgumentItems.argumentsExhausted) return [];
   // Otherwise, member and user-defined signatures belong to the active session.
   // A same-name package function must not supply unrelated arguments, even
   // when the session cannot currently reply or the function has no formals.
