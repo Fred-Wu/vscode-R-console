@@ -9,6 +9,7 @@ import { authenticateBackendSocket } from "./backendAuthentication";
 import { getPersistedRuntimePid, isLegacyConsoleRecord, isProcessAlive, type LegacyConsoleRecord } from "./persistentSessionRegistry";
 
 const execute = promisify(execFile);
+const WINDOWS_PROCESS_LOOKUP_MS = 15_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type LegacyProcessStatus = {
@@ -26,6 +27,7 @@ export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<
   const { sessionId, port } = entry.terminal.runtime;
   if (!UUID.test(sessionId)) return unverified("The saved session ID is invalid.");
   const bootstrap = path.join(os.tmpdir(), `r-console-session-${sessionId}.json`);
+  let operation = "Reading the saved connection file";
   try {
     const info = JSON.parse(await fs.promises.readFile(bootstrap, "utf8"));
     const stat = await fs.promises.stat(bootstrap);
@@ -34,12 +36,14 @@ export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<
       return unverified("The session's connection file no longer matches its saved PID, port, and protocol version.");
     }
     if (process.platform === "win32") {
+      operation = "Looking up the backend process with PowerShell";
       // Numeric PID only; no user-controlled path or shell text is interpolated.
       const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
         `[pscustomobject]@{name=$p.ProcessName; startedMs=([DateTimeOffset]$p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()} | ConvertTo-Json -Compress`;
       const { stdout } = await execute("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
-        windowsHide: true, timeout: 5000, maxBuffer: 65536,
+        windowsHide: true, signal: AbortSignal.timeout(WINDOWS_PROCESS_LOOKUP_MS), maxBuffer: 65536,
       });
+      operation = "Reading the PowerShell process identity";
       const identity = JSON.parse(stdout.trim());
       // A reused PID starts after the original bootstrap file was created.
       if (identity.name !== "R_CONSOLE_HOST" || !Number.isFinite(identity.startedMs) ||
@@ -47,6 +51,7 @@ export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<
         return unverified("The recorded PID no longer identifies the original R Console backend.");
       }
     } else if (process.platform === "linux") {
+      operation = "Reading the backend process identity from /proc";
       const [executable, environment] = await Promise.all([
         fs.promises.readlink(`/proc/${pid}/exe`), fs.promises.readFile(`/proc/${pid}/environ`, "utf8"),
       ]);
@@ -55,6 +60,7 @@ export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<
         return unverified("The recorded PID belongs to a different process or session.");
       }
     } else if (process.platform === "darwin") {
+      operation = "Reading the backend process identity with ps";
       const [command, environment] = await Promise.all([
         execute("/bin/ps", ["-p", String(pid), "-o", "comm="], { timeout: 5000 }),
         execute("/bin/ps", ["eww", "-p", String(pid), "-o", "command="], { timeout: 5000, maxBuffer: 1024 * 1024 }),
@@ -68,10 +74,14 @@ export async function inspectLegacySession(entry: LegacyConsoleRecord): Promise<
       return unverified("Process verification is unavailable on this platform.");
     }
     return { state: "verified", pid };
-  } catch {
-    return isProcessAlive(pid)
-      ? unverified("The original process could not be verified. Its saved record has been kept.")
-      : { state: "stopped", pid };
+  } catch (error) {
+    if (!isProcessAlive(pid)) return { state: "stopped", pid };
+    const failure = error as NodeJS.ErrnoException;
+    // Report the failed operation without including connection-file contents or child output.
+    const detail = failure.code === "ABORT_ERR"
+      ? `timed out after ${WINDOWS_PROCESS_LOOKUP_MS / 1000} seconds`
+      : `failed (${failure.code ?? failure.name})`;
+    return unverified(`${operation} ${detail}. The saved session record has been kept.`);
   }
 }
 

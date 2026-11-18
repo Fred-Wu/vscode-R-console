@@ -23,7 +23,7 @@ function greeting(pid, protocolVersion = 1) {
   ]);
 }
 
-function fixture(t, { platform = "win32", processName = "R_CONSOLE_HOST", reusedPid = false, environmentMatches = true, currentVersion = 2, protocolVersion } = {}) {
+function fixture(t, { platform = "win32", processName = "R_CONSOLE_HOST", reusedPid = false, environmentMatches = true, currentVersion = 2, protocolVersion, windowsLookupError } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-old-process-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const entry = session({ legacy: protocolVersion === undefined || protocolVersion === 1, pid: 4242,
@@ -45,6 +45,8 @@ function fixture(t, { platform = "win32", processName = "R_CONSOLE_HOST", reused
     child_process: { execFile: (_file, args, options, callback) => {
       if (platform === "win32") {
         assert.equal(options.windowsHide, true);
+        assert.ok(options.signal instanceof AbortSignal);
+        if (windowsLookupError) return callback(windowsLookupError);
         callback(null, { stdout: JSON.stringify({ name: processName, startedMs: reusedPid ? Date.now() + 10000 : 1 }) });
       } else {
         callback(null, { stdout: args.includes("comm=") ? `/bin/${processName}\n` : `${processName} ${expectedEnvironment}\n` });
@@ -72,6 +74,19 @@ for (const options of [
     await assert.rejects(f.closeLegacySession(f.entry));
   });
 }
+
+test("Windows cleanup distinguishes a lookup timeout from a PowerShell launch failure", async t => {
+  for (const [code, reason] of [
+    ["ABORT_ERR", /PowerShell timed out after 15 seconds/],
+    ["ENOENT", /PowerShell failed \(ENOENT\)/],
+  ]) {
+    const f = fixture(t, { windowsLookupError: Object.assign(new Error(), { code }) });
+    const status = await f.inspectLegacySession(f.entry);
+    assert.equal(status.state, "unverified");
+    assert.match(status.reason, reason);
+    await assert.rejects(f.closeLegacySession(f.entry), reason);
+  }
+});
 
 test("missing or mismatched bootstrap information never triggers shutdown", async (t) => {
   const f = fixture(t);
