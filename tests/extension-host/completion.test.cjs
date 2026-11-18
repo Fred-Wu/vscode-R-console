@@ -119,6 +119,16 @@ suite("Completion in the VS Code extension host", () => {
         const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
         assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);
       }
+      const shadowPrint = { globalenv: { print: { type: 'closure' } } };
+      const probesBeforeShadow = runtimeProbes;
+      const shadowed = await complete('print(data.frame(a=1), ', shadowPrint);
+      assert.ok(shadowed.some(item => item.insertText === 'old_arg = '),
+        'native S3 metadata must not suppress the session function signature');
+      assert.equal(runtimeProbes, probesBeforeShadow + 1);
+      const qualifiedPrint = await complete('base::print(data.frame(a=1), ', shadowPrint);
+      assert.ok(qualifiedPrint.some(item => item.insertText === 'digits = '));
+      assert.ok(qualifiedPrint.every(item => item.insertText !== 'old_arg = '));
+      assert.equal(runtimeProbes, probesBeforeShadow + 1, 'qualified calls must not probe a session namesake');
       const probesBeforeNative = runtimeProbes;
       const memberText = 'obj <- list(alpha = 1)\nobj$alpha';
       const memberCursor = memberText.length - 4;

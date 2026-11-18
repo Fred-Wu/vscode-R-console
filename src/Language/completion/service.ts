@@ -18,10 +18,10 @@ export async function collectCompletionEntries(
 ): Promise<CompletionEntries> {
   if (context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
-  const runtimeArguments = context.kind === "argument" &&
-    (context.functionOperator === "$" || context.functionOperator === "@" ||
-      (isSessionFunctionCall(context, sessionData) &&
-        !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator)));
+  const sessionArguments = context.kind === "argument" && isSessionFunctionCall(context, sessionData) &&
+    !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator);
+  const memberArguments = context.kind === "argument" &&
+    (context.functionOperator === "$" || context.functionOperator === "@");
   const includeLspItems =
     !!doc && !!position;
   const rawLspItemsRequest =
@@ -46,8 +46,12 @@ export async function collectCompletionEntries(
   const rawLspResult = await rawLspItemsRequest;
   const nativeMembers = rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member");
   const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
-  const useRuntimeArguments = runtimeArguments && !rawLspResult.rConsoleLocalFunction && !rawLspResult.nativeArguments &&
-    !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter");
+  // A package method inferred by the separate LSP process cannot supersede a
+  // known session function. Current source and selected package calls still
+  // take precedence; inferred member signatures can avoid a runtime probe.
+  const useRuntimeArguments = !rawLspResult.rConsoleLocalFunction && (sessionArguments ||
+    (memberArguments && !rawLspResult.nativeArguments &&
+      !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter")));
   if (context.argumentTags && rawLspResult.argumentsExhausted && !useRuntimeArguments) return [];
   // Native results take precedence. Only probe the live session for facts the
   // language server could not infer; a busy R session cannot delay native members.

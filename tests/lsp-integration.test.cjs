@@ -1457,6 +1457,65 @@ test("native S3 arguments retain their resolved method and presentation role", {
   assert.ok(entries.find(item => item.label === 'drop').detail.includes('drop = FALSE'));
 });
 
+test("live function arguments survive native S3 inference while source and package calls keep precedence", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const setup = 'print <- function(x, custom_arg) NULL\n';
+  const provider = {
+    getCallContext: client.getCallContext.bind(client),
+    provideCompletionItems: async (...args) => {
+      const result = await client.provideCompletionItems(...args);
+      return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+    },
+  };
+  for (const [marked, expected, probe, shadow = true, selected = false] of [
+    ['print(data.frame(a=1), │)', 'custom_arg = ', true],
+    ['print(data.frame(a=1), cus│)', 'custom_arg = ', true],
+    ['print(data.frame(a=1), custom_arg=1, │)', undefined, true],
+    ['base::print(data.frame(a=1), │)', 'digits = ', false],
+    ['print(data.frame(a=1), │)', 'digits = ', false, false],
+    ['print <- function(x, source_arg) NULL\nprint(data.frame(a=1), │)', 'source_arg = ', false],
+    ['print(data.frame(a=1), │)', 'digits = ', false, true, true],
+  ]) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const before = text.slice(0, cursor), lines = text.split('\n');
+    const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
+    if (probe && expected) {
+      // R may also list S3 method arguments. The live callable's own argument
+      // must remain available regardless of those optional additional results.
+      const reference = runRJson(setup + `
+        utils:::.assignLinebuffer(inputs)
+        utils:::.assignEnd(nchar(inputs))
+        invisible(utils:::.guessTokenFromLine())
+        invisible(utils:::.completeToken())
+        cat(jsonlite::toJSON(utils:::.retrieveCompletions()))
+      `, before);
+      assert.ok(reference.includes('custom_arg='), marked);
+    }
+    client.updateInput('');
+    if (selected) {
+      client.updateInput(text);
+      client.recordCompletion(text, 0, { insertText: 'print()', source: 'lsp', packageName: 'base' });
+    }
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(lines[row], col, before, text.slice(cursor)),
+      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col },
+      shadow ? { globalenv: { print: { type: 'closure' } } } : undefined,
+      lines.slice(0, row), [], provider, async expression => {
+        probes++;
+        return runRJson(setup + `
+          value <- eval(parse(text = inputs))
+          cat(jsonlite::toJSON(lapply(names(value), function(name)
+            list(name = name, type = typeof(value[[name]]))), auto_unbox = TRUE))
+        `, expression);
+      });
+    assert.equal(probes, Number(probe), marked);
+    if (expected) assert.ok(entries.some(entry => entry.insertText === expected), marked);
+    else assert.deepEqual(entries, [], marked);
+    if (!probe) assert.ok(entries.every(entry => entry.insertText !== 'custom_arg = '), marked);
+  }
+});
+
 test("source-defined member arguments use native inference without a live-session probe", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const [line, expected] of [['obj$fun(', 'arg = '], ['obj$choose(mode = "a', 'auto']]) {

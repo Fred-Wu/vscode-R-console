@@ -132,6 +132,29 @@ test("bare session functions supply their own arguments, including quoted callab
   }
 });
 
+test("session functions retain their arguments when LSP infers a package method", async () => {
+  const input = "print(df, ";
+  const methodArgument = { label: "digits", insertText: "digits = ", kind: 5,
+    detail: "print(x, ..., digits = NULL)", data: { type: "s3_parameter" } };
+  for (const result of [
+    { rConsoleNativeArguments: true, items: [methodArgument] },
+    { items: [methodArgument] },
+    { rConsoleNativeArguments: true, rConsoleArgumentsExhausted: true, items: [] },
+  ]) {
+    let probes = 0;
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length), { getText: () => input },
+      { line: 0, character: input.length }, { globalenv: { print: { type: "closure" } } },
+      [], [], { provideCompletionItems: async () => result }, async expression => {
+        probes++;
+        assert.ok(expression.includes(".fn <- (print);"));
+        return [{ name: "custom_arg" }];
+      });
+    assert.equal(probes, 1);
+    assert.deepEqual(entries.map(entry => entry.insertText), ["custom_arg = "]);
+  }
+});
+
 test("local source completions publish without waiting for superseded runtime arguments", async () => {
   for (const [input, items] of [
     ["f(", [{ label: "new_arg", insertText: "new_arg = ", detail: "parameter", kind: 5 }]],
