@@ -183,7 +183,8 @@
           "description": "Automatically insert matching brackets and quotes."
         },
         "r.console.tabSize": {
-          "type": "number",
+          "type": "integer",
+          "minimum": 0,
           "default": 2,
           "description": "Number of spaces for indentation."
         },
