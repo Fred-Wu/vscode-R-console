@@ -357,11 +357,12 @@ test("subscript context excludes generic LSP symbols but preserves native fields
 });
 
 test("native field edits preserve their quoting and escape literal carriage returns", async () => {
-  const label = "total\rUSD";
-  for (const [marked, supplied, expected] of [
-    ['sales[["tot│"]]', label, 'total\\rUSD'],
-    ['sales[[tot│]]', '"' + label + '"', '"total\\rUSD"'],
-    ['sales$tot│', label, '`total\\rUSD`'],
+  const field = "total\rUSD";
+  for (const [marked, supplied, expected, label = field] of [
+    ['sales[["tot│"]]', field, 'total\\rUSD'],
+    ['sales[["│"]]', '`total\\rUSD`', '`total\\rUSD`', '`total\rUSD`'],
+    ['sales[[tot│]]', '"' + field + '"', '"total\\rUSD"'],
+    ['sales$tot│', field, '`total\\rUSD`'],
     ['sales$tot│', '`total\\rUSD`', '`total\\rUSD`'],
   ]) {
     const context = contextAt(marked);

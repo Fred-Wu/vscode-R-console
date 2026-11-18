@@ -3,7 +3,7 @@ import type { CompletionContext, CompletionEntry, CompletionProvider } from "./t
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { isCallableName } from "./contextParser";
-import { escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
+import { backtickRName, escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
 
 export async function getLanguageServerCompletions(
   context: CompletionContext,
@@ -214,11 +214,15 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
     ? stripSnippetSyntax(text) : text;
   const role = getCompletionRole(item);
   if (role === "member" || item.kind === vscode.CompletionItemKind.Field) {
-    const escaped = escapeRControls(result);
-    if (escaped !== result && result === label) {
-      return getFieldInsertText(label, context, role === "scope");
+    if (escapeRControls(label) !== label) {
+      if (result === label) return getFieldInsertText(label, context, role === "scope");
+      // R's language server can emit Unicode escapes inside backticks, which R cannot parse.
+      if (!context.bracketQuote && result.startsWith("`")) {
+        if (result.endsWith("`")) return backtickRName(label);
+        if (isCallableCompletionKind(item.kind) && result.endsWith("`()")) return backtickRName(label) + "()";
+      }
     }
-    return escaped;
+    return escapeRControls(result);
   }
   if (context.kind === "package" && isCallableCompletionKind(item.kind) &&
       isCallableName(result)) return result + "()";
