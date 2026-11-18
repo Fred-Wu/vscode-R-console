@@ -3,7 +3,7 @@ import type { CompletionContext, CompletionEntry, CompletionProvider } from "./t
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { isCallableName } from "./contextParser";
-import { quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
+import { backtickRName, escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
 
 export async function getLanguageServerCompletions(
   context: CompletionContext,
@@ -206,12 +206,25 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
   const label = getCompletionLabel(item);
   if (isCallableCompletionKind(item.kind) &&
       (text === label || text === `${label}()` || text === `${label}($0)`)) {
-    const name = label.startsWith("`") && isCallableName(label) ? label : quoteRNameIfNeeded(label);
+    const name = label.startsWith("`") && isCallableName(label) ? escapeRControls(label) : quoteRNameIfNeeded(label);
     return name + (text !== label || context.kind === "package" ? "()" : "");
   }
   const protocolFormat = (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat;
   const result = (typeof item.insertText === "object" && "value" in item.insertText) || protocolFormat === 2
     ? stripSnippetSyntax(text) : text;
+  const role = getCompletionRole(item);
+  if (role === "member" || item.kind === vscode.CompletionItemKind.Field) {
+    if (result === label && escapeRControls(label) !== label) {
+      return getFieldInsertText(label, context, role === "scope");
+    }
+    // Some R locales encode even printable characters as Unicode escapes.
+    // Build backticked member names from the label so R can parse them.
+    if (!context.bracketQuote && result !== label && result.startsWith("`")) {
+      if (result.endsWith("`")) return backtickRName(label);
+      if (isCallableCompletionKind(item.kind) && result.endsWith("`()")) return backtickRName(label) + "()";
+    }
+    return escapeRControls(result);
+  }
   if (context.kind === "package" && isCallableCompletionKind(item.kind) &&
       isCallableName(result)) return result + "()";
   return result;

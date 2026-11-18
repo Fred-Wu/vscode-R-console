@@ -18,6 +18,53 @@ const completion = loadSource("src/Language/completion.ts", { vscode: {
   Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
 } });
 
+test("accepting a column completion inserts R source that selects the original field", async () => {
+  const names = ["total\rUSD", "total\\rUSD", "total\nUSD", "total\tUSD", "total\u0085USD", "total'\"\x7f`USD"];
+  const workspace = { globalenv: { sales: { names, type: "list" } } };
+  const cases = [];
+  for (const marked of ['sales[["tot│"]]', "sales[['tot│']]", 'sales[[tot│]]', 'sales$tot│']) {
+    const cursor = marked.indexOf('│');
+    const text = marked.replace('│', '');
+    const context = completion.getCompletionContext(text, cursor);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, workspace, [], []);
+    for (const [index, name] of names.entries()) {
+      const entry = entries.find(entry => entry.label === name);
+      assert.ok(entry, marked);
+      assert.doesNotMatch(entry.insertText, /[\x00-\x1f\x7f-\x9f]/);
+      const source = text.slice(0, context.replaceStart) + entry.insertText + text.slice(context.replaceEnd ?? cursor);
+      if (marked === 'sales[["tot│"]]' && index === 0) assert.equal(source, 'sales[["total\\rUSD"]]');
+      cases.push({ source, index: index + 1 });
+    }
+  }
+  assert.equal(runRJson(`
+    sales <- setNames(as.data.frame(as.list(seq_along(inputs$names))), unlist(inputs$names))
+    ok <- vapply(inputs$cases, function(case) identical(eval(parse(text = case$source)), case$index), logical(1))
+    cat(jsonlite::toJSON(all(ok), auto_unbox = TRUE))
+  `, { names, cases }), true);
+});
+
+test("real language-server field and method edits preserve control characters in R names", async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const definition = 'sales <- list("total\\u0085USD" = 42L, "total\\u0085EUR" = function() 43L)';
+  const input = "sales$tot";
+  const source = definition + "\n" + input;
+  const context = completion.getCompletionContext(input, input.length, source);
+  const entries = await completion.collectCompletionEntries(context, { getText: () => source },
+    { line: 1, character: input.length }, undefined, [definition], [], {
+      provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      },
+    });
+  const expressions = ["total\u0085USD", "total\u0085EUR"].map(label => {
+    const entry = entries.find(item => item.label === label && item.source === "lsp");
+    assert.ok(entry, label);
+    return input.slice(0, entry.replaceStart) + entry.insertText + input.slice(entry.replaceEnd ?? input.length);
+  });
+  assert.deepEqual(runRJson(definition + '\ncat(jsonlite::toJSON(vapply(inputs, function(x) eval(str2lang(x)), integer(1))))',
+    expressions), [42, 43]);
+});
+
 test("typing and accepting functions opens real argument suggestions without another keystroke", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { createTerminal } = require("./helpers/inline-terminal.cjs");
