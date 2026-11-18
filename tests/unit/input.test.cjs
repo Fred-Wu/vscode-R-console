@@ -5,6 +5,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
+const { createTerminal } = require("../helpers/inline-terminal.cjs");
 function loadHistoryStore(mocks = {}) {
   const { HistoryStore, ...storage } = loadSource("src/Terminal/historyStore.ts", mocks);
   return { ...loadSource("src/Terminal/history.ts"), ...storage, HistoryManager: HistoryStore };
@@ -48,6 +49,24 @@ test("editing and wrapped cursor movement preserve input", () => {
   input.insertText("X");
   assert.equal(input.deleteBeforeCursor(), "X");
   assert.equal(input.text, "abcdefghij\nsecond");
+});
+
+test("Tab uses a non-negative indent width and Backspace works at zero width", t => {
+  const settings = {};
+  const { terminal } = createTerminal(t, 80, 24, "tab", settings);
+  for (const [configured, width] of [[4, 4], [0, 0], [-1, 0], [1.5, 2], ["4", 2]]) {
+    settings.tabSize = configured;
+    terminal.loadSettings();
+    terminal.inputState.reset();
+    terminal.applyKeyAction({ type: "tab" });
+    assert.equal(terminal.inputState.text, " ".repeat(width));
+    terminal.inputState.insertText(" ");
+    terminal.applyKeyAction({ type: "backspace" });
+    assert.equal(terminal.inputState.text, width ? " " : "");
+    terminal.inputState.reset();
+    terminal.inputState.insertText("{");
+    assert.equal(terminal.inputState.calculateNewLineIndent(terminal.tabSize), width);
+  }
 });
 
 test("history persists multiline entries and searches without losing their contents", (t) => {

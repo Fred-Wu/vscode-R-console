@@ -402,7 +402,8 @@ export class RTerminal implements vscode.Pseudoterminal {
   private loadSettings(): void {
     const config = vscode.workspace.getConfiguration("r.console");
     this.autoMatch = config.get<boolean>("autoMatch", true);
-    this.tabSize = config.get<number>("tabSize", 2);
+    const tabSize = config.get<number>("tabSize", 2);
+    this.tabSize = Number.isSafeInteger(tabSize) ? Math.max(0, tabSize) : 2;
     this.pipeOperator =
       config.get<string>("pipeOperator", "|>") === "%>%" ? "%>%" : "|>";
   }
@@ -1520,7 +1521,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
 
     const beforeOnLine = this.inputState.currentLineBeforeCursor;
-    if (/^\s+$/.test(beforeOnLine)) {
+    if (this.tabSize > 0 && /^\s+$/.test(beforeOnLine)) {
       const toDelete = Math.min(this.tabSize, beforeOnLine.length);
       this.inputState.deleteBeforeCursor(toDelete);
       return;
