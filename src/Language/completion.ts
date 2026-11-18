@@ -98,6 +98,9 @@ export type CompletionPickItem = vscode.QuickPickItem & {
 export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
 export interface CompletionProvider {
+  // A selected package function can be qualified in the LSP projection while
+  // its name remains unqualified in the visible console input.
+  getCallContext?(doc: vscode.TextDocument, position: vscode.Position): CallCompletionContext | undefined;
   provideCompletionItems(
     doc: vscode.TextDocument,
     position: vscode.Position,
@@ -132,6 +135,18 @@ type GlobalEnvItem = {
 type WorkspaceData = {
   globalenv?: Record<string, GlobalEnvItem>;
 };
+
+function isSessionFunction(item: GlobalEnvItem): boolean {
+  return item.type === "closure" || item.type === "builtin" || item.type === "special" ||
+    /^\s*function\s*\(/.test(item.str || "");
+}
+
+function isSessionFunctionCall(context: CompletionContext, data: WorkspaceData | undefined): boolean {
+  if (context.functionOperator || !context.functionName) return false;
+  return Object.entries(data?.globalenv ?? {}).some(([name, item]) => isSessionFunction(item) &&
+    (context.functionName === name ||
+      context.functionName === `\`${name.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\``));
+}
 
 const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
@@ -396,9 +411,11 @@ export async function collectCompletionEntries(
     context.kind === "member"
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions)
       : Promise.resolve([]);
-  const memberArguments = context.kind === "argument" &&
-    (context.functionOperator === "$" || context.functionOperator === "@");
-  const runtimeArgumentItemsRequest = memberArguments
+  const runtimeArguments = context.kind === "argument" &&
+    (context.functionOperator === "$" || context.functionOperator === "@" ||
+      (isSessionFunctionCall(context, sessionData) &&
+        !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator)));
+  const runtimeArgumentItemsRequest = runtimeArguments
     ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions)
     : Promise.resolve([]);
   const includeLspItems =
@@ -432,10 +449,11 @@ export async function collectCompletionEntries(
     columnItemsRequest,
     runtimeArgumentItemsRequest,
   ]);
-  // The LSP can resolve obj@lm as the unrelated global lm. Member formals must
-  // come from the active session, even when that session cannot currently reply.
+  // Member and user-defined function signatures belong to the active session.
+  // A same-name package function must not supply unrelated arguments, even
+  // when the session cannot currently reply or the function has no formals.
   const rawLspItems = rawLspResult.entries.filter(entry => {
-    if (memberArguments && isArgumentCompletionEntry(entry)) return false;
+    if (runtimeArguments && isArgumentCompletionEntry(entry)) return false;
     if (context.kind === "argument" && !context.argumentTags && entry.detail === "parameter") return false;
     return !context.pipe || isCallableCompletionKind(entry.kind);
   });
@@ -792,14 +810,11 @@ function getSessionCompletions(
   }
 
   return Object.entries(data.globalenv).flatMap(([name, obj]) => {
-    const isFunction =
-      obj.type === "closure" ||
-      obj.type === "builtin" ||
-      /^\s*function\s*\(/.test(obj.str || "");
+    const isFunction = isSessionFunction(obj);
     if (context.pipe && !isFunction) return [];
     return [{
       label: name,
-      insertText: context.pipe ? `${quoteRNameIfNeeded(name)}()` : name,
+      insertText: isFunction ? `${quoteRNameIfNeeded(name)}()` : name,
       kind: isFunction
         ? vscode.CompletionItemKind.Function
         : vscode.CompletionItemKind.Variable,

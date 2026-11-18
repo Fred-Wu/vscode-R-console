@@ -259,6 +259,12 @@ export class ConsoleLspClient implements CompletionProvider {
     return this.disposePromise;
   }
 
+  getCallContext(doc: vscode.TextDocument, position: vscode.Position) {
+    const projection = this.inputDocument.project(doc.getText());
+    return getEnclosingCall(projection.document.getText(),
+      projection.document.offsetAt(projection.toServerPosition(position)));
+  }
+
   async provideCompletionItems(
     doc: vscode.TextDocument,
     position: vscode.Position,

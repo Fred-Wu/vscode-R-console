@@ -245,7 +245,16 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     # definitions and dots. Defaults and function bodies are never evaluated.
     signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
         call$package, exported_only = call$accessor != ":::")
-    formal_names <- unique(vapply(signature, function(item) item$label, character(1)))
+    argument_name <- function(item) {
+        # Source definitions expose source spelling (e.g. `a b`), whereas
+        # package signatures already expose the actual names from formals().
+        if (!is.null(item$data$uri)) {
+            parsed <- tryCatch(parse(text = item$label)[[1L]], error = function(e) NULL)
+            if (is.symbol(parsed)) return(as.character(parsed))
+        }
+        item$label
+    }
+    formal_names <- unique(vapply(signature, argument_name, character(1)))
     if (!length(formal_names)) return(items)
     definition <- function() NULL
     formals(definition) <- as.pairlist(setNames(rep(list(NULL), length(formal_names)), formal_names))
@@ -260,9 +269,10 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     if (is.null(names(syntax))) names(syntax) <- rep("", length(syntax))
     Filter(function(item) {
         if (!identical(item$detail, "parameter")) return(TRUE)
-        if (item$label == "..." || item$label %in% names(syntax)) return(FALSE)
+        name <- argument_name(item)
+        if (name == "..." || name %in% names(syntax)) return(FALSE)
         candidate <- syntax
-        names(candidate)[cursor_slot] <- item$label
+        names(candidate)[cursor_slot] <- name
         tryCatch({
             suppressWarnings(match.call(definition = definition, call = as.call(candidate), expand.dots = FALSE))
             TRUE

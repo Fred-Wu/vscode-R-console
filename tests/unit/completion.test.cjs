@@ -90,6 +90,59 @@ test("session member formals replace unrelated LSP arguments and remain in the A
   }
 });
 
+test("user-defined function completions insert callable names in ordinary and pipe contexts", async () => {
+  const globalenv = {
+    custom: { type: "closure" }, "a b": { type: "closure" }, "a`b": { type: "closure" },
+    primitive: { type: "builtin" }, special: { type: "special" },
+    legacy: { str: "function (x)" }, variable: { type: "double" },
+  };
+  for (const input of ["", "1 |> "]) {
+    const context = completion.getCompletionContext(input, input.length) ?? {
+      kind: "default", prefix: "", replaceStart: 0, snapshotInput: input, snapshotCursor: 0,
+    };
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined, { globalenv }, []);
+    assert.deepEqual(entries.filter(item => item.kind === 2).map(item => item.insertText),
+      ["custom()", "`a b`()", "`a\\`b`()", "primitive()", "special()", "legacy()"]);
+    assert.equal(entries.some(item => item.insertText === "variable"), !context.pipe);
+  }
+});
+
+test("bare session functions supply their own arguments, including quoted callable names", async () => {
+  for (const [name, source] of [["f", "f"], ["f", "`f`"], ["a b", "`a b`"],
+    ["a`b", "`a\\`b`"], ["变量", "变量"], ["constructor", "constructor"]]) {
+    const input = `${source}(`;
+    const context = completion.getCompletionContext(input, input.length);
+    let requests = 0;
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, { globalenv: { [name]: { type: "closure" } } }, [], [], {
+        provideCompletionItems: async () => [
+          { label: "wrong", detail: "parameter", kind: 5 },
+          { label: "wrong value", detail: "value for wrong", kind: 5 },
+        ],
+      }, async expression => {
+        requests++;
+        assert.ok(expression.includes(`.fn <- (${source});`));
+        return [{ name: "a b" }, { name: "normal" }];
+      });
+    assert.equal(requests, 1, source);
+    assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.insertText),
+      ["`a b` = ", "normal = "], source);
+    assert.ok(!entries.some(item => item.label.startsWith("wrong")), source);
+  }
+});
+
+test("unavailable or empty session signatures never borrow same-name package arguments", async () => {
+  for (const request of [undefined, async () => undefined, async () => [], async () => { throw Error("disconnected"); }]) {
+    const input = "lm(";
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
+      { getText: () => input }, { line: 0, character: input.length },
+      { globalenv: { lm: { type: "closure" } } }, [], [], {
+        provideCompletionItems: async () => [{ label: "formula", detail: "parameter", kind: 5 }],
+      }, request);
+    assert.ok(!entries.some(item => item.detail === "parameter"));
+  }
+});
+
 test("Unicode member and argument prefixes preserve the object and full replacement span", () => {
   for (const name of ["éobj", "变量", "𐐀obj"]) {
     const memberInput = `${name}$éfu`;

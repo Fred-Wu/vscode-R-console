@@ -299,6 +299,95 @@ test("argument validation uses the local signature without evaluating defaults o
   ]) assert.deepEqual(await parameters(marked), expected, marked);
 });
 
+test("local quoted formals retain unused arguments and reject supplied names", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const definition = 'f <- function(`a b`, `a\\`b`, normal = stop("default evaluated")) stop("body evaluated")\n';
+  const parameters = async marked => {
+    const text = definition + marked.replace("│", "");
+    const result = await client.provideCompletionItems({ getText: () => text },
+      { line: 1, character: marked.indexOf("│") });
+    return (result.items ?? result).filter(item => item.detail === "parameter").map(item => item.insertText);
+  };
+  let initial;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    initial = await parameters("f(│)");
+    if (initial.includes("normal = ")) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.deepEqual(initial, ["`a b` = ", "`a\\`b` = ", "normal = "]);
+  for (const marked of ['f(`a b` = 1, `a\\`b` = 2, │)',
+    'f("a b" = 1, "a`b" = 2, │)', 'f(r"(a b)" = 1, `a\\`b` = 2, │)']) {
+    assert.deepEqual(await parameters(marked), ["normal = "], marked);
+  }
+  assert.deepEqual(await parameters("f(1, 2, 3, │)"), []);
+  assert.deepEqual(await parameters("f(│, normal = 1)"), ["`a b` = ", "`a\\`b` = "]);
+});
+
+test("accepting a console-defined function opens its live arguments and values", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const provide = client.provideCompletionItems.bind(client);
+  client.provideCompletionItems = async (...args) => {
+    const result = await provide(...args);
+    return { items: (result.items ?? result).map(item => ({ ...item,
+      kind: item.kind === undefined ? undefined : item.kind - 1 })), isIncomplete: result.isIncomplete };
+  };
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Value: 11, Snippet: 14 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
+  });
+  // The definition lives only in the active-session probe, never in the LSP
+  // document. Its snapshot is the same metadata the session watcher supplies.
+  const setup = 'f <- function(`a b`, normal = c("first", "second"), lazy = stop("default evaluated")) stop("body evaluated")\n';
+  const session = runRJson(setup + 'cat(jsonlite::toJSON(list(globalenv = list(f = list(type = typeof(f)))), auto_unbox = TRUE))');
+  let probes = 0;
+  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
+    requestMemberCompletions: async expression => {
+      probes++;
+      return runRJson(setup + `
+        value <- eval(parse(text = inputs), .GlobalEnv)
+        cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
+      `, expression);
+    },
+  });
+  t.after(() => lang.dispose());
+  const handleAutocomplete = lang.handleAutocomplete.bind(lang);
+  lang.handleAutocomplete = request => handleAutocomplete({ ...request, getWorkspaceData: () => session });
+  const { terminal } = require("./helpers/inline-terminal.cjs").createTerminal(t);
+  delete terminal.applyCompletion;
+  terminal.lang = lang;
+  const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
+  const waitFor = async (predicate, message) => {
+    const deadline = Date.now() + 10000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, message);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  };
+  terminal.applyKeyAction({ type: "text", text: "f" });
+  terminal.applyKeyAction({ type: "tab" });
+  await waitFor(() => choices().some(item => item.insertText === "f()"), "session function completion");
+  terminal.inlineCompletion.move(choices().findIndex(item => item.insertText === "f()") - terminal.inlineCompletion.selected);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.inputState.textBeforeCursor, "f(");
+  await waitFor(() => choices().some(item => item.insertText === "normal = "), "live function arguments");
+  assert.deepEqual(choices().filter(item => item.detail === "parameter").map(item => item.insertText),
+    ["`a b` = ", "normal = ", "lazy = "]);
+  terminal.applyKeyAction({ type: "tab" });
+  assert.equal(terminal.inputState.textBeforeCursor, "f(`a b` = ");
+  terminal.applyKeyAction({ type: "text", text: "1, " });
+  await waitFor(() => choices().some(item => item.insertText === "normal = "), "remaining arguments");
+  assert.deepEqual(choices().filter(item => item.detail === "parameter").map(item => item.insertText),
+    ["normal = ", "lazy = "]);
+  terminal.applyKeyAction({ type: "tab" });
+  await waitFor(() => choices().some(item => item.insertText === '"second"'), "live default values");
+  assert.ok(probes >= 3);
+  assert.equal(terminal.submitted, undefined, "completion must never execute the function");
+});
+
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { complete } = createConsoleLsp(t);
@@ -318,6 +407,24 @@ test("qualified namespace arguments use the real LSP despite a same-name local f
     assert.ok(parameters.includes("data"));
     assert.ok(!parameters.includes("wrong_argument"));
   }
+});
+
+test("an explicitly selected package function retains its signature over a session namesake", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const input = "lm()";
+  client.updateInput(input);
+  client.recordCompletion(input, 0, { insertText: "lm()", source: "lsp", packageName: "stats" });
+  const entries = await completion.collectCompletionEntries(completion.getCompletionContext(input, 3),
+    { getText: () => input }, { line: 0, character: 3 },
+    { globalenv: { lm: { type: "closure" } } }, [], [], {
+      getCallContext: client.getCallContext.bind(client),
+      provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return (result.items ?? result).map(item => ({ ...item, kind: item.kind - 1 }));
+      },
+    }, async () => { assert.fail("selected package must not query the session namesake"); });
+  assert.deepEqual(entries.filter(item => item.detail === "parameter").slice(0, 4).map(item => item.label),
+    ["formula", "data", "subset", "weights"]);
 });
 
 test("multiline arguments use parsed call identities and selected packages in the real LSP", { timeout: 90000 }, async t => {
