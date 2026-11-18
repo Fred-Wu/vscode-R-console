@@ -6,6 +6,7 @@ const advisoryUrl = "https://github.com/advisories/GHSA-fc5q-39xc-vjpf";
 // VSCE uses fixed glob patterns during packaging; these are dev-only packages.
 // Keep this tied to the reviewed versions and paths. See CONTRIBUTING.md.
 const reviewedPackages = {
+  ovsx: ["node_modules/ovsx", "1.4.0"],
   "@vscode/vsce": ["node_modules/@vscode/vsce", "4.1.1"],
   tinyglobby: ["node_modules/tinyglobby", "0.2.17"],
   fdir: ["node_modules/tinyglobby/node_modules/fdir", "6.5.0"],
@@ -30,6 +31,8 @@ function assessAudit(report, lock) {
         lock.packages?.[nodePath]?.dev !== true || lock.packages[nodePath].version !== version ||
         !Array.isArray(finding.via) || finding.via.length === 0) return false;
 
+    // Publishing existing VSIX files bypasses ovsx's VSCE packaging path.
+    if (name === "ovsx" && (finding.via.length !== 1 || finding.via[0] !== "@vscode/vsce")) return false;
     const visited = new Set([...ancestors, name]);
     return finding.via.every((cause) => typeof cause === "string"
       ? isExcepted(cause, visited)

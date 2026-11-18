@@ -44,6 +44,19 @@ This produces a target-specific VSIX for the current host platform, for example 
 
 Each target-specific VSIX contains exactly one platform-matching `R_CONSOLE_HOST` binary in `bundled/bin/`.
 
+The release workflow reuses the exact unsigned executable when the runtime inputs
+are unchanged. Before staging it, the workflow checks its SHA-256 against
+`sidecar/pty-host/runtime-checksums.json` for the target and runtime version.
+The initial digests match the executables published in both the v0.5.5 GitHub
+release and Open VSX. After a new runtime build, record the digest from each
+trusted build artifact in a reviewed commit before reusing it in another release.
+Changes to the Windows manifest, build script, or icon require a Windows runtime version bump.
+
+Open VSX publishes on version-tag pushes and explicit manual runs from `main`.
+For repository-side enforcement, store `OPEN_VSX_TOKEN` as a secret of the
+`open-vsx` GitHub environment, restrict its deployment refs to the `main` branch
+and `v*` tags, and remove the repository-level copy after migration.
+
 ## Implementation and Testing
 
 Run the fast unit tests with `npm test`. They use Node's built-in test runner and
@@ -97,6 +110,8 @@ VSCE 3.9.2 would remove the `--oidc` support used for Marketplace publishing.
 The advisory concerns denial of service from malicious repeated extglob patterns.
 VSCE's file collector uses fixed `**` and `node_modules/**` patterns during
 packaging. This dependency is not part of the extension's runtime dependency tree.
+The locked Open VSX CLI inherits the same advisory through VSCE. The release
+workflow passes prebuilt VSIX files, which bypass its VSCE packaging path.
 The exception is restricted to the reviewed package versions, installation paths,
 and development-only lockfile entries, including findings inherited from this
 single advisory. Other advisories, production dependencies, changed versions or
