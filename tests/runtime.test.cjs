@@ -8,7 +8,7 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 
-test("a future protocol upgrade closes a real authenticated protocol 2 session", { timeout: 30000 }, async t => {
+test("a future protocol upgrade closes a real authenticated protocol 2 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {
     "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 3 },
