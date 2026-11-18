@@ -131,6 +131,55 @@ test("bare session functions supply their own arguments, including quoted callab
   }
 });
 
+test("local source completions publish without waiting for superseded runtime arguments", async () => {
+  for (const [input, items] of [
+    ["f(", [{ label: "new_arg", insertText: "new_arg = ", detail: "parameter", kind: 5 }]],
+    ["f(", []],
+    ['f(method = "', [{ label: "new_value", detail: "value for method", kind: 11 }]],
+  ]) {
+    let releaseRuntime;
+    const runtime = new Promise(resolve => { releaseRuntime = resolve; });
+    const pending = completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
+      { getText: () => input }, { line: 0, character: input.length },
+      { globalenv: { f: { type: "closure" } } }, [], [], {
+        provideCompletionItems: async () => ({ items, rConsoleLocalFunction: true }),
+      }, () => runtime);
+    const published = await Promise.race([
+      pending.then(entries => ({ entries })),
+      new Promise(resolve => setImmediate(() => resolve(undefined))),
+    ]);
+    releaseRuntime([{ name: "old_arg" }]);
+    await pending;
+    assert.ok(published, "authoritative source results must not wait for the runtime");
+    assert.deepEqual(published.entries.filter(item => item.detail === "parameter" ||
+      item.detail?.startsWith("value for ")).map(item => item.label), items.map(item => item.label));
+  }
+});
+
+test("session argument lookups stay concurrent with LSP and await the live signature", async () => {
+  const input = "f(";
+  let releaseLsp, releaseRuntime;
+  const lsp = new Promise(resolve => { releaseLsp = resolve; });
+  const runtime = new Promise(resolve => { releaseRuntime = resolve; });
+  const started = [];
+  let settled = false;
+  const pending = completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    { globalenv: { f: { type: "closure" } } }, [], [], {
+      provideCompletionItems: () => { started.push("lsp"); return lsp; },
+    }, () => { started.push("runtime"); return runtime; }).then(entries => {
+      settled = true;
+      return entries;
+    });
+  assert.deepEqual(started.sort(), ["lsp", "runtime"]);
+  releaseLsp([{ label: "wrong_arg", detail: "parameter", kind: 5 }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, "a session function still needs its runtime signature");
+  releaseRuntime([{ name: "live_arg" }]);
+  const entries = await pending;
+  assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.label), ["live_arg"]);
+});
+
 test("unavailable or empty session signatures never borrow same-name package arguments", async () => {
   for (const request of [undefined, async () => undefined, async () => [], async () => { throw Error("disconnected"); }]) {
     const input = "lm(";

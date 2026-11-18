@@ -1098,8 +1098,6 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
     return "incomplete";
   }
 
-  let lastMeaningful: Token | null = null;
-  let secondLastMeaningful: Token | null = null;
   const meaningful: Token[] = [];
 
   for (const token of tokens) {
@@ -1112,15 +1110,7 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
     }
   }
 
-  for (let i = meaningful.length - 1; i >= 0; i -= 1) {
-    if (!lastMeaningful) {
-      lastMeaningful = meaningful[i];
-    } else {
-      secondLastMeaningful = meaningful[i];
-      break;
-    }
-  }
-
+  const lastMeaningful = meaningful.at(-1);
   if (!lastMeaningful) {
     return "complete";
   }
@@ -1151,14 +1141,6 @@ function classifyExpressionHeuristic(code: string): LocalParseClassification {
   }
 
   if (lastMeaningful.type === TokenType.Repeat) {
-    return "incomplete";
-  }
-
-  if (
-    lastMeaningful.type === TokenType.RightParen &&
-    secondLastMeaningful &&
-    isLambdaWithoutBody(tokens)
-  ) {
     return "incomplete";
   }
 
@@ -1237,30 +1219,4 @@ function isAwaitingBody(tokens: Token[]): boolean {
   }
 
   return false;
-}
-
-function isLambdaWithoutBody(tokens: Token[]): boolean {
-  let foundBackslash = false;
-
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    if (token.type !== TokenType.Operator || token.value !== "\\") {
-      continue;
-    }
-    for (let j = i + 1; j < tokens.length; j += 1) {
-      const next = tokens[j];
-      if (next.type === TokenType.Newline || next.type === TokenType.Comment) {
-        continue;
-      }
-      if (next.type === TokenType.LeftParen) {
-        foundBackslash = true;
-      }
-      break;
-    }
-  }
-
-  if (!foundBackslash) {
-    return false;
-  }
-  return isAwaitingBody(tokens);
 }

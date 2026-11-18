@@ -448,16 +448,16 @@ export async function collectCompletionEntries(
           context,
           requestRuntimeMemberCompletions
         );
-  const [runtimeMemberItems, rawLspResult, columnItems, requestedRuntimeArguments] = await Promise.all([
-    runtimeMemberItemsRequest,
-    rawLspItemsRequest,
-    columnItemsRequest,
-    runtimeArgumentItemsRequest,
-  ]);
+  const rawLspResult = await rawLspItemsRequest;
   // A source definition visible at the cursor supersedes an older session
   // function, including when it has no remaining parameters or known values.
+  // Keep lookups concurrent, but do not wait for a superseded runtime probe.
   const useRuntimeArguments = runtimeArguments && !rawLspResult.rConsoleLocalFunction;
-  const runtimeArgumentItems = useRuntimeArguments ? requestedRuntimeArguments : [];
+  const [runtimeMemberItems, columnItems, runtimeArgumentItems] = await Promise.all([
+    runtimeMemberItemsRequest,
+    columnItemsRequest,
+    useRuntimeArguments ? runtimeArgumentItemsRequest : Promise.resolve([]),
+  ]);
   // Otherwise, member and user-defined signatures belong to the active session.
   // A same-name package function must not supply unrelated arguments, even
   // when the session cannot currently reply or the function has no formals.
