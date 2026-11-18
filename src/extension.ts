@@ -17,6 +17,7 @@ import {
 } from "./Terminal/options";
 import {
   PersistentSessionRegistry,
+  getPersistentSessionRegistryPath,
   getPersistedRuntimePid,
   hasLivePersistedRuntime,
   type PersistedConsoleRecord,
@@ -94,11 +95,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
   extensionBaseUri = context.extensionUri;
-  const sessionStorageUri = context.storageUri ?? context.globalStorageUri;
-  persistentRegistry = new PersistentSessionRegistry(vscode.Uri.joinPath(
-    sessionStorageUri, "persistent-sessions.json"
-  ).fsPath);
-  void fs.promises.mkdir(sessionStorageUri.fsPath, { recursive: true }).catch(() => {});
+  persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context));
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
   context.subscriptions.push(

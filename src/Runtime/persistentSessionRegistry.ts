@@ -15,6 +15,23 @@ export type PersistedConsoleRecord = {
   terminalName?: string;
 };
 
+export async function getPersistentSessionRegistryPath(
+  context: Pick<vscode.ExtensionContext, "storageUri" | "globalStorageUri" | "workspaceState">
+): Promise<string> {
+  if (context.storageUri) {
+    return path.join(context.storageUri.fsPath, "persistent-sessions.json");
+  }
+
+  // Empty windows have separate workspaceState, which survives window reloads.
+  const key = "persistentSessionWindowId";
+  let windowId = context.workspaceState.get<string>(key);
+  if (!windowId) {
+    windowId = randomUUID();
+    await context.workspaceState.update(key, windowId);
+  }
+  return path.join(context.globalStorageUri.fsPath, "folderless", windowId, "persistent-sessions.json");
+}
+
 export type LegacyConsoleRecord = Omit<PersistedConsoleRecord, "terminal"> & {
   terminal: Omit<PersistedRTerminalState, "runtime"> & {
     runtime: Omit<PersistedRTerminalState["runtime"], "authToken" | "protocolVersion"> & {
