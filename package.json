@@ -2,7 +2,7 @@
   "name": "vsc-r-console",
   "displayName": "R Console for VS Code",
   "description": "A lightweight R console for VS Code",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "publisher": "RConsole",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "images/Rlogo.png",
@@ -170,7 +170,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 3,
-          "markdownDescription": "Start automatic suggestions after this many typed characters in the current completion prefix: `1` means the first character, `2` means the second. Applies only when `r.console.completionUI` is `inline` and `r.console.inlineCompletion.trigger` is `typing`. Explicit Tab requests and argument suggestions following an accepted function bypass this threshold."
+          "markdownDescription": "Minimum prefix length for ordinary names in inline typing mode. Calls, members, namespaces, subscripts and pipes can show suggestions immediately. Press Tab to request suggestions earlier."
         },
         "r.console.inlineCompletion.acceptOnEnter": {
           "type": "boolean",

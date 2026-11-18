@@ -2,11 +2,22 @@
 
 All notable changes to R Console will be documented in this file.
 
-## Unreleased
+## [0.5.6] - 2026-11-19
+
+### Changed
+
+- Refactored console autocompletion, improved suggestions in Quick Pick and inline mode, and updated the appearance of the inline suggestion list.
+- The inline suggestion list now has clickable group buttons when space permits. Use them to jump directly to fields, arguments or functions.
+
+### Fixed
+
+- Separate VS Code windows opened without a folder now keep independent persistent R sessions. Saving sessions in one window could previously overwrite the other window’s records.
+- A negative `r.console.tabSize` no longer breaks Tab indentation. Set it to `0` for zero-width indentation. Backspace still removes a leading space.
 
 ### Maintenance
 
-- Release workflow maintenance.
+- Switched to trusted publishing for the VS Code Marketplace and Open VSX.
+- Improved the security of the release process.
 
 ## [0.5.5] - 2026-11-09
 

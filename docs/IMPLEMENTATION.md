@@ -669,10 +669,11 @@ vscode-R manages plot, data, help, browser, httpgd, and addin session lifecycles
 Implementation files:
 
 - [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
-- [`src/Language/completion.ts`](../src/Language/completion.ts)
+- [`src/Language/completion/service.ts`](../src/Language/completion/service.ts) combines language-server, runtime and recent-input candidates. [`contextParser.ts`](../src/Language/completion/contextParser.ts) identifies the expression at the cursor.
 - [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
+- [`resources/r/completion-provider.R`](../resources/r/completion-provider.R) supplements native language-server results with console argument and source information.
 
 #### Completion Frontends
 
@@ -686,19 +687,20 @@ an explicit selection is retained on refresh.
 
 The `r.console.inlineCompletion.trigger` setting chooses automatic
 debounced suggestions or Tab activation. In Tab mode, editing refreshes an open
-list without opening a closed one. `inlineCompletion.minCharacters` gates only
-automatic opening in inline/typing mode, counting the current completion prefix.
-The default is three characters; the minimum is one. Explicit Tab requests and
-argument suggestions following an accepted function bypass it. Tab or Enter accepts the selected suggestion,
+list without opening a closed one. In typing mode, `inlineCompletion.minCharacters`
+sets the prefix length for ordinary names. The default is three characters and
+the minimum is one. Argument names and known values, member and namespace
+access, subscripts and pipe destinations can trigger suggestions with an empty
+prefix. Explicit Tab requests also bypass the threshold. Tab or Enter accepts the selected suggestion,
 or requests fresh suggestions without submitting input if the visible results are stale.
 With `inlineCompletion.acceptOnEnter` disabled, Enter submits the input instead.
 Escape dismisses it, and clearing the input dismisses the list and invalidates
 outstanding requests. Backspace resets the suggestion selection and viewport.
 
-Accepting a suggestion for a partial function name replaces the partial name
-and places the cursor inside the inserted empty parentheses. In inline
-completion's typing mode, this schedules argument suggestions using the same
-debounce as input edits.
+Accepting a function completion replaces the name at the cursor and places the
+cursor inside the call. An existing argument list is preserved. In inline
+typing mode, accepting a function schedules argument suggestions, and
+accepting an argument name schedules suggestions for its value.
 
 The terminal renderer draws a bordered transient suggestion panel below the
 physical terminal row containing the input caret. Within a wrapped logical
@@ -724,7 +726,8 @@ use colored terminal glyphs. The pseudoterminal inherits the configured terminal
 font and reads explicit color customizations through the configuration API.
 
 The completion controller manages a bounded, scrollable viewport with an
-in-box scrollbar. Up/Down changes selection and reveals the selected item.
+in-box scrollbar. When multiple groups fit, buttons above the list select the
+first suggestion in a group and scroll it into view. Up/Down changes selection and reveals the selected item.
 Page Up/Down, the footer's text triangles, wheel scrolling and thumb dragging
 move the viewport independently of selection. Clicking the scrollbar track pages
 towards the click. Temporary SGR button-motion reporting supports dragging,
@@ -756,9 +759,9 @@ Completion data comes from one shared flow:
 
 - runtime/global-environment symbols come from the selected session integration's
   cached workspace data
-- `$` and `@` member completion uses the selected session integration:
-  `sess` JSON-RPC for vscode-R 3.x or the deprecated legacy session server for
-  pre-3.0 vscode-R
+- `$` and `@` member completion uses native language-server inference when it
+  resolves the receiver, then falls back to the live session and cached fields
+  when needed
 - data-aware bracket and pipe-placeholder contexts use cached session metadata
   and current input for the first suggestion pass
 - language-server symbols come from the console-owned `languageserver` process
@@ -850,14 +853,10 @@ The handle is used for all protocol commands and for exporting reconnect state.
 
 ### 4.2 Persisted Console Records
 
-The extension stores self-managed console records in:
-
-- `persistent-sessions.json`
-
-The file is stored under extension storage:
-
-- `context.storageUri` when available
-- otherwise `context.globalStorageUri`
+Workspaces store self-managed console records in
+`context.storageUri/persistent-sessions.json`. A window without a folder stores
+its registry at `context.globalStorageUri/folderless/<window-id>/persistent-sessions.json`.
+The extension saves the window ID in `context.workspaceState` and reuses it on reload.
 
 Each record contains:
 
