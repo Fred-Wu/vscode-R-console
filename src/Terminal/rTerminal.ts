@@ -2110,6 +2110,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const input = this.getInputSnapshot();
     const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
+    this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
     if (context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
@@ -2146,7 +2147,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       force,
       applyCompletion: selection => this.applyCompletion(selection),
       onInlineEntries: items => {
-        if (this.mode !== "ready" || !this.inlineCompletion.set(items, token, this.getInputSnapshot().currentLine.slice(0, this.inputState.cursorCol).match(/[A-Za-z._][\w.]*$/)?.[0] ?? "")) return;
+        if (this.mode !== "ready" || token !== this.inlineCompletion.token) return;
+        const input = this.getInputSnapshot();
+        const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+          input.text.slice(input.textBeforeCursor.length));
+        if (!this.inlineCompletion.set(items, token, context?.prefix ?? "")) return;
         this.renderInput();
       },
     });
@@ -2740,8 +2745,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     const isLight = vscode.window.activeColorTheme?.kind === vscode.ColorThemeKind?.Light;
     const overrides = vscode.workspace.getConfiguration("workbench")
       .get<Record<string, unknown>>("colorCustomizations", {});
-    const inputPrefix = this.inputState.currentLine.slice(0, this.inputState.cursorCol);
-    this.inlineCompletion.setQuery(/[A-Za-z._][\w.]*$/.exec(inputPrefix)?.[0] ?? "");
     // Keep the active input's physical rows visible when possible by
     // reducing the completion height before resorting to windowing.
     const availableRows = Math.min(this.dimensions.rows - 2, Math.max(5,

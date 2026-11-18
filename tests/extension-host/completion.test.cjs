@@ -63,6 +63,10 @@ suite("Completion in the VS Code extension host", () => {
       assert.ok(literalValues.every(item => item.detail === 'value for $1'));
       const partial = await complete('stats::cor(met = "sp');
       assert.ok(partial.some(item => item.insertText === 'spearman' && item.isCallable === false));
+      for (const name of ['foo$1', 'foo${2:text}', 'foo bar']) {
+        const items = await complete('`' + name + '` <- function(x) NULL\nfoo');
+        assert.ok(items.some(item => item.insertText === '`' + name + '`()'), name);
+      }
       for (const operator of ['|>', '%>%']) {
         const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
         assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);

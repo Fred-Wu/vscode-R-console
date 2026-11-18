@@ -1,12 +1,13 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
+class SnippetString { constructor(value) { this.value = value; } }
 const completion = loadSource("src/Language/completion.ts", {
   vscode: {
     QuickPickItemKind: { Separator: -1 },
     Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
     CompletionItemKind: { Method: 1, Field: 4, Function: 2, Variable: 5, Property: 9, Module: 8, Text: 0, Snippet: 14 },
-    SnippetString: class SnippetString {},
+    SnippetString,
   },
 });
 
@@ -38,8 +39,8 @@ test("namespace completion normalizes bare callable names and preserves existing
         provideCompletionItems: async () => [
           { label: "bare", kind: 2 }, { label: "method", kind: 1 },
           { label: "call", kind: 2, insertText: "call()" },
-          { label: "snippet", kind: 2, insertText: "snippet($0)" },
-          { label: "defaults", kind: 2, insertText: "defaults(${1:x})" },
+          { label: "snippet", kind: 2, insertText: new SnippetString("snippet($0)") },
+          { label: "defaults", kind: 2, insertText: new SnippetString("defaults(${1:x})") },
           { label: "a(b", kind: 2, insertText: "`a(b`" },
           { label: "field", kind: 4 }, { label: "variable", kind: 5 }, { label: "unknown" },
         ],

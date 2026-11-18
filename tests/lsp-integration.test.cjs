@@ -146,6 +146,9 @@ test("typing and accepting functions opens real argument suggestions without ano
     ['stats::cor(method = "sp│ear")', "spearman", 'stats::cor(method = "spearman")'],
     ["stats::cor(method = '│')", "spearman", "stats::cor(method = 'spearman')"],
     ["stats::cor(method = sp│)", '"spearman"', 'stats::cor(method = "spearman")'],
+    ["stats::cor(method = sp│earman)", '"spearman"', 'stats::cor(method = "spearman")'],
+    ["obj$choose(method = al│pha)", '"alpha"', 'obj$choose(method = "alpha")'],
+    ["df[[al│pha]]", '"alpha"', 'df[["alpha"]]'],
     ['stats::cor(`method` = "│")', "spearman", 'stats::cor(`method` = "spearman")'],
     ["obj$choose(method = │)", '"alpha"', 'obj$choose(method = "alpha")'],
     ['obj$choose(method = "a│old")', "alpha", 'obj$choose(method = "alpha")'],
@@ -174,7 +177,7 @@ test("typing and accepting functions opens real argument suggestions without ano
       `automatic real-provider suggestions for ${marked}`);
     if (/^(df(?:\[|\$)|dt\[|obj\$data\[|nested\[|outer\(df\[|subset\(df,|df \|> subset\()/.test(marked)) {
       assert.deepEqual(choices().filter(item => / (zebra|alpha|beta|a b)$/.test(item.label)).map(item => item.label.replace(/^\$\([^)]+\) /, "")),
-        ["zebra", "alpha", "beta", "a b"], `column order: ${marked}`);
+        marked === "df[[al│pha]]" ? ["alpha"] : ["zebra", "alpha", "beta", "a b"], `column order: ${marked}`);
     }
     if (marked === "obj$choose(method = │)") {
       assert.deepEqual(choices().filter(item => item.detail === "value for method").map(item => item.insertText),
@@ -1242,6 +1245,21 @@ test("source-only pipe functions survive filtering and native-pipe parse recover
     assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
     assert.equal([...client.syncedDocuments.values()].at(-1).document.getText(), text, 'repair stays out of the visible/LSP document');
     assert.ok(instances.at(-1).requests.at(-1).params.position.character <= lines[position.line].length);
+  }
+});
+
+test("source callable names preserve literal dollar signs and quoting", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  for (const name of ['foo$1', 'foo${2:text}', 'foo bar']) {
+    const text = '`' + name + '` <- function(x) NULL\nfoo';
+    const context = completion.getCompletionContext('foo', 3, text);
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: 3 }, undefined,
+      [text.split('\n')[0]], [], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } });
+    assert.ok(entries.some(item => item.insertText === '`' + name + '`()'), name);
   }
 });
 

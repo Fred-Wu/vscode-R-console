@@ -4,6 +4,7 @@ const loadSource = require("../helpers/load-source.cjs");
 const parser = loadSource("src/Language/parser.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
   CompletionItemKind: { Text: 0, Function: 2, Field: 4, Variable: 5, Value: 11 },
+  Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
   SnippetString: class {},
 } });
 const { createTerminal } = require("../helpers/inline-terminal.cjs");
@@ -23,6 +24,90 @@ test("subscript options do not change the indexing dimensions", () => {
   assert.equal(contextAt("df[, │, drop = FALSE]").bracketDimensions, 2);
   assert.equal(contextAt("df[exact = 1, │]").bracketDimensions, 2, "index names are positional except supported options");
   assert.notEqual(contextAt("df[, drop = F│]")?.kind, "bracket");
+});
+
+test("accepting inside an identifier replaces its suffix and preserves existing calls", t => {
+  for (const [marked, inserted, kind, expected, caret] of [
+    ["lib│rary(123)", "library()", 2, "library(123)", 8],
+    ["stats::l│m(123)", "lm()", 2, "stats::lm(123)", 10],
+    ["obj$l│m(123)", "lm()", 2, "obj$lm(123)", 7],
+    ["x |> lib│rary(123)", "library()", 2, "x |> library(123)", 13],
+    ["df[[al│pha]]", '"alpha"', 4, 'df[["alpha"]]', 11],
+    ["f(method = al│pha)", '"alpha"', 11, 'f(method = "alpha")', 18],
+    ["f(met│hod)", "method = ", 5, "f(method = )", 11],
+    ["x <- al│pha + 1", "alpha", 5, "x <- alpha + 1", 10],
+  ]) {
+    const context = contextAt(marked), text = marked.replace("│", "");
+    assert.ok(context.replaceEnd > context.snapshotCursor, marked);
+    if (marked.startsWith("f(met│")) assert.deepEqual(context.argumentTags, [null]);
+    if (marked.startsWith("f(method")) assert.equal(context.argumentValue.prefix, "al");
+    const { terminal } = createTerminal(t);
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    terminal.inputState.text = text;
+    terminal.inputState.cursorPosition = marked.indexOf("│");
+    terminal.applyCompletion(completion.toCompletionPick({ label: inserted, insertText: inserted, kind, source: "lsp" }, context));
+    assert.equal(terminal.inputState.text, expected, marked);
+    assert.equal(terminal.inputState.cursorPosition, caret, marked);
+  }
+});
+
+test("literal callable names survive language-server snippet expansion", async () => {
+  for (const name of ["foo$1", "foo${2:text}", "foo bar", "a`b", "foo\\bar"]) {
+    const input = "foo", context = completion.getCompletionContext(input, input.length);
+    context.prefix = "";
+    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => [{ label: name, kind: 2, insertText: `${name}($0)` }],
+      });
+    assert.equal(entries[0].insertText, '`' + name.replace(/\\/g, "\\\\").replace(/`/g, "\\`") + '`()');
+  }
+});
+
+test("R completion identities preserve case and session variables use valid R names", async () => {
+  const input = "a", context = completion.getCompletionContext(input, input.length);
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    { globalenv: { alpha: {}, Alpha: {}, "a b": {}, "a$1": {} } }, []);
+  assert.deepEqual(entries.map(entry => entry.insertText), ["alpha", "Alpha", "`a b`", "`a$1`"]);
+  const member = completion.getCompletionContext("obj$", 4);
+  const fields = await completion.collectCompletionEntries(member, undefined, undefined,
+    { globalenv: { obj: { names: ["alpha", "Alpha"] } } }, []);
+  assert.deepEqual(fields.map(entry => entry.insertText), ["alpha", "Alpha"]);
+  assert.equal(completion.rankCompletionEntries(entries, "alpha")[0].label, "alpha");
+  assert.equal(completion.rankCompletionEntries(entries, "Alpha")[0].label, "Alpha");
+});
+
+test("trusted symbols suppress duplicate recent-input suggestions without folding case", async () => {
+  const input = "df[[alpha]]", cursor = input.indexOf("alpha") + 2;
+  const context = completion.getCompletionContext(input, cursor);
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    { globalenv: { df: { names: ["alpha"] } } }, [], ["Alpha <- 1"], undefined, undefined, input);
+  assert.deepEqual(entries.map(entry => entry.insertText), ['"alpha"', 'Alpha']);
+});
+
+test("plain completion text is never expanded as snippet syntax", async () => {
+  const input = "pkg::", context = completion.getCompletionContext(input, input.length);
+  const texts = ['`foo$1`', '`foo${2:text}`'];
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, undefined, [], [], {
+      provideCompletionItems: async () => texts.map(text => ({ label: text, insertText: text, kind: 5 })),
+    });
+  assert.deepEqual(entries.map(entry => entry.insertText), texts);
+});
+
+test("the terminal keeps the parsed quoted and Unicode query through redraws", t => {
+  for (const [text, query] of [['f(method = "a b', "a b"], ['obj$变量', "变量"], ['df[["a\\tb', "a\tb"]]) {
+    const { terminal } = createTerminal(t);
+    terminal.inputState.text = text;
+    terminal.inputState.cursorPosition = text.length;
+    terminal.lang.handleAutocomplete = ({ onInlineEntries }) => onInlineEntries([
+      completion.toCompletionPick({ label: query, insertText: query, source: "session" }, contextAt(text + "│")),
+    ]);
+    terminal.requestInlineCompletion(true);
+    assert.equal(terminal.inlineCompletion.query, query, text);
+    terminal.renderInput();
+    assert.equal(terminal.inlineCompletion.query, query, text);
+  }
 });
 
 test("nested subscripts can share closing-bracket tokens with the active subscript", () => {

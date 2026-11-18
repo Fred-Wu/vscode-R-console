@@ -146,6 +146,13 @@ export function getCompletionSyntax(code: string, cursor = code.length) {
     return prefixTokens;
   };
   return {
+    get identifierEnd() {
+      if (cursor === code.length) return undefined;
+      const token = all().find(token => token.type === TokenType.Identifier &&
+        !token.value.startsWith("`") && token.position < cursor &&
+        cursor < token.position + token.value.length);
+      return token ? token.position + token.value.length : undefined;
+    },
     get inLiteral() { return /["'`#]/.test(code) && isCompletionInLiteral(code, cursor, all()); },
     get member() { return /[$@]|::/.test(before) ? getQualifiedCompletionContext(before, prefix()) : undefined; },
     get bracket() { return code.includes("[") ? getBracketCompletionContext(code, cursor, all()) : undefined; },
@@ -247,8 +254,10 @@ function completionPrefix(tokens: Token[], start: number, end: number, cursor: n
   if (before.length !== 1) return undefined;
   const token = before[0];
   if (token.type === TokenType.Identifier && !token.value.startsWith("`") && token.value !== "..." &&
-      token.position + token.value.length === cursor) {
-    return { prefix: token.value, replaceStart: token.position };
+      token.position + token.value.length >= cursor) {
+    const end = token.position + token.value.length;
+    return { prefix: token.value.slice(0, cursor - token.position), replaceStart: token.position,
+      ...(end > cursor ? { replaceEnd: end } : {}) };
   }
   if (token.type === TokenType.String && (cursor < token.position + token.value.length || token.closed === false)) {
     const prefix = token.value.slice(1, cursor - token.position).replace(/\\([\\"'nrt])/g,
@@ -577,7 +586,7 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
       namePosition = argumentStart === end || (
         argumentStart + 1 === end && first.type === TokenType.Identifier &&
         !first.value.startsWith("`") && first.value !== "..." &&
-        first.position < cursor && first.position + first.value.length === cursor
+        first.position < cursor && first.position + first.value.length >= cursor
       );
     } else {
       // Only a supplied direct placeholder replaces implicit insertion. A

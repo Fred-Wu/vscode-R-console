@@ -265,10 +265,15 @@ export class InlineCompletion {
         entry.insertText === previous.insertText &&
         entry.description === previous.description && entry.detail === previous.detail;
     });
-    const exact = query.length > 0 ? this.choiceIndexes.findIndex(index => {
-      const entry = items[index];
-      return isChoice(entry) && entry.label.replace(ICON, "").toLowerCase() === query.toLowerCase();
-    }) : -1;
+    let exact = -1;
+    if (query.length > 0) {
+      const lowerQuery = query.toLowerCase();
+      for (const [choice, index] of this.choiceIndexes.entries()) {
+        const label = items[index].label.replace(ICON, "");
+        if (label === query) { exact = choice; break; }
+        if (exact < 0 && label.toLowerCase() === lowerQuery) exact = choice;
+      }
+    }
     const argumentHeading = items.findIndex(item => !isChoice(item) && item.label === "Arguments");
     const firstArgument = argumentHeading < 0 ? -1 : this.choiceIndexes.indexOf(argumentHeading + 1);
     this.selected = !this.resetSelectionOnUpdate && this.manuallySelected &&

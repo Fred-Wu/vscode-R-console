@@ -11,6 +11,17 @@ const item = label => ({ label, insertText: label, replaceStart: 0, snapshotInpu
 
 const { createTerminal } = require("../helpers/inline-terminal.cjs");
 
+test("exact inline selection respects R identifier case while allowing case-insensitive search", () => {
+  const panel = new InlineCompletion(unicode);
+  const choices = [item("Alpha"), item("alpha")];
+  panel.set(choices, panel.token, "alpha");
+  assert.equal(panel.current(), choices[1]);
+  panel.set(choices, panel.token, "Alpha");
+  assert.equal(panel.current(), choices[0]);
+  panel.set(choices, panel.token, "ALPHA");
+  assert.equal(panel.current(), choices[0]);
+});
+
 test("multiline input and suggestions share the viewport across redraw and dismissal", t => {
   const { terminal, screen } = createTerminal(t, 80, 12);
   const input = Array.from({ length: 10 }, (_, i) => i === 9 ? "mea" : "x <- " + i).join("\n");

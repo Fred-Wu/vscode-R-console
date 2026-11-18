@@ -285,6 +285,8 @@ export function getCompletionContext(
   const relativeOffset = textForDataContext.length - beforeCursor.length;
   const syntax = getCompletionSyntax(fullText, textForDataContext.length);
   const inLiteral = syntax.inLiteral;
+  const identifierEnd = syntax.identifierEnd;
+  const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - relativeOffset };
   const dataObjectName = detectDataContext(textForDataContext);
 
   const member = syntax.member;
@@ -296,6 +298,7 @@ export function getCompletionContext(
         kind: "package",
         prefix,
         replaceStart,
+        ...replacement,
         triggerCharacter: ":",
         autoTrigger: true,
         snapshotInput,
@@ -310,6 +313,7 @@ export function getCompletionContext(
       autoTrigger: true,
       prefix,
       replaceStart,
+      ...replacement,
       triggerCharacter: prefix.length === 0 ? operator : undefined,
       objectName: isPlaceholderMember ? dataObjectName : baseObject ?? member.objectName,
       operator,
@@ -347,7 +351,7 @@ export function getCompletionContext(
   const pipe = syntax.pipe;
   if (pipe && !inLiteral) {
     return { kind: "default", pipe: true, autoTrigger: true, prefix: pipe.prefix,
-      replaceStart: pipe.replaceStart - relativeOffset, snapshotInput, snapshotCursor };
+      replaceStart: pipe.replaceStart - relativeOffset, ...replacement, snapshotInput, snapshotCursor };
   }
 
   const call = syntax.call;
@@ -361,6 +365,7 @@ export function getCompletionContext(
       suppressAutomatic: inLiteral && !value,
       prefix,
       replaceStart: value ? value.replaceStart - relativeOffset : beforeCursor.length - prefix.length,
+      ...replacement,
       ...(value?.replaceEnd !== undefined ? { replaceEnd: value.replaceEnd - relativeOffset } : {}),
       functionName: call.name,
       functionOperator: call.operator,
@@ -395,6 +400,7 @@ export function getCompletionContext(
     suppressAutomatic: inLiteral,
     prefix,
     replaceStart: beforeCursor.length - prefix.length,
+    ...replacement,
     dataObjectName,
     snapshotInput,
     snapshotCursor,
@@ -600,6 +606,7 @@ function rankSymbolEntries(entries: CompletionEntry[], query: string): Completio
       const aRank = aLabel === needle ? 0 : aLabel.startsWith(needle) ? 1 : aLabel.includes(needle) ? 2 : 3;
       const bRank = bLabel === needle ? 0 : bLabel.startsWith(needle) ? 1 : bLabel.includes(needle) ? 2 : 3;
       return aRank - bRank ||
+        Number(b.entry.label === query) - Number(a.entry.label === query) ||
         a.match![0] - b.match![0] ||
         a.match!.at(-1)! - a.match![0] - (b.match!.at(-1)! - b.match![0]) ||
         aLabel.length - bLabel.length || compareCompletionLabels(a.entry, b.entry) || a.index - b.index;
@@ -825,7 +832,7 @@ function getSessionCompletions(
     if (context.pipe && !isFunction) return [];
     return [{
       label: name,
-      insertText: isFunction ? `${quoteRNameIfNeeded(name)}()` : name,
+      insertText: quoteRNameIfNeeded(name) + (isFunction ? "()" : ""),
       kind: isFunction
         ? vscode.CompletionItemKind.Function
         : vscode.CompletionItemKind.Variable,
@@ -1216,8 +1223,15 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
     text = getCompletionLabel(item);
   }
 
-  const result = item.detail === "parameter" && !(item.insertText instanceof vscode.SnippetString)
-    ? text : stripSnippetSyntax(text);
+  // The R server builds callable snippets from literal symbol names. Protect
+  // those names before expanding tab stops (foo$1 is an R name, not $1).
+  const label = getCompletionLabel(item);
+  if (isCallableCompletionKind(item.kind) &&
+      (text === label || text === `${label}()` || text === `${label}($0)`)) {
+    const name = label.startsWith("`") && isCallableName(label) ? label : quoteRNameIfNeeded(label);
+    return name + (text !== label || context.kind === "package" ? "()" : "");
+  }
+  const result = item.insertText instanceof vscode.SnippetString ? stripSnippetSyntax(text) : text;
   if (context.kind === "package" && isCallableCompletionKind(item.kind) &&
       isCallableName(result)) return result + "()";
   return result;
@@ -1272,11 +1286,11 @@ function filterShadowedBufferEntries(
   const preferredKeys = new Set(
     preferredEntries
       .filter((entry) => entry.source !== "buffer")
-      .map(getCompletionIdentityKey)
+      .map(entry => entry.label)
   );
 
   return bufferEntries.filter(
-    (entry) => !preferredKeys.has(getCompletionIdentityKey(entry))
+    (entry) => !preferredKeys.has(entry.label)
   );
 }
 
@@ -1319,7 +1333,7 @@ function dedupeCompletionEntries(
 
 export function getCompletionIdentityKey(entry: CompletionEntry): string {
   return [
-    entry.label.toLowerCase(),
+    entry.label,
     entry.detail ?? "",
     getCompletionDescription(entry),
   ].join("\u0000");

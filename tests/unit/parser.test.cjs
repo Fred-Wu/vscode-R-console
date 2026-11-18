@@ -66,6 +66,7 @@ test("call context tracks only arguments of the enclosing call on both sides of 
     ["obj$fun(x %(% y, se|)", "obj$fun", ["", null]],
     ["obj$fun(fi|, 2)", "obj$fun", [null, ""]],
     ["obj$fun(1, se|, 3)", "obj$fun", ["", null, ""]],
+    ["obj$fun(fir|st)", "obj$fun", [null]],
     ["obj$fun(fi|, , third = 3)", "obj$fun", [null, "", "third"]],
     ["obj$return(return = 1, ne|)", "obj$return", ["return", null]],
     ["base::toString(x = 1, wi|)", "base::toString", ["x", null]],
@@ -84,7 +85,7 @@ test("call context suppresses argument names in values, literals, comments and e
     'obj$fun("fir|st")', "obj$fun('fir|st')", 'obj$fun(r"--(fir|st)--")',
     "obj$fun(`fir|st`)", 'obj$fun("escaped\\"fir|st")',
     "obj$fun(# fir|\n)", "obj$fun(first |)", "obj$fun(|first = 1)",
-    "obj$fun(fir| = 1)", "obj$fun(fir|st)", "obj$fun(..., fir|)",
+    "obj$fun(fir| = 1)", "obj$fun(..., fir|)",
   ]) {
     const cursor = marked.indexOf("|");
     const context = parser.getEnclosingCall(marked.replace("|", ""), cursor);
