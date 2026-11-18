@@ -2172,7 +2172,9 @@ export class RTerminal implements vscode.Pseudoterminal {
     const input = this.inputState.text;
     const cursor = this.inputState.cursorPosition;
     const before = input.slice(0, selectionStart);
-    const after = input.slice(cursor);
+    const replacementEnd = selection.replaceEnd === undefined ? cursor :
+      cursor + selection.replaceEnd - this.inputState.cursorCol;
+    const after = input.slice(replacementEnd);
     const cursorInsideEmptyCall = selection.insertText.endsWith("()");
     let insertText = selection.insertText;
     let nextInput = before + insertText + after;

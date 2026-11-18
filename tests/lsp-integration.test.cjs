@@ -128,6 +128,7 @@ test("typing and accepting functions opens real argument suggestions without ano
     ["df[, │]", '"alpha"', 'df[, "alpha"]'],
     ["df[[│]]", '"alpha"', 'df[["alpha"]]'],
     ['df[["│"]]', "a b", 'df[["a b"]]'],
+    ['df[["a│old"]]', "a b", 'df[["a b"]]'],
     ["df[['│']]", "a b", "df[['a b']]"],
     ['df[, "│"]', "a b", 'df[, "a b"]'],
     ["df$│", "alpha", "df$alpha"],
@@ -142,10 +143,12 @@ test("typing and accepting functions opens real argument suggestions without ano
     ["stats::cor(\n  x, │)", "method = ", "stats::cor(\n  x, method = )"],
     ["stats::cor(method = │)", '"spearman"', 'stats::cor(method = "spearman")'],
     ['stats::cor(method = "│")', "spearman", 'stats::cor(method = "spearman")'],
+    ['stats::cor(method = "sp│ear")', "spearman", 'stats::cor(method = "spearman")'],
     ["stats::cor(method = '│')", "spearman", "stats::cor(method = 'spearman')"],
     ["stats::cor(method = sp│)", '"spearman"', 'stats::cor(method = "spearman")'],
     ['stats::cor(`method` = "│")', "spearman", 'stats::cor(`method` = "spearman")'],
     ["obj$choose(method = │)", '"alpha"', 'obj$choose(method = "alpha")'],
+    ['obj$choose(method = "a│old")', "alpha", 'obj$choose(method = "alpha")'],
     ["subset(df, │)", "alpha", "subset(df, alpha)"],
     ["df |> subset(│)", "alpha", "df |> subset(alpha)"],
     ["df |> │", undefined, undefined], ["df %>% │", undefined, undefined],
@@ -159,7 +162,7 @@ test("typing and accepting functions opens real argument suggestions without ano
     terminal.inputState.cursorPosition = cursor;
     // Typing a separator exercises the ordinary edit-to-popup path.
     const quoted = /["']$/.test(marked.slice(0, cursor));
-    const prefix = marked.slice(0, cursor).endsWith("sp");
+    const prefix = /[A-Za-z]$/.test(marked.slice(0, cursor));
     if (quoted || prefix) {
       terminal.inputState.deleteBeforeCursor();
       terminal.applyKeyAction({ type: "text", text: marked[cursor - 1] });
@@ -228,7 +231,7 @@ test("real LSP excludes supplied argument names while retaining signature order"
     ["library(package = inner(help = 1), │)", "help", ["package"]],
     ["library(help = inner(package = 1), │)", "package", ["help"]],
     ["library(pack│)", "package", []],
-    ["library(packages = , │)", "package", []],
+    ["library(packages = , │)", undefined, ["package"]],
     ["stats::lm(data = , │)", "formula", ["data"]],
   ]) {
     const cursor = marked.indexOf("│");
@@ -241,6 +244,59 @@ test("real LSP excludes supplied argument names while retaining signature order"
     assert.equal(parameters[0], first, marked);
     for (const name of excluded) assert.ok(!parameters.includes(name), `${marked}: exclude ${name}`);
   }
+});
+
+test("real LSP validates positional, partial, quoted and piped argument candidates", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  for (const [marked, expected] of [
+    ["base::atan2(1, 2, │)", []],
+    ["atan2(1, 2, │)", []],
+    ["base::atan2(1, │)", ["y", "x"]],
+    ["base::atan2(│, x = 2)", ["y"]],
+    ["base::atan2(`x` = stop('must not run'), │)", ["y"]],
+    ['base::atan2("x" = , │)', ["y"]],
+    ['stats::cor(x = 1, y = 2, u = "everything", m = "pearson", │)', []],
+    ['stats::cor(x = 1, y = 2, u = "everything", │)', ["method"]],
+    ["1 |> base::atan2(2, │)", []],
+    ["1 |> base::atan2(x = _, │)", ["y"]],
+    ["1 |> base::atan2(│)", ["y", "x"]],
+    ["base::sum(1, 2, │)", ["na.rm"]],
+    ["base::sum(na = 1, │)", ["na.rm"]],
+    ["base::sum(na.rm = TRUE, │)", []],
+  ]) {
+    const cursor = marked.indexOf("│");
+    const text = marked.replace("│", "");
+    const result = await client.provideCompletionItems({ getText: () => text }, { line: 0, character: cursor });
+    const parameters = (Array.isArray(result) ? result : result?.items ?? [])
+      .filter(item => item.detail === "parameter").map(item => item.label);
+    assert.deepEqual(parameters, expected, marked);
+  }
+});
+
+test("argument validation uses the local signature without evaluating defaults or bodies", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const definition = 'atan2 <- function(first, second = stop("default evaluated")) stop("body evaluated")\n';
+  const parameters = async marked => {
+    const text = definition + marked.replace("│", "");
+    const result = await client.provideCompletionItems({ getText: () => text },
+      { line: 1, character: marked.indexOf("│") });
+    return (Array.isArray(result) ? result : result?.items ?? [])
+      .filter(item => item.detail === "parameter").map(item => item.label);
+  };
+  // Local definitions become available after the server's document parse job.
+  let initial;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    initial = await parameters("atan2(│)");
+    if (initial.includes("first")) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.deepEqual(initial, ["first", "second"]);
+  for (const [marked, expected] of [
+    ["atan2(1, 2, │)", []],
+    ["atan2(fir = 1, │)", ["second"]],
+    ["atan2(│, second = stop('argument evaluated'))", ["first"]],
+    ["atan2(1, │)", ["first", "second"]],
+  ]) assert.deepEqual(await parameters(marked), expected, marked);
 });
 
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {

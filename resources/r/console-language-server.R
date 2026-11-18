@@ -238,6 +238,38 @@ console_call_identity <- function(source) {
     NULL
 }
 
+console_valid_argument_items <- function(items, tags, call, uri, workspace, point) {
+    if (is.null(call) || is.null(tags) ||
+        !any(vapply(items, function(item) identical(item$detail, "parameter"), logical(1)))) return(items)
+    # Ask the same provider for the complete signature, including local source
+    # definitions and dots. Defaults and function bodies are never evaluated.
+    signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
+        call$package, exported_only = call$accessor != ":::")
+    formal_names <- unique(vapply(signature, function(item) item$label, character(1)))
+    if (!length(formal_names)) return(items)
+    definition <- function() NULL
+    formals(definition) <- as.pairlist(setNames(rep(list(NULL), length(formal_names)), formal_names))
+    cursor_slot <- which(vapply(tags, is.null, logical(1))) + 1L
+    if (length(cursor_slot) != 1L) return(items)
+    supplied <- vapply(tags, function(tag) {
+        if (is.null(tag)) "TRUE" else if (nzchar(tag)) paste0(tag, " = NULL") else "NULL"
+    }, character(1))
+    syntax <- tryCatch(as.list(parse(text = paste0(".fn(", paste(supplied, collapse = ", "), ")"))[[1L]]),
+        error = function(e) NULL)
+    if (is.null(syntax)) return(items)
+    if (is.null(names(syntax))) names(syntax) <- rep("", length(syntax))
+    Filter(function(item) {
+        if (!identical(item$detail, "parameter")) return(TRUE)
+        if (item$label == "..." || item$label %in% names(syntax)) return(FALSE)
+        candidate <- syntax
+        names(candidate)[cursor_slot] <- item$label
+        tryCatch({
+            suppressWarnings(match.call(definition = definition, call = as.call(candidate), expand.dots = FALSE))
+            TRUE
+        }, error = function(e) FALSE)
+    }, items)
+}
+
 server$request_handlers[["textDocument/completion"]] <- function(self, id, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -292,18 +324,10 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
             reply$result$isIncomplete <- isTRUE(reply$result$isIncomplete) || length(items) > nmax
         }
     }
-    # The provider returns all formals, including names already entered in this
-    # call. Use lexer-selected tags so missing values and tags after the cursor
-    # work too. Parse quoted names without evaluating any argument expressions.
-    tags <- Filter(function(tag) is.character(tag) && length(tag) == 1L && nzchar(tag), params$rConsoleArgumentTags)
-    if (length(tags)) {
-        supplied <- vapply(tags, function(tag) tryCatch(
-            names(as.list(parse(text = paste0(".fn(", tag, " = NULL)"))[[1L]]))[2L],
-            error = function(e) ""
-        ), character(1))
-        reply$result$items <- Filter(function(item) !identical(item$detail, "parameter") ||
-            !(item$label %in% supplied), reply$result$items)
-    }
+    # Validate each proposed name using R's matching rules. Positional values,
+    # partial tags and pipe insertion can make an otherwise unused name invalid.
+    reply$result$items <- console_valid_argument_items(reply$result$items,
+        params$rConsoleArgumentTags, call, uri, workspace, point)
     if (isTRUE(params$rConsolePipe)) {
         token <- params$rConsolePrefix
         nmax <- languageserver:::lsp_settings$get("max_completions")

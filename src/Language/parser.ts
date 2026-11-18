@@ -100,7 +100,7 @@ export type CallCompletionContext = {
   // R source tags; "" denotes a positional argument and null the cursor's slot. Undefined
   // means the cursor is in a value, comment, or another non-name position.
   argumentTags?: (string | null)[];
-  argumentValue?: { name: string; prefix: string; replaceStart: number; quote?: "\"" | "'" };
+  argumentValue?: { name: string; prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" };
 };
 
 export type BracketCompletionContext = {
@@ -108,6 +108,7 @@ export type BracketCompletionContext = {
   operator: "[" | "[[";
   prefix: string;
   replaceStart: number;
+  replaceEnd?: number;
   quote?: "\"" | "'";
   dimension: number;
   dimensions: number;
@@ -135,7 +136,7 @@ export function isCompletionInLiteral(code: string, cursor = code.length): boole
 }
 
 function completionPrefix(tokens: Token[], start: number, end: number, cursor: number):
-  { prefix: string; replaceStart: number; quote?: "\"" | "'" } | undefined {
+  { prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" } | undefined {
   const before = tokens.slice(start, end).filter(token => token.position < cursor);
   if (!before.length) return start === end ? { prefix: "", replaceStart: cursor } : undefined;
   if (before.length !== 1) return undefined;
@@ -147,7 +148,9 @@ function completionPrefix(tokens: Token[], start: number, end: number, cursor: n
   if (token.type === TokenType.String && (cursor < token.position + token.value.length || token.closed === false)) {
     const prefix = token.value.slice(1, cursor - token.position).replace(/\\([\\"'nrt])/g,
       (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
-    return { prefix, replaceStart: token.position + 1, quote: token.value[0] as "\"" | "'" };
+    return { prefix, replaceStart: token.position + 1,
+      replaceEnd: token.position + token.value.length - Number(token.closed === true),
+      quote: token.value[0] as "\"" | "'" };
   }
   return undefined;
 }

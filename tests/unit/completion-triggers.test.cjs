@@ -52,6 +52,39 @@ test("bracket insertions distinguish ordinary indexing, data.table expressions a
   }
 });
 
+test("quoted completions replace the existing value through its closing quote", async t => {
+  for (const [marked, label, expected] of [
+    ['stats::cor(method = "sp│ear")', "spearman", 'stats::cor(method = "spearman")'],
+    ["stats::cor(method = 'sp│ear')", "spearman", "stats::cor(method = 'spearman')"],
+    ['stats::cor(\n method = "sp│ear", x = 1)', "spearman", 'stats::cor(\n method = "spearman", x = 1)'],
+    ['stats::cor(method = "sp│ear\nold", x = 1)', "spearman", 'stats::cor(method = "spearman", x = 1)'],
+    ['stats::cor(method = "sp│ear', "spearman", 'stats::cor(method = "spearman'],
+    ['obj[["al│pha"]]', "alpha", 'obj[["alpha"]]'],
+    ["obj[['a│old']]", "a'b", "obj[['a\\'b']]"],
+    ['obj[["a│old\\\"tail"]]', 'a"b', 'obj[["a\\"b"]]'],
+    ['obj[["a│old\\\\tail"]]', 'a\\b', 'obj[["a\\\\b"]]'],
+  ]) {
+    const { terminal } = createTerminal(t, 80, 24, "tab");
+    delete terminal.applyCompletion;
+    terminal.lang.recordCompletion = () => {};
+    const context = contextAt(marked);
+    const text = marked.replace("│", "");
+    const cursor = marked.indexOf("│");
+    const entries = await completion.collectCompletionEntries(context, { getText: () => text },
+      { line: text.slice(0, cursor).split("\n").length - 1, character: context.snapshotCursor },
+      { globalenv: { obj: { names: [label] } } }, [], [], {
+        provideCompletionItems: async () => [{ label, insertText: `"${label}"`, kind: 11, detail: "value for method" }],
+      });
+    const selection = completion.toCompletionPick(entries.find(entry => entry.label === label), context);
+    terminal.inputState.text = text;
+    terminal.inputState.cursorPosition = cursor;
+    terminal.applyCompletion(selection);
+    assert.equal(terminal.inputState.text, expected, marked);
+    assert.equal(terminal.inputState.cursorPosition,
+      text.lastIndexOf("\n", cursor - 1) + 1 + context.replaceStart + selection.insertText.length, marked);
+  }
+});
+
 test("nested bracket completion queries the complete object instead of an unrelated global", async () => {
   const context = contextAt("obj$data[[│]]");
   const entries = await completion.collectCompletionEntries(context, undefined, undefined,

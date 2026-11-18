@@ -1535,6 +1535,19 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
     getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries() {} });
   assert.equal(lang.refineInlineCompletion(snapshot("obj$fun(TRUE")), undefined,
     "a literal cannot reuse cached argument-name candidates");
+
+  for (const text of ['df[["aold"]]', 'fun(method = "aold")']) {
+    const cursor = text.indexOf("aold") + 1;
+    const quotedInput = snapshot(text, cursor);
+    await lang.handleAutocomplete({ input: quotedInput, getCurrentInput: () => quotedInput,
+      getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries() {} });
+    const nextText = text.replace("aold", "alold");
+    const next = lang.refineInlineCompletion(snapshot(nextText, cursor + 1))
+      .filter(entry => "insertText" in entry);
+    assert.deepEqual(next.map(entry => entry.insertText), ["alpha"]);
+    assert.equal(next[0].replaceEnd, nextText.lastIndexOf('"'), "cached replacement ends move with typing");
+    assert.equal(lang.refineInlineCompletion(snapshot(nextText.replace("old", "changed"), cursor + 1)), undefined);
+  }
 });
 
 test("inline refresh, cached filtering and Quick Pick preserve semantic order", async () => {

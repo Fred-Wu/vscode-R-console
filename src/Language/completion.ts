@@ -7,6 +7,8 @@ export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
   replaceStart: number;
+  // Line-relative offset, potentially past this line for a multiline string.
+  replaceEnd?: number;
   triggerCharacter?: string;
   objectName?: string;
   operator?: "$" | "@";
@@ -87,6 +89,7 @@ export type CompletionPickItem = vscode.QuickPickItem & {
   packageName?: string;
   insertText: string;
   replaceStart: number;
+  replaceEnd?: number;
   snapshotInput: string;
   snapshotCursor: number;
   source: "lsp" | "session" | "buffer";
@@ -305,6 +308,7 @@ export function getCompletionContext(
       autoTrigger: true,
       prefix: bracket.prefix,
       replaceStart: bracket.replaceStart - relativeOffset,
+      ...(bracket.replaceEnd !== undefined ? { replaceEnd: bracket.replaceEnd - relativeOffset } : {}),
       triggerCharacter: bracket.quote ? undefined : "[",
       objectName: effectiveDataObject,
       bracketOperator: bracket.operator,
@@ -336,6 +340,7 @@ export function getCompletionContext(
       suppressAutomatic: inLiteral && !value,
       prefix,
       replaceStart: value ? value.replaceStart - relativeOffset : beforeCursor.length - prefix.length,
+      ...(value?.replaceEnd !== undefined ? { replaceEnd: value.replaceEnd - relativeOffset } : {}),
       functionName: call.name,
       functionOperator: call.operator,
       argumentTags: call.argumentTags,
@@ -586,6 +591,7 @@ export function toCompletionPick(
     detail: entry.detail ? stripSnippetSyntax(entry.detail) : undefined,
     insertText: entry.insertText,
     replaceStart: entry.replaceStart ?? context.replaceStart,
+    ...(context.replaceEnd !== undefined ? { replaceEnd: context.replaceEnd } : {}),
     snapshotInput: context.snapshotInput,
     snapshotCursor: context.snapshotCursor,
     source: entry.source,
