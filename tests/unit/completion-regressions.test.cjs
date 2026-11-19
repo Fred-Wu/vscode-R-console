@@ -222,19 +222,24 @@ test("quoted values ending in parentheses keep the caret after the entire value"
   }
 });
 
-test("source function completion retains only functions attributed to this console document", async () => {
+test("source function completion keeps console definitions without duplicating runtime functions", async () => {
   const text = "1 %>% fun", uri = "r-console://review/console.R";
   const context = completion.getCompletionContext(text, text.length);
   const entries = await completion.collectCompletionEntries(context, { getText: () => text, uri: { toString: () => uri } },
-    { line: 0, character: text.length }, undefined, [], [], {
+    { line: 0, character: text.length }, { globalenv: { fun_runtime: { type: "closure" } } }, [], [], {
       provideCompletionItems: async () => [
         { label: "fun_local", kind: 2, insertText: "fun_local()", detail: "[workspace]",
           data: { package: "_workspace_", context_uri: uri } },
         { label: "fun_other", kind: 2, insertText: "fun_other()", detail: "[workspace]",
           data: { package: "_workspace_", context_uri: "file:///other.R" } },
+        { label: "fun_runtime", kind: 2, insertText: "fun_runtime()", detail: "[workspace]",
+          data: { package: "_workspace_", context_uri: uri } },
+        { label: "fun_runtime", kind: 2, insertText: "fun_runtime()", detail: "{pkg}",
+          data: { package: "pkg" } },
       ],
     });
-  assert.deepEqual(entries.map(item => item.insertText), ["fun_local()"]);
+  assert.deepEqual(entries.map(item => [item.insertText, item.detail]),
+    [["fun_local()", "[workspace]"], ["fun_runtime()", "{pkg}"], ["fun_runtime()", "session"]]);
 });
 
 test("completion lexical snapshots remain correct after arbitrary edits and cursor moves", () => {

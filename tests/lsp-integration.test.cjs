@@ -495,13 +495,27 @@ test("accepting a console-defined function opens its live arguments and values",
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
   });
-  const setup = 'f <- function(`a b`, normal = c("first", "second"), lazy = stop("default evaluated")) stop("body evaluated")\n';
-  const session = runRJson(setup + 'cat(jsonlite::toJSON(list(search = search(), loaded_namespaces = loadedNamespaces(), globalenv = list(f = list(type = typeof(f), str = paste(capture.output(str(f)), collapse="\\n")))), auto_unbox = TRUE))');
+  const setup = 'f <- function(`a b`, normal = c("first", "second"), lazy = stop("default evaluated")) stop("body evaluated")\n' +
+    'my_function <- function(method = c("fast", "accurate")) {}\n';
+  const session = runRJson(setup + 'cat(jsonlite::toJSON(list(search = search(), loaded_namespaces = loadedNamespaces(), globalenv = lapply(mget(c("f", "my_function")), function(fn) list(type = typeof(fn), str = paste(capture.output(str(fn)), collapse="\\n")))), auto_unbox = TRUE))');
   const lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
     requestMemberCompletions: async () => { assert.fail("function arguments must not query sess"); },
   });
   lang.updateSessionData(session);
   t.after(() => lang.dispose());
+  await lang.start();
+  for (const [text, expected] of [
+    ['my_fun', ['my_function']], ['1 |> my_fun', ['my_function']],
+    ['my_function(', ['method']], ['my_function(fa', []],
+    ['my_function(method = ', ['fast', 'accurate']], ['my_function(method = "fa', ['fast']],
+  ]) {
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 0, character: text.length },
+      session, [], [], client, async () => assert.fail("function completion must not query sess"));
+    const displayed = entries.filter(item => item.label === 'my_function' || item.role === 'argument' || item.role === 'value');
+    assert.deepEqual(displayed.map(item => item.label), expected, text);
+    if (expected.includes('my_function')) assert.equal(displayed[0].source, 'session');
+  }
   const handleAutocomplete = lang.handleAutocomplete.bind(lang);
   lang.handleAutocomplete = request => handleAutocomplete({ ...request, getWorkspaceData: () => session });
   const { terminal } = require("./helpers/inline-terminal.cjs").createTerminal(t);
@@ -530,6 +544,7 @@ test("accepting a console-defined function opens its live arguments and values",
   await waitFor(() => choices().some(item => item.insertText === "normal = "), "remaining arguments");
   assert.deepEqual(choices().filter(item => item.detail === "parameter").map(item => item.insertText),
     ["normal = ", "lazy = "]);
+  assert.ok(choices().every(item => !item.detail?.startsWith("value for ")));
   terminal.applyKeyAction({ type: "tab" });
   await waitFor(() => choices().some(item => item.insertText === '"second"'), "live default values");
   assert.equal(terminal.submitted, undefined, "completion must never execute the function");

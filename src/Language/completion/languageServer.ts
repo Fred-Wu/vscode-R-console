@@ -28,7 +28,9 @@ export async function getLanguageServerCompletions(
     let argumentsExhausted = result?.rConsoleArgumentsExhausted === true;
 
     let items = Array.isArray(result) ? result : result?.items || [];
-    const usable = (item: vscode.CompletionItem): boolean => isLanguageServerCompletionItem(context, item, doc.uri?.toString());
+    const usable = (item: vscode.CompletionItem): boolean =>
+      !(workspaceFunction && !context.argumentValue && getCompletionRole(item) === "value") &&
+      isLanguageServerCompletionItem(context, item, doc.uri?.toString());
     // Some R language servers only return contiguous matches. If that lookup
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
