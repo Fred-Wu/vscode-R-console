@@ -53,6 +53,7 @@ export class SessProxy {
   private rSocketWaiters: Array<(socket: net.Socket | undefined) => void> = [];
   private workspaceData: WorkspaceData | undefined;
   private libraryPathsRequest: Promise<void> | undefined;
+  private lastLibraryPathsRead = 0;
   private sessionId: string | undefined;
   private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
   private onConnectionChange: ((state: "attached" | "disconnected") => void) | undefined;
@@ -147,20 +148,21 @@ export class SessProxy {
     if (socket && (this.rSocket !== socket || socket.destroyed)) {
       return this.workspaceData;
     }
-    if (this.workspaceData?.libraryPaths) {
-      result.libraryPaths = this.workspaceData.libraryPaths;
-    }
     // Workspace updates must not wait for the optional library-path probe.
     this.setWorkspaceData(result);
-    this.refreshLibraryPaths();
+    void this.refreshLibraryPaths(true);
     return result;
   }
 
-  private refreshLibraryPaths(): void {
+  async refreshLibraryPaths(force = false): Promise<void> {
     const socket = this.rSocket;
-    if (!socket || socket.destroyed || this.libraryPathsRequest) {
-      return;
+    if (!socket || socket.destroyed) return;
+    if (this.libraryPathsRequest) return this.libraryPathsRequest;
+    if (!this.workspaceData) {
+      await this.requestWorkspace();
+      return this.libraryPathsRequest;
     }
+    if (!force && this.workspaceData.libraryPaths && Date.now() - this.lastLibraryPathsRead < 1000) return;
     // sess completion returns list names without modifying R state.
     const request = this.request("completion", {
       expr: "stats::setNames(as.list(.libPaths()), .libPaths())",
@@ -175,6 +177,7 @@ export class SessProxy {
         return;
       }
       const libraryPaths = paths.map((item) => item.name as string);
+      this.lastLibraryPathsRead = Date.now();
       if (JSON.stringify(this.workspaceData.libraryPaths) !== JSON.stringify(libraryPaths)) {
         this.setWorkspaceData({ ...this.workspaceData, libraryPaths });
       }
@@ -184,6 +187,7 @@ export class SessProxy {
       }
     });
     this.libraryPathsRequest = request;
+    return request;
   }
 
   getWorkspaceData(): WorkspaceData | undefined {
@@ -534,6 +538,7 @@ export class SessProxy {
   }
 
   private setWorkspaceData(data: WorkspaceData): void {
+    if (!data.libraryPaths && this.workspaceData?.libraryPaths) data.libraryPaths = this.workspaceData.libraryPaths;
     this.workspaceData = data;
     this.onWorkspaceData?.(data);
   }

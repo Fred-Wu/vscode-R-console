@@ -26,7 +26,7 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
-import type { WorkspaceData } from "../Runtime/VSCR";
+import { getVscodeRIntegration, type WorkspaceData } from "../Runtime/VSCR";
 import {
   InputSnapshot,
   RTermLang,
@@ -287,6 +287,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       requestWorkspaceData: async () =>
         await getRuntimeWorkspaceData(this.runtimeHost()),
+      refreshLibraryPaths: (force) => getVscodeRIntegration(this.runtimeHost()).refreshLibraryPaths(force),
+      onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestMemberCompletions: async (expression, operator) =>
         await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
     });

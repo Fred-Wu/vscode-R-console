@@ -764,7 +764,8 @@ Completion data comes from one shared flow:
   when needed
 - data-aware bracket and pipe-placeholder contexts use cached session metadata
   and current input for the first suggestion pass
-- language-server symbols come from the console-owned `languageserver` process
+- language-server symbols come from the console-owned `languageserver` process.
+  A bare package prefix also offers names from the active package libraries.
 
 #### Language Server Lifecycle
 
@@ -789,22 +790,48 @@ to the console. Diagnostics are disabled for these completion documents.
 `rConsole/syncSessionState` synchronizes attached packages and library paths.
 The client deduplicates unchanged snapshots and shares an in-flight sync request
 among concurrent callers. The R server resolves the requested session paths,
-configured fallback paths, and default libraries with `.libPaths()`. It compares
-their effective search order with the running server's paths, then restores
-those paths before replying. A changed search order requests a process restart
-so namespaces load from the selected libraries.
+configured fallback paths, and default libraries with `.libPaths()`. It returns
+the resolved search order to the background package monitor. Startup and
+session updates keep the console's library paths current;
+completion requests do not wait for a library-path probe.
 
-`rConsole/checkPackageChanges` compares fingerprints for cached and explicitly
-referenced packages. Fingerprints include package paths, file sizes, and
-modification timestamps. The client throttles these checks to one per second;
-changed packages request a restart to refresh loaded namespaces and cached data.
+`PackageInventory` monitors library folders outside the R process. Folder
+events schedule a scan of the changed library after 250 ms. It reads package names,
+versions, resolved paths, and package-directory timestamps, reusing unchanged
+package records. There are no periodic package scans or library-path probes. Scans use
+bounded asynchronous file operations. Installation lock folders defer changes
+in that library, and a changed inventory must be stable across two scans.
+
+The first library containing a package selects its effective installation.
+Adding or removing a lower-priority copy updates the inventory and counts but
+preserves completion data. A new effective package updates the package-name
+list without restarting. A changed effective copy invalidates that package's
+completion metadata and affected requests. `rConsole/refreshPackages` requests
+a restart only when a changed package is already loaded in the LSP process,
+or the loaded namespace comes from a different installation. Ordinary typing
+does not run package scans or change checks.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
 latest snapshot. A completion interrupted by replacement reopens its document
-and retries once on the replacement client. Disposal stops the child process
-before removing its working directory. The `R Console Language Server` output
-channel records process starts, stops, and errors.
+and retries once on the replacement client. Before a package-triggered restart,
+the server saves its package symbols, cached function signatures, member metadata,
+and S3 method metadata to a temporary snapshot in the console's working directory.
+This snapshot is separate from the library inventory. Each entry records the
+inventory identities of its package and dependencies. The replacement server
+restores only entries whose identities still match the latest inventory, with
+matching R, language-server, and snapshot versions. Changed packages and affected
+dependents are rebuilt as needed. The snapshot contains no console runtime objects
+or loaded namespace environments, and is removed when the console LSP is disposed.
+Export/restore failures are logged and leave normal metadata discovery available.
+The replacement receives a silent completion after restoration to warm any missing
+metadata. Package changes invalidate stale displayed
+suggestions. Disposal closes library watchers and timers and stops the child
+process before removing its working directory. The `R Console Language Server`
+output channel records additions, updates, removals, remaining or selected
+copies, refresh/restart decisions, and library paths in search order with
+per-library and unique-package counts, as well as saved/restored metadata counts,
+process starts, stops, and errors.
 
 #### Keybinding Dispatch
 

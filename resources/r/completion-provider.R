@@ -125,6 +125,19 @@ console_supplement_completion <- function(reply, self, params) {
             isTRUE(attr(symbols, "truncated")) ||
             isTRUE(reply$result$isIncomplete)
     }
+    if (!is.null(params$rConsolePackagePrefix)) {
+        if (is.null(completion_packages)) {
+            completion_packages <<- .packages(all.available = TRUE, lib.loc = completion_libraries)
+        }
+        matches <- completion_packages[languageserver:::match_with(completion_packages, params$rConsolePackagePrefix)]
+        limit <- languageserver:::lsp_settings$get("max_completions")
+        items <- lapply(head(matches, limit), function(name) {
+            list(label = name, kind = languageserver:::CompletionItemKind$Module, data = list(type = "package"))
+        })
+        symbols <- Filter(function(item) !identical(item$data$type, "package"), reply$result$items)
+        reply$result$items <- c(symbols, items)
+        if (length(matches) > limit) reply$result$isIncomplete <- TRUE
+    }
     reply
 }
 
@@ -141,8 +154,6 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
                 reply$result <- native_result
                 reply
             })
-            workspace <- self$get_workspace(languageserver:::uri_escape_unicode(params$textDocument$uri))
-            record_cached_package_fingerprints(workspace)
         }
         self$deliver(reply)
     }

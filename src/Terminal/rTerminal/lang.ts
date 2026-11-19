@@ -32,6 +32,8 @@ type LangOptions = {
   env: NodeJS.ProcessEnv;
   getRecentSessionEntries?: () => string[];
   requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
+  refreshLibraryPaths?: (force: boolean) => Promise<void>;
+  onPackagesChanged?: () => void;
   requestMemberCompletions: RuntimeMemberCompletionRequester;
 };
 
@@ -61,10 +63,14 @@ export class RTermLang {
   private silentCompletionRequest: Promise<void> | undefined;
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
+  private completionPickerAbort: AbortController | undefined;
 
   constructor(private readonly options: LangOptions) {}
 
   async start(): Promise<void> {
+    if (!this.disposed) {
+      void this.options.refreshLibraryPaths?.(false).catch(() => undefined);
+    }
     const completionProvider = await this.ensureConsoleLspStarted();
     if (!completionProvider) {
       return;
@@ -129,10 +135,9 @@ export class RTermLang {
       }).catch(() => undefined);
 
       let completionProvider: CompletionProvider | undefined;
-      const completionProviderRequest = this.ensureConsoleLspStarted();
       const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
-        completionProvider = await completionProviderRequest;
+        completionProvider = await this.ensureConsoleLspStarted();
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
@@ -214,8 +219,12 @@ export class RTermLang {
         return;
       }
 
+      this.completionPickerAbort?.abort();
+      const pickerAbort = new AbortController();
+      this.completionPickerAbort = pickerAbort;
       const selection = await pickCompletion({
         context, latestInput, initialEntries,
+        signal: pickerAbort.signal,
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
@@ -253,6 +262,7 @@ export class RTermLang {
           return nextEntries;
         },
       });
+      if (this.completionPickerAbort === pickerAbort) this.completionPickerAbort = undefined;
 
       if (!isCompletionPickItem(selection)) {
         return;
@@ -292,6 +302,8 @@ export class RTermLang {
   cancelCompletion(): void {
     this.completionRequestId++;
     this.inlineCache = undefined;
+    this.completionPickerAbort?.abort();
+    this.completionPickerAbort = undefined;
   }
 
   dispose(): Promise<void> {
@@ -300,7 +312,7 @@ export class RTermLang {
     }
 
     this.disposed = true;
-    this.completionRequestId += 1;
+    this.cancelCompletion();
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;
     this.completionDocument = undefined;
@@ -342,6 +354,7 @@ export class RTermLang {
     if (this.disposed || !data) {
       return false;
     }
+    void this.options.refreshLibraryPaths?.(true).catch(() => undefined);
 
     const nextState = this.toSessionState(data);
     if (
@@ -424,6 +437,10 @@ export class RTermLang {
         extensionPath: this.options.extensionPath,
         rPath: this.options.rPath,
         env: this.options.env,
+        onPackagesChanged: () => {
+          this.cancelCompletion();
+          this.options.onPackagesChanged?.();
+        },
       });
       this.consoleLsp = lsp;
     }

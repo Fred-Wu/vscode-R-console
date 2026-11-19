@@ -9,13 +9,14 @@ import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
 export async function pickCompletion({
-  context, latestInput, initialEntries, delayedEntries, force, isCurrent, collect,
+  context, latestInput, initialEntries, delayedEntries, force, isCurrent, collect, signal,
 }: {
   context: CompletionContext;
   latestInput: InputSnapshot;
   initialEntries: CompletionEntries;
   delayedEntries?: Promise<CompletionEntries | undefined>;
   force: boolean;
+  signal?: AbortSignal;
   isCurrent: () => boolean;
   collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number) => Promise<CompletionEntries | undefined>;
 }): Promise<CompletionPickItem | undefined> {
@@ -67,7 +68,13 @@ export async function pickCompletion({
     initialEntries: CompletionEntries,
     delayedEntries?: Promise<CompletionEntries | undefined>
   ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(undefined);
+      return;
+    }
     const pick = vscode.window.createQuickPick<vscode.QuickPickItem>();
+    const cancel = () => pick.hide();
+    signal?.addEventListener("abort", cancel, { once: true });
     let active = true;
     let prefillTimer: ReturnType<typeof setTimeout> | undefined;
     let request = 0;
@@ -182,6 +189,7 @@ export async function pickCompletion({
       pick.hide();
     });
     pick.onDidHide(() => {
+      signal?.removeEventListener("abort", cancel);
       clearTimeout(prefillTimer);
       const cancelled = active;
       active = false;

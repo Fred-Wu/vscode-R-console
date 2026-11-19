@@ -34,8 +34,11 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     async sendRequest(method, params) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
-      if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? true;
-      if (method === "rConsole/checkPackageChanges") return await packageChanges?.(this) ?? [];
+      if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: params.libraryPaths ?? libraries };
+      if (method === "rConsole/libraryPaths") return libraries;
+      if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
+      if (method === "rConsole/exportPackageMetadata") return { saved: ["utils"], skipped: [] };
+      if (method === "rConsole/restorePackageMetadata") return { restored: ["utils"], skipped: [] };
       assert.equal(method, "completion");
       return await completion?.(this, params) ?? [{ label: "lm" }];
     }
@@ -61,8 +64,14 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     consoleId: "lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
     rPath: "R", env: {},
   });
+  client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
   return { client, instances };
+}
+
+function change() {
+  return { libraries: [{ path: "/base/library", packages: new Map() }],
+    packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
 
 test("first session snapshot keeps a server whose effective library paths already match", async (t) => {
@@ -79,16 +88,17 @@ test("session path checks include configured fallback libraries", async (t) => {
   assert.deepEqual(request.params.libraryPaths, ["/session", "/configured"]);
 });
 
-test("a real library change restarts once and applies the latest session state", async (t) => {
+test("a confirmed loaded-package change restarts once and applies the latest session state", async (t) => {
   let releaseStart;
   const startGate = new Promise((resolve) => { releaseStart = resolve; });
   t.after(releaseStart);
   const { client, instances } = createClient(t, {
-    reply: (server) => server === instances[0] ? { restartRequired: true } : true,
+    packageChanges: (server) => server === instances[0] ? ["stats"] : [],
     start: async (server) => { if (server === instances[1]) await startGate; },
   });
   await client.start();
-  const first = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/first"] });
+  await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/first"] });
+  const first = client.refreshPackages(change());
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(instances.length, 2);
   const concurrentStart = client.start();
@@ -96,22 +106,26 @@ test("a real library change restarts once and applies the latest session state",
   releaseStart();
   await Promise.all([first, concurrentStart, latest]);
   assert.equal(instances.length, 2, "concurrent callers share one restart");
-  assert.deepEqual(instances[1].requests.at(-1).params, {
+  assert.deepEqual(instances[1].requests.filter(request => request.method === "rConsole/syncSessionState").at(-1).params, {
     attachedPackages: ["utils"], libraryPaths: ["/latest"],
   });
+  assert.ok(instances[0].requests.some(request => request.method === "rConsole/exportPackageMetadata"));
+  const restored = instances[1].requests.findIndex(request => request.method === "rConsole/restorePackageMetadata");
+  assert.ok(restored > instances[1].requests.findIndex(request => request.method === "rConsole/refreshPackages"));
+  assert.ok(restored < instances[1].requests.findIndex(request => request.method === "completion"));
 });
 
-test("completion survives a library restart while its package check is pending", async (t) => {
+test("completion survives a background replacement while its response is pending", async (t) => {
   const { client, instances } = createClient(t, {
-    reply: (server) => server === instances[0] ? { restartRequired: true } : true,
+    packageChanges: (server) => server === instances[0] ? ["stats"] : [],
   });
   await client.start();
   const first = instances[0];
   const originalRequest = first.sendRequest.bind(first);
   let sync;
   first.sendRequest = async (method, params) => {
-    if (method === "rConsole/checkPackageChanges") {
-      sync = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/new"] });
+    if (method === "completion") {
+      sync = client.refreshPackages(change());
       await sync;
       throw new Error("Pending response rejected since connection got disposed");
     }
@@ -121,15 +135,15 @@ test("completion survives a library restart while its package check is pending",
   await sync;
   assert.deepEqual(result, [{ label: "lm" }]);
   assert.equal(instances.length, 2);
-  assert.deepEqual(instances[1].documents, ["stats::l"], "reopen the document on the replacement server");
+  assert.equal(instances[1].documents.at(-1), "stats::l", "reopen the document on the replacement server");
 });
 
 test("completion retries a request interrupted by a server replacement", async (t) => {
   const { client, instances } = createClient(t, {
-    reply: (server) => server === instances[0] ? { restartRequired: true } : true,
+    packageChanges: (server) => server === instances[0] ? ["stats"] : [],
     completion: async (server) => {
       if (server === instances[0]) {
-        await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/new"] });
+        await client.refreshPackages(change());
         throw new Error("Pending response rejected since connection got disposed");
       }
       return [{ label: "lm" }];
@@ -163,6 +177,8 @@ test("package replacement and a simultaneous library update share one restart", 
       if (server === instances[0]) { enteredStop(); await stopGate; }
     },
   });
+  await client.start();
+  const refresh = client.refreshPackages(change());
   const request = client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8));
   await stopping;
   const state = { attachedPackages: ["stats"], libraryPaths: ["/project"] };
@@ -170,7 +186,7 @@ test("package replacement and a simultaneous library update share one restart", 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(instances.length, 1, "do not launch a server while its predecessor is stopping");
   releaseStop();
-  const [result] = await Promise.all([request, sync]);
+  const [result] = await Promise.all([request, sync, refresh]);
   assert.deepEqual(result, [{ label: "lm" }]);
   assert.equal(instances.length, 2);
   assert.deepEqual(instances[1].requests.find(({ method }) => method === "rConsole/syncSessionState").params, state);
@@ -181,15 +197,15 @@ test("an obsolete library update does not restart a server that matches the late
   let enteredRequest;
   const replyGate = new Promise((resolve) => { releaseReply = resolve; });
   const requested = new Promise((resolve) => { enteredRequest = resolve; });
-  t.after(() => releaseReply({ restartRequired: true }));
+  t.after(() => releaseReply({ libraryPaths: ["/obsolete"] }));
   let requests = 0;
   const { client, instances } = createClient(t, {
-    reply: async () => { if (++requests === 1) { enteredRequest(); return replyGate; } return true; },
+    reply: async () => { if (++requests === 1) { enteredRequest(); return replyGate; } return { libraryPaths: ["/current"] }; },
   });
   const first = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/obsolete"] });
   await requested;
   const latest = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/current"] });
-  releaseReply({ restartRequired: true });
+  releaseReply({ libraryPaths: ["/obsolete"] });
   await Promise.all([first, latest]);
   assert.equal(instances.length, 1);
   assert.equal(requests, 2, "check the latest state before deciding to restart");

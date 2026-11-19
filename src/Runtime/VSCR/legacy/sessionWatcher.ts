@@ -36,6 +36,8 @@ export class SessionWatcher {
   private expectedPidAutoPinned = false;
   private attachedPid: number | undefined;
   private server: SessionServerInfo | undefined;
+  private libraryPathsRequest: Promise<void> | undefined;
+  private lastLibraryPathsRead = 0;
 
   constructor(private watcherDir: string) {}
 
@@ -149,6 +151,30 @@ export class SessionWatcher {
     void this.updateWorkspace();
   }
 
+  async refreshLibraryPaths(force: boolean): Promise<void> {
+    const sessionDir = this.sessionDir;
+    if (!this.server || !sessionDir) return;
+    if (this.libraryPathsRequest) return this.libraryPathsRequest;
+    if (!force && this.workspaceData?.libraryPaths && Date.now() - this.lastLibraryPathsRead < 1000) return;
+    const request = (async () => {
+      if (!this.workspaceData) await this.updateWorkspace();
+      const items = await this.requestMemberCompletions("stats::setNames(as.list(.libPaths()), .libPaths())", "$");
+      if (sessionDir !== this.sessionDir || !this.workspaceData || !items?.length) return;
+      this.lastLibraryPathsRead = Date.now();
+      const libraryPaths = items.map(item => item.name);
+      if (JSON.stringify(libraryPaths) !== JSON.stringify(this.workspaceData.libraryPaths)) {
+        this.workspaceData = { ...this.workspaceData, libraryPaths };
+        this.onChangeCallback?.(this.workspaceData);
+      }
+    })();
+    this.libraryPathsRequest = request;
+    try {
+      await request;
+    } finally {
+      if (this.libraryPathsRequest === request) this.libraryPathsRequest = undefined;
+    }
+  }
+
   /**
    * Register a callback invoked immediately when a new R session attaches
    * (i.e. when request.log is processed with command="attach" and a new
@@ -212,6 +238,7 @@ export class SessionWatcher {
       }
       this.sessionDir = nextSessionDir;
       this.workspaceData = undefined;
+      this.libraryPathsRequest = undefined;
       this.onAttachCallback?.();
       this.startWorkspaceWatcher();
     } catch {
@@ -249,10 +276,12 @@ export class SessionWatcher {
   }
 
   private async updateWorkspace(): Promise<void> {
+    const sessionDir = this.sessionDir;
     const response = await this.postToSessionServer({ type: "workspace" });
-    if (!this.isWorkspaceData(response)) {
+    if (this.sessionDir !== sessionDir || !this.isWorkspaceData(response)) {
       return;
     }
+    if (!response.libraryPaths && this.workspaceData?.libraryPaths) response.libraryPaths = this.workspaceData.libraryPaths;
     this.workspaceData = response;
     this.onChangeCallback?.(this.workspaceData);
   }

@@ -90,6 +90,10 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return await this.watcher.requestWorkspaceData();
   }
 
+  override async refreshLibraryPaths(force: boolean): Promise<void> {
+    await this.watcher.refreshLibraryPaths(force);
+  }
+
   override async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"

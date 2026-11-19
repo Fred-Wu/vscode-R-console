@@ -727,6 +727,9 @@ test("sess workspace refresh publishes promptly and then synchronizes library pa
   await proxy.requestWorkspace();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(updates.length, 3, "unchanged libraries do not emit a separate update");
+  proxy.forwardedRequests.set("explorer", "workspace");
+  proxy.handleRLine(JSON.stringify({ id: "explorer", result: { search: [], loaded_namespaces: [], globalenv: {} } }));
+  assert.deepEqual(proxy.getWorkspaceData().libraryPaths, ["/project/.uvr/library", "/base/library"]);
   proxy.dispose();
 });
 

@@ -29,6 +29,7 @@ import type { CompletionPickItem, CompletionProvider, CompletionResult } from ".
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
+import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -50,6 +51,7 @@ type ConsoleLspClientOptions = {
   extensionPath: string;
   rPath: string;
   env: NodeJS.ProcessEnv;
+  onPackagesChanged?: () => void;
 };
 
 type ConsoleLspSessionState = {
@@ -60,7 +62,6 @@ type ConsoleLspSessionState = {
 type SessionStateSyncResult = {
   synced: boolean;
   stateKey: string;
-  restartRequired?: boolean;
 };
 
 class SilentOutputChannel implements vscode.OutputChannel {
@@ -104,8 +105,10 @@ export class ConsoleLspClient implements CompletionProvider {
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
-  private packageCheckPromise: Promise<boolean> | undefined;
-  private lastPackageCheckAt = 0;
+  private readonly packageInventory: PackageInventory;
+  private packageRefreshPromise: Promise<void> | undefined;
+  private packageRevision = 0;
+  private packageMetadataSaved = false;
   private configuredLibraryPaths: string[] = [];
   private restartPromise: Promise<void> | undefined;
 
@@ -114,6 +117,10 @@ export class ConsoleLspClient implements CompletionProvider {
     this.outputChannel = new SilentOutputChannel("R Console");
     // A client removes only its own cwd after its R process has stopped.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
+    this.packageInventory = new PackageInventory(
+      change => this.refreshPackages(change),
+      message => lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] ${message}`),
+    );
   }
 
   async start(): Promise<void> {
@@ -242,6 +249,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.disposed = true;
+    this.packageInventory.dispose();
     this.disposePromise = (async () => {
       while (!(await this.stop())) {
         const child = this.spawnedServer;
@@ -273,6 +281,8 @@ export class ConsoleLspClient implements CompletionProvider {
     contextPosition: vscode.Position = position
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      await this.packageRefreshPromise;
+      const revision = this.packageRevision;
       const client = await this.ensureClient();
       if (!client) {
         return undefined;
@@ -283,17 +293,6 @@ export class ConsoleLspClient implements CompletionProvider {
         await this.applySessionState(client);
         if (this.client !== client) {
           continue;
-        }
-        const packagesChanged = await this.packageChangesDetected(client, projection.document.getText());
-        if (this.client !== client || !client.isRunning()) {
-          continue;
-        }
-        if (packagesChanged) {
-          if (attempt === 0) {
-            await this.restartClient(client);
-            continue;
-          }
-          return undefined;
         }
         const context: vscode.CompletionContext = triggerCharacter
           ? {
@@ -307,7 +306,7 @@ export class ConsoleLspClient implements CompletionProvider {
         const serverPosition = projection.toServerPosition(position);
         const params = createCompletionParams(client, projection, serverPosition, contextPosition, context);
         const result = await client.sendRequest(CompletionRequest.type, params);
-        if (this.client !== client) {
+        if (this.client !== client || revision !== this.packageRevision) {
           continue;
         }
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
@@ -335,6 +334,7 @@ export class ConsoleLspClient implements CompletionProvider {
               : { inserting: mapRange(item.range.inserting), replacing: mapRange(item.range.replacing) };
           }
         }
+        if (this.client !== client || revision !== this.packageRevision) continue;
         return completions;
       } catch {
         // A session update can replace the server at any await above. Reopen
@@ -400,14 +400,16 @@ export class ConsoleLspClient implements CompletionProvider {
       const params = state.libraryPaths && this.configuredLibraryPaths.length
         ? { ...state, libraryPaths: [...state.libraryPaths, ...this.configuredLibraryPaths] }
         : state;
-      syncPromise = client.sendRequest<boolean | { restartRequired: boolean }>("rConsole/syncSessionState", params)
+      syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", params)
         .then((reply) => {
-          const restartRequired = typeof reply === "object" && reply?.restartRequired === true;
-          const synced = this.client === client && !restartRequired;
+          if (this.client === client && typeof reply === "object" && Array.isArray(reply?.libraryPaths)) {
+            this.packageInventory.setLibraryPaths(reply.libraryPaths);
+          }
+          const synced = this.client === client;
           if (synced) {
             this.syncedSessionStateKey = stateKey;
           }
-          return { synced, stateKey, restartRequired };
+          return { synced, stateKey };
         })
         .catch(() => ({ synced: false, stateKey }))
         .finally(() => {
@@ -423,11 +425,6 @@ export class ConsoleLspClient implements CompletionProvider {
       return;
     }
     const currentStateKey = this.getSessionStateKey(this.sessionState);
-    if (result.restartRequired && result.stateKey === currentStateKey) {
-      await this.restartClient(client);
-      if (this.client?.isRunning()) await this.applySessionState(this.client);
-      return;
-    }
     if (
       this.syncedSessionStateKey !== currentStateKey &&
       (result.synced || result.stateKey !== currentStateKey)
@@ -449,8 +446,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return;
     }
 
-    // Package and library updates share one replacement. Completion and startup
-    // callers wait for it instead of launching or using a server being stopped.
+    // Completion and startup callers join the same background replacement.
     const refresh = (async () => {
       if (!(await this.stop())) {
         throw new Error("Cannot restart the console language server.");
@@ -469,36 +465,74 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  private async packageChangesDetected(
-    client: ConsoleLanguageClient,
-    content: string
-  ): Promise<boolean> {
-    if (this.packageCheckPromise) {
-      return await this.packageCheckPromise;
-    }
-    if (Date.now() - this.lastPackageCheckAt < 1000) {
-      return false;
-    }
-
-    this.lastPackageCheckAt = Date.now();
-    const packages = [...content.matchAll(/\b([A-Za-z][A-Za-z0-9._]*)::/g)]
-      .map((match) => match[1]);
-    let checkPromise: Promise<boolean>;
-    checkPromise = client.sendRequest<string[]>(
-      "rConsole/checkPackageChanges",
-      { packages }
-    )
-      .then((changedPackages) =>
-        this.client === client && changedPackages.length > 0
-      )
-      .catch(() => false)
-      .finally(() => {
-        if (this.packageCheckPromise === checkPromise) {
-          this.packageCheckPromise = undefined;
+  private async refreshPackages(change: PackageInventoryChange): Promise<void> {
+    const refresh = (async () => {
+      let client = this.client;
+      if (!client?.isRunning() || this.disposed) throw new Error("Language server is not running");
+      if (change.changed.length) {
+        this.packageRevision++;
+        this.options.onPackagesChanged?.();
+      }
+      const params = {
+        libraryPaths: change.libraries.map(library => library.path),
+        packages: [...change.packages.keys()],
+        installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
+        identities: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.identity])),
+        changed: change.changed,
+      };
+      const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
+      if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
+      if (!change.isCurrent()) return;
+      if (result.restart.length) {
+        if (!change.changed.length) {
+          this.packageRevision++;
+          this.options.onPackagesChanged?.();
         }
-      });
-    this.packageCheckPromise = checkPromise;
-    return await checkPromise;
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restart required: loaded packages changed: ${result.restart.join(", ")}`);
+        await this.transferPackageMetadata(client, "export");
+        await this.restartClient(client);
+        client = this.client;
+        if (!client?.isRunning() || this.disposed) return;
+        await this.applySessionState(client);
+        if (!change.isCurrent()) return;
+        await client.sendRequest("rConsole/refreshPackages", { ...params, changed: [] });
+      } else if (change.changed.length) {
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
+      }
+      if (this.packageMetadataSaved) await this.transferPackageMetadata(client, "restore");
+      if (result.restart.length) {
+        try {
+          const projection = this.inputDocument.project(this.inputDocument.getText());
+          await this.syncDocument(client, projection.document);
+          const position = projection.document.positionAt(projection.document.getText().length);
+          await client.sendRequest(CompletionRequest.type, createCompletionParams(client, projection,
+            position, position, { triggerKind: vscode.CompletionTriggerKind.Invoke, triggerCharacter: undefined }));
+        } catch {
+          // Incomplete console input must not turn a successful refresh into a restart loop.
+        }
+      }
+    })();
+    this.packageRefreshPromise = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (this.packageRefreshPromise === refresh) this.packageRefreshPromise = undefined;
+    }
+  }
+
+  private async transferPackageMetadata(client: ConsoleLanguageClient, action: "export" | "restore"): Promise<void> {
+    this.packageMetadataSaved = false;
+    try {
+      const result = await client.sendRequest<{ saved?: string[]; restored?: string[]; skipped?: string[]; error?: string }>(
+        `rConsole/${action}PackageMetadata`, { file: path.join(this.workingDirectory, "package-metadata.rds") });
+      if (result.error) throw new Error(result.error);
+      const packages = action === "export" ? result.saved : result.restored;
+      if (!Array.isArray(packages)) throw new Error("Invalid package metadata response");
+      if (action === "export") this.packageMetadataSaved = true;
+      lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] ${action === "export" ? "Saved" : "Restored"} package metadata: ${packages.length} packages${packages.length ? ` (${packages.join(", ")})` : ""}; skipped ${result.skipped?.length ?? 0}`);
+    } catch (error) {
+      lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Could not ${action} package metadata: ${String(error)}`);
+    }
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
@@ -580,10 +614,12 @@ export class ConsoleLspClient implements CompletionProvider {
     this.client = client;
     this.syncedSessionStateKey = undefined;
     this.sessionStateSyncPromise = undefined;
-    this.packageCheckPromise = undefined;
-    this.lastPackageCheckAt = 0;
     await client.start();
     await this.disableConsoleDiagnostics(client);
+    const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});
+    if (this.client === client && !this.disposed && !this.syncedSessionStateKey) {
+      this.packageInventory.setLibraryPaths(libraries);
+    }
   }
 
   private createStdioTransport(args: string[], env: NodeJS.ProcessEnv): Promise<StreamInfo> {
@@ -829,8 +865,7 @@ export class ConsoleLspClient implements CompletionProvider {
       ...(config.get<string[]>("libPaths") ?? []),
     ];
 
-    // The lifecycle channel reports errors only; languageserver writes its
-    // debug and info entries to the same stderr stream as errors.
+    // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
     env.VSCR_USE_RENV_LIB_PATH = useRenvLibPath ? "TRUE" : "FALSE";
     env.VSCR_LIB_PATHS = libPaths.join("\n");

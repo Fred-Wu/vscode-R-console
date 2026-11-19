@@ -392,7 +392,7 @@ test("unfinished multiline definitions complete immediately without executing or
     // One request per edit: polling would conceal a stale asynchronous parse.
     const result = await client.provideCompletionItems({ getText: () => text }, position);
     assert.deepEqual((result.items ?? result).filter(item => item.detail === "parameter").map(item => item.label), expected, marked);
-    const request = instances.at(-1).requests.at(-1);
+    const request = instances.at(-1).requests.filter(request => request.params?.position).at(-1);
     assert.deepEqual({ ...request.params.position }, position);
     assert.equal([...client.syncedDocuments.values()].at(-1).document.getText(), text);
   }
@@ -697,13 +697,13 @@ test("Unicode call identity never substitutes a same-suffix global function", { 
       await new Promise(resolve => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
     assert.deepEqual(parameters, validNames[index] ? ["correct_argument"] : [], input);
-    assert.equal(instances.at(-1).requests.at(-1).params.rConsoleCall, name);
+    assert.equal(instances.at(-1).requests.filter(request => request.params?.position).at(-1).params.rConsoleCall, name);
   }
   // Exercise parse rejection on every platform, even where unquoted
   // supplementary characters are accepted by R.
   const instance = instances.at(-1);
   const result = await instance.sendRequest("textDocument/completion", {
-    ...instance.requests.at(-1).params, rConsoleCall: "not a valid name",
+    ...instance.requests.filter(request => request.params?.position).at(-1).params, rConsoleCall: "not a valid name",
   });
   assert.ok(result.items.every(item => item.detail !== "parameter" && !item.detail?.startsWith("value for ")));
 });
@@ -1103,7 +1103,7 @@ test("real console languageserver authenticates, initializes and completes code"
     attachedPackages: ["stats"],
     libraryPaths: [],
   });
-  assert.equal(synced, true, "console-specific session synchronization must work");
+  assert.ok(Array.isArray(synced.libraryPaths) && synced.libraryPaths.length > 0, "session synchronization returns the resolved libraries");
 
   lsp.notify("textDocument/didOpen", {
     textDocument: { uri, languageId: "r", version: 1, text: "stats::l\n" },
@@ -1349,7 +1349,7 @@ test("source-only pipe functions survive filtering and native-pipe parse recover
       } });
     assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
     assert.equal([...client.syncedDocuments.values()].at(-1).document.getText(), text, 'repair stays out of the visible/LSP document');
-    assert.ok(instances.at(-1).requests.at(-1).params.position.character <= lines[position.line].length);
+    assert.ok(instances.at(-1).requests.filter(request => request.params?.position).at(-1).params.position.character <= lines[position.line].length);
   }
 });
 

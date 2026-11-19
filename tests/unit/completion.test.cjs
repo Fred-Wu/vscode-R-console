@@ -554,152 +554,66 @@ test("the LSP client sends qualified input and maps both completion range format
 });
 
 
-test("package change restarts the console language server before completion", async (t) => {
-  class TestPosition {
-    constructor(line, character) {
-      Object.assign(this, { line, character });
-    }
-  }
-  class TestVirtualRDocument {
-    project() {
-      return {
-        document: { getText: () => "foo::bar", version: 1 },
-        toServerPosition: (position) => position,
-        toConsolePosition: (position) => position,
-      };
-    }
-    update() {}
-    selectFunction() {}
-  }
-  const vscode = {
-    Position: TestPosition,
-    Range: class Range {},
-    Uri: { parse: (value) => ({ toString: () => value }) },
-    window: { createOutputChannel: () => ({ dispose() {} }) },
-    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
-  };
+test("background package replacement shares startup and preserves newer session libraries", async t => {
+  const logs = [];
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
-    vscode,
-    "./virtualRDocument": { VirtualRDocument: TestVirtualRDocument },
-    "vscode-languageclient/node": {
-      LanguageClient: class {},
-      CompletionRequest: { type: "completion" },
-      DidOpenTextDocumentNotification: { type: "open" },
-      DidChangeTextDocumentNotification: { type: "change" },
-      DidCloseTextDocumentNotification: { type: "close" },
+    vscode: {
+      Uri: { parse: value => ({ toString: () => value }) },
+      window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
     },
+    "vscode-languageclient/node": { LanguageClient: class {} },
   });
-  const client = new ConsoleLspClient({
-    consoleId: "package-refresh-test",
-    extensionPath: "",
-    rPath: "R",
-    env: {},
-  });
-  t.after(() => client.dispose());
-
-  const firstClient = {
+  const lsp = new ConsoleLspClient({ consoleId: "background-replacement", env: {} });
+  t.after(() => lsp.dispose());
+  let current = true;
+  let releaseStart;
+  const gate = new Promise(resolve => { releaseStart = resolve; });
+  const requests = [];
+  const first = { isRunning: () => true, sendRequest: async method =>
+    method === "rConsole/exportPackageMetadata" ? { saved: ["utils"], skipped: [] } : { restart: ["example"] } };
+  const second = {
     isRunning: () => true,
     sendRequest: async (method, params) => {
-      assert.equal(method, "rConsole/checkPackageChanges");
-      assert.deepEqual(params.packages, ["foo"]);
-      return ["foo"];
+      requests.push({ method, params });
+      if (method === "rConsole/refreshPackages") return { restart: [] };
+      if (method === "rConsole/restorePackageMetadata") return { restored: ["utils"], skipped: [] };
+      return { libraryPaths: params.libraryPaths };
     },
-    stop: async () => {},
-    dispose: async () => {},
   };
-  const secondClient = {
-    isRunning: () => true,
-    code2ProtocolConverter: { asCompletionParams: () => ({}) },
-    protocol2CodeConverter: { asCompletionResult: async (result) => result },
-    sendRequest: async (method) => {
-      if (method === "rConsole/checkPackageChanges") {
-        return [];
-      }
-      assert.equal(method, "completion");
-      return [{ label: "new" }];
-    },
-    stop: async () => {},
-    dispose: async () => {},
-  };
-  client.client = firstClient;
-  client.syncDocument = async () => {};
-  client.applySessionState = async () => {};
-
-  let stops = 0;
+  lsp.packageInventory.setLibraryPaths = () => { current = false; };
+  lsp.client = first;
   let starts = 0;
-  client.stop = async () => {
-    stops += 1;
-    client.client = undefined;
-    return true;
+  lsp.stop = async () => { lsp.client = undefined; return true; };
+  lsp.startClient = async () => {
+    starts++;
+    await gate;
+    lsp.client = second;
   };
-  client.startClient = async () => {
-    starts += 1;
-    client.client = secondClient;
-    client.lastPackageCheckAt = 0;
-  };
-
-  const result = await client.provideCompletionItems(
-    { getText: () => "foo::bar" },
-    new TestPosition(0, 8)
-  );
-  assert.deepEqual(result, [{ label: "new" }]);
-  assert.equal(stops, 1);
+  const refresh = lsp.refreshPackages({
+    changed: ["example"], libraries: [{ path: "/old", packages: new Map() }],
+    packages: new Map(), isCurrent: () => current,
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const start = lsp.start();
+  const sync = lsp.syncSessionState({ attachedPackages: [], libraryPaths: ["/latest"] });
+  releaseStart();
+  await Promise.all([refresh, start, sync]);
   assert.equal(starts, 1);
+  assert.deepEqual(requests, [{ method: "rConsole/syncSessionState", params: {
+    attachedPackages: [], libraryPaths: ["/latest"],
+  } }], "do not replay the older inventory after session libraries change");
+  assert.ok(logs.some(line => line.includes("loaded packages changed: example")));
+  await lsp.refreshPackages({
+    changed: [], libraries: [{ path: "/latest", packages: new Map() }],
+    packages: new Map(), isCurrent: () => true,
+  });
+  assert.deepEqual(requests.slice(1).map(request => request.method),
+    ["rConsole/refreshPackages", "rConsole/restorePackageMetadata"],
+    "restore only after the latest library inventory has reached the new server");
+  assert.deepEqual(requests[1].params.libraryPaths, ["/latest"]);
 });
 
-
-test("concurrent package change checks share the in-flight request", async (t) => {
-  const vscode = {
-    Position,
-    Uri: { parse: (value) => ({ toString: () => value }) },
-    window: { createOutputChannel: () => ({ dispose() {} }) },
-  };
-  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
-    vscode,
-    "vscode-languageclient/node": {
-      LanguageClient: class {},
-      CompletionRequest: { type: "completion" },
-      DidOpenTextDocumentNotification: { type: "open" },
-      DidChangeTextDocumentNotification: { type: "change" },
-      DidCloseTextDocumentNotification: { type: "close" },
-    },
-  });
-  const client = new ConsoleLspClient({
-    consoleId: "package-refresh-concurrency-test",
-    extensionPath: "",
-    rPath: "R",
-    env: {},
-  });
-  t.after(() => client.dispose());
-
-  let checks = 0;
-  let resolveCheck;
-  const languageClient = {
-    isRunning: () => true,
-    sendRequest: (method, params) => {
-      assert.equal(method, "rConsole/checkPackageChanges");
-      assert.deepEqual(params.packages, ["foo"]);
-      checks += 1;
-      return new Promise((resolve) => {
-        resolveCheck = resolve;
-      });
-    },
-    stop: async () => {},
-    dispose: async () => {},
-  };
-  client.client = languageClient;
-
-  const first = client.packageChangesDetected(languageClient, "foo::bar");
-  await new Promise((resolve) => setImmediate(resolve));
-  const second = client.packageChangesDetected(languageClient, "foo::bar");
-
-  assert.equal(checks, 1);
-  resolveCheck(["foo"]);
-  assert.deepEqual(await Promise.all([first, second]), [true, true]);
-});
-
-
-test("package change checks are throttled across rapid completions", async (t) => {
+test("completion requests do not perform package inventory checks", async (t) => {
   class TestPosition {
     constructor(line, character) {
       Object.assign(this, { line, character });
@@ -766,7 +680,7 @@ test("package change checks are throttled across rapid completions", async (t) =
   await client.provideCompletionItems(doc, new TestPosition(0, 8));
   await client.provideCompletionItems(doc, new TestPosition(0, 8));
 
-  assert.equal(checks, 1);
+  assert.equal(checks, 0);
   assert.equal(completions, 2);
 });
 
@@ -850,7 +764,7 @@ test("language-server completion starts before a fresh workspace request finishe
 });
 
 
-test("member and package completions do not refresh workspace data", async () => {
+test("namespace completion does not wait for library or workspace probes", async () => {
   class TestPosition {
     constructor(line, character) {
       Object.assign(this, { line, character });
@@ -882,6 +796,7 @@ test("member and package completions do not refresh workspace data", async () =>
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
+  const events = [];
   const lang = new RTermLang({
     extensionPath: "",
     rPath: "R",
@@ -889,14 +804,21 @@ test("member and package completions do not refresh workspace data", async () =>
     requestWorkspaceData: async () => {
       throw new Error("workspace request should not run");
     },
+    refreshLibraryPaths: async force => {
+      assert.equal(force, true);
+      await new Promise(resolve => setImmediate(resolve));
+      events.push("paths");
+    },
     requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({
-    provideCompletionItems: async () => [],
-  });
+  lang.ensureConsoleLspStarted = async () => {
+    events.push("lookup");
+    return { provideCompletionItems: async () => [] };
+  };
   lang.getOrOpenCompletionDocument = async () => ({});
 
   for (const text of contexts.keys()) {
+    events.length = 0;
     const input = {
       text,
       currentLine: text,
@@ -911,6 +833,7 @@ test("member and package completions do not refresh workspace data", async () =>
       getWorkspaceData: () => undefined,
       applyCompletion: () => {},
     });
+    assert.deepEqual(events, ["lookup"]);
   }
 });
 
@@ -1787,17 +1710,24 @@ test("function argument completion awaits parameters before offering runtime var
   assert.equal(published[0][0].label, "na.rm");
 });
 
-test("library path changes trigger console LSP state synchronization", () => {
+test("library paths refresh at startup and session events without periodic probes", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {},
     "../../Language/completion": {},
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
+  const probes = [];
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
     requestMemberCompletions: async () => [],
+    refreshLibraryPaths: async force => { probes.push(force); },
   });
+  lang.ensureConsoleLspStarted = async () => undefined;
+  await lang.start();
+  t.mock.timers.tick(10000);
+  assert.deepEqual(probes, [false], "startup must not start a periodic probe");
   const states = [];
   lang.consoleLsp = { syncSessionState: (state) => {
     states.push(state);
@@ -1815,6 +1745,8 @@ test("library path changes trigger console LSP state synchronization", () => {
     ...data, libraryPaths: ["/another/library", "/base/library"],
   }), true);
   assert.equal(states.length, 2);
+  t.mock.timers.tick(10000);
+  assert.deepEqual(probes, [false, true, true, true], "only session events refresh paths after startup");
 });
 
 test("console LSP keeps configured libraries after live session libraries", async (t) => {
@@ -1834,69 +1766,6 @@ test("console LSP keeps configured libraries after live session libraries", asyn
   lsp.sessionState = { attachedPackages: [], libraryPaths: ["/project/.uvr/library"] };
   const env = lsp.buildServerEnv(config);
   assert.equal(env.VSCR_LIB_PATHS, "/project/.uvr/library\n/fallback");
-});
-
-test("library-path restart serializes concurrent starts and applies the latest paths", async (t) => {
-  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
-    vscode: {
-      Uri: { parse: (value) => ({ toString: () => value }) },
-      window: { createOutputChannel: () => ({ dispose() {} }) },
-    },
-    "vscode-languageclient/node": { LanguageClient: class {} },
-  });
-  const lsp = new ConsoleLspClient({ consoleId: "restart-order", env: {} });
-  t.after(() => lsp.dispose());
-  const requests = [];
-  const fakeClient = (paths) => ({
-    isRunning: () => true,
-    sendRequest: async (_method, state) => {
-      requests.push(state);
-      return JSON.stringify(state.libraryPaths) === paths ? true : { restartRequired: true };
-    },
-  });
-  lsp.client = fakeClient(JSON.stringify(["/original"]));
-  let runningPaths;
-  let stopCount = 0;
-  let startCount = 0;
-  let releaseStart;
-  const firstStartGate = new Promise((resolve) => { releaseStart = resolve; });
-  lsp.stop = async () => {
-    stopCount++;
-    lsp.client = undefined;
-    return true;
-  };
-  lsp.startClient = async () => {
-    const startupPaths = JSON.stringify(lsp.sessionState?.libraryPaths);
-    startCount++;
-    if (startCount === 1) await firstStartGate;
-    runningPaths = startupPaths;
-    lsp.client = fakeClient(startupPaths);
-  };
-  const first = lsp.syncSessionState({
-    attachedPackages: ["stats"], libraryPaths: ["/first"],
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(stopCount, 1);
-
-  // A completion-triggered start must join the restart rather than start
-  // another server; a new session snapshot must win over the old one.
-  const concurrentStart = lsp.start();
-  const latest = lsp.syncSessionState({
-    attachedPackages: ["stats"], libraryPaths: ["/latest"],
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(startCount, 1);
-  releaseStart();
-  await Promise.all([first, latest, concurrentStart]);
-  assert.equal(stopCount, 2);
-  assert.equal(startCount, 2);
-  assert.equal(runningPaths, JSON.stringify(["/latest"]));
-  assert.deepEqual(requests.at(-1), {
-    attachedPackages: ["stats"], libraryPaths: ["/latest"],
-  });
-  const previousStops = stopCount;
-  await lsp.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/latest"] });
-  assert.equal(stopCount, previousStops, "unchanged paths do not restart");
 });
 
 test("language-server state sync failures do not reject terminal workspace updates", async () => {

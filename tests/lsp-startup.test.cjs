@@ -15,7 +15,7 @@ test("R authenticates after initialization exceeding the handshake deadline", { 
   const source = fs.readFileSync(path.join(__dirname, "../resources/r/console-language-server.R"), "utf8");
   const ctor = "server <- languageserver:::LanguageServer$new(host, NULL)";
   const start = source.indexOf("if (!is.null(port)) {", source.indexOf(ctor));
-  const end = source.indexOf("\nfor (workspace in server$workspaces$values())", start);
+  const end = source.indexOf("\n# Source dedicated completion adapters", start);
   assert.ok(start > source.indexOf(ctor) && end > start, "extract production R authentication block");
   const authentication = source.slice(start, end);
 
