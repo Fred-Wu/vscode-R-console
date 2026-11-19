@@ -51,12 +51,13 @@ type ConsoleLspClientOptions = {
   extensionPath: string;
   rPath: string;
   env: NodeJS.ProcessEnv;
+  cwd?: string;
   onPackagesChanged?: () => void;
 };
 
 type ConsoleLspSessionState = {
   attachedPackages: string[];
-  libraryPaths?: string[];
+  functions?: Record<string, string>;
 };
 
 type SessionStateSyncResult = {
@@ -108,14 +109,12 @@ export class ConsoleLspClient implements CompletionProvider {
   private readonly packageInventory: PackageInventory;
   private packageRefreshPromise: Promise<void> | undefined;
   private packageRevision = 0;
-  private packageMetadataSaved = false;
-  private configuredLibraryPaths: string[] = [];
   private restartPromise: Promise<void> | undefined;
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
     this.outputChannel = new SilentOutputChannel("R Console");
-    // A client removes only its own cwd after its R process has stopped.
+    // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
     this.packageInventory = new PackageInventory(
       change => this.refreshPackages(change),
@@ -312,6 +311,9 @@ export class ConsoleLspClient implements CompletionProvider {
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
         // VS Code's converter preserves standard LSP fields only. Carry this
         // source decision separately so an empty signature stays authoritative.
+        if (completions && (result as { rConsoleWorkspaceFunction?: boolean } | null)?.rConsoleWorkspaceFunction === true) {
+          completions.rConsoleWorkspaceFunction = true;
+        }
         if (completions && (result as { rConsoleLocalFunction?: boolean } | null)?.rConsoleLocalFunction === true) {
           completions.rConsoleLocalFunction = true;
         }
@@ -397,10 +399,7 @@ export class ConsoleLspClient implements CompletionProvider {
 
     let syncPromise = this.sessionStateSyncPromise;
     if (!syncPromise) {
-      const params = state.libraryPaths && this.configuredLibraryPaths.length
-        ? { ...state, libraryPaths: [...state.libraryPaths, ...this.configuredLibraryPaths] }
-        : state;
-      syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", params)
+      syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", state)
         .then((reply) => {
           if (this.client === client && typeof reply === "object" && Array.isArray(reply?.libraryPaths)) {
             this.packageInventory.setLibraryPaths(reply.libraryPaths);
@@ -434,7 +433,7 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {
-    return JSON.stringify([state.attachedPackages, state.libraryPaths]);
+    return JSON.stringify([state.attachedPackages, state.functions]);
   }
 
   private async restartClient(client: ConsoleLanguageClient): Promise<void> {
@@ -475,9 +474,7 @@ export class ConsoleLspClient implements CompletionProvider {
       }
       const params = {
         libraryPaths: change.libraries.map(library => library.path),
-        packages: [...change.packages.keys()],
         installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
-        identities: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.identity])),
         changed: change.changed,
       };
       const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
@@ -489,7 +486,6 @@ export class ConsoleLspClient implements CompletionProvider {
           this.options.onPackagesChanged?.();
         }
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restart required: loaded packages changed: ${result.restart.join(", ")}`);
-        await this.transferPackageMetadata(client, "export");
         await this.restartClient(client);
         client = this.client;
         if (!client?.isRunning() || this.disposed) return;
@@ -499,7 +495,6 @@ export class ConsoleLspClient implements CompletionProvider {
       } else if (change.changed.length) {
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
       }
-      if (this.packageMetadataSaved) await this.transferPackageMetadata(client, "restore");
       if (result.restart.length) {
         try {
           const projection = this.inputDocument.project(this.inputDocument.getText());
@@ -517,21 +512,6 @@ export class ConsoleLspClient implements CompletionProvider {
       await refresh;
     } finally {
       if (this.packageRefreshPromise === refresh) this.packageRefreshPromise = undefined;
-    }
-  }
-
-  private async transferPackageMetadata(client: ConsoleLanguageClient, action: "export" | "restore"): Promise<void> {
-    this.packageMetadataSaved = false;
-    try {
-      const result = await client.sendRequest<{ saved?: string[]; restored?: string[]; skipped?: string[]; error?: string }>(
-        `rConsole/${action}PackageMetadata`, { file: path.join(this.workingDirectory, "package-metadata.rds") });
-      if (result.error) throw new Error(result.error);
-      const packages = action === "export" ? result.saved : result.restored;
-      if (!Array.isArray(packages)) throw new Error("Invalid package metadata response");
-      if (action === "export") this.packageMetadataSaved = true;
-      lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] ${action === "export" ? "Saved" : "Restored"} package metadata: ${packages.length} packages${packages.length ? ` (${packages.join(", ")})` : ""}; skipped ${result.skipped?.length ?? 0}`);
-    } catch (error) {
-      lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Could not ${action} package metadata: ${String(error)}`);
     }
   }
 
@@ -567,7 +547,6 @@ export class ConsoleLspClient implements CompletionProvider {
     const config = vscode.workspace.getConfiguration("r");
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
-    this.configuredLibraryPaths = config.get<string[]>("libPaths") ?? [];
     const env = this.buildServerEnv(config);
     const useStdio = config.get<boolean>("lsp.use_stdio") === true && process.platform !== "win32";
 
@@ -628,7 +607,7 @@ export class ConsoleLspClient implements CompletionProvider {
       let child: ChildProcess;
       try {
         child = spawn(this.options.rPath, args, {
-          cwd: this.workingDirectory,
+          cwd: this.options.cwd ?? this.workingDirectory,
           env,
           stdio: ["pipe", "pipe", "pipe"],
           shell: false,
@@ -761,7 +740,7 @@ export class ConsoleLspClient implements CompletionProvider {
         let child: ChildProcess;
         try {
           child = spawn(this.options.rPath, args, {
-            cwd: this.workingDirectory,
+            cwd: this.options.cwd ?? this.workingDirectory,
             env,
             stdio: ["ignore", "ignore", "pipe"],
             shell: false,
@@ -860,10 +839,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = [
-      ...(this.sessionState?.libraryPaths ?? []),
-      ...(config.get<string[]>("libPaths") ?? []),
-    ];
+    const libPaths = config.get<string[]>("libPaths") ?? [];
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";

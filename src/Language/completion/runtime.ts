@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
-import { backtickRName, quoteRNameIfNeeded, getFieldInsertText, quoteCompletionValue } from "./candidates";
-import { subscriptArgumentExpression } from "./subscript";
+import { backtickRName, quoteRNameIfNeeded, getFieldInsertText } from "./candidates";
 import { allowsSymbolCompletions } from "./policy";
 
 function isSessionFunction(item: GlobalEnvItem): boolean {
@@ -105,34 +104,11 @@ export async function getRuntimeDataCompletions(
   context: CompletionContext,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
 ): Promise<CompletionEntries> {
-  if (!context.dataObjectName || !requestRuntimeMemberCompletions || context.bracketArgumentName) {
+  if (context.kind === "bracket" || !context.dataObjectName || !requestRuntimeMemberCompletions) {
     return [];
   }
 
   try {
-    if (context.kind === "bracket") {
-      const items = await requestRuntimeMemberCompletions(
-        `base::local({ .obj <- (${context.dataObjectName}); ` +
-        `.tagged <- function(.values, .prefix) stats::setNames(base::as.list(.values), if (base::length(.values)) base::paste0(.prefix, .values) else base::character()); ` +
-        `.bare <- base::inherits(.obj, "data.table"); ` +
-        `.nms <- if (.bare || ${context.bracketDimensions ?? 1}L == 1L) base::names(.obj) else ` +
-        `{ .dims <- base::dimnames(.obj); if (base::length(.dims) >= ${(context.bracketDimension ?? 0) + 1}L) .dims[[${(context.bracketDimension ?? 0) + 1}L]] else NULL }; ` +
-        `base::c(.tagged(.nms, if (.bare) "bare:" else "quoted:"), .tagged(${subscriptArgumentExpression(context)}, "argument:")) })`, "$"
-      );
-      const entries: CompletionEntries = (items ?? []).flatMap(item => {
-        const match = /^(bare|quoted|argument):([\s\S]+)$/.exec(item.name);
-        if (!match) return [];
-        const [, type, name] = match;
-        return [{ label: name,
-          insertText: type === "argument" ? name === "..." ? "..." : quoteRNameIfNeeded(name) + " = "
-            : getFieldInsertText(name, context, type === "bare"),
-          kind: type === "argument" ? vscode.CompletionItemKind.Variable : vscode.CompletionItemKind.Field,
-          ...(type === "argument" ? { role: "argument" as const } : {}),
-          detail: type === "argument" ? "parameter" : context.dataObjectName, source: "session" as const }];
-      });
-      if (items !== undefined) entries.subscriptResolved = true;
-      return entries;
-    }
     const items = await requestRuntimeMemberCompletions(
       context.dataObjectName,
       "$"
@@ -190,82 +166,3 @@ export async function getRuntimeMemberCompletions(
     return undefined;
   }
 }
-
-export async function getRuntimeArgumentCompletions(
-  context: CompletionContext,
-  request?: RuntimeMemberCompletionRequester
-): Promise<CompletionEntries> {
-  if (!request || !context.functionName || (!context.argumentTags && !context.argumentValue)) return [];
-  try {
-    if (context.argumentValue) {
-      const value = context.argumentValue;
-      const supplied = (value.argumentTags ?? [null]).map(tag =>
-        tag === null ? `${value.name} = TRUE` : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
-      const items = await request(
-        `base::local({ .fn <- (${context.functionName}); .vals <- NULL; ` +
-        `if (base::is.function(.fn)) { .defs <- base::formals(base::args(.fn)); ` +
-        `.matched <- base::tryCatch(base::suppressWarnings(base::match.call(definition = base::args(.fn), ` +
-        `call = base::quote(.fn(${supplied})), expand.dots = FALSE)), error = function(e) NULL); ` +
-        `.matched <- base::as.list(.matched)[-1L]; ` +
-        `.tag <- base::names(.matched)[base::vapply(.matched, base::identical, base::logical(1), TRUE)]; ` +
-        `if (base::length(.tag) == 1L && .tag %in% base::names(.defs)` +
-        (value.argumentTags ? "" : ` && .tag == base::names(base::as.list(base::quote(.fn(${value.name} = NULL))))[2L]`) +
-        `) { .expr <- .defs[[.tag]]; ` +
-        `.vals <- if (base::is.character(.expr)) .expr else if (base::is.call(.expr) && ` +
-        `base::identical(.expr[[1L]], base::quote(c))) ` +
-        `base::unlist(base::lapply(base::as.list(.expr)[-1L], function(.value) { ` +
-        `if (base::is.character(.value)) .value else if (base::is.call(.value) && ` +
-        `base::identical(.value[[1L]], base::quote(I)) && base::length(.value) > 1L && ` +
-        `base::is.character(.value[[2L]])) .value[[2L]] else NULL }), use.names = FALSE) else NULL } }; ` +
-        `stats::setNames(base::as.list(.vals), if (base::length(.vals)) base::paste0("value:", .vals) else base::character()) })`, "$"
-      );
-      return (items ?? []).filter(item => item.name.startsWith("value:")).map(item => ({
-        label: item.name.slice(6), insertText: quoteCompletionValue(item.name.slice(6), value.quote),
-        kind: vscode.CompletionItemKind.Value, detail: `value for ${value.name}`, source: "session" as const }));
-    }
-    // Treat supplied positional values as filled, then validate each remaining
-    // name with R's matching rules. Only syntax is matched: values, defaults
-    // and the function body are never evaluated. All candidates share one request.
-    const supplied = context.argumentTags!.map(tag =>
-      tag === null ? "TRUE" : `${tag ? `${tag} = ` : ""}NULL`).join(", ");
-    const cursorSlot = context.argumentTags!.indexOf(null) + 2;
-    const forwardedDots = context.argumentTags!.includes("...");
-    const suppliedCount = context.argumentTags!.filter(tag => tag !== null && tag !== "...").length;
-    const items = await request(
-      `base::local({ .fn <- (${context.functionName}); .exhausted <- FALSE; ` +
-      `.args <- if (base::is.function(.fn)) { ` +
-      `.def <- base::args(.fn); ` +
-      `.formals <- base::names(base::formals(.def)); ` +
-      `.exhausted <- !base::is.null(.def) && !("..." %in% .formals) && ` +
-      `${suppliedCount}L >= base::length(.formals); ` +
-      `.call <- base::as.list(base::quote(.fn(${supplied}))); ` +
-      `if (base::is.null(base::names(.call))) base::names(.call) <- base::rep("", base::length(.call)); ` +
-      `.matched <- if (${forwardedDots ? "FALSE" : "TRUE"}) base::tryCatch(base::as.list(base::suppressWarnings(` +
-      `base::match.call(definition = .def, call = base::as.call(.call), expand.dots = FALSE)))[-1L], ` +
-      `error = function(e) NULL) else NULL; ` +
-      `.used <- base::names(.matched)[!base::vapply(.matched, base::identical, base::logical(1), TRUE)]; ` +
-      `.candidates <- base::setdiff(.formals, base::setdiff(base::c(base::names(.call), .used), "...")); ` +
-      `.candidates[base::vapply(.candidates, function(.name) { ` +
-      `if (.name == "..." || ${forwardedDots ? "TRUE" : "FALSE"}) return(TRUE); ` +
-      `.candidate <- .call; base::names(.candidate)[${cursorSlot}L] <- .name; ` +
-      `base::tryCatch({ base::suppressWarnings(base::match.call(` +
-      `definition = .def, call = base::as.call(.candidate), expand.dots = FALSE)); TRUE }, ` +
-      `error = function(e) FALSE) }, base::logical(1))] } else NULL; ` +
-      // A logical dots marker denotes exhaustion; ordinary dots candidates
-      // carry character values, keeping variadic signatures distinguishable.
-      `if (.exhausted) stats::setNames(base::list(TRUE), "...") else stats::setNames(base::as.list(.args), .args) })`, "$"
-    );
-    const entries: CompletionEntries = (items ?? []).filter(item => item.name && !(item.name === "..." && item.type === "logical")).map(item => ({
-      label: item.name,
-      insertText: item.name === "..." ? "..." : `${quoteRNameIfNeeded(item.name)} = `,
-      kind: vscode.CompletionItemKind.Variable,
-      detail: "parameter",
-      source: "session",
-    }));
-    if (items?.some(item => item.name === "..." && item.type === "logical")) entries.argumentsExhausted = true;
-    return entries;
-  } catch {
-    return [];
-  }
-}
-

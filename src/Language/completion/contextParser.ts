@@ -104,7 +104,6 @@ export type BracketCompletionContext = {
   quote?: "\"" | "'";
   dimension: number;
   dimensions: number;
-  argumentTags: (string | null)[];
   argumentName?: string;
 };
 
@@ -218,7 +217,6 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
   let dimension = 0;
   let dimensions = 0;
   let selected: ReturnType<typeof completionPrefix>;
-  const argumentTags: (string | null)[] = [];
   let argumentName: string | undefined;
   const nested: string[] = [];
   for (let index = slotStart; index <= tokens.length; index++) {
@@ -232,7 +230,6 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
       const name = named ? first.value.replace(/^[`"']|[`"']$/g, "") : undefined;
       const option = name === (opening.value === "[[" ? "exact" : "drop");
       const active = slotOffset <= cursor && cursor <= (token?.position ?? code.length);
-      argumentTags.push(active ? null : named ? first.value : slotStart + 1 === index && first.value === "..." ? "..." : "");
       if (!option && active) {
         selected = completionPrefix(tokens, slotStart + (named ? 2 : 0), index, cursor);
         // Retain source spelling so quoted/escaped argument tags remain valid R.
@@ -252,7 +249,7 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
     }
   }
   if (!selected || (isCompletionInLiteral(code, cursor, sourceTokens) && !selected.quote)) return undefined;
-  return { objectName: object.objectName, operator: opening.value as "[" | "[[", ...selected, dimension, dimensions, argumentTags, argumentName };
+  return { objectName: object.objectName, operator: opening.value as "[" | "[[", ...selected, dimension, dimensions, argumentName };
 }
 
 export function getPipeCompletionContext(code: string, all?: Token[]): { prefix: string; replaceStart: number } | undefined {

@@ -13,7 +13,7 @@ const uri = (value) => ({ toString: () => value });
 
 // Replace only the VS Code host adapter. Use the production client lifecycle,
 // R launcher, authentication, JSON-RPC streams, and console-language-server.R.
-function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
+function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env } = {}) {
   const instances = [];
   const logs = [];
   class HostClientAdapter {
@@ -96,7 +96,7 @@ function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
       window: { createOutputChannel: () => ({ appendLine: (line) => logs.push(line), dispose() {} }) },
       workspace: { getConfiguration: () => ({ get: (key) => {
-        if (key === "lsp.args") return ["--vanilla"];
+        if (key === "lsp.args") return args;
         if (key === "libPaths") return libraries;
         return undefined;
       } }) },
@@ -109,7 +109,7 @@ function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
   });
   const client = new ConsoleLspClient({
     consoleId: "real-lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
+    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd,
   });
   t.after(async () => {
     try { await client.dispose(); }

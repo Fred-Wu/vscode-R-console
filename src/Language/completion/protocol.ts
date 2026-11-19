@@ -10,8 +10,6 @@ export function createCompletionParams(
   serverPosition: vscode.Position, contextPosition: vscode.Position, context: vscode.CompletionContext
 ) {
   const text = projection.document.getText();
-  const barePackagePrefix = serverPosition.line === 0 && /^[ \t]*[A-Za-z][A-Za-z0-9.]*$/.test(text)
-    ? text.slice(0, serverPosition.character).trimStart() : "";
   const hasContext = text.includes("(") || text.includes("|>") || text.includes("%>%");
   const contextOffset = hasContext ? projection.document.offsetAt(projection.toServerPosition(contextPosition)) : 0;
   const call = text.includes("(")
@@ -24,7 +22,6 @@ export function createCompletionParams(
   // context for argument matching, literal values and unfinished-input repair.
   return {
     ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
-    ...(barePackagePrefix ? { rConsolePackagePrefix: barePackagePrefix } : {}),
     ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
     ...(parseInsertion ? { rConsoleParseInsertion: {
       position: projection.document.positionAt(parseInsertion.offset), text: parseInsertion.text,

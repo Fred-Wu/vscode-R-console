@@ -284,10 +284,10 @@ export class RTerminal implements vscode.Pseudoterminal {
       extensionPath: this.extensionPath,
       rPath: this.options.rPath,
       env: this.options.env,
+      cwd: this.options.cwd,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       requestWorkspaceData: async () =>
         await getRuntimeWorkspaceData(this.runtimeHost()),
-      refreshLibraryPaths: (force) => getVscodeRIntegration(this.runtimeHost()).refreshLibraryPaths(force),
       onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestMemberCompletions: async (expression, operator) =>
         await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),

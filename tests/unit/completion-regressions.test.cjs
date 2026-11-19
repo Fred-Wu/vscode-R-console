@@ -474,31 +474,30 @@ test("empty-to-typed refinement refreshes newly eligible sources and then reuses
   }
 });
 
-test("subscript method metadata keeps names, values, quotes and supplied options distinct", () => {
-  for (const [marked, name, tags] of [
-    ['DT[, key│]', undefined, ['', null]],
-    ['DT[, keyby = al│]', 'keyby', ['', null]],
-    ['DT[, by = "al│"]', 'by', ['', null]],
-    ['DT[, `keyby` = al│]', '`keyby`', ['', null]],
-    ['obj["a\\\"b" = al│]', '"a\\\"b"', [null]],
-    ['DT[, │, by = alpha]', undefined, ['', null, 'by']],
-    ['obj[mode = "a,b", │]', undefined, ['mode', null]],
-    ['obj[..., │]', undefined, ['...', null]],
-    ['DT |> _[, │]', undefined, ['', null]],
+test("subscript contexts keep names, values and quoted options distinct", () => {
+  for (const [marked, name] of [
+    ['DT[, key│]', undefined],
+    ['DT[, keyby = al│]', 'keyby'],
+    ['DT[, by = "al│"]', 'by'],
+    ['DT[, `keyby` = al│]', '`keyby`'],
+    ['obj["a\\\"b" = al│]', '"a\\\"b"'],
+    ['DT[, │, by = alpha]', undefined],
+    ['obj[mode = "a,b", │]', undefined],
+    ['obj[..., │]', undefined],
+    ['DT |> _[, │]', undefined],
   ]) {
     const context = contextAt(marked);
     assert.equal(context.kind, 'bracket', marked);
     assert.equal(context.bracketArgumentName, name, marked);
-    assert.deepEqual(context.bracketArgumentTags, tags, marked);
   }
 });
 
-test("named subscript values and resolved empty results do not invent cached columns", async () => {
-  for (const marked of ['DT[, mult = │]', 'DT[, mult = "│"]', 'DT[, │]']) {
+test("named subscript values do not invent cached columns", async () => {
+  for (const marked of ['DT[, mult = │]', 'DT[, mult = "│"]']) {
     const context = contextAt(marked);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined,
       { globalenv: { DT: { class: ['data.table', 'data.frame'], names: ['alpha'] } } }, [], [], undefined,
-      async () => []);
+      async () => assert.fail("bracket completion must not query sess"));
     assert.deepEqual(entries, [], marked);
   }
 });

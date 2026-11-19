@@ -35,10 +35,13 @@ console_supplement_completion <- function(reply, self, params) {
     source <- if (is.null(call) || !is.null(call$package)) NULL else if (member_call) {
         if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
     } else console_source_function(document, point, call$token)
+    workspace_call <- is.null(source) && !is.null(call) && is.null(call$package) &&
+        identical(call$accessor, "") && call$token %in% console_workspace_functions
+    if (workspace_call) reply$result$rConsoleWorkspaceFunction <- TRUE
     # Native S3 inference can still select a package generic when a binding in
     # a brace block or enclosing function shadows it. Resolve lexical bindings
     # first, including unknown signatures, before trusting that inference.
-    native_arguments <- native_arguments && is.null(source)
+    native_arguments <- native_arguments && is.null(source) && !workspace_call
     signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
     if (!is.null(source)) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
@@ -66,7 +69,7 @@ console_supplement_completion <- function(reply, self, params) {
     } else if (!native_arguments && !is.null(call) && (!member_call || !is.null(source))) {
         detected <- document$detect_call(point)
         value_mode <- is.character(params$rConsoleArgument) && length(params$rConsoleArgument) == 1L
-        if (!is.null(source) || value_mode || !identical(call$token, detected$token) ||
+        if (!is.null(source) || workspace_call || value_mode || !identical(call$token, detected$token) ||
             !identical(call$package, detected$package) ||
             !identical(call$accessor, detected$accessor)) {
             # Resolve parameters with the same workspace/provider as ordinary
@@ -124,19 +127,6 @@ console_supplement_completion <- function(reply, self, params) {
         reply$result$isIncomplete <- length(functions) > nmax || isTRUE(attr(scope, "truncated")) ||
             isTRUE(attr(symbols, "truncated")) ||
             isTRUE(reply$result$isIncomplete)
-    }
-    if (!is.null(params$rConsolePackagePrefix)) {
-        if (is.null(completion_packages)) {
-            completion_packages <<- .packages(all.available = TRUE, lib.loc = completion_libraries)
-        }
-        matches <- completion_packages[languageserver:::match_with(completion_packages, params$rConsolePackagePrefix)]
-        limit <- languageserver:::lsp_settings$get("max_completions")
-        items <- lapply(head(matches, limit), function(name) {
-            list(label = name, kind = languageserver:::CompletionItemKind$Module, data = list(type = "package"))
-        })
-        symbols <- Filter(function(item) !identical(item$data$type, "package"), reply$result$items)
-        reply$result$items <- c(symbols, items)
-        if (length(matches) > limit) reply$result$isIncomplete <- TRUE
     }
     reply
 }

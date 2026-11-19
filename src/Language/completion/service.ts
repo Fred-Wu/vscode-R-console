@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
-import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getRuntimeArgumentCompletions, getDataColumnCompletions, getRuntimeDataCompletions } from "./runtime";
+import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getDataColumnCompletions, getRuntimeDataCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
@@ -26,7 +26,7 @@ export async function collectCompletionEntries(
     !!doc && !!position;
   const rawLspItemsRequest =
     !includeLspItems
-      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, memberResolved: false, nativeArguments: false, argumentsExhausted: false })
+      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
       : getLanguageServerCompletions(
           context,
           doc,
@@ -46,24 +46,12 @@ export async function collectCompletionEntries(
   const rawLspResult = await rawLspItemsRequest;
   const nativeMembers = rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member");
   const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
-  // A package method inferred by the separate LSP process cannot supersede a
-  // known session function. Current source and selected package calls still
-  // take precedence; inferred member signatures can avoid a runtime probe.
-  const useRuntimeArguments = !rawLspResult.rConsoleLocalFunction && (sessionArguments ||
-    (memberArguments && !rawLspResult.nativeArguments &&
-      !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter")));
-  if (context.argumentTags && rawLspResult.argumentsExhausted && !useRuntimeArguments) return [];
-  // Native results take precedence. Only probe the live session for facts the
-  // language server could not infer; a busy R session cannot delay native members.
-  const probeSubscript = context.kind === "bracket" && !context.bracketQuote &&
-    !context.bracketArgumentName && !!requestRuntimeMemberCompletions;
-  const [runtimeMemberItems, runtimeDataItems, runtimeArgumentItems] = await Promise.all([
+  if (context.argumentTags && rawLspResult.argumentsExhausted) return [];
+  const [runtimeMemberItems, runtimeDataItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve(undefined),
-    probeSubscript ? getRuntimeDataCompletions(context, requestRuntimeMemberCompletions) :
     !includeColumns || nativeFields ? Promise.resolve([]) : cachedColumnItems.length > 0
       ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions),
-    useRuntimeArguments ? getRuntimeArgumentCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve([] as CompletionEntries),
   ]);
   if (context.kind === "member") {
     // A successful live lookup is authoritative even when it is empty or no
@@ -72,14 +60,11 @@ export async function collectCompletionEntries(
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete);
   }
-  const resolvedDataItems = probeSubscript && !(runtimeDataItems as CompletionEntries).subscriptResolved
-    ? cachedColumnItems : runtimeDataItems;
-  const dataItems = nativeFields ? resolvedDataItems.filter(entry => entry.kind !== vscode.CompletionItemKind.Field) : resolvedDataItems;
-  if (runtimeArgumentItems.argumentsExhausted) return [];
-  // Otherwise, member and user-defined signatures belong to the active session.
-  // A same-name package function must not supply unrelated arguments, even
-  // when the session cannot currently reply or the function has no formals.
-  const rawLspItems = useRuntimeArguments
+  const dataItems = nativeFields ? runtimeDataItems.filter(entry => entry.kind !== vscode.CompletionItemKind.Field) : runtimeDataItems;
+  const unavailableSignature = !rawLspResult.rConsoleLocalFunction && !rawLspResult.workspaceFunction &&
+    (sessionArguments || (memberArguments && !rawLspResult.nativeArguments &&
+      !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter")));
+  const rawLspItems = unavailableSignature
     ? rawLspResult.entries.filter(entry => !isArgumentCompletionEntry(entry))
     : rawLspResult.entries;
   const lspItems =
@@ -94,7 +79,6 @@ export async function collectCompletionEntries(
     ...lspItems,
     ...sessionItems,
     ...dataItems,
-    ...runtimeArgumentItems,
   ]);
 
   if (context.kind === "bracket") {
@@ -116,7 +100,6 @@ export async function collectCompletionEntries(
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
     return asCompletionEntries(dedupeCompletionEntries([
-      ...filterCompletionEntries(runtimeArgumentItems, context.prefix),
       ...(!context.argumentValue?.quote ? columnFiltered : []),
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),

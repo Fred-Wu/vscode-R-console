@@ -13,7 +13,7 @@ const { runRJson } = require("./helpers/run-r-json.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
-  CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Snippet: 14 },
+  CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Value: 11, Snippet: 14 },
   SnippetString: class {},
   Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
 } });
@@ -122,12 +122,17 @@ test("typing and accepting functions opens real argument suggestions without ano
   for (const [typed, insertText, argument] of [
     ["lib", "library()", "package"],
     ["stats::", "lm()", "formula"], ["stats:::", "lm()", "formula"],
-    ["obj$", "lm()", "member_arg"], ["slot_obj@", "lm()", "slot_arg"],
+    ["obj$", "lm()"], ["slot_obj@", "lm()"],
   ]) {
     client.updateInput("");
     const { terminal, screen } = createTerminal(t);
     delete terminal.applyCompletion;
     terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+    const handle = terminal.lang.handleAutocomplete.bind(terminal.lang);
+    terminal.lang.handleAutocomplete = request => handle({ ...request, getWorkspaceData: () => ({ search: [], loaded_namespaces: [], globalenv: {
+      df: { names: ['zebra', 'alpha', 'beta', 'a b'], class: ['data.frame'], type: 'list' },
+      dt: { names: ['zebra', 'alpha', 'beta', 'a b'], class: ['data.table', 'data.frame'], type: 'list' },
+    } }) });
     const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
     for (const text of typed) terminal.applyKeyAction({ type: "text", text });
     await waitFor(() => terminal.inlineCompletion.visible, `automatic popup after ${typed}`);
@@ -141,6 +146,7 @@ test("typing and accepting functions opens real argument suggestions without ano
     assert.equal(terminal.inputState.text, expected);
     assert.equal(terminal.inputState.textBeforeCursor, expected.slice(0, -1));
     assert.equal(terminal.submitted, undefined);
+    if (!argument) { terminal.dismissInlineCompletion(false); terminal.lang.cancelCompletion(); continue; }
     await waitFor(() => choices().some(item => item.insertText === `${argument} = `), `argument popup after ${expected}`);
     if (typed === "stats::" || typed === "stats:::") {
       assert.deepEqual(choices().filter(item => item.detail === "parameter").slice(0, 4).map(item => item.insertText),
@@ -179,8 +185,6 @@ test("typing and accepting functions opens real argument suggestions without ano
     ["df[['│']]", "a b", "df[['a b']]"],
     ['df[, "│"]', "a b", 'df[, "a b"]'],
     ["df$│", "alpha", "df$alpha"],
-    ["obj$data[[│]]", '"alpha"', 'obj$data[["alpha"]]'],
-    ["nested[[1]][[│]]", '"alpha"', 'nested[[1]][["alpha"]]'],
     ["dt[, │]", "alpha", "dt[, alpha]"],
     ["dt[, │]", "`a b`", "dt[, `a b`]"],
     ["dt[[│]]", '"alpha"', 'dt[["alpha"]]'],
@@ -194,11 +198,8 @@ test("typing and accepting functions opens real argument suggestions without ano
     ["stats::cor(method = '│')", "spearman", "stats::cor(method = 'spearman')"],
     ["stats::cor(method = sp│)", '"spearman"', 'stats::cor(method = "spearman")'],
     ["stats::cor(method = sp│earman)", '"spearman"', 'stats::cor(method = "spearman")'],
-    ["obj$choose(method = al│pha)", '"alpha"', 'obj$choose(method = "alpha")'],
     ["df[[al│pha]]", '"alpha"', 'df[["alpha"]]'],
     ['stats::cor(`method` = "│")', "spearman", 'stats::cor(`method` = "spearman")'],
-    ["obj$choose(method = │)", '"alpha"', 'obj$choose(method = "alpha")'],
-    ['obj$choose(method = "a│old")', "alpha", 'obj$choose(method = "alpha")'],
     ["subset(df, │)", "alpha", "subset(df, alpha)"],
     ["df |> subset(│)", "alpha", "df |> subset(alpha)"],
     ["df |> │", undefined, undefined], ["df %>% │", undefined, undefined],
@@ -207,6 +208,11 @@ test("typing and accepting functions opens real argument suggestions without ano
     const { terminal } = createTerminal(t);
     delete terminal.applyCompletion;
     terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+    const handle = terminal.lang.handleAutocomplete.bind(terminal.lang);
+    terminal.lang.handleAutocomplete = request => handle({ ...request, getWorkspaceData: () => ({ search: [], loaded_namespaces: [], globalenv: {
+      df: { names: ['zebra', 'alpha', 'beta', 'a b'], class: ['data.frame'], type: 'list' },
+      dt: { names: ['zebra', 'alpha', 'beta', 'a b'], class: ['data.table', 'data.frame'], type: 'list' },
+    } }) });
     const cursor = marked.indexOf("│");
     terminal.inputState.insertText(marked.replace("│", ""));
     terminal.inputState.cursorPosition = cursor;
@@ -443,11 +449,8 @@ test("current source signatures supersede older session definitions, including e
     },
   };
   const session = { globalenv: { f: { type: "closure" } } };
-  const request = async expression => runRJson(`
-    f <- function(old_arg = "old_value") stop("body evaluated")
-    value <- eval(parse(text = inputs), .GlobalEnv)
-    cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
-  `, expression);
+  await client.syncSessionState({ attachedPackages: [], functions: { f: 'function(old_arg = "old_value")' } });
+  const request = async () => assert.fail("workspace arguments must not query sess");
   for (const [marked, expected] of [
     ["{\n f <- function(new_arg) NULL\n f(│", ["new_arg"]],
     ["f <- function(new_arg) NULL\nf(│)", ["new_arg"]],
@@ -471,7 +474,7 @@ test("current source signatures supersede older session definitions, including e
     const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
       session, lines.slice(0, position.line), [], provider, request);
     assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.label), expected, marked);
-    assert.ok(!entries.some(item => item.label === "old_value"), marked);
+    if (!expected.includes("old_arg")) assert.ok(!entries.some(item => item.label === "old_value"), marked);
   }
 });
 
@@ -480,31 +483,24 @@ test("accepting a console-defined function opens its live arguments and values",
   const provide = client.provideCompletionItems.bind(client);
   client.provideCompletionItems = async (...args) => {
     const result = await provide(...args);
-    return { items: (result.items ?? result).map(item => ({ ...item,
+    return { ...result, items: (result.items ?? result).map(item => ({ ...item,
       kind: item.kind === undefined ? undefined : item.kind - 1 })), isIncomplete: result.isIncomplete };
   };
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {
       Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
       CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Value: 11, Snippet: 14 },
+      Uri: { parse: value => ({ toString: () => value }) },
       QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
   });
-  // The definition lives only in the active-session probe, never in the LSP
-  // document. Its snapshot is the same metadata the session watcher supplies.
   const setup = 'f <- function(`a b`, normal = c("first", "second"), lazy = stop("default evaluated")) stop("body evaluated")\n';
-  const session = runRJson(setup + 'cat(jsonlite::toJSON(list(globalenv = list(f = list(type = typeof(f)))), auto_unbox = TRUE))');
-  let probes = 0;
+  const session = runRJson(setup + 'cat(jsonlite::toJSON(list(search = search(), loaded_namespaces = loadedNamespaces(), globalenv = list(f = list(type = typeof(f), str = paste(capture.output(str(f)), collapse="\\n")))), auto_unbox = TRUE))');
   const lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
-    requestMemberCompletions: async expression => {
-      probes++;
-      return runRJson(setup + `
-        value <- eval(parse(text = inputs), .GlobalEnv)
-        cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n)), auto_unbox = TRUE))
-      `, expression);
-    },
+    requestMemberCompletions: async () => { assert.fail("function arguments must not query sess"); },
   });
+  lang.updateSessionData(session);
   t.after(() => lang.dispose());
   const handleAutocomplete = lang.handleAutocomplete.bind(lang);
   lang.handleAutocomplete = request => handleAutocomplete({ ...request, getWorkspaceData: () => session });
@@ -536,8 +532,29 @@ test("accepting a console-defined function opens its live arguments and values",
     ["normal = ", "lazy = "]);
   terminal.applyKeyAction({ type: "tab" });
   await waitFor(() => choices().some(item => item.insertText === '"second"'), "live default values");
-  assert.ok(probes >= 3);
   assert.equal(terminal.submitted, undefined, "completion must never execute the function");
+});
+
+test("workspace signatures replace and remove native definitions and survive restart", { timeout: 90000 }, async t => {
+  const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const complete = () => client.provideCompletionItems({ getText: () => 'workspace_test_fn(' }, { line: 0, character: 18 });
+  for (const [functions, expected] of [
+    [{ workspace_test_fn: 'function(first)' }, ['first']],
+    [{ workspace_test_fn: 'function(second = stop("never evaluate"))' }, ['second']],
+    [{ workspace_test_fn: 'function(truncated = c("a",' }, []],
+    [{ workspace_test_fn: 'function()' }, []],
+    [{}, []],
+  ]) {
+    await client.syncSessionState({ attachedPackages: [], functions });
+    const result = await complete();
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected);
+    assert.equal(!!result.rConsoleWorkspaceFunction, !!functions.workspace_test_fn && !functions.workspace_test_fn.includes('truncated'));
+  }
+  const state = { attachedPackages: [], functions: { workspace_test_fn: 'function(restored)' } };
+  await client.syncSessionState(state);
+  await instances.at(-1).stop();
+  const result = await complete();
+  assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), ['restored']);
 });
 
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {
@@ -751,96 +768,12 @@ test("fuzzy fallback preserves value, comment and member-call identities", { tim
   }
 });
 
-test("member argument probe inspects the actual R callable without executing bodies or defaults", async () => {
-  const setup = `
-    lm <- function(wrong_argument) NULL
-    obj <- list(lm = function(list_argument, missing, lazy = stop("default evaluated"), ...) stop("body called"),
-                primitive = sum, empty = function() NULL, field = 1,
-                quoted = function(\`a b\`, remaining) stop("body called"),
-                dots = function(first, ..., after) stop("body called"),
-                positional = function(first, second, third) stop("body called"))
-    methods::setClass("CompletionTest", slots = c(lm = "function"))
-    slot_obj <- methods::new("CompletionTest", lm = function(slot_argument) stop("body called"))
-    éobj <- list(lm = function(correct_argument) stop("body called"))
-    obj$élm <- function(correct_argument) stop("body called")
-    \`𐐀obj\` <- list(lm = function(correct_argument) stop("body called"))
-    obj$unicode <- function(éarg, \`𐐀arg\`, remaining) stop("body called")
-    obj$pair <- function(first, second) stop("body called")
-    .args <- .fn <- "unchanged"
-  `;
-  for (const [expression, expected, argumentsBefore = "", argumentsAfter = ""] of [
-    ["obj$lm", ["list_argument", "missing", "lazy"]],
-    ["éobj$lm", ["correct_argument"]],
-    ["obj$élm", ["correct_argument"]],
-    ["`𐐀obj`$lm", ["correct_argument"]],
-    ["obj$unicode", ["remaining"], 'éarg = stop("value evaluated"), `𐐀arg` = stop("value evaluated"), '],
-    ["obj$pair", [], "se", ', stop("value evaluated"))'],
-    ["obj$pair", ["first"], "", ', stop("value evaluated"))'],
-    ["obj$pair", ["second"], 'stop("value evaluated"), '],
-    ["slot_obj@lm", ["slot_argument"]],
-    ["obj$primitive", ["na.rm"]],
-    ["obj$empty", []], ["obj$field", []], ["unavailable$lm", []],
-    ["obj$lm", ["missing", "lazy"], 'list_argument = stop("value evaluated"), '],
-    ["obj$lm", ["missing", "lazy"], 'li = stop("value evaluated"), '],
-    ["obj$lm", ["missing", "lazy"], 'stop("value evaluated"), '],
-    ["obj$lm", ["missing", "lazy"], ', '],
-    ["obj$lm", ["missing"], 'lazy = stop("value evaluated"), stop("value evaluated"), '],
-    ["obj$lm", ["list_argument", "lazy"], '', ', missing = stop("value evaluated"))'],
-    ["obj$lm", [], 'list_argument = 1, li'],
-    ["obj$quoted", ["remaining"], '`a b` = stop("value evaluated"), '],
-    ["obj$quoted", ["remaining"], '"a b" = stop("value evaluated"), '],
-    ["obj$quoted", ["remaining"], 'r"---(a b)---" = stop("value evaluated"), '],
-    ["obj$positional", ["first", "second"], 'r"(third)" = stop("value evaluated"), '],
-    ["obj$dots", ["after"], '1, 2, '],
-    ["obj$dots", ["first", "after"], 'af = 1, '],
-    ["obj$dots", ["first"], 'after = 1, '],
-    ["obj$dots", ["first"], '..., after = 1, '],
-    ["obj$positional", ["first", "second", "third"], '..., '],
-    ["obj$positional", [], '1, 2, 3, ..., '],
-    ["obj$primitive", [], 'na.rm = TRUE, '],
-    ["obj$positional", ["first"], 'fi', ', stop("value evaluated"))'],
-    ["obj$positional", ["first", "third"], '', ', stop("value evaluated"))'],
-    ["obj$positional", ["second"], 'stop("value evaluated"), se', ', stop("value evaluated"))'],
-    ["obj$positional", ["second"], 'first = stop("value evaluated"), ', ', stop("value evaluated"))'],
-    ["obj$positional", ["first"], '', ', , third = stop("value evaluated"))'],
-    ["obj$positional", ["second"], '', ', fir = stop("value evaluated"), stop("value evaluated"))'],
-    ["obj$positional", [], '1, 2, 3, '],
-    ["obj$dots", ["first", "after"], '', ', 1, 2)'],
-    ["obj$dots", ["after"], '1, ', ', 2)'],
-    ["(obj\n$positional", ["first"], 'fi', ', 2))'],
-    ["obj$ # continuation\npositional", ["first"], 'fi', ', 2)'],
-    ["stop('pipe evaluated') |> obj$positional", ["second", "third"]],
-    ["1 |> obj$positional", ["third"], '2, '],
-    ["1 |> obj$positional", [], 'fi', ', second = 2, third = 3)'],
-    ["1 |> obj$positional", ["second"], '', ', third = 3)'],
-    ["1 |> obj$positional", ["first", "third"], 'second = _, '],
-    ["1 |> obj$positional", ["first", "second"], '', ', third = _)'],
-    ["1 |> obj$positional", ["first", "second"], 'r"(third)" = _, '],
-    ["1 |> obj$positional", ["third"], '2 |> identity(x = _), '],
-    ["stop('pipe evaluated') %>% obj$positional", ["second", "third"]],
-    ["1 %>% obj$positional", ["first", "third"], 'second = ., '],
-    ["1 %>% obj$positional", ["third"], 'identity(.), '],
-    ["1 %>% obj$positional", ["second", "third"], '., '],
-  ]) {
-    const input = expression + "(" + argumentsBefore + argumentsAfter;
-    const context = completion.getCompletionContext(input, input.length - argumentsAfter.length);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
-      undefined, async (probe, operator) => {
-        assert.equal(operator, "$");
-        // This is the existing session completion contract: evaluate the
-        // expression in R, then return its named list members.
-        return runRJson(setup + `
-          options(warn = 2, warnPartialMatchArgs = TRUE)
-          value <- tryCatch(eval(parse(text = inputs), .GlobalEnv), error = function(e) NULL)
-          stopifnot(identical(.args, "unchanged"), identical(.fn, "unchanged"))
-          cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
-        `, probe);
-      });
-    assert.deepEqual(entries.filter(entry => entry.label !== '...').map(entry => entry.label), expected, input);
-    const variadic = ['obj$lm', 'obj$dots', 'obj$primitive'].includes(expression);
-    const dots = entries.find(entry => entry.label === '...');
-    assert.equal(!!dots, variadic && !context.prefix, input);
-    if (dots) assert.equal(dots.insertText, '...');
+test("unknown runtime member signatures do not request expressions or borrow global signatures", async () => {
+  for (const text of ["obj$lm(", "slot_obj@lm(", 'obj$choose(mode = "']) {
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),
+      undefined, undefined, undefined, [], [], undefined,
+      async () => assert.fail("member arguments must not evaluate expressions through sess"));
+    assert.deepEqual(entries, []);
   }
 });
 
@@ -874,15 +807,17 @@ test("completion call boundaries agree with the R parser across newlines", async
     assert.equal(context.kind === "argument", expected, input);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
       async () => [{ name: "first" }]);
-    assert.equal(entries.some(entry => entry.detail === "parameter"), expected, input);
+    assert.equal(entries.some(entry => entry.detail === "parameter"), false, "unknown signature: " + input);
   }
 });
 
-test("argument probes agree with native R calls across pipe and argument combinations", async () => {
+test("workspace signatures agree with native R calls across pipe and argument combinations", { timeout: 120000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  await client.syncSessionState({ attachedPackages: [], functions: Object.fromEntries(["positional", "dots", "constructor"].map(name => [name, name === "dots" ? "function(first, ..., after)" : "function(first, second, third)"])) });
   const cases = [];
-  const probes = [];
+  const actualResults = [];
   for (const pipe of ["", "1 |> ", "1 %>% "]) {
-    for (const fn of ["positional", "dots", "return", "toString", "constructor"]) {
+    for (const fn of ["positional", "dots", "constructor"]) {
       const argumentsList = [
         "§", "1, §", "first = 1, §", "fi = 1, §", "§, third = 3",
         "third = 3, §", 'r"(third)" = 3, §', "§, 2", "1, §, 3",
@@ -892,18 +827,12 @@ test("argument probes agree with native R calls across pipe and argument combina
       if (pipe === "1 |> ") argumentsList.push("third = _, §", "§, second = _", "2 |> identity(x = _), §");
       if (pipe === "1 %>% ") argumentsList.push("third = ., §", "§, second = .", "identity(.), §", "., §");
       for (const args of argumentsList) {
-        const marked = `${pipe}obj$${fn}(${args})`;
+        const marked = `${pipe}\`${fn}\`(${args})`;
         const cursor = marked.indexOf("§");
         const input = marked.replace("§", "");
-        let probe;
-        await completion.collectCompletionEntries(completion.getCompletionContext(input, cursor),
-          undefined, undefined, undefined, [], [], undefined, async expression => {
-            probe = expression;
-            return [];
-          });
-        assert.ok(probe, marked);
+        const result = await client.provideCompletionItems({ getText: () => input }, { line: 0, character: cursor });
         cases.push({ call: marked, fn });
-        probes.push(probe);
+        actualResults.push(result.items.filter(item => item.detail === "parameter" && item.label !== "...").map(item => item.label));
       }
     }
   }
@@ -928,6 +857,7 @@ test("argument probes agree with native R calls across pipe and argument combina
       return = function(first, second, third) capture(sys.call(), sys.function()),
       toString = function(first, second, third) capture(sys.call(), sys.function()),
       constructor = function(first, second, third) capture(sys.call(), sys.function()))
+    invisible(list2env(obj, .GlobalEnv))
     result <- lapply(seq_along(inputs$cases), function(i) {
       case <- inputs$cases[[i]]
       candidates <- setdiff(names(formals(obj[[case$fn]])), "...")
@@ -940,14 +870,13 @@ test("argument probes agree with native R calls across pipe and argument combina
         call <- sub("§", paste0(name, " = .cursor_marker"), case$call, fixed = TRUE)
         tryCatch({ eval(parse(text = call)); TRUE }, error = function(e) FALSE)
       }, logical(1))]
-      actual <- tryCatch(setdiff(names(eval(parse(text = inputs$probes[[i]]))), "..."), error = function(e) character())
-      list(expected = as.list(expected), actual = as.list(actual))
+      as.list(expected)
     })
     cat(jsonlite::toJSON(result, auto_unbox = TRUE))
-  `, { cases, probes });
+  `, { cases });
   assert.equal(results.length, cases.length);
   for (const [index, result] of results.entries()) {
-    assert.deepEqual(result.actual, result.expected, cases[index].call);
+    assert.deepEqual(actualResults[index], result, cases[index].call);
   }
 });
 
@@ -1070,6 +999,7 @@ test("real console languageserver authenticates, initializes and completes code"
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) child.kill();
     await childClosed;
+    if (!t.passed && stderr) t.diagnostic(stderr);
     for (const socket of sockets) socket.destroy();
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -1101,7 +1031,6 @@ test("real console languageserver authenticates, initializes and completes code"
   lsp.notify("initialized", {});
   const synced = await lsp.request("rConsole/syncSessionState", {
     attachedPackages: ["stats"],
-    libraryPaths: [],
   });
   assert.ok(Array.isArray(synced.libraryPaths) && synced.libraryPaths.length > 0, "session synchronization returns the resolved libraries");
 
@@ -1128,22 +1057,24 @@ test("subscript options and adjacent nested closers preserve native R indexing",
     ['df[[│, exact = TRUE]]', ['alpha', 'beta']],
     ['df[│, drop = FALSE]', ['alpha', 'beta']],
     ['df[drop = FALSE, │]', ['alpha', 'beta']],
-    ['df[│, cols[1]]', ['row_one', 'row_two']],
-    ['df[│, cols[[1]]]', ['row_one', 'row_two']],
+    ['df[│, cols[1]]', []],
+    ['df[│, cols[[1]]]', []],
     ['df[, │, drop = FALSE]', ['alpha', 'beta']],
   ]) {
     const text = marked.replace('│', ''), cursor = marked.indexOf('│');
     const context = completion.getCompletionContext(text, cursor);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async expression => runRJson(setup + 'x <- eval(parse(text = inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression));
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { df: { names: ['alpha', 'beta'], class: ['data.frame'], type: 'list' } } }, [], [], undefined,
+      async () => assert.fail("bracket completion must use workspace data"));
     assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.label), expected, marked);
+    if (!expected.length) continue;
     const selected = entries.find(item => item.label === expected[0]);
     const code = text.slice(0, context.replaceStart) + selected.insertText + text.slice(cursor);
     assert.equal(runRJson(setup + 'invisible(suppressWarnings(eval(parse(text=inputs)))); cat("true")', code), true, code);
   }
 });
 
-test("partial argument values follow R matching in LSP and active-session probes", { timeout: 90000 }, async t => {
+test("partial argument values follow R matching in source and workspace signatures", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   const provide = async (...args) => {
     const result = await client.provideCompletionItems(...args);
@@ -1151,6 +1082,7 @@ test("partial argument values follow R matching in LSP and active-session probes
   };
   const definitions = 'f <- function(method = c("spearman", "pearson"), metric = "other") stop("body evaluated")\n';
   for (const runtime of [false, true]) {
+    await client.syncSessionState({ attachedPackages: [], functions: runtime ? { f: 'function(method = c("spearman", "pearson"), metric = "other")' } : {} });
     for (const [call, expected] of [
       ['f(meth = sp│)', ['spearman']], ['f(meth = "sp│")', ['spearman']],
       ['f(met = sp│)', []], ['f(metric = stop("argument evaluated"), met = sp│)', ['spearman']],
@@ -1162,8 +1094,7 @@ test("partial argument values follow R matching in LSP and active-session probes
       const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
       const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
         runtime ? { globalenv: { f: { type: 'closure' } } } : undefined, lines.slice(0, position.line), [],
-        { provideCompletionItems: provide }, async expression => runRJson(definitions +
-          'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression));
+        { provideCompletionItems: provide }, async () => assert.fail("workspace arguments must not query sess"));
       assert.deepEqual(entries.filter(item => item.detail?.startsWith('value for ')).map(item => item.label), expected,
         `${runtime ? 'runtime' : 'source'}: ${marked}`);
     }
@@ -1368,26 +1299,11 @@ test("source callable names preserve literal dollar signs and quoting", { timeou
   }
 });
 
-test("empty runtime values survive both session completion transports", async () => {
-  const { SessProxy } = loadSource('src/Runtime/VSCR/sess/sessProxy.ts');
-  const { SessionWatcher } = loadSource('src/Runtime/VSCR/legacy/sessionWatcher.ts');
-  const setup = 'choose <- function(mode = c("", "auto", "value:literal")) stop("body evaluated")\n';
-  const response = expression => runRJson(setup +
-    'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression);
-  const sess = Object.create(SessProxy.prototype);
-  sess.request = async (_method, params) => response(params.expr);
-  const legacy = Object.create(SessionWatcher.prototype);
-  legacy.postToSessionServer = async params => response(params.expr);
-  for (const transport of [sess, legacy]) {
-    const text = 'choose(mode = )';
-    const context = completion.getCompletionContext(text, text.length - 1);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
-      { globalenv: { choose: { type: 'closure' } } }, [], [], undefined,
-      transport.requestMemberCompletions.bind(transport));
-    const values = entries.filter(item => item.detail === 'value for mode');
-    assert.deepEqual(values.map(item => item.insertText), ['""', '"auto"', '"value:literal"']);
-    assert.ok(completion.toCompletionPick(values[0], context).label.endsWith('""'), 'empty choice has a visible label');
-  }
+test("empty workspace default choices survive native completion", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  await client.syncSessionState({ attachedPackages: [], functions: { choose: 'function(mode = c("", "auto", "value:literal"))' } });
+  const result = await client.provideCompletionItems({ getText: () => 'choose(mode = )' }, { line: 0, character: 14 });
+  assert.deepEqual(result.items.filter(item => item.detail === 'value for mode').map(item => item.label), ['', 'auto', 'value:literal']);
 });
 
 test("complex defaults cannot suppress source argument completions", { timeout: 90000 }, async t => {
@@ -1411,16 +1327,13 @@ test("complex defaults cannot suppress source argument completions", { timeout: 
   }
 });
 
-test("runtime literal choices match source extraction without evaluating defaults", async () => {
+test("workspace literal choices use native extraction without evaluating defaults", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const expression of ['c(I("known"), , base::stop("never evaluate"))',
     'c("known", base::identity("never evaluate"))', 'c((function() stop("never evaluate"))())']) {
-    const text = 'f(x = "")';
-    const context = completion.getCompletionContext(text, text.length - 2);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
-      { globalenv: { f: { type: 'closure' } } }, [], [], undefined, async probe => runRJson(
-        `f <- function(x = ${expression}) stop("body evaluated")\n` +
-        'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', probe));
-    assert.deepEqual(entries.map(item => item.insertText), expression.includes('"known"') ? ['known'] : [], expression);
+    await client.syncSessionState({ attachedPackages: [], functions: { f: 'function(x = ' + expression + ')' } });
+    const result = await client.provideCompletionItems({ getText: () => 'f(x = "")' }, { line: 0, character: 7 });
+    assert.deepEqual(result.items.filter(item => item.detail === 'value for x').map(item => item.label), expression.includes('"known"') ? ['known'] : [], expression);
   }
 });
 
@@ -1520,7 +1433,7 @@ test("live function arguments survive native S3 inference while source and packa
       return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
     },
   };
-  for (const [marked, expected, probe, shadow = true, selected = false] of [
+  for (const [marked, expected, workspaceCall, shadow = true, selected = false] of [
     ['print(data.frame(a=1), │)', 'custom_arg = ', true],
     ['print(data.frame(a=1), cus│)', 'custom_arg = ', true],
     ['print(data.frame(a=1), custom_arg=1, │)', undefined, true],
@@ -1532,7 +1445,7 @@ test("live function arguments survive native S3 inference while source and packa
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     const before = text.slice(0, cursor), lines = text.split('\n');
     const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
-    if (probe && expected) {
+    if (workspaceCall && expected) {
       // R may also list S3 method arguments. The live callable's own argument
       // must remain available regardless of those optional additional results.
       const reference = runRJson(setup + `
@@ -1545,6 +1458,7 @@ test("live function arguments survive native S3 inference while source and packa
       assert.ok(reference.includes('custom_arg='), marked);
     }
     client.updateInput('');
+    await client.syncSessionState({ attachedPackages: [], functions: shadow ? { print: 'function(x, custom_arg)' } : {} });
     if (selected) {
       client.updateInput(text);
       client.recordCompletion(text, 0, { insertText: 'print()', source: 'lsp', packageName: 'base' });
@@ -1554,18 +1468,11 @@ test("live function arguments survive native S3 inference while source and packa
       completion.getCompletionContext(lines[row], col, before, text.slice(cursor)),
       { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col },
       shadow ? { globalenv: { print: { type: 'closure' } } } : undefined,
-      lines.slice(0, row), [], provider, async expression => {
-        probes++;
-        return runRJson(setup + `
-          value <- eval(parse(text = inputs))
-          cat(jsonlite::toJSON(lapply(names(value), function(name)
-            list(name = name, type = typeof(value[[name]]))), auto_unbox = TRUE))
-        `, expression);
-      });
-    assert.equal(probes, Number(probe), marked);
+      lines.slice(0, row), [], provider, async () => { probes++; });
+    assert.equal(probes, 0, marked);
     if (expected) assert.ok(entries.some(entry => entry.insertText === expected), marked);
     else assert.deepEqual(entries, [], marked);
-    if (!probe) assert.ok(entries.every(entry => entry.insertText !== 'custom_arg = '), marked);
+    if (!workspaceCall) assert.ok(entries.every(entry => entry.insertText !== 'custom_arg = '), marked);
   }
 });
 
@@ -1578,37 +1485,30 @@ test("source bindings inside blocks override inferred S3 signatures and live fun
       return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
     },
   };
-  for (const [marked, expected, expectedProbes] of [
-    ['print(data.frame(a=1), │)', ['custom_arg = '], 1],
-    ['print(x=data.frame(a=1), │)', ['custom_arg = '], 1],
-    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['source_arg = '], 0],
-    ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = '], 0],
-    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), sou│) }', ['source_arg = '], 0],
-    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), source_arg=1, │) }', [], 0],
-    ['{ print <- function() NULL; print(data.frame(a=1), │) }', [], 0],
-    ['{ print <- get("identity"); print(data.frame(a=1), │) }', [], 0],
-    ['g <- function(print) { print(data.frame(a=1), │) }', [], 0],
-    ['{ print <- function(x, mode=c("auto", "manual")) NULL; print(data.frame(a=1), mode="aut│") }', ['auto'], 0],
+  await client.syncSessionState({ attachedPackages: [], functions: { print: 'function(x, custom_arg)' } });
+  for (const [marked, expected] of [
+    ['print(data.frame(a=1), │)', ['custom_arg = ']],
+    ['print(x=data.frame(a=1), │)', ['custom_arg = ']],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['source_arg = ']],
+    ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = ']],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), sou│) }', ['source_arg = ']],
+    ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), source_arg=1, │) }', []],
+    ['{ print <- function() NULL; print(data.frame(a=1), │) }', []],
+    ['{ print <- get("identity"); print(data.frame(a=1), │) }', []],
+    ['g <- function(print) { print(data.frame(a=1), │) }', []],
+    ['{ print <- function(x, mode=c("auto", "manual")) NULL; print(data.frame(a=1), mode="aut│") }', ['auto']],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     let probes = 0;
     const entries = await completion.collectCompletionEntries(
       completion.getCompletionContext(text, cursor),
       { getText: () => text, uri: client.inputDocument.uri }, { line: 0, character: cursor },
-      { globalenv: { print: { type: 'closure' } } }, [], [], provider, async expression => {
-        probes++;
-        return runRJson(`
-          print <- function(x, custom_arg) NULL
-          value <- eval(parse(text = inputs))
-          cat(jsonlite::toJSON(lapply(names(value), function(name)
-            list(name = name, type = typeof(value[[name]]))), auto_unbox = TRUE))
-        `, expression);
-      });
+      { globalenv: { print: { type: 'closure' } } }, [], [], provider, async () => { probes++; });
     const argumentsAndValues = entries.filter(item => item.role === 'argument' || item.role === 'value' ||
       item.detail === 'parameter' || item.detail?.startsWith('value for '));
     assert.deepEqual(argumentsAndValues.map(item => item.insertText), expected, marked);
     if (!expected.length) assert.deepEqual(entries, [], marked);
-    assert.equal(probes, expectedProbes, marked);
+    assert.equal(probes, 0, marked);
   }
 });
 
@@ -1703,7 +1603,8 @@ test("unquoted list indices prioritize matching index variables", { timeout: 900
   assert.equal(entries[0].insertText, 'index');
 });
 
-test("runtime argument exhaustion preserves variadic and unknown signatures", async () => {
+test("workspace argument exhaustion preserves variadic and unknown signatures", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
   const session = { globalenv: { f: { type: 'closure' }, runtime_function: { type: 'closure' } } };
   for (const [definition, marked, exhausted] of [
     ['function(a,b) NULL', 'f(1,2, │)', true],
@@ -1711,13 +1612,14 @@ test("runtime argument exhaustion preserves variadic and unknown signatures", as
     ['function() NULL', 'f(│)', true],
     ['function(a,...) NULL', 'f(1,2, run│)', false],
     ['function(...) NULL', 'f(1,2, run│)', false],
-    ['function(a,b) NULL', 'obj$f(1,2, │)', true],
   ]) {
     const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+    await client.syncSessionState({ attachedPackages: [], functions: { f: definition.replace(/ NULL$/, '') } });
     const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, cursor),
-      undefined, undefined, session, [], [], undefined, async expression => runRJson(
-        `f <- ${definition}; obj <- list(f=f); value <- eval(parse(text=inputs)); ` +
-        'cat(jsonlite::toJSON(lapply(names(value), function(n) list(name=n, type=typeof(value[[n]]))), auto_unbox=TRUE))', expression));
+      { getText: () => text }, { line: 0, character: cursor }, session, [], [], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } }, async () => assert.fail("arguments must not query sess"));
     if (exhausted) assert.equal(entries.length, 0, marked);
     else assert.ok(entries.some(entry => entry.label === 'runtime_function'), marked);
   }
@@ -1834,61 +1736,29 @@ test("variadic completion retains dots after supplied arguments without leaking 
   }
 });
 
-test("subscript completion reads installed receiver methods without executing them", async () => {
-  const setup = `
-    suppressPackageStartupMessages(library(data.table))
-    DT <- data.table(zebra = 1, alpha = 2)
-    df <- as.data.frame(DT)
-    lst <- list(alpha = 1, beta = 2)
-    obj <- structure(list(alpha = 1), class = "completion_custom")
-    \`[.completion_custom\` <- function(x, i, mode = stop("default evaluated"), ...) stop("method evaluated")
-    variadic <- structure(list(alpha = 1), class = "completion_variadic")
-    \`[.completion_variadic\` <- function(...) stop("method evaluated")
-    methods::setClass("CompletionSubsetS4", slots = c(alpha = "numeric"))
-    methods::setMethod("[", c(x = "CompletionSubsetS4", i = "ANY", j = "ANY", drop = "ANY"),
-      function(x, i, j, ..., drop = TRUE) stop("S4 method evaluated"))
-    s4 <- methods::new("CompletionSubsetS4", alpha = 1)
-  `;
-  const collect = async marked => {
+test("workspace subscript columns respect receiver class and dimensions without sess expressions", async () => {
+  const workspace = { globalenv: {
+    DT: { class: ['data.table', 'data.frame'], names: ['alpha', 'beta'], type: 'list' },
+    df: { class: ['data.frame'], names: ['alpha', 'beta'], type: 'list' },
+    lst: { names: ['alpha', 'beta'], type: 'list' },
+  } };
+  for (const [marked, expected] of [
+    ['DT[, │]', ['alpha', 'beta']], ['df[, │]', ['"alpha"', '"beta"']],
+    ['lst[[│]]', ['"alpha"', '"beta"']], ['df[│, ]', []], ['DT[, by = │]', []],
+    ['unknown[[│]]', []], ['lst$nested[[│]]', []],
+  ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
-    const context = completion.getCompletionContext(text, cursor);
-    assert.ok(context, marked);
-    return completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async expression => {
-        assert.ok(!expression.includes('user expression must not execute'), marked);
-        return runRJson(setup + `
-          value <- eval(parse(text = inputs))
-          cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
-        `, expression);
-      });
-  };
-  for (const marked of ['DT[, │]', 'DT[, .N, │]', 'DT |> _[, │]']) {
-    const entries = await collect(marked);
-    for (const name of ['by', 'keyby', '.SDcols']) assert.ok(entries.some(e => e.insertText === name + ' = '), marked + name);
-    assert.ok(entries.some(e => e.insertText === 'alpha' && e.kind === 4), marked);
+    const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, cursor),
+      undefined, undefined, workspace, [], [], undefined, async () => assert.fail('no bracket expressions'));
+    assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.insertText), expected, marked);
   }
-  for (const marked of ['DT[, by = │]', 'DT[, keyby = │]', 'DT[, by = "al│"]', 'DT[, `keyby` = al│]']) {
-    assert.deepEqual(await collect(marked), [], 'named values need provider inference: ' + marked);
-  }
-  const supplied = await collect('DT[, stop("user expression must not execute"), by = alpha, │]');
-  assert.ok(supplied.every(e => !['i', 'j', 'by'].includes(e.label)));
-  const dataFrame = await collect('df[, │]');
-  assert.ok(dataFrame.some(e => e.insertText === 'drop = '));
-  assert.ok(dataFrame.every(e => !['by', 'keyby'].includes(e.label)));
-  assert.ok((await collect('df[, , dr│]')).some(e => e.insertText === 'drop = '));
-  const custom = await collect('obj[│]');
-  assert.deepEqual(custom.filter(e => e.role === 'argument').map(e => e.label), ['i', 'mode', '...']);
-  assert.deepEqual((await collect('obj[..., │]')).filter(e => e.role === 'argument').map(e => e.label), ['i', 'mode', '...']);
-  assert.ok((await collect('variadic[│]')).some(e => e.insertText === '...'));
-  assert.ok((await collect('s4[│]')).some(e => e.insertText === 'drop = '));
-  assert.ok((await collect('obj[1, mode = TRUE, │]')).some(e => e.insertText === '...'));
-  assert.ok((await collect('lst[[│]]')).every(e => e.kind === 4));
 });
 
-test("subscript methods and visible functions combine through the real language server", { timeout: 90000 }, async t => {
+test("subscript symbols and fields come from the real language server", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   await client.syncSessionState({ attachedPackages: ['data.table', 'stats', 'base'] });
   const collect = async marked => {
+    marked = 'DT <- data.table::data.table(alpha = 1, beta = 2); df <- as.data.frame(DT)\n' + marked;
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     const before = text.slice(0, cursor), lines = text.split('\n');
     const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
@@ -1899,17 +1769,11 @@ test("subscript methods and visible functions combine through the real language 
           const result = await client.provideCompletionItems(...args);
           return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
         },
-      }, async expression => runRJson(`
-        DT <- data.table::data.table(alpha = 1, beta = 2)
-        df <- as.data.frame(DT)
-        value <- eval(parse(text = inputs))
-        cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
-      `, expression));
+      }, async () => assert.fail("source inference must not query sess"));
   };
   for (const [marked, insertion] of [['DT[, fca│]', 'fcase()'], ['df[, mea│]', 'mean()']]) {
     assert.ok((await collect(marked)).some(e => e.kind === 2 && e.insertText === insertion), marked);
   }
-  assert.ok((await collect('DT[, keyb│]')).some(e => e.role === 'argument' && e.insertText === 'keyby = '));
   const specials = await collect('DT[, .N│]');
   assert.equal(specials.filter(e => e.label === '.N').length, 1);
   assert.ok(specials.some(e => e.label === '.N' && e.source === 'lsp'));

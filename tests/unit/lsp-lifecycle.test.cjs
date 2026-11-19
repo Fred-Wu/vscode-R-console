@@ -34,11 +34,9 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     async sendRequest(method, params) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
-      if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: params.libraryPaths ?? libraries };
+      if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
       if (method === "rConsole/libraryPaths") return libraries;
       if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
-      if (method === "rConsole/exportPackageMetadata") return { saved: ["utils"], skipped: [] };
-      if (method === "rConsole/restorePackageMetadata") return { restored: ["utils"], skipped: [] };
       assert.equal(method, "completion");
       return await completion?.(this, params) ?? [{ label: "lm" }];
     }
@@ -74,19 +72,13 @@ function change() {
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
 
-test("first session snapshot keeps a server whose effective library paths already match", async (t) => {
+test("first session snapshot keeps the running server", async (t) => {
   const { client, instances } = createClient(t);
   await client.start();
-  await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/base/library"] });
+  await client.syncSessionState({ attachedPackages: ["stats"] });
   assert.equal(instances.length, 1, "matching paths must not restart a healthy server");
 });
 
-test("session path checks include configured fallback libraries", async (t) => {
-  const { client, instances } = createClient(t, { libraries: ["/configured"] });
-  await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/session"] });
-  const request = instances[0].requests.find(({ method }) => method === "rConsole/syncSessionState");
-  assert.deepEqual(request.params.libraryPaths, ["/session", "/configured"]);
-});
 
 test("a confirmed loaded-package change restarts once and applies the latest session state", async (t) => {
   let releaseStart;
@@ -97,22 +89,21 @@ test("a confirmed loaded-package change restarts once and applies the latest ses
     start: async (server) => { if (server === instances[1]) await startGate; },
   });
   await client.start();
-  await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/first"] });
+  await client.syncSessionState({ attachedPackages: ["stats"] });
   const first = client.refreshPackages(change());
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(instances.length, 2);
   const concurrentStart = client.start();
-  const latest = client.syncSessionState({ attachedPackages: ["utils"], libraryPaths: ["/latest"] });
+  const latest = client.syncSessionState({ attachedPackages: ["utils"] });
   releaseStart();
   await Promise.all([first, concurrentStart, latest]);
   assert.equal(instances.length, 2, "concurrent callers share one restart");
   assert.deepEqual(instances[1].requests.filter(request => request.method === "rConsole/syncSessionState").at(-1).params, {
-    attachedPackages: ["utils"], libraryPaths: ["/latest"],
+    attachedPackages: ["utils"],
   });
-  assert.ok(instances[0].requests.some(request => request.method === "rConsole/exportPackageMetadata"));
-  const restored = instances[1].requests.findIndex(request => request.method === "rConsole/restorePackageMetadata");
-  assert.ok(restored > instances[1].requests.findIndex(request => request.method === "rConsole/refreshPackages"));
-  assert.ok(restored < instances[1].requests.findIndex(request => request.method === "completion"));
+  const refreshed = instances[1].requests.findIndex(request => request.method === "rConsole/refreshPackages");
+  assert.ok(refreshed >= 0);
+  assert.ok(refreshed < instances[1].requests.findIndex(request => request.method === "completion"));
 });
 
 test("completion survives a background replacement while its response is pending", async (t) => {
@@ -165,7 +156,7 @@ test("ordinary completion errors do not restart the server or repeat the request
   assert.equal(instances[0].requests.filter(({ method }) => method === "completion").length, 1);
 });
 
-test("package replacement and a simultaneous library update share one restart", async (t) => {
+test("package replacement and a simultaneous session update share one restart", async (t) => {
   let releaseStop;
   let enteredStop;
   const stopGate = new Promise((resolve) => { releaseStop = resolve; });
@@ -181,7 +172,7 @@ test("package replacement and a simultaneous library update share one restart", 
   const refresh = client.refreshPackages(change());
   const request = client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8));
   await stopping;
-  const state = { attachedPackages: ["stats"], libraryPaths: ["/project"] };
+  const state = { attachedPackages: ["stats"] };
   const sync = client.syncSessionState(state);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(instances.length, 1, "do not launch a server while its predecessor is stopping");
@@ -192,7 +183,7 @@ test("package replacement and a simultaneous library update share one restart", 
   assert.deepEqual(instances[1].requests.find(({ method }) => method === "rConsole/syncSessionState").params, state);
 });
 
-test("an obsolete library update does not restart a server that matches the latest state", async (t) => {
+test("a superseded session update applies the latest attached packages", async (t) => {
   let releaseReply;
   let enteredRequest;
   const replyGate = new Promise((resolve) => { releaseReply = resolve; });
@@ -202,9 +193,9 @@ test("an obsolete library update does not restart a server that matches the late
   const { client, instances } = createClient(t, {
     reply: async () => { if (++requests === 1) { enteredRequest(); return replyGate; } return { libraryPaths: ["/current"] }; },
   });
-  const first = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/obsolete"] });
+  const first = client.syncSessionState({ attachedPackages: ["stats"] });
   await requested;
-  const latest = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/current"] });
+  const latest = client.syncSessionState({ attachedPackages: ["utils"] });
   releaseReply({ libraryPaths: ["/obsolete"] });
   await Promise.all([first, latest]);
   assert.equal(instances.length, 1);
@@ -216,6 +207,7 @@ test("cached session state reaches the LSP before its first launch", async () =>
   class ConsoleLspClient {
     async start() { calls.push("start"); }
     async syncSessionState(state) { calls.push(state); }
+    updateInput() {}
     async dispose() {}
   }
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
@@ -223,8 +215,12 @@ test("cached session state reaches the LSP before its first launch", async () =>
     "../../Language/consoleLspClient": { ConsoleLspClient },
   });
   const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
-  lang.updateSessionData({ search: ["package:stats"], globalenv: {}, libraryPaths: ["/project"], loaded_namespaces: [] });
+  const data = { search: ["package:stats"], globalenv: { f: { type: "closure", str: "function(first)" } }, loaded_namespaces: [] };
+  lang.updateSessionData(data);
   await lang.ensureConsoleLspStarted();
-  assert.deepEqual(calls, [{ attachedPackages: ["stats"], libraryPaths: ["/project"] }]);
+  assert.deepEqual(calls, [{ attachedPackages: ["stats"], functions: { f: "function(first)" } }]);
+  assert.equal(lang.updateSessionData(data), false, "unchanged metadata is not resent");
+  lang.clearSessionState();
+  assert.deepEqual(calls.at(-1), { attachedPackages: [] });
   await lang.dispose();
 });

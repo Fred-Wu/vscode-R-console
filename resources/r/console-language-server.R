@@ -10,7 +10,6 @@ if (use_renv_lib_path) {
     }
 }
 
-fallback_lib_paths <- .paths
 add_lib_paths <- Sys.getenv("VSCR_LIB_PATHS")
 if (nzchar(add_lib_paths)) {
     add_lib_paths <- strsplit(add_lib_paths, "\n", fixed = TRUE)[[1L]]
@@ -70,9 +69,6 @@ console_text_document_did_close <- function(self, params) {
 
     languageserver:::text_document_did_close(self, params)
 }
-
-completion_libraries <- .libPaths()
-completion_packages <- NULL
 
 server <- languageserver:::LanguageServer$new(host, NULL)
 if (!is.null(port)) {
@@ -148,7 +144,7 @@ if (is.null(console_script)) {
     console_script <- sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE)[[1L]])
 }
 console_resource_dir <- dirname(console_script)
-for (resource in c("completion-source.R", "completion-arguments.R", "completion-provider.R", "completion-cache.R")) {
+for (resource in c("completion-source.R", "completion-arguments.R", "completion-provider.R")) {
     source(file.path(console_resource_dir, resource), local = TRUE)
 }
 
@@ -159,12 +155,8 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     # languageserver resolves package conflicts from the end of this list.
     workspace$startup_packages <- rev(attached_packages)
     workspace$update_loaded_packages()
+    console_sync_workspace_functions(workspace, params$functions)
 
-    paths <- .libPaths()
-    if (!is.null(params$libraryPaths)) {
-        on.exit(.libPaths(paths))
-        .libPaths(c(normalize_character(params$libraryPaths), fallback_lib_paths))
-    }
     self$deliver(languageserver:::Response$new(id, result = list(libraryPaths = as.list(.libPaths()))))
 }
 server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params) {
@@ -184,9 +176,6 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
         return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))
     }
     .libPaths(normalize_character(params$libraryPaths))
-    completion_libraries <<- .libPaths()
-    completion_packages <<- normalize_character(params$packages)
-    completion_package_identities <<- params$identities
     for (workspace in self$workspaces$values()) {
         affected <- changed
         if (length(changed) && is.function(workspace$s3_metadata$keys)) {

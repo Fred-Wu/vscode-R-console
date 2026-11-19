@@ -52,8 +52,6 @@ export class SessProxy {
   private forwardedRequests = new Map<string, string>();
   private rSocketWaiters: Array<(socket: net.Socket | undefined) => void> = [];
   private workspaceData: WorkspaceData | undefined;
-  private libraryPathsRequest: Promise<void> | undefined;
-  private lastLibraryPathsRead = 0;
   private sessionId: string | undefined;
   private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
   private onConnectionChange: ((state: "attached" | "disconnected") => void) | undefined;
@@ -120,7 +118,6 @@ export class SessProxy {
     this.rBuffer = "";
     this.upstreamBuffer = "";
     this.workspaceData = undefined;
-    this.libraryPathsRequest = undefined;
     this.sessionId = undefined;
 
     const server = this.server;
@@ -148,46 +145,8 @@ export class SessProxy {
     if (socket && (this.rSocket !== socket || socket.destroyed)) {
       return this.workspaceData;
     }
-    // Workspace updates must not wait for the optional library-path probe.
     this.setWorkspaceData(result);
-    void this.refreshLibraryPaths(true);
     return result;
-  }
-
-  async refreshLibraryPaths(force = false): Promise<void> {
-    const socket = this.rSocket;
-    if (!socket || socket.destroyed) return;
-    if (this.libraryPathsRequest) return this.libraryPathsRequest;
-    if (!this.workspaceData) {
-      await this.requestWorkspace();
-      return this.libraryPathsRequest;
-    }
-    if (!force && this.workspaceData.libraryPaths && Date.now() - this.lastLibraryPathsRead < 1000) return;
-    // sess completion returns list names without modifying R state.
-    const request = this.request("completion", {
-      expr: "stats::setNames(as.list(.libPaths()), .libPaths())",
-      trigger: "$",
-    }).then((paths) => {
-      if (this.rSocket !== socket || socket.destroyed || !this.workspaceData) {
-        return;
-      }
-      if (!Array.isArray(paths) || paths.length === 0 || !paths.every((item) =>
-        item && typeof item.name === "string" && item.name.length > 0
-      )) {
-        return;
-      }
-      const libraryPaths = paths.map((item) => item.name as string);
-      this.lastLibraryPathsRead = Date.now();
-      if (JSON.stringify(this.workspaceData.libraryPaths) !== JSON.stringify(libraryPaths)) {
-        this.setWorkspaceData({ ...this.workspaceData, libraryPaths });
-      }
-    }).catch(() => undefined).finally(() => {
-      if (this.libraryPathsRequest === request) {
-        this.libraryPathsRequest = undefined;
-      }
-    });
-    this.libraryPathsRequest = request;
-    return request;
   }
 
   getWorkspaceData(): WorkspaceData | undefined {
@@ -309,7 +268,6 @@ export class SessProxy {
     // A new attach can replace an old R socket during sess recovery.
     this.sessionId = undefined;
     this.workspaceData = undefined;
-    this.libraryPathsRequest = undefined;
     this.rSocket = socket;
     const upstream = net.createConnection({ path: this.options.upstreamPipePath });
     this.upstreamSocket = upstream;
@@ -368,7 +326,6 @@ export class SessProxy {
       const wasAttached = Boolean(this.sessionId);
       this.sessionId = undefined;
       this.workspaceData = undefined;
-      this.libraryPathsRequest = undefined;
       if (wasAttached) { this.onConnectionChange?.("disconnected"); }
       this.forwardedRequests.clear();
       this.resolveRSocketWaiters(undefined);
@@ -538,7 +495,6 @@ export class SessProxy {
   }
 
   private setWorkspaceData(data: WorkspaceData): void {
-    if (!data.libraryPaths && this.workspaceData?.libraryPaths) data.libraryPaths = this.workspaceData.libraryPaths;
     this.workspaceData = data;
     this.onWorkspaceData?.(data);
   }

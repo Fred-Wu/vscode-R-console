@@ -368,10 +368,6 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return await this.proxy?.requestWorkspace();
   }
 
-  override async refreshLibraryPaths(force: boolean): Promise<void> {
-    await this.proxy?.refreshLibraryPaths(force);
-  }
-
   override async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"

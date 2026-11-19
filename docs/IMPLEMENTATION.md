@@ -633,11 +633,12 @@ The `workspace` response provides:
 - loaded namespaces
 - global environment summary
 
-The `completion` response provides runtime `$` and `@` members for an expression.
-Console data-frame bracket completion obtains column names through a completion
-request for the data object expression. The proxy also queries `.libPaths()`
-through a completion expression and includes the resulting package folders in
-the cached workspace data.
+The `completion` response provides runtime `$` and `@` members for names and
+chains such as `obj$data`. It does not accept arbitrary R expressions.
+Data-frame bracket completion uses column names from workspace data.
+That data does not include row names or subscript-method arguments, so those
+suggestions depend on what the language server can infer from source.
+The separate language-server process obtains its own library paths.
 
 In `sess` mode, a restored console obtains the current endpoint through vscode-R's
 public session API and reconnects at an empty main prompt. A console detached
@@ -655,12 +656,11 @@ In `legacy` mode, the console consumes watcher metadata for:
 - attached-package synchronization with the console-owned language server
 
 In `sess` mode, R Console caches metadata passing through its proxy and routes
-completion requests to its embedded session. Runtime `$`, `@`, and data-frame
-bracket completion are requested from the current embedded R session through
-the `sess` JSON-RPC `completion` method.
+completion requests to its embedded session. Runtime `$` and `@` members are
+requested through the `sess` JSON-RPC `completion` method.
 Workspace snapshots are cached from forwarded or console-injected `workspace`
-responses and are used for search-path/package synchronization and top-level
-workspace completions.
+responses and supply search-path synchronization, workspace symbols, column
+names, and function signatures for the language server.
 
 vscode-R manages plot, data, help, browser, httpgd, and addin session lifecycles.
 
@@ -763,18 +763,25 @@ Completion data comes from one shared flow:
   resolves the receiver, then falls back to the live session and cached fields
   when needed
 - data-aware bracket and pipe-placeholder contexts use cached session metadata
-  and current input for the first suggestion pass
-- language-server symbols come from the console-owned `languageserver` process.
-  A bare package prefix also offers names from the active package libraries.
+  and current input; bracket completion does not evaluate expressions through sess
+- complete function signatures from workspace data are supplied to the language
+  server as an in-memory source document. Its native providers generate argument
+  names and default choices. The document is updated only when signatures change,
+  including redefinitions and removals; function bodies and defaults are not run.
+  Truncated signatures and nested functions absent from workspace data cannot
+  provide runtime arguments. Native inference from the current input still applies.
+- language-server symbols and package-name suggestions come from the
+  console-owned `languageserver` process.
 
 #### Language Server Lifecycle
 
 `ConsoleLspClient` owns a `languageserver` child process for each console UI.
 The child inherits the console runtime's normalized R environment and runs
-`resources/r/console-language-server.R` in a temporary working directory.
+`resources/r/console-language-server.R` from the console's project directory,
+so R reads the project startup files and discovers its package libraries.
+The LSP workspace remains a separate temporary folder to avoid project indexing.
 Opening the console starts the client and issues a silent completion request
-to initialize completion caches. Known session state supplies the initial
-library paths before launch. Runtime start and attach events reuse the client.
+to initialize completion caches. Runtime start and attach events reuse the client.
 
 Windows uses an authenticated loopback TCP connection. On Unix,
 `r.lsp.use_stdio` selects stdio or TCP. For TCP, the R server initializes its
@@ -787,13 +794,12 @@ documents before requesting completion. `VirtualRDocument` projects console
 input into the server document and maps completion positions and ranges back
 to the console. Diagnostics are disabled for these completion documents.
 
-`rConsole/syncSessionState` synchronizes attached packages and library paths.
-The client deduplicates unchanged snapshots and shares an in-flight sync request
-among concurrent callers. The R server resolves the requested session paths,
-configured fallback paths, and default libraries with `.libPaths()`. It returns
-the resolved search order to the background package monitor. Startup and
-session updates keep the console's library paths current;
-completion requests do not wait for a library-path probe.
+`rConsole/syncSessionState` synchronizes attached package names. The client
+deduplicates unchanged state and shares an in-flight sync request among concurrent
+callers. The language server reads its own `.libPaths()`, including project startup
+and configured `r.libPaths`, and supplies the search order to the background package
+monitor. No library-path requests go through sess or the legacy session integration.
+A manual `.libPaths(...)` change in the console affects only that R process.
 
 `PackageInventory` monitors library folders outside the R process. Folder
 events schedule a scan of the changed library after 250 ms. It reads package names,
@@ -808,30 +814,21 @@ preserves completion data. A new effective package updates the package-name
 list without restarting. A changed effective copy invalidates that package's
 completion metadata and affected requests. `rConsole/refreshPackages` requests
 a restart only when a changed package is already loaded in the LSP process,
-or the loaded namespace comes from a different installation. Ordinary typing
-does not run package scans or change checks.
+or the loaded namespace comes from a different installation. Console-side
+package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
 latest snapshot. A completion interrupted by replacement reopens its document
-and retries once on the replacement client. Before a package-triggered restart,
-the server saves its package symbols, cached function signatures, member metadata,
-and S3 method metadata to a temporary snapshot in the console's working directory.
-This snapshot is separate from the library inventory. Each entry records the
-inventory identities of its package and dependencies. The replacement server
-restores only entries whose identities still match the latest inventory, with
-matching R, language-server, and snapshot versions. Changed packages and affected
-dependents are rebuilt as needed. The snapshot contains no console runtime objects
-or loaded namespace environments, and is removed when the console LSP is disposed.
-Export/restore failures are logged and leave normal metadata discovery available.
-The replacement receives a silent completion after restoration to warm any missing
-metadata. Package changes invalidate stale displayed
+and retries once on the replacement client. `languageserver` owns its completion
+metadata and rebuilds it after a restart. The console does not export or restore
+that metadata. The replacement receives a silent completion request to prepare
+suggestions for the current input. Package changes invalidate stale displayed
 suggestions. Disposal closes library watchers and timers and stops the child
 process before removing its working directory. The `R Console Language Server`
 output channel records additions, updates, removals, remaining or selected
 copies, refresh/restart decisions, and library paths in search order with
-per-library and unique-package counts, as well as saved/restored metadata counts,
-process starts, stops, and errors.
+per-library and unique-package counts, process starts, stops, and errors.
 
 #### Keybinding Dispatch
 

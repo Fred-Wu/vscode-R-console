@@ -13,7 +13,6 @@ export type CompletionContext = {
   bracketQuote?: "\"" | "'";
   bracketDimension?: number;
   bracketDimensions?: number;
-  bracketArgumentTags?: (string | null)[];
   bracketArgumentName?: string;
   argumentValue?: CallCompletionContext["argumentValue"];
   pipe?: boolean;
@@ -42,8 +41,6 @@ export type CompletionEntry = {
 
 export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
-  argumentsExhausted?: boolean;
-  subscriptResolved?: boolean;
 };
 
 export type CompletionPickItem = vscode.QuickPickItem & {
@@ -62,6 +59,7 @@ export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[]) & {
   // Applies even when filtering leaves no arguments or the definition has none.
   rConsoleLocalFunction?: boolean;
+  rConsoleWorkspaceFunction?: boolean;
   rConsoleMemberResolved?: boolean;
   rConsoleNativeArguments?: boolean;
   rConsoleArgumentsExhausted?: boolean;
