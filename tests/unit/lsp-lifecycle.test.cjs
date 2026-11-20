@@ -7,7 +7,7 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], inspectRuntimeCompletion } = {}) {
+function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], inspectRuntimeCompletion, staticAnalysis = false } = {}) {
   const instances = [];
   const logs = [];
   class LanguageClient {
@@ -62,6 +62,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
   const client = new ConsoleLspClient({
     consoleId: "lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
     rPath: "R", env: {}, inspectRuntimeCompletion,
+    getStaticAnalysisEnabled: () => staticAnalysis,
   });
   client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
@@ -75,6 +76,7 @@ function change() {
 
 test("native member signatures never wait for runtime inspection", async t => {
   const { client } = createClient(t, {
+    staticAnalysis: true,
     completion: () => ({ items: [], rConsoleLocalFunction: true }),
     inspectRuntimeCompletion: async () => assert.fail("current source is authoritative, including empty signatures"),
   });

@@ -1,18 +1,3 @@
-## Console completion modes
-
-The default `r.console.completion.staticAnalysis` setting is `false`.
-Normal console completions use the current runtime session and package
-metadata, while parsing the editable input only to identify the cursor
-context. Completed unsubmitted statements are masked in the LSP-only virtual
-document so they cannot redefine objects or functions before execution.
-Recent Input suggestions are still text-based in both modes.
-
-Setting `r.console.completion.staticAnalysis` to `true` opts into
-editor-style source inference: the full pending input can supply function
-formals, members, and locally declared completion candidates. Runtime and
-static source handling live in `completion-runtime.R` and
-`completion-static.R`, respectively.
-
 # Design and Implementation
 
 `vscode-R-console` runs an embedded R session through a Rust backend and presents
@@ -688,7 +673,23 @@ Implementation files:
 - [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
-- [`resources/r/completion-provider.R`](../resources/r/completion-provider.R) supplements native language-server results with console argument and source information.
+- [`resources/r/completion-provider.R`](../resources/r/completion-provider.R) supplements native language-server completion with console argument handling.
+- [`resources/r/completion-runtime.R`](../resources/r/completion-runtime.R) handles the live session signatures.
+- [`resources/r/completion-static.R`](../resources/r/completion-static.R) handles optional unsubmitted source inference.
+
+#### Completion Sources And Modes
+
+The `r.console.completion.staticAnalysis` setting defaults to `false`.
+In runtime mode, completions use the active R session and installed package
+metadata. Unsubmitted statements are masked in the LSP-only virtual document,
+preserving cursor positions while preventing pending definitions from taking
+precedence. Recent Input remains a text-completion source in both modes.
+
+Enable `r.console.completion.staticAnalysis` to retain editor-style
+source inference, including function arguments and members inferred from
+unsubmitted input. Session-backed signature handling is implemented in
+`resources/r/completion-runtime.R`; optional source inference is in
+`resources/r/completion-static.R`.
 
 #### Completion Frontends
 
