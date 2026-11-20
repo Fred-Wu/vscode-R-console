@@ -127,13 +127,46 @@ console_source_function <- function(document, point, name) {
 
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
-console_member_function <- function(uri, workspace, document, point) {
-    if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
-    location <- languageserver:::member_call_location(document, point)
-    if (is.null(location)) return(NULL)
-    resolved <- languageserver:::member_resolve_cursor(uri, workspace, document,
-        location$point, location$cursor, location$cursor$token)
+console_member_function <- function(uri, workspace, document, point, source) {
+    # Whether the source shadows a live binding is independent of whether
+    # native inference succeeds. A failure must not abort runtime fallback.
+    bound <- console_source_member_binding(document, point, source)
+    resolved <- tryCatch({
+        location <- if (exists("member_call_location", asNamespace("languageserver"), inherits = FALSE))
+            languageserver:::member_call_location(document, point) else NULL
+        if (is.null(location)) NULL else languageserver:::member_resolve_cursor(
+            uri, workspace, document, location$point, location$cursor, location$cursor$token)
+    }, error = function(e) NULL)
     definition <- resolved$value$function_expr
-    if (is.null(definition)) return(NULL)
-    list(formals = definition[[2L]])
+    if (!is.null(definition)) return(list(formals = definition[[2L]]))
+    if (bound) return(list(formals = NULL, unknown = TRUE))
+    NULL
+}
+
+# A pending source write is authoritative even when its value is not a
+# function or the native resolver cannot infer its signature. The receiver's
+# root binding and writes to its member chain are both relevant. Never
+# execute the source or an existing runtime namesake to decide precedence.
+console_source_member_binding <- function(document, point, source) {
+    member <- tryCatch(str2lang(source), error = function(e) NULL)
+    if (!is.call(member) || !is.symbol(member[[1L]]) ||
+        !as.character(member[[1L]]) %in% c("$", "@")) return(FALSE)
+    root <- member
+    while (is.call(root) && length(root) >= 2L && is.symbol(root[[1L]]) &&
+        as.character(root[[1L]]) %in% c("$", "@", "[[", "[")) {
+        root <- root[[2L]]
+    }
+    if (!is.symbol(root)) return(FALSE)
+    name <- as.character(root)
+    if (!is.null(console_source_function(document, point, name))) return(TRUE)
+
+    # The document's indexed binding history tracks direct and nested member
+    # writes as well as roots with unknown RHS values. It is independent of
+    # native receiver inference and excludes writes after the actual cursor.
+    at <- c(point$row, point$col)
+    history <- document$parse_data$member_data$bindings[[name]]
+    length(history) > 0L && isTRUE(tryCatch(
+        languageserver:::member_history_position(
+            languageserver:::member_history_at(history, at), at) > 0L,
+        error = function(e) FALSE))
 }

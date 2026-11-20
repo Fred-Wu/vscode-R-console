@@ -42,7 +42,7 @@ console_supplement_completion <- function(reply, self, params) {
             (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
     source <- if (is.null(call) || !is.null(call$package)) NULL else if (member_call) {
-        if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
+        if (native_arguments) NULL else console_member_function(uri, workspace, document, point, params$rConsoleCall)
     } else console_source_function(document, point, call$token)
     runtime <- if (member_call && is.null(source) && !native_arguments)
         console_parse_signature(params$rConsoleRuntimeSignature) else NULL

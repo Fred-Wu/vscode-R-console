@@ -94,6 +94,13 @@ test("inventory detects same-version package replacement from folder events", as
   const identity = changes.at(-1).packages.get("example").identity;
   fs.rmSync(directory, { recursive: true });
   install(library);
+  // Filesystem notifications are asynchronous. "Settled" can be true
+  // before the first event arrives, so wait for the actual replacement.
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.identity === identity) {
+    assert.ok(Date.now() < deadline, "same-version replacement must be observed");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.notEqual(changes.at(-1).packages.get("example").identity, identity);
