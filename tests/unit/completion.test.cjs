@@ -580,7 +580,7 @@ test("background package replacement shares startup and preserves the newer libr
   assert.deepEqual(requests, [{ method: "rConsole/syncSessionState", params: {
     attachedPackages: [],
   } }], "do not replay the older inventory after the server reports newer libraries");
-  assert.ok(logs.some(line => line.includes("loaded packages changed: example")));
+  assert.ok(logs.some(line => line.includes("Restarting language server: example (removed); clearing packages loaded in the server.")));
   await lsp.refreshPackages({
     changed: [], libraries: [{ path: "/latest", packages: new Map() }],
     packages: new Map(), isCurrent: () => true,

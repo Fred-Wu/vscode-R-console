@@ -110,6 +110,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private packageRefreshPromise: Promise<void> | undefined;
   private packageRevision = 0;
   private restartPromise: Promise<void> | undefined;
+  private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
@@ -436,7 +437,7 @@ export class ConsoleLspClient implements CompletionProvider {
     return JSON.stringify([state.attachedPackages, state.functions]);
   }
 
-  private async restartClient(client: ConsoleLanguageClient): Promise<void> {
+  private async restartClient(client: ConsoleLanguageClient, reason: string): Promise<void> {
     if (this.restartPromise) {
       await this.restartPromise;
       return;
@@ -445,6 +446,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return;
     }
 
+    if (this.spawnedServer) this.plannedRestarts.set(this.spawnedServer, reason);
     // Completion and startup callers join the same background replacement.
     const refresh = (async () => {
       if (!(await this.stop())) {
@@ -466,8 +468,14 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private async refreshPackages(change: PackageInventoryChange): Promise<void> {
     const refresh = (async () => {
-      let client = this.client;
+      if (!change.isCurrent()) return;
+      const previousClient = this.client;
+      let client = await this.ensureClient();
       if (!client?.isRunning() || this.disposed) throw new Error("Language server is not running");
+      if (!change.isCurrent()) return;
+      await this.applySessionState(client);
+      if (this.client !== client) throw new Error("Language server changed during package refresh");
+      if (!change.isCurrent()) return;
       if (change.changed.length) {
         this.packageRevision++;
         this.options.onPackagesChanged?.();
@@ -475,7 +483,8 @@ export class ConsoleLspClient implements CompletionProvider {
       const params = {
         libraryPaths: change.libraries.map(library => library.path),
         installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
-        changed: change.changed,
+        // A recovered server already loaded the current installations.
+        changed: client === previousClient ? change.changed : [],
       };
       const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
       if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
@@ -485,8 +494,10 @@ export class ConsoleLspClient implements CompletionProvider {
           this.packageRevision++;
           this.options.onPackagesChanged?.();
         }
-        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restart required: loaded packages changed: ${result.restart.join(", ")}`);
-        await this.restartClient(client);
+        const reason = result.restart.map(name =>
+          `${name} (${change.packages.has(name) ? "installation changed" : "removed"})`).join(", ");
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restarting language server: ${reason}; clearing packages loaded in the server.`);
+        await this.restartClient(client, reason);
         client = this.client;
         if (!client?.isRunning() || this.disposed) return;
         await this.applySessionState(client);
@@ -642,7 +653,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
       });
       child.once("exit", (code, signal) => {
-        this.logServerStopped(code, signal);
+        this.logServerStopped(code, signal, child);
         if (code === 10) {
           void vscode.window.showWarningMessage(
             "R package {languageserver} is required for console autocompletion."
@@ -683,7 +694,8 @@ export class ConsoleLspClient implements CompletionProvider {
           }
           settled = true;
           if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
-          socket.on("error", (error) => this.logServerError(error));
+          const child = this.spawnedServer;
+          socket.on("error", (error) => this.logServerError(error, child));
           server.close();
           // Authentication leaves the socket paused, possibly with early LSP
           // bytes buffered. Resume only after JSON-RPC installs its reader.
@@ -761,7 +773,7 @@ export class ConsoleLspClient implements CompletionProvider {
           rejectOnce(error);
         });
         child.once("exit", (code, signal) => {
-          this.logServerStopped(code, signal);
+          this.logServerStopped(code, signal, child);
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -878,14 +890,21 @@ export class ConsoleLspClient implements CompletionProvider {
   private logServerStarted(): void {
     const timestamp = formatLogTimestamp();
     lifecycleOutputChannel.appendLine(
-      `[Info - ${timestamp}] R Console language server started`
+      `[${timestamp}] R Console language server started`
     );
     lifecycleOutputChannel.appendLine(
-      `[Info - ${timestamp}] R executable: "${this.options.rPath}"`
+      `[${timestamp}] R executable: "${this.options.rPath}"`
     );
   }
 
-  private logServerError(error: unknown): void {
+  private logServerError(error: unknown, child?: ChildProcess): void {
+    const reason = child && this.plannedRestarts.get(child);
+    if (reason && (error as NodeJS.ErrnoException | null)?.code === "ECONNRESET") {
+      lifecycleOutputChannel.appendLine(
+        `[${formatLogTimestamp()}] R Console language server connection closed during planned restart: ${reason} (ECONNRESET)`
+      );
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     lifecycleOutputChannel.appendLine(
       `[Error - ${formatLogTimestamp()}] ${message}`
@@ -899,18 +918,20 @@ export class ConsoleLspClient implements CompletionProvider {
     const lines = readline.createInterface({ input: child.stderr });
     lines.on("line", (line) => {
       lifecycleOutputChannel.appendLine(
-        `[R stderr - ${formatLogTimestamp()}] ${line}`
+        `[${formatLogTimestamp()}] ${line}`
       );
     });
   }
 
   private logServerStopped(
     code: number | null,
-    signal: NodeJS.Signals | null
+    signal: NodeJS.Signals | null,
+    child: ChildProcess
   ): void {
     const result = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+    const reason = this.plannedRestarts.get(child);
     lifecycleOutputChannel.appendLine(
-      `[Info - ${formatLogTimestamp()}] stopped (${result})`
+      `[${formatLogTimestamp()}] R Console language server stopped (${result}${reason ? `; planned restart: ${reason}` : ""})`
     );
   }
 

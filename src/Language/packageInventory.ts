@@ -20,8 +20,10 @@ export class PackageInventory {
   private paths: string[] = [];
   private libraries: LibraryInventory[] = [];
   private packages = new Map<string, PackageInstallation>();
-  private watchers: fs.FSWatcher[] = [];
+  private readonly watchers = new Map<string, fs.FSWatcher>();
   private timer: NodeJS.Timeout | undefined;
+  private retryTimer: NodeJS.Timeout | undefined;
+  private retryDelay = 1000;
   private pending: Promise<void> | undefined;
   private candidate: string | undefined;
   private initialized = false;
@@ -38,53 +40,100 @@ export class PackageInventory {
     if (this.disposed || JSON.stringify(paths) === JSON.stringify(this.paths)) return;
     this.paths = [...paths];
     this.revision++;
+    this.clearRetry();
+    this.dirtyLibraries.clear();
     for (const library of paths) this.dirtyLibraries.add(library);
-    for (const watcher of this.watchers) watcher.close();
-    this.watchers = [];
-    for (const library of paths) {
-      try {
-        const watcher = fs.watch(library, { persistent: false }, () => {
-          this.dirtyLibraries.add(library);
-          this.schedule(250);
-        });
-        watcher.on("error", error => {
-          watcher.close();
-          this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
-        });
-        this.watchers.push(watcher);
-      } catch (error) {
-        this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
-      }
-    }
+    for (const watcher of this.watchers.values()) watcher.close();
+    this.watchers.clear();
+    for (const library of paths) this.watchLibrary(library);
     this.schedule(0);
+  }
+
+  private watchLibrary(library: string, recovering = false): void {
+    try {
+      const watcher = fs.watch(library, { persistent: false }, (event, filename) => {
+        if (this.disposed || this.watchers.get(library) !== watcher) return;
+        this.log(`[Libraries] Filesystem event: ${event} - ${library} - ${filename ? JSON.stringify(filename) : "filename unavailable"}`);
+        this.dirtyLibraries.add(library);
+        this.schedule(250);
+      });
+      watcher.on("error", error => {
+        if (this.disposed || this.watchers.get(library) !== watcher) return;
+        this.watchers.delete(library);
+        watcher.close();
+        this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
+        this.scheduleRetry();
+      });
+      this.watchers.set(library, watcher);
+      this.dirtyLibraries.add(library);
+      this.log(`[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
+    } catch (error) {
+      this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
+      this.scheduleRetry();
+    }
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    this.retryDelay = 1000;
+  }
+
+  private scheduleRetry(): void {
+    if (this.disposed || this.retryTimer) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.log(`[Libraries] Recovery retry scheduled in ${this.retryDelay / 1000}s`);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      this.log("[Libraries] Recovery retry started");
+      for (const library of this.paths) {
+        if (!this.watchers.has(library)) this.watchLibrary(library, true);
+      }
+      void this.refresh();
+    }, this.retryDelay);
+    this.retryDelay = Math.min(this.retryDelay * 2, 30000);
+    this.retryTimer.unref();
   }
 
   dispose(): void {
     this.disposed = true;
     this.revision++;
     if (this.timer) clearTimeout(this.timer);
-    for (const watcher of this.watchers) watcher.close();
-    this.watchers = [];
+    this.timer = undefined;
+    this.clearRetry();
+    for (const watcher of this.watchers.values()) watcher.close();
+    this.watchers.clear();
   }
 
   refresh(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     if (this.pending) return this.pending;
     const revision = this.revision;
-    const request = this.scan().catch(error => {
+    const dirty = new Set(this.dirtyLibraries);
+    this.dirtyLibraries.clear();
+    const request = this.scan(revision, dirty).then(() => {
+      if (!this.disposed && revision === this.revision &&
+          this.watchers.size === this.paths.length && !this.dirtyLibraries.size) {
+        if (this.retryDelay > 1000) this.log("[Libraries] Recovery complete; retries stopped");
+        this.clearRetry();
+      }
+    }).catch(error => {
       if (!this.disposed && revision === this.revision) {
+        for (const library of dirty) this.dirtyLibraries.add(library);
         this.log(`[Libraries] Could not refresh package inventory: ${String(error)}`);
+        this.scheduleRetry();
       }
     }).finally(() => {
       if (this.pending === request) this.pending = undefined;
-      if (!this.timer && this.dirtyLibraries.size) this.schedule(250);
+      if (!this.timer && !this.retryTimer && this.dirtyLibraries.size) this.schedule(250);
     });
     this.pending = request;
     return request;
   }
 
   private schedule(delay: number): void {
-    if (this.disposed) return;
+    if (this.disposed || this.retryTimer) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = undefined;
@@ -93,10 +142,7 @@ export class PackageInventory {
     this.timer.unref();
   }
 
-  private async scan(): Promise<void> {
-    const revision = this.revision;
-    const dirty = new Set(this.dirtyLibraries);
-    this.dirtyLibraries.clear();
+  private async scan(revision: number, dirty: Set<string>): Promise<void> {
     const libraries: LibraryInventory[] = [];
     for (const library of this.paths) {
       if (this.disposed || revision !== this.revision) return;
@@ -107,6 +153,7 @@ export class PackageInventory {
       }
       let entries: fs.Dirent[];
       try {
+        this.log(`[Libraries] Scanning folder: ${library}`);
         entries = await fs.promises.readdir(library, { withFileTypes: true });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -115,6 +162,7 @@ export class PackageInventory {
       // R moves the old package aside during installation. Do not publish that
       // temporary absence or a partially written replacement.
       if (entries.some(entry => entry.name.startsWith("00LOCK"))) {
+        this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
         libraries.push(previous ?? { path: library, packages: new Map() });
         continue;
       }
@@ -142,10 +190,12 @@ export class PackageInventory {
       [...library.packages.values()].map(item => [item.name, item.identity])]));
     if (this.initialized && signature === previousSignature) {
       this.candidate = undefined;
+      this.log("[Libraries] Package inventory unchanged");
       return;
     }
     if (this.initialized && this.candidate !== signature) {
       this.candidate = signature;
+      this.log("[Libraries] Package inventory changed; checking again to confirm");
       for (const library of dirty) this.dirtyLibraries.add(library);
       this.schedule(250);
       return;

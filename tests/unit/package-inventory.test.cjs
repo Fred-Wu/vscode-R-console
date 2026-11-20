@@ -27,7 +27,7 @@ function fixture(t) {
     const deadline = Date.now() + 10000;
     do {
       await new Promise(resolve => setTimeout(resolve, 20));
-      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.pending && !inventory.dirtyLibraries.size)) return;
+      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size)) return;
       assert.ok(Date.now() < deadline, "inventory settles after pending filesystem events");
     } while (true);
   };
@@ -67,7 +67,7 @@ test("inventory preserves effective copies across duplicate additions, removals 
 });
 
 test("inventory ignores lock-only changes and defers packages while installation is locked", async t => {
-  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
   inventory.setLibraryPaths([library]);
   await settle();
   const count = changes.length;
@@ -75,6 +75,9 @@ test("inventory ignores lock-only changes and defers packages while installation
   fs.mkdirSync(lock);
   await settle();
   assert.equal(changes.length, count);
+  assert.ok(logs.some(line => line.includes("Filesystem event:") && line.includes(library)));
+  assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
+  assert.ok(logs.includes("[Libraries] Package inventory unchanged"));
   install(library);
   await settle();
   assert.equal(changes.length, count);
@@ -150,4 +153,121 @@ test("two library links to the same installation retain its completion metadata"
   await settle();
   assert.deepEqual(changes.at(-1).changed, []);
   assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
+});
+
+test("a failed refresh retries only dirty libraries and publishes the latest installation", async t => {
+  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  install(first);
+  install(second);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  const original = changes.at(-1);
+  assert.ok(!logs.some(line => line.includes("Recovery complete")));
+  const publish = inventory.onChange;
+  let fail;
+  const failed = new Promise(resolve => { fail = resolve; });
+  inventory.onChange = async () => {
+    fail();
+    throw new Error("Language server connection closed");
+  };
+  fs.rmSync(path.join(first, "example"), { recursive: true });
+  install(first, "2.0");
+  await failed;
+  await inventory.pending;
+  assert.equal(changes.at(-1), original, "retain the last successful inventory");
+  assert.ok(inventory.dirtyLibraries.has(first));
+  assert.ok(inventory.retryTimer);
+  assert.equal(inventory.timer, undefined, "failure recovery uses the slower retry timer");
+  inventory.onChange = publish;
+  fs.rmSync(path.join(first, "example"), { recursive: true });
+  install(first, "3.0");
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").version, "3.0");
+  assert.equal(changes.at(-1).libraries[1], original.libraries[1], "reuse the unaffected library");
+  assert.equal(inventory.retryDelay, 1000);
+  assert.equal(inventory.retryTimer, undefined);
+  assert.ok(logs.includes("[Libraries] Recovery retry scheduled in 1s"));
+  assert.ok(logs.includes("[Libraries] Recovery retry started"));
+  assert.equal(logs.filter(line => line.includes("Recovery complete; retries stopped")).length, 1);
+});
+
+test("watcher recovery reconciles additions and removals made while watching was unavailable", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const firstWatcher = inventory.watchers.get(library);
+  firstWatcher.emit("error", new Error("Watch unavailable"));
+  assert.ok(!inventory.watchers.has(library));
+  install(library);
+  await settle();
+  assert.ok(changes.at(-1).packages.has("example"));
+  const secondWatcher = inventory.watchers.get(library);
+  assert.ok(secondWatcher);
+  assert.notEqual(secondWatcher, firstWatcher);
+  assert.ok(logs.includes(`[Libraries] Watcher restored: ${library}`));
+  secondWatcher.emit("error", new Error("Watch unavailable"));
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  await settle();
+  assert.equal(changes.at(-1).packages.size, 0);
+  assert.equal(inventory.retryTimer, undefined);
+});
+
+test("a library scan failure keeps its changes pending for retry", async t => {
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const readPackage = inventory.readPackage.bind(inventory);
+  let failed = false;
+  inventory.readPackage = (...args) => {
+    if (!failed) {
+      failed = true;
+      return Promise.reject(new Error("Temporary read failure"));
+    }
+    return readPackage(...args);
+  };
+  install(library);
+  await settle();
+  assert.ok(failed);
+  assert.ok(changes.at(-1).packages.has("example"));
+  assert.equal(inventory.retryTimer, undefined);
+});
+
+test("a watcher that could not be created recovers when its library becomes available", async t => {
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  fs.rmdirSync(library);
+  inventory.setLibraryPaths([library]);
+  assert.equal(inventory.watchers.size, 0);
+  assert.ok(inventory.retryTimer);
+  install(library);
+  await settle();
+  assert.ok(inventory.watchers.has(library));
+  assert.ok(changes.at(-1).packages.has("example"));
+  assert.equal(inventory.retryTimer, undefined);
+});
+
+test("repeated failures back off and disposal cancels recovery", async t => {
+  const { libraries: [library], inventory, logs, install, settle } = fixture(t);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  let attempts = 0;
+  let secondFailure;
+  const failedTwice = new Promise(resolve => { secondFailure = resolve; });
+  inventory.onChange = async () => {
+    if (++attempts === 2) secondFailure();
+    throw new Error("Language server unavailable");
+  };
+  install(library);
+  await failedTwice;
+  await inventory.pending;
+  assert.equal(inventory.retryDelay, 4000, "the next delay doubles after each failure");
+  assert.ok(logs.includes("[Libraries] Recovery retry scheduled in 2s"));
+  assert.ok(inventory.retryTimer);
+  inventory.watchers.get(library).emit("error", new Error("Watch unavailable"));
+  inventory.dispose();
+  assert.equal(inventory.retryTimer, undefined);
+  assert.equal(inventory.timer, undefined);
+  assert.equal(inventory.watchers.size, 0);
+  await inventory.refresh();
+  assert.equal(attempts, 2);
+  assert.ok(!logs.some(line => line.includes("Recovery complete")), "disposal is not successful recovery");
 });

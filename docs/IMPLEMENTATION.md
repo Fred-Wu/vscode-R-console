@@ -808,6 +808,12 @@ package records. There are no periodic package scans or library-path probes. Sca
 bounded asynchronous file operations. Installation lock folders defer changes
 in that library, and a changed inventory must be stable across two scans.
 
+Failed library reads or language-server updates leave changes pending for retry.
+Retry delays increase from 1 second to a maximum of 30 seconds. Failed folder
+monitoring is also retried; restoring it triggers a scan to catch changes missed
+while monitoring was unavailable. Recovery stops once successful or when the
+console closes. Healthy libraries continue to use the existing inventory.
+
 The first library containing a package selects its effective installation.
 Adding or removing a lower-priority copy updates the inventory and counts but
 preserves completion data. A new effective package updates the package-name
@@ -829,6 +835,9 @@ process before removing its working directory. The `R Console Language Server`
 output channel records additions, updates, removals, remaining or selected
 copies, refresh/restart decisions, and library paths in search order with
 per-library and unique-package counts, process starts, stops, and errors.
+It also records filesystem events with their folder and filename when available,
+folder scans, checks that find no package changes, installation-lock deferrals,
+retry delays and attempts, restored watchers, and completed recovery.
 
 #### Keybinding Dispatch
 

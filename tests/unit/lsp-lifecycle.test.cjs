@@ -9,6 +9,7 @@ class Position {
 
 function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [] } = {}) {
   const instances = [];
+  const logs = [];
   class LanguageClient {
     constructor() {
       this.running = false;
@@ -45,7 +46,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     vscode: {
       Position, Range: class Range {},
       Uri: { parse: (value) => ({ toString: () => value }), file: () => ({}) },
-      window: { createOutputChannel: () => ({ appendLine() {}, dispose() {} }) },
+      window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
       workspace: { getConfiguration: () => ({ get: (key) => key === "libPaths" ? libraries : undefined }) },
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
     },
@@ -64,7 +65,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
   });
   client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
-  return { client, instances };
+  return { client, instances, logs };
 }
 
 function change() {
@@ -79,16 +80,46 @@ test("first session snapshot keeps the running server", async (t) => {
   assert.equal(instances.length, 1, "matching paths must not restart a healthy server");
 });
 
+test("a package refresh recovers a stopped server and restores session state", async t => {
+  const { client, instances } = createClient(t);
+  await client.syncSessionState({ attachedPackages: ["stats"] });
+  instances[0].running = false;
+  await client.refreshPackages(change());
+  assert.equal(instances.length, 2);
+  const requests = instances[1].requests;
+  const sync = requests.findIndex(request => request.method === "rConsole/syncSessionState");
+  const refresh = requests.findIndex(request => request.method === "rConsole/refreshPackages");
+  assert.ok(sync >= 0 && refresh > sync);
+  assert.deepEqual(requests[refresh].params.changed, [], "a fresh server already loads the updated files");
+  assert.deepEqual(await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8)),
+    [{ label: "lm" }]);
+});
+
 
 test("a confirmed loaded-package change restarts once and applies the latest session state", async (t) => {
   let releaseStart;
   const startGate = new Promise((resolve) => { releaseStart = resolve; });
   t.after(releaseStart);
-  const { client, instances } = createClient(t, {
+  const oldProcess = { exitCode: 0, signalCode: null };
+  const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  const { client, instances, logs } = createClient(t, {
     packageChanges: (server) => server === instances[0] ? ["stats"] : [],
-    start: async (server) => { if (server === instances[1]) await startGate; },
+    start: async (server) => {
+      if (server === instances[1]) {
+        client.logServerStarted();
+        client.logServerError(reset, {});
+        await startGate;
+      }
+    },
+    stop: server => {
+      if (server === instances[0]) {
+        client.logServerError(reset, oldProcess);
+        client.logServerStopped(0, null, oldProcess);
+      }
+    },
   });
   await client.start();
+  client.spawnedServer = oldProcess;
   await client.syncSessionState({ attachedPackages: ["stats"] });
   const first = client.refreshPackages(change());
   await new Promise((resolve) => setImmediate(resolve));
@@ -104,6 +135,11 @@ test("a confirmed loaded-package change restarts once and applies the latest ses
   const refreshed = instances[1].requests.findIndex(request => request.method === "rConsole/refreshPackages");
   assert.ok(refreshed >= 0);
   assert.ok(refreshed < instances[1].requests.findIndex(request => request.method === "completion"));
+  assert.ok(logs.some(line => line.includes("connection closed during planned restart: stats (removed) (ECONNRESET)")));
+  assert.ok(logs.some(line => line.includes("stopped (exit code 0; planned restart: stats (removed))")));
+  assert.ok(logs.some(line => line.endsWith("R Console language server started")));
+  assert.equal(logs.filter(line => line.startsWith("[Error -") && line.includes("ECONNRESET")).length, 1,
+    "a connection reset from the replacement process must still be reported as an error");
 });
 
 test("completion survives a background replacement while its response is pending", async (t) => {
