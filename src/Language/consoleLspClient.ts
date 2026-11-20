@@ -533,7 +533,8 @@ export class ConsoleLspClient implements CompletionProvider {
       }
       if (result.restart.length) {
         try {
-          const projection = this.inputDocument.project(this.inputDocument.getText());
+          const projection = this.inputDocument.project(this.inputDocument.getText(),
+            this.options.getStaticAnalysisEnabled?.() === true);
           await this.syncDocument(client, projection.document);
           const position = projection.document.positionAt(projection.document.getText().length);
           await client.sendRequest(CompletionRequest.type, createCompletionParams(client, projection,

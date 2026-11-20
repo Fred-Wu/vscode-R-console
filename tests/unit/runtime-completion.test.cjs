@@ -10,16 +10,17 @@ test("static completion is opt-in and disabled by default", () => {
 
 test("runtime document masks completed input definitions without changing offsets", () => {
   for (const [input, expected] of [
-    ["f <- function(new_arg) NULL\\nf(", "f("],
+    ["f <- function(new_arg) NULL\nf(", "f("],
     ["obj <- list(alpha = 1); obj$", "obj$"],
     ["{ f <- function(new_arg) NULL; f(", " f("],
-    ["obj <- list(alpha = 1)\\nobj$fun(", "obj$fun("],
-    ["f <- function(x) \\n  { f(", " f("],
+    ["obj <- list(alpha = 1)\nobj$fun(", "obj$fun("],
+    ["f <- function(x) \n  { f(", " f("],
   ]) {
     const actual = runtimeCompletionText(input, input.length);
     assert.equal(actual.length, input.length);
-    assert.equal(actual.slice(actual.lastIndexOf(expected.trimStart())), expected.trimStart(), input);
-    assert.equal(actual.replace(/[^\\n ]/g, "").length >= input.length - expected.length, true, input);
+    assert.ok(actual.endsWith(expected.trimStart()), input);
+    const prefix = actual.slice(0, -expected.trimStart().length);
+    assert.equal(prefix.trim(), "", input);
   }
 });
 
