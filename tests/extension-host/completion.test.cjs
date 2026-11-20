@@ -119,16 +119,19 @@ suite("Completion in the VS Code extension host", () => {
         const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
         assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);
       }
-      const shadowPrint = { globalenv: { print: { type: 'closure' } } };
+      const shadowPrint = { search: [], globalenv: { print: {
+        type: 'closure', str: 'function(x, old_arg)',
+      } } };
+      lang.updateSessionData(shadowPrint);
       const probesBeforeShadow = runtimeProbes;
       const shadowed = await complete('print(data.frame(a=1), ', shadowPrint);
       assert.ok(shadowed.some(item => item.insertText === 'old_arg = '),
         'native S3 metadata must not suppress the session function signature');
-      assert.equal(runtimeProbes, probesBeforeShadow + 1);
+      assert.equal(runtimeProbes, probesBeforeShadow, 'workspace signatures must not query the session');
       const qualifiedPrint = await complete('base::print(data.frame(a=1), ', shadowPrint);
       assert.ok(qualifiedPrint.some(item => item.insertText === 'digits = '));
       assert.ok(qualifiedPrint.every(item => item.insertText !== 'old_arg = '));
-      assert.equal(runtimeProbes, probesBeforeShadow + 1, 'qualified calls must not probe a session namesake');
+      assert.equal(runtimeProbes, probesBeforeShadow, 'qualified calls must not probe a session namesake');
       for (const [marked, expected] of [
         ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['source_arg = ']],
         ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = ']],
@@ -138,7 +141,7 @@ suite("Completion in the VS Code extension host", () => {
         const text = marked.replace('│', '');
         const items = await complete(text, shadowPrint, marked.indexOf('│'));
         assert.deepEqual(items.map(item => item.insertText), expected, marked);
-        assert.equal(runtimeProbes, probesBeforeShadow + 1,
+        assert.equal(runtimeProbes, probesBeforeShadow,
           'lexical bindings must supersede native S3 metadata without probing the session');
       }
       const probesBeforeNative = runtimeProbes;
@@ -225,41 +228,53 @@ suite("Completion in the VS Code extension host", () => {
   });
 });
 
-suite("Subscript method completion in the VS Code extension host", () => {
-  test("live method arguments and fields retain separate groups", async () => {
-    const { runRJson } = require('../helpers/run-r-json.cjs');
+suite("Subscript completion in the VS Code extension host", () => {
+  test("workspace columns and source-inferred arguments retain separate groups", async () => {
     const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
       'vscode-languageclient/node': require('vscode-languageclient/node'),
     });
+    let expressionProbes = 0;
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, '../..'),
       rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
-      requestMemberCompletions: async expression => runRJson(`
-        DT <- data.table::data.table(zebra = 1, alpha = 2)
-        df <- as.data.frame(DT)
-        value <- eval(parse(text = inputs))
-        cat(jsonlite::toJSON(lapply(names(value), function(n) list(name = n, type = typeof(value[[n]]))), auto_unbox = TRUE))
-      `, expression),
+      requestMemberCompletions: async () => { expressionProbes++; return undefined; },
     });
+    const session = { search: [], loaded_namespaces: [], globalenv: {
+      DT: { type: 'list', class: ['data.table', 'data.frame'], names: ['zebra', 'alpha'] },
+      df: { type: 'list', class: ['data.frame'], names: ['zebra', 'alpha'] },
+    } };
     const complete = async text => {
-      const input = { text, currentLine: text, lines: [text], cursorRow: 0,
-        cursorCol: text.length, textBeforeCursor: text };
+      const lines = text.split('\n'), currentLine = lines.at(-1);
+      const input = { text, currentLine, lines, cursorRow: lines.length - 1,
+        cursorCol: currentLine.length, textBeforeCursor: text };
       let items;
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
-        getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries: result => { items = result; } });
+        getWorkspaceData: () => session, applyCompletion() {}, onInlineEntries: result => { items = result; } });
       assert.ok(Array.isArray(items));
       return items;
     };
     try {
-      const items = await complete('DT[, ');
-      assert.deepEqual(items.filter(item => !('insertText' in item)).map(item => item.label),
-        ['Fields', 'Arguments']);
-      assert.deepEqual(items.filter(item => item.detail === 'DT').map(item => item.insertText), ['zebra', 'alpha']);
-      assert.ok(items.some(item => item.insertText === 'keyby = '));
+      const dataTable = await complete('DT[, ');
+      assert.ok(dataTable.some(item => !('insertText' in item) && item.label === 'Fields'));
+      assert.deepEqual(dataTable.filter(item => item.detail === 'DT').map(item => item.insertText),
+        ['zebra', 'alpha']);
+
       const dataFrame = await complete('df[, ');
-      assert.ok(dataFrame.some(item => item.insertText === 'drop = '));
+      assert.deepEqual(dataFrame.filter(item => item.detail === 'df').map(item => item.insertText),
+        ['"zebra"', '"alpha"']);
+
+      // Unlike runtime-only receivers, a source-defined receiver gives the
+      // language server enough information to infer S3 method arguments.
+      const sourced = await complete('df <- data.frame(zebra = 1, alpha = 2)\nsubset(df, ');
+      const groups = sourced.filter(item => !('insertText' in item)).map(item => item.label);
+      assert.ok(groups.includes('Fields'), 'cached columns remain available in the data mask');
+      assert.ok(groups.includes('Arguments'), 'native S3 arguments remain available');
+      assert.ok(groups.indexOf('Fields') < groups.indexOf('Arguments'));
+      assert.ok(sourced.some(item => item.insertText === 'drop = '));
+
       const value = await complete('DT[, keyby = al');
       assert.ok(value.every(item => item.detail !== 'parameter'));
+      assert.equal(expressionProbes, 0, 'subscript completion must not evaluate R expressions');
     } finally {
       await lang.dispose();
     }

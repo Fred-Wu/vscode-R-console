@@ -73,7 +73,8 @@ test("project startup supplies package libraries without session path probes", {
   projectClient = client;
   assert.ok((await complete("ggp")).some(item => item.label === pkg), "bare prefixes find project packages");
   assert.ok((await complete(pkg + "::proj")).some(item => item.label === "projectFunction"));
-  assert.ok(logs.some(line => line.includes(library.replaceAll(path.sep, "/"))), "the output channel lists the project library");
+  await waitFor(() => logs.some(line => line.includes(library.replaceAll(path.sep, "/"))),
+    "the output channel lists the project library");
   assert.notEqual(client.workingDirectory, directory, "project startup must not enable project indexing");
   assert.ok(!instances[0].requests.some(request => request.method === "rConsole/syncSessionState"),
     "library discovery works without any session information");
