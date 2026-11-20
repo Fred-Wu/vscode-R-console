@@ -47,9 +47,13 @@ export async function collectCompletionEntries(
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
   const truncatedColumnNames = cachedColumnItems.length > 0 && hasTruncatedColumnNames(context, sessionData);
   const rawLspResult = await rawLspItemsRequest;
-  const nativeMembers = rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member");
+  const runtimeOnly = rawLspResult.runtimeOnly === true;
+  const nativeMembers = !runtimeOnly &&
+    (rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member"));
   const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
-  if (context.argumentTags && rawLspResult.argumentsExhausted) return [];
+  // A package-inferred exhaustion must not override an unresolved live member.
+  if (context.argumentTags && rawLspResult.argumentsExhausted &&
+      !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
   const [runtimeMemberItems, dataItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion) : Promise.resolve(undefined),
@@ -63,13 +67,16 @@ export async function collectCompletionEntries(
   if (context.kind === "member") {
     // A successful live lookup is authoritative even when it is empty or no
     // name matches. Cached fields are only a fallback for an unavailable probe.
-    const entries = nativeMembers ? rawLspResult.entries : runtimeMemberItems ?? sessionItems;
+    const entries = runtimeOnly
+      ? runtimeMemberItems ?? (sessionItems.length ? sessionItems : rawLspResult.entries)
+      : nativeMembers ? rawLspResult.entries : runtimeMemberItems ?? sessionItems;
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete);
   }
-  const unavailableSignature = !rawLspResult.rConsoleLocalFunction && !rawLspResult.workspaceFunction &&
+  const unavailableSignature = (runtimeOnly && memberArguments && !rawLspResult.workspaceFunction) ||
+    (!rawLspResult.rConsoleLocalFunction && !rawLspResult.workspaceFunction &&
     (sessionArguments || (memberArguments && !rawLspResult.nativeArguments &&
-      !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter")));
+      !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter"))));
   const rawLspItems = unavailableSignature
     ? rawLspResult.entries.filter(entry => !isArgumentCompletionEntry(entry))
     : rawLspResult.entries;

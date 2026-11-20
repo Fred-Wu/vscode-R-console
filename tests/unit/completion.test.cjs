@@ -30,6 +30,37 @@ test("runtime member completion adds calls only for callable members", async () 
   }
 });
 
+test("runtime-only member lookup wins over native source inference", async () => {
+  const input = "obj$";
+  const context = completion.getCompletionContext(input, input.length);
+  let probes = 0;
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, { globalenv: { obj: { names: ["cached"] } } }, [], [],
+    { provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true, rConsoleMemberResolved: true,
+      items: [{ label: "source_only", kind: 4, data: { type: "member" } }] }) },
+    async () => { probes++; return [{ name: "live", type: "double" }]; });
+  assert.deepEqual(entries.map(item => item.label), ["live"]);
+  assert.equal(probes, 1);
+});
+
+test("runtime-only unresolved member signatures do not borrow native arguments or exhaustion", async () => {
+  const input = "obj$fun(";
+  const context = completion.getCompletionContext(input, input.length);
+  const native = { label: "stale", kind: 5, detail: "parameter" };
+  const provider = result => ({ provideCompletionItems: async () => ({
+    rConsoleRuntimeOnly: true, rConsoleNativeArguments: true, rConsoleArgumentsExhausted: true,
+    items: [native], ...result,
+  }) });
+  const stale = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, undefined, [], [], provider({}));
+  assert.deepEqual(stale.filter(item => item.detail === "parameter"), []);
+  const live = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, undefined, [], [],
+    provider({ rConsoleWorkspaceFunction: true, items: [{ label: "new_arg",
+      kind: 5, detail: "parameter" }] }));
+  assert.deepEqual(live.filter(item => item.detail === "parameter").map(item => item.label), ["new_arg"]);
+});
+
 test("namespace completion normalizes bare callable names and preserves existing calls", async () => {
   for (const operator of ["::", ":::"]) {
     const input = `pkg${operator}`;

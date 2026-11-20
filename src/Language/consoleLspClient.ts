@@ -322,8 +322,9 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         const flags = result as CompletionResult | null;
         if (params.rConsoleCall && (call?.operator === "$" || call?.operator === "@") &&
-            !flags?.rConsoleLocalFunction && !flags?.rConsoleWorkspaceFunction && !flags?.rConsoleNativeArguments &&
-            this.options.inspectRuntimeCompletion) {
+            this.options.inspectRuntimeCompletion &&
+            (!staticAnalysis || (!flags?.rConsoleLocalFunction &&
+              !flags?.rConsoleWorkspaceFunction && !flags?.rConsoleNativeArguments))) {
           const metadata = await this.options.inspectRuntimeCompletion(params.rConsoleCall, "function");
           if (this.client !== client || revision !== this.packageRevision) continue;
           if (this.disposed || this.syncedDocuments.get(projection.document.uri.toString())?.version !== documentVersion ||
@@ -336,6 +337,9 @@ export class ConsoleLspClient implements CompletionProvider {
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
         // VS Code's converter preserves standard LSP fields only. Carry this
         // source decision separately so an empty signature stays authoritative.
+        if (completions && (result as { rConsoleRuntimeOnly?: boolean } | null)?.rConsoleRuntimeOnly === true) {
+          completions.rConsoleRuntimeOnly = true;
+        }
         if (completions && (result as { rConsoleWorkspaceFunction?: boolean } | null)?.rConsoleWorkspaceFunction === true) {
           completions.rConsoleWorkspaceFunction = true;
         }

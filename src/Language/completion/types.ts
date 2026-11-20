@@ -61,6 +61,7 @@ export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
 export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[]) & {
   // Applies even when filtering leaves no arguments or the definition has none.
+  rConsoleRuntimeOnly?: boolean;
   rConsoleLocalFunction?: boolean;
   rConsoleWorkspaceFunction?: boolean;
   rConsoleMemberResolved?: boolean;

@@ -9,6 +9,7 @@ console_supplement_completion <- function(reply, self, params) {
 
     point <- document$from_lsp_position(params$position)
     static_analysis <- isTRUE(params$rConsoleStaticAnalysis)
+    reply$result$rConsoleRuntimeOnly <- !static_analysis
     # Ask the native resolver whether an empty member list is authoritative.
     # This uses its cached receiver and avoids probing stale live objects when
     # the current source defines an empty list or the prefix has no matches.
@@ -52,7 +53,8 @@ console_supplement_completion <- function(reply, self, params) {
         identical(call$accessor, "")) {
         source <- console_runtime_function(call$token)
     }
-    runtime <- if (member_call && is.null(source) && !native_arguments)
+    runtime <- if (member_call && is.null(source) &&
+        (!native_arguments || (!static_analysis && !is.null(params$rConsoleRuntimeSignature))))
         console_parse_signature(params$rConsoleRuntimeSignature) else NULL
     if (!is.null(runtime)) source <- list(formals = runtime[[2L]])
     workspace_call <- !is.null(call) && is.null(call$package) &&

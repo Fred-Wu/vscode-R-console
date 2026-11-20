@@ -11,7 +11,7 @@ export async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
   }
@@ -21,6 +21,7 @@ export async function getLanguageServerCompletions(
       position,
       context.triggerCharacter
     );
+    let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
     let workspaceFunction = result?.rConsoleWorkspaceFunction === true;
     let memberResolved = result?.rConsoleMemberResolved === true;
@@ -42,6 +43,7 @@ export async function getLanguageServerCompletions(
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
         context.triggerCharacter, position);
+      runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;
       memberResolved ||= result?.rConsoleMemberResolved === true;
@@ -68,6 +70,7 @@ export async function getLanguageServerCompletions(
       })),
       isIncomplete: !Array.isArray(result) && result?.isIncomplete === true,
       rConsoleLocalFunction: localFunction,
+      runtimeOnly,
       memberResolved,
       workspaceFunction,
       nativeArguments,
