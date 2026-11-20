@@ -49,22 +49,15 @@ console_supplement_completion <- function(reply, self, params) {
         if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
     } else console_source_function(document, point, call$token)
     source_is_static <- !is.null(source)
-    if (is.null(source) && !is.null(call) && is.null(call$package) &&
-        identical(call$accessor, "")) {
-        source <- console_runtime_function(call$token)
-    }
-    runtime <- if (member_call && is.null(source) &&
-        (!native_arguments || (!static_analysis && !is.null(params$rConsoleRuntimeSignature))))
+    runtime <- if (is.null(source) && !is.null(call) && is.null(call$package))
         console_parse_signature(params$rConsoleRuntimeSignature) else NULL
-    if (!is.null(runtime)) source <- list(formals = runtime[[2L]])
-    workspace_call <- !is.null(call) && is.null(call$package) &&
-        identical(call$accessor, "") && call$token %in% console_workspace_functions
-    if (!source_is_static && (!is.null(source) || workspace_call)) {
+    if (!is.null(runtime)) {
+        source <- list(formals = runtime[[2L]])
         reply$result$rConsoleWorkspaceFunction <- TRUE
     }
-    # A real session signature overrides package inference for an unqualified
-    # function; a source-only signature may override it only in static mode.
-    native_arguments <- native_arguments && is.null(source) && !workspace_call
+    # Live sess signatures override package inference; unsubmitted source
+    # definitions have precedence only in the opt-in static analysis mode.
+    native_arguments <- native_arguments && is.null(source)
     signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
     if (source_is_static) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
@@ -92,7 +85,7 @@ console_supplement_completion <- function(reply, self, params) {
     } else if (!native_arguments && !is.null(call) && (!member_call || !is.null(source))) {
         detected <- document$detect_call(point)
         value_mode <- is.character(params$rConsoleArgument) && length(params$rConsoleArgument) == 1L
-        if (!is.null(source) || workspace_call || value_mode || !identical(call$token, detected$token) ||
+        if (!is.null(source) || value_mode || !identical(call$token, detected$token) ||
             !identical(call$package, detected$package) ||
             !identical(call$accessor, detected$accessor)) {
             # Resolve parameters with the same workspace/provider as ordinary
@@ -138,6 +131,47 @@ console_supplement_completion <- function(reply, self, params) {
         reply$result$rConsoleArgumentsExhausted <- TRUE
         reply$result$items <- list()
         reply$result$isIncomplete <- FALSE
+    }
+    if (isTRUE(params$rConsoleSubscript)) {
+        # The receiver is the implicit first argument of a subscript method.
+        # Session signatures come from named sess hover requests; registered
+        # package methods can be read from the LSP's own loaded namespaces.
+        parsed <- console_parse_signature(params$rConsoleRuntimeSignature)
+        method_formals <- if (!is.null(parsed)) parsed[[2L]] else NULL
+        if (is.null(method_formals)) {
+            op <- if (identical(params$rConsoleSubscriptOperator, "[[")) "[[" else "["
+            classes <- normalize_character(params$rConsoleSubscriptClasses)
+            for (class_name in classes) {
+                method <- tryCatch(utils::getS3method(op, class_name, optional = TRUE),
+                    error = function(error) NULL)
+                if (is.function(method)) {
+                    method_formals <- formals(method)
+                    break
+                }
+            }
+        }
+        tags <- params$rConsoleSubscriptTags
+        if (!is.null(method_formals) && is.list(tags) &&
+            sum(vapply(tags, is.null, logical(1))) == 1L) {
+            source_signature <- console_source_signature(list(formals = method_formals), uri)
+            token <- params$rConsoleSubscriptPrefix
+            if (!is.character(token) || length(token) != 1L) token <- ""
+            arguments <- Filter(function(item) languageserver:::match_with(item$label, token),
+                source_signature)
+            selected <- console_valid_argument_items(arguments, c(list(""), tags),
+                list(token = "", package = NULL, accessor = ""), uri, workspace, point, source_signature)
+            # Mark these separately: native arguments belonging to an enclosing
+            # function must never appear inside a subscript.
+            selected <- lapply(selected, function(item) {
+                item$data$type <- "subscript_parameter"
+                item
+            })
+            # Preserve native symbols and inferred fields. Only parameter names
+            # are supplemented by the active receiver's method.
+            others <- Filter(function(item) !console_is_argument_item(item), reply$result$items)
+            reply$result$items <- c(selected, others)
+            reply$result$rConsoleSubscriptArguments <- TRUE
+        }
     }
     if (isTRUE(params$rConsolePipe)) {
         token <- params$rConsolePrefix

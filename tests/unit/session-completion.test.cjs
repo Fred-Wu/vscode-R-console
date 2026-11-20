@@ -189,3 +189,24 @@ test("sess child paging is bounded and reports partial results", async () => {
     async () => assert.fail("excessively deep inspection must not make requests"));
   assert.equal(blocked, undefined);
 });
+
+test("subscript method completion uses sess hover and class metadata without evaluating receivers", async () => {
+  const workspace = { globalenv: { obj: { class: ["myclass", "list"] } } };
+  const requests = [];
+  const signature = "function(x, i, mode = c(\"safe\", \"fast\"), ...)";
+  const result = await inspectSessionCompletion("obj", "subscript", async (method, params) => {
+    requests.push({ method, params });
+    return params.expr === "`[.myclass`" ? { str: signature } : undefined;
+  }, workspace);
+  assert.deepEqual(result, { signature, classes: ["myclass", "list"] });
+  assert.deepEqual(requests, [{ method: "hover", params: { expr: "`[.myclass`" } }]);
+  const fallback = await inspectSessionCompletion("obj", "subscript", async (method, params) => {
+    assert.equal(method, "hover");
+    assert.ok(params.expr.startsWith("`[."));
+    return undefined;
+  }, { globalenv: { obj: { class: ["data.table", "data.frame"] } } });
+  assert.deepEqual(fallback, { classes: ["data.table", "data.frame"] },
+    "unexported package methods are handled by the LSP's registered S3 metadata");
+  assert.equal(await inspectSessionCompletion("obj$nested", "subscript",
+    async () => assert.fail("nested method inference must not evaluate a receiver"), workspace), undefined);
+});

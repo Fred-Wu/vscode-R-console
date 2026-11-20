@@ -26,7 +26,13 @@ export function createCompletionParams(
     ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
     ...(staticAnalysis ? { rConsoleStaticAnalysis: true } : {}),
     ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
-    ...(bracket ? { rConsoleDataObject: bracket.objectName } : {}),
+    ...(bracket ? {
+      rConsoleDataObject: bracket.objectName,
+      rConsoleSubscriptOperator: bracket.operator,
+      rConsoleSubscriptTags: bracket.argumentTags,
+      rConsoleSubscriptPrefix: bracket.prefix,
+      ...(bracket.argumentName ? { rConsoleSubscriptArgument: bracket.argumentName } : {}),
+    } : {}),
     ...(parseInsertion ? { rConsoleParseInsertion: {
       position: projection.document.positionAt(parseInsertion.offset), text: parseInsertion.text,
     } } : {}),

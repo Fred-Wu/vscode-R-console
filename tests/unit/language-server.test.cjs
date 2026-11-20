@@ -17,6 +17,8 @@ test("session state sync updates attached packages without eager namespace loadi
   assert.match(handler, /attached_packages <- normalize_character\(params\$attachedPackages\)/);
   assert.match(handler, /workspace\$startup_packages <- rev\(attached_packages\)/);
   assert.match(handler, /workspace\$update_loaded_packages\(\)/);
+  assert.doesNotMatch(handler, /functions|console_sync_workspace_functions/,
+    "session-state synchronization must not inject function signature documents");
   assert.doesNotMatch(handler, /loadedNamespaces|get_namespace|namespaces_to_load/);
 });
 

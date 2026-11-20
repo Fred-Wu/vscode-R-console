@@ -65,8 +65,30 @@ export async function inspectSessionCompletion(
 ): Promise<SessionCompletionData | undefined> {
   const target = inspectionPath(expression);
   if (!target || target.steps.length > MAX_INSPECTION_DEPTH) return undefined;
+  if (kind === "subscript" || kind === "doubleSubscript") {
+    // Lookup a visible S3 method by name through the supported sess hover.
+    // Installed, non-exported package methods are resolved by the LSP process.
+    if (target.steps.length) return undefined;
+    const classes = workspace?.globalenv[target.name]?.class;
+    if (!Array.isArray(classes)) return undefined;
+    const usable = classes.slice(0, 4).filter(name => typeof name === "string" &&
+      /^(?:[A-Za-z]|\.(?![0-9]))[A-Za-z0-9._]*$/.test(name));
+    const prefix = kind === "subscript" ? "[." : "[[.";
+    for (const className of usable) {
+      const methodName = "`" + prefix + className + "`";
+      const result = await request("hover", { expr: methodName }) as { str?: unknown } | undefined;
+      if (typeof result?.str === "string" && /^\s*function\s*\(/.test(result.str)) {
+        return { signature: result.str, classes: usable };
+      }
+    }
+    return { classes: usable };
+  }
   if (kind === "function") {
     if (target.steps.some(step => step.operator === "[[")) return undefined;
+    if (!target.steps.length && workspace?.globalenv) {
+      const item = workspace.globalenv[target.name];
+      if (!item || !["closure", "builtin", "special"].includes(item.type ?? "")) return undefined;
+    }
     const result = await request("hover", { expr: expression }) as { str?: unknown } | undefined;
     return typeof result?.str === "string" && /^\s*function\s*\(/.test(result.str)
       ? { signature: result.str } : undefined;

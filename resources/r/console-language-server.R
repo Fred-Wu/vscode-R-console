@@ -155,7 +155,6 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     # languageserver resolves package conflicts from the end of this list.
     workspace$startup_packages <- rev(attached_packages)
     workspace$update_loaded_packages()
-    console_sync_workspace_functions(workspace, params$functions)
 
     self$deliver(languageserver:::Response$new(id, result = list(libraryPaths = as.list(.libPaths()))))
 }

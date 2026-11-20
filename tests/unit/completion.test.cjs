@@ -1854,3 +1854,18 @@ test("dots remain a variadic argument indicator and never insert an equals sign"
     assert.deepEqual(entries.map(item => item.insertText), ['...']);
   }
 });
+
+test("bracket methods preserve native parameter suggestions and column fields", async () => {
+  const input = "DT[, keyb";
+  const context = completion.getCompletionContext(input, input.length);
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, { globalenv: { DT: { names: ["keyboard"], class: ["data.table"] } } }, [], [], {
+      provideCompletionItems: async () => ({ items: [
+        { label: "keyby", insertText: "keyby = ", detail: "parameter",
+          data: { type: "subscript_parameter" }, kind: 5 },
+        { label: "keyboard", insertText: "keyboard", data: { type: "scope" }, kind: 4 },
+      ] }),
+    });
+  assert.ok(entries.some(item => item.insertText === "keyby = "), "bracket context must accept method parameters");
+  assert.ok(entries.some(item => item.label === "keyboard"), "ordinary native fields remain available");
+});

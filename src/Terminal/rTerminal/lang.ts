@@ -51,7 +51,6 @@ type AutocompleteRequest = {
 
 type ConsoleSessionState = {
   attachedPackages: string[];
-  functions?: Record<string, string>;
 };
 
 export class RTermLang {
@@ -63,6 +62,7 @@ export class RTermLang {
     .slice(2)}`;
   private consoleLsp: ConsoleLspClient | undefined;
   private sessionState: ConsoleSessionState | undefined;
+  private workspaceRevision: number | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
@@ -327,6 +327,8 @@ export class RTermLang {
   clearSessionState(): void {
     this.cancelCompletion();
     this.sessionState = { attachedPackages: [] };
+    this.workspaceRevision = undefined;
+    this.consoleLsp?.invalidateRuntimeCompletion?.();
     void this.consoleLsp?.syncSessionState(this.sessionState).catch(() => undefined);
     this.consoleLsp?.updateInput("");
   }
@@ -354,19 +356,21 @@ export class RTermLang {
   }
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
-    this.inlineCache = undefined;
-    if (this.disposed || !data) {
-      return false;
-    }
+    if (this.disposed || !data) return false;
 
+    // sess includes a stable revision in unchanged workspace responses.
+    // Avoid cancelling suggestions on every ordinary completion-time poll.
+    if (typeof data.revision === "number" && data.revision !== this.workspaceRevision) {
+      this.workspaceRevision = data.revision;
+      this.cancelCompletion();
+      this.consoleLsp?.invalidateRuntimeCompletion?.();
+    }
     const nextState = this.toSessionState(data);
-    if (
-      this.sessionState &&
-      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages) &&
-      JSON.stringify(nextState.functions) === JSON.stringify(this.sessionState.functions)
-    ) {
+    if (this.sessionState &&
+        this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages)) {
       return false;
     }
+    this.inlineCache = undefined;
 
     this.sessionState = nextState;
     if (this.consoleLsp) {
@@ -477,11 +481,7 @@ export class RTermLang {
   }
 
   private toSessionState(data: WorkspaceData): ConsoleSessionState {
-    const functions = Object.fromEntries(Object.entries(data.globalenv)
-      .filter(([, item]) => ["closure", "builtin", "special"].includes(item.type) && item.str)
-      .map(([name, item]) => [name, item.str ?? ""]));
     return {
-      ...(Object.keys(functions).length ? { functions } : {}),
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))
         .map((value) => value.slice(8)),

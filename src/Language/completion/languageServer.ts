@@ -112,15 +112,18 @@ function isLanguageServerCompletionItem(
   documentUri?: string
 ): boolean {
   const role = getCompletionRole(item);
+  const subscriptParameter = context.kind === "bracket" &&
+    (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_parameter";
   if (context.suppressAutomatic) return false;
   if (context.kind !== "member" && context.kind !== "package" && !allowsSymbolCompletions(context) &&
       role !== "argument" && role !== "value" && role !== "member" &&
       !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
-  if (role === "argument" && !context.argumentTags) return false;
+  if (role === "argument" && !context.argumentTags && !subscriptParameter) return false;
   if (role === "value" && !context.argumentTags && !context.argumentValue) return false;
   // Native call detection can still see an outer call while our cursor is in
   // its subscript or member expression. Its arguments do not belong there.
-  if ((role === "argument" || role === "value") && context.kind !== "argument") return false;
+  if ((role === "argument" || role === "value") &&
+      context.kind !== "argument" && !subscriptParameter) return false;
   if (context.pipe && !isCallableCompletionKind(item.kind)) return false;
   if (context.argumentValue?.quote && role !== "value") return false;
   if (context.kind === "member" && role !== "member") return false;
@@ -128,7 +131,8 @@ function isLanguageServerCompletionItem(
   // generic LSP symbols. Preserve that boundary while allowing native fields
   // and literal index values inferred from this receiver.
   if (restrictsBracketSymbols(context) &&
-      role !== "member" && !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
+      !subscriptParameter && role !== "member" &&
+      !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }

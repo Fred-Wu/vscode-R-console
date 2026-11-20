@@ -60,7 +60,6 @@ type ConsoleLspClientOptions = {
 
 type ConsoleLspSessionState = {
   attachedPackages: string[];
-  functions?: Record<string, string>;
 };
 
 type SessionStateSyncResult = {
@@ -112,6 +111,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private readonly packageInventory: PackageInventory;
   private packageRefreshPromise: Promise<void> | undefined;
   private packageRevision = 0;
+  private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
   private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
@@ -313,28 +313,52 @@ export class ConsoleLspClient implements CompletionProvider {
           staticAnalysis);
         const documentVersion = projection.document.version;
         const sessionState = this.sessionState;
+        const runtimeRevision = this.runtimeRevision;
         const call = params.rConsoleCall && this.options.inspectRuntimeCompletion
           ? getEnclosingCall(projection.document.getText(),
             projection.document.offsetAt(projection.toServerPosition(contextPosition))) : undefined;
         let result = await client.sendRequest(CompletionRequest.type, params);
-        if (this.client !== client || revision !== this.packageRevision) {
-          continue;
-        }
+        if (this.client !== client || revision !== this.packageRevision) continue;
+        const isCurrent = () => !this.disposed && this.client === client &&
+          revision === this.packageRevision && runtimeRevision === this.runtimeRevision &&
+          this.sessionState === sessionState &&
+          this.syncedDocuments.get(projection.document.uri.toString())?.version === documentVersion;
+        if (!isCurrent()) return undefined;
         const flags = result as CompletionResult | null;
-        if (params.rConsoleCall && (call?.operator === "$" || call?.operator === "@") &&
+        // Qualified calls retain the native package signature. Other calls
+        // can use the active R function's signature via sess hover.
+        if (params.rConsoleCall && call &&
+            !["::", ":::"].includes(call.operator ?? "") &&
             this.options.inspectRuntimeCompletion &&
             (!staticAnalysis || (!flags?.rConsoleLocalFunction &&
               !flags?.rConsoleWorkspaceFunction && !flags?.rConsoleNativeArguments))) {
           const metadata = await this.options.inspectRuntimeCompletion(params.rConsoleCall, "function");
           if (this.client !== client || revision !== this.packageRevision) continue;
-          if (this.disposed || this.syncedDocuments.get(projection.document.uri.toString())?.version !== documentVersion ||
-              this.sessionState !== sessionState) return undefined;
+          if (!isCurrent()) return undefined;
           if (metadata?.signature) {
             const runtimeParams = { ...params, rConsoleRuntimeSignature: metadata.signature };
             result = await client.sendRequest(CompletionRequest.type, runtimeParams);
+            if (!isCurrent()) return undefined;
+          }
+        } else if (params.rConsoleSubscriptOperator && params.rConsoleDataObject &&
+            this.options.inspectRuntimeCompletion &&
+            (!staticAnalysis || !flags?.rConsoleNativeArguments)) {
+          // S3 method names come from live class metadata. Local methods are
+          // read through sess; installed method metadata stays in languageserver.
+          const metadata = await this.options.inspectRuntimeCompletion(params.rConsoleDataObject,
+            params.rConsoleSubscriptOperator === "[[" ? "doubleSubscript" : "subscript");
+          if (this.client !== client || revision !== this.packageRevision) continue;
+          if (!isCurrent()) return undefined;
+          if (metadata?.signature || metadata?.classes?.length) {
+            const runtimeParams = { ...params, rConsoleSubscript: true,
+              rConsoleRuntimeSignature: metadata.signature,
+              rConsoleSubscriptClasses: metadata.classes };
+            result = await client.sendRequest(CompletionRequest.type, runtimeParams);
+            if (!isCurrent()) return undefined;
           }
         }
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
+        if (!isCurrent()) return undefined;
         // VS Code's converter preserves standard LSP fields only. Carry this
         // source decision separately so an empty signature stays authoritative.
         if (completions && (result as { rConsoleRuntimeOnly?: boolean } | null)?.rConsoleRuntimeOnly === true) {
@@ -366,6 +390,7 @@ export class ConsoleLspClient implements CompletionProvider {
           }
         }
         if (this.client !== client || revision !== this.packageRevision) continue;
+        if (!isCurrent()) return undefined;
         return completions;
       } catch {
         // A session update can replace the server at any await above. Reopen
@@ -390,6 +415,10 @@ export class ConsoleLspClient implements CompletionProvider {
       await this.syncDocument(currentClient, this.inputDocument.project(doc.getText(),
         this.options.getStaticAnalysisEnabled?.() === true).document);
     }
+  }
+
+  invalidateRuntimeCompletion(): void {
+    this.runtimeRevision++;
   }
 
   updateInput(input: string): void {
@@ -463,7 +492,7 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {
-    return JSON.stringify([state.attachedPackages, state.functions]);
+    return JSON.stringify(state.attachedPackages);
   }
 
   private async restartClient(client: ConsoleLanguageClient, reason: string): Promise<void> {

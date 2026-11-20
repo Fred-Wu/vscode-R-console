@@ -449,7 +449,7 @@ test("current source signatures supersede older session definitions, including e
     },
   };
   const session = { globalenv: { f: { type: "closure" } } };
-  await client.syncSessionState({ attachedPackages: [], functions: { f: 'function(old_arg = "old_value")' } });
+  client.setRuntimeSignatures({ f: 'function(old_arg = "old_value")' });
   const request = async () => assert.fail("workspace arguments must not query sess");
   for (const [marked, expected] of [
     ["{\n f <- function(new_arg) NULL\n f(│", ["new_arg"]],
@@ -485,12 +485,12 @@ test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer
   const { client: runtime } = createConsoleLsp(t, {
     staticAnalysis: false,
     inspectRuntimeCompletion: async (expression, kind) => {
-      assert.equal(expression, "obj$fun");
+      if (expression !== "obj$fun") return undefined;
       assert.equal(kind, "function");
       return { signature: "function(old_arg)" };
     },
   });
-  await runtime.syncSessionState({ attachedPackages: [], functions: { f: "function(old_arg)" } });
+  runtime.setRuntimeSignatures({ f: "function(old_arg)" });
   const params = async (client, marked) => {
     const cursor = marked.indexOf("│");
     const text = marked.replace("│", "");
@@ -513,7 +513,7 @@ test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer
   assert.ok(!(pipe.result.items ?? pipe.result).some(item => item.label === "only_source"));
 
   const { client: staticClient } = createConsoleLsp(t, { staticAnalysis: true });
-  await staticClient.syncSessionState({ attachedPackages: [], functions: { f: "function(old_arg)" } });
+  staticClient.setRuntimeSignatures({ f: "function(old_arg)" });
   const staticPlain = await params(staticClient, "f <- function(new_arg) NULL\nf(│");
   assert.deepEqual(staticPlain.parameters, ["new_arg"]);
   assert.equal(staticPlain.result.rConsoleLocalFunction, true);
@@ -566,6 +566,10 @@ test("accepting a console-defined function opens its live arguments and values",
   });
   const setup = 'f <- function(`a b`, normal = c("first", "second"), lazy = stop("default evaluated")) stop("body evaluated")\n' +
     'my_function <- function(method = c("fast", "accurate")) {}\n';
+  client.setRuntimeSignatures({
+    f: 'function(`a b`, normal = c("first", "second"), lazy = stop("default evaluated"))',
+    my_function: 'function(method = c("fast", "accurate"))',
+  });
   const session = runRJson(setup + 'cat(jsonlite::toJSON(list(search = search(), loaded_namespaces = loadedNamespaces(), globalenv = lapply(mget(c("f", "my_function")), function(fn) list(type = typeof(fn), str = paste(capture.output(str(fn)), collapse="\\n")))), auto_unbox = TRUE))');
   const lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
     requestMemberCompletions: async () => { assert.fail("function arguments must not query sess"); },
@@ -619,8 +623,8 @@ test("accepting a console-defined function opens its live arguments and values",
   assert.equal(terminal.submitted, undefined, "completion must never execute the function");
 });
 
-test("workspace signatures replace and remove native definitions and survive restart", { timeout: 90000 }, async t => {
-  const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+test("sess hover signatures replace and remove native definitions and survive restart", { timeout: 90000 }, async t => {
+  const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t, { staticAnalysis: false });
   const complete = () => client.provideCompletionItems({ getText: () => 'workspace_test_fn(' }, { line: 0, character: 18 });
   for (const [functions, expected] of [
     [{ workspace_test_fn: 'function(first)' }, ['first']],
@@ -629,13 +633,13 @@ test("workspace signatures replace and remove native definitions and survive res
     [{ workspace_test_fn: 'function()' }, []],
     [{}, []],
   ]) {
-    await client.syncSessionState({ attachedPackages: [], functions });
+    client.setRuntimeSignatures(functions);
     const result = await complete();
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected);
     assert.equal(!!result.rConsoleWorkspaceFunction, !!functions.workspace_test_fn && !functions.workspace_test_fn.includes('truncated'));
   }
   const state = { attachedPackages: [], functions: { workspace_test_fn: 'function(restored)' } };
-  await client.syncSessionState(state);
+  client.setRuntimeSignatures(state.functions);
   await instances.at(-1).stop();
   const result = await complete();
   assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), ['restored']);
@@ -960,9 +964,10 @@ test("completion call boundaries agree with the R parser across newlines", async
   }
 });
 
-test("workspace signatures agree with native R calls across pipe and argument combinations", { timeout: 120000 }, async t => {
-  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
-  await client.syncSessionState({ attachedPackages: [], functions: Object.fromEntries(["positional", "dots", "constructor"].map(name => [name, name === "dots" ? "function(first, ..., after)" : "function(first, second, third)"])) });
+test("live sess signatures agree with native R calls across pipe and argument combinations", { timeout: 120000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { staticAnalysis: false });
+  client.setRuntimeSignatures(Object.fromEntries(["positional", "dots", "constructor"].map(name =>
+    [name, name === "dots" ? "function(first, ..., after)" : "function(first, second, third)"])));
   const cases = [];
   const actualResults = [];
   for (const pipe of ["", "1 |> ", "1 %>% "]) {
@@ -1231,7 +1236,7 @@ test("partial argument values follow R matching in source and workspace signatur
   };
   const definitions = 'f <- function(method = c("spearman", "pearson"), metric = "other") stop("body evaluated")\n';
   for (const runtime of [false, true]) {
-    await client.syncSessionState({ attachedPackages: [], functions: runtime ? { f: 'function(method = c("spearman", "pearson"), metric = "other")' } : {} });
+    client.setRuntimeSignatures(runtime ? { f: 'function(method = c("spearman", "pearson"), metric = "other")' } : {});
     for (const [call, expected] of [
       ['f(meth = sp│)', ['spearman']], ['f(meth = "sp│")', ['spearman']],
       ['f(met = sp│)', []], ['f(metric = stop("argument evaluated"), met = sp│)', ['spearman']],
@@ -1448,9 +1453,9 @@ test("source callable names preserve literal dollar signs and quoting", { timeou
   }
 });
 
-test("empty workspace default choices survive native completion", { timeout: 90000 }, async t => {
+test("empty sess default choices survive native completion", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  await client.syncSessionState({ attachedPackages: [], functions: { choose: 'function(mode = c("", "auto", "value:literal"))' } });
+  client.setRuntimeSignatures({ choose: 'function(mode = c("", "auto", "value:literal"))' });
   const result = await client.provideCompletionItems({ getText: () => 'choose(mode = )' }, { line: 0, character: 14 });
   assert.deepEqual(result.items.filter(item => item.detail === 'value for mode').map(item => item.label), ['', 'auto', 'value:literal']);
 });
@@ -1476,11 +1481,11 @@ test("complex defaults cannot suppress source argument completions", { timeout: 
   }
 });
 
-test("workspace literal choices use native extraction without evaluating defaults", { timeout: 90000 }, async t => {
+test("sess literal choices use native extraction without evaluating defaults", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const expression of ['c(I("known"), , base::stop("never evaluate"))',
     'c("known", base::identity("never evaluate"))', 'c((function() stop("never evaluate"))())']) {
-    await client.syncSessionState({ attachedPackages: [], functions: { f: 'function(x = ' + expression + ')' } });
+    client.setRuntimeSignatures({ f: 'function(x = ' + expression + ')' });
     const result = await client.provideCompletionItems({ getText: () => 'f(x = "")' }, { line: 0, character: 7 });
     assert.deepEqual(result.items.filter(item => item.detail === 'value for x').map(item => item.label), expression.includes('"known"') ? ['known'] : [], expression);
   }
@@ -1607,7 +1612,8 @@ test("live function arguments survive native S3 inference while source and packa
       assert.ok(reference.includes('custom_arg='), marked);
     }
     client.updateInput('');
-    await client.syncSessionState({ attachedPackages: [], functions: shadow ? { print: 'function(x, custom_arg)' } : {} });
+    client.setRuntimeSignatures(shadow ? { print: 'function(x, custom_arg)' } : {});
+    client.setStaticAnalysis(!shadow || marked.includes('print <- function'));
     if (selected) {
       client.updateInput(text);
       client.recordCompletion(text, 0, { insertText: 'print()', source: 'lsp', packageName: 'base' });
@@ -1634,7 +1640,7 @@ test("source bindings inside blocks override inferred S3 signatures and live fun
       return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
     },
   };
-  await client.syncSessionState({ attachedPackages: [], functions: { print: 'function(x, custom_arg)' } });
+  client.setRuntimeSignatures({ print: 'function(x, custom_arg)' });
   for (const [marked, expected] of [
     ['print(data.frame(a=1), │)', ['custom_arg = ']],
     ['print(x=data.frame(a=1), │)', ['custom_arg = ']],
@@ -1648,6 +1654,7 @@ test("source bindings inside blocks override inferred S3 signatures and live fun
     ['{ print <- function(x, mode=c("auto", "manual")) NULL; print(data.frame(a=1), mode="aut│") }', ['auto']],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    client.setStaticAnalysis(marked.includes('<-'));
     let probes = 0;
     const entries = await completion.collectCompletionEntries(
       completion.getCompletionContext(text, cursor),
@@ -1752,7 +1759,7 @@ test("unquoted list indices prioritize matching index variables", { timeout: 900
   assert.equal(entries[0].insertText, 'index');
 });
 
-test("workspace argument exhaustion preserves variadic and unknown signatures", { timeout: 90000 }, async t => {
+test("sess argument exhaustion preserves variadic and unknown signatures", { timeout: 90000 }, async t => {
   const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
   const session = { globalenv: { f: { type: 'closure' }, runtime_function: { type: 'closure' } } };
   for (const [definition, marked, exhausted] of [
@@ -1763,7 +1770,7 @@ test("workspace argument exhaustion preserves variadic and unknown signatures", 
     ['function(...) NULL', 'f(1,2, run│)', false],
   ]) {
     const text = marked.replace('│', ''), cursor = marked.indexOf('│');
-    await client.syncSessionState({ attachedPackages: [], functions: { f: definition.replace(/ NULL$/, '') } });
+    client.setRuntimeSignatures({ f: definition.replace(/ NULL$/, '') });
     const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, cursor),
       { getText: () => text }, { line: 0, character: cursor }, session, [], [], { provideCompletionItems: async (...args) => {
         const result = await client.provideCompletionItems(...args);
@@ -1883,6 +1890,36 @@ test("variadic completion retains dots after supplied arguments without leaking 
     if (marked === 'base::atan2(..., │)') assert.deepEqual(entries.map(entry => entry.label), ['y', 'x']);
     if (marked === 'base::atan2(1,2,..., │)') assert.deepEqual(entries, []);
   }
+});
+
+test("live subscript methods complete parameters through sess and registered packages", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const inspected = [];
+  const { client } = createConsoleLsp(t, { staticAnalysis: false,
+    inspectRuntimeCompletion: async (expression, kind) => {
+      inspected.push([expression, kind]);
+      if (expression === "obj" && kind === "subscript") {
+        return { signature: 'function(x, i, mode = c("safe", "fast"), ...)', classes: ["myclass"] };
+      }
+      if (expression === "DT" && kind === "subscript") {
+        return { classes: ["data.table", "data.frame"] };
+      }
+      return undefined;
+    },
+  });
+  await client.syncSessionState({ attachedPackages: ["data.table"] });
+  const parameters = async input => {
+    const response = await client.provideCompletionItems({ getText: () => input },
+      { line: 0, character: input.length });
+    return (response?.items ?? []).filter(item => item.detail === "parameter")
+      .map(item => item.insertText);
+  };
+  assert.ok((await parameters("obj[mo")).includes("mode = "),
+    "a live user S3 method restores its argument names");
+  assert.ok((await parameters("DT[, keyb")).includes("keyby = "),
+    "the LSP resolves non-exported data.table methods by registered S3 metadata");
+  assert.deepEqual(inspected, [["obj", "subscript"], ["DT", "subscript"]],
+    "never submit executable expressions to sess");
 });
 
 test("workspace subscript columns respect receiver class and dimensions without sess expressions", async () => {

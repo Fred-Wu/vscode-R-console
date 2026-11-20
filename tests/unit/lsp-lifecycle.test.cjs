@@ -284,9 +284,31 @@ test("cached session state reaches the LSP before its first launch", async () =>
   const data = { search: ["package:stats"], globalenv: { f: { type: "closure", str: "function(first)" } }, loaded_namespaces: [] };
   lang.updateSessionData(data);
   await lang.ensureConsoleLspStarted();
-  assert.deepEqual(calls, [{ attachedPackages: ["stats"], functions: { f: "function(first)" } }]);
+  assert.deepEqual(calls, [{ attachedPackages: ["stats"] }],
+    "workspace function signatures are no longer sent to the separate language server");
   assert.equal(lang.updateSessionData(data), false, "unchanged metadata is not resent");
   lang.clearSessionState();
   assert.deepEqual(calls.at(-1), { attachedPackages: [] });
   await lang.dispose();
+});
+
+test("a pending second LSP request cannot publish an obsolete sess signature", async t => {
+  let release, inspected;
+  const secondReply = new Promise(resolve => { release = resolve; });
+  const inspecting = new Promise(resolve => { inspected = resolve; });
+  t.after(() => release({ items: [] }));
+  let requests = 0;
+  const { client } = createClient(t, {
+    inspectRuntimeCompletion: async () => ({ signature: "function(old_arg)" }),
+    completion: async () => {
+      if (++requests === 2) { inspected(); return secondReply; }
+      return { items: [] };
+    },
+  });
+  const pending = client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
+  await inspecting;
+  client.invalidateRuntimeCompletion();
+  release({ items: [{ label: "old_arg", detail: "parameter" }] });
+  assert.equal(await pending, undefined);
+  assert.equal(requests, 2);
 });

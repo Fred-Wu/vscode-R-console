@@ -19,6 +19,16 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
   inspectRuntimeCompletion, staticAnalysis = true } = {}) {
   const instances = [];
   const logs = [];
+  const runtimeSignatures = new Map();
+  let staticMode = staticAnalysis;
+  const inspect = async (expression, kind) => {
+    const name = expression.startsWith("`") && expression.endsWith("`")
+      ? expression.slice(1, -1) : expression;
+    if (kind === "function" && runtimeSignatures.has(name)) {
+      return { signature: runtimeSignatures.get(name) };
+    }
+    return inspectRuntimeCompletion?.(expression, kind);
+  };
   class HostClientAdapter {
     constructor(_id, _name, serverOptions, options) {
       Object.assign(this, { serverOptions, options, running: false, requests: [], opened: [] });
@@ -112,8 +122,8 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
   });
   const client = new ConsoleLspClient({
     consoleId: "real-lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd, inspectRuntimeCompletion,
-    getStaticAnalysisEnabled: () => staticAnalysis,
+    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd, inspectRuntimeCompletion: inspect,
+    getStaticAnalysisEnabled: () => staticMode,
   });
   t.after(async () => {
     try { await client.dispose(); }
@@ -123,6 +133,12 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
     const result = await client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
     return Array.isArray(result) ? result : result?.items;
   };
+  // Test-only session fixture: no synthetic workspace functions are sent to LSP.
+  client.setRuntimeSignatures = signatures => {
+    runtimeSignatures.clear();
+    for (const [name, signature] of Object.entries(signatures)) runtimeSignatures.set(name, signature);
+  };
+  client.setStaticAnalysis = enabled => { staticMode = enabled; };
   return { client, instances, logs, complete };
 }
 

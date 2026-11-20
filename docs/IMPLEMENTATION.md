@@ -659,8 +659,8 @@ In `sess` mode, R Console caches metadata passing through its proxy and routes
 completion requests to its embedded session. Runtime `$` and `@` members are
 requested through the `sess` JSON-RPC `completion` method.
 Workspace snapshots are cached from forwarded or console-injected `workspace`
-responses and supply search-path synchronization, workspace symbols, column
-names, and function signatures for the language server.
+responses and supply search-path synchronization, workspace symbols and column
+names. Function signatures are queried directly from sess when needed.
 
 vscode-R manages plot, data, help, browser, httpgd, and addin session lifecycles.
 
@@ -783,15 +783,14 @@ Completion data comes from one shared flow:
   `workspace_children` API using its returned selectors and pages. Only names,
   `$`/`@` chains and literal `[[` indices are inspected; calls and computed indices
   are not sent to sess.
-- complete function signatures from workspace data are supplied to the language
-  server as an in-memory source document. Its native providers generate argument
-  names and default choices. The document is updated only when signatures change,
-  including redefinitions and removals; function bodies and defaults are not run.
-  When native inference cannot resolve a member function, sess's `hover` request
-  supplies its signature. The language server parses that signature without
-  executing it and applies the same argument matching and default-choice rules.
-  Truncated signatures remain unavailable. Replies from a replaced session or
-  superseded document are discarded.
+- function arguments for live R functions come from targeted sess `hover` requests,
+  not workspace-snapshot signatures or synthetic function documents. The
+  language server parses the returned signature without evaluating the function
+  body or defaults, applies R argument matching, and supplies literal choices.
+  For `[` and `[[` calls, completion uses the receiver's live class metadata
+  to inspect a named S3 method, or the separate language server's registered
+  package methods when they are not exported. Truncated signatures remain
+  unavailable, and obsolete replies are discarded after session changes.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
 

@@ -10,6 +10,7 @@ export type GlobalEnvItem = {
 };
 
 export type WorkspaceData = {
+  revision?: number;
   search: string[];
   loaded_namespaces: string[];
   globalenv: Record<string, GlobalEnvItem>;
@@ -23,13 +24,14 @@ export type SessionMemberCompletionItem = {
 
 export type SessionCompletionData = {
   signature?: string;
+  classes?: string[];
   names?: string[];
   class?: string[];
   members?: SessionMemberCompletionItem[];
   incomplete?: boolean;
 };
 
-export type SessionCompletionKind = "function" | "columns" | "members" | "slots";
+export type SessionCompletionKind = "function" | "columns" | "members" | "slots" | "subscript" | "doubleSubscript";
 
 export type SessionCompletionInspector = (
   expression: string, kind: SessionCompletionKind
