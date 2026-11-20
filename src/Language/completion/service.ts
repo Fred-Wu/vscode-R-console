@@ -51,7 +51,7 @@ export async function collectCompletionEntries(
   if (context.argumentTags && rawLspResult.argumentsExhausted) return [];
   const [runtimeMemberItems, dataItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
-      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve(undefined),
+      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion) : Promise.resolve(undefined),
     !includeColumns || nativeFields || (context.kind === "bracket" && rawLspResult.memberResolved) ? Promise.resolve([]) : cachedColumnItems.length > 0
       ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion),
   ]);

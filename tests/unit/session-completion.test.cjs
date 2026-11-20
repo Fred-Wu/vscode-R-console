@@ -67,6 +67,40 @@ test("runtime inspection drops replies after sess reconnect and never continues 
   }
 });
 
+test("indexed members use the selected object and never fall back to parent fields", async () => {
+  const completion = loadSource("src/Language/completion.ts", { vscode: {
+    CompletionItemKind: { Field: 4, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},
+  } });
+  for (const [input, type, children, expected] of [
+    ['test[["xtest"]]$', 'integer', [], []],
+    ['test[[1]]$', 'list', [
+      { selector: { kind: 'index', value: 1, name: 'child' }, type: 'integer' },
+      { selector: { kind: 'index', value: 2, name: 'fun' }, type: 'closure' },
+    ], ['child', 'fun()']],
+    ['test[[1]]@', 'S4', [{ selector: { kind: 'slot', value: 'slot' }, type: 'integer' }], ['slot']],
+    ['test[[1]]$', 'S4', [], []],
+    ["test[[stop('bad')]]$", 'list', [], []],
+  ]) {
+    const context = completion.getCompletionContext(input, input.length);
+    const requests = [];
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { test: { names: ['xtest'], slots: ['parentSlot'] } } }, [], [], undefined,
+      async () => assert.fail('indexed receivers must not use expression-based completion'), undefined,
+      (expression, kind) => inspectSessionCompletion(expression, kind, async (method, params) => {
+        requests.push(params);
+        assert.equal(method, 'workspace_children');
+        assert.equal(params.name, 'test');
+        return { children: params.path.length ? children : [
+          { selector: { kind: 'index', value: 1, name: 'xtest' }, type },
+        ] };
+      }));
+    assert.deepEqual(entries.map(item => item.insertText), expected, input);
+    assert.equal(requests.length, input.includes('stop') ? 0 : expected.length ? 2 : 1, input);
+  }
+  const input = 'test %>% .[[1]]$';
+  assert.equal(completion.getCompletionContext(input, input.length).objectName, 'test[[1]]');
+});
+
 test("nested data columns retain quoting, dimensions and native completion priority", async () => {
   const completion = loadSource("src/Language/completion.ts", { vscode: {
     CompletionItemKind: { Field: 4, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},

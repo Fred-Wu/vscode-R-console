@@ -8,6 +8,7 @@ import * as os from "os";
 import { inspectSessionCompletion } from "./completionInspection";
 import type {
   SessionCompletionData,
+  SessionCompletionKind,
   SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
@@ -194,7 +195,7 @@ export class SessProxy {
     return parseMemberCompletionItems(result);
   }
 
-  async inspectCompletion(expression: string, kind: "function" | "columns"): Promise<SessionCompletionData | undefined> {
+  async inspectCompletion(expression: string, kind: SessionCompletionKind): Promise<SessionCompletionData | undefined> {
     const socket = this.rSocket;
     if (!socket || socket.destroyed) return undefined;
     return await inspectSessionCompletion(expression, kind, async (method, params) => {

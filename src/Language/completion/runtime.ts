@@ -140,22 +140,21 @@ export async function getRuntimeDataCompletions(
 
 export async function getRuntimeMemberCompletions(
   context: CompletionContext,
-  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
+  inspectRuntimeCompletion?: SessionCompletionInspector
 ): Promise<CompletionEntry[] | undefined> {
   if (
     context.kind !== "member" ||
     !context.objectName ||
-    !context.operator ||
-    !requestRuntimeMemberCompletions
+    !context.operator
   ) {
     return undefined;
   }
 
   try {
-    const items = await requestRuntimeMemberCompletions(
-      context.objectName,
-      context.operator
-    );
+    const items = context.indexedObject
+      ? (await inspectRuntimeCompletion?.(context.objectName, context.operator === "@" ? "slots" : "members"))?.members
+      : await requestRuntimeMemberCompletions?.(context.objectName, context.operator);
     return items
       ?.filter((item) => typeof item.name === "string" && item.name.length > 0)
       .map((item) => {

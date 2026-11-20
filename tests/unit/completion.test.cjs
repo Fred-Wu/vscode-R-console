@@ -240,15 +240,18 @@ test("member completion sends token-derived objects and keeps line-relative repl
   }
 });
 
-test("subscript member detection preserves base-object lookup without evaluating indices", async () => {
+test("subscript member detection preserves the receiver without evaluating indices or suggesting parent fields", async () => {
   const input = "obj[[stop('must not execute')]]$fi";
   const context = completion.getCompletionContext(input, input.length);
   assert.equal(context.kind, "member");
-  await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-    async expression => { assert.equal(expression, "obj"); return []; });
+  assert.equal(context.objectName, "obj[[stop('must not execute')]]");
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    { globalenv: { obj: { names: ["fieldOnParent"] } } }, [], [], undefined,
+    async () => assert.fail("indexed receivers must not use expression-based completion"));
+  assert.deepEqual(entries, []);
 });
 
-test("subscripted slot completion uses only slots inferred by the language server", async () => {
+test("computed subscript slot completion uses only slots inferred by the language server", async () => {
   const input = "objects[[choose_index()]]@sl";
   const context = completion.getCompletionContext(input, input.length);
   assert.equal(context.kind, "member");

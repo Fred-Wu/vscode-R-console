@@ -804,8 +804,10 @@ test("managed sess inspection restores runtime arguments and nested columns with
       ns <- loadNamespace("sess", lib.loc = c(Sys.getenv("R_SESS_TEST_LIBRARY"), .libPaths()))
       obj <- list(fun = ${signature} stop("body ran"), data = data.frame(alpha = 1, beta = 2))
       nested <- list(obj$data)
+      test <- data.frame(xtest = 1:1000)
       methods::setClass("CompletionSlots", slots = c(fun = "function"))
       slot_obj <- methods::new("CompletionSlots", fun = function(slot_arg) stop("body ran"))
+      objects <- list(obj, slot_obj, c(named = 1))
       result <- get("inspection_call_handlers", ns)()[[inputs$method]](inputs$params)
       cat(jsonlite::toJSON(result, auto_unbox = TRUE, null = "null"))
     `, { method, params });
@@ -830,6 +832,12 @@ test("managed sess inspection restores runtime arguments and nested columns with
     ['slot_obj@fun(|)', ['slot_arg = ']],
     ['nested[[1]][[|]]', ['"alpha"', '"beta"']],
     ['obj$data[["al|"]]', ['alpha']],
+    ['test[["xtest"]]$|', []],
+    ['test[[1]]$|', []],
+    ['nested[[1]]$|', ['alpha', 'beta']],
+    ['objects[[1]]$|', ['fun()', 'data']],
+    ['objects[[2]]@|', ['fun()']],
+    ['objects[[3]]$|', []],
   ]) assert.deepEqual((await complete(marked)).map(item => item.insertText), expected, marked);
 
   signature = 'function(redefined)';
@@ -842,6 +850,8 @@ test("managed sess inspection restores runtime arguments and nested columns with
   assert.equal(requests.length, count, "native source signatures do not query the session");
   assert.deepEqual(await complete('obj <- list(data = list())\nobj$data[[|]]'), []);
   assert.equal(requests.length, count, "known empty source objects do not query the session");
+  assert.deepEqual(await complete('test <- data.frame(xtest = 1:1000)\ntest[["xtest"]]$|'), []);
+  assert.equal(requests.length, count, "known source vectors do not query the session");
   assert.ok(requests.some(request => request.method === 'hover'));
   assert.ok(requests.some(request => request.method === 'workspace_children'));
   assert.ok(requests.every(request => request.method !== 'completion'));

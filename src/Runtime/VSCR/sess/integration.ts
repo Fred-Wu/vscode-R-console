@@ -3,6 +3,7 @@ import * as path from "path";
 import type { RuntimeHost } from "../../../Terminal/rTerminal/runtime";
 import { BaseVscodeRSessionIntegration } from "../integration";
 import type {
+  SessionCompletionKind,
   SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
@@ -368,7 +369,7 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return await this.proxy?.requestWorkspace();
   }
 
-  override async inspectCompletion(expression: string, kind: "function" | "columns") {
+  override async inspectCompletion(expression: string, kind: SessionCompletionKind) {
     return await this.proxy?.inspectCompletion(expression, kind);
   }
 

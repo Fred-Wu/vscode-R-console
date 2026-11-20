@@ -23,6 +23,7 @@ import {
 import type {
   VscodeRSessionIntegration,
 } from "../../Runtime/VSCR";
+import type { SessionCompletionKind } from "../../Runtime/VSCR/types";
 import { ANSI, stripBracketedPasteMarkers } from "../ansi";
 import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
@@ -250,7 +251,7 @@ export async function requestRuntimeMemberCompletions(
   return await vscodeRIntegration(host).requestMemberCompletions(expression, operator);
 }
 
-export async function inspectRuntimeCompletion(host: RuntimeHost, expression: string, kind: "function" | "columns") {
+export async function inspectRuntimeCompletion(host: RuntimeHost, expression: string, kind: SessionCompletionKind) {
   return await vscodeRIntegration(host).inspectCompletion(expression, kind);
 }
 

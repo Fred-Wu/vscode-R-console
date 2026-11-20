@@ -444,7 +444,14 @@ test("typed indices preserve expression variables including self references", as
 test("member chains never guess fields from unrelated current or recent input", async () => {
   for (const marked of ['lst[[1]]$│', 'lst[[1]]$al│', 'obj$│', 'obj@│']) {
     const entries = await completion.collectCompletionEntries(contextAt(marked), undefined, undefined,
-      undefined, [], ['alpha_unrelated <- 1'], undefined, async () => [{ name: 'alpha' }], 'alpha_unrelated');
+      undefined, [], ['alpha_unrelated <- 1'], undefined, async expression => {
+        assert.ok(expression === 'obj');
+        return [{ name: 'alpha' }];
+      }, 'alpha_unrelated', async (expression, kind) => {
+        assert.equal(expression, 'lst[[1]]');
+        assert.equal(kind, 'members');
+        return { members: [{ name: 'alpha' }] };
+      });
     assert.deepEqual(entries.map(entry => entry.label), ['alpha'], marked);
   }
 });

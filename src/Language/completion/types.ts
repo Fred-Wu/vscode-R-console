@@ -8,6 +8,7 @@ export type CompletionContext = {
   replaceEnd?: number;
   triggerCharacter?: string;
   objectName?: string;
+  indexedObject?: boolean;
   operator?: "$" | "@";
   bracketOperator?: "[" | "[[";
   bracketQuote?: "\"" | "'";

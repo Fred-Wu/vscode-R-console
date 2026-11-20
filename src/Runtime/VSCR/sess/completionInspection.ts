@@ -1,9 +1,9 @@
 import { tokenize, TokenType, type Token } from "../../../Language/lexer";
-import type { SessionCompletionData, WorkspaceData } from "../types";
+import type { SessionCompletionData, SessionCompletionKind, SessionMemberCompletionItem, WorkspaceData } from "../types";
 
 type Selector = { kind: "index" | "name" | "slot"; value: string | number; name?: string };
 type Step = { operator: "$" | "@" | "[["; value: string | number };
-type Child = { selector: Selector; class?: string | string[] };
+type Child = { selector: Selector; class?: string | string[]; type?: string };
 type Request = (method: "hover" | "workspace_children", params: Record<string, unknown>) => Promise<unknown>;
 
 function literalName(token: Token | undefined): string | undefined {
@@ -55,7 +55,7 @@ function inspectionPath(expression: string): { name: string; steps: Step[] } | u
 }
 
 export async function inspectSessionCompletion(
-  expression: string, kind: "function" | "columns", request: Request, workspace?: WorkspaceData
+  expression: string, kind: SessionCompletionKind, request: Request, workspace?: WorkspaceData
 ): Promise<SessionCompletionData | undefined> {
   const target = inspectionPath(expression);
   if (!target) return undefined;
@@ -67,12 +67,15 @@ export async function inspectSessionCompletion(
   }
 
   const path: Selector[] = [];
-  let metadata: { class?: string | string[] } | undefined = workspace?.globalenv[target.name];
+  let metadata: { class?: string | string[]; type?: string } | undefined = workspace?.globalenv[target.name];
   // Use selectors returned by sess: list indices, environment names and S4
   // slots have different meanings even when their displayed names are equal.
   for (let depth = 0; depth <= target.steps.length; depth++) {
     const step = target.steps[depth];
+    if (!step && kind === "members" && metadata?.type &&
+        !["list", "pairlist", "environment"].includes(metadata.type)) return { members: [] };
     const names: string[] = [];
+    const members: SessionMemberCompletionItem[] = [];
     let selected: Child | undefined;
     let start = 1;
     do {
@@ -84,7 +87,12 @@ export async function inspectSessionCompletion(
         if (!selector || !["index", "name", "slot"].includes(selector.kind)) continue;
         const name = selector.kind === "index" ? selector.name : selector.value;
         if (!step) {
-          if (typeof name === "string" && name) names.push(name);
+          if (typeof name === "string" && name) {
+            if (kind === "columns") names.push(name);
+            else if (kind === "slots" ? selector.kind === "slot" : selector.kind !== "slot") {
+              members.push({ name, type: child.type });
+            }
+          }
         } else if (step.operator === "@" ? selector.kind === "slot" && selector.value === step.value
           : selector.kind !== "slot" && (typeof step.value === "number"
             ? selector.kind === "index" && selector.value === step.value : name === step.value)) {
@@ -97,7 +105,9 @@ export async function inspectSessionCompletion(
       if (!Number.isSafeInteger(result.next_start) || (result.next_start as number) <= start) return undefined;
       start = result.next_start as number;
     } while (true);
-    if (!step) return { names, class: typeof metadata?.class === "string" ? [metadata.class] : metadata?.class };
+    if (!step) return kind === "columns"
+      ? { names, class: typeof metadata?.class === "string" ? [metadata.class] : metadata?.class }
+      : { members };
     if (!selected) return undefined;
     metadata = selected;
     path.push(selected.selector);

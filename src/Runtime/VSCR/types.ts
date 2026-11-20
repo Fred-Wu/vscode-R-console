@@ -25,10 +25,13 @@ export type SessionCompletionData = {
   signature?: string;
   names?: string[];
   class?: string[];
+  members?: SessionMemberCompletionItem[];
 };
 
+export type SessionCompletionKind = "function" | "columns" | "members" | "slots";
+
 export type SessionCompletionInspector = (
-  expression: string, kind: "function" | "columns"
+  expression: string, kind: SessionCompletionKind
 ) => Promise<SessionCompletionData | undefined>;
 
 export type VscodeRIntegrationOptions =
