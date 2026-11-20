@@ -37,6 +37,7 @@ type LangOptions = {
   onPackagesChanged?: () => void;
   requestMemberCompletions: RuntimeMemberCompletionRequester;
   inspectRuntimeCompletion?: SessionCompletionInspector;
+  getStaticAnalysisEnabled?: () => boolean;
 };
 
 type AutocompleteRequest = {
@@ -441,6 +442,7 @@ export class RTermLang {
         env: this.options.env,
         cwd: this.options.cwd,
         inspectRuntimeCompletion: this.options.inspectRuntimeCompletion,
+        getStaticAnalysisEnabled: this.options.getStaticAnalysisEnabled,
         onPackagesChanged: () => {
           this.cancelCompletion();
           this.options.onPackagesChanged?.();

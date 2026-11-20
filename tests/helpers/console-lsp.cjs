@@ -13,7 +13,10 @@ const uri = (value) => ({ toString: () => value });
 
 // Replace only the VS Code host adapter. Use the production client lifecycle,
 // R launcher, authentication, JSON-RPC streams, and console-language-server.R.
-function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env, inspectRuntimeCompletion } = {}) {
+// Existing static-inference integration fixtures request it explicitly via
+// this helper's default. The extension setting and production default are off.
+function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env,
+  inspectRuntimeCompletion, staticAnalysis = true } = {}) {
   const instances = [];
   const logs = [];
   class HostClientAdapter {
@@ -110,6 +113,7 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
   const client = new ConsoleLspClient({
     consoleId: "real-lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
     rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd, inspectRuntimeCompletion,
+    getStaticAnalysisEnabled: () => staticAnalysis,
   });
   t.after(async () => {
     try { await client.dispose(); }

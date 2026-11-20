@@ -1,3 +1,18 @@
+## Console completion modes
+
+The default `r.console.completion.staticAnalysis` setting is `false`.
+Normal console completions use the current runtime session and package
+metadata, while parsing the editable input only to identify the cursor
+context. Completed unsubmitted statements are masked in the LSP-only virtual
+document so they cannot redefine objects or functions before execution.
+Recent Input suggestions are still text-based in both modes.
+
+Setting `r.console.completion.staticAnalysis` to `true` opts into
+editor-style source inference: the full pending input can supply function
+formals, members, and locally declared completion candidates. Runtime and
+static source handling live in `completion-runtime.R` and
+`completion-static.R`, respectively.
+
 # Design and Implementation
 
 `vscode-R-console` runs an embedded R session through a Rust backend and presents

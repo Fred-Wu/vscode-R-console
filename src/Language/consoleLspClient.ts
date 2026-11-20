@@ -55,6 +55,7 @@ type ConsoleLspClientOptions = {
   cwd?: string;
   onPackagesChanged?: () => void;
   inspectRuntimeCompletion?: SessionCompletionInspector;
+  getStaticAnalysisEnabled?: () => boolean;
 };
 
 type ConsoleLspSessionState = {
@@ -271,7 +272,8 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   getCallContext(doc: vscode.TextDocument, position: vscode.Position) {
-    const projection = this.inputDocument.project(doc.getText());
+    const projection = this.inputDocument.project(doc.getText(),
+      this.options.getStaticAnalysisEnabled?.() === true, position);
     return getEnclosingCall(projection.document.getText(),
       projection.document.offsetAt(projection.toServerPosition(position)));
   }
@@ -290,7 +292,8 @@ export class ConsoleLspClient implements CompletionProvider {
         return undefined;
       }
       try {
-        const projection = this.inputDocument.project(doc.getText());
+        const staticAnalysis = this.options.getStaticAnalysisEnabled?.() === true;
+        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition);
         await this.syncDocument(client, projection.document);
         await this.applySessionState(client);
         if (this.client !== client) {
@@ -306,7 +309,8 @@ export class ConsoleLspClient implements CompletionProvider {
               triggerCharacter: undefined,
             };
         const serverPosition = projection.toServerPosition(position);
-        const params = createCompletionParams(client, projection, serverPosition, contextPosition, context);
+        const params = createCompletionParams(client, projection, serverPosition, contextPosition, context,
+          staticAnalysis);
         const documentVersion = projection.document.version;
         const sessionState = this.sessionState;
         const call = params.rConsoleCall && this.options.inspectRuntimeCompletion
@@ -379,7 +383,8 @@ export class ConsoleLspClient implements CompletionProvider {
     await this.applySessionState(client);
     const currentClient = this.client;
     if (currentClient?.isRunning()) {
-      await this.syncDocument(currentClient, this.inputDocument.project(doc.getText()).document);
+      await this.syncDocument(currentClient, this.inputDocument.project(doc.getText(),
+        this.options.getStaticAnalysisEnabled?.() === true).document);
     }
   }
 

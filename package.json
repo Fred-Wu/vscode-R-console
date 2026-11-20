@@ -154,6 +154,11 @@
     "configuration": {
       "title": "R Console",
       "properties": {
+        "r.console.completion.staticAnalysis": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable editor-style static completion from unsubmitted console input, including source-defined functions and members. Disabled by default: completions use the live R session and installed package metadata. Recent Input text suggestions remain available in both modes."
+        },
         "r.console.completionUI": {
           "type": "string",
           "enum": ["quickPick", "inline"],

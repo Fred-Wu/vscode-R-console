@@ -144,7 +144,7 @@ if (is.null(console_script)) {
     console_script <- sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE)[[1L]])
 }
 console_resource_dir <- dirname(console_script)
-for (resource in c("completion-source.R", "completion-arguments.R", "completion-provider.R")) {
+for (resource in c("completion-runtime.R", "completion-static.R", "completion-arguments.R", "completion-provider.R")) {
     source(file.path(console_resource_dir, resource), local = TRUE)
 }
 

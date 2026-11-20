@@ -294,6 +294,8 @@ export class RTerminal implements vscode.Pseudoterminal {
         await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
       inspectRuntimeCompletion: async (expression, kind) =>
         await inspectRuntimeCompletion(this.runtimeHost(), expression, kind),
+      getStaticAnalysisEnabled: () =>
+        vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
 
     this.syntax = new ConsoleSyntax(

@@ -7,7 +7,8 @@ import { getBracketCompletionContext, getCompletionParseInsertion, getCompletion
 // position and document contents remain available to the native LSP handler.
 export function createCompletionParams(
   client: LanguageClient, projection: ReturnType<VirtualRDocument["project"]>,
-  serverPosition: vscode.Position, contextPosition: vscode.Position, context: vscode.CompletionContext
+  serverPosition: vscode.Position, contextPosition: vscode.Position, context: vscode.CompletionContext,
+  staticAnalysis = false
 ) {
   const text = projection.document.getText();
   const hasContext = text.includes("(") || text.includes("[") || text.includes("|>") || text.includes("%>%");
@@ -23,6 +24,7 @@ export function createCompletionParams(
   // context for argument matching, literal values and unfinished-input repair.
   return {
     ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
+    ...(staticAnalysis ? { rConsoleStaticAnalysis: true } : {}),
     ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
     ...(bracket ? { rConsoleDataObject: bracket.objectName } : {}),
     ...(parseInsertion ? { rConsoleParseInsertion: {

@@ -8,10 +8,11 @@ console_supplement_completion <- function(reply, self, params) {
     if (is.null(reply$result)) reply$result <- list(items = list(), isIncomplete = FALSE)
 
     point <- document$from_lsp_position(params$position)
+    static_analysis <- isTRUE(params$rConsoleStaticAnalysis)
     # Ask the native resolver whether an empty member list is authoritative.
     # This uses its cached receiver and avoids probing stale live objects when
     # the current source defines an empty list or the prefix has no matches.
-    if (exists("member_cursor", asNamespace("languageserver"), inherits = FALSE)) {
+    if (static_analysis && exists("member_cursor", asNamespace("languageserver"), inherits = FALSE)) {
         cursor <- languageserver:::member_cursor(document, point)
         if (!is.null(cursor)) {
             resolved <- languageserver:::member_resolve_cursor(uri, workspace, document, point, cursor)
@@ -27,7 +28,7 @@ console_supplement_completion <- function(reply, self, params) {
         document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix, params$rConsoleParseInsertion))
     }
 
-    if (is.character(params$rConsoleDataObject) && length(params$rConsoleDataObject) == 1L) {
+    if (static_analysis && is.character(params$rConsoleDataObject) && length(params$rConsoleDataObject) == 1L) {
         root <- tryCatch(str2lang(params$rConsoleDataObject), error = function(e) NULL)
         while (is.call(root) && is.symbol(root[[1L]]) && as.character(root[[1L]]) %in% c("$", "@", "[[")) root <- root[[2L]]
         # An unexecuted source binding is not the same object as a live namesake.
@@ -41,24 +42,29 @@ console_supplement_completion <- function(reply, self, params) {
         isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")) ||
             (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
-    source <- if (is.null(call) || !is.null(call$package)) NULL else if (member_call) {
+    # Static source inference is explicitly opt-in. Live sess signatures take
+    # precedence in normal console mode regardless of native package inference.
+    source <- if (is.null(call) || !is.null(call$package) || !static_analysis) NULL else if (member_call) {
         if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
     } else console_source_function(document, point, call$token)
+    source_is_static <- !is.null(source)
+    if (is.null(source) && !is.null(call) && is.null(call$package) &&
+        identical(call$accessor, "")) {
+        source <- console_runtime_function(call$token)
+    }
     runtime <- if (member_call && is.null(source) && !native_arguments)
         console_parse_signature(params$rConsoleRuntimeSignature) else NULL
-    if (!is.null(runtime)) {
-        source <- list(formals = runtime[[2L]])
+    if (!is.null(runtime)) source <- list(formals = runtime[[2L]])
+    workspace_call <- !is.null(call) && is.null(call$package) &&
+        identical(call$accessor, "") && call$token %in% console_workspace_functions
+    if (!source_is_static && (!is.null(source) || workspace_call)) {
         reply$result$rConsoleWorkspaceFunction <- TRUE
     }
-    workspace_call <- is.null(source) && !is.null(call) && is.null(call$package) &&
-        identical(call$accessor, "") && call$token %in% console_workspace_functions
-    if (workspace_call) reply$result$rConsoleWorkspaceFunction <- TRUE
-    # Native S3 inference can still select a package generic when a binding in
-    # a brace block or enclosing function shadows it. Resolve lexical bindings
-    # first, including unknown signatures, before trusting that inference.
+    # A real session signature overrides package inference for an unqualified
+    # function; a source-only signature may override it only in static mode.
     native_arguments <- native_arguments && is.null(source) && !workspace_call
     signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
-    if (!is.null(source) && is.null(runtime)) reply$result$rConsoleLocalFunction <- TRUE
+    if (source_is_static) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
         reply$result$rConsoleNativeArguments <- TRUE
         for (item in reply$result$items) {

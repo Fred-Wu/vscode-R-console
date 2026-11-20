@@ -478,6 +478,47 @@ test("current source signatures supersede older session definitions, including e
   }
 });
 
+test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer them", {
+  timeout: 90000,
+}, async t => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const { client: runtime } = createConsoleLsp(t, {
+    staticAnalysis: false,
+    inspectRuntimeCompletion: async (expression, kind) => {
+      assert.equal(expression, "obj$fun");
+      assert.equal(kind, "function");
+      return { signature: "function(old_arg)" };
+    },
+  });
+  await runtime.syncSessionState({ attachedPackages: [], functions: { f: "function(old_arg)" } });
+  const params = async (client, marked) => {
+    const cursor = marked.indexOf("│");
+    const text = marked.replace("│", "");
+    const before = marked.slice(0, cursor).split("\\n");
+    const result = await client.provideCompletionItems({ getText: () => text },
+      { line: before.length - 1, character: before.at(-1).length });
+    assert.ok(result, marked);
+    return { result, parameters: (result.items ?? result).filter(item => item.detail === "parameter")
+      .map(item => item.label) };
+  };
+  const runtimePlain = await params(runtime, "f <- function(new_arg) NULL\\nf(│");
+  assert.deepEqual(runtimePlain.parameters, ["old_arg"]);
+  assert.equal(runtimePlain.result.rConsoleLocalFunction, undefined);
+  assert.equal(runtimePlain.result.rConsoleWorkspaceFunction, true);
+  const member = await params(runtime, "obj <- list(fun = function(new_arg) NULL)\\nobj$fun(│");
+  assert.deepEqual(member.parameters, ["old_arg"]);
+  const nonexistent = await params(runtime, "only_source <- function(source_arg) NULL\\nonly_source(│");
+  assert.deepEqual(nonexistent.parameters, []);
+  const pipe = await params(runtime, "only_source <- function(source_arg) NULL\\n1 |> only_so│");
+  assert.ok(!(pipe.result.items ?? pipe.result).some(item => item.label === "only_source"));
+
+  const { client: staticClient } = createConsoleLsp(t, { staticAnalysis: true });
+  await staticClient.syncSessionState({ attachedPackages: [], functions: { f: "function(old_arg)" } });
+  const staticPlain = await params(staticClient, "f <- function(new_arg) NULL\\nf(│");
+  assert.deepEqual(staticPlain.parameters, ["new_arg"]);
+  assert.equal(staticPlain.result.rConsoleLocalFunction, true);
+});
+
 test("console member arguments use the current runtime signature after an executed redefinition", {
   timeout: 90000,
 }, async t => {
