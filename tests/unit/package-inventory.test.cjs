@@ -271,3 +271,33 @@ test("repeated failures back off and disposal cancels recovery", async t => {
   assert.equal(attempts, 2);
   assert.ok(!logs.some(line => line.includes("Recovery complete")), "disposal is not successful recovery");
 });
+
+test("replacing an existing library directory re-arms its watcher without an error event", async t => {
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const previous = inventory.watchers.get(library);
+  const moved = library + "-old";
+  fs.renameSync(library, moved);
+  fs.mkdirSync(library);
+  install(library, "2.0");
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1)?.packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "replacement directory must be detected");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  assert.notEqual(inventory.watchers.get(library), previous);
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+
+  // The newly created watcher must keep observing subsequent installations.
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "3.0");
+  const nextDeadline = Date.now() + 10000;
+  while (changes.at(-1)?.packages.get("example")?.version !== "3.0") {
+    assert.ok(Date.now() < nextDeadline, "rearmed watcher must receive later package changes");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+});

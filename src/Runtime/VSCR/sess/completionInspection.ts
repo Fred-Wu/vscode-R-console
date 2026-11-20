@@ -68,6 +68,11 @@ export async function inspectSessionCompletion(
 
   const path: Selector[] = [];
   let metadata: { class?: string | string[]; type?: string } | undefined = workspace?.globalenv[target.name];
+  // sess workspace_children serializes class vectors as one comma-separated
+  // string, unlike top-level workspace metadata which carries an array.
+  const classNames = (classes: string | string[] | undefined): string[] | undefined =>
+    classes === undefined ? undefined : (Array.isArray(classes) ? classes : [classes])
+      .flatMap(value => value.split(",").map(name => name.trim()).filter(Boolean));
   // Use selectors returned by sess: list indices, environment names and S4
   // slots have different meanings even when their displayed names are equal.
   for (let depth = 0; depth <= target.steps.length; depth++) {
@@ -106,7 +111,7 @@ export async function inspectSessionCompletion(
       start = result.next_start as number;
     } while (true);
     if (!step) return kind === "columns"
-      ? { names, class: typeof metadata?.class === "string" ? [metadata.class] : metadata?.class }
+      ? { names, class: classNames(metadata?.class) }
       : { members };
     if (!selected) return undefined;
     metadata = selected;

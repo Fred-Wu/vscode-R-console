@@ -21,6 +21,9 @@ export class PackageInventory {
   private libraries: LibraryInventory[] = [];
   private packages = new Map<string, PackageInstallation>();
   private readonly watchers = new Map<string, fs.FSWatcher>();
+  // The child watcher follows the old inode after the library is replaced.
+  // Watch its parent as well so an atomic directory/symlink switch re-arms it.
+  private readonly parentWatchers = new Map<string, fs.FSWatcher>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -45,8 +48,43 @@ export class PackageInventory {
     for (const library of paths) this.dirtyLibraries.add(library);
     for (const watcher of this.watchers.values()) watcher.close();
     this.watchers.clear();
-    for (const library of paths) this.watchLibrary(library);
+    for (const watcher of this.parentWatchers.values()) watcher.close();
+    this.parentWatchers.clear();
+    for (const library of paths) {
+      this.watchParent(library);
+      this.watchLibrary(library);
+    }
     this.schedule(0);
+  }
+
+  private watchParent(library: string): void {
+    if (this.disposed || this.parentWatchers.has(library)) return;
+    try {
+      const basename = path.basename(library);
+      const watcher = fs.watch(path.dirname(library), { persistent: false }, (_event, filename) => {
+        if (this.disposed || this.parentWatchers.get(library) !== watcher) return;
+        if (filename && String(filename).toLowerCase() !== basename.toLowerCase()) return;
+        // The existing library watcher may still be alive but attached to an
+        // unlinked directory (or an old symlink target).
+        const previous = this.watchers.get(library);
+        if (previous) previous.close();
+        this.watchers.delete(library);
+        this.watchLibrary(library, true);
+        this.dirtyLibraries.add(library);
+        this.schedule(250);
+      });
+      watcher.on("error", error => {
+        if (this.disposed || this.parentWatchers.get(library) !== watcher) return;
+        this.parentWatchers.delete(library);
+        watcher.close();
+        this.log(`[Libraries] Could not watch parent of ${library}: ${String(error)}`);
+        this.scheduleRetry();
+      });
+      this.parentWatchers.set(library, watcher);
+    } catch (error) {
+      this.log(`[Libraries] Could not watch parent of ${library}: ${String(error)}`);
+      this.scheduleRetry();
+    }
   }
 
   private watchLibrary(library: string, recovering = false): void {
@@ -88,6 +126,7 @@ export class PackageInventory {
       this.retryTimer = undefined;
       this.log("[Libraries] Recovery retry started");
       for (const library of this.paths) {
+        if (!this.parentWatchers.has(library)) this.watchParent(library);
         if (!this.watchers.has(library)) this.watchLibrary(library, true);
       }
       void this.refresh();
@@ -104,6 +143,8 @@ export class PackageInventory {
     this.clearRetry();
     for (const watcher of this.watchers.values()) watcher.close();
     this.watchers.clear();
+    for (const watcher of this.parentWatchers.values()) watcher.close();
+    this.parentWatchers.clear();
   }
 
   refresh(): Promise<void> {
@@ -114,7 +155,8 @@ export class PackageInventory {
     this.dirtyLibraries.clear();
     const request = this.scan(revision, dirty).then(() => {
       if (!this.disposed && revision === this.revision &&
-          this.watchers.size === this.paths.length && !this.dirtyLibraries.size) {
+          this.watchers.size === this.paths.length &&
+          this.parentWatchers.size === this.paths.length && !this.dirtyLibraries.size) {
         if (this.retryDelay > 1000) this.log("[Libraries] Recovery complete; retries stopped");
         this.clearRetry();
       }

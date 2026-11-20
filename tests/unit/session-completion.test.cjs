@@ -28,7 +28,7 @@ test("nested column lookup uses sess selectors and follows pages without guessin
     requests.push({ method, params });
     if (!params.path.length) {
       if (params.start === 1) return { children: [], next_start: 2 };
-      return { children: [{ selector, class: ["data.table", "data.frame"] }], next_start: null };
+      return { children: [{ selector, class: "data.table, data.frame" }], next_start: null };
     }
     assert.deepEqual(params.path, [selector]);
     return { children: [
@@ -124,4 +124,24 @@ test("nested data columns retain quoting, dimensions and native completion prior
     undefined, [], [], { provideCompletionItems: async () => [{ label: 'native', kind: 4, data: { type: 'scope' } }] },
     undefined, undefined, async () => assert.fail("known native fields must not wait for sess"));
   assert.equal(entries[0].label, 'native');
+});
+
+test("real sess nested class strings preserve bare data.table column insertion", async () => {
+  const completion = loadSource("src/Language/completion.ts", { vscode: {
+    CompletionItemKind: { Field: 4, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},
+  } });
+  const input = "obj$data[, ";
+  const context = completion.getCompletionContext(input, input.length);
+  const data = await inspectSessionCompletion("obj$data", "columns", async (_, params) => ({
+    children: params.path.length
+      ? [{ selector: { kind: "index", value: 1, name: "a b" } },
+         { selector: { kind: "index", value: 2, name: "alpha" } }]
+      : [{ selector: { kind: "index", value: 1, name: "data" }, class: "data.table, data.frame" }],
+    next_start: null,
+  }));
+  assert.deepEqual(data.class, ["data.table", "data.frame"]);
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    undefined, [], [], undefined, async () => assert.fail("no code-based runtime probes"),
+    undefined, async () => data);
+  assert.deepEqual(entries.map(item => item.insertText), ["`a b`", "alpha"]);
 });
