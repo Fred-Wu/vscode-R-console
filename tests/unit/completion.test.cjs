@@ -56,7 +56,7 @@ test("runtime-only unresolved member signatures do not borrow native arguments o
   assert.deepEqual(stale.filter(item => item.detail === "parameter"), []);
   const live = await completion.collectCompletionEntries(context, { getText: () => input },
     { line: 0, character: input.length }, undefined, [], [],
-    provider({ rConsoleWorkspaceFunction: true, items: [{ label: "new_arg",
+    provider({ rConsoleWorkspaceFunction: true, rConsoleArgumentsExhausted: false, items: [{ label: "new_arg",
       kind: 5, detail: "parameter" }] }));
   assert.deepEqual(live.filter(item => item.detail === "parameter").map(item => item.label), ["new_arg"]);
 });

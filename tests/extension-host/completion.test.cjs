@@ -13,6 +13,8 @@ suite("Completion in the VS Code extension host", () => {
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, "../.."),
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
+      // These legacy cases deliberately exercise the opt-in source analyzer.
+      getStaticAnalysisEnabled: () => true,
       requestMemberCompletions: async expression => {
         runtimeProbes++;
         // This fixture has no live receiver. Preserve the cached-name fallback
@@ -237,6 +239,8 @@ suite("Subscript completion in the VS Code extension host", () => {
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, '../..'),
       rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
+      // These legacy cases deliberately exercise the opt-in source analyzer.
+      getStaticAnalysisEnabled: () => true,
       requestMemberCompletions: async () => { expressionProbes++; return undefined; },
     });
     const session = { search: [], loaded_namespaces: [], globalenv: {

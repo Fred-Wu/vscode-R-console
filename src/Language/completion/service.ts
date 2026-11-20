@@ -28,7 +28,7 @@ export async function collectCompletionEntries(
     !!doc && !!position;
   const rawLspItemsRequest =
     !includeLspItems
-      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
+      ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, runtimeOnly: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
       : getLanguageServerCompletions(
           context,
           doc,
