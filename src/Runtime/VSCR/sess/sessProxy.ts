@@ -5,7 +5,9 @@ import * as fs from "fs";
 import * as net from "net";
 import * as path from "path";
 import * as os from "os";
+import { inspectSessionCompletion } from "./completionInspection";
 import type {
+  SessionCompletionData,
   SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
@@ -190,6 +192,16 @@ export class SessProxy {
       trigger: operator,
     });
     return parseMemberCompletionItems(result);
+  }
+
+  async inspectCompletion(expression: string, kind: "function" | "columns"): Promise<SessionCompletionData | undefined> {
+    const socket = this.rSocket;
+    if (!socket || socket.destroyed) return undefined;
+    return await inspectSessionCompletion(expression, kind, async (method, params) => {
+      if (this.rSocket !== socket || socket.destroyed) return undefined;
+      const result = await this.request(method, params);
+      return this.rSocket === socket && !socket.destroyed ? result : undefined;
+    }, this.workspaceData);
   }
 
   private createPipePath(): string {

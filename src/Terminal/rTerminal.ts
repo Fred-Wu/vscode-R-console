@@ -58,6 +58,7 @@ import {
   getRuntimeWorkspaceData,
   type RuntimeHost,
   requestRuntimeMemberCompletions,
+  inspectRuntimeCompletion,
   startNextRuntimeSubmission,
   type Submission,
   type TerminalMode,
@@ -291,6 +292,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestMemberCompletions: async (expression, operator) =>
         await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
+      inspectRuntimeCompletion: async (expression, kind) =>
+        await inspectRuntimeCompletion(this.runtimeHost(), expression, kind),
     });
 
     this.syntax = new ConsoleSyntax(

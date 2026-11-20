@@ -1,4 +1,13 @@
 # Workspace signatures are source for languageserver, never evaluated in either R session.
+console_parse_signature <- function(signature) {
+    if (!is.character(signature) || length(signature) != 1L) return(NULL)
+    parsed <- tryCatch(parse(text = paste0(signature, "\nNULL"), keep.source = FALSE),
+        error = function(e) NULL)
+    if (length(parsed) != 1L || !is.call(parsed[[1L]]) ||
+        !identical(parsed[[1L]][[1L]], quote(`function`)) || !is.null(parsed[[1L]][[3L]])) return(NULL)
+    parsed[[1L]]
+}
+
 console_workspace_functions <- character()
 console_workspace_signatures <- NULL
 console_sync_workspace_functions <- function(workspace, functions) {
@@ -6,14 +15,10 @@ console_sync_workspace_functions <- function(workspace, functions) {
     uri <- "r-console://session/workspace.R"
     known <- character()
     definitions <- lapply(names(functions), function(name) {
-        signature <- functions[[name]]
-        if (!is.character(signature) || length(signature) != 1L) return(NULL)
-        parsed <- tryCatch(parse(text = paste0(signature, "\nNULL"), keep.source = FALSE),
-            error = function(e) NULL)
-        if (length(parsed) != 1L || !is.call(parsed[[1L]]) ||
-            !identical(parsed[[1L]][[1L]], quote(`function`)) || !is.null(parsed[[1L]][[3L]])) return(NULL)
+        parsed <- console_parse_signature(functions[[name]])
+        if (is.null(parsed)) return(NULL)
         known <<- c(known, name)
-        paste(deparse(call("<-", as.name(name), parsed[[1L]]), backtick = TRUE), collapse = "\n")
+        paste(deparse(call("<-", as.name(name), parsed), backtick = TRUE), collapse = "\n")
     })
     console_workspace_functions <<- known
     content <- strsplit(paste(unlist(definitions, use.names = FALSE), collapse = "\n"), "\n", fixed = TRUE)[[1L]]

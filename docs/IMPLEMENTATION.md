@@ -763,13 +763,19 @@ Completion data comes from one shared flow:
   resolves the receiver, then falls back to the live session and cached fields
   when needed
 - data-aware bracket and pipe-placeholder contexts use cached session metadata
-  and current input; bracket completion does not evaluate expressions through sess
+  and current input. Missing nested column names are requested through sess's
+  `workspace_children` API using its returned selectors and pages. Only names,
+  `$`/`@` chains and literal `[[` indices are inspected; calls and computed indices
+  are not sent to sess.
 - complete function signatures from workspace data are supplied to the language
   server as an in-memory source document. Its native providers generate argument
   names and default choices. The document is updated only when signatures change,
   including redefinitions and removals; function bodies and defaults are not run.
-  Truncated signatures and nested functions absent from workspace data cannot
-  provide runtime arguments. Native inference from the current input still applies.
+  When native inference cannot resolve a member function, sess's `hover` request
+  supplies its signature. The language server parses that signature without
+  executing it and applies the same argument matching and default-choice rules.
+  Truncated signatures remain unavailable. Replies from a replaced session or
+  superseded document are discarded.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
 

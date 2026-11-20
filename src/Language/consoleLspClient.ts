@@ -30,6 +30,7 @@ import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
+import type { SessionCompletionInspector } from "../Runtime/VSCR/types";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -53,6 +54,7 @@ type ConsoleLspClientOptions = {
   env: NodeJS.ProcessEnv;
   cwd?: string;
   onPackagesChanged?: () => void;
+  inspectRuntimeCompletion?: SessionCompletionInspector;
 };
 
 type ConsoleLspSessionState = {
@@ -305,9 +307,27 @@ export class ConsoleLspClient implements CompletionProvider {
             };
         const serverPosition = projection.toServerPosition(position);
         const params = createCompletionParams(client, projection, serverPosition, contextPosition, context);
-        const result = await client.sendRequest(CompletionRequest.type, params);
+        const documentVersion = projection.document.version;
+        const sessionState = this.sessionState;
+        const call = params.rConsoleCall && this.options.inspectRuntimeCompletion
+          ? getEnclosingCall(projection.document.getText(),
+            projection.document.offsetAt(projection.toServerPosition(contextPosition))) : undefined;
+        let result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client || revision !== this.packageRevision) {
           continue;
+        }
+        const flags = result as CompletionResult | null;
+        if (params.rConsoleCall && (call?.operator === "$" || call?.operator === "@") &&
+            !flags?.rConsoleLocalFunction && !flags?.rConsoleWorkspaceFunction && !flags?.rConsoleNativeArguments &&
+            this.options.inspectRuntimeCompletion) {
+          const metadata = await this.options.inspectRuntimeCompletion(params.rConsoleCall, "function");
+          if (this.client !== client || revision !== this.packageRevision) continue;
+          if (this.disposed || this.syncedDocuments.get(projection.document.uri.toString())?.version !== documentVersion ||
+              this.sessionState !== sessionState) return undefined;
+          if (metadata?.signature) {
+            const runtimeParams = { ...params, rConsoleRuntimeSignature: metadata.signature };
+            result = await client.sendRequest(CompletionRequest.type, runtimeParams);
+          }
         }
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
         // VS Code's converter preserves standard LSP fields only. Carry this

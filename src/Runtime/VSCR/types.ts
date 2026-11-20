@@ -21,6 +21,16 @@ export type SessionMemberCompletionItem = {
   str?: string;
 };
 
+export type SessionCompletionData = {
+  signature?: string;
+  names?: string[];
+  class?: string[];
+};
+
+export type SessionCompletionInspector = (
+  expression: string, kind: "function" | "columns"
+) => Promise<SessionCompletionData | undefined>;
+
 export type VscodeRIntegrationOptions =
   | { kind: "disabled" }
   | { kind: "sess" }

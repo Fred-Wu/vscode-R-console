@@ -7,7 +7,7 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [] } = {}) {
+function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], inspectRuntimeCompletion } = {}) {
   const instances = [];
   const logs = [];
   class LanguageClient {
@@ -61,7 +61,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
   });
   const client = new ConsoleLspClient({
     consoleId: "lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: "R", env: {},
+    rPath: "R", env: {}, inspectRuntimeCompletion,
   });
   client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
@@ -72,6 +72,34 @@ function change() {
   return { libraries: [{ path: "/base/library", packages: new Map() }],
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
+
+test("native member signatures never wait for runtime inspection", async t => {
+  const { client } = createClient(t, {
+    completion: () => ({ items: [], rConsoleLocalFunction: true }),
+    inspectRuntimeCompletion: async () => assert.fail("current source is authoritative, including empty signatures"),
+  });
+  const result = await client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
+  assert.equal(result.rConsoleLocalFunction, true);
+});
+
+test("a pending runtime signature cannot resubmit completion against a newer document or session", async t => {
+  for (const replacement of ["document", "session"]) {
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const inspecting = new Promise(resolve => { entered = resolve; });
+    t.after(() => release(undefined));
+    const { client, instances } = createClient(t, {
+      inspectRuntimeCompletion: async () => { entered(); return gate; },
+    });
+    const pending = client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
+    await inspecting;
+    if (replacement === "document") await client.prepareDocument({ getText: () => "obj$other(" });
+    else await client.syncSessionState({ attachedPackages: ["stats"] });
+    release({ signature: "function(obsolete)" });
+    assert.equal(await pending, undefined);
+    assert.equal(instances[0].requests.filter(request => request.method === "completion").length, 1);
+  }
+});
 
 test("first session snapshot keeps the running server", async (t) => {
   const { client, instances } = createClient(t);

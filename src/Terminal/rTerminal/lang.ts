@@ -16,6 +16,7 @@ import {
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
+import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 
 export type InputSnapshot = {
   text: string;
@@ -35,6 +36,7 @@ type LangOptions = {
   requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
   onPackagesChanged?: () => void;
   requestMemberCompletions: RuntimeMemberCompletionRequester;
+  inspectRuntimeCompletion?: SessionCompletionInspector;
 };
 
 type AutocompleteRequest = {
@@ -159,7 +161,8 @@ export class RTermLang {
           recentEntries,
           completionProvider,
           this.options.requestMemberCompletions,
-          latestInput.text
+          latestInput.text,
+          this.options.inspectRuntimeCompletion
         );
       })();
       // Argument candidates must await LSP parameters; early session-only
@@ -254,7 +257,8 @@ export class RTermLang {
             recentEntries,
             completionProvider,
             this.options.requestMemberCompletions,
-            nextInputText
+            nextInputText,
+            this.options.inspectRuntimeCompletion
           );
           return nextEntries;
         },
@@ -436,6 +440,7 @@ export class RTermLang {
         rPath: this.options.rPath,
         env: this.options.env,
         cwd: this.options.cwd,
+        inspectRuntimeCompletion: this.options.inspectRuntimeCompletion,
         onPackagesChanged: () => {
           this.cancelCompletion();
           this.options.onPackagesChanged?.();

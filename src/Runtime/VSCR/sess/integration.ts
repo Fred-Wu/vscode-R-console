@@ -368,6 +368,10 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return await this.proxy?.requestWorkspace();
   }
 
+  override async inspectCompletion(expression: string, kind: "function" | "columns") {
+    return await this.proxy?.inspectCompletion(expression, kind);
+  }
+
   override async requestMemberCompletions(
     expression: string,
     operator: "$" | "@"

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
 import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getDataColumnCompletions, getRuntimeDataCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
@@ -14,7 +15,8 @@ export async function collectCompletionEntries(
   recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
-  consoleInputText?: string
+  consoleInputText?: string,
+  inspectRuntimeCompletion?: SessionCompletionInspector
 ): Promise<CompletionEntries> {
   if (context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -50,8 +52,8 @@ export async function collectCompletionEntries(
   const [runtimeMemberItems, dataItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve(undefined),
-    !includeColumns || nativeFields ? Promise.resolve([]) : cachedColumnItems.length > 0
-      ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions),
+    !includeColumns || nativeFields || (context.kind === "bracket" && rawLspResult.memberResolved) ? Promise.resolve([]) : cachedColumnItems.length > 0
+      ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion),
   ]);
   if (context.kind === "member") {
     // A successful live lookup is authoritative even when it is empty or no

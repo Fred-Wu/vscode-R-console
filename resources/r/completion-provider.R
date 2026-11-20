@@ -20,11 +20,20 @@ console_supplement_completion <- function(reply, self, params) {
         }
     }
 
-    if ((!is.null(params$rConsoleCall) || isTRUE(params$rConsolePipe)) &&
+    if ((!is.null(params$rConsoleCall) || !is.null(params$rConsoleDataObject) || isTRUE(params$rConsolePipe)) &&
         is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L) {
         previous_parse <- document$parse_data
         on.exit(document$update_parse_data(previous_parse), add = TRUE)
         document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix, params$rConsoleParseInsertion))
+    }
+
+    if (is.character(params$rConsoleDataObject) && length(params$rConsoleDataObject) == 1L) {
+        root <- tryCatch(str2lang(params$rConsoleDataObject), error = function(e) NULL)
+        while (is.call(root) && is.symbol(root[[1L]]) && as.character(root[[1L]]) %in% c("$", "@", "[[")) root <- root[[2L]]
+        # An unexecuted source binding is not the same object as a live namesake.
+        if (is.symbol(root) && !is.null(console_source_function(document, point, as.character(root)))) {
+            reply$result$rConsoleMemberResolved <- TRUE
+        }
     }
 
     call <- console_call_identity(params$rConsoleCall)
@@ -35,6 +44,12 @@ console_supplement_completion <- function(reply, self, params) {
     source <- if (is.null(call) || !is.null(call$package)) NULL else if (member_call) {
         if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
     } else console_source_function(document, point, call$token)
+    runtime <- if (member_call && is.null(source) && !native_arguments)
+        console_parse_signature(params$rConsoleRuntimeSignature) else NULL
+    if (!is.null(runtime)) {
+        source <- list(formals = runtime[[2L]])
+        reply$result$rConsoleWorkspaceFunction <- TRUE
+    }
     workspace_call <- is.null(source) && !is.null(call) && is.null(call$package) &&
         identical(call$accessor, "") && call$token %in% console_workspace_functions
     if (workspace_call) reply$result$rConsoleWorkspaceFunction <- TRUE
@@ -43,7 +58,7 @@ console_supplement_completion <- function(reply, self, params) {
     # first, including unknown signatures, before trusting that inference.
     native_arguments <- native_arguments && is.null(source) && !workspace_call
     signature <- if (!is.null(source)) console_source_signature(source, uri) else NULL
-    if (!is.null(source)) reply$result$rConsoleLocalFunction <- TRUE
+    if (!is.null(source) && is.null(runtime)) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
         reply$result$rConsoleNativeArguments <- TRUE
         for (item in reply$result$items) {

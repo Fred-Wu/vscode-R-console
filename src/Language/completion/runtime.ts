@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
 import { backtickRName, quoteRNameIfNeeded, getFieldInsertText } from "./candidates";
 import { allowsSymbolCompletions } from "./policy";
@@ -102,13 +103,20 @@ function asStringArray(value: string | string[] | undefined): string[] {
 
 export async function getRuntimeDataCompletions(
   context: CompletionContext,
-  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
+  inspectRuntimeCompletion?: SessionCompletionInspector
 ): Promise<CompletionEntries> {
-  if (context.kind === "bracket" || !context.dataObjectName || !requestRuntimeMemberCompletions) {
+  if (!context.dataObjectName || context.bracketArgumentName) {
     return [];
   }
 
   try {
+    if (context.kind === "bracket") {
+      const data = await inspectRuntimeCompletion?.(context.dataObjectName, "columns");
+      if (!data?.names) return [];
+      return getDataColumnCompletions(context, { globalenv: { [context.dataObjectName]: data } });
+    }
+    if (!requestRuntimeMemberCompletions) return [];
     const items = await requestRuntimeMemberCompletions(
       context.dataObjectName,
       "$"

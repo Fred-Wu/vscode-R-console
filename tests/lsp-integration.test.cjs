@@ -792,6 +792,61 @@ test("unknown runtime member signatures do not request expressions or borrow glo
   }
 });
 
+test("managed sess inspection restores runtime arguments and nested columns without executable requests", {
+  timeout: 90000, skip: !process.env.R_SESS_TEST_LIBRARY,
+}, async t => {
+  const { inspectSessionCompletion } = loadSource("src/Runtime/VSCR/sess/completionInspection.ts");
+  const requests = [];
+  let signature = 'function(first, mode = c("auto", "manual"), lazy = stop("default ran"))';
+  const inspectRuntimeCompletion = (expression, kind) => inspectSessionCompletion(expression, kind, async (method, params) => {
+    requests.push({ method, params });
+    return runRJson(`
+      ns <- loadNamespace("sess", lib.loc = c(Sys.getenv("R_SESS_TEST_LIBRARY"), .libPaths()))
+      obj <- list(fun = ${signature} stop("body ran"), data = data.frame(alpha = 1, beta = 2))
+      nested <- list(obj$data)
+      methods::setClass("CompletionSlots", slots = c(fun = "function"))
+      slot_obj <- methods::new("CompletionSlots", fun = function(slot_arg) stop("body ran"))
+      result <- get("inspection_call_handlers", ns)()[[inputs$method]](inputs$params)
+      cat(jsonlite::toJSON(result, auto_unbox = TRUE, null = "null"))
+    `, { method, params });
+  });
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { inspectRuntimeCompletion });
+  const provider = { provideCompletionItems: async (...args) => {
+    const result = await client.provideCompletionItems(...args);
+    return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+  } };
+  const complete = async marked => {
+    const offset = marked.indexOf('|'), text = marked.replace('|', '');
+    const before = text.slice(0, offset).split('\n'), line = before.length - 1, character = before.at(-1).length;
+    const input = text.split('\n')[line];
+    return completion.collectCompletionEntries(completion.getCompletionContext(input, character, text.slice(0, offset)),
+      { getText: () => text }, { line, character }, undefined, text.split('\n').slice(0, line), [], provider,
+      async () => assert.fail("runtime probes must use supported inspection requests"), undefined, inspectRuntimeCompletion);
+  };
+  for (const [marked, expected] of [
+    ['obj$fun(|)', ['first = ', 'mode = ', 'lazy = ']],
+    ['obj$fun(1, |)', ['mode = ', 'lazy = ']],
+    ['obj$fun(mode = "au|")', ['auto']],
+    ['slot_obj@fun(|)', ['slot_arg = ']],
+    ['nested[[1]][[|]]', ['"alpha"', '"beta"']],
+    ['obj$data[["al|"]]', ['alpha']],
+  ]) assert.deepEqual((await complete(marked)).map(item => item.insertText), expected, marked);
+
+  signature = 'function(redefined)';
+  assert.deepEqual((await complete('obj$fun(|)')).map(item => item.insertText), ['redefined = ']);
+  signature = 'function()';
+  assert.deepEqual(await complete('obj$fun(|)'), []);
+  const count = requests.length;
+  assert.deepEqual((await complete('obj <- list(fun = function(source_arg) NULL)\nobj$fun(|)'))
+    .map(item => item.insertText), ['source_arg = ']);
+  assert.equal(requests.length, count, "native source signatures do not query the session");
+  assert.deepEqual(await complete('obj <- list(data = list())\nobj$data[[|]]'), []);
+  assert.equal(requests.length, count, "known empty source objects do not query the session");
+  assert.ok(requests.some(request => request.method === 'hover'));
+  assert.ok(requests.some(request => request.method === 'workspace_children'));
+  assert.ok(requests.every(request => request.method !== 'completion'));
+});
+
 test("completion call boundaries agree with the R parser across newlines", async () => {
   const cases = [
     ["obj$fun\n(fi)", false],

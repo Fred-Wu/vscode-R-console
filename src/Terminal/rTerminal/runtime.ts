@@ -250,6 +250,10 @@ export async function requestRuntimeMemberCompletions(
   return await vscodeRIntegration(host).requestMemberCompletions(expression, operator);
 }
 
+export async function inspectRuntimeCompletion(host: RuntimeHost, expression: string, kind: "function" | "columns") {
+  return await vscodeRIntegration(host).inspectCompletion(expression, kind);
+}
+
 export async function startRuntime(host: RuntimeHost): Promise<void> {
   pendingRuntimeRewrites.delete(host);
   const integration = vscodeRIntegration(host);

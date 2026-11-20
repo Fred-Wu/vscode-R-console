@@ -649,6 +649,27 @@ test("proxy forwards protocol 2 attach metadata and keeps workspace and completi
     result: [{ name: "member", type: "numeric" }],
   });
   assert.deepEqual(await completion, [{ name: "member", type: "numeric" }]);
+
+  const signature = proxy.inspectCompletion("obj$fun", "function");
+  await waitFor(() => r.messages.some(message => message.method === "hover"));
+  const hover = r.messages.find(message => message.method === "hover");
+  assert.deepEqual(hover.params, { expr: "obj$fun" });
+  send(r.socket, { jsonrpc: "2.0", id: hover.id, result: { str: "function(arg)" } });
+  assert.deepEqual(await signature, { signature: "function(arg)" });
+
+  const columns = proxy.inspectCompletion("nested[[1]]", "columns");
+  await waitFor(() => r.messages.some(message => message.method === "workspace_children"));
+  const root = r.messages.find(message => message.method === "workspace_children");
+  assert.deepEqual(root.params, { name: "nested", path: [], start: 1 });
+  const selector = { kind: "index", value: 1 };
+  send(r.socket, { jsonrpc: "2.0", id: root.id,
+    result: { children: [{ selector, class: "data.frame" }], next_start: null } });
+  await waitFor(() => r.messages.filter(message => message.method === "workspace_children").length === 2);
+  const nested = r.messages.filter(message => message.method === "workspace_children")[1];
+  assert.deepEqual(nested.params, { name: "nested", path: [selector], start: 1 });
+  send(r.socket, { jsonrpc: "2.0", id: nested.id,
+    result: { children: [{ selector: { kind: "index", value: 1, name: "alpha" } }], next_start: null } });
+  assert.deepEqual(await columns, { names: ["alpha"], class: ["data.frame"] });
 });
 
 test("proxy replacement survives old socket close, forwards Unicode, and propagates upstream disconnect", { timeout: 10000 }, async (t) => {
