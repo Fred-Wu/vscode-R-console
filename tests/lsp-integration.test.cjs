@@ -507,13 +507,16 @@ test("pending receiver and member writes block stale runtime formals but leave u
   };
   for (const marked of ["obj$fun(│)", "other <- 1\nobj$fun(│",
     "obj$fun(│); obj <- list(fun = 1)",
+    "obj$fun(│); obj$fun <- 1",
+    "obj$other <- 1\nobj$fun(│",
+    "g <- function() { obj$fun <- 1 }; obj$fun(│",
     "g <- function() { obj <- list(fun = 1) }; obj$fun(│"]) {
     const result = await complete(marked);
     assert.deepEqual(result.parameters, ["old_arg"], marked + ": " + JSON.stringify(result));
     assert.equal(result.source, false, marked);
   }
   const baselineProbes = inspected.length;
-  assert.equal(baselineProbes, 4, "unshadowed runtime members retain their signature fallback");
+  assert.equal(baselineProbes, 7, "unshadowed runtime members retain their signature fallback");
   for (const marked of [
     "obj <- list(fun = 1)\nobj$fun(│",
     "obj <- get('unknown')\nobj$fun(│",
