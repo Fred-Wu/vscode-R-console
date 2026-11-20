@@ -145,3 +145,47 @@ test("real sess nested class strings preserve bare data.table column insertion",
     undefined, async () => data);
   assert.deepEqual(entries.map(item => item.insertText), ["`a b`", "alpha"]);
 });
+
+test("truncated workspace names request additional safe sess pages", async () => {
+  const completion = loadSource("src/Language/completion.ts", { vscode: {
+    CompletionItemKind: { Field: 4, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},
+  } });
+  const names = Array.from({ length: 1501 }, (_, i) => "field" + String(i).padStart(4, "0"));
+  const workspace = { globalenv: { df: {
+    class: ["data.frame"], type: "list", length: names.length, names: names.slice(0, 1000),
+  } } };
+  let pages = 0;
+  const inspect = (expression, kind) => inspectSessionCompletion(expression, kind, async (method, params) => {
+    assert.equal(method, "workspace_children");
+    assert.equal(params.name, "df");
+    pages++;
+    const start = params.start;
+    const slice = names.slice(start - 1, start + 499);
+    return {
+      children: slice.map((name, i) => ({ selector: { kind: "index", value: start + i, name } })),
+      next_start: start + 500 <= names.length ? start + 500 : null,
+    };
+  }, workspace);
+  const input = "df[[field15";
+  const context = completion.getCompletionContext(input, input.length);
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    workspace, [], [], undefined, undefined, undefined, inspect);
+  assert.ok(pages >= 4, "completion must inspect beyond the first 1000 cached names");
+  assert.ok(entries.some(item => item.insertText === '"field1500"'));
+  assert.equal(entries.isIncomplete, undefined);
+});
+
+test("sess child paging is bounded and reports partial results", async () => {
+  let requests = 0;
+  const result = await inspectSessionCompletion("wide", "columns", async () => {
+    requests++;
+    return { children: [{ selector: { kind: "index", value: requests, name: "column" + requests } }],
+      next_start: requests + 1 };
+  });
+  assert.ok(requests <= 64);
+  assert.equal(result.incomplete, true);
+  assert.equal(result.names.length, requests);
+  const blocked = await inspectSessionCompletion("obj" + "$item".repeat(17), "columns",
+    async () => assert.fail("excessively deep inspection must not make requests"));
+  assert.equal(blocked, undefined);
+});

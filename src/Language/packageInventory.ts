@@ -117,10 +117,14 @@ export class PackageInventory {
     this.retryDelay = 1000;
   }
 
-  private scheduleRetry(): void {
+  private scheduleRetry(cancelScheduledScan = false): void {
     if (this.disposed || this.retryTimer) return;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = undefined;
+    // Keep already queued events from healthy libraries when a different
+    // watcher fails. Only a failed publication should defer its next retry.
+    if (cancelScheduledScan) {
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = undefined;
+    }
     this.log(`[Libraries] Recovery retry scheduled in ${this.retryDelay / 1000}s`);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
@@ -164,7 +168,7 @@ export class PackageInventory {
       if (!this.disposed && revision === this.revision) {
         for (const library of dirty) this.dirtyLibraries.add(library);
         this.log(`[Libraries] Could not refresh package inventory: ${String(error)}`);
-        this.scheduleRetry();
+        this.scheduleRetry(true);
       }
     }).finally(() => {
       if (this.pending === request) this.pending = undefined;
@@ -175,7 +179,9 @@ export class PackageInventory {
   }
 
   private schedule(delay: number): void {
-    if (this.disposed || this.retryTimer) return;
+    // Event-driven scans for healthy libraries must not wait for an unrelated
+    // library watcher or failed publish to exhaust its recovery backoff.
+    if (this.disposed) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = undefined;

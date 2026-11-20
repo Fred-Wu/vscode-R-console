@@ -6,6 +6,12 @@ type Step = { operator: "$" | "@" | "[["; value: string | number };
 type Child = { selector: Selector; class?: string | string[]; type?: string };
 type Request = (method: "hover" | "workspace_children", params: Record<string, unknown>) => Promise<unknown>;
 
+// A sess request already has its own timeout. Bound the *total* amount of
+// sequential child paging that can block one interactive completion.
+const MAX_INSPECTION_PAGES = 64;
+const MAX_INSPECTION_DURATION_MS = 2000;
+const MAX_INSPECTION_DEPTH = 16;
+
 function literalName(token: Token | undefined): string | undefined {
   if (!token) return undefined;
   if (token.type === TokenType.Identifier && !token.value.startsWith("`")) return token.value;
@@ -58,7 +64,7 @@ export async function inspectSessionCompletion(
   expression: string, kind: SessionCompletionKind, request: Request, workspace?: WorkspaceData
 ): Promise<SessionCompletionData | undefined> {
   const target = inspectionPath(expression);
-  if (!target) return undefined;
+  if (!target || target.steps.length > MAX_INSPECTION_DEPTH) return undefined;
   if (kind === "function") {
     if (target.steps.some(step => step.operator === "[[")) return undefined;
     const result = await request("hover", { expr: expression }) as { str?: unknown } | undefined;
@@ -67,6 +73,8 @@ export async function inspectSessionCompletion(
   }
 
   const path: Selector[] = [];
+  const deadline = Date.now() + MAX_INSPECTION_DURATION_MS;
+  let pages = 0;
   let metadata: { class?: string | string[]; type?: string } | undefined = workspace?.globalenv[target.name];
   // sess workspace_children serializes class vectors as one comma-separated
   // string, unlike top-level workspace metadata which carries an array.
@@ -84,6 +92,12 @@ export async function inspectSessionCompletion(
     let selected: Child | undefined;
     let start = 1;
     do {
+      if (pages >= MAX_INSPECTION_PAGES || Date.now() >= deadline) {
+        if (step) return undefined;
+        return kind === "columns" ? { names, class: classNames(metadata?.class), incomplete: true }
+          : { members, incomplete: true };
+      }
+      pages++;
       const result = await request("workspace_children", { name: target.name, path: [...path], start }) as
         { children?: Child[]; next_start?: unknown } | undefined;
       if (!Array.isArray(result?.children)) return undefined;

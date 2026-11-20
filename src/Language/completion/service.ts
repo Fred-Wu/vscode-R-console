@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
-import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getDataColumnCompletions, getRuntimeDataCompletions } from "./runtime";
+import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getDataColumnCompletions, getRuntimeDataCompletions, hasTruncatedColumnNames } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
@@ -45,6 +45,7 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
+  const truncatedColumnNames = cachedColumnItems.length > 0 && hasTruncatedColumnNames(context, sessionData);
   const rawLspResult = await rawLspItemsRequest;
   const nativeMembers = rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member");
   const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
@@ -52,9 +53,13 @@ export async function collectCompletionEntries(
   const [runtimeMemberItems, dataItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion) : Promise.resolve(undefined),
-    !includeColumns || nativeFields || (context.kind === "bracket" && rawLspResult.memberResolved) ? Promise.resolve([]) : cachedColumnItems.length > 0
-      ? Promise.resolve(cachedColumnItems) : getRuntimeDataCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion),
+    !includeColumns || nativeFields || (context.kind === "bracket" && rawLspResult.memberResolved) ? Promise.resolve([]) :
+      cachedColumnItems.length > 0 && !truncatedColumnNames ? Promise.resolve(cachedColumnItems) :
+      getRuntimeDataCompletions(context, requestRuntimeMemberCompletions,
+        inspectRuntimeCompletion, truncatedColumnNames).then(items =>
+        items.columnsResolved || !cachedColumnItems.length ? items : cachedColumnItems),
   ]);
+  const columnsIncomplete = (dataItems as CompletionEntries).isIncomplete === true;
   if (context.kind === "member") {
     // A successful live lookup is authoritative even when it is empty or no
     // name matches. Cached fields are only a fallback for an unavailable probe.
@@ -91,7 +96,7 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...columnFiltered,
       ...(!context.bracketQuote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete);
+    ]), rawLspResult.isIncomplete || columnsIncomplete);
   }
 
   if (context.kind === "argument") {
@@ -104,7 +109,7 @@ export async function collectCompletionEntries(
       ...(!context.argumentValue?.quote ? columnFiltered : []),
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete);
+    ]), rawLspResult.isIncomplete || columnsIncomplete);
   }
 
   const defaultColumnFiltered = filterCompletionEntries(dataItems, context.prefix);
@@ -117,7 +122,7 @@ export async function collectCompletionEntries(
       ...(!context.pipe ? fallbackBufferItems : []),
     ],
     context.prefix
-  )), rawLspResult.isIncomplete);
+  )), rawLspResult.isIncomplete || columnsIncomplete);
 }
 
 function asCompletionEntries(

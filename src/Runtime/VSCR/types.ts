@@ -26,6 +26,7 @@ export type SessionCompletionData = {
   names?: string[];
   class?: string[];
   members?: SessionMemberCompletionItem[];
+  incomplete?: boolean;
 };
 
 export type SessionCompletionKind = "function" | "columns" | "members" | "slots";

@@ -101,20 +101,34 @@ function asStringArray(value: string | string[] | undefined): string[] {
   return value ? [value] : [];
 }
 
+/** vscode-R's automatic workspace snapshot caps names at 1000. */
+export function hasTruncatedColumnNames(context: CompletionContext, data: WorkspaceData | undefined): boolean {
+  if (!context.dataObjectName) return false;
+  const object = data?.globalenv?.[context.dataObjectName];
+  return typeof object?.length === "number" &&
+    object.length > asStringArray(object.names).length;
+}
+
 export async function getRuntimeDataCompletions(
   context: CompletionContext,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
-  inspectRuntimeCompletion?: SessionCompletionInspector
+  inspectRuntimeCompletion?: SessionCompletionInspector,
+  preferInspectedColumns = false
 ): Promise<CompletionEntries> {
   if (!context.dataObjectName || context.bracketArgumentName) {
     return [];
   }
 
   try {
-    if (context.kind === "bracket") {
+    if (context.kind === "bracket" || (preferInspectedColumns && inspectRuntimeCompletion)) {
       const data = await inspectRuntimeCompletion?.(context.dataObjectName, "columns");
       if (!data?.names) return [];
-      return getDataColumnCompletions(context, { globalenv: { [context.dataObjectName]: data } });
+      const entries = getDataColumnCompletions(context, {
+        globalenv: { [context.dataObjectName]: data },
+      }) as CompletionEntries;
+      entries.columnsResolved = true;
+      if (data.incomplete) entries.isIncomplete = true;
+      return entries;
     }
     if (!requestRuntimeMemberCompletions) return [];
     const items = await requestRuntimeMemberCompletions(

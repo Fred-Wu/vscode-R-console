@@ -42,6 +42,8 @@ export type CompletionEntry = {
 
 export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
+  // An empty but successful sess column inspection is authoritative.
+  columnsResolved?: boolean;
 };
 
 export type CompletionPickItem = vscode.QuickPickItem & {

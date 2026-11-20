@@ -187,7 +187,8 @@ test("a failed refresh retries only dirty libraries and publishes the latest ins
   assert.equal(inventory.retryDelay, 1000);
   assert.equal(inventory.retryTimer, undefined);
   assert.ok(logs.includes("[Libraries] Recovery retry scheduled in 1s"));
-  assert.ok(logs.includes("[Libraries] Recovery retry started"));
+  // A fresh filesystem event can now recover before the delayed retry fires.
+  // Both paths must settle the inventory and cancel the backoff timer.
   assert.equal(logs.filter(line => line.includes("Recovery complete; retries stopped")).length, 1);
 });
 
@@ -300,4 +301,49 @@ test("replacing an existing library directory re-arms its watcher without an err
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   await settle();
+});
+
+test("healthy library events refresh during a different library's recovery backoff", async t => {
+  const { libraries: [first, second], inventory, changes, install, settle } = fixture(t);
+  install(first);
+  install(second);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  // Keep the recovery timer well beyond the normal two-pass 250ms scan.
+  inventory.retryDelay = 10000;
+  inventory.watchers.get(first).emit("error", new Error("Watcher unavailable"));
+  assert.ok(inventory.retryTimer);
+  fs.rmSync(path.join(second, "example"), { recursive: true });
+  install(second, "2.0");
+  const deadline = Date.now() + 3000;
+  while (changes.at(-1).libraries[1].packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "healthy library must refresh before recovery retry");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(inventory.retryTimer, "failed library is still backing off");
+  assert.equal(changes.at(-1).libraries[1].packages.get("example").version, "2.0");
+});
+
+test("a queued healthy scan is not cancelled by another library's watcher failure", async t => {
+  const { libraries: [first, second], inventory, changes, install, settle } = fixture(t);
+  install(first);
+  install(second);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  inventory.retryDelay = 10000;
+  fs.rmSync(path.join(second, "example"), { recursive: true });
+  install(second, "2.0");
+  const eventDeadline = Date.now() + 2000;
+  while (!inventory.timer) {
+    assert.ok(Date.now() < eventDeadline, "healthy library must schedule a scan");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  inventory.watchers.get(first).emit("error", new Error("Unrelated watcher failure"));
+  assert.ok(inventory.timer, "queued healthy scan must survive retry scheduling");
+  const deadline = Date.now() + 3000;
+  while (changes.at(-1).libraries[1].packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "healthy library change must publish without retry");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(inventory.retryTimer, "failed watcher still backs off independently");
 });
