@@ -47,7 +47,7 @@ export async function collectCompletionEntries(
   const nativeMembers = rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member");
   const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
   if (context.argumentTags && rawLspResult.argumentsExhausted) return [];
-  const [runtimeMemberItems, runtimeDataItems] = await Promise.all([
+  const [runtimeMemberItems, dataItems] = await Promise.all([
     context.kind === "member" && !nativeMembers
       ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions) : Promise.resolve(undefined),
     !includeColumns || nativeFields ? Promise.resolve([]) : cachedColumnItems.length > 0
@@ -60,7 +60,6 @@ export async function collectCompletionEntries(
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete);
   }
-  const dataItems = nativeFields ? runtimeDataItems.filter(entry => entry.kind !== vscode.CompletionItemKind.Field) : runtimeDataItems;
   const unavailableSignature = !rawLspResult.rConsoleLocalFunction && !rawLspResult.workspaceFunction &&
     (sessionArguments || (memberArguments && !rawLspResult.nativeArguments &&
       !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter")));

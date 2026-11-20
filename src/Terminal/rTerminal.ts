@@ -26,7 +26,7 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
-import { getVscodeRIntegration, type WorkspaceData } from "../Runtime/VSCR";
+import type { WorkspaceData } from "../Runtime/VSCR";
 import {
   InputSnapshot,
   RTermLang,
