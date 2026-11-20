@@ -219,7 +219,7 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
   if (isCallableCompletionKind(item.kind) &&
       (text === label || text === `${label}()` || text === `${label}($0)`)) {
     const name = label.startsWith("`") && isCallableName(label) ? escapeRControls(label) : quoteRNameIfNeeded(label);
-    return name + (text !== label || context.kind === "package" || context.kind === "member" ? "()" : "");
+    return name + (text !== label || context.kind === "package" ? "()" : "");
   }
   const protocolFormat = (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat;
   const result = (typeof item.insertText === "object" && "value" in item.insertText) || protocolFormat === 2

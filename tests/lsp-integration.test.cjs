@@ -65,7 +65,7 @@ test("real language-server field and method edits preserve control characters in
     expressions), [42, 43]);
 });
 
-test("typing and accepting functions opens real argument suggestions without another keystroke", { timeout: 90000 }, async t => {
+test("typing and accepting package functions opens real argument suggestions without another keystroke", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { createTerminal } = require("./helpers/inline-terminal.cjs");
   const { client } = createConsoleLsp(t);
@@ -122,7 +122,6 @@ test("typing and accepting functions opens real argument suggestions without ano
   for (const [typed, insertText, argument] of [
     ["lib", "library()", "package"],
     ["stats::", "lm()", "formula"], ["stats:::", "lm()", "formula"],
-    ["obj$", "lm()"], ["slot_obj@", "lm()"],
   ]) {
     client.updateInput("");
     const { terminal, screen } = createTerminal(t);
@@ -1491,16 +1490,16 @@ test("sess literal choices use native extraction without evaluating defaults", {
   }
 });
 
-test("runtime column probes use the active data scope without executing input", async () => {
+test("unavailable runtime data scopes never execute R expressions to supply columns", async () => {
   const setup = 'old_df <- data.frame(old_column = 1); new_df <- data.frame(new_column = 1); obj <- list(data = new_df)\n';
   for (const [marked, expected] of [
     ['with(old_df, x)\nnew_fun(│)', []],
-    ['old_df |> identity()\nnew_df |> subset(│)', ['new_column']],
-    ['old_df |> subset(new_df, │)', ['old_column']],
-    ['old_df %>% subset(., │)', ['old_column']],
-    ['with(old_df, subset(new_df, │))', ['new_column']],
-    ['with(new_df, text = ")", │)', ['new_column']],
-    ['obj$data |> subset(│)', ['new_column']],
+    ['old_df |> identity()\nnew_df |> subset(│)', []],
+    ['old_df |> subset(new_df, │)', []],
+    ['old_df %>% subset(., │)', []],
+    ['with(old_df, subset(new_df, │))', []],
+    ['with(new_df, text = ")", │)', []],
+    ['obj$data |> subset(│)', []],
     ['with(old_df, stop("must not execute") |> subset(│))', []],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
@@ -1514,7 +1513,7 @@ test("runtime column probes use the active data scope without executing input", 
         return runRJson(setup + 'x <- eval(parse(text=inputs)); cat(jsonlite::toJSON(lapply(names(x), function(n) list(name=n)), auto_unbox=TRUE))', expression);
       });
     assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.label), expected, marked);
-    assert.equal(probes, expected.length ? 1 : 0, 'unrelated or unsafe expressions must not be probed');
+    assert.equal(probes, 0, 'unsubmitted inputs and runtime objects must not be evaluated');
   }
 });
 
