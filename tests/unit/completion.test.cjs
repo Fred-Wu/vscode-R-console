@@ -242,7 +242,7 @@ test("Unicode member and argument prefixes preserve the object and full replacem
   }
 });
 
-test("member completion sends token-derived objects and keeps line-relative replacement spans", async () => {
+test("member completion parses token-derived objects without live inspection", async () => {
   for (const [input, objectName, prefix] of [
     ["obj $ nested @ sl", "obj$nested", "sl"],
     ["obj$ # comment\n nested$fi", "obj$nested", "fi"],
@@ -257,10 +257,8 @@ test("member completion sends token-derived objects and keeps line-relative repl
     assert.equal(context.kind, "member", input);
     assert.equal(context.prefix, prefix, input);
     assert.equal(context.replaceStart, line.length - prefix.length, input);
-    let requests = 0;
     await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async expression => { requests++; assert.equal(expression, objectName, input); return []; });
-    assert.equal(requests, 1, input);
+      async () => assert.fail("automatic member completion must not send sess requests"));
   }
 });
 
@@ -1029,7 +1027,7 @@ test("package completion filters locally without repeated language-server reques
 });
 
 
-test("runtime column completion runs only after the language server cannot supply fields", async () => {
+test("runtime column inspection is omitted when cached names are unavailable", async () => {
   let resolveLsp;
   const lspResult = new Promise((resolve) => {
     resolveLsp = resolve;
@@ -1070,8 +1068,8 @@ test("runtime column completion runs only after the language server cannot suppl
 
   resolveLsp([]);
   const entries = await request;
-  assert.equal(runtimeStarted, true);
-  assert.ok(entries.some((entry) => entry.label === "alpha"));
+  assert.equal(runtimeStarted, false);
+  assert.ok(!entries.some((entry) => entry.label === "alpha"));
 });
 
 
@@ -1488,17 +1486,17 @@ test("data contexts retain column order while ordinary symbols remain alphabetic
   }
 });
 
-test("dollar and slot members retain source order including callable members", async () => {
+test("dollar and slot members retain cached workspace order without R extraction", async () => {
   for (const operator of ["$", "@"]) {
     const input = `obj${operator}`;
     const context = completion.getCompletionContext(input, input.length);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
-      undefined, async () => [
-        { name: "zebra", type: "closure" }, { name: "alpha", type: "double" }, { name: "beta", type: "closure" },
-      ]);
+    const names = ["zebra", "alpha", "beta"];
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { obj: { names, slots: names } } }, [], [],
+      undefined, async () => assert.fail("must not execute custom R accessors"));
     for (const query of ["", "a", "b"]) {
       assert.deepEqual(completion.rankCompletionEntries(entries, query, context).map(e => e.label),
-        query === "b" ? ["zebra", "beta"] : ["zebra", "alpha", "beta"]);
+        query === "b" ? ["zebra", "beta"] : names);
     }
   }
 });

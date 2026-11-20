@@ -441,18 +441,13 @@ test("typed indices preserve expression variables including self references", as
   }
 });
 
-test("member chains never guess fields from unrelated current or recent input", async () => {
+test("member chains never request live runtime inspectors", async () => {
   for (const marked of ['lst[[1]]$│', 'lst[[1]]$al│', 'obj$│', 'obj@│']) {
     const entries = await completion.collectCompletionEntries(contextAt(marked), undefined, undefined,
-      undefined, [], ['alpha_unrelated <- 1'], undefined, async expression => {
-        assert.ok(expression === 'obj');
-        return [{ name: 'alpha' }];
-      }, 'alpha_unrelated', async (expression, kind) => {
-        assert.equal(expression, 'lst[[1]]');
-        assert.equal(kind, 'members');
-        return { members: [{ name: 'alpha' }] };
-      });
-    assert.deepEqual(entries.map(entry => entry.label), ['alpha'], marked);
+      undefined, [], ['alpha_unrelated <- 1'], undefined,
+      async () => assert.fail("must not call live member completion"),
+      'alpha_unrelated', async () => assert.fail("must not call nested child inspection"));
+    assert.deepEqual(entries, [], marked);
   }
 });
 
@@ -514,20 +509,14 @@ test("named subscript values do not invent cached columns", async () => {
   }
 });
 
-test("successful live member lookups supersede stale cached fields even without matches", async () => {
+test("cached member names do not run live object inspectors", async () => {
   const session = { globalenv: { obj: { names: ['alpha'], slots: ['alpha'] } } };
   for (const text of ['obj$', 'obj$al', 'obj@al']) {
-    for (const reply of [[], [{ name: 'beta' }]]) {
-      const context = completion.getCompletionContext(text, text.length);
-      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
-        session, [], [], undefined, async () => reply);
-      assert.deepEqual(entries.map(entry => entry.label), text === 'obj$' ? reply.map(item => item.name) : [], text);
-    }
-  }
-  for (const request of [undefined, async () => undefined, async () => { throw new Error('unavailable'); }]) {
-    const entries = await completion.collectCompletionEntries(completion.getCompletionContext('obj$al', 6),
-      undefined, undefined, session, [], [], undefined, request);
-    assert.deepEqual(entries.map(entry => entry.label), ['alpha']);
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(text, text.length),
+      undefined, undefined, session, [], [], undefined,
+      async () => assert.fail("automatic completion must not execute R methods"));
+    assert.deepEqual(entries.map(entry => entry.label), ['alpha'], text);
   }
 });
 
