@@ -127,76 +127,13 @@ console_source_function <- function(document, point, name) {
 
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
-console_member_function <- function(uri, workspace, document, point, source) {
-    # Whether the source shadows a live binding is independent of whether
-    # native inference succeeds. A failure must not abort runtime fallback.
-    bound <- console_source_member_binding(document, point, source)
-    resolved <- tryCatch({
-        location <- if (exists("member_call_location", asNamespace("languageserver"), inherits = FALSE))
-            languageserver:::member_call_location(document, point) else NULL
-        if (is.null(location)) NULL else languageserver:::member_resolve_cursor(
-            uri, workspace, document, location$point, location$cursor, location$cursor$token)
-    }, error = function(e) NULL)
+console_member_function <- function(uri, workspace, document, point) {
+    if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
+    location <- languageserver:::member_call_location(document, point)
+    if (is.null(location)) return(NULL)
+    resolved <- languageserver:::member_resolve_cursor(uri, workspace, document,
+        location$point, location$cursor, location$cursor$token)
     definition <- resolved$value$function_expr
-    if (!is.null(definition)) return(list(formals = definition[[2L]]))
-    if (bound) return(list(formals = NULL, unknown = TRUE))
-    NULL
-}
-
-# Extract a literal member path without evaluating an object or index.
-# Comparing paths, rather than root names, avoids invalidating obj$fun
-# when the source only changes an unrelated member such as obj$other.
-console_member_binding_path <- function(expr) {
-    fields <- character()
-    while (is.call(expr) && length(expr) == 3L && is.symbol(expr[[1L]])) {
-        operator <- as.character(expr[[1L]])
-        if (!operator %in% c("$", "@", "[[")) return(NULL)
-        field <- expr[[3L]]
-        if (is.symbol(field) && operator != "[[") field <- as.character(field)
-        if (!is.character(field) || length(field) != 1L) return(NULL)
-        fields <- c(paste0(if (operator == "@") "@" else "$", field), fields)
-        expr <- expr[[2L]]
-    }
-    if (!is.symbol(expr)) return(NULL)
-    c(as.character(expr), fields)
-}
-
-# Once a matching source write has completed, the existing runtime signature
-# is stale even if the replacement is a non-function or an unknown value.
-console_source_member_binding <- function(document, point, source) {
-    member <- tryCatch(str2lang(source), error = function(e) NULL)
-    path <- console_member_binding_path(member)
-    if (length(path) < 2L) return(FALSE)
-    if (!is.null(console_source_function(document, point, path[[1L]]))) return(TRUE)
-
-    xdoc <- languageserver:::parse_data_xml(document$parse_data)
-    if (is.null(xdoc)) return(FALSE)
-    row <- point$row + 1L
-    col <- point$col + 1L
-    before <- function(node) {
-        line <- as.integer(xml2::xml_attr(node, "line1"))
-        line < row || (line == row && as.integer(xml2::xml_attr(node, "col1")) <= col)
-    }
-    contains <- function(node) {
-        line <- as.integer(xml2::xml_attr(node, "line2"))
-        before(node) && (line > row || (line == row && as.integer(xml2::xml_attr(node, "col2")) >= col - 1L))
-    }
-    for (node in xml2::xml_find_all(xdoc, "//*[LEFT_ASSIGN or EQ_ASSIGN or RIGHT_ASSIGN]")) {
-        # Writes after the cursor or still inside an RHS cannot shadow it.
-        if (!before(node) || contains(node)) next
-        rightward <- length(xml2::xml_find_all(node, "RIGHT_ASSIGN")) > 0L
-        target <- xml2::xml_find_first(node, if (rightward) "expr[last()]" else "expr[1]")
-        if (inherits(target, "xml_missing")) next
-        written <- console_member_binding_path(console_source_expression(target))
-        if (length(written) < 2L || length(written) > length(path) ||
-            !identical(written, path[seq_along(written)])) next
-        scopes <- xml2::xml_find_all(node, "ancestor::expr[FUNCTION or OP-LAMBDA]")
-        if (!all(vapply(scopes, contains, logical(1)))) next
-        # Quoted and lazy arguments do not establish a binding in the caller.
-        delayed <- xml2::xml_find_all(node, paste0(
-            "ancestor-or-self::expr[preceding-sibling::*[1][self::EQ_FORMALS] or ",
-            "(preceding-sibling::OP-LEFT-PAREN and parent::expr[*[1][self::expr]])]"))
-        if (all(vapply(delayed, contains, logical(1)))) return(TRUE)
-    }
-    FALSE
+    if (is.null(definition)) return(NULL)
+    list(formals = definition[[2L]])
 }
