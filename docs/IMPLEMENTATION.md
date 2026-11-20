@@ -775,14 +775,13 @@ Completion data comes from one shared flow:
 
 - runtime/global-environment symbols come from the selected session integration's
   cached workspace data
-- `$` and `@` member completion uses native language-server inference when it
-  resolves the receiver, then falls back to the live session and cached fields
-  when needed
-- data-aware bracket and pipe-placeholder contexts use cached session metadata
-  and current input. Missing nested column names are requested through sess's
-  `workspace_children` API using its returned selectors and pages. Only names,
-  `$`/`@` chains and literal `[[` indices are inspected; calls and computed indices
-  are not sent to sess.
+- `$` and `@` member completion uses native language-server inference where
+  available and cached top-level workspace metadata otherwise. It does not
+  automatically request live member values.
+- data-aware bracket and pipe-placeholder contexts use cached workspace names.
+  Nested runtime-only names are omitted instead of using sess workspace_children,
+  which can invoke user-defined extraction or formatting methods. Static LSP
+  suggestions remain available when the source supplies the nested structure.
 - function arguments for live R functions come from targeted sess `hover` requests,
   not workspace-snapshot signatures or synthetic function documents. The
   language server parses the returned signature without evaluating the function

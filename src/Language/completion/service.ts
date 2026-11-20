@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
-import { isSessionFunctionCall, getSessionCompletions, getRuntimeMemberCompletions, getDataColumnCompletions, getRuntimeDataCompletions, hasTruncatedColumnNames } from "./runtime";
+import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
@@ -45,7 +45,6 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
-  const truncatedColumnNames = cachedColumnItems.length > 0 && hasTruncatedColumnNames(context, sessionData);
   const rawLspResult = await rawLspItemsRequest;
   const runtimeOnly = rawLspResult.runtimeOnly === true;
   const nativeMembers = !runtimeOnly &&
@@ -54,22 +53,13 @@ export async function collectCompletionEntries(
   // A package-inferred exhaustion must not override an unresolved live member.
   if (context.argumentTags && rawLspResult.argumentsExhausted &&
       !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
-  const [runtimeMemberItems, dataItems] = await Promise.all([
-    context.kind === "member" && !nativeMembers
-      ? getRuntimeMemberCompletions(context, requestRuntimeMemberCompletions, inspectRuntimeCompletion) : Promise.resolve(undefined),
-    !includeColumns || nativeFields || (context.kind === "bracket" && rawLspResult.memberResolved) ? Promise.resolve([]) :
-      cachedColumnItems.length > 0 && !truncatedColumnNames ? Promise.resolve(cachedColumnItems) :
-      getRuntimeDataCompletions(context, requestRuntimeMemberCompletions,
-        inspectRuntimeCompletion, truncatedColumnNames).then(items =>
-        items.columnsResolved || !cachedColumnItems.length ? items : cachedColumnItems),
-  ]);
-  const columnsIncomplete = (dataItems as CompletionEntries).isIncomplete === true;
+  // Live member/child inspection can invoke user-defined R methods. Only
+  // cached top-level names and non-executing LSP inference are automatic.
+  const dataItems = !includeColumns || nativeFields ||
+    (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
   if (context.kind === "member") {
-    // A successful live lookup is authoritative even when it is empty or no
-    // name matches. Cached fields are only a fallback for an unavailable probe.
-    const entries = runtimeOnly
-      ? runtimeMemberItems ?? (sessionItems.length ? sessionItems : rawLspResult.entries)
-      : nativeMembers ? rawLspResult.entries : runtimeMemberItems ?? sessionItems;
+    const entries = runtimeOnly ? sessionItems
+      : nativeMembers ? rawLspResult.entries : sessionItems;
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete);
   }
@@ -103,7 +93,7 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...columnFiltered,
       ...(!context.bracketQuote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete || columnsIncomplete);
+    ]), rawLspResult.isIncomplete);
   }
 
   if (context.kind === "argument") {
@@ -116,7 +106,7 @@ export async function collectCompletionEntries(
       ...(!context.argumentValue?.quote ? columnFiltered : []),
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete || columnsIncomplete);
+    ]), rawLspResult.isIncomplete);
   }
 
   const defaultColumnFiltered = filterCompletionEntries(dataItems, context.prefix);
@@ -129,7 +119,7 @@ export async function collectCompletionEntries(
       ...(!context.pipe ? fallbackBufferItems : []),
     ],
     context.prefix
-  )), rawLspResult.isIncomplete || columnsIncomplete);
+  )), rawLspResult.isIncomplete);
 }
 
 function asCompletionEntries(

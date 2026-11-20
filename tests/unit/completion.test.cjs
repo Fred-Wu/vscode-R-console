@@ -11,36 +11,29 @@ const completion = loadSource("src/Language/completion.ts", {
   },
 });
 
-test("runtime member completion adds calls only for callable members", async () => {
-  for (const operator of ["$", "@"]) {
-    const input = `obj${operator}`;
-    const context = completion.getCompletionContext(input, input.length);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
-      undefined, async (expression, trigger) => {
-        assert.equal(expression, "obj");
-        assert.equal(trigger, operator);
-        return [
-          { name: "fun", type: "closure" }, { name: "primitive", type: "builtin" },
-          { name: "special", type: "special" }, { name: "a b", str: "function (x)" },
-          { name: "field", type: "double" }, { name: "unknown" },
-        ];
-      });
-    assert.deepEqual(entries.map(entry => entry.insertText),
-      ["fun()", "primitive()", "special()", "`a b`()", "field", "unknown"]);
+test("automatic member completion uses cached workspace names without calling sess", async () => {
+  const workspace = { globalenv: { obj: { names: ["fun", "field"], slots: ["slot"] } } };
+  for (const [input, expected] of [["obj$", ["fun", "field"]], ["obj@", ["slot"]]]) {
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length),
+      undefined, undefined, workspace, [], [], undefined,
+      async () => assert.fail("automatic members must not call sess"));
+    assert.deepEqual(entries.map(item => item.label), expected, input);
   }
 });
 
-test("runtime-only member lookup wins over native source inference", async () => {
+test("runtime-only member lookup uses cached names, never live completion", async () => {
   const input = "obj$";
-  const context = completion.getCompletionContext(input, input.length);
-  let probes = 0;
-  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-    { line: 0, character: input.length }, { globalenv: { obj: { names: ["cached"] } } }, [], [],
-    { provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true, rConsoleMemberResolved: true,
-      items: [{ label: "source_only", kind: 4, data: { type: "member" } }] }) },
-    async () => { probes++; return [{ name: "live", type: "double" }]; });
-  assert.deepEqual(entries.map(item => item.label), ["live"]);
-  assert.equal(probes, 1);
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    { globalenv: { obj: { names: ["cached"] } } }, [], [],
+    { provideCompletionItems: async () => ({
+      rConsoleRuntimeOnly: true, rConsoleMemberResolved: true,
+      items: [{ label: "source_only", kind: 4, data: { type: "member" } }],
+    }) },
+    async () => assert.fail("must not request live members"));
+  assert.deepEqual(entries.map(item => item.label), ["cached"]);
 });
 
 test("runtime-only unresolved member signatures do not borrow native arguments or exhaustion", async () => {

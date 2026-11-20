@@ -1,15 +1,8 @@
 import { tokenize, TokenType, type Token } from "../../../Language/lexer";
-import type { SessionCompletionData, SessionCompletionKind, SessionMemberCompletionItem, WorkspaceData } from "../types";
+import type { SessionCompletionData, SessionCompletionKind, WorkspaceData } from "../types";
 
-type Selector = { kind: "index" | "name" | "slot"; value: string | number; name?: string };
 type Step = { operator: "$" | "@" | "[["; value: string | number };
-type Child = { selector: Selector; class?: string | string[]; type?: string };
-type Request = (method: "hover" | "workspace_children", params: Record<string, unknown>) => Promise<unknown>;
-
-// A sess request already has its own timeout. Bound the *total* amount of
-// sequential child paging that can block one interactive completion.
-const MAX_INSPECTION_PAGES = 64;
-const MAX_INSPECTION_DURATION_MS = 2000;
+type Request = (method: "hover", params: Record<string, unknown>) => Promise<unknown>;
 const MAX_INSPECTION_DEPTH = 16;
 
 function literalName(token: Token | undefined): string | undefined {
@@ -94,64 +87,7 @@ export async function inspectSessionCompletion(
       ? { signature: result.str } : undefined;
   }
 
-  const path: Selector[] = [];
-  const deadline = Date.now() + MAX_INSPECTION_DURATION_MS;
-  let pages = 0;
-  let metadata: { class?: string | string[]; type?: string } | undefined = workspace?.globalenv[target.name];
-  // sess workspace_children serializes class vectors as one comma-separated
-  // string, unlike top-level workspace metadata which carries an array.
-  const classNames = (classes: string | string[] | undefined): string[] | undefined =>
-    classes === undefined ? undefined : (Array.isArray(classes) ? classes : [classes])
-      .flatMap(value => value.split(",").map(name => name.trim()).filter(Boolean));
-  // Use selectors returned by sess: list indices, environment names and S4
-  // slots have different meanings even when their displayed names are equal.
-  for (let depth = 0; depth <= target.steps.length; depth++) {
-    const step = target.steps[depth];
-    if (!step && kind === "members" && metadata?.type &&
-        !["list", "pairlist", "environment"].includes(metadata.type)) return { members: [] };
-    const names: string[] = [];
-    const members: SessionMemberCompletionItem[] = [];
-    let selected: Child | undefined;
-    let start = 1;
-    do {
-      if (pages >= MAX_INSPECTION_PAGES || Date.now() >= deadline) {
-        if (step) return undefined;
-        return kind === "columns" ? { names, class: classNames(metadata?.class), incomplete: true }
-          : { members, incomplete: true };
-      }
-      pages++;
-      const result = await request("workspace_children", { name: target.name, path: [...path], start }) as
-        { children?: Child[]; next_start?: unknown } | undefined;
-      if (!Array.isArray(result?.children)) return undefined;
-      for (const child of result.children) {
-        const selector = child?.selector;
-        if (!selector || !["index", "name", "slot"].includes(selector.kind)) continue;
-        const name = selector.kind === "index" ? selector.name : selector.value;
-        if (!step) {
-          if (typeof name === "string" && name) {
-            if (kind === "columns") names.push(name);
-            else if (kind === "slots" ? selector.kind === "slot" : selector.kind !== "slot") {
-              members.push({ name, type: child.type });
-            }
-          }
-        } else if (step.operator === "@" ? selector.kind === "slot" && selector.value === step.value
-          : selector.kind !== "slot" && (typeof step.value === "number"
-            ? selector.kind === "index" && selector.value === step.value : name === step.value)) {
-          selected = child;
-          break;
-        }
-      }
-      if (selected) break;
-      if (result.next_start == null) break;
-      if (!Number.isSafeInteger(result.next_start) || (result.next_start as number) <= start) return undefined;
-      start = result.next_start as number;
-    } while (true);
-    if (!step) return kind === "columns"
-      ? { names, class: classNames(metadata?.class) }
-      : { members };
-    if (!selected) return undefined;
-    metadata = selected;
-    path.push(selected.selector);
-  }
+  // Nested object inspection may call user-defined extraction/format methods.
+  // Automatic member and column completions use cached workspace names or LSP.
   return undefined;
 }

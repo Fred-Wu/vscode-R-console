@@ -865,7 +865,7 @@ test("unknown runtime member signatures do not request expressions or borrow glo
   }
 });
 
-test("managed sess inspection restores runtime arguments and nested columns without executable requests", {
+test("managed sess inspection restores runtime arguments without probing nested values", {
   timeout: 90000, skip: !process.env.R_SESS_TEST_LIBRARY,
 }, async t => {
   const { inspectSessionCompletion } = loadSource("src/Runtime/VSCR/sess/completionInspection.ts");
@@ -903,13 +903,13 @@ test("managed sess inspection restores runtime arguments and nested columns with
     ['obj$fun(1, |)', ['mode = ', 'lazy = ']],
     ['obj$fun(mode = "au|")', ['auto']],
     ['slot_obj@fun(|)', ['slot_arg = ']],
-    ['nested[[1]][[|]]', ['"alpha"', '"beta"']],
-    ['obj$data[["al|"]]', ['alpha']],
+    ['nested[[1]][[|]]', []],
+    ['obj$data[["al|"]]', []],
     ['test[["xtest"]]$|', []],
     ['test[[1]]$|', []],
-    ['nested[[1]]$|', ['alpha', 'beta']],
-    ['objects[[1]]$|', ['fun()', 'data']],
-    ['objects[[2]]@|', ['fun()']],
+    ['nested[[1]]$|', []],
+    ['objects[[1]]$|', []],
+    ['objects[[2]]@|', []],
     ['objects[[3]]$|', []],
   ]) assert.deepEqual((await complete(marked)).map(item => item.insertText), expected, marked);
 
@@ -926,7 +926,7 @@ test("managed sess inspection restores runtime arguments and nested columns with
   assert.deepEqual(await complete('test <- data.frame(xtest = 1:1000)\ntest[["xtest"]]$|'), []);
   assert.equal(requests.length, count, "known source vectors do not query the session");
   assert.ok(requests.some(request => request.method === 'hover'));
-  assert.ok(requests.some(request => request.method === 'workspace_children'));
+  assert.ok(!requests.some(request => request.method === 'workspace_children'));
   assert.ok(requests.every(request => request.method !== 'completion'));
 });
 

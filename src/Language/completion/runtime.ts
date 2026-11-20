@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
-import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
-import type { CompletionContext, CompletionEntry, CompletionEntries, RuntimeMemberCompletionRequester, WorkspaceData, GlobalEnvItem } from "./types";
+import type { CompletionContext, CompletionEntry, WorkspaceData, GlobalEnvItem } from "./types";
 import { backtickRName, quoteRNameIfNeeded, getFieldInsertText } from "./candidates";
 import { allowsSymbolCompletions } from "./policy";
 
@@ -99,91 +98,4 @@ function asStringArray(value: string | string[] | undefined): string[] {
     return value.filter((item) => item.length > 0);
   }
   return value ? [value] : [];
-}
-
-/** vscode-R's automatic workspace snapshot caps names at 1000. */
-export function hasTruncatedColumnNames(context: CompletionContext, data: WorkspaceData | undefined): boolean {
-  if (!context.dataObjectName) return false;
-  const object = data?.globalenv?.[context.dataObjectName];
-  return typeof object?.length === "number" &&
-    object.length > asStringArray(object.names).length;
-}
-
-export async function getRuntimeDataCompletions(
-  context: CompletionContext,
-  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
-  inspectRuntimeCompletion?: SessionCompletionInspector,
-  preferInspectedColumns = false
-): Promise<CompletionEntries> {
-  if (!context.dataObjectName || context.bracketArgumentName) {
-    return [];
-  }
-
-  try {
-    if (context.kind === "bracket" || (preferInspectedColumns && inspectRuntimeCompletion)) {
-      const data = await inspectRuntimeCompletion?.(context.dataObjectName, "columns");
-      if (!data?.names) return [];
-      const entries = getDataColumnCompletions(context, {
-        globalenv: { [context.dataObjectName]: data },
-      }) as CompletionEntries;
-      entries.columnsResolved = true;
-      if (data.incomplete) entries.isIncomplete = true;
-      return entries;
-    }
-    if (!requestRuntimeMemberCompletions) return [];
-    const items = await requestRuntimeMemberCompletions(
-      context.dataObjectName,
-      "$"
-    );
-    if (!items || items.length === 0) {
-      return [];
-    }
-    return items
-      .filter((item) => typeof item.name === "string" && item.name.length > 0)
-      .map((item) => ({
-        label: item.name,
-        insertText: getFieldInsertText(item.name, context),
-        kind: vscode.CompletionItemKind.Field,
-        detail: context.dataObjectName,
-        source: "session" as const,
-      }));
-  } catch {
-    return [];
-  }
-}
-
-export async function getRuntimeMemberCompletions(
-  context: CompletionContext,
-  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
-  inspectRuntimeCompletion?: SessionCompletionInspector
-): Promise<CompletionEntry[] | undefined> {
-  if (
-    context.kind !== "member" ||
-    !context.objectName ||
-    !context.operator
-  ) {
-    return undefined;
-  }
-
-  try {
-    const items = context.indexedObject
-      ? (await inspectRuntimeCompletion?.(context.objectName, context.operator === "@" ? "slots" : "members"))?.members
-      : await requestRuntimeMemberCompletions?.(context.objectName, context.operator);
-    return items
-      ?.filter((item) => typeof item.name === "string" && item.name.length > 0)
-      .map((item) => {
-        const isFunction = isSessionFunction(item);
-        return {
-          label: item.name,
-          insertText: quoteRNameIfNeeded(item.name) + (isFunction ? "()" : ""),
-          kind: isFunction
-            ? vscode.CompletionItemKind.Function
-            : vscode.CompletionItemKind.Field,
-          detail: context.objectName,
-          source: "session" as const,
-        };
-      });
-  } catch {
-    return undefined;
-  }
 }
