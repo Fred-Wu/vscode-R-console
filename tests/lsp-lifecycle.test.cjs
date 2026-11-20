@@ -73,8 +73,12 @@ test("project startup supplies package libraries without session path probes", {
   projectClient = client;
   assert.ok((await complete("ggp")).some(item => item.label === pkg), "bare prefixes find project packages");
   assert.ok((await complete(pkg + "::proj")).some(item => item.label === "projectFunction"));
-  await waitFor(() => logs.some(line => line.includes(library.replaceAll(path.sep, "/"))),
-    "the output channel lists the project library");
+  // R canonicalizes Windows library roots; match the unique project folder
+  // and inventory count rather than comparing its entire absolute path.
+  const projectLibrary = `${path.basename(directory)}/.uvr/library - 1 package`;
+  await waitFor(() => logs.some(line =>
+    line.replaceAll("\\", "/").toLowerCase().includes(projectLibrary.toLowerCase())),
+  "the output channel lists the project library");
   assert.notEqual(client.workingDirectory, directory, "project startup must not enable project indexing");
   assert.ok(!instances[0].requests.some(request => request.method === "rConsole/syncSessionState"),
     "library discovery works without any session information");
