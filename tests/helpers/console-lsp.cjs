@@ -16,19 +16,11 @@ const uri = (value) => ({ toString: () => value });
 // Existing static-inference integration fixtures request it explicitly via
 // this helper's default. The extension setting and production default are off.
 function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env,
-  inspectRuntimeCompletion, staticAnalysis = true } = {}) {
+  staticAnalysis = true } = {}) {
   const instances = [];
   const logs = [];
   const runtimeSignatures = new Map();
   let staticMode = staticAnalysis;
-  const inspect = async (expression, kind) => {
-    const name = expression.startsWith("`") && expression.endsWith("`")
-      ? expression.slice(1, -1) : expression;
-    if (kind === "function" && runtimeSignatures.has(name)) {
-      return { signature: runtimeSignatures.get(name) };
-    }
-    return inspectRuntimeCompletion?.(expression, kind);
-  };
   class HostClientAdapter {
     constructor(_id, _name, serverOptions, options) {
       Object.assign(this, { serverOptions, options, running: false, requests: [], opened: [] });
@@ -122,7 +114,9 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
   });
   const client = new ConsoleLspClient({
     consoleId: "real-lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd, inspectRuntimeCompletion: inspect,
+    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd,
+    getCachedWorkspaceData: () => ({ globalenv: Object.fromEntries(
+      [...runtimeSignatures].map(([name, str]) => [name, { type: "closure", str }])) }),
     getStaticAnalysisEnabled: () => staticMode,
   });
   t.after(async () => {
