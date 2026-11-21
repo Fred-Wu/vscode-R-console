@@ -29,6 +29,7 @@ import type { CompletionPickItem, CompletionProvider, CompletionResult } from ".
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
+import { backtickRName } from "./completion/candidates";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
 
@@ -319,7 +320,10 @@ export class ConsoleLspClient implements CompletionProvider {
         const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
         if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
             !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
-          const item = globals[params.rConsoleCall];
+          const name = Object.hasOwn(globals, params.rConsoleCall)
+            ? params.rConsoleCall
+            : Object.keys(globals).find(key => backtickRName(key) === params.rConsoleCall);
+          const item = name === undefined ? undefined : globals[name];
           if (item && ["closure", "builtin", "special"].includes(item.type) &&
               typeof item.str === "string" && /^\s*function\s*\(/.test(item.str)) {
             (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = item.str;
