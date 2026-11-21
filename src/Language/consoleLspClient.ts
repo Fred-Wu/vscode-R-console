@@ -926,6 +926,8 @@ export class ConsoleLspClient implements CompletionProvider {
     env.VSCR_LSP_DEBUG = "FALSE";
     env.VSCR_USE_RENV_LIB_PATH = useRenvLibPath ? "TRUE" : "FALSE";
     env.VSCR_LIB_PATHS = libPaths.join("\n");
+    // On a replacement server, apply the last console snapshot before loading namespaces.
+    env.VSCR_RUNTIME_LIB_PATHS = this.runtimeLibraryPaths?.join("\n") ?? "";
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {
