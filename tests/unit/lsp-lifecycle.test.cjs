@@ -7,7 +7,7 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], inspectRuntimeCompletion, staticAnalysis = false } = {}) {
+function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false } = {}) {
   const instances = [];
   const logs = [];
   class LanguageClient {
@@ -61,7 +61,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
   });
   const client = new ConsoleLspClient({
     consoleId: "lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: "R", env: {}, inspectRuntimeCompletion,
+    rPath: "R", env: {}, getCachedWorkspaceData,
     getStaticAnalysisEnabled: () => staticAnalysis,
   });
   client.packageInventory.setLibraryPaths = () => {};
@@ -78,29 +78,21 @@ test("native member signatures never wait for runtime inspection", async t => {
   const { client } = createClient(t, {
     staticAnalysis: true,
     completion: () => ({ items: [], rConsoleLocalFunction: true }),
-    inspectRuntimeCompletion: async () => assert.fail("current source is authoritative, including empty signatures"),
   });
   const result = await client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
   assert.equal(result.rConsoleLocalFunction, true);
 });
 
-test("a pending runtime signature cannot resubmit completion against a newer document or session", async t => {
-  for (const replacement of ["document", "session"]) {
-    let release, entered;
-    const gate = new Promise(resolve => { release = resolve; });
-    const inspecting = new Promise(resolve => { entered = resolve; });
-    t.after(() => release(undefined));
-    const { client, instances } = createClient(t, {
-      inspectRuntimeCompletion: async () => { entered(); return gate; },
-    });
-    const pending = client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
-    await inspecting;
-    if (replacement === "document") await client.prepareDocument({ getText: () => "obj$other(" });
-    else await client.syncSessionState({ attachedPackages: ["stats"] });
-    release({ signature: "function(obsolete)" });
-    assert.equal(await pending, undefined);
-    assert.equal(instances[0].requests.filter(request => request.method === "completion").length, 1);
-  }
+test("cached workspace functions use one LSP request without sess inspection", async t => {
+  const { client, instances } = createClient(t, {
+    getCachedWorkspaceData: () => ({ globalenv: {
+      f: { type: "closure", str: "function(first, second = 2)" },
+    } }),
+    completion: (_client, params) => ({ items: [], seenSignature: params.rConsoleRuntimeSignature }),
+  });
+  const result = await client.provideCompletionItems({ getText: () => "f(" }, new Position(0, 2));
+  assert.equal(result.seenSignature, "function(first, second = 2)");
+  assert.equal(instances[0].requests.filter(request => request.method === "completion").length, 1);
 });
 
 test("first session snapshot keeps the running server", async (t) => {
@@ -292,23 +284,19 @@ test("cached session state reaches the LSP before its first launch", async () =>
   await lang.dispose();
 });
 
-test("a pending second LSP request cannot publish an obsolete sess signature", async t => {
-  let release, inspected;
-  const secondReply = new Promise(resolve => { release = resolve; });
-  const inspecting = new Promise(resolve => { inspected = resolve; });
+test("a pending LSP response cannot publish after the runtime changes", async t => {
+  let release, entered;
+  const reply = new Promise(resolve => { release = resolve; });
+  const waiting = new Promise(resolve => { entered = resolve; });
   t.after(() => release({ items: [] }));
   let requests = 0;
   const { client } = createClient(t, {
-    inspectRuntimeCompletion: async () => ({ signature: "function(old_arg)" }),
-    completion: async () => {
-      if (++requests === 2) { inspected(); return secondReply; }
-      return { items: [] };
-    },
+    completion: async () => { requests++; entered(); return reply; },
   });
-  const pending = client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
-  await inspecting;
+  const pending = client.provideCompletionItems({ getText: () => "f(" }, new Position(0, 2));
+  await waiting;
   client.invalidateRuntimeCompletion();
   release({ items: [{ label: "old_arg", detail: "parameter" }] });
   assert.equal(await pending, undefined);
-  assert.equal(requests, 2);
+  assert.equal(requests, 1);
 });
