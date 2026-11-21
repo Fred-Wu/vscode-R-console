@@ -10,6 +10,8 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 mod unix_host {
     use crate::console_input::ConsoleInput;
     use crate::library_paths::{self, LibraryPathsApi};
+    use crate::member_inspection::{self, InspectorApi, MemberQuery};
+    use crate::member_inspection::{self, InspectorApi, MemberQuery};
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -131,6 +133,8 @@ mod unix_host {
         r_base_env_ptr: *mut Sexp,
         r_nil_value_ptr: *mut Sexp,
         library_paths_api: LibraryPathsApi,
+        inspector_api: Option<InspectorApi>,
+        inspector_api: Option<InspectorApi>,
     }
 
     struct HostRuntime {
@@ -174,6 +178,8 @@ mod unix_host {
         Submit(VecDeque<Vec<u8>>),
         Reply(Vec<u8>),
         ParseStatus { request_id: u32, code: String },
+        MemberNames { request_id: u32, query: MemberQuery },
+        MemberNames { request_id: u32, query: MemberQuery },
     }
 
     enum WaitKind {
@@ -189,6 +195,8 @@ mod unix_host {
     static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
     static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
     static LIBRARY_PATHS_API: OnceLock<LibraryPathsApi> = OnceLock::new();
+    static INSPECTOR_API: OnceLock<Option<InspectorApi>> = OnceLock::new();
+    static INSPECTOR_API: OnceLock<Option<InspectorApi>> = OnceLock::new();
     static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
@@ -250,7 +258,9 @@ mod unix_host {
         let library_path = resolve_r_library_path(&r_executable)?;
         let api = unsafe { RApi::load(&library_path)? };
 
-        let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
+        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        if api.inspector_api.is_some() { capabilities.push("member-inspection"); }
+        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
             let _ =
@@ -284,6 +294,10 @@ mod unix_host {
         LIBRARY_PATHS_API
             .set(api.library_paths_api())
             .map_err(|_| "library paths api already initialized")?;
+        INSPECTOR_API.set(api.inspector_api)
+            .map_err(|_| "member inspection api already initialized")?;
+        INSPECTOR_API.set(api.inspector_api)
+            .map_err(|_| "member inspection api already initialized")?;
 
         if let Some(width) = initial_console_width_from_env() {
             if let Err(error) = apply_console_width(width) {
@@ -605,6 +619,8 @@ mod unix_host {
             IncomingCommand::ParseStatus { request_id, code } => {
                 queue_parse_status(request_id, code)
             }
+            IncomingCommand::MemberNames { request_id, query } => queue_member_names(request_id, query),
+            IncomingCommand::MemberNames { request_id, query } => queue_member_names(request_id, query),
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
@@ -650,6 +666,66 @@ mod unix_host {
                 .pending_commands
                 .push_back(PendingCommand::ParseStatus { request_id, code });
             runtime.cv.notify_all();
+        }
+    }
+
+    fn queue_member_names(request_id: u32, query: MemberQuery) {
+        let Some(runtime) = host_runtime() else { return };
+        let mut state = runtime.state.lock().expect("host state lock poisoned");
+        // Never inspect while a submission is queued or R is in a nested input.
+        let idle = !state.busy && !state.shutdown_requested &&
+            !state.startup_input_pending && state.active_submission_lines.is_empty() &&
+            state.pending_fragment.is_none() &&
+            matches!(state.wait_state.as_ref(), Some(StoredWaitState::TopLevel(PromptKind::Main))) &&
+            !state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_)));
+        if idle && INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            state.pending_commands.push_back(PendingCommand::MemberNames { request_id, query });
+            runtime.cv.notify_all();
+        } else {
+            drop(state);
+            let _ = runtime.output.emit_member_names_result(request_id, None);
+        }
+    }
+
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, MemberQuery)> {
+        if state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_))) {
+            return None;
+        }
+        let index = state.pending_commands.iter().position(|command|
+            matches!(command, PendingCommand::MemberNames { .. }))?;
+        match state.pending_commands.remove(index)? {
+            PendingCommand::MemberNames { request_id, query } => Some((request_id, query)),
+            _ => None,
+        }
+    }
+
+    fn queue_member_names(request_id: u32, query: MemberQuery) {
+        let Some(runtime) = host_runtime() else { return };
+        let mut state = runtime.state.lock().expect("host state lock poisoned");
+        // Never inspect while a submission is queued or R is in a nested input.
+        let idle = !state.busy && !state.shutdown_requested &&
+            !state.startup_input_pending && state.active_submission_lines.is_empty() &&
+            state.pending_fragment.is_none() &&
+            matches!(state.wait_state.as_ref(), Some(StoredWaitState::TopLevel(PromptKind::Main))) &&
+            !state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_)));
+        if idle && INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            state.pending_commands.push_back(PendingCommand::MemberNames { request_id, query });
+            runtime.cv.notify_all();
+        } else {
+            drop(state);
+            let _ = runtime.output.emit_member_names_result(request_id, None);
+        }
+    }
+
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, MemberQuery)> {
+        if state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_))) {
+            return None;
+        }
+        let index = state.pending_commands.iter().position(|command|
+            matches!(command, PendingCommand::MemberNames { .. }))?;
+        match state.pending_commands.remove(index)? {
+            PendingCommand::MemberNames { request_id, query } => Some((request_id, query)),
+            _ => None,
         }
     }
 
@@ -959,6 +1035,28 @@ mod unix_host {
                 }
                 READ_CONSOLE_INTERRUPTED.store(true, Ordering::Relaxed);
                 return 0;
+            }
+
+            if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+                if let Some((request_id, query)) = take_next_member_request(&mut state) {
+                    drop(state);
+                    let names = INSPECTOR_API.get().copied().flatten()
+                        .and_then(|api| member_inspection::inspect(api, query));
+                    let _ = runtime.output.emit_member_names_result(request_id, names.as_deref());
+                    state = runtime.state.lock().expect("host state lock poisoned");
+                    continue;
+                }
+            }
+
+            if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+                if let Some((request_id, query)) = take_next_member_request(&mut state) {
+                    drop(state);
+                    let names = INSPECTOR_API.get().copied().flatten()
+                        .and_then(|api| member_inspection::inspect(api, query));
+                    let _ = runtime.output.emit_member_names_result(request_id, names.as_deref());
+                    state = runtime.state.lock().expect("host state lock poisoned");
+                    continue;
+                }
             }
 
             if let Some((request_id, code)) = take_next_parse_request(&mut state) {
@@ -1602,6 +1700,10 @@ mod unix_host {
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
                 r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                inspector_api: InspectorApi::load(|name| library.get::<*const c_void>(name).ok()
+                    .map(|value| *value as usize)),
+                inspector_api: InspectorApi::load(|name| library.get::<*const c_void>(name).ok()
+                    .map(|value| *value as usize)),
                 library_paths_api: LibraryPathsApi {
                     install: load_function(&library, b"Rf_install\0")?,
                     lang1: load_function(&library, b"Rf_lang1\0")?,
@@ -2119,7 +2221,9 @@ mod windows_host {
         let layout = resolve_r_layout(&r_executable)?;
         let mut api = unsafe { RApi::load(&layout)? };
 
-        let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
+        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        if api.inspector_api.is_some() { capabilities.push("member-inspection"); }
+        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
             let _ =

@@ -242,7 +242,7 @@ test("Unicode member and argument prefixes preserve the object and full replacem
   }
 });
 
-test("member completion parses token-derived objects without live inspection", async () => {
+test("member completion parses token-derived objects without evaluating draft code", async () => {
   for (const [input, objectName, prefix] of [
     ["obj $ nested @ sl", "obj$nested", "sl"],
     ["obj$ # comment\n nested$fi", "obj$nested", "fi"],
@@ -258,7 +258,7 @@ test("member completion parses token-derived objects without live inspection", a
     assert.equal(context.prefix, prefix, input);
     assert.equal(context.replaceStart, line.length - prefix.length, input);
     await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async () => assert.fail("automatic member completion must not send sess requests"));
+      async () => undefined /* Optional guarded native completion, never sess evaluation */);
   }
 });
 

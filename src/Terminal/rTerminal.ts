@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
 import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
@@ -285,6 +285,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       cwd: this.options.cwd,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       onPackagesChanged: () => this.dismissInlineCompletion(false),
+      requestRuntimeMemberCompletions: (expression, operator) => {
+        const query = parseRuntimeMemberQuery(expression, operator === "@");
+        const response = query && this.runtimeBackend?.requestMemberNames?.(this.rProcess, query);
+        return response?.then(names => names?.map(name => ({ name })));
+      },
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });

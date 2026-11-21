@@ -25,11 +25,11 @@ test("workspace members and slots use cached metadata without any R inspection",
 
 test("nested objects cannot trigger live extraction or hover", async () => {
   const workspace = { globalenv: { obj: { type: "list", names: ["inner"] } } };
-  const reject = async () => assert.fail("nested completion must not invoke sess");
+  const unavailable = async () => undefined; // No safe inspector available.
   for (const input of ["obj$inner$", "obj$inner[[", 'obj[["inner"]]$', "obj[[1]][[", "obj$inner@"]) {
     const context = completion.getCompletionContext(input, input.length);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined,
-      workspace, [], [], undefined, reject, undefined, reject);
+      workspace, [], [], undefined, unavailable);
     assert.deepEqual(entries.filter(item => item.source === "session"), [], input);
   }
 });
@@ -62,4 +62,44 @@ test("truncated workspace names never cause child-page requests", async () => {
       workspace, [], [], undefined, reject, undefined, reject);
     assert.equal(entries.some(item => item.label === label), present, input);
   }
+});
+
+test("safe existing-session nested members override runtime-only LSP and retain quoting", async () => {
+  const input = "obj$inner$";
+  const workspace = { globalenv: { obj: { type: "list", names: ["inner"] } } };
+  const requested = [];
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    workspace, [], [],
+    { provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true,
+      items: [{ label: "source_only", kind: 4, data: { type: "member" } }] }) },
+    async (expression, operator) => {
+      requested.push([expression, operator]);
+      return [{ name: "alpha" }, { name: "a b" }];
+    });
+  assert.deepEqual(requested, [["obj$inner", "$"]]);
+  assert.deepEqual(entries.map(item => item.label), ["alpha", "a b"]);
+  assert.deepEqual(entries.map(item => item.insertText), ["alpha", "`a b`"]);
+  assert.ok(entries.every(item => item.source === "session"));
+});
+
+test("nested bracket fields use the same safe session result and quote names", async () => {
+  const input = "obj$inner[[";
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length), undefined, undefined,
+    undefined, [], [], undefined, async () => [{ name: "a b" }]);
+  assert.deepEqual(entries.filter(item => item.label === "a b").map(item => item.insertText), ['"a b"']);
+});
+
+test("static source member resolution remains authoritative without a native probe", async () => {
+  const input = "obj$inner$";
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    undefined, [], [], { provideCompletionItems: async () => ({
+      rConsoleMemberResolved: true,
+      items: [{ label: "source", kind: 4, data: { type: "member" } }],
+    }) }, async () => assert.fail("source inference must not request native inspection"));
+  assert.deepEqual(entries.map(item => item.label), ["source"]);
 });

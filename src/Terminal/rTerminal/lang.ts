@@ -6,6 +6,7 @@ import {
   type CompletionContext,
   type CompletionProvider,
   CompletionPickItem,
+  type RuntimeMemberCompletionRequester,
   collectCompletionEntries,
   getCompletionContext,
   rankCompletionEntries,
@@ -33,6 +34,7 @@ type LangOptions = {
   getRecentSessionEntries?: () => string[];
   onPackagesChanged?: () => void;
   getStaticAnalysisEnabled?: () => boolean;
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
 };
 
 type AutocompleteRequest = {
@@ -150,7 +152,7 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          undefined,
+          this.options.requestRuntimeMemberCompletions,
           latestInput.text
         );
       })();
@@ -238,7 +240,7 @@ export class RTermLang {
             lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            undefined,
+            this.options.requestRuntimeMemberCompletions,
             nextInputText
           );
           return nextEntries;

@@ -9,6 +9,7 @@ import { StringDecoder } from "string_decoder";
 import {
   type BackendCapability,
   type BackendControlEvent,
+  type MemberInspectionQuery,
   type BackendDialogResult,
   BackendFrameSizeError,
   BACKEND_PROTOCOL_VERSION,
@@ -18,6 +19,7 @@ import {
   encodeDialogResultFrame,
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
+  encodeMemberNamesRequestFrame,
   encodeReplyInputFrame,
   encodeSetWidthFrame,
   encodeShutdownFrame,
@@ -72,6 +74,7 @@ type BackendSessionState = {
   capabilities: Set<BackendCapability>;
   hostConnected: boolean;
   nextRequestId: number;
+  pendingMemberRequests: Map<number, { resolve: (names: string[] | undefined) => void; timeout: NodeJS.Timeout }>;
   pendingParseRequests: Map<
     number,
     {
@@ -99,6 +102,7 @@ type SessionBootstrapFile = {
 };
 
 const PARSE_STATUS_TIMEOUT_MS = 150;
+const MEMBER_NAMES_TIMEOUT_MS = 500;
 const SESSION_BOOTSTRAP_TIMEOUT_MS = 5000;
 const SESSION_BOOTSTRAP_POLL_MS = 40;
 const INITIAL_CONNECT_GRACE_MS = 60000;
@@ -114,6 +118,7 @@ export interface RuntimeBackend {
   canUseSessionCommands(session: RuntimeSessionHandle | null): boolean;
   sendSessionCommand(session: RuntimeSessionHandle | null, command: RuntimeSessionCommand): boolean;
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined;
+  requestMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<string[] | undefined> | undefined;
   close(session: RuntimeSessionHandle): void;
   isAlive(session: RuntimeSessionHandle | null): boolean;
   getPid(session: RuntimeSessionHandle | null): number | undefined;
@@ -159,6 +164,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       hostConnected: false,
       nextRequestId: 0,
       pendingParseRequests: new Map(),
+      pendingMemberRequests: new Map(),
+      pendingMemberRequests: new Map(),
+      pendingMemberRequests: new Map(),
       child,
       childListenersAttached: false,
       sessionFilePath,
@@ -231,6 +239,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.socket = undefined;
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
+        this.resolvePendingMemberRequests(state);
         this.cleanupSessionBootstrapFile(state);
         state.handlers?.onExit?.(code ?? 0);
       });
@@ -242,6 +251,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.socket = undefined;
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
+        this.resolvePendingMemberRequests(state);
         this.cleanupSessionBootstrapFile(state);
         state.handlers?.onError?.(error instanceof Error ? error : new Error(String(error)));
       });
@@ -261,6 +271,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     state.hostConnected = false;
     state.socketCarry = Buffer.alloc(0);
     this.resolvePendingParseRequests(state, 1);
+    this.resolvePendingMemberRequests(state);
     state.socket?.destroy();
     state.socket = undefined;
   }
@@ -305,6 +316,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         if (!state.capabilities.has("top-level-submit")) {
           return false;
         }
+        this.resolvePendingMemberRequests(state);
         return this.writeFrame(state, encodeSubmitFrame(command.code));
       case "interrupt":
         return this.writeFrame(state, encodeInterruptFrame());
@@ -328,6 +340,33 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       state.handlers?.onStderr?.(`${error.message}\n`);
       return false;
     }
+  }
+
+  requestMemberNames(
+    session: RuntimeSessionHandle | null, query: MemberInspectionQuery
+  ): Promise<string[] | undefined> | undefined {
+    if (!session) return undefined;
+    const state = this.sessionStates.get(session);
+    if (!state?.hostConnected || !state.capabilities.has("member-inspection") ||
+        state.pendingMemberRequests.size >= 16) return undefined;
+    return new Promise<string[] | undefined>(resolve => {
+      const requestId = ++state.nextRequestId;
+      const timeout = setTimeout(() => {
+        const pending = state.pendingMemberRequests.get(requestId);
+        if (!pending) return;
+        state.pendingMemberRequests.delete(requestId);
+        pending.resolve(undefined);
+      }, MEMBER_NAMES_TIMEOUT_MS);
+      state.pendingMemberRequests.set(requestId, { resolve, timeout });
+      try {
+        if (this.writeFrame(state, encodeMemberNamesRequestFrame(requestId, query))) return;
+      } catch {
+        // Invalid paths must never reach the R backend.
+      }
+      state.pendingMemberRequests.delete(requestId);
+      clearTimeout(timeout);
+      resolve(undefined);
+    });
   }
 
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined {
@@ -527,6 +566,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           state.hostConnected = false;
           socket.destroy();
           this.resolvePendingParseRequests(state, 1);
+          this.resolvePendingMemberRequests(state);
           state.handlers?.onError?.(error as Error);
           return;
         }
@@ -556,6 +596,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           return;
         }
         this.resolvePendingParseRequests(state, 1);
+        this.resolvePendingMemberRequests(state);
         if (state.hostConnected && isSocketDisconnectError(error)) {
           return;
         }
@@ -574,6 +615,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.socket = undefined;
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
+        this.resolvePendingMemberRequests(state);
         if (!state.explicitClose && wasHostConnected) {
           state.handlers?.onExit?.(0);
         }
@@ -747,6 +789,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           state.reconnectInfo.pid = event.pid;
         }
         return;
+      case "member-names-result": {
+        const pending = state.pendingMemberRequests.get(event.requestId);
+        if (!pending) return;
+        state.pendingMemberRequests.delete(event.requestId);
+        clearTimeout(pending.timeout);
+        pending.resolve(event.names);
+        return;
+      }
       case "parse-status-result": {
         const pending = state.pendingParseRequests.get(event.requestId);
         if (!pending) {
@@ -760,6 +810,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       default:
         return;
     }
+  }
+
+  private resolvePendingMemberRequests(state: BackendSessionState): void {
+    for (const pending of state.pendingMemberRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve(undefined);
+    }
+    state.pendingMemberRequests.clear();
   }
 
   private resolvePendingParseRequests(state: BackendSessionState, status: number): void {

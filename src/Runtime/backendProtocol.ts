@@ -47,6 +47,8 @@ const FrameKind = {
   HostError: 19,
   SessionState: 20,
   LibraryPaths: 21,
+  MemberNamesRequest: 25,
+  MemberNamesResult: 26,
 } as const;
 
 export type BackendCapability =
@@ -56,7 +58,8 @@ export type BackendCapability =
   | "top-level-submit"
   | "nested-input"
   | "parse-status"
-  | "set-width";
+  | "set-width"
+  | "member-inspection";
 
 export type BackendDialogRequest =
   | {
@@ -85,6 +88,16 @@ export type BackendDialogResult =
       kind: "edit-files";
       completed: boolean;
     };
+
+export type MemberInspectionStep =
+  | { kind: "field" | "slot"; name: string }
+  | { kind: "index"; index: number };
+
+export type MemberInspectionQuery = {
+  root: string;
+  steps: MemberInspectionStep[];
+  slots: boolean;
+};
 
 export type BackendControlEvent =
   | {
@@ -124,6 +137,11 @@ export type BackendControlEvent =
       type: "parse-status-result";
       requestId: number;
       status: number;
+    }
+  | {
+      type: "member-names-result";
+      requestId: number;
+      names?: string[];
     }
   | {
       type: "host-error";
@@ -175,7 +193,8 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "top-level-submit" ||
     value === "nested-input" ||
     value === "parse-status" ||
-    value === "set-width"
+    value === "set-width" ||
+    value === "member-inspection"
   );
 }
 
@@ -323,6 +342,21 @@ function parseControlFrame(
       };
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
+    case FrameKind.MemberNamesResult: {
+      if (payload.length > 1024 * 1024 || (payload[0] !== 0 && payload[0] !== 1)) {
+        throw new Error("invalid member inspection result");
+      }
+      if (payload[0] === 0 && payload.length === 1) {
+        return { type: "member-names-result", requestId };
+      }
+      const count = parseU32(payload, 1);
+      if (count > 1000) throw new Error("too many inspected members");
+      const parsed = parseStringArray(payload, 1);
+      if (parsed.offset !== payload.length || parsed.values.some(name => Buffer.byteLength(name, "utf8") > 4096)) {
+        throw new Error("invalid inspected member names");
+      }
+      return { type: "member-names-result", requestId, names: parsed.values };
+    }
     case FrameKind.ParseStatusResult:
       return {
         type: "parse-status-result",
@@ -550,4 +584,34 @@ export function encodeParseStatusRequestFrame(
 
 export function encodeShutdownFrame(): Buffer {
   return createFrame(FrameKind.Shutdown, 0, Buffer.alloc(0));
+}
+
+export function encodeMemberNamesRequestFrame(requestId: number, query: MemberInspectionQuery): Buffer {
+  if (query.steps.length > 12 || query.steps.length === 0 || query.root.length === 0 ||
+      Buffer.byteLength(query.root, "utf8") > 4096) {
+    throw new Error("invalid member inspection request");
+  }
+  const encodeString = (value: string): Buffer => {
+    const bytes = Buffer.from(value, "utf8");
+    if (!bytes.length || bytes.length > 4096 || value.includes("\0")) throw new Error("invalid member name");
+    const result = Buffer.allocUnsafe(4 + bytes.length);
+    result.writeUInt32LE(bytes.length, 0);
+    bytes.copy(result, 4);
+    return result;
+  };
+  const parts: Buffer[] = [Buffer.from([query.slots ? 1 : 0, query.steps.length]), encodeString(query.root)];
+  for (const step of query.steps) {
+    if (step.kind === "index") {
+      if (!Number.isSafeInteger(step.index) || step.index < 1 || step.index > 100000) {
+        throw new Error("invalid member index");
+      }
+      const part = Buffer.allocUnsafe(5);
+      part[0] = 2;
+      part.writeUInt32LE(step.index, 1);
+      parts.push(part);
+    } else {
+      parts.push(Buffer.from([step.kind === "slot" ? 1 : 0]), encodeString(step.name));
+    }
+  }
+  return createFrame(FrameKind.MemberNamesRequest, requestId, Buffer.concat(parts));
 }
