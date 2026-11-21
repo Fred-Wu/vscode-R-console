@@ -93,3 +93,41 @@ test("outbound commands enforce Rust's 16 MiB payload limit using UTF-8 bytes", 
     /16 MiB backend frame limit/
   );
 });
+
+function pathPayload(paths) {
+  const chunks = [Buffer.alloc(4)];
+  chunks[0].writeUInt32LE(paths.length);
+  for (const value of paths) {
+    const encoded = Buffer.from(value, "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(encoded.length);
+    chunks.push(len, encoded);
+  }
+  return Buffer.concat(chunks);
+}
+
+test("library-path control frames preserve ordered paths, Unicode and removals", () => {
+  const snapshots = [
+    ["C:/用户/library", "C:/base/library"],
+    ["C:/base/library", "C:/用户/library"],
+    ["C:/base/library"],
+  ];
+  const bytes = Buffer.concat(snapshots.map(paths => frame(21, pathPayload(paths))));
+  const expected = snapshots.map(paths => ({ type: "library-paths", paths }));
+  for (let split = 0; split <= bytes.length; split++) {
+    const first = protocol.parseBackendFrames(bytes.subarray(0, split));
+    const second = protocol.parseBackendFrames(bytes.subarray(split), first.carry);
+    assert.equal(first.error ?? second.error, undefined);
+    assert.deepEqual([...first.events, ...second.events], expected);
+  }
+});
+
+test("library-path snapshots reject malformed and unbounded lists", () => {
+  const extra = Buffer.concat([pathPayload(["/base"]), Buffer.from([1])]);
+  assert.match(protocol.parseBackendFrames(frame(21, extra)).error, /payload length/);
+  const tooMany = Buffer.alloc(4);
+  tooMany.writeUInt32LE(257);
+  assert.match(protocol.parseBackendFrames(frame(21, tooMany)).error, /too many library paths/);
+  assert.match(protocol.parseBackendFrames(frame(21, Buffer.from([1, 0]))).error, /truncated/);
+  assert.match(protocol.parseBackendFrames(frame(21, Buffer.alloc(128 * 1024 + 5))).error, /size limit/);
+});
