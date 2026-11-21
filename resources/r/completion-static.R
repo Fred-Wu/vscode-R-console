@@ -1,3 +1,4 @@
+# Optional static analysis of unsubmitted console source. This file is only consulted when enabled.
 # Syntax-only fallback for lexical bindings in unfinished console input.
 console_source_expression <- function(node) {
     leaves <- xml2::xml_find_all(node, ".//*[not(*) and not(self::COMMENT)]")

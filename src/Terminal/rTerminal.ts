@@ -55,9 +55,7 @@ import {
   attachRuntimeSession,
   primeRuntimeAttach,
   updateRuntimeTerminalName,
-  getRuntimeWorkspaceData,
   type RuntimeHost,
-  requestRuntimeMemberCompletions,
   startNextRuntimeSubmission,
   type Submission,
   type TerminalMode,
@@ -284,11 +282,11 @@ export class RTerminal implements vscode.Pseudoterminal {
       extensionPath: this.extensionPath,
       rPath: this.options.rPath,
       env: this.options.env,
+      cwd: this.options.cwd,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
-      requestWorkspaceData: async () =>
-        await getRuntimeWorkspaceData(this.runtimeHost()),
-      requestMemberCompletions: async (expression, operator) =>
-        await requestRuntimeMemberCompletions(this.runtimeHost(), expression, operator),
+      onPackagesChanged: () => this.dismissInlineCompletion(false),
+      getStaticAnalysisEnabled: () =>
+        vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
 
     this.syntax = new ConsoleSyntax(

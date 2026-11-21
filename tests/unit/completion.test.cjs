@@ -11,23 +11,47 @@ const completion = loadSource("src/Language/completion.ts", {
   },
 });
 
-test("runtime member completion adds calls only for callable members", async () => {
-  for (const operator of ["$", "@"]) {
-    const input = `obj${operator}`;
-    const context = completion.getCompletionContext(input, input.length);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
-      undefined, async (expression, trigger) => {
-        assert.equal(expression, "obj");
-        assert.equal(trigger, operator);
-        return [
-          { name: "fun", type: "closure" }, { name: "primitive", type: "builtin" },
-          { name: "special", type: "special" }, { name: "a b", str: "function (x)" },
-          { name: "field", type: "double" }, { name: "unknown" },
-        ];
-      });
-    assert.deepEqual(entries.map(entry => entry.insertText),
-      ["fun()", "primitive()", "special()", "`a b`()", "field", "unknown"]);
+test("automatic member completion uses cached workspace names without calling sess", async () => {
+  const workspace = { globalenv: { obj: { names: ["fun", "field"], slots: ["slot"] } } };
+  for (const [input, expected] of [["obj$", ["fun", "field"]], ["obj@", ["slot"]]]) {
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length),
+      undefined, undefined, workspace, [], [], undefined,
+      async () => assert.fail("automatic members must not call sess"));
+    assert.deepEqual(entries.map(item => item.label), expected, input);
   }
+});
+
+test("runtime-only member lookup uses cached names, never live completion", async () => {
+  const input = "obj$";
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    { globalenv: { obj: { names: ["cached"] } } }, [], [],
+    { provideCompletionItems: async () => ({
+      rConsoleRuntimeOnly: true, rConsoleMemberResolved: true,
+      items: [{ label: "source_only", kind: 4, data: { type: "member" } }],
+    }) },
+    async () => assert.fail("must not request live members"));
+  assert.deepEqual(entries.map(item => item.label), ["cached"]);
+});
+
+test("runtime-only unresolved member signatures do not borrow native arguments or exhaustion", async () => {
+  const input = "obj$fun(";
+  const context = completion.getCompletionContext(input, input.length);
+  const native = { label: "stale", kind: 5, detail: "parameter" };
+  const provider = result => ({ provideCompletionItems: async () => ({
+    rConsoleRuntimeOnly: true, rConsoleNativeArguments: true, rConsoleArgumentsExhausted: true,
+    items: [native], ...result,
+  }) });
+  const stale = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, undefined, [], [], provider({}));
+  assert.deepEqual(stale.filter(item => item.detail === "parameter"), []);
+  const live = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, undefined, [], [],
+    provider({ rConsoleWorkspaceFunction: true, rConsoleArgumentsExhausted: false, items: [{ label: "new_arg",
+      kind: 5, detail: "parameter" }] }));
+  assert.deepEqual(live.filter(item => item.detail === "parameter").map(item => item.label), ["new_arg"]);
 });
 
 test("namespace completion normalizes bare callable names and preserves existing calls", async () => {
@@ -69,21 +93,18 @@ test("argument context preserves qualified calls across nested arguments and lin
   }
 });
 
-test("session member formals replace unrelated LSP arguments and remain in the Arguments group", async () => {
+test("native member formals supply arguments and remain in the Arguments group", async () => {
   for (const operator of ["$", "@"]) {
     const input = `obj${operator}lm(`;
     const context = completion.getCompletionContext(input, input.length);
     const entries = await completion.collectCompletionEntries(context, { getText: () => input },
       { line: 0, character: input.length }, undefined, [], [], {
-        provideCompletionItems: async () => [
-          { label: "formula", insertText: "formula = ", kind: 5, detail: "parameter" },
-          { label: "data", kind: 5 },
-        ],
-      }, async (expression, trigger) => {
-        assert.ok(expression.includes(`.fn <- (obj${operator}lm);`));
-        assert.equal(trigger, "$");
-        return [{ name: "member_arg" }, { name: "a b" }, { name: "..." }];
-      });
+        provideCompletionItems: async () => ({ rConsoleNativeArguments: true, items: [
+          { label: "member_arg", insertText: "member_arg = ", kind: 5, detail: "parameter" },
+          { label: "a b", insertText: "`a b` = ", kind: 5, detail: "parameter" },
+          { label: "...", insertText: "...", kind: 5, detail: "parameter" },
+        ] }),
+      }, async () => { assert.fail("member arguments must use languageserver"); });
     assert.deepEqual(entries.map(entry => entry.insertText), ["member_arg = ", "`a b` = ", "..."]);
     const picks = completion.toCompletionQuickPickItems(entries, context);
     assert.equal(picks[0].label, "Arguments");
@@ -116,23 +137,22 @@ test("bare session functions supply their own arguments, including quoted callab
     let requests = 0;
     const entries = await completion.collectCompletionEntries(context, { getText: () => input },
       { line: 0, character: input.length }, { globalenv: { [name]: { type: "closure" } } }, [], [], {
-        provideCompletionItems: async () => [
-          { label: "wrong", detail: "parameter", kind: 5 },
-          { label: "wrong value", detail: "value for wrong", kind: 5 },
-        ],
+        provideCompletionItems: async () => ({ rConsoleWorkspaceFunction: true, items: [
+          { label: "a b", insertText: "`a b` = ", detail: "parameter", kind: 5 },
+          { label: "normal", insertText: "normal = ", detail: "parameter", kind: 5 },
+        ] }),
       }, async expression => {
         requests++;
-        assert.ok(expression.includes(`.fn <- (${source});`));
-        return [{ name: "a b" }, { name: "normal" }];
+        assert.fail("workspace arguments must not query sess");
       });
-    assert.equal(requests, 1, source);
+    assert.equal(requests, 0, source);
     assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.insertText),
       ["`a b` = ", "normal = "], source);
     assert.ok(!entries.some(item => item.label.startsWith("wrong")), source);
   }
 });
 
-test("session functions retain their arguments when LSP infers a package method", async () => {
+test("unknown session signatures never borrow inferred package arguments", async () => {
   const input = "print(df, ";
   const methodArgument = { label: "digits", insertText: "digits = ", kind: 5,
     detail: "print(x, ..., digits = NULL)", data: { type: "s3_parameter" } };
@@ -147,11 +167,11 @@ test("session functions retain their arguments when LSP infers a package method"
       { line: 0, character: input.length }, { globalenv: { print: { type: "closure" } } },
       [], [], { provideCompletionItems: async () => result }, async expression => {
         probes++;
-        assert.ok(expression.includes(".fn <- (print);"));
+        assert.fail("unknown signatures must not query sess");
         return [{ name: "custom_arg" }];
       });
-    assert.equal(probes, 1);
-    assert.deepEqual(entries.map(entry => entry.insertText), ["custom_arg = "]);
+    assert.equal(probes, 0);
+    assert.deepEqual(entries.map(entry => entry.insertText), []);
   }
 });
 
@@ -180,29 +200,18 @@ test("local source completions publish without waiting for superseded runtime ar
   }
 });
 
-test("session argument fallbacks wait for LSP and then await the live signature", async () => {
+test("workspace arguments wait only for languageserver", async () => {
   const input = "f(";
-  let releaseLsp, releaseRuntime;
-  const lsp = new Promise(resolve => { releaseLsp = resolve; });
-  const runtime = new Promise(resolve => { releaseRuntime = resolve; });
-  const started = [];
-  let settled = false;
+  let release;
+  const lsp = new Promise(resolve => { release = resolve; });
   const pending = completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
     { getText: () => input }, { line: 0, character: input.length },
-    { globalenv: { f: { type: "closure" } } }, [], [], {
-      provideCompletionItems: () => { started.push("lsp"); return lsp; },
-    }, () => { started.push("runtime"); return runtime; }).then(entries => {
-      settled = true;
-      return entries;
-    });
-  assert.deepEqual(started, ["lsp"]);
-  releaseLsp([{ label: "wrong_arg", detail: "parameter", kind: 5 }]);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(started, ["lsp", "runtime"]);
-  assert.equal(settled, false, "a session function still needs its runtime signature");
-  releaseRuntime([{ name: "live_arg" }]);
-  const entries = await pending;
-  assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.label), ["live_arg"]);
+    { globalenv: { f: { type: "closure" } } }, [], [], { provideCompletionItems: () => lsp },
+    async () => { assert.fail("no expression-based signature request"); });
+  release({ rConsoleWorkspaceFunction: true, items: [
+    { label: "live_arg", insertText: "live_arg = ", detail: "parameter", kind: 5 },
+  ] });
+  assert.deepEqual((await pending).map(entry => entry.insertText), ["live_arg = "]);
 });
 
 test("unavailable or empty session signatures never borrow same-name package arguments", async () => {
@@ -233,7 +242,7 @@ test("Unicode member and argument prefixes preserve the object and full replacem
   }
 });
 
-test("member completion sends token-derived objects and keeps line-relative replacement spans", async () => {
+test("member completion parses token-derived objects without live inspection", async () => {
   for (const [input, objectName, prefix] of [
     ["obj $ nested @ sl", "obj$nested", "sl"],
     ["obj$ # comment\n nested$fi", "obj$nested", "fi"],
@@ -248,22 +257,23 @@ test("member completion sends token-derived objects and keeps line-relative repl
     assert.equal(context.kind, "member", input);
     assert.equal(context.prefix, prefix, input);
     assert.equal(context.replaceStart, line.length - prefix.length, input);
-    let requests = 0;
     await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async expression => { requests++; assert.equal(expression, objectName, input); return []; });
-    assert.equal(requests, 1, input);
+      async () => assert.fail("automatic member completion must not send sess requests"));
   }
 });
 
-test("subscript member detection preserves base-object lookup without evaluating indices", async () => {
+test("subscript member detection preserves the receiver without evaluating indices or suggesting parent fields", async () => {
   const input = "obj[[stop('must not execute')]]$fi";
   const context = completion.getCompletionContext(input, input.length);
   assert.equal(context.kind, "member");
-  await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-    async expression => { assert.equal(expression, "obj"); return []; });
+  assert.equal(context.objectName, "obj[[stop('must not execute')]]");
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    { globalenv: { obj: { names: ["fieldOnParent"] } } }, [], [], undefined,
+    async () => assert.fail("indexed receivers must not use expression-based completion"));
+  assert.deepEqual(entries, []);
 });
 
-test("subscripted slot completion uses only slots inferred by the language server", async () => {
+test("computed subscript slot completion uses only slots inferred by the language server", async () => {
   const input = "objects[[choose_index()]]@sl";
   const context = completion.getCompletionContext(input, input.length);
   assert.equal(context.kind, "member");
@@ -316,7 +326,7 @@ test("member value completion keeps variables but never requests or inserts para
             { label: "first", insertText: "first = ", kind: 5, detail: "parameter" },
           ],
         }, async () => { requests++; return [{ name: "first" }]; });
-      assert.equal(requests, context.argumentValue ? 1 : 0, input);
+      assert.equal(requests, 0, input);
       assert.equal(entries.some(entry => entry.insertText === "first_value"),
         !context.suppressAutomatic && !context.argumentValue?.quote, input);
       assert.ok(entries.every(entry => entry.detail !== "parameter" && !entry.insertText.endsWith(" = ")), input);
@@ -324,16 +334,12 @@ test("member value completion keeps variables but never requests or inserts para
   }
 });
 
-test("completion passes supplied argument tags without copying user expressions into the runtime probe", async () => {
+test("argument completion never sends expressions to sess", async () => {
   const input = "obj$fun(first = stop('do not execute'), sec, third = system('do not execute'))";
   const cursor = input.indexOf("sec") + 3;
   const context = completion.getCompletionContext(input, cursor);
   await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-    async expression => {
-      assert.ok(expression.includes("base::quote(.fn(first = NULL, TRUE, third = NULL))"));
-      assert.ok(!expression.includes("do not execute"));
-      return [];
-    });
+    async () => { assert.fail("no expression-based argument requests"); });
 });
 
 test("call detection stays responsive with long quoted member chains", { timeout: 3000 }, () => {
@@ -521,10 +527,6 @@ test("the LSP client sends qualified input and maps both completion range format
     protocol2CodeConverter: { asCompletionResult: async (result) => result },
     sendNotification: async (method, params) => { if (method !== "close") synced.push(params); },
     sendRequest: async (method, params) => {
-      if (method === "rConsole/checkPackageChanges") {
-        assert.deepEqual(params.packages, ["stats", "dplyr"]);
-        return [];
-      }
       assert.equal(method, "completion");
       assert.equal(params.text, "stats::filter() + dplyr::filter(si)");
       assert.deepEqual(params.rConsoleArgumentTags, [null], "the current argument stays eligible for completion");
@@ -554,152 +556,67 @@ test("the LSP client sends qualified input and maps both completion range format
 });
 
 
-test("package change restarts the console language server before completion", async (t) => {
-  class TestPosition {
-    constructor(line, character) {
-      Object.assign(this, { line, character });
-    }
-  }
-  class TestVirtualRDocument {
-    project() {
-      return {
-        document: { getText: () => "foo::bar", version: 1 },
-        toServerPosition: (position) => position,
-        toConsolePosition: (position) => position,
-      };
-    }
-    update() {}
-    selectFunction() {}
-  }
-  const vscode = {
-    Position: TestPosition,
-    Range: class Range {},
-    Uri: { parse: (value) => ({ toString: () => value }) },
-    window: { createOutputChannel: () => ({ dispose() {} }) },
-    CompletionTriggerKind: { Invoke: 0, TriggerCharacter: 1 },
-  };
+test("background package replacement shares startup and preserves the newer library inventory", async t => {
+  const logs = [];
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
-    vscode,
-    "./virtualRDocument": { VirtualRDocument: TestVirtualRDocument },
-    "vscode-languageclient/node": {
-      LanguageClient: class {},
-      CompletionRequest: { type: "completion" },
-      DidOpenTextDocumentNotification: { type: "open" },
-      DidChangeTextDocumentNotification: { type: "change" },
-      DidCloseTextDocumentNotification: { type: "close" },
+    vscode: {
+      Uri: { parse: value => ({ toString: () => value }) },
+      window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
     },
+    "vscode-languageclient/node": { LanguageClient: class {} },
   });
-  const client = new ConsoleLspClient({
-    consoleId: "package-refresh-test",
-    extensionPath: "",
-    rPath: "R",
-    env: {},
-  });
-  t.after(() => client.dispose());
-
-  const firstClient = {
+  const lsp = new ConsoleLspClient({ consoleId: "background-replacement", env: {} });
+  t.after(() => lsp.dispose());
+  let current = true;
+  let releaseStart;
+  const gate = new Promise(resolve => { releaseStart = resolve; });
+  const requests = [];
+  const first = { isRunning: () => true, sendRequest: async method => {
+    assert.equal(method, "rConsole/refreshPackages");
+    return { restart: ["example"] };
+  } };
+  const second = {
     isRunning: () => true,
     sendRequest: async (method, params) => {
-      assert.equal(method, "rConsole/checkPackageChanges");
-      assert.deepEqual(params.packages, ["foo"]);
-      return ["foo"];
+      requests.push({ method, params });
+      if (method === "rConsole/refreshPackages") return { restart: [] };
+      return { libraryPaths: ["/latest"] };
     },
-    stop: async () => {},
-    dispose: async () => {},
   };
-  const secondClient = {
-    isRunning: () => true,
-    code2ProtocolConverter: { asCompletionParams: () => ({}) },
-    protocol2CodeConverter: { asCompletionResult: async (result) => result },
-    sendRequest: async (method) => {
-      if (method === "rConsole/checkPackageChanges") {
-        return [];
-      }
-      assert.equal(method, "completion");
-      return [{ label: "new" }];
-    },
-    stop: async () => {},
-    dispose: async () => {},
-  };
-  client.client = firstClient;
-  client.syncDocument = async () => {};
-  client.applySessionState = async () => {};
-
-  let stops = 0;
+  lsp.packageInventory.setLibraryPaths = () => { current = false; };
+  lsp.client = first;
   let starts = 0;
-  client.stop = async () => {
-    stops += 1;
-    client.client = undefined;
-    return true;
+  lsp.stop = async () => { lsp.client = undefined; return true; };
+  lsp.startClient = async () => {
+    starts++;
+    await gate;
+    lsp.client = second;
   };
-  client.startClient = async () => {
-    starts += 1;
-    client.client = secondClient;
-    client.lastPackageCheckAt = 0;
-  };
-
-  const result = await client.provideCompletionItems(
-    { getText: () => "foo::bar" },
-    new TestPosition(0, 8)
-  );
-  assert.deepEqual(result, [{ label: "new" }]);
-  assert.equal(stops, 1);
+  const refresh = lsp.refreshPackages({
+    changed: ["example"], libraries: [{ path: "/old", packages: new Map() }],
+    packages: new Map(), isCurrent: () => current,
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const start = lsp.start();
+  const sync = lsp.syncSessionState({ attachedPackages: [] });
+  releaseStart();
+  await Promise.all([refresh, start, sync]);
   assert.equal(starts, 1);
+  assert.deepEqual(requests, [{ method: "rConsole/syncSessionState", params: {
+    attachedPackages: [],
+  } }], "do not replay the older inventory after the server reports newer libraries");
+  assert.ok(logs.some(line => line.includes("Restarting language server: example (removed); clearing packages loaded in the server.")));
+  await lsp.refreshPackages({
+    changed: [], libraries: [{ path: "/latest", packages: new Map() }],
+    packages: new Map(), isCurrent: () => true,
+  });
+  assert.deepEqual(requests.slice(1).map(request => request.method),
+    ["rConsole/refreshPackages"],
+    "apply only the latest library inventory to the new server");
+  assert.deepEqual(requests[1].params.libraryPaths, ["/latest"]);
 });
 
-
-test("concurrent package change checks share the in-flight request", async (t) => {
-  const vscode = {
-    Position,
-    Uri: { parse: (value) => ({ toString: () => value }) },
-    window: { createOutputChannel: () => ({ dispose() {} }) },
-  };
-  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
-    vscode,
-    "vscode-languageclient/node": {
-      LanguageClient: class {},
-      CompletionRequest: { type: "completion" },
-      DidOpenTextDocumentNotification: { type: "open" },
-      DidChangeTextDocumentNotification: { type: "change" },
-      DidCloseTextDocumentNotification: { type: "close" },
-    },
-  });
-  const client = new ConsoleLspClient({
-    consoleId: "package-refresh-concurrency-test",
-    extensionPath: "",
-    rPath: "R",
-    env: {},
-  });
-  t.after(() => client.dispose());
-
-  let checks = 0;
-  let resolveCheck;
-  const languageClient = {
-    isRunning: () => true,
-    sendRequest: (method, params) => {
-      assert.equal(method, "rConsole/checkPackageChanges");
-      assert.deepEqual(params.packages, ["foo"]);
-      checks += 1;
-      return new Promise((resolve) => {
-        resolveCheck = resolve;
-      });
-    },
-    stop: async () => {},
-    dispose: async () => {},
-  };
-  client.client = languageClient;
-
-  const first = client.packageChangesDetected(languageClient, "foo::bar");
-  await new Promise((resolve) => setImmediate(resolve));
-  const second = client.packageChangesDetected(languageClient, "foo::bar");
-
-  assert.equal(checks, 1);
-  resolveCheck(["foo"]);
-  assert.deepEqual(await Promise.all([first, second]), [true, true]);
-});
-
-
-test("package change checks are throttled across rapid completions", async (t) => {
+test("completion requests do not perform package inventory checks", async (t) => {
   class TestPosition {
     constructor(line, character) {
       Object.assign(this, { line, character });
@@ -735,7 +652,7 @@ test("package change checks are throttled across rapid completions", async (t) =
     },
   });
   const client = new ConsoleLspClient({
-    consoleId: "package-refresh-throttle-test",
+    consoleId: "package-refresh-background-test",
     extensionPath: "",
     rPath: "R",
     env: {},
@@ -744,17 +661,13 @@ test("package change checks are throttled across rapid completions", async (t) =
   client.syncDocument = async () => {};
   client.applySessionState = async () => {};
 
-  let checks = 0;
   let completions = 0;
   client.client = {
     isRunning: () => true,
     code2ProtocolConverter: { asCompletionParams: () => ({}) },
     protocol2CodeConverter: { asCompletionResult: async (result) => result },
     sendRequest: async (method) => {
-      if (method === "rConsole/checkPackageChanges") {
-        checks += 1;
-        return [];
-      }
+      assert.equal(method, "completion");
       completions += 1;
       return [];
     },
@@ -766,17 +679,13 @@ test("package change checks are throttled across rapid completions", async (t) =
   await client.provideCompletionItems(doc, new TestPosition(0, 8));
   await client.provideCompletionItems(doc, new TestPosition(0, 8));
 
-  assert.equal(checks, 1);
   assert.equal(completions, 2);
 });
 
 
-test("language-server completion starts before a fresh workspace request finishes", async () => {
-  let resolveWorkspace;
+test("language-server completion does not request a workspace refresh", async () => {
+  let workspaceRequests = 0;
   let lspCompletionStarted = false;
-  const workspaceRequest = new Promise((resolve) => {
-    resolveWorkspace = resolve;
-  });
   class TestPosition {
     constructor(line, character) {
       Object.assign(this, { line, character });
@@ -817,7 +726,7 @@ test("language-server completion starts before a fresh workspace request finishe
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => workspaceRequest,
+    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
     requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
@@ -846,11 +755,11 @@ test("language-server completion starts before a fresh workspace request finishe
   assert.equal(lspCompletionStarted, true);
   await request;
 
-  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+  assert.equal(workspaceRequests, 0);
 });
 
 
-test("member and package completions do not refresh workspace data", async () => {
+test("namespace completion does not wait for library or workspace probes", async () => {
   class TestPosition {
     constructor(line, character) {
       Object.assign(this, { line, character });
@@ -882,6 +791,7 @@ test("member and package completions do not refresh workspace data", async () =>
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
+  const events = [];
   const lang = new RTermLang({
     extensionPath: "",
     rPath: "R",
@@ -891,12 +801,14 @@ test("member and package completions do not refresh workspace data", async () =>
     },
     requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({
-    provideCompletionItems: async () => [],
-  });
+  lang.ensureConsoleLspStarted = async () => {
+    events.push("lookup");
+    return { provideCompletionItems: async () => [] };
+  };
   lang.getOrOpenCompletionDocument = async () => ({});
 
   for (const text of contexts.keys()) {
+    events.length = 0;
     const input = {
       text,
       currentLine: text,
@@ -911,15 +823,13 @@ test("member and package completions do not refresh workspace data", async () =>
       getWorkspaceData: () => undefined,
       applyCompletion: () => {},
     });
+    assert.deepEqual(events, ["lookup"]);
   }
 });
 
 
-test("F7 refinement starts language-server completion before workspace refresh finishes", async () => {
-  let resolveWorkspace;
-  const workspaceRequest = new Promise((resolve) => {
-    resolveWorkspace = resolve;
-  });
+test("F7 refinement does not request a workspace refresh", async () => {
+  let workspaceRequests = 0;
   let refinedCompletionStarted = false;
   let changeValue;
   let hide;
@@ -978,7 +888,7 @@ test("F7 refinement starts language-server completion before workspace refresh f
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => workspaceRequest,
+    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
     requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
@@ -1009,7 +919,7 @@ test("F7 refinement starts language-server completion before workspace refresh f
 
   quickPick.hide();
   await request;
-  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+  assert.equal(workspaceRequests, 0);
 });
 
 
@@ -1111,7 +1021,7 @@ test("package completion filters locally without repeated language-server reques
 });
 
 
-test("runtime column completion runs only after the language server cannot supply fields", async () => {
+test("runtime column inspection is omitted when cached names are unavailable", async () => {
   let resolveLsp;
   const lspResult = new Promise((resolve) => {
     resolveLsp = resolve;
@@ -1152,8 +1062,8 @@ test("runtime column completion runs only after the language server cannot suppl
 
   resolveLsp([]);
   const entries = await request;
-  assert.equal(runtimeStarted, true);
-  assert.ok(entries.some((entry) => entry.label === "alpha"));
+  assert.equal(runtimeStarted, false);
+  assert.ok(!entries.some((entry) => entry.label === "alpha"));
 });
 
 
@@ -1570,17 +1480,17 @@ test("data contexts retain column order while ordinary symbols remain alphabetic
   }
 });
 
-test("dollar and slot members retain source order including callable members", async () => {
+test("dollar and slot members retain cached workspace order without R extraction", async () => {
   for (const operator of ["$", "@"]) {
     const input = `obj${operator}`;
     const context = completion.getCompletionContext(input, input.length);
-    const entries = await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [],
-      undefined, async () => [
-        { name: "zebra", type: "closure" }, { name: "alpha", type: "double" }, { name: "beta", type: "closure" },
-      ]);
+    const names = ["zebra", "alpha", "beta"];
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { obj: { names, slots: names } } }, [], [],
+      undefined, async () => assert.fail("must not execute custom R accessors"));
     for (const query of ["", "a", "b"]) {
       assert.deepEqual(completion.rankCompletionEntries(entries, query, context).map(e => e.label),
-        query === "b" ? ["zebra", "beta"] : ["zebra", "alpha", "beta"]);
+        query === "b" ? ["zebra", "beta"] : names);
     }
   }
 });
@@ -1787,37 +1697,24 @@ test("function argument completion awaits parameters before offering runtime var
   assert.equal(published[0][0].label, "na.rm");
 });
 
-test("library path changes trigger console LSP state synchronization", () => {
+test("session updates synchronize attached packages without supplying library paths", async () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
-    vscode: {},
-    "../../Language/completion": {},
+    vscode: {}, "../../Language/completion": {},
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({
-    extensionPath: "", rPath: "R", env: {},
-    requestMemberCompletions: async () => [],
-  });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
   const states = [];
-  lang.consoleLsp = { syncSessionState: (state) => {
-    states.push(state);
-    return Promise.resolve();
-  } };
-  const data = { search: [".GlobalEnv", "package:stats"], loaded_namespaces: [],
-    globalenv: {}, libraryPaths: ["/project/.uvr/library", "/base/library"] };
+  lang.consoleLsp = { syncSessionState: async state => { states.push(state); } };
+  const data = { search: ["package:stats"], loaded_namespaces: [], globalenv: {} };
   assert.equal(lang.updateSessionData(data), true);
-  assert.deepEqual(states[0], {
-    attachedPackages: ["stats"],
-    libraryPaths: data.libraryPaths,
-  });
+  assert.deepEqual(states, [{ attachedPackages: ["stats"] }]);
   assert.equal(lang.updateSessionData({ ...data }), false);
-  assert.equal(lang.updateSessionData({
-    ...data, libraryPaths: ["/another/library", "/base/library"],
-  }), true);
-  assert.equal(states.length, 2);
+  assert.equal(lang.updateSessionData({ ...data, search: ["package:utils"] }), true);
+  assert.deepEqual(states.at(-1), { attachedPackages: ["utils"] });
 });
 
-test("console LSP keeps configured libraries after live session libraries", async (t) => {
+test("console LSP passes configured libraries to its own R process", async (t) => {
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
     vscode: {
       Uri: { parse: (value) => ({ toString: () => value }) },
@@ -1831,72 +1728,6 @@ test("console LSP keeps configured libraries after live session libraries", asyn
   t.after(() => lsp.dispose());
   const config = { get: (key) => key === "libPaths" ? ["/fallback"] : false };
   assert.equal(lsp.buildServerEnv(config).VSCR_LIB_PATHS, "/fallback");
-  lsp.sessionState = { attachedPackages: [], libraryPaths: ["/project/.uvr/library"] };
-  const env = lsp.buildServerEnv(config);
-  assert.equal(env.VSCR_LIB_PATHS, "/project/.uvr/library\n/fallback");
-});
-
-test("library-path restart serializes concurrent starts and applies the latest paths", async (t) => {
-  const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
-    vscode: {
-      Uri: { parse: (value) => ({ toString: () => value }) },
-      window: { createOutputChannel: () => ({ dispose() {} }) },
-    },
-    "vscode-languageclient/node": { LanguageClient: class {} },
-  });
-  const lsp = new ConsoleLspClient({ consoleId: "restart-order", env: {} });
-  t.after(() => lsp.dispose());
-  const requests = [];
-  const fakeClient = (paths) => ({
-    isRunning: () => true,
-    sendRequest: async (_method, state) => {
-      requests.push(state);
-      return JSON.stringify(state.libraryPaths) === paths ? true : { restartRequired: true };
-    },
-  });
-  lsp.client = fakeClient(JSON.stringify(["/original"]));
-  let runningPaths;
-  let stopCount = 0;
-  let startCount = 0;
-  let releaseStart;
-  const firstStartGate = new Promise((resolve) => { releaseStart = resolve; });
-  lsp.stop = async () => {
-    stopCount++;
-    lsp.client = undefined;
-    return true;
-  };
-  lsp.startClient = async () => {
-    const startupPaths = JSON.stringify(lsp.sessionState?.libraryPaths);
-    startCount++;
-    if (startCount === 1) await firstStartGate;
-    runningPaths = startupPaths;
-    lsp.client = fakeClient(startupPaths);
-  };
-  const first = lsp.syncSessionState({
-    attachedPackages: ["stats"], libraryPaths: ["/first"],
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(stopCount, 1);
-
-  // A completion-triggered start must join the restart rather than start
-  // another server; a new session snapshot must win over the old one.
-  const concurrentStart = lsp.start();
-  const latest = lsp.syncSessionState({
-    attachedPackages: ["stats"], libraryPaths: ["/latest"],
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(startCount, 1);
-  releaseStart();
-  await Promise.all([first, latest, concurrentStart]);
-  assert.equal(stopCount, 2);
-  assert.equal(startCount, 2);
-  assert.equal(runningPaths, JSON.stringify(["/latest"]));
-  assert.deepEqual(requests.at(-1), {
-    attachedPackages: ["stats"], libraryPaths: ["/latest"],
-  });
-  const previousStops = stopCount;
-  await lsp.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/latest"] });
-  assert.equal(stopCount, previousStops, "unchanged paths do not restart");
 });
 
 test("language-server state sync failures do not reject terminal workspace updates", async () => {
@@ -1912,7 +1743,7 @@ test("language-server state sync failures do not reject terminal workspace updat
   });
   lang.consoleLsp = { syncSessionState: async () => { throw Error("restart failed"); } };
   assert.equal(lang.updateSessionData({
-    search: [], loaded_namespaces: [], globalenv: {}, libraryPaths: ["/new"],
+    search: [], loaded_namespaces: [], globalenv: {},
   }), true);
   await new Promise((resolve) => setImmediate(resolve));
 });
@@ -2007,4 +1838,19 @@ test("dots remain a variadic argument indicator and never insert an equals sign"
       });
     assert.deepEqual(entries.map(item => item.insertText), ['...']);
   }
+});
+
+test("bracket methods preserve native parameter suggestions and column fields", async () => {
+  const input = "DT[, keyb";
+  const context = completion.getCompletionContext(input, input.length);
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, { globalenv: { DT: { names: ["keyboard"], class: ["data.table"] } } }, [], [], {
+      provideCompletionItems: async () => ({ items: [
+        { label: "keyby", insertText: "keyby = ", detail: "parameter",
+          data: { type: "subscript_parameter" }, kind: 5 },
+        { label: "keyboard", insertText: "keyboard", data: { type: "scope" }, kind: 4 },
+      ] }),
+    });
+  assert.ok(entries.some(item => item.insertText === "keyby = "), "bracket context must accept method parameters");
+  assert.ok(entries.some(item => item.label === "keyboard"), "ordinary native fields remain available");
 });

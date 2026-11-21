@@ -6,7 +6,6 @@ import * as net from "net";
 import * as path from "path";
 import * as os from "os";
 import type {
-  SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
 
@@ -52,7 +51,6 @@ export class SessProxy {
   private forwardedRequests = new Map<string, string>();
   private rSocketWaiters: Array<(socket: net.Socket | undefined) => void> = [];
   private workspaceData: WorkspaceData | undefined;
-  private libraryPathsRequest: Promise<void> | undefined;
   private sessionId: string | undefined;
   private onWorkspaceData: ((data: WorkspaceData) => void) | undefined;
   private onConnectionChange: ((state: "attached" | "disconnected") => void) | undefined;
@@ -119,7 +117,6 @@ export class SessProxy {
     this.rBuffer = "";
     this.upstreamBuffer = "";
     this.workspaceData = undefined;
-    this.libraryPathsRequest = undefined;
     this.sessionId = undefined;
 
     const server = this.server;
@@ -147,43 +144,8 @@ export class SessProxy {
     if (socket && (this.rSocket !== socket || socket.destroyed)) {
       return this.workspaceData;
     }
-    if (this.workspaceData?.libraryPaths) {
-      result.libraryPaths = this.workspaceData.libraryPaths;
-    }
-    // Workspace updates must not wait for the optional library-path probe.
     this.setWorkspaceData(result);
-    this.refreshLibraryPaths();
     return result;
-  }
-
-  private refreshLibraryPaths(): void {
-    const socket = this.rSocket;
-    if (!socket || socket.destroyed || this.libraryPathsRequest) {
-      return;
-    }
-    // sess completion returns list names without modifying R state.
-    const request = this.request("completion", {
-      expr: "stats::setNames(as.list(.libPaths()), .libPaths())",
-      trigger: "$",
-    }).then((paths) => {
-      if (this.rSocket !== socket || socket.destroyed || !this.workspaceData) {
-        return;
-      }
-      if (!Array.isArray(paths) || paths.length === 0 || !paths.every((item) =>
-        item && typeof item.name === "string" && item.name.length > 0
-      )) {
-        return;
-      }
-      const libraryPaths = paths.map((item) => item.name as string);
-      if (JSON.stringify(this.workspaceData.libraryPaths) !== JSON.stringify(libraryPaths)) {
-        this.setWorkspaceData({ ...this.workspaceData, libraryPaths });
-      }
-    }).catch(() => undefined).finally(() => {
-      if (this.libraryPathsRequest === request) {
-        this.libraryPathsRequest = undefined;
-      }
-    });
-    this.libraryPathsRequest = request;
   }
 
   getWorkspaceData(): WorkspaceData | undefined {
@@ -216,17 +178,6 @@ export class SessProxy {
 
   getSessionId(): string | undefined {
     return this.sessionId;
-  }
-
-  async requestMemberCompletions(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    const result = await this.request("completion", {
-      expr: expression,
-      trigger: operator,
-    });
-    return parseMemberCompletionItems(result);
   }
 
   private createPipePath(): string {
@@ -305,7 +256,6 @@ export class SessProxy {
     // A new attach can replace an old R socket during sess recovery.
     this.sessionId = undefined;
     this.workspaceData = undefined;
-    this.libraryPathsRequest = undefined;
     this.rSocket = socket;
     const upstream = net.createConnection({ path: this.options.upstreamPipePath });
     this.upstreamSocket = upstream;
@@ -364,7 +314,6 @@ export class SessProxy {
       const wasAttached = Boolean(this.sessionId);
       this.sessionId = undefined;
       this.workspaceData = undefined;
-      this.libraryPathsRequest = undefined;
       if (wasAttached) { this.onConnectionChange?.("disconnected"); }
       this.forwardedRequests.clear();
       this.resolveRSocketWaiters(undefined);
@@ -575,15 +524,4 @@ function isWorkspaceData(value: unknown): value is WorkspaceData {
     typeof data.globalenv === "object" &&
     !Array.isArray(data.globalenv)
   );
-}
-
-function parseMemberCompletionItems(value: unknown): SessionMemberCompletionItem[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const items = value.filter(
-    (item): item is SessionMemberCompletionItem =>
-      !!item && typeof item === "object" && typeof item.name === "string" && item.name.length > 0
-  );
-  return items.length > 0 ? items : undefined;
 }

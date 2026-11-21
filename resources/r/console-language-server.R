@@ -10,7 +10,6 @@ if (use_renv_lib_path) {
     }
 }
 
-fallback_lib_paths <- .paths
 add_lib_paths <- Sys.getenv("VSCR_LIB_PATHS")
 if (nzchar(add_lib_paths)) {
     add_lib_paths <- strsplit(add_lib_paths, "\n", fixed = TRUE)[[1L]]
@@ -51,15 +50,6 @@ normalize_character <- function(value) {
     unique(value)
 }
 
-library_paths_changed <- function(paths) {
-    current <- .libPaths()
-    # Ask R to resolve existing folders and normalize their names exactly as it
-    # does at startup. Restore the running server's paths before doing any work.
-    on.exit(.libPaths(current))
-    .libPaths(c(normalize_character(paths), fallback_lib_paths))
-    !identical(current, .libPaths())
-}
-
 console_text_document_did_close <- function(self, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -79,77 +69,6 @@ console_text_document_did_close <- function(self, params) {
 
     languageserver:::text_document_did_close(self, params)
 }
-
-package_fingerprints <- new.env(parent = emptyenv())
-
-package_fingerprint <- function(pkgname) {
-    package_path <- find.package(pkgname, quiet = TRUE)
-    if (!length(package_path)) {
-        return("<missing>")
-    }
-
-    package_path <- normalizePath(package_path[[1L]], winslash = "/", mustWork = FALSE)
-    pkgbase <- basename(package_path)
-    files <- c(
-        package_path,
-        file.path(package_path, "DESCRIPTION"),
-        file.path(package_path, "NAMESPACE"),
-        file.path(package_path, "Meta", "package.rds"),
-        file.path(package_path, "R", paste0(pkgbase, ".rdb")),
-        file.path(package_path, "R", paste0(pkgbase, ".rdx")),
-        file.path(package_path, "help", paste0(pkgbase, ".rdb")),
-        file.path(package_path, "help", paste0(pkgbase, ".rdx")),
-        file.path(package_path, "libs"),
-        list.files(file.path(package_path, "libs"), full.names = TRUE)
-    )
-    files <- unique(files[file.exists(files)])
-    info <- file.info(files)
-
-    paste(
-        files,
-        info$size,
-        format(info$mtime, "%Y-%m-%dT%H:%M:%OS6", tz = "UTC"),
-        format(info$ctime, "%Y-%m-%dT%H:%M:%OS6", tz = "UTC"),
-        sep = ":",
-        collapse = "|"
-    )
-}
-
-record_package_fingerprints <- function(packages) {
-    for (pkgname in normalize_character(packages)) {
-        if (!exists(pkgname, envir = package_fingerprints, inherits = FALSE)) {
-            assign(pkgname, package_fingerprint(pkgname), envir = package_fingerprints)
-        }
-    }
-}
-
-record_cached_package_fingerprints <- function(workspace) {
-    record_package_fingerprints(workspace$namespaces$keys())
-}
-
-check_package_changes <- function(workspace, packages = character()) {
-    changed <- character()
-    packages <- unique(c(
-        "languageserver",
-        normalize_character(packages),
-        workspace$namespaces$keys()
-    ))
-
-    for (pkgname in packages) {
-        fingerprint <- package_fingerprint(pkgname)
-        if (exists(pkgname, envir = package_fingerprints, inherits = FALSE)) {
-            if (!identical(get(pkgname, envir = package_fingerprints, inherits = FALSE), fingerprint)) {
-                changed <- c(changed, pkgname)
-            }
-        } else {
-            assign(pkgname, fingerprint, envir = package_fingerprints)
-        }
-    }
-
-    changed
-}
-
-record_package_fingerprints("languageserver")
 
 server <- languageserver:::LanguageServer$new(host, NULL)
 if (!is.null(port)) {
@@ -219,26 +138,17 @@ if (!is.null(port)) {
     flush(server$outputcon)
     socketTimeout(server$inputcon, previous_socket_timeout)
 }
-for (workspace in server$workspaces$values()) {
-    record_cached_package_fingerprints(workspace)
-}
-
 # Source dedicated completion adapters beside this entry point.
 console_script <- if (sys.nframe() > 0L) sys.frame(1)$ofile else NULL
 if (is.null(console_script)) {
     console_script <- sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE)[[1L]])
 }
 console_resource_dir <- dirname(console_script)
-for (resource in c("completion-source.R", "completion-arguments.R", "completion-provider.R")) {
+for (resource in c("completion-runtime.R", "completion-static.R", "completion-arguments.R", "completion-provider.R")) {
     source(file.path(console_resource_dir, resource), local = TRUE)
 }
 
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
-    if (!is.null(params$libraryPaths) && library_paths_changed(params$libraryPaths)) {
-        # Loaded namespaces cannot safely switch libraries in this process.
-        # Only a real change in the effective search order needs a fresh server.
-        return(self$deliver(languageserver:::Response$new(id, result = list(restartRequired = TRUE))))
-    }
     attached_packages <- normalize_character(params$attachedPackages)
     workspace <- self$get_workspace(self$rootUri)
 
@@ -246,13 +156,65 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     workspace$startup_packages <- rev(attached_packages)
     workspace$update_loaded_packages()
 
-    self$deliver(languageserver:::Response$new(id, result = TRUE))
+    self$deliver(languageserver:::Response$new(id, result = list(libraryPaths = as.list(.libPaths()))))
 }
-server$request_handlers[["rConsole/checkPackageChanges"]] <- function(self, id, params) {
-    workspace <- self$get_workspace(self$rootUri)
-    packages <- normalize_character(params$packages)
-    changed_packages <- check_package_changes(workspace, packages)
-    self$deliver(languageserver:::Response$new(id, result = changed_packages))
+server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params) {
+    self$deliver(languageserver:::Response$new(id, result = as.list(.libPaths())))
+}
+server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, params) {
+    changed <- normalize_character(params$changed)
+    loaded <- loadedNamespaces()
+    switched <- Filter(function(pkgname) {
+        selected <- normalizePath(params$installations[[pkgname]], winslash = "/", mustWork = FALSE)
+        current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
+        !identical(selected, current)
+    }, intersect(names(params$installations), setdiff(loaded, "base")))
+    restart <- union(intersect(changed, loaded), switched)
+    if (length(restart)) {
+        # Removing metadata cannot replace functions or DLLs already loaded in R.
+        return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))
+    }
+    .libPaths(normalize_character(params$libraryPaths))
+    for (workspace in self$workspaces$values()) {
+        affected <- changed
+        if (length(changed) && is.function(workspace$s3_metadata$keys)) {
+            repeat {
+                dependents <- Filter(function(pkgname) {
+                    dependencies <- workspace$s3_metadata$catalog(pkgname)$dependencies
+                    any(normalize_character(dependencies) %in% affected)
+                }, workspace$s3_metadata$keys())
+                expanded <- union(affected, dependents)
+                if (identical(expanded, affected)) break
+                affected <- expanded
+            }
+        }
+        for (pkgname in affected) {
+            if (workspace$namespaces$has(pkgname)) workspace$namespaces$remove(pkgname)
+            if (is.function(workspace$member_metadata$has) && workspace$member_metadata$has(pkgname)) {
+                workspace$member_metadata$remove(pkgname)
+            }
+            if (is.function(workspace$s3_metadata$has) && workspace$s3_metadata$has(pkgname)) {
+                workspace$s3_metadata$set(pkgname, list(schema = 1L, package = pkgname,
+                    generation = paste0("invalidated-", Sys.time()), dependencies = character(),
+                    functions = list(), objects = list(), methods = list(), error = "Package installation changed"))
+            }
+        }
+        if (length(affected)) {
+            workspace$update_loaded_packages()
+            for (document in workspace$documents$values()) {
+                requested <- normalize_character(c(document$loaded_packages,
+                    unlist(document$requested_packages, use.names = FALSE)))
+                if (!any(requested %in% affected)) next
+                uri <- document$uri
+                self$resolve_task_manager$cancel(uri)
+                if (!is.null(self$member_task_manager)) self$member_task_manager$cancel(uri)
+                if ("requested_packages" %in% names(document)) document$requested_packages <- NULL
+                if ("member_refresh" %in% names(document)) document$member_refresh <- TRUE
+                self$text_sync(uri, document, parse = TRUE)
+            }
+        }
+    }
+    self$deliver(languageserver:::Response$new(id, result = list(restart = list())))
 }
 server$notification_handlers[["textDocument/didClose"]] <- console_text_document_did_close
 

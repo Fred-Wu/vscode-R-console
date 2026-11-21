@@ -13,9 +13,14 @@ const uri = (value) => ({ toString: () => value });
 
 // Replace only the VS Code host adapter. Use the production client lifecycle,
 // R launcher, authentication, JSON-RPC streams, and console-language-server.R.
-function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
+// Existing static-inference integration fixtures request it explicitly via
+// this helper's default. The extension setting and production default are off.
+function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env,
+  staticAnalysis = true } = {}) {
   const instances = [];
   const logs = [];
+  const runtimeSignatures = new Map();
+  let staticMode = staticAnalysis;
   class HostClientAdapter {
     constructor(_id, _name, serverOptions, options) {
       Object.assign(this, { serverOptions, options, running: false, requests: [], opened: [] });
@@ -96,7 +101,7 @@ function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
       window: { createOutputChannel: () => ({ appendLine: (line) => logs.push(line), dispose() {} }) },
       workspace: { getConfiguration: () => ({ get: (key) => {
-        if (key === "lsp.args") return ["--vanilla"];
+        if (key === "lsp.args") return args;
         if (key === "libPaths") return libraries;
         return undefined;
       } }) },
@@ -109,7 +114,10 @@ function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
   });
   const client = new ConsoleLspClient({
     consoleId: "real-lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
+    rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...env }, cwd,
+    getCachedWorkspaceData: () => ({ globalenv: Object.fromEntries(
+      [...runtimeSignatures].map(([name, str]) => [name, { type: "closure", str }])) }),
+    getStaticAnalysisEnabled: () => staticMode,
   });
   t.after(async () => {
     try { await client.dispose(); }
@@ -119,6 +127,12 @@ function createConsoleLsp(t, { libraries = [], afterResponse } = {}) {
     const result = await client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
     return Array.isArray(result) ? result : result?.items;
   };
+  // Test-only session fixture: no synthetic workspace functions are sent to LSP.
+  client.setRuntimeSignatures = signatures => {
+    runtimeSignatures.clear();
+    for (const [name, signature] of Object.entries(signatures)) runtimeSignatures.set(name, signature);
+  };
+  client.setStaticAnalysis = enabled => { staticMode = enabled; };
   return { client, instances, logs, complete };
 }
 

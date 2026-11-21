@@ -11,7 +11,7 @@ export async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; memberResolved?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
   }
@@ -21,13 +21,17 @@ export async function getLanguageServerCompletions(
       position,
       context.triggerCharacter
     );
+    let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
+    let workspaceFunction = result?.rConsoleWorkspaceFunction === true;
     let memberResolved = result?.rConsoleMemberResolved === true;
     let nativeArguments = result?.rConsoleNativeArguments === true;
     let argumentsExhausted = result?.rConsoleArgumentsExhausted === true;
 
     let items = Array.isArray(result) ? result : result?.items || [];
-    const usable = (item: vscode.CompletionItem): boolean => isLanguageServerCompletionItem(context, item, doc.uri?.toString());
+    const usable = (item: vscode.CompletionItem): boolean =>
+      !(workspaceFunction && !context.argumentValue && getCompletionRole(item) === "value") &&
+      isLanguageServerCompletionItem(context, item, doc.uri?.toString());
     // Some R language servers only return contiguous matches. If that lookup
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
@@ -39,7 +43,9 @@ export async function getLanguageServerCompletions(
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
         context.triggerCharacter, position);
+      runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
+      workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;
       memberResolved ||= result?.rConsoleMemberResolved === true;
       nativeArguments ||= result?.rConsoleNativeArguments === true;
       argumentsExhausted ||= result?.rConsoleArgumentsExhausted === true;
@@ -64,7 +70,9 @@ export async function getLanguageServerCompletions(
       })),
       isIncomplete: !Array.isArray(result) && result?.isIncomplete === true,
       rConsoleLocalFunction: localFunction,
+      runtimeOnly,
       memberResolved,
+      workspaceFunction,
       nativeArguments,
       argumentsExhausted,
     };
@@ -104,15 +112,18 @@ function isLanguageServerCompletionItem(
   documentUri?: string
 ): boolean {
   const role = getCompletionRole(item);
+  const subscriptParameter = context.kind === "bracket" &&
+    (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_parameter";
   if (context.suppressAutomatic) return false;
   if (context.kind !== "member" && context.kind !== "package" && !allowsSymbolCompletions(context) &&
       role !== "argument" && role !== "value" && role !== "member" &&
       !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
-  if (role === "argument" && !context.argumentTags) return false;
+  if (role === "argument" && !context.argumentTags && !subscriptParameter) return false;
   if (role === "value" && !context.argumentTags && !context.argumentValue) return false;
   // Native call detection can still see an outer call while our cursor is in
   // its subscript or member expression. Its arguments do not belong there.
-  if ((role === "argument" || role === "value") && context.kind !== "argument") return false;
+  if ((role === "argument" || role === "value") &&
+      context.kind !== "argument" && !subscriptParameter) return false;
   if (context.pipe && !isCallableCompletionKind(item.kind)) return false;
   if (context.argumentValue?.quote && role !== "value") return false;
   if (context.kind === "member" && role !== "member") return false;
@@ -120,7 +131,8 @@ function isLanguageServerCompletionItem(
   // generic LSP symbols. Preserve that boundary while allowing native fields
   // and literal index values inferred from this receiver.
   if (restrictsBracketSymbols(context) &&
-      role !== "member" && !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
+      !subscriptParameter && role !== "member" &&
+      !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }

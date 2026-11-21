@@ -310,8 +310,9 @@ for (const operator of ["$", "@", "::", ":::"]) {
         const context = completion.getCompletionContext(input, prefix.length);
         const entries = await completion.collectCompletionEntries(context, { getText: () => input },
           { line: 0, character: prefix.length }, undefined, [], [],
-          { provideCompletionItems: async () => [{ label: "fun", kind: 2 }] },
-          async () => [{ name: "fun", type: "closure" }]);
+          { provideCompletionItems: async () => [{ label: "fun", kind: 2, insertText: "fun()",
+            ...(operator === "$" || operator === "@" ? { data: { type: "member" } } : {}) }] },
+          async () => assert.fail("live member completion must not execute"));
         const choice = completion.toCompletionPick(entries[0], context);
         terminal.inlineCompletion.set([choice], terminal.inlineCompletion.token);
         const requests = [];

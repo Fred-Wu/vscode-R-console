@@ -3,7 +3,6 @@ import * as path from "path";
 import type { RuntimeHost } from "../../../Terminal/rTerminal/runtime";
 import { BaseVscodeRSessionIntegration } from "../integration";
 import type {
-  SessionMemberCompletionItem,
   VscodeRIntegrationOptions,
   WorkspaceData,
 } from "../types";
@@ -88,13 +87,6 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
 
   override async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
     return await this.watcher.requestWorkspaceData();
-  }
-
-  override async requestMemberCompletions(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    return await this.watcher.requestMemberCompletions(expression, operator);
   }
 
   override handleRuntimeExit(): void {

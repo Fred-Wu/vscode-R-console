@@ -5,7 +5,6 @@ import {
   type CompletionEntries,
   type CompletionContext,
   type CompletionProvider,
-  type RuntimeMemberCompletionRequester,
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
@@ -30,9 +29,10 @@ type LangOptions = {
   extensionPath: string;
   rPath: string;
   env: NodeJS.ProcessEnv;
+  cwd?: string;
   getRecentSessionEntries?: () => string[];
-  requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
-  requestMemberCompletions: RuntimeMemberCompletionRequester;
+  onPackagesChanged?: () => void;
+  getStaticAnalysisEnabled?: () => boolean;
 };
 
 type AutocompleteRequest = {
@@ -46,7 +46,6 @@ type AutocompleteRequest = {
 
 type ConsoleSessionState = {
   attachedPackages: string[];
-  libraryPaths?: string[];
 };
 
 export class RTermLang {
@@ -58,9 +57,12 @@ export class RTermLang {
     .slice(2)}`;
   private consoleLsp: ConsoleLspClient | undefined;
   private sessionState: ConsoleSessionState | undefined;
+  private workspaceRevision: number | undefined;
+  private cachedSessionData: WorkspaceData | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
+  private completionPickerAbort: AbortController | undefined;
 
   constructor(private readonly options: LangOptions) {}
 
@@ -107,11 +109,7 @@ export class RTermLang {
     }
 
     {
-      const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
-      const workspaceDataRequest = shouldRequestWorkspaceData
-        ? this.options.requestWorkspaceData?.()
-        : undefined;
-      const cachedSessionData = getWorkspaceData();
+      const cachedSessionData = getWorkspaceData() ?? this.cachedSessionData;
 
       const latestInput = getCurrentInput();
       if (
@@ -123,16 +121,11 @@ export class RTermLang {
       }
 
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
-      let refreshedSessionData: WorkspaceData | undefined;
-      void workspaceDataRequest?.then((data) => {
-        refreshedSessionData = data ?? getWorkspaceData();
-      }).catch(() => undefined);
 
       let completionProvider: CompletionProvider | undefined;
-      const completionProviderRequest = this.ensureConsoleLspStarted();
       const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
-        completionProvider = await completionProviderRequest;
+        completionProvider = await this.ensureConsoleLspStarted();
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
@@ -147,7 +140,7 @@ export class RTermLang {
         );
         const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
         const sessionData =
-          refreshedSessionData ?? getWorkspaceData() ?? cachedSessionData;
+          getWorkspaceData() ?? cachedSessionData;
         return await collectCompletionEntries(
           context,
           document,
@@ -156,7 +149,7 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          this.options.requestMemberCompletions,
+          undefined,
           latestInput.text
         );
       })();
@@ -214,18 +207,15 @@ export class RTermLang {
         return;
       }
 
+      this.completionPickerAbort?.abort();
+      const pickerAbort = new AbortController();
+      this.completionPickerAbort = pickerAbort;
       const selection = await pickCompletion({
         context, latestInput, initialEntries,
+        signal: pickerAbort.signal,
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
-          let refreshedRefinedSessionData: WorkspaceData | undefined;
-          const refinedWorkspaceDataRequest = this.shouldRequestWorkspaceData(nextContext)
-            ? this.options.requestWorkspaceData?.()
-            : undefined;
-          void refinedWorkspaceDataRequest?.then((data) => {
-            refreshedRefinedSessionData = data ?? getWorkspaceData();
-          }).catch(() => undefined);
 
           const nextDocumentRequest = this.getOrOpenCompletionDocument(nextInputText);
           if (!completionProvider) {
@@ -236,7 +226,7 @@ export class RTermLang {
             return;
           }
           const refinedSessionData =
-            refreshedRefinedSessionData ?? getWorkspaceData() ?? cachedSessionData;
+            getWorkspaceData() ?? cachedSessionData;
           const nextEntries = await collectCompletionEntries(
             nextContext,
             nextDocument,
@@ -247,12 +237,13 @@ export class RTermLang {
             lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            this.options.requestMemberCompletions,
+            undefined,
             nextInputText
           );
           return nextEntries;
         },
       });
+      if (this.completionPickerAbort === pickerAbort) this.completionPickerAbort = undefined;
 
       if (!isCompletionPickItem(selection)) {
         return;
@@ -292,6 +283,8 @@ export class RTermLang {
   cancelCompletion(): void {
     this.completionRequestId++;
     this.inlineCache = undefined;
+    this.completionPickerAbort?.abort();
+    this.completionPickerAbort = undefined;
   }
 
   dispose(): Promise<void> {
@@ -300,7 +293,7 @@ export class RTermLang {
     }
 
     this.disposed = true;
-    this.completionRequestId += 1;
+    this.cancelCompletion();
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;
     this.completionDocument = undefined;
@@ -311,7 +304,12 @@ export class RTermLang {
   }
 
   clearSessionState(): void {
-    this.sessionState = undefined;
+    this.cancelCompletion();
+    this.sessionState = { attachedPackages: [] };
+    this.workspaceRevision = undefined;
+    this.cachedSessionData = undefined;
+    this.consoleLsp?.invalidateRuntimeCompletion?.();
+    void this.consoleLsp?.syncSessionState(this.sessionState).catch(() => undefined);
     this.consoleLsp?.updateInput("");
   }
 
@@ -338,19 +336,22 @@ export class RTermLang {
   }
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
-    this.inlineCache = undefined;
-    if (this.disposed || !data) {
-      return false;
-    }
+    if (this.disposed || !data) return false;
+    this.cachedSessionData = data;
 
+    // sess includes a stable revision in unchanged workspace responses.
+    // Avoid cancelling suggestions on every ordinary completion-time poll.
+    if (typeof data.revision === "number" && data.revision !== this.workspaceRevision) {
+      this.workspaceRevision = data.revision;
+      this.cancelCompletion();
+      this.consoleLsp?.invalidateRuntimeCompletion?.();
+    }
     const nextState = this.toSessionState(data);
-    if (
-      this.sessionState &&
-      this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages) &&
-      this.arraysEqual(nextState.libraryPaths ?? [], this.sessionState.libraryPaths ?? [])
-    ) {
+    if (this.sessionState &&
+        this.arraysEqual(nextState.attachedPackages, this.sessionState.attachedPackages)) {
       return false;
     }
+    this.inlineCache = undefined;
 
     this.sessionState = nextState;
     if (this.consoleLsp) {
@@ -424,6 +425,13 @@ export class RTermLang {
         extensionPath: this.options.extensionPath,
         rPath: this.options.rPath,
         env: this.options.env,
+        cwd: this.options.cwd,
+        getCachedWorkspaceData: () => this.cachedSessionData,
+        getStaticAnalysisEnabled: this.options.getStaticAnalysisEnabled,
+        onPackagesChanged: () => {
+          this.cancelCompletion();
+          this.options.onPackagesChanged?.();
+        },
       });
       this.consoleLsp = lsp;
     }
@@ -447,18 +455,11 @@ export class RTermLang {
     }
   }
 
-  private shouldRequestWorkspaceData(
-    context: NonNullable<ReturnType<typeof getCompletionContext>>
-  ): boolean {
-    return context.kind !== "member" && context.kind !== "package";
-  }
-
   private toSessionState(data: WorkspaceData): ConsoleSessionState {
     return {
       attachedPackages: data.search
         .filter((value) => value.startsWith("package:"))
         .map((value) => value.slice(8)),
-      ...(data.libraryPaths ? { libraryPaths: data.libraryPaths } : {}),
     };
   }
 

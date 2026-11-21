@@ -1,20 +1,22 @@
 import type * as vscode from "vscode";
 import type { LanguageClient } from "vscode-languageclient/node";
 import type { VirtualRDocument } from "../virtualRDocument";
-import { getCompletionParseInsertion, getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./contextParser";
+import { getBracketCompletionContext, getCompletionParseInsertion, getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./contextParser";
 
 // Supplemental syntax belongs to the console adapter. Standard completion
 // position and document contents remain available to the native LSP handler.
 export function createCompletionParams(
   client: LanguageClient, projection: ReturnType<VirtualRDocument["project"]>,
-  serverPosition: vscode.Position, contextPosition: vscode.Position, context: vscode.CompletionContext
+  serverPosition: vscode.Position, contextPosition: vscode.Position, context: vscode.CompletionContext,
+  staticAnalysis = false
 ) {
   const text = projection.document.getText();
-  const hasContext = text.includes("(") || text.includes("|>") || text.includes("%>%");
+  const hasContext = text.includes("(") || text.includes("[") || text.includes("|>") || text.includes("%>%");
   const contextOffset = hasContext ? projection.document.offsetAt(projection.toServerPosition(contextPosition)) : 0;
   const call = text.includes("(")
     ? getEnclosingCall(text, contextOffset) : undefined;
   const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
+  const bracket = text.includes("[") ? getBracketCompletionContext(text, contextOffset) : undefined;
   const parseSuffix = getCompletionParseSuffix(text);
   const parseInsertion = parseSuffix !== undefined && pipe
     ? getCompletionParseInsertion(text, contextOffset) : undefined;
@@ -22,7 +24,15 @@ export function createCompletionParams(
   // context for argument matching, literal values and unfinished-input repair.
   return {
     ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
+    ...(staticAnalysis ? { rConsoleStaticAnalysis: true } : {}),
     ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
+    ...(bracket ? {
+      rConsoleDataObject: bracket.objectName,
+      rConsoleSubscriptOperator: bracket.operator,
+      rConsoleSubscriptTags: bracket.argumentTags,
+      rConsoleSubscriptPrefix: bracket.prefix,
+      ...(bracket.argumentName ? { rConsoleSubscriptArgument: bracket.argumentName } : {}),
+    } : {}),
     ...(parseInsertion ? { rConsoleParseInsertion: {
       position: projection.document.positionAt(parseInsertion.offset), text: parseInsertion.text,
     } } : {}),

@@ -7,8 +7,9 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [] } = {}) {
+function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false } = {}) {
   const instances = [];
+  const logs = [];
   class LanguageClient {
     constructor() {
       this.running = false;
@@ -34,8 +35,9 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     async sendRequest(method, params) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
-      if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? true;
-      if (method === "rConsole/checkPackageChanges") return await packageChanges?.(this) ?? [];
+      if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
+      if (method === "rConsole/libraryPaths") return libraries;
+      if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
       assert.equal(method, "completion");
       return await completion?.(this, params) ?? [{ label: "lm" }];
     }
@@ -44,7 +46,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     vscode: {
       Position, Range: class Range {},
       Uri: { parse: (value) => ({ toString: () => value }), file: () => ({}) },
-      window: { createOutputChannel: () => ({ appendLine() {}, dispose() {} }) },
+      window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
       workspace: { getConfiguration: () => ({ get: (key) => key === "libPaths" ? libraries : undefined }) },
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
     },
@@ -59,59 +61,123 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
   });
   const client = new ConsoleLspClient({
     consoleId: "lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
-    rPath: "R", env: {},
+    rPath: "R", env: {}, getCachedWorkspaceData,
+    getStaticAnalysisEnabled: () => staticAnalysis,
   });
+  client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
-  return { client, instances };
+  return { client, instances, logs };
 }
 
-test("first session snapshot keeps a server whose effective library paths already match", async (t) => {
+function change() {
+  return { libraries: [{ path: "/base/library", packages: new Map() }],
+    packages: new Map(), changed: ["stats"], isCurrent: () => true };
+}
+
+test("native member signatures never wait for runtime inspection", async t => {
+  const { client } = createClient(t, {
+    staticAnalysis: true,
+    completion: () => ({ items: [], rConsoleLocalFunction: true }),
+  });
+  const result = await client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
+  assert.equal(result.rConsoleLocalFunction, true);
+});
+
+test("cached workspace functions use one LSP request without sess inspection", async t => {
+  const { client, instances } = createClient(t, {
+    getCachedWorkspaceData: () => ({ globalenv: {
+      f: { type: "closure", str: "function(first, second = 2)" },
+    } }),
+    completion: (_client, params) => ({ items: [], seenSignature: params.rConsoleRuntimeSignature }),
+  });
+  for (const text of ["f(", "`f`("]) {
+    const result = await client.provideCompletionItems({ getText: () => text },
+      new Position(0, text.length));
+    assert.equal(result.seenSignature, "function(first, second = 2)", text);
+  }
+  assert.equal(instances[0].requests.filter(request => request.method === "completion").length, 2);
+});
+
+test("first session snapshot keeps the running server", async (t) => {
   const { client, instances } = createClient(t);
   await client.start();
-  await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/base/library"] });
+  await client.syncSessionState({ attachedPackages: ["stats"] });
   assert.equal(instances.length, 1, "matching paths must not restart a healthy server");
 });
 
-test("session path checks include configured fallback libraries", async (t) => {
-  const { client, instances } = createClient(t, { libraries: ["/configured"] });
-  await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/session"] });
-  const request = instances[0].requests.find(({ method }) => method === "rConsole/syncSessionState");
-  assert.deepEqual(request.params.libraryPaths, ["/session", "/configured"]);
+test("a package refresh recovers a stopped server and restores session state", async t => {
+  const { client, instances } = createClient(t);
+  await client.syncSessionState({ attachedPackages: ["stats"] });
+  instances[0].running = false;
+  await client.refreshPackages(change());
+  assert.equal(instances.length, 2);
+  const requests = instances[1].requests;
+  const sync = requests.findIndex(request => request.method === "rConsole/syncSessionState");
+  const refresh = requests.findIndex(request => request.method === "rConsole/refreshPackages");
+  assert.ok(sync >= 0 && refresh > sync);
+  assert.deepEqual(requests[refresh].params.changed, [], "a fresh server already loads the updated files");
+  assert.deepEqual(await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8)),
+    [{ label: "lm" }]);
 });
 
-test("a real library change restarts once and applies the latest session state", async (t) => {
+
+test("a confirmed loaded-package change restarts once and applies the latest session state", async (t) => {
   let releaseStart;
   const startGate = new Promise((resolve) => { releaseStart = resolve; });
   t.after(releaseStart);
-  const { client, instances } = createClient(t, {
-    reply: (server) => server === instances[0] ? { restartRequired: true } : true,
-    start: async (server) => { if (server === instances[1]) await startGate; },
+  const oldProcess = { exitCode: 0, signalCode: null };
+  const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  const { client, instances, logs } = createClient(t, {
+    packageChanges: (server) => server === instances[0] ? ["stats"] : [],
+    start: async (server) => {
+      if (server === instances[1]) {
+        client.logServerStarted();
+        client.logServerError(reset, {});
+        await startGate;
+      }
+    },
+    stop: server => {
+      if (server === instances[0]) {
+        client.logServerError(reset, oldProcess);
+        client.logServerStopped(0, null, oldProcess);
+      }
+    },
   });
   await client.start();
-  const first = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/first"] });
+  client.spawnedServer = oldProcess;
+  await client.syncSessionState({ attachedPackages: ["stats"] });
+  const first = client.refreshPackages(change());
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(instances.length, 2);
   const concurrentStart = client.start();
-  const latest = client.syncSessionState({ attachedPackages: ["utils"], libraryPaths: ["/latest"] });
+  const latest = client.syncSessionState({ attachedPackages: ["utils"] });
   releaseStart();
   await Promise.all([first, concurrentStart, latest]);
   assert.equal(instances.length, 2, "concurrent callers share one restart");
-  assert.deepEqual(instances[1].requests.at(-1).params, {
-    attachedPackages: ["utils"], libraryPaths: ["/latest"],
+  assert.deepEqual(instances[1].requests.filter(request => request.method === "rConsole/syncSessionState").at(-1).params, {
+    attachedPackages: ["utils"],
   });
+  const refreshed = instances[1].requests.findIndex(request => request.method === "rConsole/refreshPackages");
+  assert.ok(refreshed >= 0);
+  assert.ok(refreshed < instances[1].requests.findIndex(request => request.method === "completion"));
+  assert.ok(logs.some(line => line.includes("connection closed during planned restart: stats (removed) (ECONNRESET)")));
+  assert.ok(logs.some(line => line.includes("stopped (exit code 0; planned restart: stats (removed))")));
+  assert.ok(logs.some(line => line.endsWith("R Console language server started")));
+  assert.equal(logs.filter(line => line.startsWith("[Error -") && line.includes("ECONNRESET")).length, 1,
+    "a connection reset from the replacement process must still be reported as an error");
 });
 
-test("completion survives a library restart while its package check is pending", async (t) => {
+test("completion survives a background replacement while its response is pending", async (t) => {
   const { client, instances } = createClient(t, {
-    reply: (server) => server === instances[0] ? { restartRequired: true } : true,
+    packageChanges: (server) => server === instances[0] ? ["stats"] : [],
   });
   await client.start();
   const first = instances[0];
   const originalRequest = first.sendRequest.bind(first);
   let sync;
   first.sendRequest = async (method, params) => {
-    if (method === "rConsole/checkPackageChanges") {
-      sync = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/new"] });
+    if (method === "completion") {
+      sync = client.refreshPackages(change());
       await sync;
       throw new Error("Pending response rejected since connection got disposed");
     }
@@ -121,15 +187,15 @@ test("completion survives a library restart while its package check is pending",
   await sync;
   assert.deepEqual(result, [{ label: "lm" }]);
   assert.equal(instances.length, 2);
-  assert.deepEqual(instances[1].documents, ["stats::l"], "reopen the document on the replacement server");
+  assert.equal(instances[1].documents.at(-1), "stats::l", "reopen the document on the replacement server");
 });
 
 test("completion retries a request interrupted by a server replacement", async (t) => {
   const { client, instances } = createClient(t, {
-    reply: (server) => server === instances[0] ? { restartRequired: true } : true,
+    packageChanges: (server) => server === instances[0] ? ["stats"] : [],
     completion: async (server) => {
       if (server === instances[0]) {
-        await client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/new"] });
+        await client.refreshPackages(change());
         throw new Error("Pending response rejected since connection got disposed");
       }
       return [{ label: "lm" }];
@@ -151,7 +217,7 @@ test("ordinary completion errors do not restart the server or repeat the request
   assert.equal(instances[0].requests.filter(({ method }) => method === "completion").length, 1);
 });
 
-test("package replacement and a simultaneous library update share one restart", async (t) => {
+test("package replacement and a simultaneous session update share one restart", async (t) => {
   let releaseStop;
   let enteredStop;
   const stopGate = new Promise((resolve) => { releaseStop = resolve; });
@@ -163,33 +229,35 @@ test("package replacement and a simultaneous library update share one restart", 
       if (server === instances[0]) { enteredStop(); await stopGate; }
     },
   });
+  await client.start();
+  const refresh = client.refreshPackages(change());
   const request = client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8));
   await stopping;
-  const state = { attachedPackages: ["stats"], libraryPaths: ["/project"] };
+  const state = { attachedPackages: ["stats"] };
   const sync = client.syncSessionState(state);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(instances.length, 1, "do not launch a server while its predecessor is stopping");
   releaseStop();
-  const [result] = await Promise.all([request, sync]);
+  const [result] = await Promise.all([request, sync, refresh]);
   assert.deepEqual(result, [{ label: "lm" }]);
   assert.equal(instances.length, 2);
   assert.deepEqual(instances[1].requests.find(({ method }) => method === "rConsole/syncSessionState").params, state);
 });
 
-test("an obsolete library update does not restart a server that matches the latest state", async (t) => {
+test("a superseded session update applies the latest attached packages", async (t) => {
   let releaseReply;
   let enteredRequest;
   const replyGate = new Promise((resolve) => { releaseReply = resolve; });
   const requested = new Promise((resolve) => { enteredRequest = resolve; });
-  t.after(() => releaseReply({ restartRequired: true }));
+  t.after(() => releaseReply({ libraryPaths: ["/obsolete"] }));
   let requests = 0;
   const { client, instances } = createClient(t, {
-    reply: async () => { if (++requests === 1) { enteredRequest(); return replyGate; } return true; },
+    reply: async () => { if (++requests === 1) { enteredRequest(); return replyGate; } return { libraryPaths: ["/current"] }; },
   });
-  const first = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/obsolete"] });
+  const first = client.syncSessionState({ attachedPackages: ["stats"] });
   await requested;
-  const latest = client.syncSessionState({ attachedPackages: ["stats"], libraryPaths: ["/current"] });
-  releaseReply({ restartRequired: true });
+  const latest = client.syncSessionState({ attachedPackages: ["utils"] });
+  releaseReply({ libraryPaths: ["/obsolete"] });
   await Promise.all([first, latest]);
   assert.equal(instances.length, 1);
   assert.equal(requests, 2, "check the latest state before deciding to restart");
@@ -200,6 +268,7 @@ test("cached session state reaches the LSP before its first launch", async () =>
   class ConsoleLspClient {
     async start() { calls.push("start"); }
     async syncSessionState(state) { calls.push(state); }
+    updateInput() {}
     async dispose() {}
   }
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
@@ -207,8 +276,30 @@ test("cached session state reaches the LSP before its first launch", async () =>
     "../../Language/consoleLspClient": { ConsoleLspClient },
   });
   const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
-  lang.updateSessionData({ search: ["package:stats"], globalenv: {}, libraryPaths: ["/project"], loaded_namespaces: [] });
+  const data = { search: ["package:stats"], globalenv: { f: { type: "closure", str: "function(first)" } }, loaded_namespaces: [] };
+  lang.updateSessionData(data);
   await lang.ensureConsoleLspStarted();
-  assert.deepEqual(calls, [{ attachedPackages: ["stats"], libraryPaths: ["/project"] }]);
+  assert.deepEqual(calls, [{ attachedPackages: ["stats"] }],
+    "workspace function signatures are no longer sent to the separate language server");
+  assert.equal(lang.updateSessionData(data), false, "unchanged metadata is not resent");
+  lang.clearSessionState();
+  assert.deepEqual(calls.at(-1), { attachedPackages: [] });
   await lang.dispose();
+});
+
+test("a pending LSP response cannot publish after the runtime changes", async t => {
+  let release, entered;
+  const reply = new Promise(resolve => { release = resolve; });
+  const waiting = new Promise(resolve => { entered = resolve; });
+  t.after(() => release({ items: [] }));
+  let requests = 0;
+  const { client } = createClient(t, {
+    completion: async () => { requests++; entered(); return reply; },
+  });
+  const pending = client.provideCompletionItems({ getText: () => "f(" }, new Position(0, 2));
+  await waiting;
+  client.invalidateRuntimeCompletion();
+  release({ items: [{ label: "old_arg", detail: "parameter" }] });
+  assert.equal(await pending, undefined);
+  assert.equal(requests, 1);
 });

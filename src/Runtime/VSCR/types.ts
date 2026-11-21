@@ -10,9 +10,9 @@ export type GlobalEnvItem = {
 };
 
 export type WorkspaceData = {
+  revision?: number;
   search: string[];
   loaded_namespaces: string[];
-  libraryPaths?: string[];
   globalenv: Record<string, GlobalEnvItem>;
 };
 

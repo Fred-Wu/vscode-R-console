@@ -249,8 +249,9 @@ export class SessionWatcher {
   }
 
   private async updateWorkspace(): Promise<void> {
+    const sessionDir = this.sessionDir;
     const response = await this.postToSessionServer({ type: "workspace" });
-    if (!this.isWorkspaceData(response)) {
+    if (this.sessionDir !== sessionDir || !this.isWorkspaceData(response)) {
       return;
     }
     this.workspaceData = response;

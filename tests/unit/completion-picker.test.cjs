@@ -41,6 +41,35 @@ test('Quick Pick re-queries incomplete results in every completion context', asy
   }
 });
 
+test('package invalidation closes Quick Pick and discards delayed suggestions', async () => {
+  let onHide, resolveEntries;
+  let disposed = false;
+  const controller = new AbortController();
+  const pick = {
+    items: [], value: '', activeItems: [],
+    onDidChangeValue() {}, onDidAccept() {}, onDidHide(fn) { onHide = fn; },
+    show() {}, hide() { onHide(); }, dispose() { disposed = true; },
+  };
+  const { pickCompletion } = loadSource('src/Terminal/rTerminal/completionPicker.ts', {
+    vscode: { ...vscode, window: { createQuickPick: () => pick } },
+  });
+  const text = 'pkg::';
+  const showing = pickCompletion({
+    context: completion.getCompletionContext(text, text.length),
+    latestInput: { text, currentLine: text, lines: [text], cursorRow: 0, cursorCol: text.length, textBeforeCursor: text },
+    initialEntries: entries(['oldExport']),
+    delayedEntries: new Promise(resolve => { resolveEntries = resolve; }),
+    force: true, isCurrent: () => !controller.signal.aborted,
+    collect: async () => entries([]), signal: controller.signal,
+  });
+  controller.abort();
+  assert.equal(await showing, undefined);
+  assert.equal(disposed, true);
+  resolveEntries(entries(['lateExport']));
+  await tick();
+  assert.ok(!pick.items.some(item => item.label === 'lateExport'));
+});
+
 test('Quick Pick changing the first character refreshes a blank-context query', async t => {
   const calls = [];
   const picker = await openPicker(t, '', entries([]), async context => {

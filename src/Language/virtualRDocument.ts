@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { getCallOpenings, tokenizeForHighlighting } from "./parser";
+import { runtimeCompletionText } from "./completion/runtimeDocument";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 
@@ -46,7 +47,7 @@ export class VirtualRDocument {
     }
   }
 
-  project(content: string) {
+  project(content: string, staticAnalysis = true, cursor?: vscode.Position) {
     // Picker previews must not change the selections saved with the actual input.
     const visible = new VirtualRDocument(this.id, content);
     const selections = this.getSelections(content);
@@ -60,9 +61,13 @@ export class VirtualRDocument {
     }
     parts.push(content.slice(previous));
     const text = parts.join("");
-    if (!this.projectedDocument || this.projectedDocument.getText() !== text) {
+    const position = visible.offsetAt(cursor ?? visible.positionAt(content.length));
+    const projectedOffset = position + insertions.reduce((sum, selection) =>
+      sum + (selection.start <= position ? selection.packageName.length + 2 : 0), 0);
+    const completionText = staticAnalysis ? text : runtimeCompletionText(text, projectedOffset);
+    if (!this.projectedDocument || this.projectedDocument.getText() !== completionText) {
       const version = (this.projectedDocument?.version ?? 0) + 1;
-      this.projectedDocument = new VirtualRDocument(this.id, text);
+      this.projectedDocument = new VirtualRDocument(this.id, completionText);
       this.projectedDocument.version = version;
     }
     const document = this.projectedDocument;

@@ -40,14 +40,8 @@ export function getCompletionContext(
         snapshotCursor,
       };
     }
-    let objectName: string | undefined = member.objectName;
     const isPlaceholderMember = member.hasSubscript && operator === "$" &&
       isPipePlaceholder(member.baseObject) && !!dataObjectName;
-    if (member.hasSubscript) {
-      // The live provider evaluates its receiver. For $ we can suggest base
-      // columns; slots belong to the indexed object and need static inference.
-      objectName = operator === "@" ? undefined : member.baseObject;
-    }
     return {
       kind: "member",
       autoTrigger: true,
@@ -55,7 +49,9 @@ export function getCompletionContext(
       replaceStart,
       ...replacement,
       triggerCharacter: prefix.length === 0 ? operator : undefined,
-      objectName: isPlaceholderMember ? dataObjectName : objectName,
+      objectName: isPlaceholderMember
+        ? dataObjectName + member.objectName.slice(member.baseObject.length) : member.objectName,
+      indexedObject: member.hasSubscript,
       operator,
       dataObjectName: isPlaceholderMember ? dataObjectName : undefined,
       snapshotInput,
@@ -79,7 +75,6 @@ export function getCompletionContext(
       bracketQuote: bracket.quote,
       bracketDimension: bracket.dimension,
       bracketDimensions: bracket.dimensions,
-      bracketArgumentTags: bracket.argumentTags,
       bracketArgumentName: bracket.argumentName,
       dataObjectName: effectiveDataObject,
       operator: undefined,

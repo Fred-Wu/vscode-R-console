@@ -615,7 +615,7 @@ test("cancelled manual recovery does not submit R code after preparation resolve
   assert.deepEqual(fixture.commands, []);
 });
 
-test("proxy forwards protocol 2 attach metadata and keeps workspace and completion capabilities", { timeout: 10000 }, async (t) => {
+test("proxy forwards protocol 2 attach metadata and caches workspace without inspecting members", { timeout: 10000 }, async (t) => {
   const server = await upstream(t);
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
   const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
@@ -636,19 +636,10 @@ test("proxy forwards protocol 2 attach metadata and keeps workspace and completi
   );
   assert.deepEqual(proxy.getWorkspaceData(), workspace);
 
-  const completion = proxy.requestMemberCompletions("x", "$");
-  await waitFor(() => r.messages.some((message) =>
-    message.method === "completion" && message.params?.expr === "x"
-  ));
-  const request = r.messages.find((message) =>
-    message.method === "completion" && message.params?.expr === "x"
-  );
-  send(r.socket, {
-    jsonrpc: "2.0",
-    id: request.id,
-    result: [{ name: "member", type: "numeric" }],
-  });
-  assert.deepEqual(await completion, [{ name: "member", type: "numeric" }]);
+  assert.ok(!r.messages.some(message =>
+    message.method === "hover" || message.method === "workspace_children"),
+    "completion must not initiate live sess inspection");
+
 });
 
 test("proxy replacement survives old socket close, forwards Unicode, and propagates upstream disconnect", { timeout: 10000 }, async (t) => {
@@ -662,13 +653,13 @@ test("proxy replacement survives old socket close, forwards Unicode, and propaga
   await waitFor(() => proxy.getSessionId() && server.sockets.length === 1);
   const oldSocket = proxy.rSocket;
   const oldUpstream = proxy.upstreamSocket;
-  const pending = proxy.requestMemberCompletions("x", "$");
-  await waitFor(() => first.messages.some((message) => message.method === "completion"));
+  const pending = proxy.requestWorkspace();
+  await waitFor(() => first.messages.some((message) => message.method === "workspace"));
   const second = await connectR(t, endpoint);
   const replacement = { ...attach, params: { ...attach.params, session_id: "replacement" } };
   send(second.socket, replacement);
   await waitFor(() => server.sockets.length === 2);
-  assert.equal(await pending, undefined);
+  await pending;
   assert.equal(proxy.getSessionId(), "replacement");
   oldSocket.emit("close");
   oldSocket.emit("drain");
@@ -695,38 +686,15 @@ test("proxy replacement survives old socket close, forwards Unicode, and propaga
   assert.equal(proxy.getWorkspaceData(), undefined);
 });
 
-test("sess workspace refresh publishes promptly and then synchronizes library paths", async () => {
+test("sess workspace refresh does not issue library-path completion requests", async () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
   const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "/not-connected" });
-  proxy.rSocket = { destroyed: false, destroy() { this.destroyed = true; } };
-  let resolvePaths;
-  const pathsPending = new Promise((resolve) => { resolvePaths = resolve; });
   const methods = [];
-  const updates = [];
-  proxy.setWorkspaceDataListener((data) => updates.push(data));
-  proxy.request = async (method, params) => {
-    methods.push([method, params]);
-    if (method === "workspace") {
-      return { search: [], loaded_namespaces: [], globalenv: {} };
-    }
-    return pathsPending;
-  };
-  const workspace = await proxy.requestWorkspace();
-  assert.deepEqual(workspace, { search: [], loaded_namespaces: [], globalenv: {} });
+  const workspace = { search: [], loaded_namespaces: [], globalenv: {} };
+  proxy.request = async (method) => { methods.push(method); return workspace; };
+  assert.deepEqual(await proxy.requestWorkspace(), workspace);
   assert.deepEqual(proxy.getWorkspaceData(), workspace);
-  assert.equal(updates.length, 1, "do not delay the workspace behind the paths request");
-  assert.equal(methods[1][0], "completion");
-  assert.match(methods[1][1].expr, /\.libPaths\(\)/);
-
-  resolvePaths([{ name: "/project/.uvr/library" }, { name: "/base/library" }]);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(proxy.getWorkspaceData().libraryPaths, [
-    "/project/.uvr/library", "/base/library",
-  ]);
-  assert.equal(updates.length, 2);
-  await proxy.requestWorkspace();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(updates.length, 3, "unchanged libraries do not emit a separate update");
+  assert.deepEqual(methods, ["workspace"]);
   proxy.dispose();
 });
 
@@ -744,27 +712,6 @@ test("late workspace responses cannot restore a disconnected session", async () 
   assert.equal(proxy.getWorkspaceData(), undefined);
 });
 
-test("late library-path responses do not overwrite a replacement R socket", async () => {
-  const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
-  const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: "/not-connected" });
-  const oldSocket = { destroyed: false, destroy() { this.destroyed = true; } };
-  const newSocket = { destroyed: false, destroy() { this.destroyed = true; } };
-  proxy.rSocket = oldSocket;
-  let completePaths;
-  proxy.request = async (method) => method === "workspace"
-    ? { search: [], loaded_namespaces: [], globalenv: {} }
-    : new Promise((resolve) => { completePaths = resolve; });
-  await proxy.requestWorkspace();
-  assert.equal(typeof completePaths, "function");
-  proxy.rSocket = newSocket;
-  proxy.workspaceData = undefined;
-  proxy.libraryPathsRequest = undefined;
-  completePaths([{ name: "/stale/library" }]);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(proxy.getWorkspaceData(), undefined);
-  oldSocket.destroy();
-  proxy.dispose();
-});
 
 test("sess proxy accepts multiple bounded JSON-RPC messages in one chunk", () => {
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
@@ -878,19 +825,19 @@ test("local sess requests respect backpressure without disconnecting R", async (
     write(data) {
       writes++;
       const { id } = JSON.parse(data);
-      setImmediate(() => proxy.handleRLine(JSON.stringify({ id, result: [{ name: "member" }] })));
+      setImmediate(() => proxy.handleRLine(JSON.stringify({ id, result: { search: [], loaded_namespaces: [], globalenv: {} } })));
       return true;
     },
     destroy() { this.destroyed = true; },
   };
   proxy.rSocket = socket;
-  assert.equal(await proxy.requestMemberCompletions("x", "$"), undefined);
+  assert.equal(await proxy.requestWorkspace(), undefined);
   assert.equal(writes, 0);
   assert.equal(proxy.pendingRequests.size, 0);
   assert.equal(socket.destroyed, false);
   socket.writableNeedDrain = false;
-  const result = await proxy.requestMemberCompletions("x", "$");
-  assert.equal(result[0].name, "member");
+  const result = await proxy.requestWorkspace();
+  assert.deepEqual(result, { search: [], loaded_namespaces: [], globalenv: {} });
   assert.equal(writes, 1);
   proxy.dispose();
 });

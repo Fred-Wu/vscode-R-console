@@ -130,11 +130,13 @@ export function filterShadowedWorkspaceEntries(
   const workspaceLabels = new Set(
     workspaceEntries.map(getCompletionIdentityKey)
   );
+  const workspaceNames = new Set(workspaceEntries.map(entry => entry.label));
 
   return entries.filter((entry) => {
     if (preserveEntry?.(entry)) {
       return true;
     }
+    if (entry.detail === "[workspace]" && workspaceNames.has(entry.label)) return false;
     return !workspaceLabels.has(getCompletionIdentityKey(entry));
   });
 }

@@ -85,15 +85,12 @@ test("quoted completions replace the existing value through its closing quote", 
   }
 });
 
-test("nested bracket completion queries the complete object instead of an unrelated global", async () => {
+test("nested bracket completion does not borrow an unrelated global object's fields", async () => {
   const context = contextAt("obj$data[[│]]");
   const entries = await completion.collectCompletionEntries(context, undefined, undefined,
-    { globalenv: { data: { names: ["wrong_global"] } } }, [], [], undefined, async expression => {
-      assert.ok(expression.includes(".obj <- (obj$data)"));
-      return [{ name: "quoted:correct" }];
-    });
-  assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.insertText), ['"correct"']);
-  assert.deepEqual(entries.map(item => item.insertText), ['"correct"']);
+    { globalenv: { data: { names: ["wrong_global"] } } }, [], [], undefined,
+    async () => assert.fail("bracket completion must not query sess"));
+  assert.deepEqual(entries.filter(item => item.kind === 4), []);
   const typed = await completion.collectCompletionEntries(contextAt("obj$data[[da│]]"), undefined, undefined,
     { globalenv: { data: { type: "integer" } } }, []);
   assert.ok(typed.some(item => item.insertText === "data" && item.kind === 5),

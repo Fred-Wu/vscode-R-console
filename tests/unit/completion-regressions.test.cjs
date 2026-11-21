@@ -222,19 +222,24 @@ test("quoted values ending in parentheses keep the caret after the entire value"
   }
 });
 
-test("source function completion retains only functions attributed to this console document", async () => {
+test("source function completion keeps console definitions without duplicating runtime functions", async () => {
   const text = "1 %>% fun", uri = "r-console://review/console.R";
   const context = completion.getCompletionContext(text, text.length);
   const entries = await completion.collectCompletionEntries(context, { getText: () => text, uri: { toString: () => uri } },
-    { line: 0, character: text.length }, undefined, [], [], {
+    { line: 0, character: text.length }, { globalenv: { fun_runtime: { type: "closure" } } }, [], [], {
       provideCompletionItems: async () => [
         { label: "fun_local", kind: 2, insertText: "fun_local()", detail: "[workspace]",
           data: { package: "_workspace_", context_uri: uri } },
         { label: "fun_other", kind: 2, insertText: "fun_other()", detail: "[workspace]",
           data: { package: "_workspace_", context_uri: "file:///other.R" } },
+        { label: "fun_runtime", kind: 2, insertText: "fun_runtime()", detail: "[workspace]",
+          data: { package: "_workspace_", context_uri: uri } },
+        { label: "fun_runtime", kind: 2, insertText: "fun_runtime()", detail: "{pkg}",
+          data: { package: "pkg" } },
       ],
     });
-  assert.deepEqual(entries.map(item => item.insertText), ["fun_local()"]);
+  assert.deepEqual(entries.map(item => [item.insertText, item.detail]),
+    [["fun_local()", "[workspace]"], ["fun_runtime()", "{pkg}"], ["fun_runtime()", "session"]]);
 });
 
 test("completion lexical snapshots remain correct after arbitrary edits and cursor moves", () => {
@@ -436,11 +441,13 @@ test("typed indices preserve expression variables including self references", as
   }
 });
 
-test("member chains never guess fields from unrelated current or recent input", async () => {
+test("member chains never request live runtime inspectors", async () => {
   for (const marked of ['lst[[1]]$│', 'lst[[1]]$al│', 'obj$│', 'obj@│']) {
     const entries = await completion.collectCompletionEntries(contextAt(marked), undefined, undefined,
-      undefined, [], ['alpha_unrelated <- 1'], undefined, async () => [{ name: 'alpha' }], 'alpha_unrelated');
-    assert.deepEqual(entries.map(entry => entry.label), ['alpha'], marked);
+      undefined, [], ['alpha_unrelated <- 1'], undefined,
+      async () => assert.fail("must not call live member completion"),
+      'alpha_unrelated', async () => assert.fail("must not call nested child inspection"));
+    assert.deepEqual(entries, [], marked);
   }
 });
 
@@ -474,49 +481,42 @@ test("empty-to-typed refinement refreshes newly eligible sources and then reuses
   }
 });
 
-test("subscript method metadata keeps names, values, quotes and supplied options distinct", () => {
-  for (const [marked, name, tags] of [
-    ['DT[, key│]', undefined, ['', null]],
-    ['DT[, keyby = al│]', 'keyby', ['', null]],
-    ['DT[, by = "al│"]', 'by', ['', null]],
-    ['DT[, `keyby` = al│]', '`keyby`', ['', null]],
-    ['obj["a\\\"b" = al│]', '"a\\\"b"', [null]],
-    ['DT[, │, by = alpha]', undefined, ['', null, 'by']],
-    ['obj[mode = "a,b", │]', undefined, ['mode', null]],
-    ['obj[..., │]', undefined, ['...', null]],
-    ['DT |> _[, │]', undefined, ['', null]],
+test("subscript contexts keep names, values and quoted options distinct", () => {
+  for (const [marked, name] of [
+    ['DT[, key│]', undefined],
+    ['DT[, keyby = al│]', 'keyby'],
+    ['DT[, by = "al│"]', 'by'],
+    ['DT[, `keyby` = al│]', '`keyby`'],
+    ['obj["a\\\"b" = al│]', '"a\\\"b"'],
+    ['DT[, │, by = alpha]', undefined],
+    ['obj[mode = "a,b", │]', undefined],
+    ['obj[..., │]', undefined],
+    ['DT |> _[, │]', undefined],
   ]) {
     const context = contextAt(marked);
     assert.equal(context.kind, 'bracket', marked);
     assert.equal(context.bracketArgumentName, name, marked);
-    assert.deepEqual(context.bracketArgumentTags, tags, marked);
   }
 });
 
-test("named subscript values and resolved empty results do not invent cached columns", async () => {
-  for (const marked of ['DT[, mult = │]', 'DT[, mult = "│"]', 'DT[, │]']) {
+test("named subscript values do not invent cached columns", async () => {
+  for (const marked of ['DT[, mult = │]', 'DT[, mult = "│"]']) {
     const context = contextAt(marked);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined,
       { globalenv: { DT: { class: ['data.table', 'data.frame'], names: ['alpha'] } } }, [], [], undefined,
-      async () => []);
+      async () => assert.fail("bracket completion must not query sess"));
     assert.deepEqual(entries, [], marked);
   }
 });
 
-test("successful live member lookups supersede stale cached fields even without matches", async () => {
+test("cached member names do not run live object inspectors", async () => {
   const session = { globalenv: { obj: { names: ['alpha'], slots: ['alpha'] } } };
   for (const text of ['obj$', 'obj$al', 'obj@al']) {
-    for (const reply of [[], [{ name: 'beta' }]]) {
-      const context = completion.getCompletionContext(text, text.length);
-      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
-        session, [], [], undefined, async () => reply);
-      assert.deepEqual(entries.map(entry => entry.label), text === 'obj$' ? reply.map(item => item.name) : [], text);
-    }
-  }
-  for (const request of [undefined, async () => undefined, async () => { throw new Error('unavailable'); }]) {
-    const entries = await completion.collectCompletionEntries(completion.getCompletionContext('obj$al', 6),
-      undefined, undefined, session, [], [], undefined, request);
-    assert.deepEqual(entries.map(entry => entry.label), ['alpha']);
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(text, text.length),
+      undefined, undefined, session, [], [], undefined,
+      async () => assert.fail("automatic completion must not execute R methods"));
+    assert.deepEqual(entries.map(entry => entry.label), ['alpha'], text);
   }
 });
 

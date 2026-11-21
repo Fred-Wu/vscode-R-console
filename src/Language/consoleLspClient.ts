@@ -29,6 +29,9 @@ import type { CompletionPickItem, CompletionProvider, CompletionResult } from ".
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
+import { backtickRName } from "./completion/candidates";
+import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
+import type { WorkspaceData } from "../Runtime/VSCR/types";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -50,17 +53,19 @@ type ConsoleLspClientOptions = {
   extensionPath: string;
   rPath: string;
   env: NodeJS.ProcessEnv;
+  cwd?: string;
+  onPackagesChanged?: () => void;
+  getCachedWorkspaceData?: () => WorkspaceData | undefined;
+  getStaticAnalysisEnabled?: () => boolean;
 };
 
 type ConsoleLspSessionState = {
   attachedPackages: string[];
-  libraryPaths?: string[];
 };
 
 type SessionStateSyncResult = {
   synced: boolean;
   stateKey: string;
-  restartRequired?: boolean;
 };
 
 class SilentOutputChannel implements vscode.OutputChannel {
@@ -104,16 +109,22 @@ export class ConsoleLspClient implements CompletionProvider {
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
-  private packageCheckPromise: Promise<boolean> | undefined;
-  private lastPackageCheckAt = 0;
-  private configuredLibraryPaths: string[] = [];
+  private readonly packageInventory: PackageInventory;
+  private packageRefreshPromise: Promise<void> | undefined;
+  private packageRevision = 0;
+  private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
+  private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
     this.outputChannel = new SilentOutputChannel("R Console");
-    // A client removes only its own cwd after its R process has stopped.
+    // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
+    this.packageInventory = new PackageInventory(
+      change => this.refreshPackages(change),
+      message => lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] ${message}`),
+    );
   }
 
   async start(): Promise<void> {
@@ -242,6 +253,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.disposed = true;
+    this.packageInventory.dispose();
     this.disposePromise = (async () => {
       while (!(await this.stop())) {
         const child = this.spawnedServer;
@@ -261,7 +273,8 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   getCallContext(doc: vscode.TextDocument, position: vscode.Position) {
-    const projection = this.inputDocument.project(doc.getText());
+    const projection = this.inputDocument.project(doc.getText(),
+      this.options.getStaticAnalysisEnabled?.() === true, position);
     return getEnclosingCall(projection.document.getText(),
       projection.document.offsetAt(projection.toServerPosition(position)));
   }
@@ -273,27 +286,19 @@ export class ConsoleLspClient implements CompletionProvider {
     contextPosition: vscode.Position = position
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      await this.packageRefreshPromise;
+      const revision = this.packageRevision;
       const client = await this.ensureClient();
       if (!client) {
         return undefined;
       }
       try {
-        const projection = this.inputDocument.project(doc.getText());
+        const staticAnalysis = this.options.getStaticAnalysisEnabled?.() === true;
+        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition);
         await this.syncDocument(client, projection.document);
         await this.applySessionState(client);
         if (this.client !== client) {
           continue;
-        }
-        const packagesChanged = await this.packageChangesDetected(client, projection.document.getText());
-        if (this.client !== client || !client.isRunning()) {
-          continue;
-        }
-        if (packagesChanged) {
-          if (attempt === 0) {
-            await this.restartClient(client);
-            continue;
-          }
-          return undefined;
         }
         const context: vscode.CompletionContext = triggerCharacter
           ? {
@@ -305,14 +310,42 @@ export class ConsoleLspClient implements CompletionProvider {
               triggerCharacter: undefined,
             };
         const serverPosition = projection.toServerPosition(position);
-        const params = createCompletionParams(client, projection, serverPosition, contextPosition, context);
-        const result = await client.sendRequest(CompletionRequest.type, params);
-        if (this.client !== client) {
-          continue;
+        const params = createCompletionParams(client, projection, serverPosition, contextPosition, context,
+          staticAnalysis);
+        const documentVersion = projection.document.version;
+        const sessionState = this.sessionState;
+        const runtimeRevision = this.runtimeRevision;
+        // Use the already-published workspace snapshot; completion must not
+        // query sess to resolve or inspect runtime objects.
+        const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
+        if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
+            !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
+          const name = Object.hasOwn(globals, params.rConsoleCall)
+            ? params.rConsoleCall
+            : Object.keys(globals).find(key => backtickRName(key) === params.rConsoleCall);
+          const item = name === undefined ? undefined : globals[name];
+          if (item && ["closure", "builtin", "special"].includes(item.type) &&
+              typeof item.str === "string" && /^\s*function\s*\(/.test(item.str)) {
+            (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = item.str;
+          }
         }
+        const result = await client.sendRequest(CompletionRequest.type, params);
+        if (this.client !== client || revision !== this.packageRevision) continue;
+        const isCurrent = () => !this.disposed && this.client === client &&
+          revision === this.packageRevision && runtimeRevision === this.runtimeRevision &&
+          this.sessionState === sessionState &&
+          this.syncedDocuments.get(projection.document.uri.toString())?.version === documentVersion;
+        if (!isCurrent()) return undefined;
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
+        if (!isCurrent()) return undefined;
         // VS Code's converter preserves standard LSP fields only. Carry this
         // source decision separately so an empty signature stays authoritative.
+        if (completions && (result as { rConsoleRuntimeOnly?: boolean } | null)?.rConsoleRuntimeOnly === true) {
+          completions.rConsoleRuntimeOnly = true;
+        }
+        if (completions && (result as { rConsoleWorkspaceFunction?: boolean } | null)?.rConsoleWorkspaceFunction === true) {
+          completions.rConsoleWorkspaceFunction = true;
+        }
         if (completions && (result as { rConsoleLocalFunction?: boolean } | null)?.rConsoleLocalFunction === true) {
           completions.rConsoleLocalFunction = true;
         }
@@ -335,6 +368,8 @@ export class ConsoleLspClient implements CompletionProvider {
               : { inserting: mapRange(item.range.inserting), replacing: mapRange(item.range.replacing) };
           }
         }
+        if (this.client !== client || revision !== this.packageRevision) continue;
+        if (!isCurrent()) return undefined;
         return completions;
       } catch {
         // A session update can replace the server at any await above. Reopen
@@ -356,8 +391,13 @@ export class ConsoleLspClient implements CompletionProvider {
     await this.applySessionState(client);
     const currentClient = this.client;
     if (currentClient?.isRunning()) {
-      await this.syncDocument(currentClient, this.inputDocument.project(doc.getText()).document);
+      await this.syncDocument(currentClient, this.inputDocument.project(doc.getText(),
+        this.options.getStaticAnalysisEnabled?.() === true).document);
     }
+  }
+
+  invalidateRuntimeCompletion(): void {
+    this.runtimeRevision++;
   }
 
   updateInput(input: string): void {
@@ -397,17 +437,16 @@ export class ConsoleLspClient implements CompletionProvider {
 
     let syncPromise = this.sessionStateSyncPromise;
     if (!syncPromise) {
-      const params = state.libraryPaths && this.configuredLibraryPaths.length
-        ? { ...state, libraryPaths: [...state.libraryPaths, ...this.configuredLibraryPaths] }
-        : state;
-      syncPromise = client.sendRequest<boolean | { restartRequired: boolean }>("rConsole/syncSessionState", params)
+      syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", state)
         .then((reply) => {
-          const restartRequired = typeof reply === "object" && reply?.restartRequired === true;
-          const synced = this.client === client && !restartRequired;
+          if (this.client === client && typeof reply === "object" && Array.isArray(reply?.libraryPaths)) {
+            this.packageInventory.setLibraryPaths(reply.libraryPaths);
+          }
+          const synced = this.client === client;
           if (synced) {
             this.syncedSessionStateKey = stateKey;
           }
-          return { synced, stateKey, restartRequired };
+          return { synced, stateKey };
         })
         .catch(() => ({ synced: false, stateKey }))
         .finally(() => {
@@ -423,11 +462,6 @@ export class ConsoleLspClient implements CompletionProvider {
       return;
     }
     const currentStateKey = this.getSessionStateKey(this.sessionState);
-    if (result.restartRequired && result.stateKey === currentStateKey) {
-      await this.restartClient(client);
-      if (this.client?.isRunning()) await this.applySessionState(this.client);
-      return;
-    }
     if (
       this.syncedSessionStateKey !== currentStateKey &&
       (result.synced || result.stateKey !== currentStateKey)
@@ -437,10 +471,10 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {
-    return JSON.stringify([state.attachedPackages, state.libraryPaths]);
+    return JSON.stringify(state.attachedPackages);
   }
 
-  private async restartClient(client: ConsoleLanguageClient): Promise<void> {
+  private async restartClient(client: ConsoleLanguageClient, reason: string): Promise<void> {
     if (this.restartPromise) {
       await this.restartPromise;
       return;
@@ -449,8 +483,8 @@ export class ConsoleLspClient implements CompletionProvider {
       return;
     }
 
-    // Package and library updates share one replacement. Completion and startup
-    // callers wait for it instead of launching or using a server being stopped.
+    if (this.spawnedServer) this.plannedRestarts.set(this.spawnedServer, reason);
+    // Completion and startup callers join the same background replacement.
     const refresh = (async () => {
       if (!(await this.stop())) {
         throw new Error("Cannot restart the console language server.");
@@ -469,36 +503,65 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  private async packageChangesDetected(
-    client: ConsoleLanguageClient,
-    content: string
-  ): Promise<boolean> {
-    if (this.packageCheckPromise) {
-      return await this.packageCheckPromise;
-    }
-    if (Date.now() - this.lastPackageCheckAt < 1000) {
-      return false;
-    }
-
-    this.lastPackageCheckAt = Date.now();
-    const packages = [...content.matchAll(/\b([A-Za-z][A-Za-z0-9._]*)::/g)]
-      .map((match) => match[1]);
-    let checkPromise: Promise<boolean>;
-    checkPromise = client.sendRequest<string[]>(
-      "rConsole/checkPackageChanges",
-      { packages }
-    )
-      .then((changedPackages) =>
-        this.client === client && changedPackages.length > 0
-      )
-      .catch(() => false)
-      .finally(() => {
-        if (this.packageCheckPromise === checkPromise) {
-          this.packageCheckPromise = undefined;
+  private async refreshPackages(change: PackageInventoryChange): Promise<void> {
+    const refresh = (async () => {
+      if (!change.isCurrent()) return;
+      const previousClient = this.client;
+      let client = await this.ensureClient();
+      if (!client?.isRunning() || this.disposed) throw new Error("Language server is not running");
+      if (!change.isCurrent()) return;
+      await this.applySessionState(client);
+      if (this.client !== client) throw new Error("Language server changed during package refresh");
+      if (!change.isCurrent()) return;
+      if (change.changed.length) {
+        this.packageRevision++;
+        this.options.onPackagesChanged?.();
+      }
+      const params = {
+        libraryPaths: change.libraries.map(library => library.path),
+        installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
+        // A recovered server already loaded the current installations.
+        changed: client === previousClient ? change.changed : [],
+      };
+      const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
+      if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
+      if (!change.isCurrent()) return;
+      if (result.restart.length) {
+        if (!change.changed.length) {
+          this.packageRevision++;
+          this.options.onPackagesChanged?.();
         }
-      });
-    this.packageCheckPromise = checkPromise;
-    return await checkPromise;
+        const reason = result.restart.map(name =>
+          `${name} (${change.packages.has(name) ? "installation changed" : "removed"})`).join(", ");
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restarting language server: ${reason}; clearing packages loaded in the server.`);
+        await this.restartClient(client, reason);
+        client = this.client;
+        if (!client?.isRunning() || this.disposed) return;
+        await this.applySessionState(client);
+        if (!change.isCurrent()) return;
+        await client.sendRequest("rConsole/refreshPackages", { ...params, changed: [] });
+      } else if (change.changed.length) {
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
+      }
+      if (result.restart.length) {
+        try {
+          const projection = this.inputDocument.project(this.inputDocument.getText(),
+            this.options.getStaticAnalysisEnabled?.() === true);
+          await this.syncDocument(client, projection.document);
+          const position = projection.document.positionAt(projection.document.getText().length);
+          await client.sendRequest(CompletionRequest.type, createCompletionParams(client, projection,
+            position, position, { triggerKind: vscode.CompletionTriggerKind.Invoke, triggerCharacter: undefined }));
+        } catch {
+          // Incomplete console input must not turn a successful refresh into a restart loop.
+        }
+      }
+    })();
+    this.packageRefreshPromise = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (this.packageRefreshPromise === refresh) this.packageRefreshPromise = undefined;
+    }
   }
 
   private async ensureClient(): Promise<ConsoleLanguageClient | undefined> {
@@ -533,7 +596,6 @@ export class ConsoleLspClient implements CompletionProvider {
     const config = vscode.workspace.getConfiguration("r");
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
-    this.configuredLibraryPaths = config.get<string[]>("libPaths") ?? [];
     const env = this.buildServerEnv(config);
     const useStdio = config.get<boolean>("lsp.use_stdio") === true && process.platform !== "win32";
 
@@ -580,10 +642,12 @@ export class ConsoleLspClient implements CompletionProvider {
     this.client = client;
     this.syncedSessionStateKey = undefined;
     this.sessionStateSyncPromise = undefined;
-    this.packageCheckPromise = undefined;
-    this.lastPackageCheckAt = 0;
     await client.start();
     await this.disableConsoleDiagnostics(client);
+    const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});
+    if (this.client === client && !this.disposed && !this.syncedSessionStateKey) {
+      this.packageInventory.setLibraryPaths(libraries);
+    }
   }
 
   private createStdioTransport(args: string[], env: NodeJS.ProcessEnv): Promise<StreamInfo> {
@@ -592,7 +656,7 @@ export class ConsoleLspClient implements CompletionProvider {
       let child: ChildProcess;
       try {
         child = spawn(this.options.rPath, args, {
-          cwd: this.workingDirectory,
+          cwd: this.options.cwd ?? this.workingDirectory,
           env,
           stdio: ["pipe", "pipe", "pipe"],
           shell: false,
@@ -627,7 +691,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
       });
       child.once("exit", (code, signal) => {
-        this.logServerStopped(code, signal);
+        this.logServerStopped(code, signal, child);
         if (code === 10) {
           void vscode.window.showWarningMessage(
             "R package {languageserver} is required for console autocompletion."
@@ -668,7 +732,8 @@ export class ConsoleLspClient implements CompletionProvider {
           }
           settled = true;
           if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
-          socket.on("error", (error) => this.logServerError(error));
+          const child = this.spawnedServer;
+          socket.on("error", (error) => this.logServerError(error, child));
           server.close();
           // Authentication leaves the socket paused, possibly with early LSP
           // bytes buffered. Resume only after JSON-RPC installs its reader.
@@ -725,7 +790,7 @@ export class ConsoleLspClient implements CompletionProvider {
         let child: ChildProcess;
         try {
           child = spawn(this.options.rPath, args, {
-            cwd: this.workingDirectory,
+            cwd: this.options.cwd ?? this.workingDirectory,
             env,
             stdio: ["ignore", "ignore", "pipe"],
             shell: false,
@@ -746,7 +811,7 @@ export class ConsoleLspClient implements CompletionProvider {
           rejectOnce(error);
         });
         child.once("exit", (code, signal) => {
-          this.logServerStopped(code, signal);
+          this.logServerStopped(code, signal, child);
           if (code === 10) {
             void vscode.window.showWarningMessage(
               "R package {languageserver} is required for console autocompletion."
@@ -824,13 +889,9 @@ export class ConsoleLspClient implements CompletionProvider {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
     const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = [
-      ...(this.sessionState?.libraryPaths ?? []),
-      ...(config.get<string[]>("libPaths") ?? []),
-    ];
+    const libPaths = config.get<string[]>("libPaths") ?? [];
 
-    // The lifecycle channel reports errors only; languageserver writes its
-    // debug and info entries to the same stderr stream as errors.
+    // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
     env.VSCR_USE_RENV_LIB_PATH = useRenvLibPath ? "TRUE" : "FALSE";
     env.VSCR_LIB_PATHS = libPaths.join("\n");
@@ -867,14 +928,21 @@ export class ConsoleLspClient implements CompletionProvider {
   private logServerStarted(): void {
     const timestamp = formatLogTimestamp();
     lifecycleOutputChannel.appendLine(
-      `[Info - ${timestamp}] R Console language server started`
+      `[${timestamp}] R Console language server started`
     );
     lifecycleOutputChannel.appendLine(
-      `[Info - ${timestamp}] R executable: "${this.options.rPath}"`
+      `[${timestamp}] R executable: "${this.options.rPath}"`
     );
   }
 
-  private logServerError(error: unknown): void {
+  private logServerError(error: unknown, child?: ChildProcess): void {
+    const reason = child && this.plannedRestarts.get(child);
+    if (reason && (error as NodeJS.ErrnoException | null)?.code === "ECONNRESET") {
+      lifecycleOutputChannel.appendLine(
+        `[${formatLogTimestamp()}] R Console language server connection closed during planned restart: ${reason} (ECONNRESET)`
+      );
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     lifecycleOutputChannel.appendLine(
       `[Error - ${formatLogTimestamp()}] ${message}`
@@ -888,18 +956,20 @@ export class ConsoleLspClient implements CompletionProvider {
     const lines = readline.createInterface({ input: child.stderr });
     lines.on("line", (line) => {
       lifecycleOutputChannel.appendLine(
-        `[R stderr - ${formatLogTimestamp()}] ${line}`
+        `[${formatLogTimestamp()}] ${line}`
       );
     });
   }
 
   private logServerStopped(
     code: number | null,
-    signal: NodeJS.Signals | null
+    signal: NodeJS.Signals | null,
+    child: ChildProcess
   ): void {
     const result = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+    const reason = this.plannedRestarts.get(child);
     lifecycleOutputChannel.appendLine(
-      `[Info - ${formatLogTimestamp()}] stopped (${result})`
+      `[${formatLogTimestamp()}] R Console language server stopped (${result}${reason ? `; planned restart: ${reason}` : ""})`
     );
   }
 

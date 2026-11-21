@@ -17,7 +17,6 @@ import {
 } from "../../Runtime/runtimeBackend";
 import {
   getVscodeRIntegration,
-  type SessionMemberCompletionItem,
   type WorkspaceData,
 } from "../../Runtime/VSCR";
 import type {
@@ -240,14 +239,6 @@ export async function getRuntimeWorkspaceData(
   host: RuntimeHost
 ): Promise<WorkspaceData | undefined> {
   return await vscodeRIntegration(host).requestWorkspaceData();
-}
-
-export async function requestRuntimeMemberCompletions(
-  host: RuntimeHost,
-  expression: string,
-  operator: "$" | "@"
-): Promise<SessionMemberCompletionItem[] | undefined> {
-  return await vscodeRIntegration(host).requestMemberCompletions(expression, operator);
 }
 
 export async function startRuntime(host: RuntimeHost): Promise<void> {
