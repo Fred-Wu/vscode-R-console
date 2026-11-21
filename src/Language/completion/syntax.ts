@@ -21,7 +21,7 @@ function hasUnsupportedMemberReceiver(before: string): boolean {
   if (last.type !== TokenType.Identifier || last.closed === false ||
       last.position + last.value.length !== before.length) return false;
   const preceding = tokens.at(-3);
-  return isMemberAccessor(preceding) &&
+  return preceding !== undefined && isMemberAccessor(preceding) &&
     before.slice(preceding.position + preceding.value.length, last.position).trim().length === 0;
 }
 
