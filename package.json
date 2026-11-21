@@ -253,6 +253,6 @@
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0",
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^11.0.0"
   }
 }
