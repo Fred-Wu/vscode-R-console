@@ -3,8 +3,6 @@ import * as path from "path";
 import type { RuntimeHost } from "../../../Terminal/rTerminal/runtime";
 import { BaseVscodeRSessionIntegration } from "../integration";
 import type {
-  SessionCompletionKind,
-  SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
 import { SessProxy } from "./sessProxy";
@@ -367,17 +365,6 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
 
   override async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
     return await this.proxy?.requestWorkspace();
-  }
-
-  override async inspectCompletion(expression: string, kind: SessionCompletionKind) {
-    return await this.proxy?.inspectCompletion(expression, kind);
-  }
-
-  override async requestMemberCompletions(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    return await this.proxy?.requestMemberCompletions(expression, operator);
   }
 
   override filterRuntimeOutput(text: string): string {
