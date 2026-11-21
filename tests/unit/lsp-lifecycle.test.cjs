@@ -347,7 +347,7 @@ test("a late session-sync reply cannot replace newer R Console paths", async t =
   await synchronizing;
   assert.deepEqual(watched.at(-1), ["/new", "/startup"]);
   assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS,
-    "/new\\n/startup");
+    "/new\n/startup");
   client.resetRuntimeLibraryPaths();
   assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS, "");
 });
