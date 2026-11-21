@@ -24,6 +24,8 @@ export class PackageInventory {
   // The child watcher follows the old inode after the library is replaced.
   // Watch its parent as well so an atomic directory/symlink switch re-arms it.
   private readonly parentWatchers = new Map<string, fs.FSWatcher>();
+  // fs.watch follows the directory inode (or a symlink's target), not its path.
+  private readonly watchedTargets = new Map<string, string | undefined>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -48,6 +50,7 @@ export class PackageInventory {
       if (!active.has(library)) {
         watcher.close();
         this.watchers.delete(library);
+        this.watchedTargets.delete(library);
       }
     }
     for (const [library, watcher] of this.parentWatchers) {
@@ -69,6 +72,21 @@ export class PackageInventory {
     this.schedule(0);
   }
 
+  private libraryTarget(library: string): string | undefined {
+    try {
+      const stats = fs.statSync(library);
+      // A real path distinguishes symlink / junction retargeting. Device,
+      // inode, and creation time distinguish replacement at the same path,
+      // including on Windows volumes where inode may not be available.
+      return JSON.stringify([
+        fs.realpathSync.native(library), stats.dev, stats.ino, stats.birthtimeMs,
+      ]);
+    } catch {
+      // A temporarily missing target must be re-armed by the parent watcher.
+      return undefined;
+    }
+  }
+
   private watchParent(library: string): void {
     if (this.disposed || this.parentWatchers.has(library)) return;
     try {
@@ -76,11 +94,15 @@ export class PackageInventory {
       const watcher = fs.watch(path.dirname(library), { persistent: false }, (_event, filename) => {
         if (this.disposed || this.parentWatchers.get(library) !== watcher) return;
         if (filename && String(filename).toLowerCase() !== basename.toLowerCase()) return;
-        // The existing library watcher may still be alive but attached to an
-        // unlinked directory (or an old symlink target).
+        // macOS can omit filenames for unrelated parent changes. Only re-arm
+        // if the watched directory was actually removed or replaced.
         const previous = this.watchers.get(library);
+        const target = this.libraryTarget(library);
+        if (previous && target !== undefined &&
+            target === this.watchedTargets.get(library)) return;
         if (previous) previous.close();
         this.watchers.delete(library);
+        this.watchedTargets.delete(library);
         this.watchLibrary(library, true);
         this.dirtyLibraries.add(library);
         this.schedule(250);
@@ -101,6 +123,7 @@ export class PackageInventory {
 
   private watchLibrary(library: string, recovering = false): void {
     try {
+      const target = this.libraryTarget(library);
       const watcher = fs.watch(library, { persistent: false }, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         this.log(`[Libraries] Filesystem event: ${event} - ${library} - ${filename ? JSON.stringify(filename) : "filename unavailable"}`);
@@ -110,11 +133,13 @@ export class PackageInventory {
       watcher.on("error", error => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         this.watchers.delete(library);
+        this.watchedTargets.delete(library);
         watcher.close();
         this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
         this.scheduleRetry();
       });
       this.watchers.set(library, watcher);
+      this.watchedTargets.set(library, target);
       this.dirtyLibraries.add(library);
       this.log(`[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
     } catch (error) {
@@ -159,6 +184,7 @@ export class PackageInventory {
     this.clearRetry();
     for (const watcher of this.watchers.values()) watcher.close();
     this.watchers.clear();
+    this.watchedTargets.clear();
     for (const watcher of this.parentWatchers.values()) watcher.close();
     this.parentWatchers.clear();
   }

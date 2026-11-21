@@ -363,6 +363,89 @@ test("repeated failures back off and disposal cancels recovery", async t => {
   assert.ok(!logs.some(line => line.includes("Recovery complete")), "disposal is not successful recovery");
 });
 
+test("unchanged parent events do not repeatedly restore renv-style library watchers", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const childWatcher = inventory.watchers.get(library);
+  const parentWatcher = inventory.parentWatchers.get(library);
+  const count = changes.length;
+  assert.ok(childWatcher && parentWatcher);
+
+  logs.length = 0;
+  // macOS may not supply a filename; Windows and Linux commonly do.
+  for (let n = 0; n < 8; n++) {
+    parentWatcher.emit("change", "rename", undefined);
+    parentWatcher.emit("change", "rename", path.basename(library));
+    parentWatcher.emit("change", "rename", Buffer.from(path.basename(library)));
+    parentWatcher.emit("change", "rename", "unrelated-folder");
+  }
+  await settle();
+  assert.equal(inventory.watchers.get(library), childWatcher);
+  assert.equal(inventory.parentWatchers.get(library), parentWatcher);
+  assert.equal(changes.length, count);
+  assert.ok(!logs.some(line => line.includes("Watcher restored") ||
+    line.includes("Scanning folder:")),
+  "unchanged parent events must not rewatch or rescan the library");
+
+  // Unrelated parent notifications must not suppress real child changes.
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "2.0");
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "package updates remain observable");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  assert.equal(inventory.watchers.get(library), childWatcher,
+    "normal package updates do not re-arm the directory watcher");
+});
+
+test("a symlinked library retargets its watcher while ignoring unchanged parent events", async t => {
+  const { root, inventory, changes, install, settle } = fixture(t);
+  const first = path.join(root, "original-target");
+  const second = path.join(root, "replacement-target");
+  const library = path.join(root, "active-library");
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  install(first);
+  install(second, "2.0");
+  const type = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(first, library, type);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example")?.version, "1.0");
+  const previous = inventory.watchers.get(library);
+
+  fs.unlinkSync(library);
+  fs.symlinkSync(second, library, type);
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "symlink target replacement must be detected");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  const restored = inventory.watchers.get(library);
+  assert.ok(restored);
+  assert.notEqual(restored, previous);
+
+  // Duplicate / filename-less parent notifications must retain the new watch.
+  const parent = inventory.parentWatchers.get(library);
+  parent.emit("change", "rename", undefined);
+  parent.emit("change", "rename", path.basename(library));
+  await settle();
+  assert.equal(inventory.watchers.get(library), restored);
+
+  fs.rmSync(path.join(second, "example"), { recursive: true });
+  install(second, "3.0");
+  const nextDeadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "3.0") {
+    assert.ok(Date.now() < nextDeadline, "new symlink target must still receive package events");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
 test("replacing an existing library directory re-arms its watcher without an error event", async t => {
   const { libraries: [library], inventory, changes, install, settle } = fixture(t);
   install(library);
