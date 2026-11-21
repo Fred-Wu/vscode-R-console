@@ -102,7 +102,9 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       window: { createOutputChannel: () => ({ appendLine: (line) => logs.push(line), dispose() {} }) },
       workspace: { getConfiguration: () => ({ get: (key) => {
         if (key === "lsp.args") return args;
-        if (key === "libPaths") return libraries;
+        if (key === "libPaths" || key === "useRenvLibPath") {
+          throw new Error("R Console must not read vscode-R library settings");
+        }
         return undefined;
       } }) },
     },
@@ -119,6 +121,9 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       [...runtimeSignatures].map(([name, str]) => [name, { type: "closure", str }])) }),
     getStaticAnalysisEnabled: () => staticMode,
   });
+  // Model the authenticated console's library-path snapshot, not vscode-R's
+  // r.libPaths setting. This also tests replacement servers with the same paths.
+  if (libraries.length) client.updateRuntimeLibraryPaths(libraries);
   t.after(async () => {
     try { await client.dispose(); }
     finally { if (!t.passed) t.diagnostic(logs.join("\n")); }

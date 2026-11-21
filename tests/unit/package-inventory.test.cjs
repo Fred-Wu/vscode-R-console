@@ -138,6 +138,14 @@ test("inventory stops scanning after events settle and coalesces concurrent scan
   const second = inventory.refresh();
   assert.equal(first, second);
   await first;
+  // Filesystem events can arrive after the first explicit scan finishes.
+  // Wait for the observed publication instead of treating idle as settled
+  // before the OS has delivered its watcher notification.
+  const deadline = Date.now() + 10000;
+  while (changes.length === count) {
+    assert.ok(Date.now() < deadline, "replacement notification arrives");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   await settle();
   assert.equal(changes.length, count + 1);
   assert.deepEqual(changes.at(-1).changed, ["example"]);
