@@ -199,14 +199,17 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   assert.ok(initialLibraries?.paths.length, "initial active R libraries are published");
   const extraLibrary = path.join(dir, "runtime-library");
   fs.mkdirSync(extraLibrary);
-  const normalizeLibrary = value => value.replaceAll("\\", "/").toLowerCase();
+  // R normalizes library paths (e.g. /var -> /private/var on macOS).
+  // Compare filesystem identity rather than the original command string.
+  const normalizeLibrary = value => fs.realpathSync.native(value).replaceAll("\\", "/").toLowerCase();
   const initialSnapshotCount = events.filter(event => event.type === "library-paths").length;
   await submit('baseline_dynamic_paths <- .libPaths(); .libPaths(c(' +
     JSON.stringify(extraLibrary) +
     ', baseline_dynamic_paths)); cat("RUNTIME_LIBRARY_ADDED\\n")', "RUNTIME_LIBRARY_ADDED");
   const addedLibraries = events.filter(event => event.type === "library-paths").at(-1);
   assert.ok(addedLibraries.paths.some(value =>
-    normalizeLibrary(value) === normalizeLibrary(extraLibrary)), "added library appears in R metadata");
+    normalizeLibrary(value) === normalizeLibrary(extraLibrary)),
+    `added library must appear in R metadata (expected ${normalizeLibrary(extraLibrary)}, actual ${JSON.stringify(addedLibraries.paths)})`);
   assert.ok(events.filter(event => event.type === "library-paths").length > initialSnapshotCount);
   await submit('.libPaths(baseline_dynamic_paths); cat("RUNTIME_LIBRARY_REMOVED\\n")',
     "RUNTIME_LIBRARY_REMOVED");
