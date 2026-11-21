@@ -22,21 +22,6 @@ export type SessionMemberCompletionItem = {
   str?: string;
 };
 
-export type SessionCompletionData = {
-  signature?: string;
-  classes?: string[];
-  names?: string[];
-  class?: string[];
-  members?: SessionMemberCompletionItem[];
-  incomplete?: boolean;
-};
-
-export type SessionCompletionKind = "function" | "columns" | "members" | "slots" | "subscript" | "doubleSubscript";
-
-export type SessionCompletionInspector = (
-  expression: string, kind: SessionCompletionKind
-) => Promise<SessionCompletionData | undefined>;
-
 export type VscodeRIntegrationOptions =
   | { kind: "disabled" }
   | { kind: "sess" }
