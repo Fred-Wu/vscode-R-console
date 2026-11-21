@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
@@ -15,8 +14,7 @@ export async function collectCompletionEntries(
   recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
-  consoleInputText?: string,
-  inspectRuntimeCompletion?: SessionCompletionInspector
+  consoleInputText?: string
 ): Promise<CompletionEntries> {
   if (context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
