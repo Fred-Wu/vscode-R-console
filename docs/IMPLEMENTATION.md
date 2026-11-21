@@ -525,8 +525,8 @@ are JSON-RPC 2.0 objects framed as newline-delimited JSON.
 The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
 the console-owned proxy endpoint, and the proxy connects to vscode-R's endpoint.
 Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
-Console observes workspace responses and injects its own `workspace` and
-`completion` requests when the console needs session data. It uses vscode-R's
+Console observes workspace responses and can request a workspace snapshot outside
+the completion path. It never injects `completion` or `hover` requests while typing. It uses vscode-R's
 public API for connection discovery, attachment preparation, terminal
 registration, connection references, and session activation.
 
