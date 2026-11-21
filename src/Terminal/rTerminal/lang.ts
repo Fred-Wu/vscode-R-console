@@ -308,7 +308,7 @@ export class RTermLang {
     this.cancelCompletion();
     this.sessionState = { attachedPackages: [] };
     this.runtimeLibraryPaths = undefined;
-    this.consoleLsp?.resetRuntimeLibraryPaths();
+    this.consoleLsp?.resetRuntimeLibraryPaths?.();
     this.workspaceRevision = undefined;
     this.cachedSessionData = undefined;
     this.consoleLsp?.invalidateRuntimeCompletion?.();
