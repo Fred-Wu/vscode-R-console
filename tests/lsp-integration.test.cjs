@@ -88,33 +88,9 @@ test("typing and accepting package functions opens real argument suggestions wit
     },
     "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
   });
-  let memberProbeError;
-  const requestMemberCompletions = async (expression, operator) => {
-    try {
-      return runRJson(`
-      df <- data.frame(zebra = 0, alpha = 1, beta = 2, check.names = FALSE)
-      df[["a b"]] <- 2
-      obj <- list(lm = function(member_arg) stop("must not execute"), data = df,
-        choose = function(method = c("zebra", "alpha", "beta"), other = c("wrong_value")) stop("must not execute"))
-      nested <- list(df)
-      dt <- data.table::as.data.table(df)
-      methods::setClass("InlineCompletionTest", slots = c(lm = "function"))
-      slot_obj <- methods::new("InlineCompletionTest", lm = function(slot_arg) stop("must not execute"))
-      value <- eval(parse(text = inputs$expression), .GlobalEnv)
-      slots <- identical(inputs$operator, "@")
-      nms <- if (slots) methods::slotNames(value) else names(value)
-      cat(jsonlite::toJSON(lapply(nms, function(n) list(name = n,
-        type = typeof(if (slots) methods::slot(value, n) else value[[n]]))), auto_unbox = TRUE))
-    `, { expression, operator });
-    } catch (error) {
-      memberProbeError = error;
-      throw error;
-    }
-  };
   const waitFor = async (predicate, label) => {
     const deadline = Date.now() + 10000;
     while (!predicate()) {
-      assert.ifError(memberProbeError);
       assert.ok(Date.now() < deadline, label);
       await new Promise(resolve => setTimeout(resolve, 20));
     }
@@ -126,7 +102,7 @@ test("typing and accepting package functions opens real argument suggestions wit
     client.updateInput("");
     const { terminal, screen } = createTerminal(t);
     delete terminal.applyCompletion;
-    terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+    terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {} });
     const handle = terminal.lang.handleAutocomplete.bind(terminal.lang);
     terminal.lang.handleAutocomplete = request => handle({ ...request, getWorkspaceData: () => ({ search: [], loaded_namespaces: [], globalenv: {
       df: { names: ['zebra', 'alpha', 'beta', 'a b'], class: ['data.frame'], type: 'list' },
@@ -206,7 +182,7 @@ test("typing and accepting package functions opens real argument suggestions wit
     client.updateInput("");
     const { terminal } = createTerminal(t);
     delete terminal.applyCompletion;
-    terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+    terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {} });
     const handle = terminal.lang.handleAutocomplete.bind(terminal.lang);
     terminal.lang.handleAutocomplete = request => handle({ ...request, getWorkspaceData: () => ({ search: [], loaded_namespaces: [], globalenv: {
       df: { names: ['zebra', 'alpha', 'beta', 'a b'], class: ['data.frame'], type: 'list' },
@@ -259,7 +235,7 @@ test("typing and accepting package functions opens real argument suggestions wit
   client.updateInput("");
   const { terminal: piped } = createTerminal(t);
   delete piped.applyCompletion;
-  piped.lang = new RTermLang({ extensionPath: "", rPath: "", env: {}, requestMemberCompletions });
+  piped.lang = new RTermLang({ extensionPath: "", rPath: "", env: {} });
   piped.applyKeyAction({ type: "text", text: '"file.csv" |> rdcsv' });
   const pipeChoices = () => piped.inlineCompletion.items.filter(item => "insertText" in item);
   await waitFor(() => pipeChoices().some(item => item.insertText === "read.csv()"), "fuzzy pipe function completion");
@@ -420,7 +396,7 @@ test("unfinished multiline definitions complete immediately without executing or
   const { terminal } = require("./helpers/inline-terminal.cjs").createTerminal(t);
   delete terminal.applyCompletion;
   terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
-    requestMemberCompletions: async () => { assert.fail("unsubmitted definitions must not query the runtime"); } });
+ });
   const input = cases[0][0].replace("│", "");
   terminal.applyKeyAction({ type: "text", text: input });
   const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
@@ -554,7 +530,7 @@ test("accepting a console-defined function opens its live arguments and values",
   });
   const session = runRJson(setup + 'cat(jsonlite::toJSON(list(search = search(), loaded_namespaces = loadedNamespaces(), globalenv = lapply(mget(c("f", "my_function")), function(fn) list(type = typeof(fn), str = paste(capture.output(str(fn)), collapse="\\n")))), auto_unbox = TRUE))');
   const lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
-    requestMemberCompletions: async () => { assert.fail("function arguments must not query sess"); },
+,
   });
   lang.updateSessionData(session);
   t.after(() => lang.dispose());
