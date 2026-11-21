@@ -207,7 +207,7 @@ unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<St
         // Raw list extraction is equivalent to console access only for plain
         // lists and unmodified data.frames. Other S3 classes may define $ or [[
         // and must not be guessed from their storage.
-        let container_is_safe = |obj: Sexp| -> bool { unsafe {
+        let container_is_safe = |obj: Sexp| -> bool {
             if typeof_(obj) != VECSXP || is_s4(obj) != 0 { return false; }
             if is_object(obj) == 0 { return true; }
             let class = get_attrib(obj, class_symbol);
@@ -216,7 +216,7 @@ unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<St
                     let cls = utf8(string_elt(class, 0));
                     !cls.is_null() && CStr::from_ptr(cls).to_bytes() == b"data.frame"
                 }
-        } };
+        };
         for step in &query.steps {
             if altrep(value) != 0 { return None; }
             let next = match step {
