@@ -233,8 +233,12 @@ impl OutputSink {
     }
 
     pub(crate) fn emit_member_names_result(&self, request_id: u32, names: Option<&[String]>) -> io::Result<()> {
-        let mut payload = vec![if names.is_some() { 1 } else { 0 }];
-        if let Some(names) = names { encode_string_array(names, &mut payload); }
+        // Keep the result inside the frontend's 1 MiB inspection limit.
+        let valid = names.filter(|names| names.len() <= 1000 &&
+            names.iter().all(|name| name.len() <= 4096) &&
+            names.iter().map(|name| name.len() + 4).sum::<usize>() <= 1024 * 1024 - 5);
+        let mut payload = vec![if valid.is_some() { 1 } else { 0 }];
+        if let Some(names) = valid { encode_string_array(names, &mut payload); }
         self.emit_frame(FRAME_MEMBER_NAMES_RESULT, request_id, &payload)
     }
 
