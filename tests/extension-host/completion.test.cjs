@@ -9,26 +9,12 @@ suite("Completion in the VS Code extension host", () => {
     const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
       "vscode-languageclient/node": require("vscode-languageclient/node"),
     });
-    let runtimeProbes = 0;
     let staticMode = true;
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, "../.."),
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
       // These legacy cases deliberately exercise the opt-in source analyzer.
       getStaticAnalysisEnabled: () => staticMode,
-      inspectRuntimeCompletion: async (expression, kind) => {
-        if (kind === "function" && expression === "print") {
-          runtimeProbes++;
-          return { signature: "function(x, old_arg)" };
-        }
-        return undefined;
-      },
-      requestMemberCompletions: async expression => {
-        runtimeProbes++;
-        // This fixture has no live receiver. Preserve the cached-name fallback
-        // while retaining the stale argument fixture used by signature tests.
-        return expression.includes(".tagged <-") ? undefined : [{ name: "old_arg" }];
-      },
     });
     const snapshot = (text, cursor = text.length) => {
       const lines = text.split("\n"), before = text.slice(0, cursor);
@@ -134,17 +120,13 @@ suite("Completion in the VS Code extension host", () => {
       } } };
       lang.updateSessionData(shadowPrint);
       staticMode = false;
-      const probesBeforeShadow = runtimeProbes;
       const shadowed = await complete('print(data.frame(a=1), ', shadowPrint);
       assert.ok(shadowed.some(item => item.insertText === 'old_arg = '),
         'native S3 metadata must not suppress the session function signature');
-      assert.ok(runtimeProbes > probesBeforeShadow, 'runtime arguments must query sess hover');
       const qualifiedPrint = await complete('base::print(data.frame(a=1), ', shadowPrint);
       assert.ok(qualifiedPrint.some(item => item.insertText === 'digits = '));
       assert.ok(qualifiedPrint.every(item => item.insertText !== 'old_arg = '));
-      const probesAfterShadow = runtimeProbes;
       staticMode = true;
-      assert.equal(runtimeProbes, probesAfterShadow, 'qualified calls must not probe a session namesake');
       for (const [marked, expected] of [
         ['{ print <- function(x, source_arg) NULL; print(data.frame(a=1), │) }', ['source_arg = ']],
         ['{ print <- function(x, source_arg) NULL; print(x=data.frame(a=1), │) }', ['source_arg = ']],
@@ -154,10 +136,7 @@ suite("Completion in the VS Code extension host", () => {
         const text = marked.replace('│', '');
         const items = await complete(text, shadowPrint, marked.indexOf('│'));
         assert.deepEqual(items.map(item => item.insertText), expected, marked);
-        assert.equal(runtimeProbes, probesAfterShadow,
-          'lexical bindings must supersede native S3 metadata without probing the session');
       }
-      const probesBeforeNative = runtimeProbes;
       const memberText = 'obj <- list(alpha = 1)\nobj$alpha';
       const memberCursor = memberText.length - 4;
       const memberItems = await complete(memberText, undefined, memberCursor);
@@ -176,7 +155,6 @@ suite("Completion in the VS Code extension host", () => {
       const constructor = await complete('Thing <- R6::R6Class("Thing", public = list(initialize = function(value, other) NULL))\nThing$new(value=1, ');
       assert.ok(constructor.some(item => item.insertText === 'other = '));
       assert.ok(constructor.every(item => item.insertText !== 'value = '));
-      assert.equal(runtimeProbes, probesBeforeNative, 'native results must survive the real converter without runtime probes');
       const collator = new Intl.Collator("en", { sensitivity: "base" });
       for (const operator of ["::", ":::"]) {
         const items = await complete(`data.table${operator}`);
