@@ -91,7 +91,7 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("named", [], "[["), available(["alpha", "beta"]));
   assert.deepEqual(await inspect("named", [{ kind: "slice-index", index: 1 }], "$"), available([]));
   output = "";
-  await submit('duplicate <- setNames(list(1, 2), c("same", "same")); cat("DUPLICATE_READY\\n")');
+  await submit('duplicate <- structure(list(1, 2), names = c("same", "same")); cat("DUPLICATE_READY\\n")');
   await until(() => output.includes("DUPLICATE_READY"), "duplicated-name fixture ready");
   assert.deepEqual(await inspect("duplicate", [], "$"), available(["same"]));
   assert.deepEqual(await inspect("duplicate", [{ kind: "slice-index", index: 2 }]), available(["same"]));
