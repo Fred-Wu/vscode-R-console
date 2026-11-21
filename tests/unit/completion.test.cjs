@@ -1861,3 +1861,19 @@ test("bracket methods preserve native parameter suggestions and column fields", 
   assert.ok(entries.some(item => item.insertText === "keyby = "), "bracket context must accept method parameters");
   assert.ok(entries.some(item => item.label === "keyboard"), "ordinary native fields remain available");
 });
+
+test("accessor completion ranks exact and prefix matches before fuzzy members", () => {
+  const context = completion.getCompletionContext("task$data", "task$data".length);
+  const entries = [
+    { label: "add_strata", insertText: "add_strata()", kind: 2, source: "session" },
+    { label: "dataset", insertText: "dataset", kind: 4, source: "session" },
+    { label: "data", insertText: "data()", kind: 2, source: "session" },
+  ];
+  const ranked = completion.rankCompletionEntries(entries, "data", context);
+  assert.deepEqual(ranked.map(entry => entry.label), ["data", "dataset", "add_strata"]);
+  const picker = completion.toCompletionQuickPickItems(ranked, context);
+  assert.equal(picker.find(item => "insertText" in item).insertText, "data()");
+  assert.deepEqual(entries.map(entry => entry.label), ["add_strata", "dataset", "data"]);
+  const prefix = completion.rankCompletionEntries(entries, "da", { ...context, prefix: "da" });
+  assert.deepEqual(prefix.map(entry => entry.label), ["dataset", "data", "add_strata"]);
+});

@@ -17,10 +17,14 @@ export const lifecycleOutputChannel = {
 };
 
 const lastDecision = new Map<string, number>();
-export function logConsoleCompletionDecision(decision: CompletionDecision): void {
+let lastContext: string | undefined;
+export function logConsoleCompletionDecision(decision: CompletionDecision, context?: string): void {
   const message = formatCompletionDecision(decision);
   const now = Date.now();
-  if (now - (lastDecision.get(message) ?? -Infinity) < 1500) return;
+  const identity = context === undefined ? undefined : message + "\u0000" + context;
+  if (identity !== undefined && identity === lastContext) return;
+  if (identity === undefined && now - (lastDecision.get(message) ?? -Infinity) < 1500) return;
+  lastContext = identity;
   lastDecision.set(message, now);
   const pad = (value: number) => String(value).padStart(2, "0");
   const date = new Date();

@@ -1874,3 +1874,27 @@ test("namespace kind groups produce clickable buttons and survive filtering", ()
     }
   }
 });
+
+test("accessor prefixes bypass top-level character threshold even without a visible panel", mock => {
+  mock.mock.timers.enable({ apis: ["setTimeout"] });
+  const { terminal } = createTerminal(mock, 80, 24, "typing", { "inlineCompletion.minCharacters": 99 });
+  const requests = [];
+  terminal.lang.handleAutocomplete = request => {
+    requests.push(request.input.textBeforeCursor);
+    request.onInlineEntries?.([]);
+  };
+  terminal.applyKeyAction({ type: "text", text: "task$" });
+  mock.mock.timers.tick(150);
+  for (const character of "dat") {
+    terminal.applyKeyAction({ type: "text", text: character });
+    mock.mock.timers.tick(150);
+  }
+  assert.deepEqual(requests, ["task$", "task$d", "task$da", "task$dat"]);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  terminal.dismissInlineCompletion(false);
+  terminal.inputState.text = "normal";
+  terminal.inputState.cursorPosition = 6;
+  terminal.applyKeyAction({ type: "text", text: "x" });
+  mock.mock.timers.tick(150);
+  assert.equal(requests.length, 4);
+});

@@ -15,6 +15,7 @@ import {
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
 import { logConsoleCompletionDecision } from "../../Language/completion/outputChannel";
+import { completionDecisionContext } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
 
@@ -108,7 +109,8 @@ export class RTermLang {
         }
       : undefined);
     if (context?.rejectionReason) {
-      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason });
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
+        completionDecisionContext(input.textBeforeCursor));
       onInlineEntries?.([]);
       return;
     }

@@ -3,6 +3,7 @@ import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from
 import { spawnSync } from "child_process";
 import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
 import { logConsoleCompletionDecision } from "../Language/completion/outputChannel";
+import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
@@ -289,13 +290,15 @@ export class RTerminal implements vscode.Pseudoterminal {
       requestRuntimeMemberCompletions: (expression, operator) => {
         const query = parseRuntimeMemberQuery(expression, operator);
         if (!query) {
-          logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" });
+          logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
+            expression + operator);
           return undefined;
         }
         const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
         return response?.then(result => {
           if (result.status === "suppressed") {
-            logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason });
+            logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+              expression + operator);
           }
           return result;
         });
@@ -2128,10 +2131,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
     if (context?.rejectionReason) {
-      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason });
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
+        completionDecisionContext(input.textBeforeCursor));
     }
     if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
-        !context?.autoTrigger && (!context || [...context.prefix].length < minimum))) {
+        (!context || (context.kind === "default" && !context.autoTrigger &&
+          [...context.prefix].length < minimum)))) {
       this.dismissInlineCompletion(false);
       return;
     }

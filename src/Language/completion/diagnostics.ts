@@ -15,3 +15,7 @@ const descriptions = {
 export function formatCompletionDecision(decision: CompletionDecision): string {
   return `[Completion - ${decision.kind}]: ${descriptions[decision.reason]}`;
 }
+
+export function completionDecisionContext(text: string): string {
+  return text.replace(/([$@])[^$@]*$/, "$1");
+}

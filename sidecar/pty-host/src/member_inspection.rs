@@ -1,7 +1,6 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 type Sexp = *mut c_void;
-const NIL: c_int = 0;
 const LIST: c_int = 2;
 const CLOSURE: c_int = 3;
 const SPECIAL: c_int = 7;
@@ -608,7 +607,7 @@ impl Native {
                         Ok(self.item(value, index as usize - 1)?.map(View::Object))
                     }
                     Step::SliceIndex(index) if matches!(kind, VECTOR | EXPRESSION) => {
-                        if (self.item(value, index as usize - 1)?.is_some()) {
+                        if self.item(value, index as usize - 1)?.is_some() {
                             Ok(Some(View::Slice { source: value, index: index as usize - 1 }))
                         } else { Ok(None) }
                     }
