@@ -78,7 +78,10 @@ test("real embedded R completion inspects nested storage without running user co
     assert.deepEqual(await inspect(root, query.steps),
       { status: "suppressed", reason: expected }, root);
   }
-  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list"), where = .GlobalEnv); s4 <- methods::new(s4name, inner = list(slot_value = TRUE), where = .GlobalEnv)');
+  output = "";
+  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list"), where = .GlobalEnv); s4 <- methods::new(s4name, inner = list(slot_value = TRUE), where = .GlobalEnv); cat("S4_CONSTRUCTED:", exists("s4", envir = .GlobalEnv, inherits = FALSE), "\\n")');
+  await until(() => output.includes("S4_CONSTRUCTED:"), "R fixture construction");
+  assert.match(output, /S4_CONSTRUCTED:\s*TRUE/, "S4 creation must finish before inspection");
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "inner" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "named-index", name: "inner" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "nm" }]), available(["alpha"]));
