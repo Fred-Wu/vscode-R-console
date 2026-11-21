@@ -299,16 +299,17 @@ The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 `127.0.0.1:0`, then writes JSON to the bootstrap file:
 
 ```json
-{"port":12345,"pid":67890,"protocolVersion":2}
+{"port":12345,"pid":67890,"protocolVersion":3}
 ```
 
-The TypeScript side polls that file, requires protocol version 2, reads the port and pid, then connects to
+The TypeScript side polls that file, requires protocol version 3, reads the port and pid, then connects to
 the loopback server. Before exchanging session traffic, both peers prove
 possession of the session secret using HMAC-SHA256 and fresh nonces. The
 authentication implementation is in
 [`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
 
-The authenticated backend uses protocol version 2; v0.5.4 used version 1 without
+The current backend uses protocol version 3, including library-path notifications.
+Protocol 2 introduced authentication; v0.5.4 used version 1 without
 authentication. The extension also checks the live `backend-ready` version.
 This version is independent of vscode-R's `sess` integration protocol.
 
@@ -952,16 +953,17 @@ The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 `127.0.0.1:0`, then writes JSON to the bootstrap file:
 
 ```json
-{"port":12345,"pid":67890,"protocolVersion":2}
+{"port":12345,"pid":67890,"protocolVersion":3}
 ```
 
-The TypeScript side polls that file, requires protocol version 2, reads the port and pid, then connects to
+The TypeScript side polls that file, requires protocol version 3, reads the port and pid, then connects to
 the loopback server. Before exchanging session traffic, both peers prove
 possession of the session secret using HMAC-SHA256 and fresh nonces. The
 authentication implementation is in
 [`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
 
-The authenticated backend uses protocol version 2; v0.5.4 used version 1 without
+The current backend uses protocol version 3, including library-path notifications.
+Protocol 2 introduced authentication; v0.5.4 used version 1 without
 authentication. The extension also checks the live `backend-ready` version.
 This version is independent of vscode-R's `sess` integration protocol.
 
@@ -1476,6 +1478,10 @@ and updates the package inventory and language-server library paths. A reconnect
 receives the last completed prompt snapshot without evaluating R on the socket
 thread. No library-path requests go through sess or the legacy session integration.
 Library removal, reordering, and restoration use the same package-inventory lifecycle.
+Unchanged libraries retain their filesystem and parent watchers and cached
+package inventories. Reordering avoids directory rescans; added paths are scanned
+and removed paths are unwatched. An in-flight scan from the previous search order
+cannot suppress publication of the newer order.
 
 `PackageInventory` monitors library folders outside the R process. Folder
 events schedule a scan of the changed library after 250 ms. It reads package names,

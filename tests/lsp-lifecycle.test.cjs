@@ -210,6 +210,139 @@ test("real R refreshes linked project libraries when package links are added, re
   assert.equal(instances.length, 3);
 });
 
+
+test("real console library-path IPC updates package completion, precedence and removal", { timeout: 120000 }, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-live-libpaths-"));
+  const first = path.join(root, "first");
+  const second = path.join(root, "second");
+  const packageName = "rconsolelivepaths";
+  const source = path.join(root, "source");
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  fs.mkdirSync(path.join(source, "R"), { recursive: true });
+  fs.writeFileSync(path.join(source, "DESCRIPTION"), [
+    "Package: " + packageName, "Version: 1.0", "Title: Runtime Library Test",
+    "Description: Test package precedence.", "Author: Test",
+    "Maintainer: Test <test@example.org>", "License: MIT", "",
+  ].join("\n"));
+  const install = (library, exported) => {
+    fs.writeFileSync(path.join(source, "NAMESPACE"), "export(" + exported + ")\n");
+    fs.writeFileSync(path.join(source, "R", "function.R"), exported + " <- function() NULL\n");
+    execFileSync(process.env.R_TEST_EXECUTABLE || "R",
+      ["CMD", "INSTALL", "--no-byte-compile", "--no-test-load", "-l", library, source],
+      { stdio: "pipe" });
+  };
+  install(first, "fromFirstLibrary");
+  install(second, "fromSecondLibrary");
+
+  const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } =
+    loadSource("src/Runtime/runtimeBackend.ts");
+  const { client, complete, logs } = createConsoleLsp(t, { cwd: root });
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {},
+    "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
+  });
+  const { runtime } = require("./helpers/submission-terminal.cjs");
+  const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"],
+    { encoding: "utf8" }).trim();
+  const rPath = path.join(rHome, "bin", process.platform === "win32" ? "R.exe" : "R");
+  const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(path.resolve(__dirname, "..")));
+  let session;
+  let pid;
+  let failure;
+  let stdout = "";
+  const snapshots = [];
+  const prompts = [];
+  const lang = new RTermLang({ extensionPath: "", rPath, env: {} });
+  // Exercise the production terminal->language bridge, not a direct LSP update.
+  lang.consoleLsp = client;
+  t.after(async () => {
+    if (session) {
+      backend.close(session);
+      backend.detach(session);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (pid) {
+        try { process.kill(pid, 0); process.kill(pid, "SIGKILL"); } catch {}
+      }
+      fs.rmSync(path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`), { force: true });
+    }
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const check = async (predicate, label) => {
+    const deadline = Date.now() + 15000;
+    while (!(await predicate())) {
+      if (failure) throw failure;
+      assert.ok(Date.now() < deadline,
+        `${label}\n${stdout.slice(-500)}\n${logs.slice(-20).join("\n")}`);
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  };
+  const samePath = (a, b) => fs.realpathSync.native(a).replaceAll("\\", "/").toLowerCase() ===
+    fs.realpathSync.native(b).replaceAll("\\", "/").toLowerCase();
+  await client.start();
+  await check(() => client.packageInventory.initialized, "initial language-server inventory");
+  session = backend.start([rPath, "--vanilla", "--quiet"], {
+    cwd: root, env: { ...process.env, R_HOME: rHome },
+  });
+  backend.attach(session, {
+    onStdout: text => { stdout += text; },
+    onStderr: text => { stdout += text; },
+    onControl: event => {
+      if (event.type === "library-paths") {
+        snapshots.push(event.paths);
+        runtime.handleRuntimeControl({ lang }, event);
+      } else if (event.type === "prompt" && event.kind === "main") {
+        prompts.push(event);
+      }
+    },
+    onError: error => { failure = error; },
+  });
+  await check(() => backend.canUseSessionCommands(session) && snapshots.length > 0 &&
+    prompts.length > 0, "initial authenticated R session and library snapshot");
+  pid = backend.getPid(session);
+  assert.ok(pid);
+  const basePaths = snapshots.at(-1);
+  const baselinePrompts = prompts.length;
+  assert.equal(backend.sendSessionCommand(session, {
+    type: "submit", code: 'baseline_paths <- .libPaths(); cat("BASE_PATHS_READY\\n")',
+  }), true);
+  await check(() => stdout.includes("BASE_PATHS_READY") && prompts.length > baselinePrompts,
+    "baseline library paths assigned");
+  const submitPaths = async (libraries, marker) => {
+    const before = snapshots.length;
+    const beforePrompts = prompts.length;
+    const pathValues = [...libraries.map(lib => JSON.stringify(lib)), "baseline_paths"].join(", ");
+    const command = `.libPaths(c(${pathValues})); cat("${marker}\\n")`;
+    assert.equal(backend.sendSessionCommand(session, { type: "submit", code: command }), true);
+    await check(() => snapshots.length > before && prompts.length > beforePrompts &&
+      stdout.includes(marker), marker + " library snapshot");
+    assert.ok(backend.canUseSessionCommands(session), "library changes must not disconnect R");
+  };
+  await submitPaths([first], "FIRST_LIBRARY_ACTIVE");
+  await check(() => logs.some(line => line.includes("Added: " + packageName)),
+    "first package addition observed");
+  await check(async () => (await complete(packageName + "::"))?.some(item => item.label === "fromFirstLibrary"),
+    "first library completion");
+  await submitPaths([first, second], "SECOND_LIBRARY_ACTIVE");
+  await check(() => client.packageInventory.libraries.some(lib => samePath(lib.path, second)),
+    "second library inventory");
+  await submitPaths([second, first], "REORDERED_LIBRARIES");
+  await check(async () => {
+    const items = await complete(packageName + "::");
+    return items?.some(item => item.label === "fromSecondLibrary") &&
+      !items.some(item => item.label === "fromFirstLibrary");
+  }, "reordered library completion precedence");
+  await submitPaths([], "REMOVED_LIBRARIES");
+  await check(() => logs.some(line => line.includes("Removed: " + packageName)),
+    "removed package inventory");
+  await check(async () => {
+    const items = await complete(packageName + "::");
+    return !items?.some(item => item.label === "fromFirstLibrary" || item.label === "fromSecondLibrary");
+  }, "removed library must not complete");
+  assert.deepEqual(snapshots.at(-1), basePaths,
+    "removing both libraries restores exactly the original console search order");
+});
+
 test("real R keeps startup completion working while the first session snapshot arrives", { timeout: 90000 }, async (t) => {
   let synchronized = false;
   const { client, instances, complete, logs } = createConsoleLsp(t, {

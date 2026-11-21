@@ -66,6 +66,70 @@ test("inventory preserves effective copies across duplicate additions, removals 
   assert.ok(logs.some(line => line.includes("no copies remain")));
 });
 
+test("library search-order changes preserve retained watches and scan only added libraries", async t => {
+  const { root, libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  install(first, "2.0");
+  install(second);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  const firstWatcher = inventory.watchers.get(first);
+  const firstParent = inventory.parentWatchers.get(first);
+  const secondWatcher = inventory.watchers.get(second);
+  const secondParent = inventory.parentWatchers.get(second);
+  assert.ok(firstWatcher && secondWatcher && firstParent && secondParent);
+
+  logs.length = 0;
+  inventory.setLibraryPaths([second, first]);
+  await settle();
+  assert.equal(inventory.watchers.get(first), firstWatcher);
+  assert.equal(inventory.watchers.get(second), secondWatcher);
+  assert.equal(inventory.parentWatchers.get(first), firstParent);
+  assert.equal(inventory.parentWatchers.get(second), secondParent);
+  assert.ok(!logs.some(line => line.includes("Scanning folder:")),
+    "changing search precedence must reuse existing package inventories");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
+
+  const third = path.join(root, "third");
+  fs.mkdirSync(third);
+  logs.length = 0;
+  inventory.setLibraryPaths([first, third]);
+  await settle();
+  assert.equal(inventory.watchers.get(first), firstWatcher);
+  assert.equal(inventory.parentWatchers.get(first), firstParent);
+  assert.equal(inventory.watchers.has(second), false);
+  assert.equal(inventory.parentWatchers.has(second), false);
+  assert.ok(inventory.watchers.has(third) && inventory.parentWatchers.has(third));
+  const scans = logs.filter(line => line.includes("Scanning folder:"));
+  assert.ok(scans.length > 0);
+  assert.ok(scans.every(line => line.endsWith(third)),
+    "only the newly added library should be scanned");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
+});
+
+test("reorders paths even when an older inventory scan is still in flight", async t => {
+  const { libraries: [first, second], inventory, changes, settle } = fixture(t);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  let begin, release;
+  const begun = new Promise(resolve => { begin = resolve; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  const originalScan = inventory.scan.bind(inventory);
+  inventory.scan = async (...args) => {
+    begin();
+    await blocked;
+    return originalScan(...args);
+  };
+  t.after(() => release());
+  const pending = inventory.refresh();
+  await begun;
+  inventory.setLibraryPaths([second, first]);
+  release();
+  await pending;
+  await settle();
+  assert.deepEqual(changes.at(-1).libraries.map(library => library.path), [second, first],
+    "the newer library order must publish after the earlier scan completes");
+});
+
 test("inventory ignores lock-only changes and defers packages while installation is locked", async t => {
   const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
   inventory.setLibraryPaths([library]);

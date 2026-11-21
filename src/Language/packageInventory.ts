@@ -41,18 +41,30 @@ export class PackageInventory {
 
   setLibraryPaths(paths: string[]): void {
     if (this.disposed || JSON.stringify(paths) === JSON.stringify(this.paths)) return;
+    const active = new Set(paths);
+    // Preserve existing watchers, cached packages and outstanding dirty scans.
+    // Only paths leaving the R search order lose their watches.
+    for (const [library, watcher] of this.watchers) {
+      if (!active.has(library)) {
+        watcher.close();
+        this.watchers.delete(library);
+      }
+    }
+    for (const [library, watcher] of this.parentWatchers) {
+      if (!active.has(library)) {
+        watcher.close();
+        this.parentWatchers.delete(library);
+      }
+    }
+    for (const library of this.dirtyLibraries) {
+      if (!active.has(library)) this.dirtyLibraries.delete(library);
+    }
     this.paths = [...paths];
     this.revision++;
-    this.clearRetry();
-    this.dirtyLibraries.clear();
-    for (const library of paths) this.dirtyLibraries.add(library);
-    for (const watcher of this.watchers.values()) watcher.close();
-    this.watchers.clear();
-    for (const watcher of this.parentWatchers.values()) watcher.close();
-    this.parentWatchers.clear();
+    this.candidate = undefined;
     for (const library of paths) {
-      this.watchParent(library);
-      this.watchLibrary(library);
+      if (!this.parentWatchers.has(library)) this.watchParent(library);
+      if (!this.watchers.has(library)) this.watchLibrary(library);
     }
     this.schedule(0);
   }
@@ -172,7 +184,10 @@ export class PackageInventory {
       }
     }).finally(() => {
       if (this.pending === request) this.pending = undefined;
-      if (!this.timer && !this.retryTimer && this.dirtyLibraries.size) this.schedule(250);
+      // A library-only reorder has no dirty directory. Still process a new
+      // revision if its scheduled refresh joined an older in-flight scan.
+      if (!this.disposed && revision !== this.revision) this.schedule(0);
+      else if (!this.timer && !this.retryTimer && this.dirtyLibraries.size) this.schedule(250);
     });
     this.pending = request;
     return request;
