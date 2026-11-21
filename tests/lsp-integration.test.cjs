@@ -481,14 +481,7 @@ test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer
   timeout: 90000,
 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
-  const { client: runtime } = createConsoleLsp(t, {
-    staticAnalysis: false,
-    inspectRuntimeCompletion: async (expression, kind) => {
-      if (expression !== "obj$fun") return undefined;
-      assert.equal(kind, "function");
-      return { signature: "function(old_arg)" };
-    },
-  });
+  const { client: runtime } = createConsoleLsp(t, { staticAnalysis: false });
   runtime.setRuntimeSignatures({ f: "function(old_arg)" });
   const params = async (client, marked) => {
     const cursor = marked.indexOf("│");
@@ -505,7 +498,7 @@ test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer
   assert.equal(runtimePlain.result.rConsoleLocalFunction, undefined);
   assert.equal(runtimePlain.result.rConsoleWorkspaceFunction, true);
   const member = await params(runtime, "obj <- list(fun = function(new_arg) NULL)\nobj$fun(│");
-  assert.deepEqual(member.parameters, ["old_arg"]);
+  assert.deepEqual(member.parameters, [], "member signatures require an explicit safe metadata source");
   const nonexistent = await params(runtime, "only_source <- function(source_arg) NULL\nonly_source(│");
   assert.deepEqual(nonexistent.parameters, []);
   const pipe = await params(runtime, "only_source <- function(source_arg) NULL\n1 |> only_so│");
@@ -518,32 +511,22 @@ test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer
   assert.equal(staticPlain.result.rConsoleLocalFunction, true);
 });
 
-test("console member arguments use the current runtime signature after an executed redefinition", {
+test("cached top-level function signatures track executed redefinitions", {
   timeout: 90000,
 }, async t => {
-  let signature = "function(old_arg)";
-  const observed = [];
-  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, {
-    inspectRuntimeCompletion: async (expression, kind) => {
-      assert.equal(expression, "obj$fun");
-      assert.equal(kind, "function");
-      observed.push(signature);
-      return { signature };
-    },
-  });
-  const text = "obj$fun(";
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { staticAnalysis: false });
+  const text = "f(";
   const position = { line: 0, character: text.length };
   const complete = async () => {
     const result = await client.provideCompletionItems({ getText: () => text }, position);
-    assert.ok(result);
-    return (result.items ?? result).filter(item => item.detail === "parameter")
-      .map(item => item.label);
+    return (result?.items ?? []).filter(item => item.detail === "parameter").map(item => item.label);
   };
+  client.setRuntimeSignatures({ f: "function(old_arg)" });
   assert.deepEqual(await complete(), ["old_arg"]);
-  // Represents a new live R definition, not an assignment in typed input.
-  signature = "function(new_arg)";
+  client.setRuntimeSignatures({ f: "function(new_arg)" });
   assert.deepEqual(await complete(), ["new_arg"]);
-  assert.deepEqual(observed, ["function(old_arg)", "function(new_arg)"]);
+  client.setRuntimeSignatures({});
+  assert.deepEqual(await complete(), []);
 });
 
 test("accepting a console-defined function opens its live arguments and values", { timeout: 90000 }, async t => {
@@ -622,7 +605,7 @@ test("accepting a console-defined function opens its live arguments and values",
   assert.equal(terminal.submitted, undefined, "completion must never execute the function");
 });
 
-test("sess hover signatures replace and remove native definitions and survive restart", { timeout: 90000 }, async t => {
+test("cached workspace signatures replace and remove native definitions and survive restart", { timeout: 90000 }, async t => {
   const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t, { staticAnalysis: false });
   const complete = () => client.provideCompletionItems({ getText: () => 'workspace_test_fn(' }, { line: 0, character: 18 });
   for (const [functions, expected] of [
@@ -862,71 +845,6 @@ test("unknown runtime member signatures do not request expressions or borrow glo
       async () => assert.fail("member arguments must not evaluate expressions through sess"));
     assert.deepEqual(entries, []);
   }
-});
-
-test("managed sess inspection restores runtime arguments without probing nested values", {
-  timeout: 90000, skip: !process.env.R_SESS_TEST_LIBRARY,
-}, async t => {
-  const { inspectSessionCompletion } = loadSource("src/Runtime/VSCR/sess/completionInspection.ts");
-  const requests = [];
-  let signature = 'function(first, mode = c("auto", "manual"), lazy = stop("default ran"))';
-  const inspectRuntimeCompletion = (expression, kind) => inspectSessionCompletion(expression, kind, async (method, params) => {
-    requests.push({ method, params });
-    return runRJson(`
-      ns <- loadNamespace("sess", lib.loc = c(Sys.getenv("R_SESS_TEST_LIBRARY"), .libPaths()))
-      obj <- list(fun = ${signature} stop("body ran"), data = data.frame(alpha = 1, beta = 2))
-      nested <- list(obj$data)
-      test <- data.frame(xtest = 1:1000)
-      methods::setClass("CompletionSlots", slots = c(fun = "function"))
-      slot_obj <- methods::new("CompletionSlots", fun = function(slot_arg) stop("body ran"))
-      objects <- list(obj, slot_obj, c(named = 1))
-      result <- get("inspection_call_handlers", ns)()[[inputs$method]](inputs$params)
-      cat(jsonlite::toJSON(result, auto_unbox = TRUE, null = "null"))
-    `, { method, params });
-  });
-  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { inspectRuntimeCompletion });
-  const provider = { provideCompletionItems: async (...args) => {
-    const result = await client.provideCompletionItems(...args);
-    return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-  } };
-  const complete = async marked => {
-    const offset = marked.indexOf('|'), text = marked.replace('|', '');
-    const before = text.slice(0, offset).split('\n'), line = before.length - 1, character = before.at(-1).length;
-    const input = text.split('\n')[line];
-    return completion.collectCompletionEntries(completion.getCompletionContext(input, character, text.slice(0, offset)),
-      { getText: () => text }, { line, character }, undefined, text.split('\n').slice(0, line), [], provider,
-      async () => assert.fail("runtime probes must use supported inspection requests"), undefined, inspectRuntimeCompletion);
-  };
-  for (const [marked, expected] of [
-    ['obj$fun(|)', ['first = ', 'mode = ', 'lazy = ']],
-    ['obj$fun(1, |)', ['mode = ', 'lazy = ']],
-    ['obj$fun(mode = "au|")', ['auto']],
-    ['slot_obj@fun(|)', ['slot_arg = ']],
-    ['nested[[1]][[|]]', []],
-    ['obj$data[["al|"]]', []],
-    ['test[["xtest"]]$|', []],
-    ['test[[1]]$|', []],
-    ['nested[[1]]$|', []],
-    ['objects[[1]]$|', []],
-    ['objects[[2]]@|', []],
-    ['objects[[3]]$|', []],
-  ]) assert.deepEqual((await complete(marked)).map(item => item.insertText), expected, marked);
-
-  signature = 'function(redefined)';
-  assert.deepEqual((await complete('obj$fun(|)')).map(item => item.insertText), ['redefined = ']);
-  signature = 'function()';
-  assert.deepEqual(await complete('obj$fun(|)'), []);
-  const count = requests.length;
-  assert.deepEqual((await complete('obj <- list(fun = function(source_arg) NULL)\nobj$fun(|)'))
-    .map(item => item.insertText), ['source_arg = ']);
-  assert.equal(requests.length, count, "native source signatures do not query the session");
-  assert.deepEqual(await complete('obj <- list(data = list())\nobj$data[[|]]'), []);
-  assert.equal(requests.length, count, "known empty source objects do not query the session");
-  assert.deepEqual(await complete('test <- data.frame(xtest = 1:1000)\ntest[["xtest"]]$|'), []);
-  assert.equal(requests.length, count, "known source vectors do not query the session");
-  assert.ok(requests.some(request => request.method === 'hover'));
-  assert.ok(!requests.some(request => request.method === 'workspace_children'));
-  assert.ok(requests.every(request => request.method !== 'completion'));
 });
 
 test("completion call boundaries agree with the R parser across newlines", async () => {
@@ -1889,36 +1807,6 @@ test("variadic completion retains dots after supplied arguments without leaking 
     if (marked === 'base::atan2(..., │)') assert.deepEqual(entries.map(entry => entry.label), ['y', 'x']);
     if (marked === 'base::atan2(1,2,..., │)') assert.deepEqual(entries, []);
   }
-});
-
-test("live subscript methods complete parameters through sess and registered packages", { timeout: 90000 }, async t => {
-  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
-  const inspected = [];
-  const { client } = createConsoleLsp(t, { staticAnalysis: false,
-    inspectRuntimeCompletion: async (expression, kind) => {
-      inspected.push([expression, kind]);
-      if (expression === "obj" && kind === "subscript") {
-        return { signature: 'function(x, i, mode = c("safe", "fast"), ...)', classes: ["myclass"] };
-      }
-      if (expression === "DT" && kind === "subscript") {
-        return { classes: ["data.table", "data.frame"] };
-      }
-      return undefined;
-    },
-  });
-  await client.syncSessionState({ attachedPackages: ["data.table"] });
-  const parameters = async input => {
-    const response = await client.provideCompletionItems({ getText: () => input },
-      { line: 0, character: input.length });
-    return (response?.items ?? []).filter(item => item.detail === "parameter")
-      .map(item => item.insertText);
-  };
-  assert.ok((await parameters("obj[mo")).includes("mode = "),
-    "a live user S3 method restores its argument names");
-  assert.ok((await parameters("DT[, keyb")).includes("keyby = "),
-    "the LSP resolves non-exported data.table methods by registered S3 metadata");
-  assert.deepEqual(inspected, [["obj", "subscript"], ["DT", "subscript"]],
-    "never submit executable expressions to sess");
 });
 
 test("workspace subscript columns respect receiver class and dimensions without sess expressions", async () => {
