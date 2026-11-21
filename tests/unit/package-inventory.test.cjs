@@ -36,6 +36,14 @@ function fixture(t) {
 
 test("inventory preserves effective copies across duplicate additions, removals and library order changes", async t => {
   const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  const waitForLog = async (message) => {
+    const deadline = Date.now() + 10000;
+    while (!logs.some(line => line.includes(message))) {
+      assert.ok(Date.now() < deadline, `inventory must report: ${message}`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await settle();
+  };
   install(first, "2.0");
   install(second);
   inventory.setLibraryPaths([first, second]);
@@ -43,27 +51,30 @@ test("inventory preserves effective copies across duplicate additions, removals 
   assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
   assert.ok(logs.some(line => line.includes("2 installations; 1 unique")));
 
+  // An idle inventory does not imply that the OS has delivered an fs.watch
+  // notification. Wait for each observable publication before asserting state.
+  logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await settle();
+  await waitForLog("Active package copies unchanged");
   assert.deepEqual(changes.at(-1).changed, []);
-  assert.ok(logs.some(line => line.includes("Active package copies unchanged")));
+  logs.length = 0;
   install(second);
-  await settle();
+  await waitForLog("Added: example 1.0");
   assert.deepEqual(changes.at(-1).changed, []);
 
   inventory.setLibraryPaths([second, first]);
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await settle();
+  await waitForLog("Using remaining copy: example 2.0");
   assert.equal(changes.at(-1).packages.get("example").version, "2.0");
-  assert.ok(logs.some(line => line.includes("Using remaining copy: example 2.0")));
+  logs.length = 0;
   fs.rmSync(path.join(first, "example"), { recursive: true });
-  await settle();
+  await waitForLog("no copies remain");
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.equal(changes.at(-1).packages.size, 0);
-  assert.ok(logs.some(line => line.includes("no copies remain")));
 });
 
 test("library search-order changes preserve retained watches and scan only added libraries", async t => {
