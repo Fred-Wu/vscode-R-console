@@ -61,6 +61,15 @@ test("native results distinguish silent empty from unavailable and unsafe access
   assert.deepEqual(parseBackendFrames(frame(Buffer.from([1, 0, 0, 0, 0]))).events, [{
     type: "member-names-result", requestId: 42, result: { status: "available", names: [] },
   }]);
+  const typed = Buffer.concat([Buffer.from([1, 2, 0, 0, 0]),
+    Buffer.from([6, 0, 0, 0]), Buffer.from("method"),
+    Buffer.from([5, 0, 0, 0]), Buffer.from("value"), Buffer.from([1, 0])]);
+  assert.deepEqual(parseBackendFrames(frame(typed)).events, [{
+    type: "member-names-result", requestId: 42,
+    result: { status: "available", names: ["method", "value"], kinds: [1, 0] },
+  }]);
+  assert.match(parseBackendFrames(frame(Buffer.concat([typed, Buffer.from([1])]))).error,
+    /invalid inspected member names/);
   const oversized = Buffer.alloc(5);
   oversized[0] = 1;
   oversized.writeUInt32LE(1001, 1);

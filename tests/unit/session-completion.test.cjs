@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
-  CompletionItemKind: { Field: 4, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},
+  CompletionItemKind: { Field: 4, Property: 9, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},
 } });
 
 test("workspace members and slots use cached metadata without any R inspection", async () => {
@@ -163,4 +163,41 @@ test("computed receivers are rejected before LSP or native member inspection", a
       () => assert.fail("runtime inspector must not receive rejected expression"));
     assert.deepEqual(entries, [], input);
   }
+});
+
+test("native member kinds distinguish callable, active, and stored bindings generally", async () => {
+  for (const receiver of ["r6", "env", "object"]) {
+    const input = receiver + "$";
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length),
+      undefined, undefined, undefined, [], [], undefined,
+      async (expression, operator) => {
+        assert.deepEqual([expression, operator], [receiver, "$"]);
+        return {
+          status: "available",
+          names: ["method", "field", "active", "deferred"],
+          kinds: [1, 0, 2, 3],
+        };
+      });
+    const byName = Object.fromEntries(entries.map(item => [item.label, item]));
+    assert.equal(byName.method.kind, 2);
+    assert.equal(byName.method.insertText, "method()");
+    assert.equal(byName.field.kind, 4);
+    assert.equal(byName.field.insertText, "field");
+    assert.equal(byName.active.kind, 9);
+    assert.equal(byName.active.insertText, "active");
+    assert.equal(byName.deferred.kind, 4);
+    assert.equal(byName.deferred.insertText, "deferred");
+  }
+});
+
+test("member kind metadata remains optional for legacy inspector results", async () => {
+  const input = "obj$";
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    undefined, undefined, undefined, [], [], undefined,
+    async () => ({ status: "available", names: ["field"] }));
+  assert.deepEqual(entries.map(entry => [entry.label, entry.kind, entry.insertText]), [
+    ["field", 4, "field"],
+  ]);
 });

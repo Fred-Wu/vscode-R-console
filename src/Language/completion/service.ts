@@ -60,13 +60,20 @@ export async function collectCompletionEntries(
     : undefined;
   const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
   const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
-  const runtimeMembers = runtimeNames?.map(name => ({
-    label: name,
-    insertText: getFieldInsertText(name, context),
-    kind: vscode.CompletionItemKind.Field,
-    detail: context.objectName,
-    source: "session" as const,
-  }));
+  const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
+  const runtimeMembers = runtimeNames?.map((name, index) => {
+    const kind = runtimeKinds?.[index] === 1 ? vscode.CompletionItemKind.Function
+      : runtimeKinds?.[index] === 2 ? vscode.CompletionItemKind.Property
+      : vscode.CompletionItemKind.Field;
+    return {
+      label: name,
+      insertText: getFieldInsertText(name, context) +
+        (kind === vscode.CompletionItemKind.Function && context.kind === "member" ? "()" : ""),
+      kind,
+      detail: context.objectName,
+      source: "session" as const,
+    };
+  });
   const runtimeOnly = rawLspResult.runtimeOnly === true;
   const nativeMembers = !runtimeOnly &&
     (rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member"));

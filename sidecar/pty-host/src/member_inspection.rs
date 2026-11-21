@@ -4,6 +4,8 @@ type Sexp = *mut c_void;
 const NIL: c_int = 0;
 const LIST: c_int = 2;
 const CLOSURE: c_int = 3;
+const SPECIAL: c_int = 7;
+const BUILTIN: c_int = 8;
 const ENV: c_int = 4;
 const PROMISE: c_int = 5;
 const LANGUAGE: c_int = 6;
@@ -178,9 +180,21 @@ impl InspectorApi {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Inspection {
-    Available(Vec<String>),
+    Available(Members),
     Suppressed(Suppression),
     Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Members {
+    pub(crate) names: Vec<String>,
+    pub(crate) kinds: Vec<u8>,
+}
+
+impl Members {
+    fn empty() -> Self {
+        Self { names: Vec::new(), kinds: Vec::new() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,18 +621,47 @@ impl Native {
         }
     }
 
-    unsafe fn inspect(&self, query: &MemberQuery) -> Result<Vec<String>, Suppression> {
-        let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Vec::new()); };
+    unsafe fn member_kind(&self, value: Sexp, target: Target, name: &str) -> Result<u8, Suppression> {
+        let kind = (self.type_of)(value);
+        let stored = if kind == ENV && matches!(target, Target::Dollar | Target::DoubleBracket) {
+            if self.custom_database(value)? { return Err(Suppression::UnsafeEnvironment); }
+            let Some(symbol) = self.symbol(name) else { return Ok(0); };
+            if (self.exists)(value, symbol) == 0 { return Ok(0); }
+            if (self.active)(symbol, value) != 0 { return Ok(2); }
+            (self.find)(value, symbol)
+        } else if target == Target::Slot {
+            if self.is_s7(value)? { return Ok(2); }
+            if (self.is_s4)(value) == 0 { return Ok(0); }
+            let Some(symbol) = self.symbol(name) else { return Ok(0); };
+            (self.get_attrib)(value, symbol)
+        } else if matches!(kind, VECTOR | EXPRESSION | LIST | LANGUAGE) &&
+            self.ordinary_dispatch(value)? {
+            let Some(index) = self.index_of(value, name)? else { return Ok(0); };
+            let Some(stored) = self.item(value, index)? else { return Ok(0); };
+            stored
+        } else {
+            return Ok(0);
+        };
+        if stored.is_null() || stored == self.unbound || stored == self.nil { return Ok(0); }
+        Ok(match (self.type_of)(stored) {
+            CLOSURE | SPECIAL | BUILTIN => 1,
+            PROMISE => 3,
+            _ => 0,
+        })
+    }
+
+    unsafe fn inspect(&self, query: &MemberQuery) -> Result<Members, Suppression> {
+        let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Members::empty()); };
         (self.protect)(root);
         let mut protected = 1;
-        let outcome = (|| -> Result<Vec<String>, Suppression> {
+        let outcome = (|| -> Result<Members, Suppression> {
             unsafe {
                 let mut current = View::Object(root);
                 for step in &query.steps {
-                    let Some(next) = self.step(current, step)? else { return Ok(Vec::new()); };
+                    let Some(next) = self.step(current, step)? else { return Ok(Members::empty()); };
                     if let View::Object(value) = next {
                         if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
-                        if value.is_null() { return Ok(Vec::new()); }
+                        if value.is_null() { return Ok(Members::empty()); }
                         (self.protect)(value);
                         protected += 1;
                     }
@@ -627,14 +670,28 @@ impl Native {
                 match current {
                     View::Object(value) => {
                         if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
-                        self.names_for(value, query.target)
+                        let names = self.names_for(value, query.target)?;
+                        let mut kinds = Vec::with_capacity(names.len());
+                        for name in &names {
+                            kinds.push(self.member_kind(value, query.target, name)?);
+                        }
+                        Ok(Members { names, kinds })
                     }
                     View::Slice { source, index } => {
-                        if query.target == Target::Slot { return Ok(Vec::new()); }
+                        if query.target == Target::Slot { return Ok(Members::empty()); }
                         if query.target == Target::Dollar && (self.type_of)(source) != VECTOR {
-                            return Ok(Vec::new());
+                            return Ok(Members::empty());
                         }
-                        Ok(self.name_at(source, index)?.into_iter().collect())
+                        let names: Vec<String> = self.name_at(source, index)?.into_iter().collect();
+                        let kind = if (self.type_of)(source) == VECTOR && self.ordinary_dispatch(source)? {
+                            self.item(source, index)?.map(|stored| match (self.type_of)(stored) {
+                                CLOSURE | SPECIAL | BUILTIN => 1,
+                                PROMISE => 3,
+                                _ => 0,
+                            }).unwrap_or(0)
+                        } else { 0 };
+                        let kinds = names.iter().map(|_| kind).collect();
+                        Ok(Members { names, kinds })
                     }
                 }
             }

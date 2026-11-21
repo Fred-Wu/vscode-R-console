@@ -96,7 +96,7 @@ export type MemberInspectionStep =
 export type MemberInspectionTarget = "$" | "@" | "[" | "[[";
 
 export type MemberInspectionResult =
-  | { status: "available"; names: string[] }
+  | { status: "available"; names: string[]; kinds?: number[] }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
   | { status: "unavailable" };
@@ -367,10 +367,16 @@ function parseControlFrame(
       const count = parseU32(payload, 1);
       if (count > 1000) throw new Error("too many inspected members");
       const parsed = parseStringArray(payload, 1);
-      if (parsed.offset !== payload.length || parsed.values.some(name => Buffer.byteLength(name, "utf8") > 4096)) {
+      const trailing = payload.subarray(parsed.offset);
+      if ((trailing.length !== 0 && trailing.length !== parsed.values.length) ||
+          trailing.some(kind => kind > 3) ||
+          parsed.values.some(name => Buffer.byteLength(name, "utf8") > 4096)) {
         throw new Error("invalid inspected member names");
       }
-      return { type: "member-names-result", requestId, result: { status: "available", names: parsed.values } };
+      return { type: "member-names-result", requestId, result: {
+        status: "available", names: parsed.values,
+        ...(trailing.length ? { kinds: [...trailing] } : {}),
+      } };
     }
     case FrameKind.ParseStatusResult:
       return {

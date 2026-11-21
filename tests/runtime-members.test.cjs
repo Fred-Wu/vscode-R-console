@@ -52,7 +52,12 @@ test("real embedded R completion inspects nested storage without running user co
     assert.equal(backend.sendSessionCommand(session, { type: "submit", code }), true);
     await until(() => mainPrompts > previous, "main prompt after execution");
   };
-  const inspect = (root, steps = [], target = "$") => backend.inspectMemberNames(session, { root, steps, target });
+  const inspectTyped = (root, steps = [], target = "$") =>
+    backend.inspectMemberNames(session, { root, steps, target });
+  const inspect = async (root, steps = [], target = "$") => {
+    const result = await inspectTyped(root, steps, target);
+    return result?.status === "available" ? { status: "available", names: result.names } : result;
+  };
   const available = (names) => ({ status: "available", names });
   await submit('obj <- list(inner = list(alpha = 1, beta = 2), df = data.frame("a b" = 1, check.names = FALSE))');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["alpha", "beta"]));
@@ -107,6 +112,30 @@ test("real embedded R completion inspects nested storage without running user co
     { status: "suppressed", reason: "active-binding" });
   assert.deepEqual(await inspect("r6", [{ kind: "field", name: "method" }]), available([]));
   assert.deepEqual(await inspect("classed", [], "$"), available(["inner"]));
+  await submit('typed <- list(method = function() { hits <<- hits + 1L }, value = list(child = 1), constant = TRUE); env$method <- function() { hits <<- hits + 1L }; env$pending <- 1L; s4function <- "CompletionInspectFunction"; methods::setClass(s4function, slots = c(method = "function", value = "numeric")); sf <- methods::new(s4function, method = function() { hits <<- hits + 1L }, value = 1)');
+  const classify = result => Object.fromEntries(result.names.map((name, index) => [name, result.kinds[index]]));
+  const listMembers = await inspectTyped("typed");
+  assert.equal(listMembers.status, "available");
+  assert.equal(classify(listMembers).method, 1);
+  assert.equal(classify(listMembers).value, 0);
+  assert.equal(classify(listMembers).constant, 0);
+  const envMembers = await inspectTyped("env");
+  assert.equal(envMembers.status, "available");
+  assert.equal(classify(envMembers).method, 1);
+  assert.equal(classify(envMembers).active_child, 2);
+  assert.equal(classify(envMembers).inner, 0);
+  const r6Members = await inspectTyped("r6");
+  assert.equal(r6Members.status, "available");
+  assert.equal(classify(r6Members).method, 1);
+  assert.equal(classify(r6Members).active, 2);
+  assert.equal(classify(r6Members).inner, 0);
+  const slotMembers = await inspectTyped("sf", [], "@");
+  assert.equal(slotMembers.status, "available");
+  assert.equal(classify(slotMembers).method, 1);
+  assert.equal(classify(slotMembers).value, 0);
+  await submit('delayedAssign("pending_member", { hits <<- hits + 1L; function() NULL }, assign.env = env)');
+  const deferredMembers = await inspectTyped("env");
+  assert.equal(classify(deferredMembers).pending_member, 3);
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');
   await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");

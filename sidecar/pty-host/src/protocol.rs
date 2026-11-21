@@ -246,11 +246,13 @@ impl OutputSink {
                 Suppression::UnsafeAltRep => 5,
                 Suppression::UnsafeEnvironment => 6,
             }),
-            Inspection::Available(names) if names.len() <= 1000 &&
-                names.iter().all(|name| name.len() <= 4096) &&
-                names.iter().map(|name| name.len() + 4).sum::<usize>() <= 1024 * 1024 - 5 => {
+            Inspection::Available(members) if members.names.len() <= 1000 &&
+                members.kinds.len() == members.names.len() &&
+                members.names.iter().all(|name| name.len() <= 4096) &&
+                members.names.iter().map(|name| name.len() + 5).sum::<usize>() <= 1024 * 1024 - 5 => {
                     payload.push(1);
-                    encode_string_array(names, &mut payload);
+                    encode_string_array(&members.names, &mut payload);
+                    payload.extend_from_slice(&members.kinds);
                 }
             Inspection::Available(_) => payload.push(0),
         }
