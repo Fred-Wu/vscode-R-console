@@ -101,7 +101,7 @@ test("real embedded R completion inspects nested storage without running user co
   output = "";
   await submit('cat("S4_READY:", exists("s4", envir = .GlobalEnv, inherits = FALSE), if (exists("s4", envir = .GlobalEnv, inherits = FALSE)) isS4(s4) else FALSE, if (exists("s4", envir = .GlobalEnv, inherits = FALSE)) paste(names(attributes(s4)), collapse = ",") else "", "\\n")');
   await until(() => output.includes("S4_READY:"), "S4 fixture state");
-  assert.match(output, /S4_READY:\\s*TRUE\\s+TRUE/, "S4 object must exist before native inspection");
+  assert.match(output, /S4_READY:\s*TRUE\s+TRUE/, "S4 object must exist before native inspection");
   assert.deepEqual(await inspect("s4", [], "@"), available(["inner"]), output);
   assert.deepEqual(await inspect("s4", [{ kind: "slot", name: "inner" }]), available(["slot_value"]));
   await submit('makeActiveBinding("active_child", function() { hits <<- hits + 1L; list(secret = 1) }, env); delayedAssign("pending_idx", { hits <<- hits + 1L; 1L })');
