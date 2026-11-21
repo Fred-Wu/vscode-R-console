@@ -650,15 +650,9 @@ test("proxy forwards protocol 2 attach metadata and keeps workspace and completi
   });
   assert.deepEqual(await completion, [{ name: "member", type: "numeric" }]);
 
-  const signature = proxy.inspectCompletion("obj$fun", "function");
-  await waitFor(() => r.messages.some(message => message.method === "hover"));
-  const hover = r.messages.find(message => message.method === "hover");
-  assert.deepEqual(hover.params, { expr: "obj$fun" });
-  send(r.socket, { jsonrpc: "2.0", id: hover.id, result: { str: "function(arg)" } });
-  assert.deepEqual(await signature, { signature: "function(arg)" });
-
-  assert.equal(await proxy.inspectCompletion("nested[[1]]", "columns"), undefined);
-  assert.ok(!r.messages.some(message => message.method === "workspace_children"));
+  assert.ok(!r.messages.some(message =>
+    message.method === "hover" || message.method === "workspace_children"),
+    "completion must not initiate live sess inspection");
 
 });
 
