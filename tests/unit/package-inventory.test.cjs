@@ -150,7 +150,6 @@ test("inventory ignores lock-only changes and defers packages while installation
   fs.mkdirSync(lock);
   await settle();
   assert.equal(changes.length, count);
-  assert.ok(logs.some(line => line.includes("Filesystem event:") && line.includes(library)));
   assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
   assert.ok(logs.includes("[Libraries] Package inventory unchanged"));
   install(library);
@@ -195,6 +194,11 @@ test("inventory detects package link replacement from folder events", async t =>
   const replacement = install(path.join(root, "replacement"), "2.0");
   fs.unlinkSync(link);
   fs.symlinkSync(replacement, link, type);
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1)?.packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "package link replacement must publish");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.equal(changes.at(-1).packages.get("example").version, "2.0");
@@ -361,6 +365,47 @@ test("repeated failures back off and disposal cancels recovery", async t => {
   await inventory.refresh();
   assert.equal(attempts, 2);
   assert.ok(!logs.some(line => line.includes("Recovery complete")), "disposal is not successful recovery");
+});
+
+test("directory timestamp touches do not rescan unchanged installed packages", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const watcher = inventory.watchers.get(library);
+  assert.ok(watcher);
+  const published = changes.length;
+
+  logs.length = 0;
+  // Touching the library directory changes metadata, not its package entries.
+  // Exercise both fs.watch formats, including filename-less macOS events.
+  const touch = new Date(Date.now() - 5000);
+  fs.utimesSync(library, touch, touch);
+  for (let i = 0; i < 12; i++) {
+    watcher.emit("change", "change", undefined);
+    watcher.emit("change", "rename", undefined);
+    watcher.emit("change", "change", path.basename(library));
+  }
+  await settle();
+  assert.equal(inventory.watchers.get(library), watcher,
+    "metadata updates must not re-arm the directory watcher");
+  assert.equal(changes.length, published,
+    "metadata-only events must not publish package inventories");
+  assert.ok(!logs.some(line => line.includes("Scanning folder:") ||
+    line.includes("Package inventory unchanged")),
+  "metadata touches must not trigger full scans or unchanged-inventory logs");
+
+  // Ambiguous events must still detect a replacement with the same package name.
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "2.0");
+  watcher.emit("change", "change", undefined);
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "same-name package replacement must be detected");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example")?.version, "2.0");
 });
 
 test("unchanged parent events do not repeatedly restore renv-style library watchers", async t => {

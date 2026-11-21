@@ -35,6 +35,8 @@ export class PackageInventory {
   private disposed = false;
   private revision = 0;
   private readonly dirtyLibraries = new Set<string>();
+  // Ambiguous events can be directory metadata touches with no package change.
+  private readonly unconfirmedLibraries = new Set<string>();
 
   constructor(
     private readonly onChange: (change: PackageInventoryChange) => Promise<void>,
@@ -62,6 +64,9 @@ export class PackageInventory {
     for (const library of this.dirtyLibraries) {
       if (!active.has(library)) this.dirtyLibraries.delete(library);
     }
+    for (const library of this.unconfirmedLibraries) {
+      if (!active.has(library)) this.unconfirmedLibraries.delete(library);
+    }
     this.paths = [...paths];
     this.revision++;
     this.candidate = undefined;
@@ -79,7 +84,8 @@ export class PackageInventory {
       // inode, and creation time distinguish replacement at the same path,
       // including on Windows volumes where inode may not be available.
       return JSON.stringify([
-        fs.realpathSync.native(library), stats.dev, stats.ino, stats.birthtimeMs,
+        fs.realpathSync.native(library), stats.dev,
+        stats.ino || stats.birthtimeMs,
       ]);
     } catch {
       // A temporarily missing target must be re-armed by the parent watcher.
@@ -126,8 +132,15 @@ export class PackageInventory {
       const target = this.libraryTarget(library);
       const watcher = fs.watch(library, { persistent: false }, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
-        this.log(`[Libraries] Filesystem event: ${event} - ${library} - ${filename ? JSON.stringify(filename) : "filename unavailable"}`);
-        this.dirtyLibraries.add(library);
+        const name = filename ? String(filename) : "";
+        // Parent-unknown events and directory metadata touches need a cheap
+        // content check first. R can update a library directory's timestamp
+        // without changing any installed packages.
+        if (event === "change" || !name || name === path.basename(library)) {
+          this.unconfirmedLibraries.add(library);
+        } else {
+          this.dirtyLibraries.add(library);
+        }
         this.schedule(250);
       });
       watcher.on("error", error => {
@@ -185,6 +198,7 @@ export class PackageInventory {
     for (const watcher of this.watchers.values()) watcher.close();
     this.watchers.clear();
     this.watchedTargets.clear();
+    this.unconfirmedLibraries.clear();
     for (const watcher of this.parentWatchers.values()) watcher.close();
     this.parentWatchers.clear();
   }
@@ -194,17 +208,21 @@ export class PackageInventory {
     if (this.pending) return this.pending;
     const revision = this.revision;
     const dirty = new Set(this.dirtyLibraries);
+    const unconfirmed = new Set(this.unconfirmedLibraries);
     this.dirtyLibraries.clear();
-    const request = this.scan(revision, dirty).then(() => {
+    this.unconfirmedLibraries.clear();
+    const request = this.scan(revision, dirty, unconfirmed).then(() => {
       if (!this.disposed && revision === this.revision &&
           this.watchers.size === this.paths.length &&
-          this.parentWatchers.size === this.paths.length && !this.dirtyLibraries.size) {
+          this.parentWatchers.size === this.paths.length &&
+          !this.dirtyLibraries.size && !this.unconfirmedLibraries.size) {
         if (this.retryDelay > 1000) this.log("[Libraries] Recovery complete; retries stopped");
         this.clearRetry();
       }
     }).catch(error => {
       if (!this.disposed && revision === this.revision) {
         for (const library of dirty) this.dirtyLibraries.add(library);
+        for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
         this.log(`[Libraries] Could not refresh package inventory: ${String(error)}`);
         this.scheduleRetry(true);
       }
@@ -213,7 +231,8 @@ export class PackageInventory {
       // A library-only reorder has no dirty directory. Still process a new
       // revision if its scheduled refresh joined an older in-flight scan.
       if (!this.disposed && revision !== this.revision) this.schedule(0);
-      else if (!this.timer && !this.retryTimer && this.dirtyLibraries.size) this.schedule(250);
+      else if (!this.timer && !this.retryTimer &&
+          (this.dirtyLibraries.size || this.unconfirmedLibraries.size)) this.schedule(250);
     });
     this.pending = request;
     return request;
@@ -231,14 +250,46 @@ export class PackageInventory {
     this.timer.unref();
   }
 
-  private async scan(revision: number, dirty: Set<string>): Promise<void> {
+  private async hasInstalledPackagesChanged(library: string, previous: LibraryInventory): Promise<boolean> {
+    try {
+      const entries = await fs.promises.readdir(library, { withFileTypes: true });
+      if (entries.some(entry => entry.name.startsWith("00LOCK"))) return true;
+      const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+        /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name);
+      if (names.length !== previous.packages.size) return true;
+      // Same-name installations may be replaced, including via symlink targets.
+      // Compare the identities already used by readPackage(), without reading
+      // DESCRIPTION or any package metadata on unchanged events.
+      for (const name of names) {
+        const installed = previous.packages.get(name);
+        if (!installed) return true;
+        const directory = path.join(library, name);
+        const target = await fs.promises.realpath(directory);
+        const stat = await fs.promises.stat(directory);
+        const identity = JSON.stringify([target, stat.mtimeMs, stat.ctimeMs, stat.ino]);
+        if (identity !== installed.identity) return true;
+      }
+      return false;
+    } catch {
+      // A missing or transient directory must take the normal recovery path.
+      return true;
+    }
+  }
+
+  private async scan(revision: number, dirty: Set<string>,
+    unconfirmed: Set<string> = new Set()): Promise<void> {
     const libraries: LibraryInventory[] = [];
     for (const library of this.paths) {
       if (this.disposed || revision !== this.revision) return;
       const previous = this.libraries.find(item => item.path === library);
       if (previous && !dirty.has(library)) {
-        libraries.push(previous);
-        continue;
+        if (!unconfirmed.has(library) ||
+            !(await this.hasInstalledPackagesChanged(library, previous))) {
+          libraries.push(previous);
+          continue;
+        }
+        if (this.disposed || revision !== this.revision) return;
+        dirty.add(library);
       }
       let entries: fs.Dirent[];
       try {
@@ -267,8 +318,9 @@ export class PackageInventory {
       libraries.push({ path: library, packages });
     }
     if (this.disposed || revision !== this.revision) return;
-    if (this.dirtyLibraries.size) {
+    if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) {
       for (const library of dirty) this.dirtyLibraries.add(library);
+      for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
       this.schedule(250);
       return;
     }
@@ -279,7 +331,9 @@ export class PackageInventory {
       [...library.packages.values()].map(item => [item.name, item.identity])]));
     if (this.initialized && signature === previousSignature) {
       this.candidate = undefined;
-      this.log("[Libraries] Package inventory unchanged");
+      // A content check without a package change is routine, not a lifecycle
+      // event. Avoid flooding the output channel on normal console input.
+      if (dirty.size) this.log("[Libraries] Package inventory unchanged");
       return;
     }
     if (this.initialized && this.candidate !== signature) {
