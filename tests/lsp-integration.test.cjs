@@ -529,9 +529,7 @@ test("accepting a console-defined function opens its live arguments and values",
     my_function: 'function(method = c("fast", "accurate"))',
   });
   const session = runRJson(setup + 'cat(jsonlite::toJSON(list(search = search(), loaded_namespaces = loadedNamespaces(), globalenv = lapply(mget(c("f", "my_function")), function(fn) list(type = typeof(fn), str = paste(capture.output(str(fn)), collapse="\\n")))), auto_unbox = TRUE))');
-  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
-,
-  });
+  const lang = new RTermLang({ extensionPath: "", rPath: "", env: {} });
   lang.updateSessionData(session);
   t.after(() => lang.dispose());
   await lang.start();
