@@ -90,9 +90,12 @@ test("cached workspace functions use one LSP request without sess inspection", a
     } }),
     completion: (_client, params) => ({ items: [], seenSignature: params.rConsoleRuntimeSignature }),
   });
-  const result = await client.provideCompletionItems({ getText: () => "f(" }, new Position(0, 2));
-  assert.equal(result.seenSignature, "function(first, second = 2)");
-  assert.equal(instances[0].requests.filter(request => request.method === "completion").length, 1);
+  for (const text of ["f(", "`f`("]) {
+    const result = await client.provideCompletionItems({ getText: () => text },
+      new Position(0, text.length));
+    assert.equal(result.seenSignature, "function(first, second = 2)", text);
+  }
+  assert.equal(instances[0].requests.filter(request => request.method === "completion").length, 2);
 });
 
 test("first session snapshot keeps the running server", async (t) => {
