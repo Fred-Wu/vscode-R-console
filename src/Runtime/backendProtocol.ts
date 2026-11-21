@@ -46,6 +46,7 @@ const FrameKind = {
   DialogResult: 18,
   HostError: 19,
   SessionState: 20,
+  LibraryPaths: 21,
 } as const;
 
 export type BackendCapability =
@@ -127,6 +128,10 @@ export type BackendControlEvent =
   | {
       type: "host-error";
       message: string;
+    }
+  | {
+      type: "library-paths";
+      paths: string[];
     }
   | {
       type: "session-state";
@@ -329,6 +334,20 @@ function parseControlFrame(
         type: "host-error",
         message: payload.toString("utf8"),
       };
+    case FrameKind.LibraryPaths: {
+      if (payload.length > 128 * 1024 + 4) {
+        throw new Error("library-paths payload exceeds size limit");
+      }
+      const count = parseU32(payload, 0);
+      if (count > 256) {
+        throw new Error("too many library paths");
+      }
+      const result = parseStringArray(payload);
+      if (result.offset !== payload.length) {
+        throw new Error("invalid library-paths payload length");
+      }
+      return { type: "library-paths", paths: result.values };
+    }
     case FrameKind.SessionState: {
       if (payload.length < 6) {
         throw new Error("invalid session-state payload");
