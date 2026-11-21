@@ -27,7 +27,7 @@ function fixture(t) {
     const deadline = Date.now() + 10000;
     do {
       await new Promise(resolve => setTimeout(resolve, 20));
-      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size)) return;
+      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size)) return;
       assert.ok(Date.now() < deadline, "inventory settles after pending filesystem events");
     } while (true);
   };
@@ -140,6 +140,60 @@ test("reorders paths even when an older inventory scan is still in flight", asyn
   assert.deepEqual(changes.at(-1).libraries.map(library => library.path), [second, first],
     "the newer library order must publish after the earlier scan completes");
 });
+
+for (const queue of ["dirty", "unconfirmed"]) {
+  test(`reordering replays ${queue} package changes from an interrupted inventory scan`, async t => {
+    const { libraries: [first, second], inventory, changes, install, settle } = fixture(t);
+    install(first, "1.0");
+    inventory.setLibraryPaths([first, second]);
+    await settle();
+    assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+
+    // Model a new installation identity without an extra filesystem event.
+    // This proves the pending notification itself survives a search-order edit.
+    const readPackage = inventory.readPackage.bind(inventory);
+    inventory.readPackage = async (library, name, previous) => {
+      const item = await readPackage(library, name, previous);
+      return library === first && item
+        ? { ...item, version: "2.0", identity: item.identity + "-updated" }
+        : item;
+    };
+    if (queue === "dirty") {
+      inventory.dirtyLibraries.add(first);
+    } else {
+      inventory.hasInstalledPackagesChanged = async library => library === first;
+      inventory.unconfirmedLibraries.add(first);
+    }
+
+    let release, started;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const begun = new Promise(resolve => { started = resolve; });
+    const scan = inventory.scan.bind(inventory);
+    inventory.scan = async (...args) => {
+      started();
+      await blocked;
+      return scan(...args);
+    };
+    t.after(() => release());
+    const pending = inventory.refresh();
+    await begun;
+    assert.equal(inventory.dirtyLibraries.size, 0);
+    assert.equal(inventory.unconfirmedLibraries.size, 0);
+    inventory.setLibraryPaths([second, first]);
+    release();
+    await pending;
+
+    const deadline = Date.now() + 10000;
+    while (inventory.libraries.find(item => item.path === first)?.packages.get("example")?.version !== "2.0") {
+      assert.ok(Date.now() < deadline, `${queue} update must survive library reordering`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await settle();
+    assert.deepEqual(changes.at(-1).libraries.map(item => item.path), [second, first]);
+    assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+    assert.deepEqual(changes.at(-1).changed, ["example"]);
+  });
+}
 
 test("inventory ignores lock-only changes and defers packages while installation is locked", async t => {
   const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);

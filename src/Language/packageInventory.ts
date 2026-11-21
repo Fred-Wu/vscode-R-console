@@ -228,11 +228,22 @@ export class PackageInventory {
       }
     }).finally(() => {
       if (this.pending === request) this.pending = undefined;
-      // A library-only reorder has no dirty directory. Still process a new
-      // revision if its scheduled refresh joined an older in-flight scan.
-      if (!this.disposed && revision !== this.revision) this.schedule(0);
-      else if (!this.timer && !this.retryTimer &&
-          (this.dirtyLibraries.size || this.unconfirmedLibraries.size)) this.schedule(250);
+      // The scan consumed these events before a newer library order arrived.
+      // Replay them for paths still in the search order; otherwise the next
+      // scan could reuse stale package metadata without another filesystem event.
+      if (!this.disposed && revision !== this.revision) {
+        const active = new Set(this.paths);
+        for (const library of dirty) {
+          if (active.has(library)) this.dirtyLibraries.add(library);
+        }
+        for (const library of unconfirmed) {
+          if (active.has(library)) this.unconfirmedLibraries.add(library);
+        }
+        this.schedule(0);
+      } else if (!this.timer && !this.retryTimer &&
+          (this.dirtyLibraries.size || this.unconfirmedLibraries.size)) {
+        this.schedule(250);
+      }
     });
     this.pending = request;
     return request;
