@@ -320,7 +320,7 @@ export class ConsoleLspClient implements CompletionProvider {
             !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
           const item = globals[params.rConsoleCall];
           if (item && ["closure", "builtin", "special"].includes(item.type) &&
-              typeof item.str === "string" && /^\\s*function\\s*\\(/.test(item.str)) {
+              typeof item.str === "string" && /^\s*function\s*\(/.test(item.str)) {
             (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = item.str;
           }
         }
