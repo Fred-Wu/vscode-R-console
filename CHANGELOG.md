@@ -2,6 +2,12 @@
 
 All notable changes to R Console will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Console autocompletion now follows library paths added, removed or reordered during an active R session.
+
 ## [0.5.6] - 2026-11-19
 
 ### Changed
