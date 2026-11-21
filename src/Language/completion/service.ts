@@ -44,16 +44,12 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
-  const nestedReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
-  const rootMember = context.kind === "member" && sessionItems.length === 0 && !!context.objectName;
-  const rootBracket = context.kind === "bracket" && context.bracketOperator === "[[" &&
-    cachedColumnItems.length === 0 && !!context.objectName;
+  const runtimeReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
   const rawLspResult = await rawLspItemsRequest;
-  // Source-inferred members remain owned by LSP in opt-in static mode.
   const inferred = rawLspResult.memberResolved ||
     rawLspResult.entries.some(entry => entry.role === "member");
-  const runtimeRequest = (nestedReceiver || rootMember || rootBracket) &&
-    (context.kind === "member" || context.kind === "bracket") &&
+  const runtimeRequest = runtimeReceiver &&
+    (context.kind === "member" || (context.kind === "bracket" && context.bracketOperator === "[[")) &&
     (rawLspResult.runtimeOnly || !inferred)
     ? requestRuntimeMemberCompletions?.(context.objectName!,
         context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")

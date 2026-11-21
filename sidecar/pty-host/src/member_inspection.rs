@@ -705,7 +705,7 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Inspection {
     struct Context {
         api: InspectorApi,
         query: MemberQuery,
-        result: Option<Result<Vec<String>, Suppression>>,
+        result: Option<Result<Members, Suppression>>,
     }
     unsafe extern "C" fn invoke(data: *mut c_void) {
         let context = &mut *(data as *mut Context);
