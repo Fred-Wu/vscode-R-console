@@ -1738,7 +1738,7 @@ test("console LSP ignores vscode-R library settings and forwards only runtime li
   assert.equal(startupEnv.VSCR_RUNTIME_LIB_PATHS, "");
   lsp.updateRuntimeLibraryPaths(["/project/library", "/R/library"]);
   assert.equal(lsp.buildServerEnv(config).VSCR_RUNTIME_LIB_PATHS,
-    "/project/library\\n/R/library");
+    "/project/library\n/R/library");
 });
 
 test("language-server state sync failures do not reject terminal workspace updates", async () => {
