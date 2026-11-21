@@ -27,10 +27,9 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
-import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
-import type { SessionCompletionInspector } from "../Runtime/VSCR/types";
+import type { WorkspaceData } from "../Runtime/VSCR/types";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -54,7 +53,7 @@ type ConsoleLspClientOptions = {
   env: NodeJS.ProcessEnv;
   cwd?: string;
   onPackagesChanged?: () => void;
-  inspectRuntimeCompletion?: SessionCompletionInspector;
+  getCachedWorkspaceData?: () => WorkspaceData | undefined;
   getStaticAnalysisEnabled?: () => boolean;
 };
 
@@ -314,49 +313,24 @@ export class ConsoleLspClient implements CompletionProvider {
         const documentVersion = projection.document.version;
         const sessionState = this.sessionState;
         const runtimeRevision = this.runtimeRevision;
-        const call = params.rConsoleCall && this.options.inspectRuntimeCompletion
-          ? getEnclosingCall(projection.document.getText(),
-            projection.document.offsetAt(projection.toServerPosition(contextPosition))) : undefined;
-        let result = await client.sendRequest(CompletionRequest.type, params);
+        // Use the already-published workspace snapshot; completion must not
+        // query sess to resolve or inspect runtime objects.
+        const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
+        if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
+            !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
+          const item = globals[params.rConsoleCall];
+          if (item && ["closure", "builtin", "special"].includes(item.type) &&
+              typeof item.str === "string" && /^\\s*function\\s*\\(/.test(item.str)) {
+            params.rConsoleRuntimeSignature = item.str;
+          }
+        }
+        const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client || revision !== this.packageRevision) continue;
         const isCurrent = () => !this.disposed && this.client === client &&
           revision === this.packageRevision && runtimeRevision === this.runtimeRevision &&
           this.sessionState === sessionState &&
           this.syncedDocuments.get(projection.document.uri.toString())?.version === documentVersion;
         if (!isCurrent()) return undefined;
-        const flags = result as CompletionResult | null;
-        // Qualified calls retain the native package signature. Other calls
-        // can use the active R function's signature via sess hover.
-        if (params.rConsoleCall && call &&
-            !["::", ":::"].includes(call.operator ?? "") &&
-            this.options.inspectRuntimeCompletion &&
-            (!staticAnalysis || (!flags?.rConsoleLocalFunction &&
-              !flags?.rConsoleWorkspaceFunction && !flags?.rConsoleNativeArguments))) {
-          const metadata = await this.options.inspectRuntimeCompletion(params.rConsoleCall, "function");
-          if (this.client !== client || revision !== this.packageRevision) continue;
-          if (!isCurrent()) return undefined;
-          if (metadata?.signature) {
-            const runtimeParams = { ...params, rConsoleRuntimeSignature: metadata.signature };
-            result = await client.sendRequest(CompletionRequest.type, runtimeParams);
-            if (!isCurrent()) return undefined;
-          }
-        } else if (params.rConsoleSubscriptOperator && params.rConsoleDataObject &&
-            this.options.inspectRuntimeCompletion &&
-            (!staticAnalysis || !flags?.rConsoleNativeArguments)) {
-          // S3 method names come from live class metadata. Local methods are
-          // read through sess; installed method metadata stays in languageserver.
-          const metadata = await this.options.inspectRuntimeCompletion(params.rConsoleDataObject,
-            params.rConsoleSubscriptOperator === "[[" ? "doubleSubscript" : "subscript");
-          if (this.client !== client || revision !== this.packageRevision) continue;
-          if (!isCurrent()) return undefined;
-          if (metadata?.signature || metadata?.classes?.length) {
-            const runtimeParams = { ...params, rConsoleSubscript: true,
-              rConsoleRuntimeSignature: metadata.signature,
-              rConsoleSubscriptClasses: metadata.classes };
-            result = await client.sendRequest(CompletionRequest.type, runtimeParams);
-            if (!isCurrent()) return undefined;
-          }
-        }
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
         if (!isCurrent()) return undefined;
         // VS Code's converter preserves standard LSP fields only. Carry this
