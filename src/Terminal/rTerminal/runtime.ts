@@ -17,13 +17,11 @@ import {
 } from "../../Runtime/runtimeBackend";
 import {
   getVscodeRIntegration,
-  type SessionMemberCompletionItem,
   type WorkspaceData,
 } from "../../Runtime/VSCR";
 import type {
   VscodeRSessionIntegration,
 } from "../../Runtime/VSCR";
-import type { SessionCompletionKind } from "../../Runtime/VSCR/types";
 import { ANSI, stripBracketedPasteMarkers } from "../ansi";
 import { ConsoleSyntax } from "../consoleSyntax";
 import { InputState } from "../inputState";
@@ -241,18 +239,6 @@ export async function getRuntimeWorkspaceData(
   host: RuntimeHost
 ): Promise<WorkspaceData | undefined> {
   return await vscodeRIntegration(host).requestWorkspaceData();
-}
-
-export async function requestRuntimeMemberCompletions(
-  host: RuntimeHost,
-  expression: string,
-  operator: "$" | "@"
-): Promise<SessionMemberCompletionItem[] | undefined> {
-  return await vscodeRIntegration(host).requestMemberCompletions(expression, operator);
-}
-
-export async function inspectRuntimeCompletion(host: RuntimeHost, expression: string, kind: SessionCompletionKind) {
-  return await vscodeRIntegration(host).inspectCompletion(expression, kind);
 }
 
 export async function startRuntime(host: RuntimeHost): Promise<void> {
