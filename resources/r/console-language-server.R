@@ -18,6 +18,13 @@ if (nzchar(add_lib_paths)) {
 
 .libPaths(.paths)
 
+# A replacement language server must start with the active console search order.
+# This fixed environment value contains only library paths, never console code.
+runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
+if (nzchar(runtime_lib_paths)) {
+    .libPaths(strsplit(runtime_lib_paths, "\\n", fixed = TRUE)[[1L]])
+}
+
 if (!requireNamespace("languageserver", quietly = TRUE)) {
     q(save = "no", status = 10)
 }
