@@ -354,3 +354,25 @@ test("a queued healthy scan is not cancelled by another library's watcher failur
   }
   assert.ok(inventory.retryTimer, "failed watcher still backs off independently");
 });
+
+test("removing and readding an entire runtime library closes and restores its watcher", async t => {
+  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  install(first, "1.0");
+  install(second, "2.0");
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+
+  inventory.setLibraryPaths([second]);
+  await settle();
+  assert.equal(inventory.watchers.has(first), false, "removed libraries must stop being watched");
+  assert.equal(inventory.parentWatchers.has(first), false);
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  assert.ok(logs.some(line => line.includes("Selected copy changed") ||
+    line.includes("Using remaining copy")));
+
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  assert.equal(inventory.watchers.has(first), true, "readded libraries resume monitoring");
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+});
