@@ -10,6 +10,7 @@ import {
   type BackendCapability,
   type BackendControlEvent,
   type MemberInspectionQuery,
+  type MemberInspectionResult,
   type BackendDialogResult,
   BackendFrameSizeError,
   BACKEND_PROTOCOL_VERSION,
@@ -74,7 +75,7 @@ type BackendSessionState = {
   capabilities: Set<BackendCapability>;
   hostConnected: boolean;
   nextRequestId: number;
-  pendingMemberRequests: Map<number, { resolve: (names: string[] | undefined) => void; timeout: NodeJS.Timeout }>;
+  pendingMemberRequests: Map<number, { resolve: (result: MemberInspectionResult) => void; timeout: NodeJS.Timeout }>;
   pendingParseRequests: Map<
     number,
     {
@@ -119,6 +120,7 @@ export interface RuntimeBackend {
   sendSessionCommand(session: RuntimeSessionHandle | null, command: RuntimeSessionCommand): boolean;
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined;
   requestMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<string[] | undefined> | undefined;
+  inspectMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<MemberInspectionResult> | undefined;
   close(session: RuntimeSessionHandle): void;
   isAlive(session: RuntimeSessionHandle | null): boolean;
   getPid(session: RuntimeSessionHandle | null): number | undefined;
@@ -344,17 +346,24 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   requestMemberNames(
     session: RuntimeSessionHandle | null, query: MemberInspectionQuery
   ): Promise<string[] | undefined> | undefined {
+    return this.inspectMemberNames(session, query)?.then(result =>
+      result.status === "available" ? result.names : undefined);
+  }
+
+  inspectMemberNames(
+    session: RuntimeSessionHandle | null, query: MemberInspectionQuery
+  ): Promise<MemberInspectionResult> | undefined {
     if (!session) return undefined;
     const state = this.sessionStates.get(session);
     if (!state?.hostConnected || !state.capabilities.has("member-inspection") ||
         state.pendingMemberRequests.size >= 16) return undefined;
-    return new Promise<string[] | undefined>(resolve => {
+    return new Promise<MemberInspectionResult>(resolve => {
       const requestId = ++state.nextRequestId;
       const timeout = setTimeout(() => {
         const pending = state.pendingMemberRequests.get(requestId);
         if (!pending) return;
         state.pendingMemberRequests.delete(requestId);
-        pending.resolve(undefined);
+        pending.resolve({ status: "unavailable" });
       }, MEMBER_NAMES_TIMEOUT_MS);
       state.pendingMemberRequests.set(requestId, { resolve, timeout });
       try {
@@ -364,7 +373,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       }
       state.pendingMemberRequests.delete(requestId);
       clearTimeout(timeout);
-      resolve(undefined);
+      resolve({ status: "unavailable" });
     });
   }
 
@@ -794,7 +803,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         if (!pending) return;
         state.pendingMemberRequests.delete(event.requestId);
         clearTimeout(pending.timeout);
-        pending.resolve(event.names);
+        pending.resolve(event.result);
         return;
       }
       case "parse-status-result": {
@@ -815,7 +824,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
   private resolvePendingMemberRequests(state: BackendSessionState): void {
     for (const pending of state.pendingMemberRequests.values()) {
       clearTimeout(pending.timeout);
-      pending.resolve(undefined);
+      pending.resolve({ status: "unavailable" });
     }
     state.pendingMemberRequests.clear();
   }

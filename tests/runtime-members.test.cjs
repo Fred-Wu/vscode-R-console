@@ -61,8 +61,15 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), ["changed"]);
 
   await submit('hits <- 0L; makeActiveBinding("active_root", function() { hits <<- hits + 1L; list(inner = list(secret = 1)) }, .GlobalEnv); classed <- structure(list(inner = list(secret = 2)), class = "custom"); `$.custom` <- function(x, name) { hits <<- hits + 1L; x[[name]] }; delayedAssign("lazy_root", { hits <<- hits + 1L; list(inner = list(secret = 3)) })');
-  for (const root of ["active_root", "classed", "lazy_root"]) {
-    assert.equal(await inspect(root, [{ kind: "field", name: "inner" }]), undefined, root);
+  for (const [root, expected] of [
+    ["active_root", "active-binding"],
+    ["classed", "unsupported-accessor"],
+    ["lazy_root", "deferred-binding"],
+  ]) {
+    const query = { root, steps: [{ kind: "field", name: "inner" }], slots: false };
+    assert.deepEqual(await backend.inspectMemberNames(session, query),
+      { status: "suppressed", reason: expected }, root);
+    assert.equal(await inspect(root, query.steps), undefined, root);
   }
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');

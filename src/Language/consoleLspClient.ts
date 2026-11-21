@@ -32,6 +32,7 @@ import { createCompletionParams } from "./completion/protocol";
 import { backtickRName } from "./completion/candidates";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
+import { formatCompletionDecision, type CompletionDecision } from "./completion/diagnostics";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 const lifecycleOutputChannel = vscode.window.createOutputChannel(
@@ -42,6 +43,16 @@ function formatLogTimestamp(date = new Date()): string {
   const pad = (value: number): string => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
     `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+// Keep source-free security decisions visible without flooding the LSP channel.
+const completionLogTimes = new Map<string, number>();
+export function logConsoleCompletionDecision(decision: CompletionDecision): void {
+  const message = formatCompletionDecision(decision);
+  const now = Date.now();
+  if (now - (completionLogTimes.get(message) ?? -Infinity) < 1500) return;
+  completionLogTimes.set(message, now);
+  lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] ${message}`);
 }
 
 export function disposeConsoleLspOutputChannel(): void {

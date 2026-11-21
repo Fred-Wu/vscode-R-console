@@ -76,7 +76,7 @@ test("safe existing-session nested members override runtime-only LSP and retain 
       items: [{ label: "source_only", kind: 4, data: { type: "member" } }] }) },
     async (expression, operator) => {
       requested.push([expression, operator]);
-      return [{ name: "alpha" }, { name: "a b" }];
+      return { status: "available", names: ["alpha", "a b"] };
     });
   assert.deepEqual(requested, [["obj$inner", "$"]]);
   assert.deepEqual(entries.map(item => item.label), ["alpha", "a b"]);
@@ -88,7 +88,7 @@ test("nested bracket fields use the same safe session result and quote names", a
   const input = "obj$inner[[";
   const entries = await completion.collectCompletionEntries(
     completion.getCompletionContext(input, input.length), undefined, undefined,
-    undefined, [], [], undefined, async () => [{ name: "a b" }]);
+    undefined, [], [], undefined, async () => ({ status: "available", names: ["a b"] }));
   assert.deepEqual(entries.filter(item => item.label === "a b").map(item => item.insertText), ['"a b"']);
 });
 
@@ -111,7 +111,7 @@ test("function-call receivers do not fall back to global names on explicit Tab",
   for (const input of ["make_object()$", "make_object()$sec", "make_object()@"]) {
     const context = completion.getCompletionContext(input, input.length);
     assert.equal(context?.kind, "member", input);
-    assert.equal(context?.suppressAutomatic, true, input);
+    assert.equal(context?.rejectionReason, "executable-receiver", input);
     const entries = await completion.collectCompletionEntries(
       context, undefined, undefined, workspace, [], [],
       { provideCompletionItems: async () => assert.fail("unsupported receiver must not query LSP") },
@@ -149,5 +149,18 @@ test("custom class cached names are inert while active bindings have no cached m
     const entries = await completion.collectCompletionEntries(context, undefined, undefined,
       workspace, [], [], undefined, async () => assert.fail("cached lookup must not inspect R"));
     assert.deepEqual(entries.map(entry => entry.label), expected, input);
+  }
+});
+
+test("computed receivers are rejected before LSP or native member inspection", async () => {
+  const inputs = ["obj[[side_effect()]]$item", "obj[[get_index()]]$", "items[[f()]]$"];
+  for (const input of inputs) {
+    const context = completion.getCompletionContext(input, input.length);
+    assert.equal(context?.rejectionReason, "executable-receiver", input);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { obj: { type: "list", names: ["unsafe"] } } }, [], [],
+      { provideCompletionItems: () => assert.fail("LSP must not receive rejected expression") },
+      () => assert.fail("runtime inspector must not receive rejected expression"));
+    assert.deepEqual(entries, [], input);
   }
 });

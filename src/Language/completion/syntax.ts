@@ -1,6 +1,7 @@
 import type { CompletionContext } from "./types";
 import { TokenType, tokenize, isMemberAccessor } from "../lexer";
 import { getCompletionSyntax } from "./contextParser";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
@@ -64,6 +65,8 @@ export function getCompletionContext(
       isPipePlaceholder(member.baseObject) && !!dataObjectName;
     return {
       kind: "member",
+      ...(member.hasSubscript && !parseRuntimeMemberQuery(member.objectName) ?
+        { rejectionReason: "executable-receiver" as const } : {}),
       autoTrigger: true,
       prefix,
       replaceStart,
@@ -86,7 +89,7 @@ export function getCompletionContext(
       kind: "member",
       prefix: "",
       replaceStart: beforeCursor.length,
-      suppressAutomatic: true,
+      rejectionReason: "executable-receiver",
       snapshotInput,
       snapshotCursor,
     };
@@ -98,6 +101,8 @@ export function getCompletionContext(
     const effectiveDataObject = isPlaceholderBracket ? dataObjectName : bracket.objectName;
     return {
       kind: "bracket",
+      ...(bracket.objectName.includes("[") && !parseRuntimeMemberQuery(bracket.objectName) ?
+        { rejectionReason: "executable-receiver" as const } : {}),
       autoTrigger: true,
       prefix: bracket.prefix,
       replaceStart: bracket.replaceStart - relativeOffset,

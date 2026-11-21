@@ -45,11 +45,26 @@ test("native member results distinguish unavailable from an empty object", () =>
     return Buffer.concat([header, payload]);
   }
   const unavailable = parseBackendFrames(frame(Buffer.from([0])));
-  assert.deepEqual(unavailable.events, [{ type: "member-names-result", requestId: 42 }]);
+  assert.deepEqual(unavailable.events, [{ type: "member-names-result", requestId: 42, result: { status: "unavailable" } }]);
   const empty = parseBackendFrames(frame(Buffer.from([1, 0, 0, 0, 0])));
-  assert.deepEqual(empty.events, [{ type: "member-names-result", requestId: 42, names: [] }]);
+  assert.deepEqual(empty.events, [{ type: "member-names-result", requestId: 42, result: { status: "available", names: [] } }]);
   const oversized = Buffer.alloc(5);
   oversized[0] = 1;
   oversized.writeUInt32LE(1001, 1);
   assert.match(parseBackendFrames(frame(oversized)).error, /too many inspected members/);
+});
+
+test("native runtime suppression reasons use fixed status bytes and never source", () => {
+  const labels = ["active-binding", "deferred-binding", "unsupported-accessor", "unsupported-structure"];
+  for (let byte = 2; byte <= 5; byte++) {
+    const header = Buffer.alloc(12);
+    header.writeUInt32LE(1, 0);
+    header.writeUInt16LE(26, 4);
+    header.writeUInt32LE(99, 8);
+    const result = parseBackendFrames(Buffer.concat([header, Buffer.from([byte])]));
+    assert.deepEqual(result.events, [{
+      type: "member-names-result", requestId: 99,
+      result: { status: "suppressed", reason: labels[byte - 2] },
+    }]);
+  }
 });

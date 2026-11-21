@@ -93,6 +93,12 @@ export type MemberInspectionStep =
   | { kind: "field" | "slot"; name: string }
   | { kind: "index"; index: number };
 
+export type MemberInspectionResult =
+  | { status: "available"; names: string[] }
+  | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
+      "unsupported-accessor" | "unsupported-structure" }
+  | { status: "unavailable" };
+
 export type MemberInspectionQuery = {
   root: string;
   steps: MemberInspectionStep[];
@@ -141,7 +147,7 @@ export type BackendControlEvent =
   | {
       type: "member-names-result";
       requestId: number;
-      names?: string[];
+      result: MemberInspectionResult;
     }
   | {
       type: "host-error";
@@ -343,11 +349,18 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || (payload[0] !== 0 && payload[0] !== 1)) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 5) {
         throw new Error("invalid member inspection result");
       }
-      if (payload[0] === 0 && payload.length === 1) {
-        return { type: "member-names-result", requestId };
+      if (payload[0] !== 1) {
+        if (payload.length !== 1) throw new Error("invalid member inspection status");
+        const reasons = {
+          2: "active-binding", 3: "deferred-binding",
+          4: "unsupported-accessor", 5: "unsupported-structure",
+        } as const;
+        return { type: "member-names-result", requestId,
+          result: payload[0] === 0 ? { status: "unavailable" } :
+            { status: "suppressed", reason: reasons[payload[0] as keyof typeof reasons] } };
       }
       const count = parseU32(payload, 1);
       if (count > 1000) throw new Error("too many inspected members");
@@ -355,7 +368,7 @@ function parseControlFrame(
       if (parsed.offset !== payload.length || parsed.values.some(name => Buffer.byteLength(name, "utf8") > 4096)) {
         throw new Error("invalid inspected member names");
       }
-      return { type: "member-names-result", requestId, names: parsed.values };
+      return { type: "member-names-result", requestId, result: { status: "available", names: parsed.values } };
     }
     case FrameKind.ParseStatusResult:
       return {

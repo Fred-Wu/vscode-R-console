@@ -676,7 +676,7 @@ mod unix_host {
             runtime.cv.notify_all();
         } else {
             drop(state);
-            let _ = runtime.output.emit_member_names_result(request_id, None);
+            let _ = runtime.output.emit_member_names_result(request_id, &member_inspection::Inspection::Unavailable);
         }
     }
 
@@ -1004,9 +1004,10 @@ mod unix_host {
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
-                    let names = INSPECTOR_API.get().copied().flatten()
-                        .and_then(|api| member_inspection::inspect(api, query));
-                    let _ = runtime.output.emit_member_names_result(request_id, names.as_deref());
+                    let result = INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query))
+                        .unwrap_or(member_inspection::Inspection::Unavailable);
+                    let _ = runtime.output.emit_member_names_result(request_id, &result);
                     state = runtime.state.lock().expect("host state lock poisoned");
                     continue;
                 }
@@ -2600,7 +2601,7 @@ mod windows_host {
             runtime.cv.notify_all();
         } else {
             drop(state);
-            let _ = runtime.output.emit_member_names_result(request_id, None);
+            let _ = runtime.output.emit_member_names_result(request_id, &member_inspection::Inspection::Unavailable);
         }
     }
 
@@ -2968,9 +2969,10 @@ mod windows_host {
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
-                    let names = INSPECTOR_API.get().copied().flatten()
-                        .and_then(|api| member_inspection::inspect(api, query));
-                    let _ = runtime.output.emit_member_names_result(request_id, names.as_deref());
+                    let result = INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query))
+                        .unwrap_or(member_inspection::Inspection::Unavailable);
+                    let _ = runtime.output.emit_member_names_result(request_id, &result);
                     state = runtime.state.lock().expect("host state lock poisoned");
                     continue;
                 }

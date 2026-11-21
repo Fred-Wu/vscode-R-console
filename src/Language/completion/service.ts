@@ -17,7 +17,7 @@ export async function collectCompletionEntries(
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string
 ): Promise<CompletionEntries> {
-  if (context.suppressAutomatic) return [];
+  if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
   const sessionArguments = context.kind === "argument" && isSessionFunctionCall(context, sessionData) &&
     !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator);
@@ -55,8 +55,9 @@ export async function collectCompletionEntries(
     (rawLspResult.runtimeOnly || !inferred)
     ? requestRuntimeMemberCompletions?.(context.objectName!, context.operator ?? "$")
     : undefined;
-  const runtimeNames = await Promise.resolve(runtimeRequest).catch(() => undefined);
-  const runtimeMembers = runtimeNames?.map(({ name }) => ({
+  const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
+  const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
+  const runtimeMembers = runtimeNames?.map(name => ({
     label: name,
     insertText: getFieldInsertText(name, context),
     kind: vscode.CompletionItemKind.Field,

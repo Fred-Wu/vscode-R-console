@@ -13,7 +13,7 @@ import {
   isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
-import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import { ConsoleLspClient, logConsoleCompletionDecision } from "../../Language/consoleLspClient";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
 
@@ -106,6 +106,11 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
+    if (context?.rejectionReason) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason });
+      onInlineEntries?.([]);
+      return;
+    }
     if (!context || context.suppressAutomatic) {
       onInlineEntries?.([]);
       return;

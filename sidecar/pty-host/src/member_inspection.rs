@@ -134,13 +134,27 @@ impl InspectorApi {
     }
 }
 
-/// Returns None when a path cannot be inspected without invoking R methods.
-/// Some([]) is an authoritative empty member list.
-pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Option<Vec<String>> {
+/// Return explicit safety decisions; never interpret missing data as rejection.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Inspection {
+    Available(Vec<String>),
+    Suppressed(Suppression),
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Suppression {
+    ActiveBinding,
+    DeferredBinding,
+    UnsupportedAccessor,
+    UnsupportedStructure,
+}
+
+pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Inspection {
     struct Context {
         api: InspectorApi,
         query: MemberQuery,
-        result: Option<Vec<String>>,
+        result: Option<Result<Vec<String>, Suppression>>,
     }
     unsafe extern "C" fn invoke(data: *mut c_void) {
         let context = &mut *(data as *mut Context);
@@ -150,10 +164,15 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Option<Vec<Strin
     let top: unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int =
         unsafe { std::mem::transmute(api.top_level) };
     let ok = unsafe { top(invoke, &mut context as *mut Context as *mut c_void) };
-    if ok == 0 { None } else { context.result }
+    if ok == 0 { return Inspection::Unavailable; }
+    match context.result {
+        Some(Ok(names)) => Inspection::Available(names),
+        Some(Err(reason)) => Inspection::Suppressed(reason),
+        None => Inspection::Unavailable,
+    }
 }
 
-unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<String>> {
+unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Result<Vec<String>, Suppression>> {
     type Unary = unsafe extern "C" fn(Sexp) -> Sexp;
     type Test = unsafe extern "C" fn(Sexp) -> c_int;
     type TypeOf = unsafe extern "C" fn(Sexp) -> c_int;
@@ -195,14 +214,14 @@ unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<St
     // On a missing binding R_BindingIsActive may signal an error, caught by
     // R_ToplevelExec. It never reads or evaluates the binding's value.
     let root = install(CString::new(query.root.as_str()).ok()?.as_ptr());
-    if binding_exists(global, root) == 0 || binding_active(root, global) != 0 { return None; }
+    if binding_exists(global, root) == 0 { return None; }
+    if binding_active(root, global) != 0 { return Some(Err(Suppression::ActiveBinding)); }
     let mut value = find_var(global, root);
-    if value.is_null() || value == unbound || value == nil || typeof_(value) == PROMSXP {
-        return None;
-    }
+    if value.is_null() || value == unbound || value == nil { return None; }
+    if typeof_(value) == PROMSXP { return Some(Err(Suppression::DeferredBinding)); }
     protect(value);
     let mut protected = 1;
-    let outcome = (|| -> Option<Vec<String>> {
+    let outcome = (|| -> Result<Vec<String>, Suppression> {
         unsafe {
         // Raw list extraction is equivalent to console access only for plain
         // lists and unmodified data.frames. Other S3 classes may define $ or [[
@@ -218,43 +237,44 @@ unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<St
                 }
         };
         for step in &query.steps {
-            if altrep(value) != 0 { return None; }
+            if altrep(value) != 0 { return Err(Suppression::UnsupportedStructure); }
             let next = match step {
                 Step::Slot(name) => {
-                    if is_s4(value) == 0 || name.starts_with('.') { return None; }
-                    get_attrib(value, install(CString::new(name.as_str()).ok()?.as_ptr()))
+                    if is_s4(value) == 0 || name.starts_with('.') { return Err(Suppression::UnsupportedAccessor); }
+                    get_attrib(value, install(CString::new(name.as_str()).map_err(|_| Suppression::UnsupportedAccessor)?.as_ptr()))
                 }
                 Step::Field(name) => {
-                    if !container_is_safe(value) { return None; }
+                    if !container_is_safe(value) { return Err(Suppression::UnsupportedAccessor); }
                     let names = get_attrib(value, names_symbol);
-                    if names == nil || typeof_(names) != STRSXP || altrep(names) != 0 { return None; }
+                    if names == nil || typeof_(names) != STRSXP || altrep(names) != 0 { return Err(Suppression::UnsupportedStructure); }
                     let len = xlength(names);
-                    if len < 0 || len as usize > MAX_NAMES { return None; }
+                    if len < 0 || len as usize > MAX_NAMES { return Err(Suppression::UnsupportedStructure); }
                     let index = (0..len).find(|&i| {
                         let raw = utf8(string_elt(names, i));
                         !raw.is_null() && CStr::from_ptr(raw).to_bytes() == name.as_bytes()
-                    })?;
+                    }).ok_or(Suppression::UnsupportedStructure)?;
                     vector_elt(value, index)
                 }
                 Step::Index(index) => {
-                    if !container_is_safe(value) { return None; }
+                    if !container_is_safe(value) { return Err(Suppression::UnsupportedAccessor); }
                     let len = xlength(value);
-                    if *index as isize > len { return None; }
+                    if *index as isize > len { return Err(Suppression::UnsupportedStructure); }
                     vector_elt(value, (*index - 1) as isize)
                 }
             };
-            if next.is_null() || next == nil || typeof_(next) == PROMSXP { return None; }
+            if next.is_null() || next == nil { return Err(Suppression::UnsupportedStructure); }
+            if typeof_(next) == PROMSXP { return Err(Suppression::DeferredBinding); }
             protect(next);
             protected += 1;
             value = next;
         }
-        if altrep(value) != 0 { return None; }
+        if altrep(value) != 0 { return Err(Suppression::UnsupportedStructure); }
         if query.slots {
-            if is_s4(value) == 0 { return None; }
+            if is_s4(value) == 0 { return Err(Suppression::UnsupportedAccessor); }
             let mut node = attrib(value);
             let mut members = Vec::new();
             while node != nil {
-                if members.len() >= MAX_NAMES { return None; }
+                if members.len() >= MAX_NAMES { return Err(Suppression::UnsupportedStructure); }
                 let sym = tag(node);
                 let text = utf8(printname(sym));
                 if !text.is_null() {
@@ -265,14 +285,14 @@ unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<St
                 }
                 node = cdr(node);
             }
-            return Some(members);
+            return Ok(members);
         }
-        if !container_is_safe(value) { return None; }
+        if !container_is_safe(value) { return Err(Suppression::UnsupportedAccessor); }
         let names = get_attrib(value, names_symbol);
-        if names == nil { return Some(Vec::new()); }
-        if typeof_(names) != STRSXP || altrep(names) != 0 { return None; }
+        if names == nil { return Ok(Vec::new()); }
+        if typeof_(names) != STRSXP || altrep(names) != 0 { return Err(Suppression::UnsupportedStructure); }
         let len = xlength(names);
-        if len < 0 || len as usize > MAX_NAMES { return None; }
+        if len < 0 || len as usize > MAX_NAMES { return Err(Suppression::UnsupportedStructure); }
         let mut members = Vec::new();
         for i in 0..len {
             let ptr = utf8(string_elt(names, i));
@@ -282,11 +302,11 @@ unsafe fn inspect_inner(api: InspectorApi, query: &MemberQuery) -> Option<Vec<St
                 members.push(name.into_owned());
             }
         }
-        Some(members)
+        Ok(members)
         }
     })();
     unprotect(protected);
-    outcome
+    Some(outcome)
 }
 
 #[cfg(test)]
