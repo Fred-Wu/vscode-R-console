@@ -22,7 +22,7 @@ if (nzchar(add_lib_paths)) {
 # This fixed environment value contains only library paths, never console code.
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
 if (nzchar(runtime_lib_paths)) {
-    .libPaths(strsplit(runtime_lib_paths, "\\n", fixed = TRUE)[[1L]])
+    .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]])
 }
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
