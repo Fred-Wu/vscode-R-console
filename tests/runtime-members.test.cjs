@@ -84,6 +84,9 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "missing" }]), available([]));
   assert.deepEqual(await inspect("named", [], "$"), available([]));
   assert.deepEqual(await inspect("named", [], "[["), available(["alpha", "beta"]));
+  assert.deepEqual(await inspect("named", [{ kind: "slice-index", index: 1 }], "$"), available([]));
+  await submit('duplicate <- setNames(list(1, 2), c("same", "same"))');
+  assert.deepEqual(await inspect("duplicate", [{ kind: "slice-index", index: 2 }]), available(["same"]));
   assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["empty", "inner"]);
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "inner" }]), available(["value"]));
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "empty" }]), available([]));

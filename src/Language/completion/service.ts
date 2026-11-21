@@ -44,8 +44,6 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
-  // Only nested, structurally addressed receivers need a native query.
-  // The existing sess snapshot remains authoritative for top-level members.
   const nestedReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
   const rootMember = context.kind === "member" && sessionItems.length === 0 && !!context.objectName;
   const rootBracket = context.kind === "bracket" && context.bracketOperator === "[[" &&
@@ -76,8 +74,6 @@ export async function collectCompletionEntries(
   // A package-inferred exhaustion must not override an unresolved live member.
   if (context.argumentTags && rawLspResult.argumentsExhausted &&
       !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
-  // Live member/child inspection can invoke user-defined R methods. Only
-  // cached top-level names and non-executing LSP inference are automatic.
   const dataItems = runtimeMembers !== undefined && context.kind === "bracket" ? runtimeMembers :
     !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;

@@ -621,7 +621,7 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
   } as const;
   const parts: Buffer[] = [Buffer.from([targetCodes[query.target], query.steps.length]), encodeString(query.root)];
   for (const step of query.steps) {
-    if (step.kind === "index" || step.kind === "slice-index") {
+    if ("index" in step) {
       if (!Number.isSafeInteger(step.index) || step.index < 1 || step.index > 100000) {
         throw new Error("invalid member index");
       }

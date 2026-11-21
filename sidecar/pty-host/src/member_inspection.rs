@@ -352,6 +352,15 @@ impl Native {
         Ok(result)
     }
 
+    unsafe fn name_at(&self, value: Sexp, index: usize) -> Result<Option<String>, Suppression> {
+        let names = (self.get_attrib)(value, self.names);
+        if names == self.nil || (self.type_of)(names) != STRING { return Ok(None); }
+        if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
+        let len = (self.xlength)(names);
+        if len < 0 || index >= len as usize { return Ok(None); }
+        Ok(self.text((self.string_elt)(names, index as isize)))
+    }
+
     unsafe fn pair_names(&self, value: Sexp) -> Vec<String> {
         let mut cursor = value;
         let mut names = Vec::new();
@@ -528,7 +537,7 @@ impl Native {
         let Some(step) = checked else { return Ok(None); };
         match view {
             View::Slice { source, index } => {
-                let selected_name = self.vector_names(source)?.get(index).cloned();
+                let selected_name = self.name_at(source, index)?;
                 match &step {
                     Step::Index(1) | Step::SliceIndex(1) => {
                         if matches!(step, Step::SliceIndex(_)) {
@@ -622,7 +631,10 @@ impl Native {
                     }
                     View::Slice { source, index } => {
                         if query.target == Target::Slot { return Ok(Vec::new()); }
-                        Ok(self.vector_names(source)?.get(index).cloned().into_iter().collect())
+                        if query.target == Target::Dollar && (self.type_of)(source) != VECTOR {
+                            return Ok(Vec::new());
+                        }
+                        Ok(self.name_at(source, index)?.into_iter().collect())
                     }
                 }
             }
