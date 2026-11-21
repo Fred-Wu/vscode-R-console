@@ -57,6 +57,7 @@ export class RTermLang {
     .slice(2)}`;
   private consoleLsp: ConsoleLspClient | undefined;
   private sessionState: ConsoleSessionState | undefined;
+  private runtimeLibraryPaths: string[] | undefined;
   private workspaceRevision: number | undefined;
   private cachedSessionData: WorkspaceData | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
@@ -306,6 +307,8 @@ export class RTermLang {
   clearSessionState(): void {
     this.cancelCompletion();
     this.sessionState = { attachedPackages: [] };
+    this.runtimeLibraryPaths = undefined;
+    this.consoleLsp?.resetRuntimeLibraryPaths();
     this.workspaceRevision = undefined;
     this.cachedSessionData = undefined;
     this.consoleLsp?.invalidateRuntimeCompletion?.();
@@ -315,6 +318,14 @@ export class RTermLang {
 
   updateInput(input: string): void {
     this.consoleLsp?.updateInput(input);
+  }
+
+  updateLibraryPaths(paths: string[]): void {
+    if (this.disposed || this.arraysEqual(paths, this.runtimeLibraryPaths ?? [])) return;
+    this.runtimeLibraryPaths = [...paths];
+    this.inlineCache = undefined;
+    this.cancelCompletion();
+    this.consoleLsp?.updateRuntimeLibraryPaths(paths);
   }
 
   recordCompletion(input: string, start: number, selection: CompletionPickItem): void {
@@ -434,6 +445,7 @@ export class RTermLang {
         },
       });
       this.consoleLsp = lsp;
+      if (this.runtimeLibraryPaths) lsp.updateRuntimeLibraryPaths(this.runtimeLibraryPaths);
     }
 
     try {
