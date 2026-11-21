@@ -27,7 +27,7 @@ function fixture(t) {
     const deadline = Date.now() + 10000;
     do {
       await new Promise(resolve => setTimeout(resolve, 20));
-      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size)) return;
+      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size)) return;
       assert.ok(Date.now() < deadline, "inventory settles after pending filesystem events");
     } while (true);
   };
@@ -36,6 +36,14 @@ function fixture(t) {
 
 test("inventory preserves effective copies across duplicate additions, removals and library order changes", async t => {
   const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  const waitForLog = async (message) => {
+    const deadline = Date.now() + 10000;
+    while (!logs.some(line => line.includes(message))) {
+      assert.ok(Date.now() < deadline, `inventory must report: ${message}`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await settle();
+  };
   install(first, "2.0");
   install(second);
   inventory.setLibraryPaths([first, second]);
@@ -43,28 +51,149 @@ test("inventory preserves effective copies across duplicate additions, removals 
   assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
   assert.ok(logs.some(line => line.includes("2 installations; 1 unique")));
 
+  // An idle inventory does not imply that the OS has delivered an fs.watch
+  // notification. Wait for each observable publication before asserting state.
+  logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await settle();
+  await waitForLog("Active package copies unchanged");
   assert.deepEqual(changes.at(-1).changed, []);
-  assert.ok(logs.some(line => line.includes("Active package copies unchanged")));
+  logs.length = 0;
   install(second);
-  await settle();
+  await waitForLog("Added: example 1.0");
   assert.deepEqual(changes.at(-1).changed, []);
 
   inventory.setLibraryPaths([second, first]);
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await settle();
+  await waitForLog("Using remaining copy: example 2.0");
   assert.equal(changes.at(-1).packages.get("example").version, "2.0");
-  assert.ok(logs.some(line => line.includes("Using remaining copy: example 2.0")));
+  logs.length = 0;
   fs.rmSync(path.join(first, "example"), { recursive: true });
-  await settle();
+  await waitForLog("no copies remain");
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.equal(changes.at(-1).packages.size, 0);
-  assert.ok(logs.some(line => line.includes("no copies remain")));
 });
+
+test("library search-order changes preserve retained watches and scan only added libraries", async t => {
+  const { root, libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  install(first, "2.0");
+  install(second);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  const firstWatcher = inventory.watchers.get(first);
+  const firstParent = inventory.parentWatchers.get(first);
+  const secondWatcher = inventory.watchers.get(second);
+  const secondParent = inventory.parentWatchers.get(second);
+  assert.ok(firstWatcher && secondWatcher && firstParent && secondParent);
+
+  logs.length = 0;
+  inventory.setLibraryPaths([second, first]);
+  await settle();
+  assert.equal(inventory.watchers.get(first), firstWatcher);
+  assert.equal(inventory.watchers.get(second), secondWatcher);
+  assert.equal(inventory.parentWatchers.get(first), firstParent);
+  assert.equal(inventory.parentWatchers.get(second), secondParent);
+  assert.ok(!logs.some(line => line.includes("Scanning folder:")),
+    "changing search precedence must reuse existing package inventories");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
+
+  const third = path.join(root, "third");
+  fs.mkdirSync(third);
+  logs.length = 0;
+  inventory.setLibraryPaths([first, third]);
+  await settle();
+  assert.equal(inventory.watchers.get(first), firstWatcher);
+  assert.equal(inventory.parentWatchers.get(first), firstParent);
+  assert.equal(inventory.watchers.has(second), false);
+  assert.equal(inventory.parentWatchers.has(second), false);
+  assert.ok(inventory.watchers.has(third) && inventory.parentWatchers.has(third));
+  const scans = logs.filter(line => line.includes("Scanning folder:"));
+  assert.ok(scans.length > 0);
+  assert.ok(scans.every(line => line.endsWith(third)),
+    "only the newly added library should be scanned");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
+});
+
+test("reorders paths even when an older inventory scan is still in flight", async t => {
+  const { libraries: [first, second], inventory, changes, settle } = fixture(t);
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  let begin, release;
+  const begun = new Promise(resolve => { begin = resolve; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  const originalScan = inventory.scan.bind(inventory);
+  inventory.scan = async (...args) => {
+    begin();
+    await blocked;
+    return originalScan(...args);
+  };
+  t.after(() => release());
+  const pending = inventory.refresh();
+  await begun;
+  inventory.setLibraryPaths([second, first]);
+  release();
+  await pending;
+  await settle();
+  assert.deepEqual(changes.at(-1).libraries.map(library => library.path), [second, first],
+    "the newer library order must publish after the earlier scan completes");
+});
+
+for (const queue of ["dirty", "unconfirmed"]) {
+  test(`reordering replays ${queue} package changes from an interrupted inventory scan`, async t => {
+    const { libraries: [first, second], inventory, changes, install, settle } = fixture(t);
+    install(first, "1.0");
+    inventory.setLibraryPaths([first, second]);
+    await settle();
+    assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+
+    // Model a new installation identity without an extra filesystem event.
+    // This proves the pending notification itself survives a search-order edit.
+    const readPackage = inventory.readPackage.bind(inventory);
+    inventory.readPackage = async (library, name, previous) => {
+      const item = await readPackage(library, name, previous);
+      return library === first && item
+        ? { ...item, version: "2.0", identity: item.identity + "-updated" }
+        : item;
+    };
+    if (queue === "dirty") {
+      inventory.dirtyLibraries.add(first);
+    } else {
+      inventory.hasInstalledPackagesChanged = async library => library === first;
+      inventory.unconfirmedLibraries.add(first);
+    }
+
+    let release, started;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const begun = new Promise(resolve => { started = resolve; });
+    const scan = inventory.scan.bind(inventory);
+    inventory.scan = async (...args) => {
+      started();
+      await blocked;
+      return scan(...args);
+    };
+    t.after(() => release());
+    const pending = inventory.refresh();
+    await begun;
+    assert.equal(inventory.dirtyLibraries.size, 0);
+    assert.equal(inventory.unconfirmedLibraries.size, 0);
+    inventory.setLibraryPaths([second, first]);
+    release();
+    await pending;
+
+    const deadline = Date.now() + 10000;
+    while (inventory.libraries.find(item => item.path === first)?.packages.get("example")?.version !== "2.0") {
+      assert.ok(Date.now() < deadline, `${queue} update must survive library reordering`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await settle();
+    assert.deepEqual(changes.at(-1).libraries.map(item => item.path), [second, first]);
+    assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+    assert.deepEqual(changes.at(-1).changed, ["example"]);
+  });
+}
 
 test("inventory ignores lock-only changes and defers packages while installation is locked", async t => {
   const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
@@ -75,7 +204,6 @@ test("inventory ignores lock-only changes and defers packages while installation
   fs.mkdirSync(lock);
   await settle();
   assert.equal(changes.length, count);
-  assert.ok(logs.some(line => line.includes("Filesystem event:") && line.includes(library)));
   assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
   assert.ok(logs.includes("[Libraries] Package inventory unchanged"));
   install(library);
@@ -120,6 +248,11 @@ test("inventory detects package link replacement from folder events", async t =>
   const replacement = install(path.join(root, "replacement"), "2.0");
   fs.unlinkSync(link);
   fs.symlinkSync(replacement, link, type);
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1)?.packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "package link replacement must publish");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.equal(changes.at(-1).packages.get("example").version, "2.0");
@@ -138,6 +271,14 @@ test("inventory stops scanning after events settle and coalesces concurrent scan
   const second = inventory.refresh();
   assert.equal(first, second);
   await first;
+  // Filesystem events can arrive after the first explicit scan finishes.
+  // Wait for the observed publication instead of treating idle as settled
+  // before the OS has delivered its watcher notification.
+  const deadline = Date.now() + 10000;
+  while (changes.length === count) {
+    assert.ok(Date.now() < deadline, "replacement notification arrives");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   await settle();
   assert.equal(changes.length, count + 1);
   assert.deepEqual(changes.at(-1).changed, ["example"]);
@@ -280,6 +421,130 @@ test("repeated failures back off and disposal cancels recovery", async t => {
   assert.ok(!logs.some(line => line.includes("Recovery complete")), "disposal is not successful recovery");
 });
 
+test("directory timestamp touches do not rescan unchanged installed packages", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const watcher = inventory.watchers.get(library);
+  assert.ok(watcher);
+  const published = changes.length;
+
+  logs.length = 0;
+  // Touching the library directory changes metadata, not its package entries.
+  // Exercise both fs.watch formats, including filename-less macOS events.
+  const touch = new Date(Date.now() - 5000);
+  fs.utimesSync(library, touch, touch);
+  for (let i = 0; i < 12; i++) {
+    watcher.emit("change", "change", undefined);
+    watcher.emit("change", "rename", undefined);
+    watcher.emit("change", "change", path.basename(library));
+  }
+  await settle();
+  assert.equal(inventory.watchers.get(library), watcher,
+    "metadata updates must not re-arm the directory watcher");
+  assert.equal(changes.length, published,
+    "metadata-only events must not publish package inventories");
+  assert.ok(!logs.some(line => line.includes("Scanning folder:") ||
+    line.includes("Package inventory unchanged")),
+  "metadata touches must not trigger full scans or unchanged-inventory logs");
+
+  // Ambiguous events must still detect a replacement with the same package name.
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "2.0");
+  watcher.emit("change", "change", undefined);
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "same-name package replacement must be detected");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example")?.version, "2.0");
+});
+
+test("unchanged parent events do not repeatedly restore renv-style library watchers", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const childWatcher = inventory.watchers.get(library);
+  const parentWatcher = inventory.parentWatchers.get(library);
+  const count = changes.length;
+  assert.ok(childWatcher && parentWatcher);
+
+  logs.length = 0;
+  // macOS may not supply a filename; Windows and Linux commonly do.
+  for (let n = 0; n < 8; n++) {
+    parentWatcher.emit("change", "rename", undefined);
+    parentWatcher.emit("change", "rename", path.basename(library));
+    parentWatcher.emit("change", "rename", Buffer.from(path.basename(library)));
+    parentWatcher.emit("change", "rename", "unrelated-folder");
+  }
+  await settle();
+  assert.equal(inventory.watchers.get(library), childWatcher);
+  assert.equal(inventory.parentWatchers.get(library), parentWatcher);
+  assert.equal(changes.length, count);
+  assert.ok(!logs.some(line => line.includes("Watcher restored") ||
+    line.includes("Scanning folder:")),
+  "unchanged parent events must not rewatch or rescan the library");
+
+  // Unrelated parent notifications must not suppress real child changes.
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "2.0");
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "package updates remain observable");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  assert.equal(inventory.watchers.get(library), childWatcher,
+    "normal package updates do not re-arm the directory watcher");
+});
+
+test("a symlinked library retargets its watcher while ignoring unchanged parent events", async t => {
+  const { root, inventory, changes, install, settle } = fixture(t);
+  const first = path.join(root, "original-target");
+  const second = path.join(root, "replacement-target");
+  const library = path.join(root, "active-library");
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  install(first);
+  install(second, "2.0");
+  const type = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(first, library, type);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example")?.version, "1.0");
+  const previous = inventory.watchers.get(library);
+
+  fs.unlinkSync(library);
+  fs.symlinkSync(second, library, type);
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+    assert.ok(Date.now() < deadline, "symlink target replacement must be detected");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await settle();
+  const restored = inventory.watchers.get(library);
+  assert.ok(restored);
+  assert.notEqual(restored, previous);
+
+  // Duplicate / filename-less parent notifications must retain the new watch.
+  const parent = inventory.parentWatchers.get(library);
+  parent.emit("change", "rename", undefined);
+  parent.emit("change", "rename", path.basename(library));
+  await settle();
+  assert.equal(inventory.watchers.get(library), restored);
+
+  fs.rmSync(path.join(second, "example"), { recursive: true });
+  install(second, "3.0");
+  const nextDeadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.version !== "3.0") {
+    assert.ok(Date.now() < nextDeadline, "new symlink target must still receive package events");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
 test("replacing an existing library directory re-arms its watcher without an error event", async t => {
   const { libraries: [library], inventory, changes, install, settle } = fixture(t);
   install(library);
@@ -353,4 +618,26 @@ test("a queued healthy scan is not cancelled by another library's watcher failur
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.ok(inventory.retryTimer, "failed watcher still backs off independently");
+});
+
+test("removing and readding an entire runtime library closes and restores its watcher", async t => {
+  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  install(first, "1.0");
+  install(second, "2.0");
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+
+  inventory.setLibraryPaths([second]);
+  await settle();
+  assert.equal(inventory.watchers.has(first), false, "removed libraries must stop being watched");
+  assert.equal(inventory.parentWatchers.has(first), false);
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  assert.ok(logs.some(line => line.includes("Selected copy changed") ||
+    line.includes("Using remaining copy")));
+
+  inventory.setLibraryPaths([first, second]);
+  await settle();
+  assert.equal(inventory.watchers.has(first), true, "readded libraries resume monitoring");
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
 });

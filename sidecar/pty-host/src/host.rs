@@ -9,6 +9,7 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 mod unix_host {
     use crate::console_input::ConsoleInput;
+    use crate::library_paths::{self, LibraryPathsApi};
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -129,6 +130,7 @@ mod unix_host {
         setcar: SetcarFn,
         r_base_env_ptr: *mut Sexp,
         r_nil_value_ptr: *mut Sexp,
+        library_paths_api: LibraryPathsApi,
     }
 
     struct HostRuntime {
@@ -186,6 +188,7 @@ mod unix_host {
 
     static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
     static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
+    static LIBRARY_PATHS_API: OnceLock<LibraryPathsApi> = OnceLock::new();
     static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
@@ -278,6 +281,9 @@ mod unix_host {
         EVENT_LOOP_API
             .set(api.event_loop_api())
             .map_err(|_| "event loop api already initialized")?;
+        LIBRARY_PATHS_API
+            .set(api.library_paths_api())
+            .map_err(|_| "library paths api already initialized")?;
 
         if let Some(width) = initial_console_width_from_env() {
             if let Err(error) = apply_console_width(width) {
@@ -565,6 +571,7 @@ mod unix_host {
             None => SessionWaitState::None,
         };
         let _ = runtime.output.emit_session_state(pid, busy, wait);
+        library_paths::publish_latest(&runtime.output);
         let _ = runtime.output.emit_output_flush();
     }
 
@@ -923,6 +930,11 @@ mod unix_host {
 
         let prompt_text = c_string_to_string(prompt);
         let wait_kind = classify_wait_kind(&prompt_text, add_history);
+        if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            if let Some(api) = LIBRARY_PATHS_API.get() {
+                library_paths::publish_if_changed(*api, &runtime.output);
+            }
+        }
         let mut wait_event_emitted = false;
         set_r_interrupts_pending(false);
         let mut state = runtime.state.lock().expect("host state lock poisoned");
@@ -1590,6 +1602,19 @@ mod unix_host {
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
                 r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                library_paths_api: LibraryPathsApi {
+                    install: load_function(&library, b"Rf_install\0")?,
+                    lang1: load_function(&library, b"Rf_lang1\0")?,
+                    try_eval: load_function(&library, b"R_tryEval\0")?,
+                    protect: load_function(&library, b"Rf_protect\0")?,
+                    unprotect: load_function(&library, b"Rf_unprotect\0")?,
+                    length: load_function(&library, b"Rf_length\0")?,
+                    is_string: load_function(&library, b"Rf_isString\0")?,
+                    string_elt: load_function(&library, b"STRING_ELT\0")?,
+                    translate_utf8: load_function(&library, b"Rf_translateCharUTF8\0")?,
+                    top_level_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                    base_env: load_global::<Sexp>(&library, b"R_BaseEnv\0")? as usize,
+                },
                 tag: load_function(&library, b"TAG\0")?,
                 cdr: load_function(&library, b"CDR\0")?,
                 setcar: load_function(&library, b"SETCAR\0")?,
@@ -1597,6 +1622,10 @@ mod unix_host {
                 r_nil_value_ptr: load_global(&library, b"R_NilValue\0")?,
                 _library: library,
             })
+        }
+
+        fn library_paths_api(&self) -> LibraryPathsApi {
+            self.library_paths_api
         }
 
         unsafe fn initialize(
@@ -1749,6 +1778,7 @@ mod unix_host {
 #[cfg(windows)]
 mod windows_host {
     use crate::console_input::ConsoleInput;
+    use crate::library_paths::{self, LibraryPathsApi};
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -1962,6 +1992,7 @@ mod windows_host {
         setcar: SetcarFn,
         r_base_env_ptr: *mut Sexp,
         r_nil_value_ptr: *mut Sexp,
+        library_paths_api: LibraryPathsApi,
         _r_start_storage: Option<Box<RStart>>,
         _r_home_storage: Option<CString>,
         _user_home_storage: Option<CString>,
@@ -2023,6 +2054,7 @@ mod windows_host {
 
     static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
     static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
+    static LIBRARY_PATHS_API: OnceLock<LibraryPathsApi> = OnceLock::new();
     static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
     static R_LOCALE_CP_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -2118,6 +2150,9 @@ mod windows_host {
         EVENT_LOOP_API
             .set(api.event_loop_api())
             .map_err(|_| "event loop api already initialized")?;
+        LIBRARY_PATHS_API
+            .set(api.library_paths_api())
+            .map_err(|_| "library paths api already initialized")?;
 
         if let Some(width) = initial_console_width_from_env() {
             if let Err(error) = apply_console_width(width) {
@@ -2405,6 +2440,7 @@ mod windows_host {
             None => SessionWaitState::None,
         };
         let _ = runtime.output.emit_session_state(pid, busy, wait);
+        library_paths::publish_latest(&runtime.output);
         let _ = runtime.output.emit_output_flush();
     }
 
@@ -2805,6 +2841,11 @@ mod windows_host {
 
         let prompt_text = c_string_to_string(prompt);
         let wait_kind = classify_wait_kind(&prompt_text, add_history);
+        if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+            if let Some(api) = LIBRARY_PATHS_API.get() {
+                library_paths::publish_if_changed(*api, &runtime.output);
+            }
+        }
         let mut wait_event_emitted = false;
         set_r_interrupts_pending(false);
         let mut state = runtime.state.lock().expect("host state lock poisoned");
@@ -3886,6 +3927,19 @@ mod windows_host {
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
                 r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                library_paths_api: LibraryPathsApi {
+                    install: load_function(&library, b"Rf_install\0")?,
+                    lang1: load_function(&library, b"Rf_lang1\0")?,
+                    try_eval: load_function(&library, b"R_tryEval\0")?,
+                    protect: load_function(&library, b"Rf_protect\0")?,
+                    unprotect: load_function(&library, b"Rf_unprotect\0")?,
+                    length: load_function(&library, b"Rf_length\0")?,
+                    is_string: load_function(&library, b"Rf_isString\0")?,
+                    string_elt: load_function(&library, b"STRING_ELT\0")?,
+                    translate_utf8: load_function(&library, b"Rf_translateCharUTF8\0")?,
+                    top_level_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                    base_env: load_global::<Sexp>(&library, b"R_BaseEnv\0")? as usize,
+                },
                 tag: load_function(&library, b"TAG\0")?,
                 cdr: load_function(&library, b"CDR\0")?,
                 setcar: load_function(&library, b"SETCAR\0")?,
@@ -3898,6 +3952,10 @@ mod windows_host {
                 _user_home_storage: None,
                 _argv_storage: Vec::new(),
             })
+        }
+
+        fn library_paths_api(&self) -> LibraryPathsApi {
+            self.library_paths_api
         }
 
         unsafe fn initialize(

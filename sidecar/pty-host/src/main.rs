@@ -1,6 +1,7 @@
 #[cfg(any(unix, windows))]
 mod console_input;
 mod host;
+mod library_paths;
 mod protocol;
 #[cfg(windows)]
 mod windows_pipe_security;

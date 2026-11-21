@@ -103,22 +103,23 @@ for (const currentVersion of [3, 4]) {
   });
 }
 
-test("only protocol 2 reconnects; old records are distinguished from unsupported or damaged records", async (t) => {
+test("only protocol 3 reconnects; old records are distinguished from unsupported or damaged records", async (t) => {
   const old = session({ legacy: true, protocolVersion: 1 });
   const historical = session({ legacy: true });
+  const oldProtocol2 = session({ protocolVersion: 2 });
   const current = session();
   const incompatible = [
     session({ protocolVersion: 1 }),
-    session({ protocolVersion: 3 }),
+    session({ protocolVersion: 4 }),
     session({ protocolVersion: undefined }),
-    session({ legacy: true, protocolVersion: 2 }),
     session({ legacy: true, protocolVersion: 3 }),
   ];
-  const { registry, read } = fixture(t, { sessions: [current, old, historical, ...incompatible] });
+  const records = [current, old, historical, oldProtocol2, ...incompatible];
+  const { registry, read } = fixture(t, { sessions: records });
   assert.deepEqual(await registry.load(), [current]);
-  assert.deepEqual(registry.legacySessions, [old, historical]);
+  assert.deepEqual(registry.legacySessions, [old, historical, oldProtocol2]);
   assert.equal(registry.save([current]), true);
-  assert.deepEqual(read().sessions, JSON.parse(JSON.stringify([current, old, historical, ...incompatible])));
+  assert.deepEqual(read().sessions, JSON.parse(JSON.stringify(records)));
 });
 
 test("malformed credentials are preserved but never treated as a legacy authentication fallback", async (t) => {

@@ -24,6 +24,8 @@ export class PackageInventory {
   // The child watcher follows the old inode after the library is replaced.
   // Watch its parent as well so an atomic directory/symlink switch re-arms it.
   private readonly parentWatchers = new Map<string, fs.FSWatcher>();
+  // fs.watch follows the directory inode (or a symlink's target), not its path.
+  private readonly watchedTargets = new Map<string, string | undefined>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -33,6 +35,8 @@ export class PackageInventory {
   private disposed = false;
   private revision = 0;
   private readonly dirtyLibraries = new Set<string>();
+  // Ambiguous events can be directory metadata touches with no package change.
+  private readonly unconfirmedLibraries = new Set<string>();
 
   constructor(
     private readonly onChange: (change: PackageInventoryChange) => Promise<void>,
@@ -41,20 +45,52 @@ export class PackageInventory {
 
   setLibraryPaths(paths: string[]): void {
     if (this.disposed || JSON.stringify(paths) === JSON.stringify(this.paths)) return;
+    const active = new Set(paths);
+    // Preserve existing watchers, cached packages and outstanding dirty scans.
+    // Only paths leaving the R search order lose their watches.
+    for (const [library, watcher] of this.watchers) {
+      if (!active.has(library)) {
+        watcher.close();
+        this.watchers.delete(library);
+        this.watchedTargets.delete(library);
+      }
+    }
+    for (const [library, watcher] of this.parentWatchers) {
+      if (!active.has(library)) {
+        watcher.close();
+        this.parentWatchers.delete(library);
+      }
+    }
+    for (const library of this.dirtyLibraries) {
+      if (!active.has(library)) this.dirtyLibraries.delete(library);
+    }
+    for (const library of this.unconfirmedLibraries) {
+      if (!active.has(library)) this.unconfirmedLibraries.delete(library);
+    }
     this.paths = [...paths];
     this.revision++;
-    this.clearRetry();
-    this.dirtyLibraries.clear();
-    for (const library of paths) this.dirtyLibraries.add(library);
-    for (const watcher of this.watchers.values()) watcher.close();
-    this.watchers.clear();
-    for (const watcher of this.parentWatchers.values()) watcher.close();
-    this.parentWatchers.clear();
+    this.candidate = undefined;
     for (const library of paths) {
-      this.watchParent(library);
-      this.watchLibrary(library);
+      if (!this.parentWatchers.has(library)) this.watchParent(library);
+      if (!this.watchers.has(library)) this.watchLibrary(library);
     }
     this.schedule(0);
+  }
+
+  private libraryTarget(library: string): string | undefined {
+    try {
+      const stats = fs.statSync(library);
+      // A real path distinguishes symlink / junction retargeting. Device,
+      // inode, and creation time distinguish replacement at the same path,
+      // including on Windows volumes where inode may not be available.
+      return JSON.stringify([
+        fs.realpathSync.native(library), stats.dev,
+        stats.ino || stats.birthtimeMs,
+      ]);
+    } catch {
+      // A temporarily missing target must be re-armed by the parent watcher.
+      return undefined;
+    }
   }
 
   private watchParent(library: string): void {
@@ -64,11 +100,15 @@ export class PackageInventory {
       const watcher = fs.watch(path.dirname(library), { persistent: false }, (_event, filename) => {
         if (this.disposed || this.parentWatchers.get(library) !== watcher) return;
         if (filename && String(filename).toLowerCase() !== basename.toLowerCase()) return;
-        // The existing library watcher may still be alive but attached to an
-        // unlinked directory (or an old symlink target).
+        // macOS can omit filenames for unrelated parent changes. Only re-arm
+        // if the watched directory was actually removed or replaced.
         const previous = this.watchers.get(library);
+        const target = this.libraryTarget(library);
+        if (previous && target !== undefined &&
+            target === this.watchedTargets.get(library)) return;
         if (previous) previous.close();
         this.watchers.delete(library);
+        this.watchedTargets.delete(library);
         this.watchLibrary(library, true);
         this.dirtyLibraries.add(library);
         this.schedule(250);
@@ -89,20 +129,30 @@ export class PackageInventory {
 
   private watchLibrary(library: string, recovering = false): void {
     try {
+      const target = this.libraryTarget(library);
       const watcher = fs.watch(library, { persistent: false }, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
-        this.log(`[Libraries] Filesystem event: ${event} - ${library} - ${filename ? JSON.stringify(filename) : "filename unavailable"}`);
-        this.dirtyLibraries.add(library);
+        const name = filename ? String(filename) : "";
+        // Parent-unknown events and directory metadata touches need a cheap
+        // content check first. R can update a library directory's timestamp
+        // without changing any installed packages.
+        if (event === "change" || !name || name === path.basename(library)) {
+          this.unconfirmedLibraries.add(library);
+        } else {
+          this.dirtyLibraries.add(library);
+        }
         this.schedule(250);
       });
       watcher.on("error", error => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         this.watchers.delete(library);
+        this.watchedTargets.delete(library);
         watcher.close();
         this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
         this.scheduleRetry();
       });
       this.watchers.set(library, watcher);
+      this.watchedTargets.set(library, target);
       this.dirtyLibraries.add(library);
       this.log(`[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
     } catch (error) {
@@ -147,6 +197,8 @@ export class PackageInventory {
     this.clearRetry();
     for (const watcher of this.watchers.values()) watcher.close();
     this.watchers.clear();
+    this.watchedTargets.clear();
+    this.unconfirmedLibraries.clear();
     for (const watcher of this.parentWatchers.values()) watcher.close();
     this.parentWatchers.clear();
   }
@@ -156,23 +208,42 @@ export class PackageInventory {
     if (this.pending) return this.pending;
     const revision = this.revision;
     const dirty = new Set(this.dirtyLibraries);
+    const unconfirmed = new Set(this.unconfirmedLibraries);
     this.dirtyLibraries.clear();
-    const request = this.scan(revision, dirty).then(() => {
+    this.unconfirmedLibraries.clear();
+    const request = this.scan(revision, dirty, unconfirmed).then(() => {
       if (!this.disposed && revision === this.revision &&
           this.watchers.size === this.paths.length &&
-          this.parentWatchers.size === this.paths.length && !this.dirtyLibraries.size) {
+          this.parentWatchers.size === this.paths.length &&
+          !this.dirtyLibraries.size && !this.unconfirmedLibraries.size) {
         if (this.retryDelay > 1000) this.log("[Libraries] Recovery complete; retries stopped");
         this.clearRetry();
       }
     }).catch(error => {
       if (!this.disposed && revision === this.revision) {
         for (const library of dirty) this.dirtyLibraries.add(library);
+        for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
         this.log(`[Libraries] Could not refresh package inventory: ${String(error)}`);
         this.scheduleRetry(true);
       }
     }).finally(() => {
       if (this.pending === request) this.pending = undefined;
-      if (!this.timer && !this.retryTimer && this.dirtyLibraries.size) this.schedule(250);
+      // The scan consumed these events before a newer library order arrived.
+      // Replay them for paths still in the search order; otherwise the next
+      // scan could reuse stale package metadata without another filesystem event.
+      if (!this.disposed && revision !== this.revision) {
+        const active = new Set(this.paths);
+        for (const library of dirty) {
+          if (active.has(library)) this.dirtyLibraries.add(library);
+        }
+        for (const library of unconfirmed) {
+          if (active.has(library)) this.unconfirmedLibraries.add(library);
+        }
+        this.schedule(0);
+      } else if (!this.timer && !this.retryTimer &&
+          (this.dirtyLibraries.size || this.unconfirmedLibraries.size)) {
+        this.schedule(250);
+      }
     });
     this.pending = request;
     return request;
@@ -190,14 +261,46 @@ export class PackageInventory {
     this.timer.unref();
   }
 
-  private async scan(revision: number, dirty: Set<string>): Promise<void> {
+  private async hasInstalledPackagesChanged(library: string, previous: LibraryInventory): Promise<boolean> {
+    try {
+      const entries = await fs.promises.readdir(library, { withFileTypes: true });
+      if (entries.some(entry => entry.name.startsWith("00LOCK"))) return true;
+      const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+        /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name);
+      if (names.length !== previous.packages.size) return true;
+      // Same-name installations may be replaced, including via symlink targets.
+      // Compare the identities already used by readPackage(), without reading
+      // DESCRIPTION or any package metadata on unchanged events.
+      for (const name of names) {
+        const installed = previous.packages.get(name);
+        if (!installed) return true;
+        const directory = path.join(library, name);
+        const target = await fs.promises.realpath(directory);
+        const stat = await fs.promises.stat(directory);
+        const identity = JSON.stringify([target, stat.mtimeMs, stat.ctimeMs, stat.ino]);
+        if (identity !== installed.identity) return true;
+      }
+      return false;
+    } catch {
+      // A missing or transient directory must take the normal recovery path.
+      return true;
+    }
+  }
+
+  private async scan(revision: number, dirty: Set<string>,
+    unconfirmed: Set<string> = new Set()): Promise<void> {
     const libraries: LibraryInventory[] = [];
     for (const library of this.paths) {
       if (this.disposed || revision !== this.revision) return;
       const previous = this.libraries.find(item => item.path === library);
       if (previous && !dirty.has(library)) {
-        libraries.push(previous);
-        continue;
+        if (!unconfirmed.has(library) ||
+            !(await this.hasInstalledPackagesChanged(library, previous))) {
+          libraries.push(previous);
+          continue;
+        }
+        if (this.disposed || revision !== this.revision) return;
+        dirty.add(library);
       }
       let entries: fs.Dirent[];
       try {
@@ -226,8 +329,9 @@ export class PackageInventory {
       libraries.push({ path: library, packages });
     }
     if (this.disposed || revision !== this.revision) return;
-    if (this.dirtyLibraries.size) {
+    if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) {
       for (const library of dirty) this.dirtyLibraries.add(library);
+      for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
       this.schedule(250);
       return;
     }
@@ -238,7 +342,9 @@ export class PackageInventory {
       [...library.packages.values()].map(item => [item.name, item.identity])]));
     if (this.initialized && signature === previousSignature) {
       this.candidate = undefined;
-      this.log("[Libraries] Package inventory unchanged");
+      // A content check without a package change is routine, not a lifecycle
+      // event. Avoid flooding the output channel on normal console input.
+      if (dirty.size) this.log("[Libraries] Package inventory unchanged");
       return;
     }
     if (this.initialized && this.candidate !== signature) {

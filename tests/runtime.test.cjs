@@ -8,10 +8,10 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 
-test("a future protocol upgrade closes a real authenticated protocol 2 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
+test("a future protocol upgrade closes a real authenticated protocol 3 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {
-    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 3 },
+    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 4 },
   });
   const { closeLegacySession } = loadSource("src/Runtime/legacySession.ts", { "./persistentSessionRegistry": registry });
   const { session: savedSession } = require("./helpers/persistent-session.cjs");
@@ -45,7 +45,7 @@ test("a future protocol upgrade closes a real authenticated protocol 2 session",
     await delay(20, undefined, { signal: t.signal });
   }
   const runtime = backend.getReconnectInfo(handle);
-  assert.equal(runtime.protocolVersion, 2);
+  assert.equal(runtime.protocolVersion, 3);
   pid = runtime.pid;
   const entry = savedSession({ ...runtime, cwd: directory });
   assert.equal(registry.isLegacyConsoleRecord(entry), true);
@@ -161,9 +161,9 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   const bootstrap = path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`);
   const sessionData = JSON.parse(fs.readFileSync(bootstrap, "utf8"));
   assert.equal(sessionData.authToken, undefined, "bootstrap must never disclose backend credentials");
-  assert.equal(sessionData.protocolVersion, 2);
-  assert.equal(backend.getReconnectInfo(session).protocolVersion, 2);
-  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, 2);
+  assert.equal(sessionData.protocolVersion, 3);
+  assert.equal(backend.getReconnectInfo(session).protocolVersion, 3);
+  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, 3);
   assert.match(backend.getReconnectInfo(session).authToken, /^[0-9a-f]{64}$/);
   if (process.platform !== "win32") assert.equal(fs.statSync(bootstrap).mode & 0o777, 0o600);
   // Wrong and missing credentials must not replace the authenticated console.
@@ -193,6 +193,34 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   assert.match(output.slice(beforeOversize), /16 MiB backend frame limit.*Nothing was sent/);
   assert.equal(backend.canUseSessionCommands(session), true, "rejected commands must not disconnect R");
   await submit('cat("STILL_CONNECTED\\n")', "STILL_CONNECTED");
+  // A real R command must update the frontend's library snapshot after the
+  // main prompt, without asking sess or parsing the submitted R expression.
+  const initialLibraries = events.filter(event => event.type === "library-paths").at(-1);
+  assert.ok(initialLibraries?.paths.length, "initial active R libraries are published");
+  const extraLibrary = path.join(dir, "runtime-library");
+  fs.mkdirSync(extraLibrary);
+  // R normalizes library paths (e.g. /var -> /private/var on macOS).
+  // Compare filesystem identity rather than the original command string.
+  const normalizeLibrary = value => fs.realpathSync.native(value).replaceAll("\\", "/").toLowerCase();
+  const initialSnapshotCount = events.filter(event => event.type === "library-paths").length;
+  await submit('baseline_dynamic_paths <- .libPaths(); .libPaths(c(' +
+    JSON.stringify(extraLibrary) +
+    ', baseline_dynamic_paths)); cat("RUNTIME_LIBRARY_ADDED\\n")', "RUNTIME_LIBRARY_ADDED");
+  const addedLibraries = events.filter(event => event.type === "library-paths").at(-1);
+  assert.ok(addedLibraries.paths.some(value =>
+    normalizeLibrary(value) === normalizeLibrary(extraLibrary)),
+    `added library must appear in R metadata (expected ${normalizeLibrary(extraLibrary)}, actual ${JSON.stringify(addedLibraries.paths)})`);
+  assert.ok(events.filter(event => event.type === "library-paths").length > initialSnapshotCount);
+  await submit('.libPaths(baseline_dynamic_paths); cat("RUNTIME_LIBRARY_REMOVED\\n")',
+    "RUNTIME_LIBRARY_REMOVED");
+  const restoredLibraries = events.filter(event => event.type === "library-paths").at(-1);
+  assert.deepEqual(restoredLibraries.paths, initialLibraries.paths,
+    "restoring R's original paths removes the temporary library from the snapshot");
+  const restoredCount = events.filter(event => event.type === "library-paths").length;
+  await submit('cat("RUNTIME_LIBRARY_UNCHANGED\\n")', "RUNTIME_LIBRARY_UNCHANGED");
+  assert.equal(events.filter(event => event.type === "library-paths").length, restoredCount,
+    "an unchanged library list must not generate redundant notifications");
+
   stage = "large output";
   await submit('cat(strrep("café 😀", 1024 * 1024)); cat("\\nLARGE_OUTPUT_DONE\\n")', "LARGE_OUTPUT_DONE");
   assert.ok(output.includes("café 😀".repeat(1024 * 1024)),
@@ -202,6 +230,43 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   assert.equal(await backend.requestParseStatus(session, "x <- ("), 2);
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");
   await submit('stop("EXPECTED_SMOKE_ERROR")', "EXPECTED_SMOKE_ERROR");
+
+  // R Console's locked options wrapper must forward unevaluated calls, as
+  // used by renv::init() when installing its temporary error handler.
+  // Preserve the three security-locked options for both argument forms.
+  await submit(`
+    local({
+      old_error <- getOption("error")
+      on.exit(options(error = old_error), add = TRUE)
+      handler <- quote(cat("ERROR_HANDLER_MUST_NOT_EXECUTE\\n"))
+      options(error = handler)
+      stopifnot(identical(getOption("error"), handler))
+      options(list(error = handler))
+      stopifnot(identical(getOption("error"), handler))
+      suppressWarnings(options(
+        error = handler, prompt = "unsafe", continue = "unsafe", menu.graphics = TRUE
+      ))
+      stopifnot(
+        identical(getOption("error"), handler),
+        identical(getOption("prompt"), "> "),
+        identical(getOption("continue"), "+ "),
+        identical(getOption("menu.graphics"), FALSE)
+      )
+      suppressWarnings(options(list(
+        error = handler, prompt = "unsafe", continue = "unsafe", menu.graphics = TRUE
+      )))
+      stopifnot(
+        identical(getOption("error"), handler),
+        identical(getOption("prompt"), "> "),
+        identical(getOption("continue"), "+ "),
+        identical(getOption("menu.graphics"), FALSE)
+      )
+      stopifnot(is.list(options("digits")))
+      cat("ERROR_HANDLER_PRESERVED\\n")
+    })
+  `, "ERROR_HANDLER_PRESERVED");
+  assert.doesNotMatch(output, /ERROR_HANDLER_MUST_NOT_EXECUTE/);
+
 
   await submit('test <- data.frame("中文" = 1); stopifnot(identical(names(test), "中文")); cat("UNICODE_COLUMN_OK\\n")', "UNICODE_COLUMN_OK");
   assert.doesNotMatch(output, /Warning/);
@@ -243,8 +308,13 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   session = backend.reconnect(JSON.parse(JSON.stringify(reconnect)));
   events.length = 0;
   backend.attach(session, handlers);
-  await waitFor(() => backend.canUseSessionCommands(session) && events.some((event) =>
-    event.type === "session-state" && event.wait.kind === "top-level"), "reconnect");
+  // The snapshot follows the session-state frame and can arrive in a separate
+  // socket read. Wait for both before checking the restored library search order.
+  await waitFor(() => backend.canUseSessionCommands(session) &&
+    events.some(event => event.type === "session-state" && event.wait.kind === "top-level") &&
+    events.some(event => event.type === "library-paths"), "reconnect state and library paths");
+  assert.deepEqual(events.filter(event => event.type === "library-paths").at(-1)?.paths,
+    initialLibraries.paths, "reconnecting receives the most recent completed library snapshot");
   await submit('cat("RESTORED:", answer, "\\n")', "RESTORED: 42");
   stage = "shutdown";
   backend.close(session);

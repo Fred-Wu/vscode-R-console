@@ -47,7 +47,12 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
       Position, Range: class Range {},
       Uri: { parse: (value) => ({ toString: () => value }), file: () => ({}) },
       window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
-      workspace: { getConfiguration: () => ({ get: (key) => key === "libPaths" ? libraries : undefined }) },
+      workspace: { getConfiguration: () => ({ get: (key) => {
+        if (key === "libPaths" || key === "useRenvLibPath") {
+          throw new Error("Console language server must not read vscode-R library settings");
+        }
+        return undefined;
+      } }) },
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
     },
     "vscode-languageclient/node": {
@@ -302,4 +307,77 @@ test("a pending LSP response cannot publish after the runtime changes", async t 
   release({ items: [{ label: "old_arg", detail: "parameter" }] });
   assert.equal(await pending, undefined);
   assert.equal(requests, 1);
+});
+
+test("live console paths override startup paths, including stale LSP synchronization replies", async t => {
+  const { client, logs } = createClient(t, { libraries: ["/startup"] });
+  const watched = [];
+  client.packageInventory.setLibraryPaths = paths => watched.push([...paths]);
+  client.updateRuntimeLibraryPaths(["/added", "/startup"]);
+  await client.start();
+  assert.deepEqual(watched.at(-1), ["/added", "/startup"],
+    "a snapshot received before LSP startup must become its initial inventory");
+  await client.syncSessionState({ attachedPackages: ["stats"] });
+  assert.deepEqual(watched.at(-1), ["/added", "/startup"],
+    "the LSP's own stale paths must not overwrite the R Console");
+  client.updateRuntimeLibraryPaths(["/startup", "/added"]);
+  assert.deepEqual(watched.at(-1), ["/startup", "/added"], "reordering changes precedence");
+  client.updateRuntimeLibraryPaths(["/startup"]);
+  assert.deepEqual(watched.at(-1), ["/startup"], "removal stops monitoring the old library");
+  const count = watched.length;
+  client.updateRuntimeLibraryPaths(["/startup"]);
+  assert.equal(watched.length, count, "unchanged snapshots do not rescan");
+  assert.ok(logs.some(line => line.includes("Removed from search order: /added")));
+  assert.ok(logs.some(line => line.includes("R Console library search order changed")));
+  client.resetRuntimeLibraryPaths();
+  assert.deepEqual(watched.at(-1), ["/startup"]);
+});
+
+test("a late session-sync reply cannot replace newer R Console paths", async t => {
+  let releaseReply, requestStarted;
+  const gate = new Promise(resolve => { releaseReply = resolve; });
+  const started = new Promise(resolve => { requestStarted = resolve; });
+  t.after(() => releaseReply({ libraryPaths: ["/stale"] }));
+  const { client } = createClient(t, {
+    libraries: ["/startup"],
+    reply: async () => { requestStarted(); return gate; },
+  });
+  const watched = [];
+  client.packageInventory.setLibraryPaths = paths => watched.push([...paths]);
+  await client.start();
+  const synchronizing = client.syncSessionState({ attachedPackages: ["stats"] });
+  await started;
+  client.updateRuntimeLibraryPaths(["/new", "/startup"]);
+  releaseReply({ libraryPaths: ["/stale"] });
+  await synchronizing;
+  assert.deepEqual(watched.at(-1), ["/new", "/startup"]);
+  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS,
+    "/new\n/startup");
+  client.resetRuntimeLibraryPaths();
+  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS, "");
+});
+
+test("runtime library snapshots are retained before completion client construction", async () => {
+  const paths = [], calls = [];
+  class ConsoleLspClient {
+    updateRuntimeLibraryPaths(value) { paths.push([...value]); }
+    resetRuntimeLibraryPaths() { calls.push("reset"); }
+    async syncSessionState(value) { calls.push(value); }
+    async start() { calls.push("start"); }
+    updateInput() {}
+    async dispose() {}
+  }
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {}, "../../Language/completion": {},
+    "../../Language/consoleLspClient": { ConsoleLspClient },
+  });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
+  lang.updateLibraryPaths(["/active", "/base"]);
+  await lang.ensureConsoleLspStarted();
+  assert.deepEqual(paths, [["/active", "/base"]]);
+  lang.updateLibraryPaths(["/base"]);
+  assert.deepEqual(paths.at(-1), ["/base"]);
+  lang.clearSessionState();
+  assert.equal(calls.includes("reset"), true);
+  await lang.dispose();
 });

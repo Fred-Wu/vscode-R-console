@@ -2,6 +2,16 @@
 
 All notable changes to R Console will be documented in this file.
 
+## Unreleased
+
+### Changed
+
+- Existing consoles using the previous backend protocol must be restarted after upgrading R Console.
+
+### Fixed
+
+- Console autocompletion now follows library paths added, removed or reordered during an active R session.
+
 ## [0.5.6] - 2026-11-19
 
 ### Changed

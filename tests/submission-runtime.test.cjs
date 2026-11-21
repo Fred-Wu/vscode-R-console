@@ -356,6 +356,7 @@ test("two real R consoles parse and execute independently across busy, reply, de
     fixtures.push(f);
     runtime.attachRuntimeSession(terminal.runtimeHostAdapter, true);
     await waitFor(() => idle(f) && backend.hasCapability(session, "parse-status"), `${name} startup`);
+    assert.ok(terminal.lang.libraryPaths?.length, `${name}: library paths reach the console handler`);
   }
   const [a, b] = fixtures;
   let value = 8100;

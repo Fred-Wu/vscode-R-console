@@ -442,6 +442,9 @@ export function handleRuntimeControl(
         );
       }
       return;
+    case "library-paths":
+      host.lang.updateLibraryPaths(event.paths);
+      return;
     case "session-state":
       applyRuntimeSessionState(host, event);
       return;

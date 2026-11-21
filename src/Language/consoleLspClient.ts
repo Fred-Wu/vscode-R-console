@@ -110,6 +110,8 @@ export class ConsoleLspClient implements CompletionProvider {
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
   private readonly packageInventory: PackageInventory;
+  private runtimeLibraryPaths: string[] | undefined;
+  private serverLibraryPaths: string[] | undefined;
   private packageRefreshPromise: Promise<void> | undefined;
   private packageRevision = 0;
   private runtimeRevision = 0;
@@ -400,6 +402,32 @@ export class ConsoleLspClient implements CompletionProvider {
     this.runtimeRevision++;
   }
 
+  // The R console owns this ordered list. It may change after startup without
+  // any change to the language server's working directory or attached packages.
+  updateRuntimeLibraryPaths(paths: string[]): void {
+    if (JSON.stringify(this.runtimeLibraryPaths) === JSON.stringify(paths)) return;
+    const before = this.runtimeLibraryPaths ?? this.serverLibraryPaths ?? [];
+    this.runtimeLibraryPaths = [...paths];
+    this.runtimeRevision++;
+    if (!this.disposed && this.client?.isRunning()) {
+      lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Libraries] R Console library search order changed: ${paths.join(" | ")}`);
+      const removed = before.filter(path => !paths.includes(path));
+      for (const library of removed) {
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Libraries] Removed from search order: ${library}`);
+      }
+      this.packageInventory.setLibraryPaths(paths);
+    }
+  }
+
+  resetRuntimeLibraryPaths(): void {
+    if (!this.runtimeLibraryPaths) return;
+    this.runtimeLibraryPaths = undefined;
+    this.runtimeRevision++;
+    if (this.client?.isRunning() && this.serverLibraryPaths) {
+      this.packageInventory.setLibraryPaths(this.serverLibraryPaths);
+    }
+  }
+
   updateInput(input: string): void {
     this.inputDocument.update(input);
   }
@@ -440,7 +468,7 @@ export class ConsoleLspClient implements CompletionProvider {
       syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", state)
         .then((reply) => {
           if (this.client === client && typeof reply === "object" && Array.isArray(reply?.libraryPaths)) {
-            this.packageInventory.setLibraryPaths(reply.libraryPaths);
+            this.packageInventory.setLibraryPaths(this.runtimeLibraryPaths ?? reply.libraryPaths);
           }
           const synced = this.client === client;
           if (synced) {
@@ -645,8 +673,11 @@ export class ConsoleLspClient implements CompletionProvider {
     await client.start();
     await this.disableConsoleDiagnostics(client);
     const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});
-    if (this.client === client && !this.disposed && !this.syncedSessionStateKey) {
-      this.packageInventory.setLibraryPaths(libraries);
+    if (this.client === client && !this.disposed) {
+      this.serverLibraryPaths = [...libraries];
+      if (!this.syncedSessionStateKey) {
+        this.packageInventory.setLibraryPaths(this.runtimeLibraryPaths ?? libraries);
+      }
     }
   }
 
@@ -887,14 +918,12 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
-    const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = config.get<string[]>("libPaths") ?? [];
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
-    env.VSCR_USE_RENV_LIB_PATH = useRenvLibPath ? "TRUE" : "FALSE";
-    env.VSCR_LIB_PATHS = libPaths.join("\n");
+    // On a replacement server, apply the last console snapshot before loading namespaces.
+    env.VSCR_RUNTIME_LIB_PATHS = this.runtimeLibraryPaths?.join("\n") ?? "";
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {

@@ -25,7 +25,7 @@ use windows_sys::Win32::{
 };
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 const MAX_INPUT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_SERVER_CHALLENGE: u16 = 22;
 const FRAME_CLIENT_PROOF: u16 = 23;
@@ -55,6 +55,7 @@ const FRAME_SHUTDOWN: u16 = 17;
 const FRAME_DIALOG_RESULT: u16 = 18;
 const FRAME_HOST_ERROR: u16 = 19;
 const FRAME_SESSION_STATE: u16 = 20;
+const FRAME_LIBRARY_PATHS: u16 = 21;
 const MAX_BUFFERED_FRAMES: usize = 4096;
 const MAX_BUFFERED_BYTES: usize = 1_000_000;
 // Use the same streaming granularity for R callbacks and captured native IO.
@@ -230,6 +231,12 @@ impl OutputSink {
 
     pub(crate) fn emit_host_error(&self, message: &str) -> io::Result<()> {
         self.emit_frame(FRAME_HOST_ERROR, 0, message.as_bytes())
+    }
+
+    pub(crate) fn emit_library_paths(&self, paths: &[String]) -> io::Result<()> {
+        let mut payload = Vec::new();
+        encode_string_array(paths, &mut payload);
+        self.emit_frame(FRAME_LIBRARY_PATHS, 0, &payload)
     }
 
     pub(crate) fn emit_session_state(

@@ -23,14 +23,14 @@ test("session state sync updates attached packages without eager namespace loadi
 });
 
 
-test("active console libraries take precedence over fallback R libraries", () => {
+test("console language server uses R startup and only the active console library snapshot", () => {
   const script = fs.readFileSync(
     path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8"
   );
-  assert.match(script, /\.paths <- c\(add_lib_paths, \.paths\)/);
-  assert.match(script, /\.libPaths\(\.paths\)/);
+  assert.doesNotMatch(script, /VSCR_LIB_PATHS|VSCR_USE_RENV_LIB_PATH|renv::paths\$cache/);
+  assert.match(script, /VSCR_RUNTIME_LIB_PATHS/);
+  assert.match(script, /\.libPaths\(strsplit\(runtime_lib_paths/);
 });
-
 
 test("console R language server authenticates before entering the LSP event loop", () => {
   const script = fs.readFileSync(path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8");

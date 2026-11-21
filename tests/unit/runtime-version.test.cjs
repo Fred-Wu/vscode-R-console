@@ -4,11 +4,21 @@ const path = require("node:path");
 const { test } = require("node:test");
 const root = path.resolve(__dirname, "../..");
 
-test("Rust and TypeScript agree on authenticated protocol version 2", () => {
+test("Rust and TypeScript agree on authenticated protocol version 3", () => {
   const source = fs.readFileSync(path.join(root, "sidecar/pty-host/src/protocol.rs"), "utf8");
   const { BACKEND_PROTOCOL_VERSION } = require("../helpers/load-source.cjs")("src/Runtime/backendProtocol.ts");
-  assert.equal(BACKEND_PROTOCOL_VERSION, 2);
+  assert.equal(BACKEND_PROTOCOL_VERSION, 3);
   assert.equal(Number(/const PROTOCOL_VERSION: u32 = (\d+);/.exec(source)?.[1]), BACKEND_PROTOCOL_VERSION);
+});
+
+test("the implementation guide documents the active backend protocol", () => {
+  const source = fs.readFileSync(path.join(root, "docs/IMPLEMENTATION.md"), "utf8");
+  const { BACKEND_PROTOCOL_VERSION } = require("../helpers/load-source.cjs")("src/Runtime/backendProtocol.ts");
+  const examples = [...source.matchAll(/"protocolVersion":(\d+)/g)].map(match => Number(match[1]));
+  assert.ok(examples.length >= 2, "documentation must include session bootstrap examples");
+  assert.ok(examples.every(version => version === BACKEND_PROTOCOL_VERSION),
+    "all active bootstrap examples must match the current IPC protocol");
+  assert.match(source, new RegExp(`requires protocol version ${BACKEND_PROTOCOL_VERSION}`));
 });
 
 test("the bundled sidecar versions match the Cargo manifest and lockfile", () => {

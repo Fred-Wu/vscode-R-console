@@ -172,7 +172,7 @@ local({
                     }
                 }
 
-                result <- do.call(base_options, list(opts))
+                result <- do.call(base_options, list(opts), quote = TRUE)
                 if (length(blocked)) {
                     base_warning(locked_message, call. = FALSE, immediate. = TRUE)
                     return(invisible(result))
@@ -193,7 +193,7 @@ local({
                 }
             }
 
-            result <- do.call(base_options, dots)
+            result <- do.call(base_options, dots, quote = TRUE)
             if (length(blocked)) {
                 base_warning(locked_message, call. = FALSE, immediate. = TRUE)
                 return(invisible(result))
