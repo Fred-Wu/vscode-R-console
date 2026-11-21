@@ -14,7 +14,13 @@ test("real embedded R completion inspects nested storage without running user co
   const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"], { encoding: "utf8" }).trim();
   const rPath = path.join(rHome, "bin", process.platform === "win32" ? "R.exe" : "R");
   const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(root));
-  const session = backend.start([rPath, "--vanilla", "--quiet"], { cwd, env: { ...process.env, R_HOME: rHome } });
+  // The direct sidecar launch bypasses the normal R Console launcher, which
+  // configures the dynamic loader path before starting embedded R.
+  const env = { ...process.env, R_HOME: rHome };
+  if (process.platform === "linux") {
+    env.LD_LIBRARY_PATH = [path.join(rHome, "lib"), env.LD_LIBRARY_PATH].filter(Boolean).join(":");
+  }
+  const session = backend.start([rPath, "--vanilla", "--quiet"], { cwd, env });
   let mainPrompts = 0;
   let output = "";
   let failure;
@@ -79,7 +85,7 @@ test("real embedded R completion inspects nested storage without running user co
       { status: "suppressed", reason: expected }, root);
   }
   output = "";
-  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list"), where = .GlobalEnv); s4 <- methods::new(s4name, inner = list(slot_value = TRUE), where = .GlobalEnv); cat("S4_CONSTRUCTED:", exists("s4", envir = .GlobalEnv, inherits = FALSE), "\\n")');
+  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list"), where = .GlobalEnv); s4 <- methods::new(s4name, inner = list(slot_value = TRUE)); cat("S4_CONSTRUCTED:", exists("s4", envir = .GlobalEnv, inherits = FALSE), "\\n")');
   await until(() => output.includes("S4_CONSTRUCTED:"), "R fixture construction");
   assert.match(output, /S4_CONSTRUCTED:\s*TRUE/, "S4 creation must finish before inspection");
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "inner" }]), available(["alpha"]));
