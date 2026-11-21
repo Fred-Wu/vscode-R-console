@@ -1,9 +1,6 @@
 import type * as vscode from "vscode";
 import type { RuntimeHost } from "../../Terminal/rTerminal/runtime";
 import type {
-  SessionCompletionData,
-  SessionCompletionKind,
-  SessionMemberCompletionItem,
   WorkspaceData,
 } from "./types";
 
@@ -23,12 +20,6 @@ export interface VscodeRSessionIntegration {
   getDisplayPid(): number | undefined;
   getCachedWorkspaceData(): WorkspaceData | undefined;
   requestWorkspaceData(): Promise<WorkspaceData | undefined>;
-  inspectCompletion(expression: string, kind: SessionCompletionKind): Promise<SessionCompletionData | undefined>;
-  requestMemberCompletions(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined>;
-
   filterRuntimeOutput(text: string): string;
   disposeUi(): void;
 }
@@ -59,17 +50,6 @@ export abstract class BaseVscodeRSessionIntegration
   }
 
   async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
-    return undefined;
-  }
-
-  async inspectCompletion(_expression: string, _kind: SessionCompletionKind): Promise<SessionCompletionData | undefined> {
-    return undefined;
-  }
-
-  async requestMemberCompletions(
-    _expression: string,
-    _operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
     return undefined;
   }
 
