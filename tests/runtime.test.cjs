@@ -271,8 +271,11 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   session = backend.reconnect(JSON.parse(JSON.stringify(reconnect)));
   events.length = 0;
   backend.attach(session, handlers);
-  await waitFor(() => backend.canUseSessionCommands(session) && events.some((event) =>
-    event.type === "session-state" && event.wait.kind === "top-level"), "reconnect");
+  // The snapshot follows the session-state frame and can arrive in a separate
+  // socket read. Wait for both before checking the restored library search order.
+  await waitFor(() => backend.canUseSessionCommands(session) &&
+    events.some(event => event.type === "session-state" && event.wait.kind === "top-level") &&
+    events.some(event => event.type === "library-paths"), "reconnect state and library paths");
   assert.deepEqual(events.filter(event => event.type === "library-paths").at(-1)?.paths,
     initialLibraries.paths, "reconnecting receives the most recent completed library snapshot");
   await submit('cat("RESTORED:", answer, "\\n")', "RESTORED: 42");
