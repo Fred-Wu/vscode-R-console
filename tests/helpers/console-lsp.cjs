@@ -1,4 +1,5 @@
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
 const rpc = require("vscode-languageserver-protocol/node");
 const loadSource = require("./load-source.cjs");
@@ -99,7 +100,10 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       Position, Range,
       Uri: { parse: uri, file: (file) => uri(pathToFileURL(file).href) },
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
-      window: { createOutputChannel: () => ({ appendLine: (line) => logs.push(line), dispose() {} }) },
+      window: {
+        createOutputChannel: () => ({ appendLine: (line) => logs.push(line), dispose() {} }),
+        showWarningMessage: (message) => { logs.push(`Warning: ${message}`); },
+      },
       workspace: { getConfiguration: () => ({ get: (key) => {
         if (key === "lsp.args") return args;
         if (key === "libPaths" || key === "useRenvLibPath") {
@@ -121,9 +125,16 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       [...runtimeSignatures].map(([name, str]) => [name, { type: "closure", str }])) }),
     getStaticAnalysisEnabled: () => staticMode,
   });
-  // Model the authenticated console's library-path snapshot, not vscode-R's
-  // r.libPaths setting. This also tests replacement servers with the same paths.
-  if (libraries.length) client.updateRuntimeLibraryPaths(libraries);
+  // Model the full .libPaths() result from an interactive session, not just
+  // its added libraries. R's ordinary libraries must remain available to the
+  // language server, including the one containing languageserver itself.
+  if (libraries.length) {
+    const defaults = execFileSync("Rscript",
+      ["--vanilla", "-e", 'cat(.libPaths(), sep = "\\n")'],
+      { cwd: cwd ?? process.cwd(), env, encoding: "utf8", timeout: 15000 })
+      .split(/\r?\n/).filter(Boolean);
+    client.updateRuntimeLibraryPaths([...new Set([...libraries, ...defaults])]);
+  }
   t.after(async () => {
     try { await client.dispose(); }
     finally { if (!t.passed) t.diagnostic(logs.join("\n")); }
