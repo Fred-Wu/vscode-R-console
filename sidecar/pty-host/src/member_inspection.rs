@@ -529,7 +529,7 @@ impl Native {
         match view {
             View::Slice { source, index } => {
                 let selected_name = self.vector_names(source)?.get(index).cloned();
-                match step {
+                match &step {
                     Step::Index(1) | Step::SliceIndex(1) => {
                         if matches!(step, Step::SliceIndex(_)) {
                             Ok(Some(View::Slice { source, index }))
