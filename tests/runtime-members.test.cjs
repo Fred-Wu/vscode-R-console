@@ -66,6 +66,6 @@ test("real embedded R completion inspects nested storage without running user co
   }
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');
-  await until(() => output.includes("SAFE_HITS:"), "counter output");
-  assert.match(output, /SAFE_HITS:\\s*0/);
+  await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");
+  assert.match(output, /SAFE_HITS:\s*0/);
 });
