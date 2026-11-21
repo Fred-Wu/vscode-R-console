@@ -5,7 +5,6 @@ import {
   type CompletionEntries,
   type CompletionContext,
   type CompletionProvider,
-  type RuntimeMemberCompletionRequester,
   CompletionPickItem,
   collectCompletionEntries,
   getCompletionContext,
@@ -16,7 +15,6 @@ import {
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
-import type { SessionCompletionInspector } from "../../Runtime/VSCR/types";
 
 export type InputSnapshot = {
   text: string;
@@ -33,10 +31,7 @@ type LangOptions = {
   env: NodeJS.ProcessEnv;
   cwd?: string;
   getRecentSessionEntries?: () => string[];
-  requestWorkspaceData?: () => Promise<WorkspaceData | undefined> | undefined;
   onPackagesChanged?: () => void;
-  requestMemberCompletions: RuntimeMemberCompletionRequester;
-  inspectRuntimeCompletion?: SessionCompletionInspector;
   getStaticAnalysisEnabled?: () => boolean;
 };
 
@@ -63,6 +58,7 @@ export class RTermLang {
   private consoleLsp: ConsoleLspClient | undefined;
   private sessionState: ConsoleSessionState | undefined;
   private workspaceRevision: number | undefined;
+  private cachedSessionData: WorkspaceData | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
@@ -113,11 +109,7 @@ export class RTermLang {
     }
 
     {
-      const shouldRequestWorkspaceData = this.shouldRequestWorkspaceData(context);
-      const workspaceDataRequest = shouldRequestWorkspaceData
-        ? this.options.requestWorkspaceData?.()
-        : undefined;
-      const cachedSessionData = getWorkspaceData();
+      const cachedSessionData = getWorkspaceData() ?? this.cachedSessionData;
 
       const latestInput = getCurrentInput();
       if (
@@ -129,10 +121,6 @@ export class RTermLang {
       }
 
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
-      let refreshedSessionData: WorkspaceData | undefined;
-      void workspaceDataRequest?.then((data) => {
-        refreshedSessionData = data ?? getWorkspaceData();
-      }).catch(() => undefined);
 
       let completionProvider: CompletionProvider | undefined;
       const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
@@ -152,7 +140,7 @@ export class RTermLang {
         );
         const linesBefore = latestInput.lines.slice(0, latestInput.cursorRow);
         const sessionData =
-          refreshedSessionData ?? getWorkspaceData() ?? cachedSessionData;
+          getWorkspaceData() ?? cachedSessionData;
         return await collectCompletionEntries(
           context,
           document,
@@ -161,9 +149,8 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          this.options.requestMemberCompletions,
-          latestInput.text,
-          this.options.inspectRuntimeCompletion
+          undefined,
+          latestInput.text
         );
       })();
       // Argument candidates must await LSP parameters; early session-only
@@ -229,13 +216,6 @@ export class RTermLang {
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
-          let refreshedRefinedSessionData: WorkspaceData | undefined;
-          const refinedWorkspaceDataRequest = this.shouldRequestWorkspaceData(nextContext)
-            ? this.options.requestWorkspaceData?.()
-            : undefined;
-          void refinedWorkspaceDataRequest?.then((data) => {
-            refreshedRefinedSessionData = data ?? getWorkspaceData();
-          }).catch(() => undefined);
 
           const nextDocumentRequest = this.getOrOpenCompletionDocument(nextInputText);
           if (!completionProvider) {
@@ -246,7 +226,7 @@ export class RTermLang {
             return;
           }
           const refinedSessionData =
-            refreshedRefinedSessionData ?? getWorkspaceData() ?? cachedSessionData;
+            getWorkspaceData() ?? cachedSessionData;
           const nextEntries = await collectCompletionEntries(
             nextContext,
             nextDocument,
@@ -257,9 +237,8 @@ export class RTermLang {
             lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            this.options.requestMemberCompletions,
-            nextInputText,
-            this.options.inspectRuntimeCompletion
+            undefined,
+            nextInputText
           );
           return nextEntries;
         },
@@ -328,6 +307,7 @@ export class RTermLang {
     this.cancelCompletion();
     this.sessionState = { attachedPackages: [] };
     this.workspaceRevision = undefined;
+    this.cachedSessionData = undefined;
     this.consoleLsp?.invalidateRuntimeCompletion?.();
     void this.consoleLsp?.syncSessionState(this.sessionState).catch(() => undefined);
     this.consoleLsp?.updateInput("");
@@ -357,6 +337,7 @@ export class RTermLang {
 
   updateSessionData(data: WorkspaceData | undefined): boolean {
     if (this.disposed || !data) return false;
+    this.cachedSessionData = data;
 
     // sess includes a stable revision in unchanged workspace responses.
     // Avoid cancelling suggestions on every ordinary completion-time poll.
@@ -445,7 +426,7 @@ export class RTermLang {
         rPath: this.options.rPath,
         env: this.options.env,
         cwd: this.options.cwd,
-        inspectRuntimeCompletion: this.options.inspectRuntimeCompletion,
+        getCachedWorkspaceData: () => this.cachedSessionData,
         getStaticAnalysisEnabled: this.options.getStaticAnalysisEnabled,
         onPackagesChanged: () => {
           this.cancelCompletion();
@@ -472,12 +453,6 @@ export class RTermLang {
     } catch {
       return undefined;
     }
-  }
-
-  private shouldRequestWorkspaceData(
-    context: NonNullable<ReturnType<typeof getCompletionContext>>
-  ): boolean {
-    return context.kind !== "member" && context.kind !== "package";
   }
 
   private toSessionState(data: WorkspaceData): ConsoleSessionState {
