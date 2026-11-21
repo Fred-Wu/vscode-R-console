@@ -27,6 +27,7 @@ import {
 } from "vscode-languageclient/node";
 import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
+import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
