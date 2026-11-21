@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
-import { logConsoleCompletionDecision } from "../Language/consoleLspClient";
+import { logConsoleCompletionDecision } from "../Language/completion/outputChannel";
 import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {

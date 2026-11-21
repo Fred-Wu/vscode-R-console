@@ -13,7 +13,8 @@ import {
   isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
-import { ConsoleLspClient, logConsoleCompletionDecision } from "../../Language/consoleLspClient";
+import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import { logConsoleCompletionDecision } from "../../Language/completion/outputChannel";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
 
