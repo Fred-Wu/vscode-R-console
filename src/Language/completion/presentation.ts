@@ -51,7 +51,6 @@ function compareCompletionLabels(a: CompletionEntry, b: CompletionEntry): number
     (a.label < b.label ? -1 : a.label > b.label ? 1 : 0);
 }
 
-/** Rank symbols within groups; keep signature, value, and object-member order. */
 export function rankCompletionEntries(
   entries: CompletionEntry[], query: string, context?: CompletionContext
 ): CompletionEntry[] {

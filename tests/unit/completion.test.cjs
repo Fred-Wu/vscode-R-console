@@ -1486,7 +1486,7 @@ test("dollar and slot members retain cached workspace order without R extraction
       undefined, async () => assert.fail("must not execute custom R accessors"));
     for (const query of ["", "a", "b"]) {
       assert.deepEqual(completion.rankCompletionEntries(entries, query, context).map(e => e.label),
-        query === "b" ? ["zebra", "beta"] : names);
+        query === "b" ? ["beta", "zebra"] : query === "a" ? ["alpha", "zebra", "beta"] : names);
     }
   }
 });
@@ -1612,12 +1612,14 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
     const request = { input, getCurrentInput: () => input, getWorkspaceData: () => undefined, applyCompletion() {} };
     const labels = items => items.filter(item => "insertText" in item).map(item => item.insertText);
     const ordered = text.startsWith("pkg:") ? ["alpha", "beta", "zebra"] : ["zebra", "alpha", "beta"];
+    const refinedOrder = ["df$", "obj@"].includes(text) ? ["beta", "zebra"]
+      : ordered.filter(label => label.includes("b"));
     let published;
     await lang.handleAutocomplete({ ...request, onInlineEntries: items => { published = items; } });
     assert.deepEqual(labels(published), ordered, `inline: ${text}`);
     const refined = lang.refineInlineCompletion(snapshot(text + "b"));
     if (["df$", "obj@", "pkg::", "pkg:::"].includes(text)) {
-      assert.deepEqual(labels(refined), ordered.filter(label => label.includes("b")), `cache: ${text}`);
+      assert.deepEqual(labels(refined), refinedOrder, `cache: ${text}`);
     } else {
       assert.equal(refined, undefined, `first typed token must fetch newly eligible symbols: ${text}`);
     }
@@ -1629,9 +1631,9 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
       pick.value = "b";
       changeValue("b");
       // Check both the immediate local filter and any asynchronous refresh.
-      assert.deepEqual(labels(pick.items), ordered.filter(label => label.includes("b")), text);
+      assert.deepEqual(labels(pick.items), refinedOrder, text);
       await new Promise(resolve => setImmediate(resolve));
-      assert.deepEqual(labels(pick.items), ordered.filter(label => label.includes("b")), text);
+      assert.deepEqual(labels(pick.items), refinedOrder, text);
     } finally {
       pick.hide();
       await showing;

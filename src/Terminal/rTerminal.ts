@@ -2135,8 +2135,8 @@ export class RTerminal implements vscode.Pseudoterminal {
         completionDecisionContext(input.textBeforeCursor));
     }
     if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
-        (!context || (context.kind === "default" && !context.autoTrigger &&
-          [...context.prefix].length < minimum)))) {
+        (!context || ((context.kind === "default" || context.kind === "argument") &&
+          !context.autoTrigger && [...context.prefix].length < minimum)))) {
       this.dismissInlineCompletion(false);
       return;
     }
