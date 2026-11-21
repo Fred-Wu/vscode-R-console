@@ -683,12 +683,9 @@ test("completion requests do not perform package inventory checks", async (t) =>
 });
 
 
-test("language-server completion starts before a fresh workspace request finishes", async () => {
-  let resolveWorkspace;
+test("language-server completion does not request a workspace refresh", async () => {
+  let workspaceRequests = 0;
   let lspCompletionStarted = false;
-  const workspaceRequest = new Promise((resolve) => {
-    resolveWorkspace = resolve;
-  });
   class TestPosition {
     constructor(line, character) {
       Object.assign(this, { line, character });
@@ -729,7 +726,7 @@ test("language-server completion starts before a fresh workspace request finishe
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => workspaceRequest,
+    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
     requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
@@ -758,7 +755,7 @@ test("language-server completion starts before a fresh workspace request finishe
   assert.equal(lspCompletionStarted, true);
   await request;
 
-  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+  assert.equal(workspaceRequests, 0);
 });
 
 
@@ -831,11 +828,8 @@ test("namespace completion does not wait for library or workspace probes", async
 });
 
 
-test("F7 refinement starts language-server completion before workspace refresh finishes", async () => {
-  let resolveWorkspace;
-  const workspaceRequest = new Promise((resolve) => {
-    resolveWorkspace = resolve;
-  });
+test("F7 refinement does not request a workspace refresh", async () => {
+  let workspaceRequests = 0;
   let refinedCompletionStarted = false;
   let changeValue;
   let hide;
@@ -894,7 +888,7 @@ test("F7 refinement starts language-server completion before workspace refresh f
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => workspaceRequest,
+    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
     requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
@@ -925,7 +919,7 @@ test("F7 refinement starts language-server completion before workspace refresh f
 
   quickPick.hide();
   await request;
-  resolveWorkspace({ search: [], loaded_namespaces: [], globalenv: {} });
+  assert.equal(workspaceRequests, 0);
 });
 
 
