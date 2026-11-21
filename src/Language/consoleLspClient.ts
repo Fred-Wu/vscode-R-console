@@ -918,14 +918,10 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
-    const useRenvLibPath = config.get<boolean>("useRenvLibPath") === true;
     const lang = config.get<string>("lsp.lang") ?? "";
-    const libPaths = config.get<string[]>("libPaths") ?? [];
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
-    env.VSCR_USE_RENV_LIB_PATH = useRenvLibPath ? "TRUE" : "FALSE";
-    env.VSCR_LIB_PATHS = libPaths.join("\n");
     // On a replacement server, apply the last console snapshot before loading namespaces.
     env.VSCR_RUNTIME_LIB_PATHS = this.runtimeLibraryPaths?.join("\n") ?? "";
     if (lang) {

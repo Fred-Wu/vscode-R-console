@@ -47,7 +47,12 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
       Position, Range: class Range {},
       Uri: { parse: (value) => ({ toString: () => value }), file: () => ({}) },
       window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
-      workspace: { getConfiguration: () => ({ get: (key) => key === "libPaths" ? libraries : undefined }) },
+      workspace: { getConfiguration: () => ({ get: (key) => {
+        if (key === "libPaths" || key === "useRenvLibPath") {
+          throw new Error("Console language server must not read vscode-R library settings");
+        }
+        return undefined;
+      } }) },
       CompletionTriggerKind: { Invoke: 1, TriggerCharacter: 2 },
     },
     "vscode-languageclient/node": {

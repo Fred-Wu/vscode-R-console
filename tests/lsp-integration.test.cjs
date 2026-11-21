@@ -1036,7 +1036,6 @@ test("real console languageserver authenticates, initializes and completes code"
       VSCR_LSP_AUTH_TOKEN: token,
       VSCR_LSP_CLIENT_NONCE: nonce,
       VSCR_LSP_AUTH_TIMEOUT_SECONDS: String(BACKEND_AUTH_TIMEOUT_MS / 1000),
-      VSCR_USE_RENV_LIB_PATH: "FALSE",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });

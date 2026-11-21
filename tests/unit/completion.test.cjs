@@ -1714,7 +1714,7 @@ test("session updates synchronize attached packages without supplying library pa
   assert.deepEqual(states.at(-1), { attachedPackages: ["utils"] });
 });
 
-test("console LSP passes configured libraries to its own R process", async (t) => {
+test("console LSP ignores vscode-R library settings and forwards only runtime library paths", async (t) => {
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
     vscode: {
       Uri: { parse: (value) => ({ toString: () => value }) },
@@ -1726,8 +1726,19 @@ test("console LSP passes configured libraries to its own R process", async (t) =
     consoleId: "library-env-test", env: {}, rPath: "R",
   });
   t.after(() => lsp.dispose());
-  const config = { get: (key) => key === "libPaths" ? ["/fallback"] : false };
-  assert.equal(lsp.buildServerEnv(config).VSCR_LIB_PATHS, "/fallback");
+  const config = { get: (key) => {
+    if (key === "libPaths" || key === "useRenvLibPath") {
+      throw new Error("R Console must not read vscode-R's library settings");
+    }
+    return undefined;
+  } };
+  const startupEnv = lsp.buildServerEnv(config);
+  assert.equal(startupEnv.VSCR_LIB_PATHS, undefined);
+  assert.equal(startupEnv.VSCR_USE_RENV_LIB_PATH, undefined);
+  assert.equal(startupEnv.VSCR_RUNTIME_LIB_PATHS, "");
+  lsp.updateRuntimeLibraryPaths(["/project/library", "/R/library"]);
+  assert.equal(lsp.buildServerEnv(config).VSCR_RUNTIME_LIB_PATHS,
+    "/project/library\\n/R/library");
 });
 
 test("language-server state sync failures do not reject terminal workspace updates", async () => {

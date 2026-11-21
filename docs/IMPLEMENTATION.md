@@ -1466,8 +1466,10 @@ to the console. Diagnostics are disabled for these completion documents.
 `rConsole/syncSessionState` synchronizes attached package names. The client
 deduplicates unchanged state and shares an in-flight sync request among concurrent
 callers. The language server starts from the console's project working directory
-and reads project and user startup libraries. The embedded R host also reads the
-fixed base `.libPaths()` call at a completed main prompt, publishing a bounded,
+and uses R's normal project and user startup library paths (including renv or uvr
+activation through .Rprofile). It does not use vscode-R's r.libPaths or
+r.useRenvLibPath settings. The embedded R host reads the fixed base `.libPaths()`
+call at a completed main prompt, publishing a bounded,
 ordered snapshot only when the effective search order changes. The console's
 completion client gives that snapshot priority over the LSP's own startup paths
 and updates the package inventory and language-server library paths. A reconnect

@@ -1,24 +1,5 @@
-.paths <- .libPaths()
-
-use_renv_lib_path <- Sys.getenv("VSCR_USE_RENV_LIB_PATH")
-use_renv_lib_path <- if (nzchar(use_renv_lib_path)) as.logical(use_renv_lib_path) else FALSE
-if (use_renv_lib_path) {
-    if (requireNamespace("renv", quietly = TRUE)) {
-        .paths <- c(.paths, renv::paths$cache())
-    } else {
-        warning("renv package is not installed. Please install renv to use renv library path.")
-    }
-}
-
-add_lib_paths <- Sys.getenv("VSCR_LIB_PATHS")
-if (nzchar(add_lib_paths)) {
-    add_lib_paths <- strsplit(add_lib_paths, "\n", fixed = TRUE)[[1L]]
-    .paths <- c(add_lib_paths, .paths)
-}
-
-.libPaths(.paths)
-
-# A replacement language server must start with the active console search order.
+# Use R's normal project .Rprofile at startup; the console snapshot overrides
+# its search order on language-server replacement, before namespaces are loaded.
 # This fixed environment value contains only library paths, never console code.
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
 if (nzchar(runtime_lib_paths)) {
