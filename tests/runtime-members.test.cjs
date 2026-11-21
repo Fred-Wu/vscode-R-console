@@ -78,7 +78,7 @@ test("real embedded R completion inspects nested storage without running user co
     assert.deepEqual(await inspect(root, query.steps),
       { status: "suppressed", reason: expected }, root);
   }
-  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list")); s4 <- methods::new(s4name, inner = list(slot_value = TRUE))');
+  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list"), where = .GlobalEnv); s4 <- methods::new(s4name, inner = list(slot_value = TRUE), where = .GlobalEnv)');
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "inner" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "named-index", name: "inner" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "nm" }]), available(["alpha"]));
@@ -98,7 +98,7 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["empty", "inner"]);
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "inner" }]), available(["value"]));
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "empty" }]), available([]));
-  assert.deepEqual(await inspect("s4", [], "@"), available(["inner"]));
+  assert.deepEqual(await inspect("s4", [], "@"), available(["inner"]), output);
   assert.deepEqual(await inspect("s4", [{ kind: "slot", name: "inner" }]), available(["slot_value"]));
   await submit('makeActiveBinding("active_child", function() { hits <<- hits + 1L; list(secret = 1) }, env); delayedAssign("pending_idx", { hits <<- hits + 1L; 1L })');
   assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["active_child", "empty", "inner"]);
