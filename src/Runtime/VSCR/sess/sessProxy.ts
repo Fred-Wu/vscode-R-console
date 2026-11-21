@@ -5,11 +5,7 @@ import * as fs from "fs";
 import * as net from "net";
 import * as path from "path";
 import * as os from "os";
-import { inspectSessionCompletion } from "./completionInspection";
 import type {
-  SessionCompletionData,
-  SessionCompletionKind,
-  SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
 
@@ -182,27 +178,6 @@ export class SessProxy {
 
   getSessionId(): string | undefined {
     return this.sessionId;
-  }
-
-  async requestMemberCompletions(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    const result = await this.request("completion", {
-      expr: expression,
-      trigger: operator,
-    });
-    return parseMemberCompletionItems(result);
-  }
-
-  async inspectCompletion(expression: string, kind: SessionCompletionKind): Promise<SessionCompletionData | undefined> {
-    const socket = this.rSocket;
-    if (!socket || socket.destroyed) return undefined;
-    return await inspectSessionCompletion(expression, kind, async (method, params) => {
-      if (this.rSocket !== socket || socket.destroyed) return undefined;
-      const result = await this.request(method, params);
-      return this.rSocket === socket && !socket.destroyed ? result : undefined;
-    }, this.workspaceData);
   }
 
   private createPipePath(): string {
@@ -549,15 +524,4 @@ function isWorkspaceData(value: unknown): value is WorkspaceData {
     typeof data.globalenv === "object" &&
     !Array.isArray(data.globalenv)
   );
-}
-
-function parseMemberCompletionItems(value: unknown): SessionMemberCompletionItem[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const items = value.filter(
-    (item): item is SessionMemberCompletionItem =>
-      !!item && typeof item === "object" && typeof item.name === "string" && item.name.length > 0
-  );
-  return items.length > 0 ? items : undefined;
 }
