@@ -52,25 +52,58 @@ test("real embedded R completion inspects nested storage without running user co
     assert.equal(backend.sendSessionCommand(session, { type: "submit", code }), true);
     await until(() => mainPrompts > previous, "main prompt after execution");
   };
-  const inspect = (root, steps, slots = false) => backend.requestMemberNames(session, { root, steps, slots });
+  const inspect = (root, steps = [], target = "$") => backend.inspectMemberNames(session, { root, steps, target });
+  const available = (names) => ({ status: "available", names });
   await submit('obj <- list(inner = list(alpha = 1, beta = 2), df = data.frame("a b" = 1, check.names = FALSE))');
-  assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), ["alpha", "beta"]);
-  assert.deepEqual(await inspect("obj", [{ kind: "index", index: 2 }]), ["a b"]);
-  assert.equal(await inspect("obj", [{ kind: "field", name: "missing" }]), undefined);
+  assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["alpha", "beta"]));
+  assert.deepEqual(await inspect("obj", [{ kind: "index", index: 2 }]), available(["a b"]));
+  assert.deepEqual(await inspect("obj", [{ kind: "field", name: "missing" }]), available([]));
   await submit('obj$inner <- list(changed = TRUE)');
-  assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), ["changed"]);
+  assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["changed"]));
 
   await submit('hits <- 0L; makeActiveBinding("active_root", function() { hits <<- hits + 1L; list(inner = list(secret = 1)) }, .GlobalEnv); classed <- structure(list(inner = list(secret = 2)), class = "custom"); `$.custom` <- function(x, name) { hits <<- hits + 1L; x[[name]] }; delayedAssign("lazy_root", { hits <<- hits + 1L; list(inner = list(secret = 3)) })');
   for (const [root, expected] of [
     ["active_root", "active-binding"],
-    ["classed", "unsupported-accessor"],
+    ["classed", "unsafe-dispatch"],
     ["lazy_root", "deferred-binding"],
   ]) {
-    const query = { root, steps: [{ kind: "field", name: "inner" }], slots: false };
+    const query = { root, steps: [{ kind: "field", name: "inner" }], target: "$" };
     assert.deepEqual(await backend.inspectMemberNames(session, query),
       { status: "suppressed", reason: expected }, root);
-    assert.equal(await inspect(root, query.steps), undefined, root);
+    assert.deepEqual(await inspect(root, query.steps),
+      { status: "suppressed", reason: expected }, root);
   }
+  await submit('plain <- list(inner = list(alpha = 1), empty = list(), scalar = 1); named <- c(alpha = 10, beta = 20); idx <- 1L; nm <- "inner"; env <- new.env(parent = emptyenv()); env$inner <- list(value = TRUE); env$empty <- list(); s4name <- "CompletionInspect"; methods::setClass(s4name, slots = c(inner = "list")); s4 <- methods::new(s4name, inner = list(slot_value = TRUE))');
+  assert.deepEqual(await inspect("plain", [{ kind: "field", name: "inner" }]), available(["alpha"]));
+  assert.deepEqual(await inspect("plain", [{ kind: "named-index", name: "inner" }]), available(["alpha"]));
+  assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "nm" }]), available(["alpha"]));
+  assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "idx" }]), available(["alpha"]));
+  assert.deepEqual(await inspect("plain", [{ kind: "slice-index", index: 1 }]), available(["inner"]));
+  assert.deepEqual(await inspect("plain", [{ kind: "field", name: "empty" }]), available([]));
+  assert.deepEqual(await inspect("plain", [{ kind: "field", name: "scalar" }]), available([]));
+  assert.deepEqual(await inspect("plain", [{ kind: "field", name: "missing" }]), available([]));
+  assert.deepEqual(await inspect("named", [], "$"), available([]));
+  assert.deepEqual(await inspect("named", [], "[["), available(["alpha", "beta"]));
+  assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["empty", "inner"]);
+  assert.deepEqual(await inspect("env", [{ kind: "field", name: "inner" }]), available(["value"]));
+  assert.deepEqual(await inspect("env", [{ kind: "field", name: "empty" }]), available([]));
+  assert.deepEqual(await inspect("s4", [], "@"), available(["inner"]));
+  assert.deepEqual(await inspect("s4", [{ kind: "slot", name: "inner" }]), available(["slot_value"]));
+  await submit('makeActiveBinding("active_child", function() { hits <<- hits + 1L; list(secret = 1) }, env); delayedAssign("pending_idx", { hits <<- hits + 1L; 1L })');
+  assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["active_child", "empty", "inner"]);
+  assert.deepEqual(await inspect("env", [{ kind: "field", name: "active_child" }]),
+    { status: "suppressed", reason: "active-binding" });
+  assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "pending_idx" }]),
+    { status: "suppressed", reason: "deferred-binding" });
+  await submit('R6Foo <- R6::R6Class("R6Foo", public = list(inner = list(item = 1), method = function() stop("must not call")), active = list(active = function(value) { hits <<- hits + 1L; 1L })); r6 <- R6Foo$new()');
+  const r6names = await inspect("r6", [], "$");
+  assert.equal(r6names.status, "available");
+  for (const name of ["inner", "method", "active"]) assert.ok(r6names.names.includes(name));
+  assert.deepEqual(await inspect("r6", [{ kind: "field", name: "inner" }]), available(["item"]));
+  assert.deepEqual(await inspect("r6", [{ kind: "field", name: "active" }]),
+    { status: "suppressed", reason: "active-binding" });
+  assert.deepEqual(await inspect("r6", [{ kind: "field", name: "method" }]), available([]));
+  assert.deepEqual(await inspect("classed", [], "$"), available(["inner"]));
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');
   await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");

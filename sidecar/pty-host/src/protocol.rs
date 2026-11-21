@@ -236,15 +236,15 @@ impl OutputSink {
         &self, request_id: u32, result: &crate::member_inspection::Inspection
     ) -> io::Result<()> {
         use crate::member_inspection::{Inspection, Suppression};
-        // Only fixed status codes cross the wire; never send source expressions.
         let mut payload = Vec::new();
         match result {
             Inspection::Unavailable => payload.push(0),
             Inspection::Suppressed(reason) => payload.push(match reason {
                 Suppression::ActiveBinding => 2,
                 Suppression::DeferredBinding => 3,
-                Suppression::UnsupportedAccessor => 4,
-                Suppression::UnsupportedStructure => 5,
+                Suppression::UnsafeDispatch => 4,
+                Suppression::UnsafeAltRep => 5,
+                Suppression::UnsafeEnvironment => 6,
             }),
             Inspection::Available(names) if names.len() <= 1000 &&
                 names.iter().all(|name| name.len() <= 4096) &&
@@ -252,7 +252,7 @@ impl OutputSink {
                     payload.push(1);
                     encode_string_array(names, &mut payload);
                 }
-            Inspection::Available(_) => payload.push(5),
+            Inspection::Available(_) => payload.push(0),
         }
         self.emit_frame(FRAME_MEMBER_NAMES_RESULT, request_id, &payload)
     }

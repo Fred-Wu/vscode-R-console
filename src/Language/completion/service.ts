@@ -47,13 +47,18 @@ export async function collectCompletionEntries(
   // Only nested, structurally addressed receivers need a native query.
   // The existing sess snapshot remains authoritative for top-level members.
   const nestedReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
+  const rootMember = context.kind === "member" && sessionItems.length === 0 && !!context.objectName;
+  const rootBracket = context.kind === "bracket" && context.bracketOperator === "[[" &&
+    cachedColumnItems.length === 0 && !!context.objectName;
   const rawLspResult = await rawLspItemsRequest;
   // Source-inferred members remain owned by LSP in opt-in static mode.
   const inferred = rawLspResult.memberResolved ||
     rawLspResult.entries.some(entry => entry.role === "member");
-  const runtimeRequest = nestedReceiver && (context.kind === "member" || context.kind === "bracket") &&
+  const runtimeRequest = (nestedReceiver || rootMember || rootBracket) &&
+    (context.kind === "member" || context.kind === "bracket") &&
     (rawLspResult.runtimeOnly || !inferred)
-    ? requestRuntimeMemberCompletions?.(context.objectName!, context.operator ?? "$")
+    ? requestRuntimeMemberCompletions?.(context.objectName!,
+        context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")
     : undefined;
   const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
   const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;

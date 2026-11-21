@@ -90,19 +90,21 @@ export type BackendDialogResult =
     };
 
 export type MemberInspectionStep =
-  | { kind: "field" | "slot"; name: string }
-  | { kind: "index"; index: number };
+  | { kind: "field" | "slot" | "named-index" | "slice-name" | "variable-index" | "variable-slice"; name: string }
+  | { kind: "index" | "slice-index"; index: number };
+
+export type MemberInspectionTarget = "$" | "@" | "[" | "[[";
 
 export type MemberInspectionResult =
   | { status: "available"; names: string[] }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
-      "unsupported-accessor" | "unsupported-structure" }
+      "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
   | { status: "unavailable" };
 
 export type MemberInspectionQuery = {
   root: string;
   steps: MemberInspectionStep[];
-  slots: boolean;
+  target: MemberInspectionTarget;
 };
 
 export type BackendControlEvent =
@@ -349,14 +351,14 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 5) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 6) {
         throw new Error("invalid member inspection result");
       }
       if (payload[0] !== 1) {
         if (payload.length !== 1) throw new Error("invalid member inspection status");
         const reasons = {
           2: "active-binding", 3: "deferred-binding",
-          4: "unsupported-accessor", 5: "unsupported-structure",
+          4: "unsafe-dispatch", 5: "unsafe-altrep", 6: "unsafe-environment",
         } as const;
         return { type: "member-names-result", requestId,
           result: payload[0] === 0 ? { status: "unavailable" } :
@@ -600,7 +602,7 @@ export function encodeShutdownFrame(): Buffer {
 }
 
 export function encodeMemberNamesRequestFrame(requestId: number, query: MemberInspectionQuery): Buffer {
-  if (query.steps.length > 12 || query.steps.length === 0 || query.root.length === 0 ||
+  if (query.steps.length > 12 || query.root.length === 0 ||
       Buffer.byteLength(query.root, "utf8") > 4096) {
     throw new Error("invalid member inspection request");
   }
@@ -612,18 +614,23 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
     bytes.copy(result, 4);
     return result;
   };
-  const parts: Buffer[] = [Buffer.from([query.slots ? 1 : 0, query.steps.length]), encodeString(query.root)];
+  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3 };
+  const stepCodes = {
+    field: 0, slot: 1, index: 2, "named-index": 3,
+    "slice-index": 4, "slice-name": 5, "variable-index": 6, "variable-slice": 7,
+  } as const;
+  const parts: Buffer[] = [Buffer.from([targetCodes[query.target], query.steps.length]), encodeString(query.root)];
   for (const step of query.steps) {
-    if (step.kind === "index") {
+    if (step.kind === "index" || step.kind === "slice-index") {
       if (!Number.isSafeInteger(step.index) || step.index < 1 || step.index > 100000) {
         throw new Error("invalid member index");
       }
       const part = Buffer.allocUnsafe(5);
-      part[0] = 2;
+      part[0] = stepCodes[step.kind];
       part.writeUInt32LE(step.index, 1);
       parts.push(part);
     } else {
-      parts.push(Buffer.from([step.kind === "slot" ? 1 : 0]), encodeString(step.name));
+      parts.push(Buffer.from([stepCodes[step.kind]]), encodeString(step.name));
     }
   }
   return createFrame(FrameKind.MemberNamesRequest, requestId, Buffer.concat(parts));

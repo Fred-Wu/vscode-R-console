@@ -287,8 +287,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestRuntimeMemberCompletions: (expression, operator) => {
-        const query = parseRuntimeMemberQuery(expression, operator === "@");
-        // The source parser is the only authority for requests with R input.
+        const query = parseRuntimeMemberQuery(expression, operator);
         if (!query) {
           logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" });
           return undefined;

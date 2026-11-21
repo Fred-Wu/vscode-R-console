@@ -1,10 +1,10 @@
 import { TokenType, tokenize, type Token } from "../lexer";
-import type { MemberInspectionQuery, MemberInspectionStep } from "../../Runtime/backendProtocol";
+import type { MemberInspectionQuery, MemberInspectionStep, MemberInspectionTarget } from "../../Runtime/backendProtocol";
 
-// This parser is a request boundary, not an evaluator. Only a global binding
-// followed by literal, direct accessors can reach the native inspector.
-export function parseRuntimeMemberQuery(expression: string, slots = false): MemberInspectionQuery | undefined {
-  if (expression.length > 4096) return undefined;
+export function parseRuntimeMemberQuery(
+  expression: string, target: MemberInspectionTarget = "$"
+): MemberInspectionQuery | undefined {
+  if (Buffer.byteLength(expression, "utf8") > 4096) return undefined;
   const tokens = tokenize(expression).filter(token => token.type !== TokenType.Newline &&
     token.type !== TokenType.EOF);
   if (!tokens.length || tokens.length > 40) return undefined;
@@ -18,28 +18,35 @@ export function parseRuntimeMemberQuery(expression: string, slots = false): Memb
       const name = memberName(tokens[index++]);
       if (name === undefined) return undefined;
       steps.push({ kind: token.value === "$" ? "field" : "slot", name });
-    } else if (token.type === TokenType.LeftBracket && token.value === "[[") {
+    } else if (token.type === TokenType.LeftBracket && (token.value === "[[" || token.value === "[")) {
+      const double = token.value === "[[";
       const value = tokens[index++];
       if (!value) return undefined;
       if (value.type === TokenType.String && value.closed) {
         const name = literalName(value.value);
         if (name === undefined) return undefined;
-        steps.push({ kind: "field", name });
+        steps.push({ kind: double ? "named-index" : "slice-name", name });
       } else if (value.type === TokenType.Number && /^(?:[1-9]\d{0,5})L?$/.test(value.value)) {
         const number = Number(value.value.replace(/L$/, ""));
         if (number > 100000) return undefined;
-        steps.push({ kind: "index", index: number });
+        steps.push({ kind: double ? "index" : "slice-index", index: number });
+      } else if (value.type === TokenType.Identifier) {
+        const name = memberName(value);
+        if (name === undefined) return undefined;
+        steps.push({ kind: double ? "variable-index" : "variable-slice", name });
       } else {
         return undefined;
       }
       const closing = tokens[index++];
-      if (closing?.type !== TokenType.RightBracket || closing.value !== "]]") return undefined;
+      if (closing?.type !== TokenType.RightBracket || closing.value !== (double ? "]]" : "]")) {
+        return undefined;
+      }
     } else {
       return undefined;
     }
   }
-  if (index !== tokens.length || steps.length === 0) return undefined;
-  return { root, steps, slots };
+  if (index !== tokens.length) return undefined;
+  return { root, steps, target };
 }
 
 function memberName(token: Token | undefined): string | undefined {
@@ -49,8 +56,6 @@ function memberName(token: Token | undefined): string | undefined {
     if (!name.endsWith("`") || name.length < 3) return undefined;
     name = name.slice(1, -1);
   }
-  // Escapes are not reinterpreted: an incorrectly decoded binding would be
-  // misleading, and the user can still obtain ordinary LSP suggestions.
   return name && !/[\x00\\]/.test(name) && Buffer.byteLength(name, "utf8") <= 4096
     ? name : undefined;
 }

@@ -86,7 +86,7 @@ export interface CompletionProvider {
 
 export type RuntimeMemberCompletionRequester = (
   expression: string,
-  operator: "$" | "@"
+  operator: "$" | "@" | "[" | "[["
 ) => Promise<
   MemberInspectionResult | undefined
 > | undefined;

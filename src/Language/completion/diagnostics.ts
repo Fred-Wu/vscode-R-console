@@ -1,18 +1,17 @@
-/** Code-free completion diagnostics. Never include source, names, paths or values. */
 export type CompletionDecision =
   | { kind: "Rejected"; reason: "executable-receiver" }
   | { kind: "Suppressed"; reason: "active-binding" | "deferred-binding" |
-      "unsupported-accessor" | "unsupported-structure" };
+      "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" };
 
 const descriptions = {
-  "executable-receiver": "executable receiver at parser stage",
-  "active-binding": "active binding at runtime",
-  "deferred-binding": "unevaluated binding at runtime",
-  "unsupported-accessor": "unsupported accessor at runtime",
-  "unsupported-structure": "unsupported object structure at runtime",
+  "executable-receiver": "function call may have side effects",
+  "active-binding": "active binding may have side effects",
+  "deferred-binding": "forcing a delayed value may have side effects",
+  "unsafe-dispatch": "custom accessor may have side effects",
+  "unsafe-altrep": "ALTREP inspection may have side effects",
+  "unsafe-environment": "custom environment access may have side effects",
 } as const;
 
-/** A fixed vocabulary ensures user input can never reach the output channel. */
 export function formatCompletionDecision(decision: CompletionDecision): string {
   return `[Completion - ${decision.kind}]: ${descriptions[decision.reason]}`;
 }
