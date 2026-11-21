@@ -193,6 +193,31 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   assert.match(output.slice(beforeOversize), /16 MiB backend frame limit.*Nothing was sent/);
   assert.equal(backend.canUseSessionCommands(session), true, "rejected commands must not disconnect R");
   await submit('cat("STILL_CONNECTED\\n")', "STILL_CONNECTED");
+  // A real R command must update the frontend's library snapshot after the
+  // main prompt, without asking sess or parsing the submitted R expression.
+  const initialLibraries = events.filter(event => event.type === "library-paths").at(-1);
+  assert.ok(initialLibraries?.paths.length, "initial active R libraries are published");
+  const extraLibrary = path.join(dir, "runtime-library");
+  fs.mkdirSync(extraLibrary);
+  const normalizeLibrary = value => value.replaceAll("\\", "/").toLowerCase();
+  const initialSnapshotCount = events.filter(event => event.type === "library-paths").length;
+  await submit('baseline_dynamic_paths <- .libPaths(); .libPaths(c(' +
+    JSON.stringify(extraLibrary) +
+    ', baseline_dynamic_paths)); cat("RUNTIME_LIBRARY_ADDED\\n")', "RUNTIME_LIBRARY_ADDED");
+  const addedLibraries = events.filter(event => event.type === "library-paths").at(-1);
+  assert.ok(addedLibraries.paths.some(value =>
+    normalizeLibrary(value) === normalizeLibrary(extraLibrary)), "added library appears in R metadata");
+  assert.ok(events.filter(event => event.type === "library-paths").length > initialSnapshotCount);
+  await submit('.libPaths(baseline_dynamic_paths); cat("RUNTIME_LIBRARY_REMOVED\\n")',
+    "RUNTIME_LIBRARY_REMOVED");
+  const restoredLibraries = events.filter(event => event.type === "library-paths").at(-1);
+  assert.deepEqual(restoredLibraries.paths, initialLibraries.paths,
+    "restoring R's original paths removes the temporary library from the snapshot");
+  const restoredCount = events.filter(event => event.type === "library-paths").length;
+  await submit('cat("RUNTIME_LIBRARY_UNCHANGED\\n")', "RUNTIME_LIBRARY_UNCHANGED");
+  assert.equal(events.filter(event => event.type === "library-paths").length, restoredCount,
+    "an unchanged library list must not generate redundant notifications");
+
   stage = "large output";
   await submit('cat(strrep("café 😀", 1024 * 1024)); cat("\\nLARGE_OUTPUT_DONE\\n")', "LARGE_OUTPUT_DONE");
   assert.ok(output.includes("café 😀".repeat(1024 * 1024)),
@@ -245,6 +270,8 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   backend.attach(session, handlers);
   await waitFor(() => backend.canUseSessionCommands(session) && events.some((event) =>
     event.type === "session-state" && event.wait.kind === "top-level"), "reconnect");
+  assert.deepEqual(events.filter(event => event.type === "library-paths").at(-1)?.paths,
+    initialLibraries.paths, "reconnecting receives the most recent completed library snapshot");
   await submit('cat("RESTORED:", answer, "\\n")', "RESTORED: 42");
   stage = "shutdown";
   backend.close(session);
