@@ -45,7 +45,7 @@ test("native member results distinguish unavailable from an empty object", () =>
     return Buffer.concat([header, payload]);
   }
   const unavailable = parseBackendFrames(frame(Buffer.from([0])));
-  assert.deepEqual(unavailable.events, [{ type: "member-names-result", requestId: 42, names: undefined }]);
+  assert.deepEqual(unavailable.events, [{ type: "member-names-result", requestId: 42 }]);
   const empty = parseBackendFrames(frame(Buffer.from([1, 0, 0, 0, 0])));
   assert.deepEqual(empty.events, [{ type: "member-names-result", requestId: 42, names: [] }]);
   const oversized = Buffer.alloc(5);
