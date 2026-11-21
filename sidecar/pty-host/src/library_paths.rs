@@ -28,7 +28,8 @@ struct ReadContext {
 }
 
 const MAX_PATHS: usize = 256;
-const MAX_PATH_BYTES: usize = 128 * 1024;
+// Leave room for the count and every length prefix in the 128 KiB control frame.
+const MAX_PATH_BYTES: usize = 128 * 1024 - 4 * (MAX_PATHS + 1);
 
 impl LibraryPathsApi {
     // Must run on R's main thread, never while R is evaluating a submission.
