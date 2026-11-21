@@ -6,6 +6,7 @@ import {
   type CompletionContext,
   type CompletionProvider,
   CompletionPickItem,
+  type RuntimeMemberCompletionRequester,
   collectCompletionEntries,
   getCompletionContext,
   rankCompletionEntries,
@@ -13,6 +14,7 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import { logConsoleCompletionDecision } from "../../Language/completion/outputChannel";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
 
@@ -33,6 +35,7 @@ type LangOptions = {
   getRecentSessionEntries?: () => string[];
   onPackagesChanged?: () => void;
   getStaticAnalysisEnabled?: () => boolean;
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
 };
 
 type AutocompleteRequest = {
@@ -104,6 +107,11 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
+    if (context?.rejectionReason) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason });
+      onInlineEntries?.([]);
+      return;
+    }
     if (!context || context.suppressAutomatic) {
       onInlineEntries?.([]);
       return;
@@ -150,7 +158,7 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          undefined,
+          this.options.requestRuntimeMemberCompletions,
           latestInput.text
         );
       })();
@@ -238,7 +246,7 @@ export class RTermLang {
             lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            undefined,
+            this.options.requestRuntimeMemberCompletions,
             nextInputText
           );
           return nextEntries;

@@ -2,6 +2,7 @@
 mod console_input;
 mod host;
 mod library_paths;
+mod member_inspection;
 mod protocol;
 #[cfg(windows)]
 mod windows_pipe_security;

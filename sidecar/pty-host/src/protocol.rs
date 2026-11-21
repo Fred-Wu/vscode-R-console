@@ -56,6 +56,8 @@ const FRAME_DIALOG_RESULT: u16 = 18;
 const FRAME_HOST_ERROR: u16 = 19;
 const FRAME_SESSION_STATE: u16 = 20;
 const FRAME_LIBRARY_PATHS: u16 = 21;
+const FRAME_MEMBER_NAMES_REQUEST: u16 = 25;
+const FRAME_MEMBER_NAMES_RESULT: u16 = 26;
 const MAX_BUFFERED_FRAMES: usize = 4096;
 const MAX_BUFFERED_BYTES: usize = 1_000_000;
 // Use the same streaming granularity for R callbacks and captured native IO.
@@ -82,6 +84,7 @@ pub(crate) enum IncomingCommand {
     ReplyInput(String),
     DialogResult(DialogResult),
     ParseStatus { request_id: u32, code: String },
+    MemberNames { request_id: u32, query: crate::member_inspection::MemberQuery },
     Interrupt,
     SetWidth { columns: u16 },
     Shutdown,
@@ -227,6 +230,31 @@ impl OutputSink {
 
     pub(crate) fn emit_parse_status_result(&self, request_id: u32, status: i32) -> io::Result<()> {
         self.emit_frame(FRAME_PARSE_STATUS_RESULT, request_id, &status.to_le_bytes())
+    }
+
+    pub(crate) fn emit_member_names_result(
+        &self, request_id: u32, result: &crate::member_inspection::Inspection
+    ) -> io::Result<()> {
+        use crate::member_inspection::{Inspection, Suppression};
+        // Only fixed status codes cross the wire; never send source expressions.
+        let mut payload = Vec::new();
+        match result {
+            Inspection::Unavailable => payload.push(0),
+            Inspection::Suppressed(reason) => payload.push(match reason {
+                Suppression::ActiveBinding => 2,
+                Suppression::DeferredBinding => 3,
+                Suppression::UnsupportedAccessor => 4,
+                Suppression::UnsupportedStructure => 5,
+            }),
+            Inspection::Available(names) if names.len() <= 1000 &&
+                names.iter().all(|name| name.len() <= 4096) &&
+                names.iter().map(|name| name.len() + 4).sum::<usize>() <= 1024 * 1024 - 5 => {
+                    payload.push(1);
+                    encode_string_array(names, &mut payload);
+                }
+            Inspection::Available(_) => payload.push(5),
+        }
+        self.emit_frame(FRAME_MEMBER_NAMES_RESULT, request_id, &payload)
     }
 
     pub(crate) fn emit_host_error(&self, message: &str) -> io::Result<()> {
@@ -740,6 +768,11 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
         FRAME_PARSE_STATUS_REQUEST => IncomingCommand::ParseStatus {
             request_id,
             code: String::from_utf8_lossy(&payload).into_owned(),
+        },
+        FRAME_MEMBER_NAMES_REQUEST => IncomingCommand::MemberNames {
+            request_id,
+            query: crate::member_inspection::MemberQuery::decode(&payload).ok_or_else(||
+                io::Error::new(io::ErrorKind::InvalidData, "invalid member-inspection request"))?,
         },
         FRAME_INTERRUPT => IncomingCommand::Interrupt,
         FRAME_SET_WIDTH => {

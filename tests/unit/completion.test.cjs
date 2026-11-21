@@ -242,7 +242,7 @@ test("Unicode member and argument prefixes preserve the object and full replacem
   }
 });
 
-test("member completion parses token-derived objects without live inspection", async () => {
+test("member completion parses token-derived objects without evaluating draft code", async () => {
   for (const [input, objectName, prefix] of [
     ["obj $ nested @ sl", "obj$nested", "sl"],
     ["obj$ # comment\n nested$fi", "obj$nested", "fi"],
@@ -258,7 +258,7 @@ test("member completion parses token-derived objects without live inspection", a
     assert.equal(context.prefix, prefix, input);
     assert.equal(context.replaceStart, line.length - prefix.length, input);
     await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async () => assert.fail("automatic member completion must not send sess requests"));
+      async () => undefined /* Optional guarded native completion, never sess evaluation */);
   }
 });
 
@@ -273,20 +273,16 @@ test("subscript member detection preserves the receiver without evaluating indic
   assert.deepEqual(entries, []);
 });
 
-test("computed subscript slot completion uses only slots inferred by the language server", async () => {
+test("computed subscript receiver is rejected before LSP or native inspection", async () => {
   const input = "objects[[choose_index()]]@sl";
   const context = completion.getCompletionContext(input, input.length);
-  assert.equal(context.kind, "member");
-  let liveRequests = 0;
-  const request = async () => { liveRequests++; return []; };
-  for (const labels of [[], ["slotName"]]) {
-    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-      { line: 0, character: input.length }, { globalenv: { objects: { slots: ["slotOnContainer"] } } },
-      [], [], { provideCompletionItems: async () =>
-        labels.map(label => ({ label, kind: 4, data: { type: "member" } })) }, request);
-    assert.deepEqual(entries.map(entry => entry.label), labels);
-  }
-  assert.equal(liveRequests, 0);
+  assert.equal(context?.kind, "member");
+  assert.equal(context?.rejectionReason, "executable-receiver");
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, { globalenv: { objects: { slots: ["slotOnContainer"] } } },
+    [], [], { provideCompletionItems: async () => assert.fail("no LSP evaluation or inference") },
+    async () => assert.fail("no native inspection"));
+  assert.deepEqual(entries, []);
 });
 
 test("member-like text in literals and comments does not request runtime members", async () => {

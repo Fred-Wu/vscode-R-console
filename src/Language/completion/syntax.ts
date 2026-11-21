@@ -1,8 +1,29 @@
 import type { CompletionContext } from "./types";
+import { TokenType, tokenize, isMemberAccessor } from "../lexer";
 import { getCompletionSyntax } from "./contextParser";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
+}
+
+/** A call/expression followed by $ or @ is not a global-name completion.
+ * The normal member parser handles safe receivers; suppress the ambient-name
+ * fallback when it cannot resolve the receiver without evaluating draft code.
+ */
+function hasUnsupportedMemberReceiver(before: string): boolean {
+  if (!before.includes("$") && !before.includes("@")) return false;
+  const tokens = tokenize(before);
+  const last = tokens.at(-2); // EOF follows the final significant token.
+  if (!last) return false;
+  if (isMemberAccessor(last)) {
+    return before.slice(last.position + last.value.length).trim().length === 0;
+  }
+  if (last.type !== TokenType.Identifier || last.closed === false ||
+      last.position + last.value.length !== before.length) return false;
+  const preceding = tokens.at(-3);
+  return preceding !== undefined && isMemberAccessor(preceding) &&
+    before.slice(preceding.position + preceding.value.length, last.position).trim().length === 0;
 }
 
 export function getCompletionContext(
@@ -44,6 +65,8 @@ export function getCompletionContext(
       isPipePlaceholder(member.baseObject) && !!dataObjectName;
     return {
       kind: "member",
+      ...(member.hasSubscript && !parseRuntimeMemberQuery(member.objectName) ?
+        { rejectionReason: "executable-receiver" as const } : {}),
       autoTrigger: true,
       prefix,
       replaceStart,
@@ -59,12 +82,27 @@ export function getCompletionContext(
     };
   }
 
+  // Without this guard, explicit Tab after make_object()$ treats the
+  // unsupported member receiver as a default/global completion request.
+  if (!inLiteral && hasUnsupportedMemberReceiver(textForDataContext)) {
+    return {
+      kind: "member",
+      prefix: "",
+      replaceStart: beforeCursor.length,
+      rejectionReason: "executable-receiver",
+      snapshotInput,
+      snapshotCursor,
+    };
+  }
+
   const bracket = syntax.bracket;
   if (bracket && bracket.replaceStart >= relativeOffset) {
     const isPlaceholderBracket = isPipePlaceholder(bracket.objectName) && !!dataObjectName;
     const effectiveDataObject = isPlaceholderBracket ? dataObjectName : bracket.objectName;
     return {
       kind: "bracket",
+      ...(bracket.objectName.includes("[") && !parseRuntimeMemberQuery(bracket.objectName) ?
+        { rejectionReason: "executable-receiver" as const } : {}),
       autoTrigger: true,
       prefix: bracket.prefix,
       replaceStart: bracket.replaceStart - relativeOffset,

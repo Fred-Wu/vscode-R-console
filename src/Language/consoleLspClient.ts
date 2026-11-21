@@ -32,11 +32,9 @@ import { createCompletionParams } from "./completion/protocol";
 import { backtickRName } from "./completion/candidates";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
+import { lifecycleOutputChannel } from "./completion/outputChannel";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
-const lifecycleOutputChannel = vscode.window.createOutputChannel(
-  "R Console Language Server"
-);
 
 function formatLogTimestamp(date = new Date()): string {
   const pad = (value: number): string => String(value).padStart(2, "0");

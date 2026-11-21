@@ -3,7 +3,8 @@ import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionP
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
-import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import { getFieldInsertText, filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
 
 export async function collectCompletionEntries(
   context: CompletionContext,
@@ -16,7 +17,7 @@ export async function collectCompletionEntries(
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string
 ): Promise<CompletionEntries> {
-  if (context.suppressAutomatic) return [];
+  if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
   const sessionArguments = context.kind === "argument" && isSessionFunctionCall(context, sessionData) &&
     !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator);
@@ -43,7 +44,26 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
+  // Only nested, structurally addressed receivers need a native query.
+  // The existing sess snapshot remains authoritative for top-level members.
+  const nestedReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
   const rawLspResult = await rawLspItemsRequest;
+  // Source-inferred members remain owned by LSP in opt-in static mode.
+  const inferred = rawLspResult.memberResolved ||
+    rawLspResult.entries.some(entry => entry.role === "member");
+  const runtimeRequest = nestedReceiver && (context.kind === "member" || context.kind === "bracket") &&
+    (rawLspResult.runtimeOnly || !inferred)
+    ? requestRuntimeMemberCompletions?.(context.objectName!, context.operator ?? "$")
+    : undefined;
+  const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
+  const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
+  const runtimeMembers = runtimeNames?.map(name => ({
+    label: name,
+    insertText: getFieldInsertText(name, context),
+    kind: vscode.CompletionItemKind.Field,
+    detail: context.objectName,
+    source: "session" as const,
+  }));
   const runtimeOnly = rawLspResult.runtimeOnly === true;
   const nativeMembers = !runtimeOnly &&
     (rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member"));
@@ -53,10 +73,11 @@ export async function collectCompletionEntries(
       !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
   // Live member/child inspection can invoke user-defined R methods. Only
   // cached top-level names and non-executing LSP inference are automatic.
-  const dataItems = !includeColumns || nativeFields ||
+  const dataItems = runtimeMembers !== undefined && context.kind === "bracket" ? runtimeMembers :
+    !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
   if (context.kind === "member") {
-    const entries = runtimeOnly ? sessionItems
+    const entries = runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
       : nativeMembers ? rawLspResult.entries : sessionItems;
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete);
