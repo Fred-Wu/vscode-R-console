@@ -231,6 +231,43 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   await submit('stopifnot(isTRUE(getOption("r.console.smoke.profile")), getOption("prompt") == "> "); answer <- 6 * 7; cat("ANSWER:", answer, "\\n")', "ANSWER: 42");
   await submit('stop("EXPECTED_SMOKE_ERROR")', "EXPECTED_SMOKE_ERROR");
 
+  // R Console's locked options wrapper must forward unevaluated calls, as
+  // used by renv::init() when installing its temporary error handler.
+  // Preserve the three security-locked options for both argument forms.
+  await submit(`
+    local({
+      old_error <- getOption("error")
+      on.exit(options(error = old_error), add = TRUE)
+      handler <- quote(cat("ERROR_HANDLER_MUST_NOT_EXECUTE\\n"))
+      options(error = handler)
+      stopifnot(identical(getOption("error"), handler))
+      options(list(error = handler))
+      stopifnot(identical(getOption("error"), handler))
+      suppressWarnings(options(
+        error = handler, prompt = "unsafe", continue = "unsafe", menu.graphics = TRUE
+      ))
+      stopifnot(
+        identical(getOption("error"), handler),
+        identical(getOption("prompt"), "> "),
+        identical(getOption("continue"), "+ "),
+        identical(getOption("menu.graphics"), FALSE)
+      )
+      suppressWarnings(options(list(
+        error = handler, prompt = "unsafe", continue = "unsafe", menu.graphics = TRUE
+      )))
+      stopifnot(
+        identical(getOption("error"), handler),
+        identical(getOption("prompt"), "> "),
+        identical(getOption("continue"), "+ "),
+        identical(getOption("menu.graphics"), FALSE)
+      )
+      stopifnot(is.list(options("digits")))
+      cat("ERROR_HANDLER_PRESERVED\\n")
+    })
+  `, "ERROR_HANDLER_PRESERVED");
+  assert.doesNotMatch(output, /ERROR_HANDLER_MUST_NOT_EXECUTE/);
+
+
   await submit('test <- data.frame("中文" = 1); stopifnot(identical(names(test), "中文")); cat("UNICODE_COLUMN_OK\\n")', "UNICODE_COLUMN_OK");
   assert.doesNotMatch(output, /Warning/);
   assert.equal(await backend.requestParseStatus(session, '中文 <- "日本語 café 🙂"'), 1);
