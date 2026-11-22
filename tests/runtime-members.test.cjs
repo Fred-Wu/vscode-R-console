@@ -132,6 +132,73 @@ test("real embedded R completion inspects nested storage without running user co
   }
   assert.deepEqual(await inspect("missing_names", [{ kind: "field", name: "inn" }]), available(["child"]));
   assert.deepEqual(await inspect("missing_names", [{ kind: "slice-index", index: 1 }]), available([]));
+  // Combine the real native response with an R-serialized workspace snapshot.
+  // A missing name is JSON null; it must not abort either UI before native
+  // results or independent global index variables can reach the user.
+  await submit('x <- setNames(list(list(wrong = 1), list(right = 2)), c(NA_character_, "NA")); idx <- NA_character_; x$stale <- 1; cat("MISSING_NAMES_SNAPSHOT:", jsonlite::toJSON(list(globalenv = list(x = list(type = typeof(x), class = class(x), names = names(x)), idx = list(type = typeof(idx)))), auto_unbox = TRUE, null = "null", force = TRUE, digits = NA), "\\n", sep = "")');
+  const missingSnapshot = JSON.parse(output.match(/MISSING_NAMES_SNAPSHOT:([^\r\n]+)/)[1]);
+  assert.deepEqual(missingSnapshot.globalenv.x.names, [null, "NA", "stale"]);
+  assert.equal(missingSnapshot.globalenv.x.class, "list");
+  // Fresh native results must also supersede stale names for unboxed classes.
+  await submit("x$stale <- NULL");
+  let currentPick;
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Field: 4, Property: 9, Variable: 5, Function: 2, Text: 0 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+      window: { createQuickPick: () => currentPick },
+    },
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  for (const inline of [true, false]) {
+    for (const [text, expected] of [
+      ["x$", ["`NA`"]], ["x[[id", ["idx"]], ["x[[idx", ["idx"]],
+      ['x[["NA"]]$', ["right"]], ["x[[idx]]$", []],
+    ]) {
+      let items = [], selected, hide, accept;
+      currentPick = { items: [], value: "", activeItems: [], selectedItems: [],
+        onDidChangeValue() {}, onDidAccept(fn) { accept = fn; }, onDidHide(fn) { hide = fn; },
+        show() {}, hide() { hide?.(); }, dispose() {} };
+      const requests = [];
+      const lang = new RTermLang({ extensionPath: root, rPath, env,
+        getStaticAnalysisEnabled: () => false,
+        requestRuntimeMemberCompletions: (receiver, target) => {
+          const request = backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver, target));
+          requests.push(request);
+          return request;
+        } });
+      lang.ensureConsoleLspStarted = async () => undefined;
+      lang.getOrOpenCompletionDocument = async () => undefined;
+      const input = { text, currentLine: text, cursorCol: text.length,
+        cursorRow: 0, lines: [text], textBeforeCursor: text };
+      const showing = lang.handleAutocomplete({ input, force: true,
+        getCurrentInput: () => input, getWorkspaceData: () => missingSnapshot,
+        applyCompletion(item) { selected = item; },
+        ...(inline ? { onInlineEntries(next) { items = next; } } : {}) });
+      try {
+        await until(() => requests.length > 0, "native UI request: " + text);
+        await Promise.all(requests);
+        await new Promise(resolve => setImmediate(resolve));
+        if (!inline) items = currentPick.items;
+        const picks = items.filter(item => "insertText" in item);
+        assert.deepEqual(picks.map(item => item.insertText), expected,
+          `${inline ? "inline" : "Quick Pick"}: ${text}`);
+        if (!inline && picks.length) {
+          currentPick.selectedItems = [picks[0]];
+          accept();
+          await showing;
+          assert.equal(selected.insertText, expected[0]);
+          assert.equal(selected.snapshotInput, text);
+        }
+      } finally {
+        if (!inline) currentPick.hide();
+        await showing;
+        lang.cancelCompletion();
+      }
+    }
+  }
   await submit('obj$inner <- list(changed = TRUE)');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["changed"]));
 

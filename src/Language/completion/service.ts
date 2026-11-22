@@ -5,6 +5,7 @@ import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
+import { workspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
 import { bracketFieldMode, getFieldInsertText, filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
 
 export async function collectCompletionEntries(
@@ -113,7 +114,7 @@ export async function collectCompletionEntries(
     // Ordinary storage still uses fresh native names, including empty lists.
     const metadata = runtimeQuery?.steps.length === 0
       ? sessionData?.globalenv?.[runtimeQuery.root] : undefined;
-    const classes = metadata?.class;
+    const classes = workspaceStrings(metadata?.class);
     const ordinaryClass = !classes?.length ||
       (classes.length === 1 && (classes[0] === metadata?.type || classes[0] === "data.frame")) ||
       (classes.length === 2 && classes[0] === "data.table" && classes[1] === "data.frame");

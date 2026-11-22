@@ -1,6 +1,7 @@
 import type * as vscode from "vscode";
 import type { CallCompletionContext } from "./contextParser";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
+import type { WorkspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
@@ -96,14 +97,14 @@ export type RuntimeMemberCompletionRequester = (
 > | undefined;
 
 export type GlobalEnvItem = {
-  class?: string[];
+  class?: WorkspaceStrings;
   type?: string;
   length?: number;
   str?: string;
   size?: number;
   dim?: number[];
-  names?: string | string[];
-  slots?: string | string[];
+  names?: WorkspaceStrings;
+  slots?: WorkspaceStrings;
 };
 
 export type WorkspaceData = {

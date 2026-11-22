@@ -23,6 +23,46 @@ test("workspace members and slots retain cached fallback when native inspection 
   }
 });
 
+test("missing cached member names cannot abort member or global index completions", async () => {
+  const workspace = { globalenv: {
+    x: { type: "list", names: [null, "NA"], slots: [null, "slot"] },
+    idx: { type: "character", str: "character, length 1" },
+  } };
+  for (const available of [false, true]) {
+    for (const [input, label, insertText] of [
+      ["x$", "NA", "`NA`"], ["x[[id", "idx", "idx"],
+      ['x[["', "NA", "NA"], ["x@", "slot", "slot"],
+    ]) {
+      const entries = await completion.collectCompletionEntries(
+        completion.getCompletionContext(input, input.length), undefined, undefined,
+        workspace, [], [], undefined, async (_receiver, target) => available
+          ? { status: "available", names: target === "@" ? ["slot"] : ["NA"] }
+          : { status: "unavailable" });
+      assert.equal(entries.find(entry => entry.label === label)?.insertText, insertText, input);
+      assert.ok(entries.every(entry => typeof entry.label === "string"));
+    }
+  }
+});
+
+test("unboxed workspace classes preserve native freshness and custom member schemas", async () => {
+  for (const [klass, expected] of [["list", ["fresh"]], ["data.frame", ["fresh"]],
+    ["custom", ["public"]]]) {
+    const input = "x$";
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length), undefined, undefined,
+      { globalenv: { x: { type: "list", class: klass, names: [null, "public"] } } },
+      [], [], undefined, async () => ({ status: "available", names: ["fresh"] }));
+    assert.deepEqual(entries.map(item => item.label), expected, klass);
+  }
+  for (const names of [null, [null], "", [null, ""], [null, 3, false, {}]]) {
+    const input = "x[[id";
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length), undefined, undefined,
+      { globalenv: { x: { type: "list", names }, idx: { type: "character" } } }, []);
+    assert.deepEqual(entries.map(item => item.insertText), ["idx"]);
+  }
+});
+
 test("nested objects cannot trigger live extraction or hover", async () => {
   const workspace = { globalenv: { obj: { type: "list", names: ["inner"] } } };
   const unavailable = async () => undefined; // No safe inspector available.

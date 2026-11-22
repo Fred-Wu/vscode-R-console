@@ -1804,7 +1804,7 @@ test("safe runtime bracket completion retains installed method arguments and spe
   const { client, instances } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { staticAnalysis: false });
   const workspace = { globalenv: {
     test: { type: "list", class: ["data.table", "data.frame"], names: ["xtest"] },
-    df: { type: "list", class: ["data.frame"], names: ["xtest"] },
+    df: { type: "list", class: "data.frame", names: "xtest" },
     custom: { type: "list", class: ["custom", "data.table"], names: ["xtest"] },
   } };
   client.options.getCachedWorkspaceData = () => workspace;

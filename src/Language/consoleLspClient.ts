@@ -33,6 +33,7 @@ import { backtickRName } from "./completion/candidates";
 import { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
+import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
@@ -330,7 +331,7 @@ export class ConsoleLspClient implements CompletionProvider {
           const primaryClass = runtimeBracketKind !== undefined ? runtimeBracketKind :
             bracketReceiver.steps.length === 0 && globals &&
               Object.hasOwn(globals, bracketReceiver.root)
-              ? globals[bracketReceiver.root].class?.[0] : undefined;
+              ? workspaceStrings(globals[bracketReceiver.root].class)[0] : undefined;
           if (primaryClass === "data.table" || primaryClass === "data.frame") {
             (params as typeof params & { rConsoleSubscriptClass?: "data.table" | "data.frame" })
               .rConsoleSubscriptClass = primaryClass;
