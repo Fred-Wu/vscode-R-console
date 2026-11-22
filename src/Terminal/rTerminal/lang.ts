@@ -162,6 +162,18 @@ export class RTermLang {
         this.options.requestRuntimeMemberCompletions !== undefined &&
         this.options.getStaticAnalysisEnabled?.() !== true;
       const prefetchedBracketMembers = this.prefetchBracketMembers(context);
+      // Publish guarded bracket names as soon as they arrive. Do not hold
+      // columns hostage to a slow or restarting language server; its method
+      // parameters can enrich the same suggestions afterward.
+      const stagedBracketEntries = prefetchedBracketMembers?.then(result =>
+        collectCompletionEntries(
+          context, undefined, undefined,
+          getWorkspaceData() ?? cachedSessionData,
+          latestInput.lines.slice(0, latestInput.cursorRow),
+          recentEntries, undefined, undefined, latestInput.text,
+          Promise.resolve(result)
+        )
+      );
       const documentRequest = runtimeMember
         ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
@@ -213,7 +225,8 @@ export class RTermLang {
         return;
       }
 
-      const opensBeforeFullResults = (force && context.kind !== "argument") || !!stagedEntries?.length;
+      const opensBeforeFullResults = (force && context.kind !== "argument") ||
+        !!stagedEntries?.length || !!stagedBracketEntries;
       const entries = stagedEntries?.length
         ? stagedEntries
         : opensBeforeFullResults
@@ -231,18 +244,23 @@ export class RTermLang {
       const initialEntries = entries ?? [];
 
       if (onInlineEntries) {
-        const publish = (results: CompletionEntries): void => {
-          if (!this.isCurrentCompletionRequest(requestId)) return;
+        let publishedPhase = -1;
+        const publish = (results: CompletionEntries, phase: number): void => {
+          if (phase < publishedPhase || !this.isCurrentCompletionRequest(requestId)) return;
           const current = getCurrentInput();
           if (current.text !== latestInput.text || current.cursorRow !== latestInput.cursorRow ||
               current.cursorCol !== context.snapshotCursor) return;
+          publishedPhase = phase;
           this.inlineCache = { input: latestInput, context, entries: results };
           onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix, context), context));
         };
-        if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries);
+        if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries, 0);
+        void stagedBracketEntries?.then(results => {
+          if (results) publish(results, 1);
+        }).catch(() => undefined);
         if (opensBeforeFullResults) {
           void fullEntriesPromise.then(results => {
-            if (results) publish(results);
+            if (results) publish(results, 2);
           }).catch(() => undefined);
         }
         return;
@@ -254,6 +272,7 @@ export class RTermLang {
       const selection = await pickCompletion({
         context, latestInput, initialEntries,
         signal: pickerAbort.signal,
+        stagedEntries: stagedBracketEntries,
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {

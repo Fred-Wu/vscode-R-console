@@ -52,13 +52,20 @@ export async function collectCompletionEntries(
     rawLspResult.entries.some(entry => entry.role === "member");
   // Bracket requests can start native inspection while the language server
   // starts. Keep its parameter candidates, and avoid a second native probe.
-  const runtimeRequest = prefetchedBracketMembers ?? (runtimeReceiver &&
+  const shouldInspectRuntime = runtimeReceiver &&
     (context.kind === "member" || context.kind === "bracket") &&
-    (rawLspResult.runtimeOnly || !inferred)
+    (rawLspResult.runtimeOnly || !inferred);
+  const runtimeRequested = prefetchedBracketMembers !== undefined ||
+    (shouldInspectRuntime && requestRuntimeMemberCompletions !== undefined);
+  const runtimeRequest = prefetchedBracketMembers ?? (shouldInspectRuntime
     ? requestRuntimeMemberCompletions?.(context.objectName!,
         context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")
     : undefined);
   const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
+  // An unavailable inspection is not a complete member list: later typing
+  // must retry instead of refining a cached empty result forever.
+  const retryableRuntime = runtimeRequested &&
+    runtimeResult?.status !== "available" && runtimeResult?.status !== "suppressed";
   const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
   const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
   const bracketKind = runtimeResult?.status === "available" ? runtimeResult.bracketKind : undefined;
@@ -95,7 +102,7 @@ export async function collectCompletionEntries(
     const entries = runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
       : nativeMembers ? rawLspResult.entries : sessionItems;
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
-      rawLspResult.isIncomplete);
+      rawLspResult.isIncomplete || retryableRuntime);
   }
   const unavailableSignature = (runtimeOnly && memberArguments && !rawLspResult.workspaceFunction) ||
     (!rawLspResult.rConsoleLocalFunction && !rawLspResult.workspaceFunction &&
@@ -132,7 +139,7 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...columnFiltered,
       ...(!context.bracketQuote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete);
+    ]), rawLspResult.isIncomplete || retryableRuntime);
   }
 
   if (context.kind === "argument") {

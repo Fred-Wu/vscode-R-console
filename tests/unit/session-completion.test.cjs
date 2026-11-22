@@ -178,7 +178,8 @@ test("unsubmitted object declarations are not a runtime source with static analy
       items: ["hidden", "unsubmitted"].map(label => ({ label, kind: 4, data: { type: "member" } })),
     }) },
     async () => undefined, input);
-  assert.deepEqual(entries, []);
+  assert.equal(entries.length, 0);
+  assert.equal(entries.isIncomplete, true, "unavailable live inspection may be retried");
 });
 
 test("custom class cached names are inert while active bindings have no cached members", async () => {

@@ -64,6 +64,99 @@ test("native nested completion reaches Rust without awaiting the language server
   }
 });
 
+test("unavailable nested inspection retries after typing instead of caching empty members", async () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Field: 4, Function: 2, Property: 9, Variable: 5, Text: 0 },
+    },
+    "../../Language/completion": completion,
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  let requests = 0;
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    getStaticAnalysisEnabled: () => false,
+    requestRuntimeMemberCompletions: async (expression, operator) => {
+      assert.deepEqual([expression, operator], ["obj$inner", "$"]);
+      return ++requests === 1
+        ? { status: "unavailable" } : { status: "available", names: ["alpha"] };
+    },
+  });
+  lang.ensureConsoleLspStarted = () => { throw Error("no LSP dependency for runtime members"); };
+  const snapshot = text => ({ text, currentLine: text, cursorCol: text.length,
+    cursorRow: 0, lines: [text], textBeforeCursor: text });
+  let input = snapshot("obj$inner$");
+  const published = [];
+  const autocomplete = () => lang.handleAutocomplete({
+    input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
+    onInlineEntries: entries => published.push(entries.filter(item => "insertText" in item)
+      .map(item => item.insertText)),
+    applyCompletion() {},
+  });
+  await autocomplete();
+  assert.equal(lang.hasCompleteInlineMemberCache(), false,
+    "timeout or disconnect is not an authoritative empty member list");
+  input = snapshot("obj$inner$a");
+  const refined = lang.refineInlineCompletion(input);
+  assert.deepEqual(refined.filter(item => "insertText" in item), []);
+  assert.equal(lang.hasCompleteInlineMemberCache(), false,
+    "refining an incomplete result must still schedule a lookup");
+  await autocomplete();
+  assert.deepEqual(published.at(-1), ["alpha"]);
+  assert.equal(requests, 2);
+  assert.equal(lang.hasCompleteInlineMemberCache(), true,
+    "successful native inspection may now be filtered locally");
+});
+
+test("bracket names publish before LSP startup and then merge its parameters", async () => {
+  const published = [];
+  let releaseServer;
+  const startup = new Promise(resolve => { releaseServer = resolve; });
+  let nativeRequests = 0;
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Field: 4, Function: 2, Property: 9, Variable: 5, Text: 0 },
+    },
+    "../../Language/completion": completion,
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    getStaticAnalysisEnabled: () => false,
+    requestRuntimeMemberCompletions: async (expression, operator) => {
+      assert.deepEqual([expression, operator], ["DT", "["]);
+      nativeRequests++;
+      return { status: "available", names: ["keyboard"], bracketKind: "data.table" };
+    },
+  });
+  lang.ensureConsoleLspStarted = () => startup;
+  lang.getOrOpenCompletionDocument = async text => ({
+    getText: () => text, uri: { toString: () => "r-console:/completion" },
+  });
+  const input = { text: "DT[, keyb", currentLine: "DT[, keyb", cursorCol: 9,
+    cursorRow: 0, lines: ["DT[, keyb"], textBeforeCursor: "DT[, keyb" };
+  const labels = items => items.filter(item => "insertText" in item).map(item => item.insertText);
+  await lang.handleAutocomplete({
+    input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
+    onInlineEntries: items => published.push(labels(items)), applyCompletion() {},
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(published, [["keyboard"]],
+    "live columns appear even if the language server has not started");
+  releaseServer({ provideCompletionItems: async () => ({ items: [
+    { label: "keyby", insertText: "keyby = ", kind: 5,
+      detail: "parameter", data: { type: "subscript_parameter" } },
+    { label: "keybird", kind: 4, data: { type: "scope" } },
+  ] }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(published.at(-1), ["keyby = ", "keyboard"]);
+  assert.equal(nativeRequests, 1, "no duplicate inspection during LSP enrichment");
+});
+
 test("default bracket completion preserves method parameters alongside prefetched live names", async () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {
@@ -108,6 +201,7 @@ test("default bracket completion preserves method parameters alongside prefetche
     onInlineEntries: items => { published = items.filter(item => "insertText" in item); },
     applyCompletion() {},
   });
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(nativeRequests, 1, "prefetched inspection must not be repeated");
   assert.equal(lspRequests, 1, "bracket-method parameters still come from languageserver");
   assert.deepEqual(published.map(item => item.insertText).sort(), ["keyboard", "keyby = "]);

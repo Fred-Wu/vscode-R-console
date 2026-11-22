@@ -240,7 +240,15 @@ test("real embedded R completion inspects nested storage without running user co
   // Submitting R code invalidates stale completion work; inspecting the new
   // state must not be delayed by requests queued for the previous state.
   const obsolete = Array.from({ length: 12 }, () => inspectTyped("wide"));
+  // Give the R thread an opportunity to enter the native inspector before
+  // submission, then measure its impact on code execution. The R inspector
+  // deadline is 450 ms; allow ample CI scheduling margin on slower hosts.
+  await delay(5);
+  const submissionStarted = Date.now();
   await submit('submission_priority <- list(ready = TRUE)');
+  const submissionLatency = Date.now() - submissionStarted;
+  assert.ok(submissionLatency < 3000,
+    `in-flight inspection delayed code submission by ${submissionLatency} ms`);
   await Promise.all(obsolete);
   assert.deepEqual(await inspect("submission_priority"), available(["ready"]));
   // Parse-status requests belong to submission and must beat queued member
