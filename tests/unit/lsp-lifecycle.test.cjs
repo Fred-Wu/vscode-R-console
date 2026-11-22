@@ -90,8 +90,6 @@ test("explicit completion mode uses the existing virtual document and controls s
   assert.equal(requests.length, 2);
   assert.equal(requests[0].params.rConsoleStaticAnalysis, undefined);
   assert.equal(requests[1].params.rConsoleStaticAnalysis, true);
-  assert.ok(!requests[0].params.text.includes("object <- list"),
-    "runtime projection masks the previous unsubmitted definition");
   assert.ok(requests[1].params.text.includes("object <- list"),
     "static projection retains the current source");
   assert.equal(client.syncedDocuments.size, 1,

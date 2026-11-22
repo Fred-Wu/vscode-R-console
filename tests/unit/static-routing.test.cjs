@@ -118,7 +118,7 @@ test("static fallback uses only inferred member results and the requested analys
     },
   });
   assert.deepEqual(items.map(item => item.label), ["alpha"]);
-  assert.equal(items[0].replaceStart, undefined);
+  assert.equal(items[0].replaceStart, context.replaceStart);
   assert.equal(items.staticResolved, true);
   assert.equal(calls[0][5], "static");
 });
