@@ -142,6 +142,20 @@ test("real embedded R completion inspects nested storage without running user co
   assert.match(output, /S4_CONSTRUCTED:\s*TRUE/, "S4 creation must finish before inspection");
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "inner" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "named-index", name: "inner" }]), available(["alpha"]));
+  await submit('partial <- list(inner = list(alpha = 1)); partial_pair <- as.pairlist(partial); partial_frame <- structure(partial, class = "data.frame", row.names = 1L); ambiguous <- list(inner = list(alpha = 1), innate = list(beta = 2)); exact_first <- list(inner = list(alpha = 1), inn = list(exact = 2)); duplicate_partial <- structure(list(list(alpha = 1), list(beta = 2)), names = c("inner", "inner")); stopifnot(identical(names(partial$inn), "alpha"), identical(names(partial_pair$inn), "alpha"), identical(names(partial_frame$inn), "alpha"), is.null(ambiguous$inn), is.null(duplicate_partial$inn), identical(names(exact_first$inn), "exact")); cat("PARTIAL_MATCH_READY\\n")');
+  assert.match(output, /PARTIAL_MATCH_READY/);
+  for (const root of ["partial", "partial_pair", "partial_frame"]) {
+    assert.deepEqual(await inspect(root, [{ kind: "field", name: "inn" }]), available(["alpha"]), root);
+    assert.deepEqual(await inspect(root, [{ kind: "named-index", name: "inn" }]), available([]), root);
+  }
+  assert.deepEqual(await inspect("partial", [{ kind: "slice-index", index: 1 },
+    { kind: "field", name: "inn" }]), available(["alpha"]));
+  assert.deepEqual(await inspect("partial", [{ kind: "slice-index", index: 1 },
+    { kind: "named-index", name: "inn" }]), available([]));
+  assert.deepEqual(await inspect("exact_first", [{ kind: "field", name: "inn" }]), available(["exact"]));
+  for (const root of ["ambiguous", "duplicate_partial"]) {
+    assert.deepEqual(await inspect(root, [{ kind: "field", name: "inn" }]), available([]), root);
+  }
   assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "nm" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "idx" }]), available(["alpha"]));
   assert.deepEqual(await inspect("plain", [{ kind: "slice-index", index: 1 }]), available(["inner"]));
@@ -163,6 +177,8 @@ test("real embedded R completion inspects nested storage without running user co
   assert.equal(envBracket.status, "available");
   assert.deepEqual([...envBracket.names].sort(), ["empty", "inner"]);
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "inner" }]), available(["value"]));
+  assert.deepEqual(await inspect("env", [{ kind: "field", name: "inn" }]), available([]),
+    "environment access never partially matches bindings");
   assert.deepEqual(await inspect("env", [{ kind: "named-index", name: "inner" }]), available(["value"]));
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "empty" }]), available([]));
   output = "";
@@ -205,6 +221,16 @@ test("real embedded R completion inspects nested storage without running user co
     { status: "suppressed", reason: "active-binding" });
   assert.deepEqual(await inspect("r6", [{ kind: "field", name: "method" }]), available([]));
   assert.deepEqual(await inspect("classed", [], "$"), available(["inner"]));
+  await submit('virtual_hits <- 0L; virtual_obj <- structure(list(storage = 1), class = "completion_virtual"); .DollarNames.completion_virtual <- function(x, pattern) { virtual_hits <<- virtual_hits + 1L; "public" }; `$.completion_virtual` <- function(x, name) { stop("must not execute") }; stopifnot(identical(utils::.DollarNames(virtual_obj), "public")); virtual_hits <- 0L');
+  const virtualInput = "virtual_obj$";
+  const virtualEntries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(virtualInput, virtualInput.length), undefined, undefined,
+    { globalenv: { virtual_obj: { type: "list", class: ["completion_virtual"], names: ["public"] } } },
+    [], [], undefined, (expression, target) =>
+      backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
+  assert.deepEqual(virtualEntries.map(entry => entry.label), ["public"]);
+  await submit('cat("VIRTUAL_HITS:", virtual_hits, "\\n")');
+  assert.match(output, /VIRTUAL_HITS:\s*0/);
   await submit('typed <- list(method = function() { hits <<- hits + 1L }, value = list(child = 1), constant = TRUE); env$method <- function() { hits <<- hits + 1L }; env$pending <- 1L; s4function <- "CompletionInspectFunction"; methods::setClass(s4function, slots = c(method = "function", value = "numeric")); sf <- methods::new(s4function, method = function() { hits <<- hits + 1L }, value = 1)');
   const classify = result => Object.fromEntries(result.names.map((name, index) => [name, result.kinds[index]]));
   const listMembers = await inspectTyped("typed");
@@ -285,7 +311,14 @@ test("real embedded R completion inspects nested storage without running user co
   await until(() => output.includes("LARGE_READY"), "large-object fixtures ready");
   assert.deepEqual(await inspect("large_env"), { status: "unavailable" });
   assert.deepEqual(await inspect("large_pair"), { status: "unavailable" });
-  assert.deepEqual(await inspect("large_pair", [{ kind: "field", name: "late" }]), available([]));
+  assert.deepEqual(await inspect("large_pair", [{ kind: "field", name: "late" }]), { status: "unavailable" });
+  await submit('partial_limit <- setNames(rep(list(list(alpha = 1)), 4097L), c("inner", rep("unrelated", 4095L), "innate")); partial_unknown <- setNames(list(list(alpha = 1), list(beta = 2)), c("inner", bytes_name))');
+  for (const root of ["partial_limit", "partial_unknown"]) {
+    assert.deepEqual(await inspect(root, [{ kind: "field", name: "inn" }]), { status: "unavailable" },
+      "do not claim a unique partial match when not every name can be checked");
+    assert.deepEqual(await inspect(root, [{ kind: "field", name: "inner" }]), available(["alpha"]),
+      "an exact match does not require checking later names");
+  }
   await submit('wide_limit <- as.list(seq_len(1001L)); names(wide_limit) <- paste0("column", seq_len(1001L))');
   assert.deepEqual(await inspect("wide_limit"), { status: "unavailable" });
   // A single oversized label must be rejected before allocating a translated

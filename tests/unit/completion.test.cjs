@@ -49,6 +49,31 @@ test("cached S4 slot schemas survive incomplete native attributes and retain gua
   }
 });
 
+test("custom top-level member metadata survives storage inspection without leaking into nested objects", async () => {
+  for (const [type, classes, expected] of [
+    ["list", ["custom"], ["public"]],
+    ["environment", ["R6Thing", "R6"], ["public"]],
+    ["environment", ["python.builtin.object"], ["public"]],
+    ["list", ["list"], ["storage"]],
+    ["list", ["data.frame"], ["storage"]],
+    ["list", ["data.table", "data.frame"], ["storage"]],
+    ["list", ["custom", "data.frame"], ["public"]],
+  ]) {
+    const data = { globalenv: { obj: { type, class: classes, names: ["public"] } } };
+    for (const [input, labels] of [["obj$", expected], ["obj$child$", ["storage"]]]) {
+      const entries = await completion.collectCompletionEntries(
+        completion.getCompletionContext(input, input.length), undefined, undefined,
+        data, [], [], undefined, async () => ({ status: "available", names: ["storage"] }));
+      assert.deepEqual(entries.map(entry => entry.label), labels, classes.join("/") + input);
+    }
+  }
+  const cleared = await completion.collectCompletionEntries(
+    completion.getCompletionContext("obj$", 4), undefined, undefined,
+    { globalenv: { obj: { type: "list", class: ["list"], names: ["stale"] } } },
+    [], [], undefined, async () => ({ status: "available", names: [] }));
+  assert.deepEqual(cleared, [], "fresh empty storage still clears stale ordinary names");
+});
+
 test("native nested completion reaches Rust without awaiting the language server", async () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {

@@ -746,36 +746,55 @@ impl Native {
         Ok(members)
     }
 
-    unsafe fn index_of(&self, value: Sexp, name: &str) -> Result<Option<usize>, Suppression> {
+    unsafe fn index_of(&self, value: Sexp, name: &str, partial: bool) -> Result<Option<usize>, Suppression> {
+        let mut candidate = None;
+        let mut ambiguous = false;
+        let mut unknown = false;
+        let mut matches = |stored: Option<String>, index: usize| {
+            let Some(stored) = stored else {
+                // An undecodable or oversized name could hide a second
+                // partial match. Exact matches remain safe and authoritative.
+                unknown = true;
+                return false;
+            };
+            if stored == name { return true; }
+            if partial && stored.starts_with(name) {
+                if candidate.is_some() { ambiguous = true; }
+                else { candidate = Some(index); }
+            }
+            false
+        };
         let kind = (self.type_of)(value);
+        let exhausted;
         if matches!(kind, LIST | LANGUAGE | DOTS) {
             let mut cursor = value;
             let mut index = 0;
             while cursor != self.nil && index < MAX_SCANNED_ENTRIES {
                 if index % 32 == 0 { self.check_deadline()?; }
                 let tag = (self.tag)(cursor);
-                if tag != self.nil && self.text((self.printname)(tag)).as_deref() == Some(name) {
+                if tag != self.nil && matches(self.text((self.printname)(tag)), index) {
                     return Ok(Some(index));
                 }
                 cursor = (self.cdr)(cursor);
                 index += 1;
             }
-            return Ok(None);
-        }
-        let names = (self.get_attrib)(value, self.names);
-        if names == self.nil || (self.type_of)(names) != STRING {
-            return Ok(None);
-        }
-        if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
-        let len = (self.xlength)(names);
-        if len < 0 { return Ok(None); }
-        for index in 0..len.min(MAX_SCANNED_ENTRIES as isize) {
-            if index % 32 == 0 { self.check_deadline()?; }
-            if self.text((self.string_elt)(names, index)).as_deref() == Some(name) {
-                return Ok(Some(index as usize));
+            exhausted = cursor == self.nil;
+        } else {
+            let names = (self.get_attrib)(value, self.names);
+            if names == self.nil || (self.type_of)(names) != STRING { return Ok(None); }
+            if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
+            let len = (self.xlength)(names);
+            if len < 0 { return Ok(None); }
+            for index in 0..len.min(MAX_SCANNED_ENTRIES as isize) {
+                if index % 32 == 0 { self.check_deadline()?; }
+                if matches(self.text((self.string_elt)(names, index)), index as usize) {
+                    return Ok(Some(index as usize));
+                }
             }
+            exhausted = len as usize <= MAX_SCANNED_ENTRIES;
         }
-        Ok(None)
+        if !exhausted || (partial && unknown) { return Err(Suppression::InspectionLimit); }
+        Ok(if ambiguous { None } else { candidate })
     }
 
     unsafe fn item(&self, value: Sexp, index: usize) -> Result<Option<Sexp>, Suppression> {
@@ -853,7 +872,10 @@ impl Native {
                             Ok(self.item(source, index)?.map(View::Object))
                         }
                     }
-                    Step::NamedIndex(name) | Step::Field(name) | Step::SliceName(name)
+                    Step::Field(name) if selected_name.as_ref().is_some_and(|selected| selected.starts_with(name)) => {
+                        Ok(self.item(source, index)?.map(View::Object))
+                    }
+                    Step::NamedIndex(name) | Step::SliceName(name)
                         if selected_name.as_deref() == Some(name.as_str()) => {
                         if matches!(step, Step::SliceName(_)) {
                             Ok(Some(View::Slice { source, index }))
@@ -900,8 +922,11 @@ impl Native {
                     return Err(Suppression::UnsafeDispatch);
                 }
                 match step {
-                    Step::Field(name) | Step::NamedIndex(name) => {
-                        let Some(index) = self.index_of(value, &name)? else { return Ok(None); };
+                    Step::Field(ref name) | Step::NamedIndex(ref name) => {
+                        // Only $ partially matches a unique stored name. [[,
+                        // environments and slots retain exact lookup semantics.
+                        let partial = matches!(step, Step::Field(_));
+                        let Some(index) = self.index_of(value, name, partial)? else { return Ok(None); };
                         Ok(self.item(value, index)?.map(View::Object))
                     }
                     Step::Index(index) => {
@@ -913,7 +938,7 @@ impl Native {
                         } else { Ok(None) }
                     }
                     Step::SliceName(name) if matches!(kind, VECTOR | EXPRESSION) => {
-                        Ok(self.index_of(value, &name)?.map(|index| View::Slice { source: value, index }))
+                        Ok(self.index_of(value, &name, false)?.map(|index| View::Slice { source: value, index }))
                     }
                     _ => Ok(None),
                 }

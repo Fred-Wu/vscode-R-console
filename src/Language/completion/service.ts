@@ -55,7 +55,8 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
-  const runtimeReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
+  const runtimeQuery = context.objectName ? parseRuntimeMemberQuery(context.objectName) : undefined;
+  const runtimeReceiver = runtimeQuery !== undefined;
   const rawLspResult = await rawLspItemsRequest;
   const inferred = rawLspResult.memberResolved ||
     rawLspResult.entries.some(entry => entry.role === "member");
@@ -111,13 +112,20 @@ export async function collectCompletionEntries(
     !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
   if (context.kind === "member") {
-    // Published S4 slot metadata describes the class schema; raw attributes
-    // cannot replace it (notably the implicit .Data slot). Retain its order
-    // and names, using guarded results only to enrich matching slot kinds.
-    const cachedSlots = runtimeRequested && context.operator === "@" && sessionItems.length > 0
+    // S4 slots and custom .DollarNames metadata can expose members absent
+    // from storage. Retain the published schema without calling its methods.
+    // Ordinary storage still uses fresh native names, including empty lists.
+    const metadata = runtimeQuery?.steps.length === 0
+      ? sessionData?.globalenv?.[runtimeQuery.root] : undefined;
+    const classes = metadata?.class;
+    const ordinaryClass = !classes?.length ||
+      (classes.length === 1 && (classes[0] === metadata?.type || classes[0] === "data.frame")) ||
+      (classes.length === 2 && classes[0] === "data.table" && classes[1] === "data.frame");
+    const cachedSchema = runtimeRequested && sessionItems.length > 0 &&
+      (context.operator === "@" || (context.operator === "$" && !ordinaryClass))
       ? sessionItems.map(item => runtimeMembers?.find(member => member.label === item.label) ?? item)
       : undefined;
-    const entries = cachedSlots ?? (runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
+    const entries = cachedSchema ?? (runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
       : nativeMembers ? rawLspResult.entries : sessionItems);
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete || retryableRuntime);
