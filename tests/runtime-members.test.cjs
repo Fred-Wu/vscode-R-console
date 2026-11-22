@@ -192,6 +192,35 @@ test("real embedded R completion inspects nested storage without running user co
     "environment access never partially matches bindings");
   assert.deepEqual(await inspect("env", [{ kind: "named-index", name: "inner" }]), available(["value"]));
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "empty" }]), available([]));
+  await submit('dispatch_hits <- 0L; custom_env <- new.env(parent = emptyenv()); custom_env$inner <- list(storage = 1); class(custom_env) <- c("child_env", "completion_custom_env")');
+  const fieldStep = [{ kind: "field", name: "inner" }];
+  const indexStep = [{ kind: "named-index", name: "inner" }];
+  const unsafeDispatch = { status: "suppressed", reason: "unsafe-dispatch" };
+  // A class alone is not a reason to disable ordinary environment/R6 access.
+  assert.deepEqual(await inspect("custom_env", fieldStep), available(["storage"]));
+  assert.deepEqual(await inspect("custom_env", indexStep), available(["storage"]));
+  await submit('`$.completion_custom_env` <- function(x, name) { dispatch_hits <<- dispatch_hits + 1L; list(actual = 2) }; registerS3method("[[", "completion_custom_env", function(x, ...) { dispatch_hits <<- dispatch_hits + 1L; list(actual_index = 3) }, envir = asNamespace("base"))');
+  assert.deepEqual(await inspect("custom_env", fieldStep), unsafeDispatch);
+  assert.deepEqual(await inspect("custom_env", indexStep), unsafeDispatch);
+  await submit('assign("callable", function() NULL, envir = custom_env)');
+  const customEnvNames = await inspectTyped("custom_env");
+  assert.equal(customEnvNames.status, "available");
+  assert.equal(customEnvNames.kinds[customEnvNames.names.indexOf("callable")], 0,
+    "custom accessors cannot promise the callable kind of a stored binding");
+  await submit('stopifnot(dispatch_hits == 0L, identical(names(custom_env$inner), "actual"), identical(names(custom_env[["inner"]]), "actual_index"), dispatch_hits == 2L); dispatch_hits <- 0L; rm("$.completion_custom_env"); rm(list = "[[.completion_custom_env", envir = get(".__S3MethodsTable__.", asNamespace("base"))); cat("ENV_DISPATCH_VERIFIED\\n")');
+  assert.match(output, /ENV_DISPATCH_VERIFIED/);
+  await submit('attach(setNames(list(function(x, name) { dispatch_hits <<- dispatch_hits + 1L; list(attached = 1) }), "$.completion_custom_env"), name = "completion_method_fixture")');
+  assert.deepEqual(await inspect("custom_env", fieldStep), unsafeDispatch);
+  assert.deepEqual(await inspect("custom_env", indexStep), available(["storage"]));
+  await submit('detach("completion_method_fixture"); delayedAssign("$.completion_custom_env", { dispatch_hits <<- dispatch_hits + 1L; function(x, name) NULL })');
+  assert.deepEqual(await inspect("custom_env", fieldStep), unsafeDispatch);
+  await submit('rm("$.completion_custom_env"); makeActiveBinding("$.completion_custom_env", function() { dispatch_hits <<- dispatch_hits + 1L; function(x, name) NULL }, .GlobalEnv)');
+  assert.deepEqual(await inspect("custom_env", fieldStep), unsafeDispatch);
+  await submit('rm("$.completion_custom_env"); `$.default` <- function(x, name) { dispatch_hits <<- dispatch_hits + 1L; list(default = 1) }');
+  assert.deepEqual(await inspect("custom_env", fieldStep), unsafeDispatch);
+  await submit('rm("$.default"); stopifnot(dispatch_hits == 0L); cat("ENV_METHODS_NOT_FORCED\\n")');
+  assert.match(output, /ENV_METHODS_NOT_FORCED/);
+  assert.deepEqual(await inspect("custom_env", fieldStep), available(["storage"]));
   output = "";
   await submit('cat("S4_READY:", exists("s4", envir = .GlobalEnv, inherits = FALSE), if (exists("s4", envir = .GlobalEnv, inherits = FALSE)) isS4(s4) else FALSE, if (exists("s4", envir = .GlobalEnv, inherits = FALSE)) paste(names(attributes(s4)), collapse = ",") else "", "\\n")');
   await until(() => output.includes("S4_READY:"), "S4 fixture state");
@@ -430,6 +459,26 @@ test("real embedded R completion inspects nested storage without running user co
   assert.equal(tableBracket.status, "available");
   assert.equal(tableBracket.bracketKind, "data.table");
   assert.deepEqual(tableBracket.names, ["amount", "code"]);
+  for (const [marked, expected] of [
+    ['nested_dt$tbl[1, mult = "│"]', undefined],
+    ['nested_dt$tbl[1, roll = │]', undefined],
+    ['nested_dt$tbl[, by = │]', 'code'],
+    ['nested_dt$tbl[, .SDcols = │]', '"code"'],
+    ['nested_dt$tbl[1, on = │]', '"code"'],
+    ['test2[i = │]', '"xtest"'], ['test2[j = │]', undefined],
+    ['test2[, j = │]', '"xtest"'], ['test2[i = │, ]', undefined],
+  ]) {
+    const cursor = marked.indexOf("│"), input = marked.replace("│", "");
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, cursor), undefined, undefined, undefined, [], [], undefined,
+      (receiver, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver, target)));
+    const column = marked.startsWith("test2") ? "xtest" : "code";
+    assert.equal(entries.find(entry => entry.label === column)?.insertText, expected, marked);
+  }
+  await submit('stopifnot(identical(names(nested_dt$tbl[, .SD, .SDcols = "code"]), "code"), identical(names(nested_dt$tbl[, .N, by = code]), c("code", "N")), nrow(nested_dt$tbl[list("a"), on = "code"]) == 1L); cat("COLUMN_ARGUMENTS_VERIFIED\\n")');
+  assert.match(output, /COLUMN_ARGUMENTS_VERIFIED/);
+  await submit('stopifnot(identical(test2[i = "xtest"], test2["xtest"]), identical(test2[, j = "xtest"], test2[["xtest"]])); cat("FRAME_ARGUMENTS_VERIFIED\\n")');
+  assert.match(output, /FRAME_ARGUMENTS_VERIFIED/);
   // [ on data.table selects rows (or joins); it cannot use a list-column view.
   await submit('slice_dt <- data.table::data.table(alpha = 1:3, beta = 4:6); slice_df <- as.data.frame(slice_dt); slice_list <- list(alpha = list(child = 1), beta = 2); slice_nested <- list(tbl = slice_dt); slice_index <- 2L; slice_name <- "alpha"; stopifnot(identical(names(slice_dt[1]), c("alpha", "beta")), identical(names(slice_dt[2]), c("alpha", "beta")))');
   for (const expression of ["slice_dt[1]", "slice_dt[2]", "slice_dt[3]",

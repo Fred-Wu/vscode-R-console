@@ -541,6 +541,41 @@ test("cached top-level member names remain available when native inspection is u
   assert.deepEqual(requested, [['obj', '$'], ['obj', '$'], ['obj', '@']]);
 });
 
+test("fresh and cached bracket fields follow argument semantics and quote column selectors", async () => {
+  const workspace = { globalenv: {
+    DT: { class: ['data.table', 'data.frame'], names: ['alpha'] },
+    df: { class: ['data.frame'], names: ['alpha'] },
+  } };
+  const cases = [
+    ['DT[1, mult = "│"]', undefined], ['DT[1, roll = │]', undefined],
+    ['DT[1, nomatch = │]', undefined], ['DT[1, unknown_option = │]', undefined],
+    ['DT[1, `mult` = │]', undefined], ['DT[1, "m\\u0075lt" = │]', undefined],
+    ['DT[, by = │]', 'alpha'], ['DT[, keyby = │]', 'alpha'],
+    ['DT[, `by` = │]', 'alpha'], ['DT[, "b\\u0079" = │]', 'alpha'],
+    ['DT[j = │]', 'alpha'], ['DT[i = │]', 'alpha'],
+    ['DT[, .SDcols = │]', '"alpha"'], ['DT[1, on = │]', '"alpha"'],
+    ['DT[, .SDcols = "│"]', 'alpha'], ['DT[, │]', 'alpha'],
+    ['df[j = │]', undefined], ['df[i = │]', '"alpha"'],
+    ['df[i = │, ]', undefined], ['df[, j = │]', '"alpha"'],
+    ['df[j = │, i = 1]', '"alpha"'], ['df[j = 1, i = │]', undefined],
+    ['df[, │]', '"alpha"'], ['df[│, ]', undefined],
+    ['DT[[exact = │]]', undefined],
+  ];
+  for (const [marked, expected] of cases) {
+    const context = contextAt(marked);
+    for (const native of [true, false]) {
+      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+        workspace, [], [], undefined, async () => native ? {
+          status: 'available', names: ['alpha'],
+          bracketKind: context.objectName === 'DT' ? 'data.table' : 'data.frame',
+        } : { status: 'unavailable' });
+      const fields = entries.filter(entry => entry.detail === context.objectName);
+      assert.deepEqual(fields.map(entry => entry.insertText), expected === undefined ? [] : [expected],
+        `${marked} (${native ? 'native' : 'cached'})`);
+    }
+  }
+});
+
 test("subscript supplements preserve symbols and fields supplied by the R provider", async () => {
   for (const text of ['DT[.', 'DT[, keyby = .']) {
     const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),

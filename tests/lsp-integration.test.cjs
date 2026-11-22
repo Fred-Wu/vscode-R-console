@@ -1790,7 +1790,7 @@ test("workspace subscript columns respect receiver class and dimensions without 
   } };
   for (const [marked, expected] of [
     ['DT[, │]', ['alpha', 'beta']], ['df[, │]', ['"alpha"', '"beta"']],
-    ['lst[[│]]', ['"alpha"', '"beta"']], ['df[│, ]', []], ['DT[, by = │]', []],
+    ['lst[[│]]', ['"alpha"', '"beta"']], ['df[│, ]', []], ['DT[, by = │]', ['alpha', 'beta']],
     ['unknown[[│]]', []], ['lst$nested[[│]]', []],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
@@ -1899,6 +1899,23 @@ test("installed bracket methods use guarded receiver classification without sess
   assert.ok(frame.some(item => item.label === "drop" && item.insertText === "drop = "));
   const completed = await collect('test2[, "xtest", │]', "data.frame");
   assert.ok(completed.some(item => item.label === "drop" && item.insertText === "drop = "));
+  for (const marked of ['test[1, mult = "│"]', 'test[1, roll = │]', 'test[1, nomatch = │]']) {
+    assert.ok(!(await collect(marked, "data.table")).some(item => item.label === "xtest"), marked);
+  }
+  for (const [marked, insertText] of [
+    ['test[, by = │]', 'xtest'], ['test[, keyby = │]', 'xtest'],
+    ['test[, .SDcols = │]', '"xtest"'], ['test[1, on = │]', '"xtest"'],
+  ]) {
+    assert.ok((await collect(marked, "data.table")).some(item =>
+      item.label === "xtest" && item.insertText === insertText), marked);
+  }
+  for (const [marked, expected] of [
+    ['test2[i = │]', true], ['test2[j = │]', false],
+    ['test2[i = │, ]', false], ['test2[, j = │]', true],
+  ]) {
+    assert.equal((await collect(marked, "data.frame")).some(item =>
+      item.label === "xtest" && item.insertText === '"xtest"'), expected, marked);
+  }
 });
 
 test("subscript symbols and fields come from the real language server", { timeout: 90000 }, async t => {

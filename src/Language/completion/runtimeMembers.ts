@@ -1,6 +1,15 @@
 import { TokenType, tokenize, type Token } from "../lexer";
 import type { MemberInspectionQuery, MemberInspectionStep, MemberInspectionTarget } from "../../Runtime/backendProtocol";
 
+/** Decode a single argument tag without parsing or evaluating R source. */
+export function decodeRArgumentName(spelling: string): string | undefined {
+  const tokens = tokenize(spelling).filter(token => token.type !== TokenType.EOF);
+  if (tokens.length !== 1) return undefined;
+  const token = tokens[0];
+  return token.type === TokenType.String && token.closed
+    ? literalName(token.value) : memberName(token);
+}
+
 export function parseRuntimeMemberQuery(
   expression: string, target: MemberInspectionTarget = "$"
 ): MemberInspectionQuery | undefined {

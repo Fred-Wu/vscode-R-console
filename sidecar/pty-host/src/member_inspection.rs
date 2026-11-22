@@ -154,6 +154,10 @@ pub(crate) struct InspectorApi {
     integer_elt: Option<usize>,
     real_elt: Option<usize>,
     envlength: Option<usize>,
+    enclosing_env: usize,
+    promise_value: usize,
+    empty_env: usize,
+    base_namespace: usize,
     vmaxget: usize,
     vmaxset: usize,
 }
@@ -200,6 +204,10 @@ impl InspectorApi {
             integer_elt: symbol(b"INTEGER_ELT\0"),
             real_elt: symbol(b"REAL_ELT\0"),
             envlength: symbol(b"Rf_envlength\0"),
+            enclosing_env: symbol(b"ENCLOS\0")?,
+            promise_value: symbol(b"PRVALUE\0")?,
+            empty_env: symbol(b"R_EmptyEnv\0")?,
+            base_namespace: symbol(b"R_BaseNamespace\0")?,
             // Required for bounded copies of R_alloc-backed UTF-8 translations.
             vmaxget: symbol(b"vmaxget\0")?,
             vmaxset: symbol(b"vmaxset\0")?,
@@ -271,6 +279,8 @@ const RMG_LS2: c_int = 21;
 const RMG_INTEGER_ELT: c_int = 22;
 const RMG_REAL_ELT: c_int = 23;
 const RMG_ENVLENGTH: c_int = 24;
+const RMG_ENCLOS: c_int = 28;
+const RMG_PRVALUE: c_int = 29;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
@@ -370,9 +380,15 @@ unsafe extern "C" fn guard_real_elt(a: Sexp, i: isize) -> f64 {
 unsafe extern "C" fn guard_envlength(a: Sexp) -> c_int {
     guarded(RMG_ENVLENGTH, a as usize, 0, 0) as u32 as c_int
 }
+unsafe extern "C" fn guard_enclosing_env(a: Sexp) -> Sexp {
+    guarded(RMG_ENCLOS, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_promise_value(a: Sexp) -> Sexp {
+    guarded(RMG_PRVALUE, a as usize, 0, 0) as usize as Sexp
+}
 
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 28] = [
+    let funcs: [usize; 30] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
@@ -380,7 +396,7 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.protect, api.unprotect, api.ls3.unwrap_or(0), api.ls2.unwrap_or(0),
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
-        api.char_ce,
+        api.char_ce, api.enclosing_env, api.promise_value,
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
         api.raw_protect, api.raw_unprotect,
@@ -423,6 +439,10 @@ struct Native {
     integer_elt: Option<unsafe extern "C" fn(Sexp, isize) -> c_int>,
     real_elt: Option<unsafe extern "C" fn(Sexp, isize) -> f64>,
     envlength: Option<unsafe extern "C" fn(Sexp) -> c_int>,
+    enclosing_env: Unary,
+    promise_value: Unary,
+    empty_env: Sexp,
+    base_namespace: Sexp,
     global: Sexp,
     nil: Sexp,
     na_string: Sexp,
@@ -473,6 +493,10 @@ impl Native {
             integer_elt: api.integer_elt.map(|_| guard_integer_elt as _),
             real_elt: api.real_elt.map(|_| guard_real_elt as _),
             envlength: api.envlength.map(|_| guard_envlength as _),
+            enclosing_env: guard_enclosing_env,
+            promise_value: guard_promise_value,
+            empty_env: *(api.empty_env as *const Sexp),
+            base_namespace: *(api.base_namespace as *const Sexp),
             global,
             nil,
             na_string: *(api.na_string as *const Sexp),
@@ -545,7 +569,7 @@ impl Native {
             (classes.len() == 2 && classes[0] == "data.table" && classes[1] == "data.frame"))
     }
 
-    unsafe fn binding(&self, env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
+    unsafe fn stored_binding(&self, env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
         self.check_deadline()?;
         if self.custom_database(env)? { return Err(Suppression::UnsafeEnvironment); }
         let Some(sym) = self.symbol(name) else { return Ok(None); };
@@ -553,8 +577,65 @@ impl Native {
         if (self.active)(sym, env) != 0 { return Err(Suppression::ActiveBinding); }
         let value = (self.find)(env, sym);
         if value.is_null() || value == self.unbound { return Ok(None); }
-        if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
         Ok(Some(value))
+    }
+
+    unsafe fn binding(&self, env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
+        let value = self.stored_binding(env, name)?;
+        if value.is_some_and(|value| (self.type_of)(value) == PROMISE) {
+            return Err(Suppression::DeferredBinding);
+        }
+        Ok(value)
+    }
+
+    // Environment classes (including R6) do not necessarily override access.
+    // Check for possible S3 dispatch without fetching or forcing any method.
+    // Primitive accessors consult the calling search path and base's S3 table.
+    unsafe fn ordinary_environment_dispatch(&self, value: Sexp, accessor: &str)
+        -> Result<bool, Suppression> {
+        if (self.is_s4)(value) != 0 { return Ok(false); }
+        if (self.is_object)(value) == 0 { return Ok(true); }
+        let mut classes = self.classes(value)?;
+        classes.push("default".into());
+        let mut symbols = Vec::with_capacity(classes.len());
+        for class in classes {
+            self.check_deadline()?;
+            let method = format!("{accessor}.{class}");
+            if method.len() > MAX_NAME_BYTES { return Err(Suppression::InspectionLimit); }
+            symbols.push(self.symbol(&method).ok_or(Suppression::UnsafeDispatch)?);
+        }
+        let has_method = |env: Sexp| -> Result<bool, Suppression> {
+            self.check_deadline()?;
+            if env.is_null() || (self.type_of)(env) != ENV {
+                return Err(Suppression::UnsafeEnvironment);
+            }
+            if self.custom_database(env)? { return Err(Suppression::UnsafeEnvironment); }
+            for symbol in &symbols {
+                self.check_deadline()?;
+                // Existence alone is sufficient to suppress: even inspecting
+                // an active or lazy method binding could execute user code.
+                if (self.exists)(env, *symbol) != 0 { return Ok(true); }
+            }
+            Ok(false)
+        };
+        let mut env = self.global;
+        let mut depth = 0;
+        while env != self.empty_env {
+            if depth >= 128 { return Err(Suppression::InspectionLimit); }
+            if has_method(env)? { return Ok(false); }
+            env = (self.enclosing_env)(env);
+            depth += 1;
+        }
+        if let Some(mut table) = self.stored_binding(self.base_namespace, ".__S3MethodsTable__.")? {
+            // Base publishes this table through an already-forced lazy binding.
+            // Read only its cached value; never evaluate an unforced promise.
+            if (self.type_of)(table) == PROMISE {
+                table = (self.promise_value)(table);
+                if table == self.unbound { return Err(Suppression::DeferredBinding); }
+            }
+            if has_method(table)? { return Ok(false); }
+        }
+        Ok(true)
     }
 
     // Collect names and stored-member kinds in the same linear pass. Looking
@@ -722,7 +803,16 @@ impl Native {
         }
         if kind == ENV {
             return if matches!(target, Target::Dollar | Target::DoubleBracket) {
-                self.classify_unindexed(value, target, self.environment_names(value)?)
+                let names = self.environment_names(value)?;
+                let accessor = if target == Target::Dollar { "$" } else { "[[" };
+                if !self.ordinary_environment_dispatch(value, accessor)? {
+                    // Names remain safe storage metadata, like a custom list.
+                    // A stored function need not be callable through its method.
+                    let kinds = vec![0; names.len()];
+                    Ok(Members { names, kinds, bracket_kind: 0 })
+                } else {
+                    self.classify_unindexed(value, target, names)
+                }
             } else { Ok(Members::empty()) };
         }
         if target == Target::Dollar && !matches!(kind, VECTOR | EXPRESSION | LIST | LANGUAGE) {
@@ -911,6 +1001,15 @@ impl Native {
                     }
                 }
                 if kind == ENV {
+                    if self.custom_database(value)? { return Err(Suppression::UnsafeEnvironment); }
+                    let accessor = match step {
+                        Step::Field(_) => "$",
+                        Step::NamedIndex(_) => "[[",
+                        _ => return Ok(None),
+                    };
+                    if !self.ordinary_environment_dispatch(value, accessor)? {
+                        return Err(Suppression::UnsafeDispatch);
+                    }
                     return match step {
                         Step::Field(name) | Step::NamedIndex(name) =>
                             Ok(self.binding(value, &name)?.map(View::Object)),

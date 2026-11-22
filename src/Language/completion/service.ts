@@ -5,7 +5,7 @@ import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
-import { getFieldInsertText, filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
+import { bracketFieldMode, getFieldInsertText, filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
 
 export async function collectCompletionEntries(
   context: CompletionContext,
@@ -79,19 +79,15 @@ export async function collectCompletionEntries(
   const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
   const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
   const bracketKind = runtimeResult?.status === "available" ? runtimeResult.bracketKind : undefined;
-  // For two-dimensional data frames, column names belong to the second index.
-  // data.table treats the first index as a column-expression context as well.
-  const suppressRowColumns = context.kind === "bracket" && context.bracketOperator === "[" &&
-    (context.bracketDimensions ?? 1) > 1 && context.bracketDimension !== 1 &&
-    bracketKind !== "data.table";
-  const runtimeMembers = runtimeNames === undefined ? undefined : suppressRowColumns ? [] :
+  const fieldMode = bracketFieldMode(context, bracketKind);
+  const runtimeMembers = runtimeNames === undefined ? undefined : fieldMode === undefined ? [] :
     runtimeNames.map((name, index) => {
     const kind = runtimeKinds?.[index] === 1 ? vscode.CompletionItemKind.Function
       : runtimeKinds?.[index] === 2 ? vscode.CompletionItemKind.Property
       : vscode.CompletionItemKind.Field;
     return {
       label: name,
-      insertText: getFieldInsertText(name, context, bracketKind === "data.table") +
+      insertText: getFieldInsertText(name, context, fieldMode === "bare") +
         (kind === vscode.CompletionItemKind.Function && context.kind === "member" ? "()" : ""),
       kind,
       detail: context.objectName,

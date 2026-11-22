@@ -13,7 +13,7 @@ enum {
   RMG_VECTOR_ELT, RMG_XLENGTH, RMG_STRING_ELT, RMG_UTF8, RMG_IS_S4,
   RMG_IS_OBJECT, RMG_PROTECT, RMG_UNPROTECT, RMG_LS3, RMG_LS2,
   RMG_INTEGER_ELT, RMG_REAL_ELT, RMG_ENVLENGTH, RMG_VMAXGET, RMG_VMAXSET,
-  RMG_CHAR_CE, RMG_COUNT
+  RMG_CHAR_CE, RMG_ENCLOS, RMG_PRVALUE, RMG_COUNT
 };
 
 typedef void *RmgSexp;
@@ -63,7 +63,7 @@ static void rmg_invoke(void *opaque) {
       call->result = (uint64_t)(uint32_t)((int (*)(RmgSexp, RmgSexp))ptr)((RmgSexp)call->a, (RmgSexp)call->b); break;
     case RMG_TYPEOF: case RMG_ALTREP: case RMG_IS_S4: case RMG_IS_OBJECT: case RMG_ENVLENGTH:
       call->result = (uint64_t)(uint32_t)((int (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
-    case RMG_ATTRIB: case RMG_TAG: case RMG_CAR: case RMG_CDR: case RMG_PRINTNAME:
+    case RMG_ATTRIB: case RMG_TAG: case RMG_CAR: case RMG_CDR: case RMG_PRINTNAME: case RMG_ENCLOS: case RMG_PRVALUE:
       call->result = (uintptr_t)((RmgSexp (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
     case RMG_VECTOR_ELT: case RMG_STRING_ELT:
       call->result = (uintptr_t)((RmgSexp (*)(RmgSexp, ptrdiff_t))ptr)((RmgSexp)call->a, (ptrdiff_t)call->b); break;

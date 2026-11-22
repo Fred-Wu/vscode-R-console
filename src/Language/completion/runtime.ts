@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, WorkspaceData, GlobalEnvItem } from "./types";
-import { backtickRName, quoteRNameIfNeeded, getFieldInsertText } from "./candidates";
+import { backtickRName, quoteRNameIfNeeded, getFieldInsertText, bracketFieldMode } from "./candidates";
 import { allowsSymbolCompletions } from "./policy";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
@@ -72,14 +72,17 @@ export function getDataColumnCompletions(
   context: CompletionContext,
   data: WorkspaceData | undefined
 ): CompletionEntry[] {
-  if (!context.dataObjectName || !data?.globalenv || context.bracketArgumentName) {
+  if (!context.dataObjectName || !data?.globalenv) {
     return [];
   }
 
   const obj = data.globalenv[context.dataObjectName];
-  const bare = obj?.class?.includes("data.table") === true;
-  if (context.kind === "bracket" && !bare && (context.bracketDimensions ?? 1) > 1 &&
-      context.bracketDimension !== 1) return [];
+  const classes = obj?.class;
+  const kind = classes?.length === 2 && classes[0] === "data.table" && classes[1] === "data.frame"
+    ? "data.table" : classes?.length === 1 && classes[0] === "data.frame" ? "data.frame" : undefined;
+  const mode = bracketFieldMode(context, kind);
+  if (mode === undefined) return [];
+  const bare = context.kind === "bracket" ? mode === "bare" : obj?.class?.includes("data.table") === true;
   const names = asStringArray(obj?.names);
   if (names.length === 0) {
     return [];
