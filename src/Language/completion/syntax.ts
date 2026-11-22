@@ -219,3 +219,99 @@ export function getCompletionContext(
   };
 }
 
+
+/**
+ * Static inference is allowed to parse an executable receiver but must never
+ * submit it to the guarded live inspector. Preserve the member/[[ context
+ * rejected by the runtime grammar instead of reinterpreting it as a global
+ * symbol prefix.
+ */
+export function getStaticFallbackContext(
+  inputBuffer: string, cursorPosition: number,
+  fullTextBeforeCursor?: string,
+  textAfterCursor = inputBuffer.slice(cursorPosition)
+): CompletionContext | undefined {
+  const runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor);
+  // Quoted indices on executable receivers may look like ordinary string
+  // literals to the strict runtime parser, which must still reject inspection.
+  const quotedIndex = runtime?.suppressAutomatic && inputBuffer.slice(0, cursorPosition).includes("[");
+  if (!runtime?.rejectionReason && !quotedIndex) return undefined;
+  if (runtime?.rejectionReason && runtime.kind === "member" &&
+      runtime.operator && runtime.objectName) {
+    return { ...runtime, rejectionReason: undefined, staticFallback: true };
+  }
+  const localBefore = inputBuffer.slice(0, cursorPosition);
+  const before = fullTextBeforeCursor ?? localBefore;
+  const shift = before.length - localBefore.length;
+  const fullText = before + textAfterCursor;
+  const identifierEnd = getCompletionSyntax(fullText, before.length).identifierEnd;
+  const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - shift };
+  const tokens = tokenize(before).filter(token =>
+    token.type !== TokenType.EOF && token.type !== TokenType.Comment && token.type !== TokenType.Newline);
+  const end = tokens.at(-1);
+  const identifier = end && isAccessorNamePrefix(end) &&
+    end.position + end.value.length === before.length ? end : undefined;
+  const beforePrefix = identifier ? tokens.slice(0, -1) : tokens;
+  const accessor = beforePrefix.at(-1);
+  if (accessor?.type === TokenType.Operator && (accessor.value === "$" || accessor.value === "@") &&
+      beforePrefix.length > 1 && before.slice(accessor.position + accessor.value.length).trim() === (identifier?.value ?? "")) {
+    const prefix = identifier?.value ?? "";
+    return {
+      kind: "member", prefix, replaceStart: (identifier?.position ?? before.length) - shift,
+      autoTrigger: true, operator: accessor.value as "$" | "@",
+      triggerCharacter: prefix ? undefined : accessor.value,
+      ...replacement,
+      snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
+      staticFallback: true,
+    };
+  }
+
+  // The runtime bracket parser intentionally rejects callable/computed
+  // receivers. For LSP only, locate the active bracket without resolving it.
+  const frames: Array<{ value: string; start: number; operator?: "[" | "[[" }> = [];
+  for (const token of tokens) {
+    if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace ||
+        token.type === TokenType.LeftBracket) {
+      frames.push({ value: token.value[0], start: token.position,
+        ...(token.type === TokenType.LeftBracket
+          ? { operator: token.value as "[" | "[[" } : {}) });
+    } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace ||
+               token.type === TokenType.RightBracket) {
+      const expected = token.value[0] === ")" ? "(" : token.value[0] === "}" ? "{" : "[";
+      if (frames.pop()?.value !== expected) return undefined;
+    }
+  }
+  const active = frames.at(-1);
+  if (!active?.operator || active.start === 0) return undefined;
+  const tail = before.slice(active.start + active.operator.length);
+  let prefix = "";
+  let quote: "\"" | "'" | undefined;
+  let replaceStart = before.length - shift;
+  if (identifier && identifier.position >= active.start + active.operator.length) {
+    prefix = identifier.value;
+    replaceStart = identifier.position - shift;
+  } else if (end?.type === TokenType.String && end.closed === false &&
+             end.position >= active.start + active.operator.length &&
+             (end.value.startsWith("'") || end.value.startsWith('"'))) {
+    quote = end.value[0] as "\"" | "'";
+    prefix = end.value.slice(1);
+    replaceStart = end.position + 1 - shift;
+  } else if (tail.trim().length !== 0) {
+    // Do not suggest members inside an index expression or after a comma.
+    return undefined;
+  }
+  // A completed quote after the cursor is part of the original source and
+  // must not be replaced when inserting a member name.
+  const stringToken = quote ? tokenize(fullText).find(token =>
+    token.position === end?.position && token.type === TokenType.String) : undefined;
+  const quotedEnd = stringToken?.closed ? stringToken.position + stringToken.value.length - 1 - shift : undefined;
+  return {
+    kind: "bracket", prefix, replaceStart, ...replacement,
+    ...(quotedEnd === undefined ? {} : { replaceEnd: quotedEnd }),
+    autoTrigger: true,
+    bracketOperator: active.operator, bracketQuote: quote,
+    triggerCharacter: prefix ? undefined : "[",
+    snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
+    staticFallback: true,
+  };
+}

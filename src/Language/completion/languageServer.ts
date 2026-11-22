@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionContext, CompletionEntry, CompletionProvider } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { isCallableName } from "./contextParser";
@@ -11,7 +11,8 @@ export async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider,
-  runtimeBracketKind?: "data.frame" | "data.table" | null
+  runtimeBracketKind?: "data.frame" | "data.table" | null,
+  analysisMode?: CompletionAnalysisMode
 ): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
@@ -20,7 +21,7 @@ export async function getLanguageServerCompletions(
     let result = await completionProvider.provideCompletionItems(
       doc,
       position,
-      context.triggerCharacter, undefined, runtimeBracketKind
+      context.triggerCharacter, undefined, runtimeBracketKind, analysisMode
     );
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
@@ -43,7 +44,7 @@ export async function getLanguageServerCompletions(
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter, position, runtimeBracketKind);
+        context.triggerCharacter, position, runtimeBracketKind, analysisMode);
       runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;

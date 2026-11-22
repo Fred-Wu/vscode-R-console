@@ -22,6 +22,8 @@ export type CompletionContext = {
   autoTrigger?: boolean;
   suppressAutomatic?: boolean;
   rejectionReason?: "executable-receiver";
+  // Parser-rejected receiver selected for source-only LSP fallback.
+  staticFallback?: boolean;
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
   // Source tags from the lexer, available only at an argument-name position.
@@ -47,6 +49,8 @@ export type CompletionEntry = {
 
 export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
+  // Whether static analysis resolved the requested member/column receiver.
+  staticResolved?: boolean;
   // An empty but successful sess column inspection is authoritative.
   columnsResolved?: boolean;
 };
@@ -74,6 +78,8 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
   rConsoleArgumentsExhausted?: boolean;
 };
 
+export type CompletionAnalysisMode = "runtime" | "static";
+
 export interface CompletionProvider {
   // A selected package function can be qualified in the LSP projection while
   // its name remains unqualified in the visible console input.
@@ -85,7 +91,8 @@ export interface CompletionProvider {
     // Keep the user's cursor when position is moved to broaden matching.
     contextPosition?: vscode.Position,
     // Safe, already-inspected receiver class; null means no supported class.
-    runtimeBracketKind?: "data.frame" | "data.table" | null
+    runtimeBracketKind?: "data.frame" | "data.table" | null,
+    analysisMode?: CompletionAnalysisMode
   ): Promise<CompletionResult | undefined>;
 }
 

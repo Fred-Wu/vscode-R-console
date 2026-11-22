@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, getStaticFallbackContext, parseRuntimeMemberQuery } from "../Language/completion";
 import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
 import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
@@ -337,8 +337,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     const query = parseRuntimeMemberQuery(expression, operator);
     if (!query) {
-      logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
-        expression + operator, this.lang.completionDiagnosticsScope);
+      if (!vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false)) {
+        logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
+          expression + operator, this.lang.completionDiagnosticsScope);
+      }
       return undefined;
     }
     const reportUnavailable = () => {
@@ -356,8 +358,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     return response.then(result => {
       if (result.status === "suppressed") {
-        logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
-          expression + operator, this.lang.completionDiagnosticsScope);
+        if (!vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false)) {
+          logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+            expression + operator, this.lang.completionDiagnosticsScope);
+        }
       } else if (result.status === "unavailable") {
         reportUnavailable();
       }
@@ -2156,12 +2160,18 @@ export class RTerminal implements vscode.Pseudoterminal {
     const input = this.getInputSnapshot();
     noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
       this.lang.completionDiagnosticsScope);
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+    const staticEnabled = settings.get<boolean>("completion.staticAnalysis", false);
+    const runtimeContext = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
+    const context = staticEnabled && (runtimeContext?.rejectionReason ||
+      (runtimeContext?.suppressAutomatic && input.textBeforeCursor.includes("[")))
+      ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+          input.text.slice(input.textBeforeCursor.length)) ?? runtimeContext
+      : runtimeContext;
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    if (context?.rejectionReason) {
+    if (context?.rejectionReason && !staticEnabled) {
       logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
         completionDecisionContext(input.textBeforeCursor), this.lang.completionDiagnosticsScope);
     }

@@ -24,6 +24,7 @@ export function refineCompletionEntries(
   const old = cached.context;
   if (allowsSymbolCompletions(context) !== allowsSymbolCompletions(old) ||
       context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
+      (context.staticFallback === true) !== (old.staticFallback === true) ||
       (context.argumentTags === undefined) !== (old.argumentTags === undefined) ||
       input.cursorRow !== cached.input.cursorRow || !context.prefix.startsWith(old.prefix) ||
       input.textBeforeCursor.slice(0, input.textBeforeCursor.length - context.prefix.length) !==

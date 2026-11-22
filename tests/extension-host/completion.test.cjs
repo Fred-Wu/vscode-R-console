@@ -328,3 +328,49 @@ suite("Subscript completion in the VS Code extension host", () => {
     }
   });
 });
+
+suite("Static fallback routing in the VS Code extension host", () => {
+  test("guarded live inspection falls back to source inference without calling an executable receiver", async () => {
+    const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+      "vscode-languageclient/node": require("vscode-languageclient/node"),
+    });
+    let staticEnabled = true;
+    const native = [];
+    const lang = new RTermLang({
+      extensionPath: path.resolve(__dirname, "../.."),
+      rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
+      getStaticAnalysisEnabled: () => staticEnabled,
+      requestRuntimeMemberCompletions: async (receiver, target) => {
+        native.push([receiver, target]);
+        return { status: "suppressed", reason: "unsafe-dispatch" };
+      },
+    });
+    const complete = async text => {
+      const lines = text.split("\n");
+      const input = { text, lines, cursorRow: lines.length - 1,
+        currentLine: lines.at(-1), cursorCol: lines.at(-1).length, textBeforeCursor: text };
+      let entries = [];
+      await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+        getWorkspaceData: () => ({ search: [], globalenv: {} }),
+        applyCompletion() {}, onInlineEntries: items => { entries = items; } });
+      return entries.filter(item => "insertText" in item).map(item => item.insertText);
+    };
+    try {
+      const suppressed = await complete("obj <- list(alpha = 1)\nobj$");
+      assert.ok(suppressed.includes("alpha"), "suppressed live inspection uses the existing R source analyzer");
+      assert.deepEqual(native, [["obj", "$"]]);
+
+      const callable = await complete("make_data <- function() list(data = 1, metadata = 2)\nmake_data()$");
+      assert.ok(callable.includes("data") && callable.includes("metadata"),
+        "source-defined factory members are inferred without evaluating the call");
+      assert.equal(native.length, 1, "executable receivers must never reach the native inspector");
+
+      staticEnabled = false;
+      assert.deepEqual(await complete("make_data()$"), [],
+        "the default runtime-only policy still rejects executable receivers");
+      assert.equal(native.length, 1);
+    } finally {
+      await lang.dispose();
+    }
+  });
+});

@@ -1,4 +1,5 @@
 export type CompletionDecision =
+  | { kind: "StaticInferred" | "StaticUnavailable" }
   | { kind: "Rejected"; reason: "executable-receiver" }
   | { kind: "Suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
@@ -21,6 +22,12 @@ const actions = {
 } as const;
 
 export function formatCompletionDecision(decision: CompletionDecision): string {
+  if (decision.kind === "StaticInferred") {
+    return "[Static Completion - Inferred]: Request completion used source-based inference. The console expression was not executed.";
+  }
+  if (decision.kind === "StaticUnavailable") {
+    return "[Static Completion - Unavailable]: Request completion could not infer members from source. The console expression was not executed.";
+  }
   return `[Runtime Completion - ${decision.kind}]: ${descriptions[decision.reason]}. ${actions[decision.kind]}.`;
 }
 

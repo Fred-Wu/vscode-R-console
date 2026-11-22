@@ -79,6 +79,25 @@ function change() {
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
 
+test("explicit completion mode uses the existing virtual document and controls source inference", async t => {
+  const { client, instances } = createClient(t, { staticAnalysis: true });
+  const source = "object <- list(alpha = 1)\\nobject$";
+  const doc = { getText: () => source };
+  const cursor = new Position(1, 7);
+  await client.provideCompletionItems(doc, cursor, undefined, undefined, undefined, "runtime");
+  await client.provideCompletionItems(doc, cursor, undefined, undefined, undefined, "static");
+  const requests = instances[0].requests.filter(item => item.method === "completion");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].params.rConsoleStaticAnalysis, undefined);
+  assert.equal(requests[1].params.rConsoleStaticAnalysis, true);
+  assert.ok(!requests[0].params.text.includes("object <- list"),
+    "runtime projection masks the previous unsubmitted definition");
+  assert.ok(requests[1].params.text.includes("object <- list"),
+    "static projection retains the current source");
+  assert.equal(client.syncedDocuments.size, 1,
+    "fallback reuses the existing document instead of creating another");
+});
+
 test("native member signatures never wait for runtime inspection", async t => {
   const { client } = createClient(t, {
     staticAnalysis: true,

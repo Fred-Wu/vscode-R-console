@@ -1343,6 +1343,17 @@ unsubmitted input. Session-backed signature handling is implemented in
 `resources/r/completion-runtime.R`; optional source inference is in
 `resources/r/completion-static.R`.
 
+For nested completion, guarded live inspection remains authoritative for
+stored receivers, including stored receivers with no members. If the runtime
+parser rejects an executable receiver or native inspection suppresses unsafe
+access, enabling static analysis routes that request to the existing console
+language server without executing the receiver. The source-only result is
+filtered to its member/index context and logged as static inference rather
+than a native rejection. When a root is not present in cached session metadata,
+positive source inference can still complete an unsubmitted declaration.
+The existing virtual document describes the editable input; it does not
+preserve a journal of previously submitted function bodies.
+
 #### Completion Frontends
 
 Inline completion is the terminal completion frontend selected with

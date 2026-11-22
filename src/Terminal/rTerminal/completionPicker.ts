@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import {
   type CompletionContext, type CompletionEntries, type CompletionEntry, type CompletionPickItem,
-  getCompletionContext, rankCompletionEntries, isCompletionPickItem,
+  getCompletionContext, getStaticFallbackContext, rankCompletionEntries, isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { rebaseCompletionEnds } from "../../Language/completion/refinement";
@@ -165,7 +165,10 @@ export async function pickCompletion({
       const nextInputText = lines.join("\n");
       const nextContext = context.kind === "package"
         ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
-        : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
+        : (context.staticFallback
+          ? getStaticFallbackContext(currentLine, cursorCol, fullTextBeforeCursor,
+              nextInputText.slice(fullTextBeforeCursor.length))
+          : undefined) ?? getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
             nextInputText.slice(fullTextBeforeCursor.length));
       if (!nextContext) {
         return;

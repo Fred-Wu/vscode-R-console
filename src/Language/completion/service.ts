@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
@@ -18,7 +18,8 @@ export async function collectCompletionEntries(
   completionProvider?: CompletionProvider,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string,
-  prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>
+  prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>,
+  analysisMode?: CompletionAnalysisMode
 ): Promise<CompletionEntries> {
   if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -46,7 +47,8 @@ export async function collectCompletionEntries(
           position,
           multilineBuffer,
           completionProvider,
-          runtimeBracketKind
+          runtimeBracketKind,
+          analysisMode
         );
   const bufferItems = getConsoleBufferCompletions(
     context,
@@ -218,3 +220,35 @@ function asCompletionEntries(
   return result;
 }
 
+
+// Static fallback is an isolated source of receiver members. Do not merge
+// unverified session names, global symbols, or buffered text after a native
+// safety refusal; those could masquerade as members of an unsafe receiver.
+export async function collectStaticFallbackEntries(
+  context: CompletionContext,
+  doc: vscode.TextDocument,
+  position: vscode.Position,
+  multilineBuffer: string[],
+  completionProvider: CompletionProvider
+): Promise<CompletionEntries> {
+  if (context.suppressAutomatic || (context.kind !== "member" && context.kind !== "bracket")) {
+    return [];
+  }
+  const result = await getLanguageServerCompletions(
+    context, doc, position, multilineBuffer, completionProvider, undefined, "static"
+  );
+  const memberItems = result.entries.filter(entry =>
+    entry.role === "member" ||
+    (context.kind === "bracket" &&
+      (entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field ||
+       entry.role === "argument" && context.bracketOperator === "["))
+  );
+  const entries = asCompletionEntries(
+    dedupeCompletionEntries(filterCompletionEntries(memberItems, context.prefix)),
+    result.isIncomplete
+  );
+  // An authoritative empty receiver is still a successful resolution.
+  entries.staticResolved = result.memberResolved || memberItems.length > 0;
+  if (!entries.staticResolved) entries.isIncomplete = true;
+  return entries;
+}
