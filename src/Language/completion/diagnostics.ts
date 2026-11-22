@@ -4,16 +4,16 @@ export type CompletionDecision =
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" };
 
 const descriptions = {
-  "executable-receiver": "function call may have side effects",
-  "active-binding": "active binding may have side effects",
-  "deferred-binding": "forcing a delayed value may have side effects",
-  "unsafe-dispatch": "custom accessor may have side effects",
-  "unsafe-altrep": "ALTREP inspection may have side effects",
-  "unsafe-environment": "custom environment access may have side effects",
+  "executable-receiver": "Receiver contains unsupported or executable syntax; runtime inspection was not attempted.",
+  "active-binding": "Active binding would invoke a getter; inspection stopped without reading it.",
+  "deferred-binding": "Deferred binding would be forced; inspection stopped without evaluating it.",
+  "unsafe-dispatch": "Object requires unsupported or custom accessor dispatch; inspection was stopped.",
+  "unsafe-altrep": "ALTREP data could require materialization; inspection was stopped.",
+  "unsafe-environment": "User-defined database environment cannot be inspected safely.",
 } as const;
 
 export function formatCompletionDecision(decision: CompletionDecision): string {
-  return `[Completion - ${decision.kind}]: ${descriptions[decision.reason]}`;
+  return `[Runtime Completion - ${decision.kind}]: ${descriptions[decision.reason]}`;
 }
 
 export function completionDecisionContext(text: string): string {

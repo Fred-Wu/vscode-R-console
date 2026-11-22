@@ -3,18 +3,18 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { formatCompletionDecision } = loadSource("src/Language/completion/diagnostics.ts");
 
-test("completion decisions identify potentially side-effecting operations without user input", () => {
+test("runtime completion refusal logs explain the inspection decision without user input", () => {
   const reasons = [
-    ["Rejected", "executable-receiver", "function call may have side effects"],
-    ["Suppressed", "active-binding", "active binding may have side effects"],
-    ["Suppressed", "deferred-binding", "forcing a delayed value may have side effects"],
-    ["Suppressed", "unsafe-dispatch", "custom accessor may have side effects"],
-    ["Suppressed", "unsafe-altrep", "ALTREP inspection may have side effects"],
-    ["Suppressed", "unsafe-environment", "custom environment access may have side effects"],
+    ["Rejected", "executable-receiver", "Receiver contains unsupported or executable syntax; runtime inspection was not attempted."],
+    ["Suppressed", "active-binding", "Active binding would invoke a getter; inspection stopped without reading it."],
+    ["Suppressed", "deferred-binding", "Deferred binding would be forced; inspection stopped without evaluating it."],
+    ["Suppressed", "unsafe-dispatch", "Object requires unsupported or custom accessor dispatch; inspection was stopped."],
+    ["Suppressed", "unsafe-altrep", "ALTREP data could require materialization; inspection was stopped."],
+    ["Suppressed", "unsafe-environment", "User-defined database environment cannot be inspected safely."],
   ];
   for (const [kind, reason, message] of reasons) {
     const output = formatCompletionDecision({ kind, reason });
-    assert.equal(output, `[Completion - ${kind}]: ${message}`);
+    assert.equal(output, `[Runtime Completion - ${kind}]: ${message}`);
     assert.doesNotMatch(output, /eval\(|make_object|active_obj|\$inner|=\s*['"]/);
   }
 });
