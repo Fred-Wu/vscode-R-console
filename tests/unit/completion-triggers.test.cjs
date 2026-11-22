@@ -36,6 +36,23 @@ test("R keyword prefixes stay in member and namespace completion while typing", 
   assert.equal(contextAt("if│")?.kind, "default", "top-level names remain unchanged");
 });
 
+test("unsupported executable receivers with keyword prefixes cannot fall back to global completion", async () => {
+  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function"];
+  for (const operator of ["$", "@"]) {
+    for (const keyword of keywords) {
+      const input = "make_object()" + operator + keyword;
+      const context = completion.getCompletionContext(input, input.length);
+      assert.equal(context?.kind, "member", input);
+      assert.equal(context.rejectionReason, "executable-receiver", input);
+      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+        { globalenv: { make_object: { type: "closure" }, secret: { type: "double" } } },
+        [], [], { provideCompletionItems: () => assert.fail("must not query LSP") },
+        () => assert.fail("must not inspect R"));
+      assert.deepEqual(entries, [], input);
+    }
+  }
+});
+
 test("bracket contexts retain the complete object, active dimension and quoted prefix", () => {
   for (const [marked, object, prefix, dimension, dimensions] of [
     ["obj[[│]]", "obj", "", 0, 1], ["obj[[\"a b│\"]]", "obj", "a b", 0, 1],

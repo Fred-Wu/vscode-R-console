@@ -36,6 +36,31 @@ test("structured receiver parsing supports safe literal and existing scalar indi
   }
 });
 
+test("quoted member selectors decode R escapes safely and reject invalid expressions", () => {
+  const backtick = String.fromCharCode(96);
+  const cases = [
+    ['obj[["a\\"b"]]', 'a"b'],
+    ["obj[['a\\'b']]", "a'b"],
+    ['obj[["a\\\\b"]]', "a\\b"],
+    ['obj[["a\\u0020b"]]', "a b"],
+    ['obj[["line\\nfeed"]]', "line\nfeed"],
+    ['obj[["\\u{1F642}"]]', "🙂"],
+    ["obj$" + backtick + "a\\" + backtick + "b" + backtick, "a" + backtick + "b"],
+  ];
+  for (const [receiver, name] of cases) {
+    const query = parseRuntimeMemberQuery(receiver);
+    assert.ok(query, receiver);
+    assert.equal(query.steps.at(-1).name, name, receiver);
+  }
+  for (const receiver of [
+    'obj[["bad\\q"]]', 'obj[["bad\\uZZZZ"]]',
+    'obj[["bad\\xFF"]]', 'obj[["bad\\0"]]',
+    'obj[["bad\\uD800"]]', 'obj[["broken\\"]]',
+  ]) {
+    assert.equal(parseRuntimeMemberQuery(receiver), undefined, receiver);
+  }
+});
+
 test("native request includes only parsed selectors and target operator", () => {
   const query = parseRuntimeMemberQuery('obj$inner[["a b"]]', "[[");
   const frame = encodeMemberNamesRequestFrame(19, query);

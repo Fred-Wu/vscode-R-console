@@ -20,6 +20,9 @@ const RAW: c_int = 24;
 const MAX_DEPTH: usize = 12;
 const MAX_NAMES: usize = 1000;
 const MAX_NAME_BYTES: usize = 4096;
+// Cap native traversal before collecting names or walking indexed pairlists.
+const MAX_SCANNED_ENTRIES: usize = 4096;
+const MAX_ENV_BINDINGS: c_int = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -138,6 +141,7 @@ pub(crate) struct InspectorApi {
     ls2: Option<usize>,
     integer_elt: Option<usize>,
     real_elt: Option<usize>,
+    envlength: Option<usize>,
 }
 
 impl InspectorApi {
@@ -173,6 +177,7 @@ impl InspectorApi {
             ls2: symbol(b"R_lsInternal\0"),
             integer_elt: symbol(b"INTEGER_ELT\0"),
             real_elt: symbol(b"REAL_ELT\0"),
+            envlength: symbol(b"Rf_envlength\0"),
         })
     }
 }
@@ -237,6 +242,7 @@ const RMG_LS3: c_int = 20;
 const RMG_LS2: c_int = 21;
 const RMG_INTEGER_ELT: c_int = 22;
 const RMG_REAL_ELT: c_int = 23;
+const RMG_ENVLENGTH: c_int = 24;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize);
@@ -324,15 +330,19 @@ unsafe extern "C" fn guard_integer_elt(a: Sexp, i: isize) -> c_int {
 unsafe extern "C" fn guard_real_elt(a: Sexp, i: isize) -> f64 {
     f64::from_bits(guarded(RMG_REAL_ELT, a as usize, i as usize, 0))
 }
+unsafe extern "C" fn guard_envlength(a: Sexp) -> c_int {
+    guarded(RMG_ENVLENGTH, a as usize, 0, 0) as u32 as c_int
+}
 
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 24] = [
+    let funcs: [usize; 25] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
         api.xlength, api.string_elt, api.utf8, api.is_s4, api.is_object,
         api.protect, api.unprotect, api.ls3.unwrap_or(0), api.ls2.unwrap_or(0),
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
+        api.envlength.unwrap_or(0),
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len());
 }
@@ -372,6 +382,7 @@ struct Native {
     ls2: Option<unsafe extern "C" fn(Sexp, c_int) -> Sexp>,
     integer_elt: Option<unsafe extern "C" fn(Sexp, isize) -> c_int>,
     real_elt: Option<unsafe extern "C" fn(Sexp, isize) -> f64>,
+    envlength: Option<unsafe extern "C" fn(Sexp) -> c_int>,
     global: Sexp,
     nil: Sexp,
     unbound: Sexp,
@@ -409,6 +420,7 @@ impl Native {
             ls2: api.ls2.map(|_| guard_ls2 as _),
             integer_elt: api.integer_elt.map(|_| guard_integer_elt as _),
             real_elt: api.real_elt.map(|_| guard_real_elt as _),
+            envlength: api.envlength.map(|_| guard_envlength as _),
             global,
             nil,
             unbound: *(api.unbound as *const Sexp),
@@ -503,7 +515,9 @@ impl Native {
     unsafe fn pair_names(&self, value: Sexp) -> Vec<String> {
         let mut cursor = value;
         let mut names = Vec::new();
-        while cursor != self.nil && names.len() < MAX_NAMES {
+        let mut scanned = 0;
+        while cursor != self.nil && names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
+            scanned += 1;
             let tag = (self.tag)(cursor);
             if tag != self.nil {
                 if let Some(name) = self.text((self.printname)(tag)) {
@@ -520,7 +534,9 @@ impl Native {
     unsafe fn slot_names(&self, value: Sexp) -> Vec<String> {
         let mut cursor = (self.attrib)(value);
         let mut names = Vec::new();
-        while cursor != self.nil && names.len() < MAX_NAMES {
+        let mut scanned = 0;
+        while cursor != self.nil && names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
+            scanned += 1;
             let tag = (self.tag)(cursor);
             if tag != self.nil {
                 if let Some(name) = self.text((self.printname)(tag)) {
@@ -537,6 +553,12 @@ impl Native {
 
     unsafe fn environment_names(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
         if self.custom_database(value)? { return Err(Suppression::UnsafeEnvironment); }
+        // R_lsInternal allocates and sorts every binding before returning.
+        // Refuse large environments first; when the preflight API is unavailable,
+        // avoid full enumeration rather than guessing about its cost.
+        let Some(envlength) = self.envlength else { return Ok(Vec::new()); };
+        let bindings = envlength(value);
+        if bindings < 0 || bindings > MAX_ENV_BINDINGS { return Ok(Vec::new()); }
         let names = if let Some(ls) = self.ls3 { ls(value, 1, 1) }
             else if let Some(ls) = self.ls2 { ls(value, 1) }
             else { return Ok(Vec::new()); };
@@ -591,7 +613,7 @@ impl Native {
         if matches!(kind, LIST | LANGUAGE | DOTS) {
             let mut cursor = value;
             let mut index = 0;
-            while cursor != self.nil && index < 100_000 {
+            while cursor != self.nil && index < MAX_SCANNED_ENTRIES {
                 let tag = (self.tag)(cursor);
                 if tag != self.nil && self.text((self.printname)(tag)).as_deref() == Some(name) {
                     return Ok(Some(index));
@@ -608,7 +630,7 @@ impl Native {
         if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
         let len = (self.xlength)(names);
         if len < 0 { return Ok(None); }
-        for index in 0..len.min(100_000) {
+        for index in 0..len.min(MAX_SCANNED_ENTRIES as isize) {
             if self.text((self.string_elt)(names, index)).as_deref() == Some(name) {
                 return Ok(Some(index as usize));
             }
@@ -625,6 +647,7 @@ impl Native {
             return Ok(Some((self.vector_elt)(value, index as isize)));
         }
         if matches!(kind, LIST | LANGUAGE | DOTS) {
+            if index >= MAX_SCANNED_ENTRIES { return Ok(None); }
             let mut cursor = value;
             for _ in 0..index {
                 if cursor == self.nil { return Ok(None); }

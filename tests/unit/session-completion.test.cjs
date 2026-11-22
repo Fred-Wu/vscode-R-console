@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
+const { parseRuntimeMemberQuery } = loadSource("src/Language/completion/runtimeMembers.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
   CompletionItemKind: { Field: 4, Property: 9, Variable: 5, Function: 2, Text: 0 }, SnippetString: class {},
 } });
@@ -161,6 +162,30 @@ test("computed receivers are rejected before LSP or native member inspection", a
       { provideCompletionItems: () => assert.fail("LSP must not receive rejected expression") },
       () => assert.fail("runtime inspector must not receive rejected expression"));
     assert.deepEqual(entries, [], input);
+  }
+});
+
+test("escaped member selectors reach the native inspection without evaluating code", async () => {
+  const slash = String.fromCharCode(92);
+  const cases = [
+    ['obj[["a' + slash + '"b"]]$', 'a"b'],
+    ['obj[["a' + slash + slash + 'b"]]$', "a" + slash + "b"],
+  ];
+  for (const [input, name] of cases) {
+    const context = completion.getCompletionContext(input, input.length);
+    assert.equal(context?.kind, "member", input);
+    assert.equal(context.objectName, input.slice(0, -1), input);
+    assert.equal(context.rejectionReason, undefined, input);
+    let calls = 0;
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      undefined, [], [], undefined, async (receiver, operator) => {
+        calls++;
+        const query = parseRuntimeMemberQuery(receiver, operator);
+        assert.equal(query.steps.at(-1).name, name);
+        return { status: "available", names: ["inner"] };
+      });
+    assert.equal(calls, 1, input);
+    assert.deepEqual(entries.map(entry => entry.label), ["inner"], input);
   }
 });
 

@@ -7,6 +7,11 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
+const { parseRuntimeMemberQuery } = loadSource("src/Language/completion/runtimeMembers.ts");
+const completion = loadSource("src/Language/completion.ts", { vscode: {
+  CompletionItemKind: { Field: 4, Property: 9, Variable: 5, Function: 2, Text: 0 },
+  SnippetString: class {},
+} });
 
 test("real embedded R completion inspects nested storage without running user code", { timeout: 60000 }, async t => {
   const root = path.resolve(__dirname, "..");
@@ -156,6 +161,47 @@ test("real embedded R completion inspects nested storage without running user co
   await submit('delayedAssign("lazy", { hits <<- hits + 1L; list(inner = 42) }, assign.env = env)');
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "lazy" }]),
     { status: "suppressed", reason: "deferred-binding" });
+  // Test the native response and frontend logging together for the exact
+  // nested delayed-value scenario that previously produced no log.
+  const logLines = [];
+  const { logConsoleCompletionDecision } = loadSource("src/Language/completion/outputChannel.ts", {
+    vscode: { window: { createOutputChannel: () => ({
+      appendLine: line => logLines.push(line), dispose() {},
+    }) } },
+  });
+  const nestedInput = "env$lazy$";
+  const nested = completion.getCompletionContext(nestedInput, nestedInput.length);
+  assert.equal(nested?.objectName, "env$lazy");
+  const entries = await completion.collectCompletionEntries(nested, undefined, undefined,
+    undefined, [], [], undefined, async (expression, operator) => {
+      const query = parseRuntimeMemberQuery(expression, operator);
+      assert.deepEqual(query, { root: "env",
+        steps: [{ kind: "field", name: "lazy" }], target: "$" });
+      const result = await backend.inspectMemberNames(session, query);
+      if (result.status === "suppressed") {
+        logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+          expression + operator);
+      }
+      return result;
+    });
+  assert.deepEqual(entries, []);
+  assert.equal(logLines.length, 1, "native suppression must be visible in completion diagnostics");
+  assert.match(logLines[0], /Request completion could run R code delayed until this value is first used/);
+  assert.match(logLines[0], /Inspection stopped without evaluating it/);
+
+  // Bound native work before allocating names for large environments and
+  // before traversing long, mostly unnamed pairlists.
+  await submit('large_env <- new.env(hash = TRUE, size = 8192L); for (i in seq_len(4200L)) assign(paste0("entry", i), i, envir = large_env); large_pair <- as.pairlist(setNames(rep(list(1L), 4200L), c(rep("", 4199L), "late"))); cat("LARGE_READY\\n")');
+  await until(() => output.includes("LARGE_READY"), "large-object fixtures ready");
+  assert.deepEqual(await inspect("large_env"), available([]));
+  assert.deepEqual(await inspect("large_pair"), available([]));
+  assert.deepEqual(await inspect("large_pair", [{ kind: "field", name: "late" }]), available([]));
+  // Ordinary safe environments still complete within the preflight budget.
+  assert.ok((await inspect("env")).names.includes("inner"));
+  await submit('escaped <- list(); escaped[["a\\\"b"]] <- list(inner = TRUE)');
+  const escapedQuery = parseRuntimeMemberQuery('escaped[["a\\"b"]]', "$");
+  assert.equal(escapedQuery.steps[0].name, 'a"b');
+  assert.deepEqual(await inspect(escapedQuery.root, escapedQuery.steps), available(["inner"]));
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');
   await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");
