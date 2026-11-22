@@ -35,7 +35,8 @@ export async function collectCompletionEntries(
     ? await Promise.resolve(prefetchedBracketMembers).catch(() => undefined)
     : undefined;
   const runtimeBracketKind = context.kind === "bracket" && context.bracketOperator === "[" &&
-    prefetchedResult?.status === "available" ? prefetchedResult.bracketKind ?? null : undefined;
+    prefetchedResult?.status === "available" ? prefetchedResult.bracketKind ?? null :
+    prefetchedResult?.status === "suppressed" ? null : undefined;
   const rawLspItemsRequest =
     !includeLspItems
       ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, runtimeOnly: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
@@ -73,11 +74,16 @@ export async function collectCompletionEntries(
         context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")
     : undefined);
   const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
+  // A definitive safety refusal must not be undone by cached receiver names
+  // or package method suggestions. In particular, a masked accessor need not
+  // accept the stored object's members or the installed method's arguments.
+  const runtimeSuppressed = runtimeResult?.status === "suppressed";
+  if (runtimeSuppressed && context.kind === "member") return [];
   // An unavailable inspection is not a complete member list: later typing
   // must retry instead of refining a cached empty result forever.
   const retryableRuntime = runtimeRequested &&
-    runtimeResult?.status !== "available" && runtimeResult?.status !== "suppressed";
-  const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
+    runtimeResult?.status !== "available" && !runtimeSuppressed;
+  const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : runtimeSuppressed ? [] : undefined;
   const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
   const bracketKind = runtimeResult?.status === "available" ? runtimeResult.bracketKind : undefined;
   const fieldMode = bracketFieldMode(context, bracketKind);
@@ -156,6 +162,9 @@ export async function collectCompletionEntries(
     const nativeLabels = new Set(runtimeMembers?.map(entry => entry.label) ?? []);
     const specialLabels = new Set(lspItems.filter(entry => entry.bracketSpecial).map(entry => entry.label));
     const bracketLspItems = lspItems.filter(entry =>
+      // Independent index variables remain useful; method arguments and
+      // package specials are tied to the unverified receiver/accessor.
+      (!runtimeSuppressed || (!entry.bracketSpecial && !isArgumentCompletionEntry(entry))) &&
       (entry.bracketSpecial || !specialLabels.has(entry.label)) &&
       (runtimeMembers === undefined || (
         entry.role !== "member" &&

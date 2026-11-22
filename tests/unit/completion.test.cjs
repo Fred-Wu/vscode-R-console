@@ -74,6 +74,37 @@ test("custom top-level member metadata survives storage inspection without leaki
   assert.deepEqual(cleared, [], "fresh empty storage still clears stale ordinary names");
 });
 
+test("safety refusals cannot fall back to cached receiver schemas or installed indexing methods", async () => {
+  const workspace = { globalenv: { obj: {
+    type: 'list', class: ['custom'], names: ['stale'], slots: ['stale'],
+  }, index: { type: 'integer' } } };
+  for (const reason of ['unsafe-dispatch', 'active-binding', 'deferred-binding', 'unsafe-altrep', 'unsafe-environment']) {
+    for (const input of ['obj$', 'obj@', 'obj[', 'obj[[', 'obj[ind', 'obj[[ind', 'obj[["']) {
+      const context = completion.getCompletionContext(input, input.length);
+      const result = { status: 'suppressed', reason };
+      const hints = [];
+      const provider = { async provideCompletionItems(_doc, _position, _trigger, _context, bracketKind) {
+        hints.push(bracketKind);
+        return { rConsoleRuntimeOnly: true, items: [
+          { label: 'stale', kind: 4, data: { type: 'scope' } },
+          { label: 'drop', kind: 5, data: { type: 'subscript_parameter' } },
+          { label: '.SD', kind: 4, data: { type: 'subscript_special' } },
+        ] };
+      } };
+      const entries = await completion.collectCompletionEntries(context,
+        { getText: () => input }, { line: 0, character: input.length },
+        workspace, [], [], provider, async () => result, input,
+        context.kind === 'bracket' ? Promise.resolve(result) : undefined);
+      if (context.kind === 'member') assert.deepEqual(entries, [], input + ': ' + reason);
+      else {
+        if (context.prefix) assert.ok(entries.some(entry => entry.label === 'index'), 'independent index variables remain available');
+        assert.ok(entries.every(entry => !['stale', 'drop', '.SD'].includes(entry.label)), input + ': ' + reason);
+        assert.deepEqual(hints, hints.map(() => null), 'suppression blocks cached installed-method hints');
+      }
+    }
+  }
+});
+
 test("native nested completion reaches Rust without awaiting the language server", async () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {

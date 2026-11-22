@@ -674,6 +674,73 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("override_df", [{kind:"field",name:"inner"}]), available(["storage"]));
   assert.deepEqual(await inspect("override_df", [{kind:"named-index",name:"inner"}]), available(["storage"]));
 
+  // Function lookup is a separate boundary from S3 dispatch. Exercise the
+  // entire selector grammar and final targets against each kind of masking
+  // binding, including bindings R legitimately skips during function lookup.
+  await submit('operator_hits <- 0L; mask_plain <- list(inner=list(storage=1), method=function() NULL); mask_pair <- as.pairlist(mask_plain); mask_expr <- as.expression(mask_plain); mask_env <- list2env(mask_plain); mask_frame <- structure(list(inner=list(storage=1)), class="data.frame", row.names=1L); mask_holder <- list(s4=s4); mask_index <- 1L; mask_name <- "inner"; mask_override <- function(...) { operator_hits <<- operator_hits + 1L; list(actual=2) }');
+  const operatorPaths = {
+    '$': ['mask_plain$inner', 'mask_pair$inner', 'mask_expr$inner', 'mask_env$inner',
+      'mask_frame$inner', 'mask_plain[1]$inner'],
+    '@': ['s4@inner', 'mask_holder$s4@inner'],
+    '[': ['mask_plain[1]', 'mask_plain["inner"]', 'mask_plain[mask_index]',
+      'mask_plain[mask_name]', 'mask_plain[1][1]', 'mask_frame[1]'],
+    '[[': ['mask_plain[[1]]', 'mask_plain[["inner"]]', 'mask_plain[[mask_index]]',
+      'mask_plain[[mask_name]]', 'mask_pair[[1]]', 'mask_expr[[1]]',
+      'mask_env[["inner"]]', 'mask_frame[[1]]', 'mask_plain[1][[1]]'],
+  };
+  for (const [operator, receivers] of Object.entries(operatorPaths)) {
+    const quoted = JSON.stringify(operator);
+    // Establish the normal answers first, then require restoration after each
+    // override. This also tests both target metadata and intermediate steps.
+    const queries = [
+      ...receivers.map(receiver => parseRuntimeMemberQuery(receiver)),
+      ...['mask_plain', 'mask_env', 'mask_frame', 's4'].map(root =>
+        parseRuntimeMemberQuery(root, operator)),
+    ];
+    const normal = [];
+    for (const query of queries) normal.push(await backend.inspectMemberNames(session, query));
+    for (const location of ['global', 'attached', 'active', 'deferred', 'other-primitive',
+      'forced-function', 'forced-value', 'forced-alias', 'non-function', 'alias']) {
+      const unsafe = !['forced-value', 'forced-alias', 'non-function', 'alias'].includes(location);
+      await submit(location === 'attached'
+        ? `attach(setNames(list(mask_override), ${quoted}), name="masked_accessors", warn.conflicts=FALSE)`
+        : location === 'active'
+          ? `makeActiveBinding(${quoted}, function() { operator_hits <<- operator_hits + 1L; mask_override }, .GlobalEnv)`
+        : location === 'deferred'
+          ? `delayedAssign(${quoted}, { operator_hits <<- operator_hits + 1L; mask_override }, assign.env=.GlobalEnv)`
+        : location.startsWith('forced-')
+          ? `delayedAssign(${quoted}, ${location === 'forced-function' ? 'mask_override' : location === 'forced-alias' ? `get(${quoted}, baseenv())` : '42L'}, assign.env=.GlobalEnv); invisible(get(${quoted}, .GlobalEnv))`
+        : location === 'other-primitive'
+          ? `assign(${quoted}, get(${JSON.stringify(operator === '$' ? '[[' : '$')}, baseenv()), .GlobalEnv)`
+          : `assign(${quoted}, ${location === 'non-function' ? '42L' : location === 'alias' ? `get(${quoted}, baseenv())` : 'mask_override'}, .GlobalEnv)`);
+      for (let index = 0; index < queries.length; index++) {
+        const result = await backend.inspectMemberNames(session, queries[index]);
+        const expected = !unsafe ? normal[index] : { status: 'suppressed', reason:
+          location === 'active' ? 'active-binding' : location === 'deferred' ? 'deferred-binding' : 'unsafe-dispatch' };
+        assert.deepEqual(result, expected, `${operator} ${location}: ${JSON.stringify(queries[index])}`);
+      }
+      await submit(location === 'attached' ? 'detach("masked_accessors")'
+        : `rm(list=${quoted}, envir=.GlobalEnv)`);
+      assert.deepEqual(await backend.inspectMemberNames(session, queries[0]), normal[0],
+        'removing a mask must immediately restore inspection');
+    }
+  }
+  // A non-function in .GlobalEnv must not hide a callable mask farther along
+  // the search path. Nor may a deferred/active operator be forced just because
+  // a later binding contains the standard primitive.
+  await submit('attach(setNames(list(mask_override), "[["), name="masked_accessors", warn.conflicts=FALSE); assign("[[", 42L, .GlobalEnv)');
+  assert.deepEqual(await inspect('mask_plain', [{kind:'index', index:1}]), unsafeDispatch);
+  await submit('rm("[["); detach("masked_accessors"); stopifnot(operator_hits == 0L); assign("[[", mask_override, .GlobalEnv); stopifnot(identical(names(mask_plain[[1]]), "actual")); rm("[["); stopifnot(operator_hits == 1L); cat("OPERATOR_LOOKUP_VERIFIED\\n")');
+  await until(() => output.includes('OPERATOR_LOOKUP_VERIFIED'), 'operator side-effect verification');
+  for (const active of [true, false]) {
+    await submit('mask_scope <- attach(NULL, name="masked_accessors"); assign("[[", 42L, .GlobalEnv); ' +
+      (active ? 'makeActiveBinding("[[", function() { operator_hits <<- operator_hits + 1L; mask_override }, mask_scope)'
+        : 'delayedAssign("[[", { operator_hits <<- operator_hits + 1L; mask_override }, assign.env=mask_scope)'));
+    assert.deepEqual(await inspect('mask_plain', [{kind:'index', index:1}]),
+      { status:'suppressed', reason:active ? 'active-binding' : 'deferred-binding' });
+    await submit('rm("[["); detach("masked_accessors"); stopifnot(operator_hits == 1L)');
+  }
+
   // Feed the actual insertion spelling back through the parser and native
   // inspector. Test both UI insertion paths, nested roots, and R's locale at
   // request time; never infer a legacy encoding from UTF-8-looking bytes.

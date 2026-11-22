@@ -34,14 +34,16 @@ export async function pickCompletion({
     return setTimeout(() => { if (pick.value.length === 0) { pick.value = context.prefix; } }, 0);
   };
   const searchValue = (value: string): string => {
+    // Filtering and grouping must rank the same query, including the empty
+    // search box shown initially (and after clearing) for member completion.
+    if (context.kind === "member" && !value) return context.prefix;
     if (context.kind === "package" && value.length > 0 && !value.startsWith(context.prefix)) {
       return context.prefix + value;
     }
     return value;
   };
   const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
-    rankCompletionEntries(sourceEntries,
-      context.kind === "member" && !value ? context.prefix : searchValue(value), context);
+    rankCompletionEntries(sourceEntries, searchValue(value), context);
   const quickPickContext = (value: string) => ({
     ...context,
     prefix: searchValue(value),

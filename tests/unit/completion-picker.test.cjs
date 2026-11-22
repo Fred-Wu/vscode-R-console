@@ -59,6 +59,32 @@ test('member Quick Pick ranks the console prefix on initial, delayed and cleared
   }
 });
 
+test('member Quick Pick keeps exact matches selected across field and function groups', async t => {
+  for (const operator of ['$', '@']) {
+    for (const delayed of [false, true]) {
+      for (const exactKind of [vscode.CompletionItemKind.Field, vscode.CompletionItemKind.Function]) {
+        const fuzzyKind = exactKind === vscode.CompletionItemKind.Field
+          ? vscode.CompletionItemKind.Function : vscode.CompletionItemKind.Field;
+        const candidates = [
+          { label: 'alphabetagamma', insertText: 'alphabetagamma', source: 'session', kind: fuzzyKind },
+          { label: 'beta', insertText: exactKind === 2 ? 'beta()' : 'beta', source: 'session', kind: exactKind },
+        ];
+        const expected = candidates[1].insertText;
+        const picker = await openPicker(t, `obj${operator}beta`, delayed ? [] : candidates,
+          async () => candidates, delayed ? Promise.resolve(candidates) : undefined);
+        await tick();
+        assert.equal(picker.labels()[0], expected);
+        assert.equal(picker.pick.activeItems[0].insertText, expected);
+        await picker.type('alphabetagamma');
+        assert.equal(picker.pick.activeItems[0].insertText, 'alphabetagamma');
+        await picker.type('');
+        assert.equal(picker.labels()[0], expected);
+        assert.equal(picker.pick.activeItems[0].insertText, expected);
+      }
+    }
+  }
+});
+
 test('package invalidation closes Quick Pick and discards delayed suggestions', async () => {
   let onHide, resolveEntries;
   let disposed = false;

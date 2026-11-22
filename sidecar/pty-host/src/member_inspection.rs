@@ -638,6 +638,48 @@ impl Native {
         if value.is_null() || value == self.unbound { None } else { Some(value) }
     }
 
+    // R resolves the function in a call before dispatching on its receiver.
+    // Reproduce only the non-evaluating part of that lookup: ordinary
+    // non-functions are skipped, forced promises may supply a stored value,
+    // and active/unforced bindings stop inspection rather than being invoked.
+    unsafe fn stored_function(&self, mut env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
+        for _ in 0..128 {
+            self.check_deadline()?;
+            if env == self.empty_env { return Ok(None); }
+            if env.is_null() || (self.type_of)(env) != ENV {
+                return Err(Suppression::UnsafeEnvironment);
+            }
+            if let Some(raw) = self.stored_binding(env, name)? {
+                let value = self.cached_value(raw).ok_or(Suppression::DeferredBinding)?;
+                if matches!((self.type_of)(value), CLOSURE | SPECIAL | BUILTIN) {
+                    return Ok(Some(value));
+                }
+            }
+            env = (self.enclosing_env)(env);
+        }
+        Err(Suppression::InspectionLimit)
+    }
+
+    // This is a query-wide precondition, not an object-type exception. Check
+    // every traversal operator AND the requested final accessor before reading
+    // the root, so lists, environments, slots, slices and callable metadata
+    // cannot accidentally bypass it. S3/storage checks still run afterward.
+    unsafe fn validate_accessors(&self, query: &MemberQuery) -> Result<(), Suppression> {
+        let mut checked = HashSet::new();
+        for accessor in query.steps.iter().map(Step::accessor)
+            .chain(std::iter::once(query.target.accessor())) {
+            if !checked.insert(accessor) { continue; }
+            let primitive = self.stored_binding(self.base_namespace, accessor)?
+                .and_then(|value| self.cached_value(value))
+                .ok_or(Suppression::UnsafeDispatch)?;
+            if !matches!((self.type_of)(primitive), SPECIAL | BUILTIN) ||
+                self.stored_function(self.global, accessor)? != Some(primitive) {
+                return Err(Suppression::UnsafeDispatch);
+            }
+        }
+        Ok(())
+    }
+
     // Only installed methods whose storage semantics we support may dispatch.
     // Match identity against the defining namespace; a same-named method in the
     // search path or S3 registry is not evidence of the installed implementation.
@@ -1199,6 +1241,7 @@ impl Native {
 
     unsafe fn inspect(&self, query: &MemberQuery) -> Result<Members, Suppression> {
         self.check_deadline()?;
+        self.validate_accessors(query)?;
         let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Members::empty()); };
         (self.protect)(root);
         let mut protected = 1;
