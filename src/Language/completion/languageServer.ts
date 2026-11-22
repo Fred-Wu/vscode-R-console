@@ -63,6 +63,7 @@ export async function getLanguageServerCompletions(
         kind: item.kind,
         detail: item.detail,
         role: getCompletionRole(item),
+        ...(isSubscriptSpecial(item) ? { bracketSpecial: true } : {}),
         source: "lsp",
         replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
         ...getCompletionReplaceEnd(item, doc, position),
@@ -81,9 +82,14 @@ export async function getLanguageServerCompletions(
   }
 }
 
+function isSubscriptSpecial(item: vscode.CompletionItem): boolean {
+  return (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_special";
+}
+
 function getCompletionRole(item: vscode.CompletionItem): CompletionEntry["role"] {
   const data = (item as vscode.CompletionItem & { data?: { type?: string; parameter?: string } }).data;
   const type = data?.type;
+  if (type === "subscript_special") return "scope";
   if (type?.endsWith("argument_value") || item.detail?.startsWith("value for ")) return "value";
   if (data?.parameter !== undefined || type?.endsWith("parameter") || item.detail === "parameter") return "argument";
   if (type === "member" || type === "scope") return type;

@@ -1800,6 +1800,76 @@ test("workspace subscript columns respect receiver class and dimensions without 
   }
 });
 
+test("safe runtime bracket completion retains installed method arguments and specials without attaching data.table", { timeout: 90000 }, async t => {
+  const { client, instances } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { staticAnalysis: false });
+  const workspace = { globalenv: {
+    test: { type: "list", class: ["data.table", "data.frame"], names: ["xtest"] },
+    df: { type: "list", class: ["data.frame"], names: ["xtest"] },
+    custom: { type: "list", class: ["custom", "data.table"], names: ["xtest"] },
+  } };
+  client.options.getCachedWorkspaceData = () => workspace;
+  await client.syncSessionState({ attachedPackages: ["stats", "base"] });
+  const inspected = [];
+  const collect = async marked => {
+    const cursor = marked.indexOf("│"), text = marked.replace("│", "");
+    const context = completion.getCompletionContext(text, cursor);
+    assert.equal(context.kind, "bracket", marked);
+    return completion.collectCompletionEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri },
+      { line: 0, character: cursor }, workspace, [], [],
+      { provideCompletionItems: async (...args) => {
+        const raw = await client.provideCompletionItems(...args);
+        return { ...raw, items: raw.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } },
+      async (receiver, operator) => {
+        inspected.push([receiver, operator]);
+        return { status: "available", names: ["xtest"],
+          bracketKind: receiver === "test" ? "data.table" : "data.frame" };
+      });
+  };
+  const columns = await collect("test[, xt│]");
+  assert.ok(columns.some(item => item.label === "xtest" &&
+    item.source === "session" && item.insertText === "xtest"));
+  const indexed = await collect("test[, xtest, key│]");
+  assert.ok(indexed.some(item => item.label === "keyby" && item.insertText === "keyby = " &&
+    item.role === "argument"), "the third bracket position must complete installed [.data.table formals");
+  const empty = await collect("test[, xtest, │]");
+  for (const name of ["by", "keyby", ".SDcols", "with", "nomatch", "mult",
+    "roll", "rollends", "which", "verbose", "allow.cartesian", "drop", "on", "env",
+    "showProgress"]) {
+    assert.ok(empty.some(item => item.label === name && item.insertText === name + " = "),
+      "missing installed method parameter " + name);
+  }
+  const special = await collect("test[, .S│]");
+  assert.ok(special.some(item => item.label === ".SD" &&
+    item.bracketSpecial === true && item.insertText === ".SD"),
+    ".SD must be sourced from the installed namespace, not from guessed columns");
+  const frame = await collect("df[, dr│]");
+  assert.ok(frame.some(item => item.label === "drop" && item.insertText === "drop = "));
+  assert.ok(!(await collect("df[, .S│]")).some(item => item.bracketSpecial),
+    "base data.frame indexing must not receive data.table symbols");
+  assert.ok(!(await collect("custom[, key│]")).some(item => item.label === "keyby"),
+    "do not infer data.table method metadata through a custom leading class");
+  assert.deepEqual(inspected, [
+    ["test", "["], ["test", "["], ["test", "["], ["test", "["],
+    ["df", "["], ["df", "["], ["custom", "["],
+  ]);
+  const requests = instances.flatMap(instance => instance.requests)
+    .filter(entry => entry.method?.method === "textDocument/completion" ||
+      entry.method === "textDocument/completion");
+  assert.ok(requests.length >= 7, "all cases must exercise the real language server");
+  for (const request of requests) {
+    assert.equal(request.params.rConsoleStaticAnalysis, undefined,
+      "runtime completion must never activate source inference");
+  }
+  const unsafe = completion.getCompletionContext("make_data()[, key", "make_data()[, key".length);
+  assert.equal(unsafe.rejectionReason, "executable-receiver");
+  assert.deepEqual(await completion.collectCompletionEntries(
+    unsafe, undefined, undefined, workspace, [], [],
+    { provideCompletionItems: () => assert.fail("rejected receiver reached language server") },
+    () => assert.fail("rejected receiver reached native inspector")), []);
+});
+
 test("subscript symbols and fields come from the real language server", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   await client.syncSessionState({ attachedPackages: ['data.table', 'stats', 'base'] });

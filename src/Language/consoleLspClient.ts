@@ -30,6 +30,7 @@ import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
 import { backtickRName } from "./completion/candidates";
+import { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
@@ -318,6 +319,18 @@ export class ConsoleLspClient implements CompletionProvider {
         // Use the already-published workspace snapshot; completion must not
         // query sess to resolve or inspect runtime objects.
         const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
+        // Only an already-submitted global binding supplies this class hint.
+        // The receiver parser rejects calls, assignments and computed indices.
+        const bracketReceiver = !staticAnalysis && params.rConsoleSubscriptOperator === "[" &&
+          params.rConsoleDataObject ? parseRuntimeMemberQuery(params.rConsoleDataObject) : undefined;
+        if (bracketReceiver?.steps.length === 0 && globals &&
+            Object.hasOwn(globals, bracketReceiver.root)) {
+          const primaryClass = globals[bracketReceiver.root].class?.[0];
+          if (primaryClass === "data.table" || primaryClass === "data.frame") {
+            (params as typeof params & { rConsoleSubscriptClass?: "data.table" | "data.frame" })
+              .rConsoleSubscriptClass = primaryClass;
+          }
+        }
         if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
             !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
           const name = Object.hasOwn(globals, params.rConsoleCall)

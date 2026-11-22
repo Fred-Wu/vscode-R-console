@@ -91,7 +91,10 @@ export async function collectCompletionEntries(
   const runtimeOnly = rawLspResult.runtimeOnly === true;
   const nativeMembers = !runtimeOnly &&
     (rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member"));
-  const nativeFields = rawLspResult.entries.some(entry => entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field);
+  // Package-specific symbols are not stored receiver columns, so their
+  // presence must not suppress cached names when inspection is unavailable.
+  const nativeFields = rawLspResult.entries.some(entry =>
+    entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field && !entry.bracketSpecial);
   // A package-inferred exhaustion must not override an unresolved live member.
   if (context.argumentTags && rawLspResult.argumentsExhausted &&
       !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
@@ -127,11 +130,18 @@ export async function collectCompletionEntries(
 
   if (context.kind === "bracket") {
     const columnFiltered = filterCompletionEntries(dataItems, context.prefix);
-    // Live stored fields supersede inferred LSP fields, not bracket-method
-    // arguments. Mixing stale source fields with runtime names is misleading.
-    const bracketLspItems = runtimeMembers === undefined ? lspItems : lspItems.filter(entry =>
-      entry.role !== "member" &&
-      !(entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field));
+    // Guarded storage wins for receiver columns. Preserve unrelated installed
+    // package symbols and indexing-method arguments, without resurrecting
+    // fields inferred from unsubmitted source in runtime-only mode.
+    const nativeLabels = new Set(runtimeMembers?.map(entry => entry.label) ?? []);
+    const specialLabels = new Set(lspItems.filter(entry => entry.bracketSpecial).map(entry => entry.label));
+    const bracketLspItems = lspItems.filter(entry =>
+      (entry.bracketSpecial || !specialLabels.has(entry.label)) &&
+      (runtimeMembers === undefined || (
+        entry.role !== "member" &&
+        !(entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field && !entry.bracketSpecial) &&
+        (!nativeLabels.has(entry.label) || isArgumentCompletionEntry(entry))
+      )));
     const lspFiltered = filterCompletionEntries(bracketLspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);

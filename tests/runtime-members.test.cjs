@@ -280,6 +280,11 @@ test("real embedded R completion inspects nested storage without running user co
 
   // Ordinary safe environments still complete within the preflight budget.
   assert.ok((await inspect("env")).names.includes("inner"));
+  await submit('test <- data.table::data.table(xtest = 1:100)');
+  const realTable = await inspectTyped("test", [], "[");
+  assert.equal(realTable.status, "available");
+  assert.equal(realTable.bracketKind, "data.table");
+  assert.deepEqual(realTable.names, ["xtest"]);
   await submit('nested_dt <- list(tbl = data.table::data.table(amount = 1, code = "a"))');
   const tableBracket = await inspectTyped("nested_dt", [{ kind: "field", name: "tbl" }], "[");
   assert.equal(tableBracket.status, "available");

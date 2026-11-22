@@ -34,6 +34,51 @@ test("nested objects cannot trigger live extraction or hover", async () => {
   }
 });
 
+test("guarded bracket names merge verified package symbols and method formals without stale scope fields", async () => {
+  const input = "test[, ";
+  const workspace = { globalenv: { test: {
+    type: "list", class: ["data.table", "data.frame"], names: ["xtest", "by"],
+  } } };
+  const lsp = { provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true, items: [
+    { label: "xtest", kind: 4, detail: "[scope]", data: { type: "scope" } },
+    { label: "stale_source", kind: 4, detail: "[scope]", data: { type: "scope" } },
+    { label: ".SD", kind: 4, detail: "{data.table}", data: { type: "subscript_special" } },
+    { label: "keyby", kind: 5, detail: "parameter", insertText: "keyby = ",
+      data: { type: "subscript_parameter" } },
+    { label: "by", kind: 5, detail: "parameter", insertText: "by = ",
+      data: { type: "subscript_parameter" } },
+    { label: "obsolete", kind: 4, data: { type: "member" } },
+  ] }) };
+  const request = async () => ({ status: "available", names: ["xtest", "by"], bracketKind: "data.table" });
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    workspace, [], [], lsp, request);
+  assert.equal(entries.filter(item => item.label === "xtest").length, 1);
+  assert.equal(entries.find(item => item.label === "xtest").source, "session");
+  assert.equal(entries.find(item => item.label === "xtest").insertText, "xtest");
+  assert.equal(entries.find(item => item.label === ".SD").source, "lsp");
+  assert.equal(entries.find(item => item.label === ".SD").bracketSpecial, true);
+  assert.ok(entries.some(item => item.insertText === "keyby = "));
+  assert.ok(entries.some(item => item.label === "by" && item.source === "session"));
+  assert.ok(entries.some(item => item.label === "by" && item.insertText === "by = "),
+    "a stored column named by must not hide the distinct method parameter");
+  assert.ok(!entries.some(item => item.label === "stale_source" || item.label === "obsolete"),
+    "an authoritative native result excludes unverified scope/member guesses");
+  const specialsOnly = { provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true, items: [
+    { label: ".SD", kind: 4, data: { type: "subscript_special" } },
+    { label: "keyby", kind: 5, detail: "parameter", insertText: "keyby = ",
+      data: { type: "subscript_parameter" } },
+  ] }) };
+  const unavailable = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    { getText: () => input }, { line: 0, character: input.length },
+    workspace, [], [], specialsOnly, async () => ({ status: "unavailable" }));
+  assert.ok(unavailable.some(item => item.label === "xtest" && item.source === "session"),
+    "package specials must not suppress cached columns during an inspector timeout");
+  assert.ok(unavailable.some(item => item.label === ".SD" && item.bracketSpecial));
+});
+
 test("stored environment fields complete through the guarded double-bracket path", async () => {
   const text = "env[[";
   const requested = [];

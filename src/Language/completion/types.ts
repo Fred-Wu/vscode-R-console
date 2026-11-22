@@ -39,6 +39,8 @@ export type CompletionEntry = {
   replaceStart?: number;
   replaceEnd?: number;
   role?: "argument" | "value" | "member" | "scope";
+  // Explicit bracket-context symbol supplied by installed package metadata.
+  bracketSpecial?: boolean;
   packageName?: string;
 };
 

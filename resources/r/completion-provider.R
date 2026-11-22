@@ -1,4 +1,55 @@
 # Native completion owns semantic inference; supplements cover console-specific gaps.
+# Only inspect installed method metadata in the separate language-server process.
+# A class hint comes from a stored global binding: never evaluate a draft
+# receiver, an index expression, an extraction method, or a default value.
+console_subscript_completion <- function(params, workspace, uri, point) {
+    klass <- params$rConsoleSubscriptClass
+    if (!identical(params$rConsoleSubscriptOperator, "[") ||
+        !is.character(klass) || length(klass) != 1L || is.na(klass) ||
+        !klass %in% c("data.table", "data.frame") ||
+        !is.null(params$rConsoleSubscriptArgument)) return(list())
+    tags <- params$rConsoleSubscriptTags
+    if (!is.list(tags) || length(tags) == 0L || length(tags) > 32L ||
+        sum(vapply(tags, is.null, logical(1L))) != 1L ||
+        !all(vapply(tags, function(tag) is.null(tag) ||
+            (is.character(tag) && length(tag) == 1L && !is.na(tag) &&
+                nchar(tag, type = "bytes") <= 4096L), logical(1L)))) return(list())
+
+    pkg <- if (identical(klass, "data.table")) "data.table" else "base"
+    method <- paste0("[.", klass)
+    installed_formals <- tryCatch(languageserver:::call_with_optional_uri(
+        workspace$get_formals, method, pkg, exported_only = FALSE, uri = uri),
+        error = function(e) NULL)
+    parameters <- list()
+    if (is.pairlist(installed_formals) && length(installed_formals) <= 128L) {
+        signature <- console_source_signature(list(formals = installed_formals), uri)
+        parameters <- lapply(signature, function(item) {
+            item$data$type <- "subscript_parameter"
+            item
+        })
+        # Receiver fills the method's x formal. Each bracket slot after it is
+        # inert syntax, including positional slots left blank by the user.
+        parameters <- console_valid_argument_items(parameters, c(list(""), tags),
+            list(token = method, package = pkg, accessor = ":::"), uri, workspace, point,
+            signature = signature)
+    }
+
+    specials <- list()
+    if (identical(klass, "data.table")) {
+        ns <- tryCatch(workspace$get_namespace(pkg, uri = uri), error = function(e) NULL)
+        exports <- tryCatch(if (is.null(ns)) character() else
+            ns$get_symbols(want_functs = FALSE, exported_only = TRUE),
+            error = function(e) character())
+        # Exported non-function uppercase dot names come from installed package
+        # metadata, not a hardcoded list or source-only inferred variables.
+        names <- head(grep("^\\.[A-Z][A-Z0-9]*$", exports, value = TRUE), 64L)
+        specials <- lapply(names, function(name) list(
+            label = name, kind = languageserver:::CompletionItemKind$Field,
+            detail = "{data.table}", data = list(type = "subscript_special")))
+    }
+    c(parameters, specials)
+}
+
 console_supplement_completion <- function(reply, self, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -131,6 +182,10 @@ console_supplement_completion <- function(reply, self, params) {
         reply$result$rConsoleArgumentsExhausted <- TRUE
         reply$result$items <- list()
         reply$result$isIncomplete <- FALSE
+    }
+    if (!static_analysis && !is.null(params$rConsoleSubscriptClass)) {
+        reply$result$items <- c(reply$result$items,
+            console_subscript_completion(params, workspace, uri, point))
     }
     if (isTRUE(params$rConsolePipe)) {
         token <- params$rConsolePrefix
