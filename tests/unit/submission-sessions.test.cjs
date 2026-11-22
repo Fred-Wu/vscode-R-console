@@ -37,7 +37,24 @@ function submit(terminal, input, code) {
     terminal.inputState.insertText(code);
     return terminal.handleEnterKey();
   }
-  terminal.handleInput(input === "editor" ? code + "\n" : `\x1b[200~${code}\n\x1b[201~`);
+  if (input === "paste") {
+    // The key handler starts handlePasteEnd() without awaiting its promise.
+    // Return that promise so assertions wait for the submission to finish.
+    const handlePasteEnd = terminal.handlePasteEnd;
+    let pendingPaste;
+    terminal.handlePasteEnd = function () {
+      pendingPaste = handlePasteEnd.call(this);
+      return pendingPaste;
+    };
+    try {
+      terminal.handleInput(`\x1b[200~${code}\n\x1b[201~`);
+    } finally {
+      terminal.handlePasteEnd = handlePasteEnd;
+    }
+    assert.ok(pendingPaste, "paste-end must dispatch its async handler");
+    return pendingPaste;
+  }
+  terminal.handleInput(code + "\n");
   return terminal.programmaticSubmissionQueue;
 }
 
