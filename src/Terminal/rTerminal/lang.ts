@@ -392,7 +392,8 @@ export class RTermLang {
 
     if (context.staticFallback) return staticEnabled ? fallback() : [];
     const requester = this.options.requestRuntimeMemberCompletions;
-    const parsed = context.objectName ? parseRuntimeMemberQuery(context.objectName) : undefined;
+    const parsed = staticEnabled && (context.kind === "member" || context.kind === "bracket") &&
+      context.objectName ? parseRuntimeMemberQuery(context.objectName) : undefined;
     const rootMissingFromSnapshot = parsed !== undefined &&
       !(sessionData?.globalenv && Object.hasOwn(sessionData.globalenv, parsed.root));
     // Opt-in static analysis already covers unsubmitted source declarations.
