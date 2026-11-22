@@ -262,9 +262,6 @@ const RMG_LS2: c_int = 21;
 const RMG_INTEGER_ELT: c_int = 22;
 const RMG_REAL_ELT: c_int = 23;
 const RMG_ENVLENGTH: c_int = 24;
-// These entries are used inside the guarded UTF-8 copy, not dispatched as methods.
-const RMG_VMAXGET: c_int = 25;
-const RMG_VMAXSET: c_int = 26;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
