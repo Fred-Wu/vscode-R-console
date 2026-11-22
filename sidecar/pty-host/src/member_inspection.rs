@@ -530,7 +530,9 @@ impl Native {
         let mut buffer = [0u8; MAX_NAME_BYTES + 1];
         let count = (self.utf8)(value, &mut buffer)?;
         if count > MAX_NAME_BYTES { return None; }
-        Some(String::from_utf8_lossy(&buffer[..count]).into_owned())
+        // Names are lookup identities, not display-only text. Replacing invalid
+        // bytes with U+FFFD could alias a different, valid member or selector.
+        std::str::from_utf8(&buffer[..count]).ok().map(str::to_owned)
     }
 
     unsafe fn classes(&self, value: Sexp) -> Result<Vec<String>, Suppression> {

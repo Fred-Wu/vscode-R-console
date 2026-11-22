@@ -132,6 +132,31 @@ test("real embedded R completion inspects nested storage without running user co
   }
   assert.deepEqual(await inspect("missing_names", [{ kind: "field", name: "inn" }]), available(["child"]));
   assert.deepEqual(await inspect("missing_names", [{ kind: "slice-index", index: 1 }]), available([]));
+  // Lossy UTF-8 replacement would alias an undecodable R name to a real U+FFFD
+  // member and inspect the wrong value. Keep exact identities across listing,
+  // literal selectors, stored selectors, slices and the frontend merge.
+  await submit('invalid_utf8 <- rawToChar(as.raw(255)); Encoding(invalid_utf8) <- "UTF-8"; replacement_name <- "\\uFFFD"; encoding_names <- setNames(list(list(wrong = 1), list(right = 2)), c(invalid_utf8, replacement_name)); encoding_only_invalid <- setNames(list(1), invalid_utf8); encoding_valid <- setNames(list(list(right = 2)), replacement_name); stopifnot(identical(names(encoding_names[[replacement_name]]), "right")); cat("ENCODING_IDENTITY_VERIFIED\\n")');
+  assert.match(output, /ENCODING_IDENTITY_VERIFIED/);
+  assert.deepEqual(await inspect("encoding_only_invalid"), available([]));
+  assert.deepEqual(await inspect("encoding_names"), available(["\uFFFD"]));
+  for (const step of [{ kind: "field", name: "\uFFFD" },
+    { kind: "named-index", name: "\uFFFD" }, { kind: "variable-index", name: "replacement_name" }]) {
+    assert.deepEqual(await inspect("encoding_names", [step]), available(["right"]));
+  }
+  for (const kind of ["variable-index", "variable-slice"]) {
+    assert.deepEqual(await inspect("encoding_valid", [{ kind, name: "invalid_utf8" }]), available([]),
+      "undecodable selectors must not alias a valid member");
+  }
+  assert.deepEqual(await inspect("encoding_names", [{ kind: "slice-index", index: 1 }]), available([]));
+  assert.deepEqual(await inspect("encoding_names", [{ kind: "slice-name", name: "\uFFFD" },
+    { kind: "index", index: 1 }]), available(["right"]));
+  for (const input of ['encoding_names[["\uFFFD"]]$', 'encoding_names$`\uFFFD`$',
+    'encoding_names[replacement_name][[1]]$']) {
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length), undefined, undefined, undefined, [], [], undefined,
+      (receiver, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver, target)));
+    assert.deepEqual(entries.map(entry => entry.insertText), ["right"], input);
+  }
   // Combine the real native response with an R-serialized workspace snapshot.
   // A missing name is JSON null; it must not abort either UI before native
   // results or independent global index variables can reach the user.
