@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, WorkspaceData, GlobalEnvItem } from "./types";
-import { backtickRName, quoteRNameIfNeeded, getFieldInsertText } from "./candidates";
+import { backtickRName, quoteRNameIfNeeded, getFieldInsertText, bracketFieldMode } from "./candidates";
 import { allowsSymbolCompletions } from "./policy";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import { workspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
 
 function isSessionFunction(item: GlobalEnvItem): boolean {
   return item.type === "closure" || item.type === "builtin" || item.type === "special" ||
@@ -19,7 +21,6 @@ export function isSessionFunctionCall(context: CompletionContext, data: Workspac
       context.functionName === backtickRName(name)));
 }
 
-const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 export function getSessionCompletions(
   context: CompletionContext,
   data: WorkspaceData | undefined
@@ -29,16 +30,18 @@ export function getSessionCompletions(
   }
 
   if (context.kind === "member" && context.objectName) {
-    if (!TOP_LEVEL_SYMBOL_PATTERN.test(context.objectName)) {
+    const receiver = parseRuntimeMemberQuery(context.objectName);
+    // Workspace snapshots cannot establish R's current locale for byte escapes.
+    if (!receiver || receiver.utf8ByteEscapes || receiver.steps.length || !Object.hasOwn(data.globalenv, receiver.root)) {
       return [];
     }
-    const obj = data.globalenv[context.objectName];
+    const obj = data.globalenv[receiver.root];
     if (!obj) {
       return [];
     }
     const members = context.operator === "@"
-      ? asStringArray(obj.slots)
-      : asStringArray(obj.names);
+      ? workspaceStrings(obj.slots)
+      : workspaceStrings(obj.names);
     return members.map((name) => ({
       label: name,
       insertText: getFieldInsertText(name, context),
@@ -71,15 +74,18 @@ export function getDataColumnCompletions(
   context: CompletionContext,
   data: WorkspaceData | undefined
 ): CompletionEntry[] {
-  if (!context.dataObjectName || !data?.globalenv || context.bracketArgumentName) {
+  if (!context.dataObjectName || !data?.globalenv) {
     return [];
   }
 
   const obj = data.globalenv[context.dataObjectName];
-  const bare = obj?.class?.includes("data.table") === true;
-  if (context.kind === "bracket" && !bare && (context.bracketDimensions ?? 1) > 1 &&
-      context.bracketDimension !== 1) return [];
-  const names = asStringArray(obj?.names);
+  const classes = workspaceStrings(obj?.class);
+  const kind = classes?.length === 2 && classes[0] === "data.table" && classes[1] === "data.frame"
+    ? "data.table" : classes?.length === 1 && classes[0] === "data.frame" ? "data.frame" : undefined;
+  const mode = bracketFieldMode(context, kind);
+  if (mode === undefined) return [];
+  const bare = context.kind === "bracket" ? mode === "bare" : classes.includes("data.table");
+  const names = workspaceStrings(obj?.names);
   if (names.length === 0) {
     return [];
   }
@@ -91,11 +97,4 @@ export function getDataColumnCompletions(
     detail: context.dataObjectName,
     source: "session" as const,
   }));
-}
-
-function asStringArray(value: string | string[] | undefined): string[] {
-  if (Array.isArray(value)) {
-    return value.filter((item) => item.length > 0);
-  }
-  return value ? [value] : [];
 }

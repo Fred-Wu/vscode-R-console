@@ -1,5 +1,6 @@
-import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isCompleteIdentifier, type Token } from "../lexer";
+import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isAccessorNamePrefix, isCompleteIdentifier, type Token } from "../lexer";
 import { getDataCompletionObject } from "./dataScope";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 // Retain only the latest completion input. Adjacent tokens can merge after an
 // edit (notably r + a quote + a raw-string delimiter, or an exponent's sign).
@@ -108,16 +109,9 @@ export type BracketCompletionContext = {
   argumentTags?: (string | null)[];
 };
 
-/** Literal indices can be inspected without running index expressions. */
+/** The bracket and member paths share a single non-evaluating selector grammar. */
 function hasOnlyLiteralSubscripts(code: string): boolean {
-  let depth = 0;
-  for (const token of tokenize(code)) {
-    if (token.type === TokenType.LeftBracket) depth += token.value.length;
-    else if (token.type === TokenType.RightBracket) depth -= token.value.length;
-    else if (depth && token.type !== TokenType.Number && token.type !== TokenType.String &&
-      token.type !== TokenType.RawString && token.type !== TokenType.Comma && token.type !== TokenType.Newline) return false;
-  }
-  return depth === 0;
+  return parseRuntimeMemberQuery(code) !== undefined;
 }
 
 export function isCompletionInLiteral(code: string, cursor = code.length, tokens?: Token[]): boolean {
@@ -159,13 +153,17 @@ export function getCompletionParseSuffix(code: string): string | undefined {
   return suffix + stack.reverse().join("");
 }
 
-function completionPrefix(tokens: Token[], start: number, end: number, cursor: number):
+function completionPrefix(tokens: Token[], start: number, end: number, cursor: number, accessorPrefix = false):
   { prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" } | undefined {
   const before = tokens.slice(start, end).filter(token => token.position < cursor);
   if (!before.length) return start === end ? { prefix: "", replaceStart: cursor } : undefined;
   if (before.length !== 1) return undefined;
   const token = before[0];
-  if (token.type === TokenType.Identifier && !token.value.startsWith("`") && token.value !== "..." &&
+  // As with obj$in, a keyword can be a transient prefix in obj[[in while
+  // typing a stored member name. Keep the receiver and its insertion rules;
+  // this does not extend the grammar of completed runtime selector paths.
+  if ((accessorPrefix ? isAccessorNamePrefix(token) : token.type === TokenType.Identifier) &&
+      !token.value.startsWith("`") && token.value !== "..." &&
       token.position + token.value.length >= cursor) {
     const end = token.position + token.value.length;
     return { prefix: token.value.slice(0, cursor - token.position), replaceStart: token.position,
@@ -235,7 +233,7 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
       argumentTags.push(active ? null : named ? first.value :
         slotStart + 1 === index && first?.value === "..." ? "..." : "");
       if (!option && active) {
-        selected = completionPrefix(tokens, slotStart + (named ? 2 : 0), index, cursor);
+        selected = completionPrefix(tokens, slotStart + (named ? 2 : 0), index, cursor, true);
         // Retain source spelling so quoted/escaped argument tags remain valid R.
         argumentName = named ? first.value : undefined;
         dimension = dimensions;
@@ -327,7 +325,11 @@ export function getQualifiedCompletionContext(code: string, sourceTokens?: Token
   const last = tokens[index];
   let prefix = "";
   let replaceStart = code.length;
-  if (isCompleteIdentifier(last) && !last.value.startsWith("`") &&
+  // R keywords such as "in" are valid *partial* names immediately after
+  // an accessor (e.g. obj$in while typing obj$inner). Treat them as a prefix
+  // here, not as completed receiver members or ordinary global tokens.
+  const keywordPrefix = isNameAccessor(tokens[index - 1]) && isAccessorNamePrefix(last);
+  if ((isCompleteIdentifier(last) || keywordPrefix) && !last.value.startsWith("`") &&
       last.position + last.value.length === code.length) {
     if (!continuations[index]) return undefined;
     prefix = last.value;

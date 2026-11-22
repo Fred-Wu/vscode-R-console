@@ -16,6 +16,159 @@ function contextAt(marked) {
     before, text.slice(cursor));
 }
 
+test("R keyword prefixes stay in member and namespace completion while typing", () => {
+  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function",
+    "TRUE", "FALSE", "NA", "NA_integer_", "NA_real_", "NA_complex_", "NA_character_", "Inf", "NaN"];
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const keyword of keywords) {
+      const input = `custom_obj${operator}${keyword}│`;
+      const context = contextAt(input);
+      assert.equal(context?.kind, operator === "$" || operator === "@" ? "member" : "package", input);
+      assert.equal(context?.prefix, keyword, input);
+      if (context.kind === "member") assert.equal(context.objectName, "custom_obj", input);
+      assert.equal(context.autoTrigger, true, input);
+    }
+  }
+  for (const prefix of ["i", "in", "inn", "inne", "inner"]) {
+    const context = contextAt(`custom_obj$${prefix}│`);
+    assert.equal(context?.kind, "member", prefix);
+    assert.equal(context?.prefix, prefix);
+  }
+  assert.equal(contextAt("if│")?.kind, "default", "top-level names remain unchanged");
+});
+
+test("bracket keyword prefixes retain guarded receivers and quoted insertion throughout typing", async () => {
+  const keywords = ['in', 'if', 'else', 'for', 'while', 'repeat', 'next', 'break', 'function',
+    'TRUE', 'FALSE', 'NULL', 'NA', 'NA_integer_', 'NA_real_', 'NA_complex_', 'NA_character_', 'Inf', 'NaN'];
+  for (const receiver of ['obj', 'box$inner', 'box[[1]]']) {
+    for (const operator of ['[', '[[']) {
+      for (const keyword of keywords) {
+        const name = keyword + '_field';
+        for (const prefix of [keyword.slice(0, -1), keyword, name]) {
+          const input = receiver + operator + prefix;
+          const context = completion.getCompletionContext(input, input.length);
+          assert.equal(context.kind, 'bracket', input);
+          assert.equal(context.objectName, receiver, input);
+          assert.equal(context.prefix, prefix, input);
+          let probes = 0;
+          const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+            undefined, [], [], undefined, async (expression, target) => {
+              probes++;
+              assert.deepEqual([expression, target], [receiver, operator]);
+              return { status:'available', names:[name] };
+            });
+          assert.equal(probes, 1, input);
+          assert.deepEqual(entries.map(entry => entry.insertText), [JSON.stringify(name)], input);
+        }
+      }
+    }
+  }
+  for (const marked of ['box$inner[[in│tegerColumn]]', 'df[, in│tegerColumn]', 'df[, j = in│tegerColumn]']) {
+    const context = contextAt(marked);
+    assert.equal(context.kind, 'bracket', marked);
+    assert.equal(context.prefix, 'in', marked);
+    assert.equal(context.replaceEnd, marked.indexOf('│') + 'tegerColumn'.length, marked);
+  }
+  // A keyword prefix must still reach the safety decision instead of falling
+  // back to stale, unquoted workspace fields in an ordinary symbol context.
+  const input = 'obj[in';
+  const rejected = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length), undefined, undefined,
+    { globalenv: { obj: { names:['integerColumn'] } } }, [], [], undefined,
+    async () => ({ status:'suppressed', reason:'unsafe-dispatch' }));
+  assert.deepEqual(rejected, []);
+});
+
+test("unsupported executable receivers with keyword prefixes cannot fall back to global completion", async () => {
+  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function",
+    "TRUE", "FALSE", "NA", "NA_integer_", "NA_real_", "NA_complex_", "NA_character_", "Inf", "NaN"];
+  for (const operator of ["$", "@"]) {
+    for (const keyword of keywords) {
+      const input = "make_object()" + operator + keyword;
+      const context = completion.getCompletionContext(input, input.length);
+      assert.equal(context?.kind, "member", input);
+      assert.equal(context.rejectionReason, "executable-receiver", input);
+      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+        { globalenv: { make_object: { type: "closure" }, secret: { type: "double" } } },
+        [], [], { provideCompletionItems: () => assert.fail("must not query LSP") },
+        () => assert.fail("must not inspect R"));
+      assert.deepEqual(entries, [], input);
+    }
+  }
+});
+
+test("constant prefixes keep live members throughout typing and preserve the replacement span", async () => {
+  const names = ["NA_value", "TRUE_value", "FALSE_value", "Inf_value", "NaN_value"];
+  for (const name of names) {
+    for (let length = 1; length <= name.length; length++) {
+      const prefix = name.slice(0, length);
+      const input = "obj$" + prefix;
+      const context = completion.getCompletionContext(input, input.length);
+      assert.equal(context.kind, "member", input);
+      assert.equal(context.replaceStart, 4, input);
+      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+        undefined, [], [], undefined, async () => ({ status: "available", names }));
+      assert.ok(entries.some(item => item.label === name), input);
+    }
+  }
+  const middle = contextAt("obj$NA│_value");
+  assert.equal(middle.prefix, "NA");
+  assert.equal(middle.replaceEnd, "obj$NA_value".length);
+  for (const literal of ["1", "1L", "1e3", "0xff"]) {
+    assert.notEqual(contextAt(`obj$${literal}│`)?.kind, "member");
+  }
+});
+
+test("unsupported bracket receivers reject unrelated global fallback without inspecting R", async () => {
+  for (const marked of [
+    "make_object()[[│", "make_object()[[al│", "make_object()[al│",
+    "make_object()[[in│", "make_object()[[al│]]",
+    "obj[[choose_index()]][[al│", "make_object()$inner[[al│",
+    "print(make_object()[al│", "x <- obj[[choose_index()]][[al│",
+    "x <-\n  make_object()[al│",
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context?.rejectionReason, "executable-receiver", marked);
+    assert.notEqual(context.kind, "default", marked);
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => marked.replace("│", "") },
+      { line: 0, character: marked.indexOf("│") },
+      { globalenv: { alpha: { type: "double" }, algorithm: { type: "double" } } },
+      [], [], { provideCompletionItems: () => assert.fail("no LSP fallback for rejected receiver") },
+      () => assert.fail("no R inspection for rejected receiver"));
+    assert.deepEqual(entries, [], marked);
+  }
+  for (const marked of [
+    "obj[[1]][[│", "obj[[1]][[al│", "obj[[i]][[al│",
+    "obj$inner[[al│", "df[, al│", "outer(obj[[al│",
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context?.kind, "bracket", marked);
+    assert.equal(context.rejectionReason, undefined, marked);
+  }
+  const computedIndex = contextAt("obj[[i + al│");
+  assert.equal(computedIndex?.rejectionReason, undefined,
+    "typing within a computed index may still complete ordinary variable names");
+});
+
+test("enclosing source never rejects ordinary completion inside safe subscripts", async () => {
+  for (const marked of [
+    "print(df[x + va│])", "x <- df[x + va│]", "print(df[drop = va│])",
+    "x <-\n  df[x + va│]", "print(\n  df[x +\n    va│])",
+    "earlier <- 1\nx <- df[x + va│]", "{ x <- df[x + va│] }",
+    "print(obj[[1]][x + va│])", "print(obj[[x + va│]])",
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context?.kind, "default", marked);
+    assert.equal(context.rejectionReason, undefined, marked);
+    assert.equal(context.prefix, "va", marked);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { variable: { type: "double" } } }, [], [], undefined,
+      () => assert.fail("ordinary index variables must not inspect a receiver"));
+    assert.ok(entries.some(item => item.label === "variable"), marked);
+  }
+});
+
 test("bracket contexts retain the complete object, active dimension and quoted prefix", () => {
   for (const [marked, object, prefix, dimension, dimensions] of [
     ["obj[[│]]", "obj", "", 0, 1], ["obj[[\"a b│\"]]", "obj", "a b", 0, 1],
@@ -85,12 +238,18 @@ test("quoted completions replace the existing value through its closing quote", 
   }
 });
 
-test("nested bracket completion does not borrow an unrelated global object's fields", async () => {
+test("nested bracket completion uses guarded names without borrowing unrelated global fields", async () => {
   const context = contextAt("obj$data[[│]]");
+  const requested = [];
   const entries = await completion.collectCompletionEntries(context, undefined, undefined,
     { globalenv: { data: { names: ["wrong_global"] } } }, [], [], undefined,
-    async () => assert.fail("bracket completion must not query sess"));
-  assert.deepEqual(entries.filter(item => item.kind === 4), []);
+    async (expression, target) => {
+      requested.push([expression, target]);
+      return { status: "available", names: ["nested_field"] };
+    });
+  assert.deepEqual(requested, [["obj$data", "[["]]);
+  assert.deepEqual(entries.filter(item => item.kind === 4).map(item => item.label), ["nested_field"]);
+  assert.ok(!entries.some(item => item.label === "wrong_global"));
   const typed = await completion.collectCompletionEntries(contextAt("obj$data[[da│]]"), undefined, undefined,
     { globalenv: { data: { type: "integer" } } }, []);
   assert.ok(typed.some(item => item.insertText === "data" && item.kind === 5),

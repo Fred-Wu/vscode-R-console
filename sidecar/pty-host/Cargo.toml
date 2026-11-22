@@ -26,4 +26,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
+cc = "=1.2.47"
 winresource = "0.1"

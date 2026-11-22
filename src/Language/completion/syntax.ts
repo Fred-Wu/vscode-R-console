@@ -1,8 +1,55 @@
 import type { CompletionContext } from "./types";
-import { getCompletionSyntax } from "./contextParser";
+import { TokenType, tokenize, isMemberAccessor, isAccessorNamePrefix } from "../lexer";
+import { getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
+}
+
+/** A call/expression followed by $ or @ is not a global-name completion.
+ * The normal member parser handles safe receivers; suppress the ambient-name
+ * fallback when it cannot resolve the receiver without evaluating draft code.
+ */
+function hasUnsupportedMemberReceiver(before: string): boolean {
+  if (!before.includes("$") && !before.includes("@")) return false;
+  const tokens = tokenize(before);
+  const last = tokens.at(-2); // EOF follows the final significant token.
+  if (!last) return false;
+  if (isMemberAccessor(last)) {
+    return before.slice(last.position + last.value.length).trim().length === 0;
+  }
+  if (!isAccessorNamePrefix(last) || last.closed === false ||
+      last.position + last.value.length !== before.length) return false;
+  const preceding = tokens.at(-3);
+  return preceding !== undefined && isMemberAccessor(preceding) &&
+    before.slice(preceding.position + preceding.value.length, last.position).trim().length === 0;
+}
+
+/** An unfinished subscript on an unsupported receiver must not fall back
+ * to unrelated global symbols. Valid bracket contexts return earlier.
+ */
+function hasUnsupportedBracketReceiver(before: string): boolean {
+  if (!before.includes("[")) return false;
+  const openings: { delimiter: string; position: number }[] = [];
+  const matching: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  for (const token of tokenize(before)) {
+    if (token.type === TokenType.LeftBracket || token.type === TokenType.LeftParen ||
+        token.type === TokenType.LeftBrace) {
+      for (const delimiter of token.value) openings.push({ delimiter, position: token.position });
+    } else if (token.type === TokenType.RightBracket || token.type === TokenType.RightParen ||
+        token.type === TokenType.RightBrace) {
+      for (const delimiter of token.value) {
+        if (openings.pop()?.delimiter !== matching[delimiter]) return false;
+      }
+    }
+  }
+  const active = openings.at(-1);
+  if (active?.delimiter !== "[") return false;
+  // Resolve only the receiver, excluding enclosing calls, assignments and
+  // earlier statements. The synthetic accessor is parsed, never evaluated.
+  const receiver = getQualifiedCompletionContext(before.slice(0, active.position) + "$");
+  return !receiver || parseRuntimeMemberQuery(receiver.objectName) === undefined;
 }
 
 export function getCompletionContext(
@@ -44,6 +91,8 @@ export function getCompletionContext(
       isPipePlaceholder(member.baseObject) && !!dataObjectName;
     return {
       kind: "member",
+      ...(member.hasSubscript && !parseRuntimeMemberQuery(member.objectName) ?
+        { rejectionReason: "executable-receiver" as const } : {}),
       autoTrigger: true,
       prefix,
       replaceStart,
@@ -59,12 +108,27 @@ export function getCompletionContext(
     };
   }
 
+  // Without this guard, explicit Tab after make_object()$ treats the
+  // unsupported member receiver as a default/global completion request.
+  if (!inLiteral && hasUnsupportedMemberReceiver(textForDataContext)) {
+    return {
+      kind: "member",
+      prefix: "",
+      replaceStart: beforeCursor.length,
+      rejectionReason: "executable-receiver",
+      snapshotInput,
+      snapshotCursor,
+    };
+  }
+
   const bracket = syntax.bracket;
   if (bracket && bracket.replaceStart >= relativeOffset) {
     const isPlaceholderBracket = isPipePlaceholder(bracket.objectName) && !!dataObjectName;
     const effectiveDataObject = isPlaceholderBracket ? dataObjectName : bracket.objectName;
     return {
       kind: "bracket",
+      ...(bracket.objectName.includes("[") && !parseRuntimeMemberQuery(bracket.objectName) ?
+        { rejectionReason: "executable-receiver" as const } : {}),
       autoTrigger: true,
       prefix: bracket.prefix,
       replaceStart: bracket.replaceStart - relativeOffset,
@@ -78,6 +142,19 @@ export function getCompletionContext(
       bracketArgumentName: bracket.argumentName,
       dataObjectName: effectiveDataObject,
       operator: undefined,
+      snapshotInput,
+      snapshotCursor,
+    };
+  }
+
+  // If the bracket parser refused an executable receiver, do not reinterpret
+  // its unfinished index as an unrelated global-symbol completion.
+  if (!inLiteral && hasUnsupportedBracketReceiver(textForDataContext)) {
+    return {
+      kind: "member",
+      prefix: "",
+      replaceStart: beforeCursor.length,
+      rejectionReason: "executable-receiver",
       snapshotInput,
       snapshotCursor,
     };

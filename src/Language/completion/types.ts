@@ -1,5 +1,7 @@
 import type * as vscode from "vscode";
 import type { CallCompletionContext } from "./contextParser";
+import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
+import type { WorkspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
@@ -19,6 +21,7 @@ export type CompletionContext = {
   pipe?: boolean;
   autoTrigger?: boolean;
   suppressAutomatic?: boolean;
+  rejectionReason?: "executable-receiver";
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
   // Source tags from the lexer, available only at an argument-name position.
@@ -37,6 +40,8 @@ export type CompletionEntry = {
   replaceStart?: number;
   replaceEnd?: number;
   role?: "argument" | "value" | "member" | "scope";
+  // Explicit bracket-context symbol supplied by installed package metadata.
+  bracketSpecial?: boolean;
   packageName?: string;
 };
 
@@ -78,30 +83,28 @@ export interface CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string,
     // Keep the user's cursor when position is moved to broaden matching.
-    contextPosition?: vscode.Position
+    contextPosition?: vscode.Position,
+    // Safe, already-inspected receiver class; null means no supported class.
+    runtimeBracketKind?: "data.frame" | "data.table" | null
   ): Promise<CompletionResult | undefined>;
 }
 
 export type RuntimeMemberCompletionRequester = (
   expression: string,
-  operator: "$" | "@"
+  operator: "$" | "@" | "[" | "[["
 ) => Promise<
-  Array<{
-    name: string;
-    type?: string;
-    str?: string;
-  }> | undefined
+  MemberInspectionResult | undefined
 > | undefined;
 
 export type GlobalEnvItem = {
-  class?: string[];
+  class?: WorkspaceStrings;
   type?: string;
   length?: number;
   str?: string;
   size?: number;
   dim?: number[];
-  names?: string | string[];
-  slots?: string | string[];
+  names?: WorkspaceStrings;
+  slots?: WorkspaceStrings;
 };
 
 export type WorkspaceData = {

@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
+import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
+import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
@@ -26,6 +28,7 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
+import type { MemberInspectionResult, MemberInspectionTarget } from "../Runtime/backendProtocol";
 import type { WorkspaceData } from "../Runtime/VSCR";
 import {
   InputSnapshot,
@@ -285,6 +288,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       cwd: this.options.cwd,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       onPackagesChanged: () => this.dismissInlineCompletion(false),
+      requestRuntimeMemberCompletions: (expression, operator) =>
+        this.requestStoredMemberCompletions(expression, operator),
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
@@ -319,6 +324,48 @@ export class RTerminal implements vscode.Pseudoterminal {
       attachRuntimeSession(this.runtimeHost(), true);
       updateRuntimeTerminalName(this.runtimeHost());
     }
+  }
+
+  /** Never start native completion after input has been accepted for parsing.
+   * The reservation remains active across the parse-result/submit-frame gap. */
+  private requestStoredMemberCompletions(
+    expression: string, operator: MemberInspectionTarget
+  ): Promise<MemberInspectionResult | undefined> | undefined {
+    if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
+        this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) {
+      return undefined;
+    }
+    const query = parseRuntimeMemberQuery(expression, operator);
+    if (!query) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
+        expression + operator, this.lang.completionDiagnosticsScope);
+      return undefined;
+    }
+    const reportUnavailable = () => {
+      // Top-level metadata may have a cached fallback; report failures
+      // to inspect nested paths, where an empty list would be ambiguous.
+      if (query.steps.length) {
+        logConsoleCompletionDecision({ kind: "Unavailable", reason: "runtime-unavailable" },
+          expression + operator, this.lang.completionDiagnosticsScope);
+      }
+    };
+    const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
+    if (!response) {
+      reportUnavailable();
+      return undefined;
+    }
+    return response.then(result => {
+      if (result.status === "suppressed") {
+        logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+          expression + operator, this.lang.completionDiagnosticsScope);
+      } else if (result.status === "unavailable") {
+        reportUnavailable();
+      }
+      return result;
+    }, () => {
+      reportUnavailable();
+      return { status: "unavailable" as const };
+    });
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
@@ -2107,19 +2154,35 @@ export class RTerminal implements vscode.Pseudoterminal {
     const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
     if (!this.inlineCompletion.visible && !typing) return;
     const input = this.getInputSnapshot();
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
+      this.lang.completionDiagnosticsScope);
     const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    if (context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
-        !context?.autoTrigger && (!context || [...context.prefix].length < minimum))) {
+    if (context?.rejectionReason) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
+        completionDecisionContext(input.textBeforeCursor), this.lang.completionDiagnosticsScope);
+    }
+    if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
+        (!context || ((context.kind === "default" || context.kind === "argument") &&
+          !context.autoTrigger && [...context.prefix].length < minimum)))) {
       this.dismissInlineCompletion(false);
       return;
     }
     const refined = this.lang.refineInlineCompletion(input, context);
     if (refined) {
       this.inlineCompletion.set(refined, this.inlineCompletion.token, context?.prefix ?? "");
+      // A complete member list can be filtered locally as the user types.
+      // Refreshing it for each prefix can replace valid results with a transient
+      // empty LSP response and close the popup below the top-level threshold.
+      if (context?.kind === "member" && context.prefix &&
+          this.lang.hasCompleteInlineMemberCache()) {
+        if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
+        this.inlineCompletionTimer = undefined;
+        return;
+      }
     }
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
     this.inlineCompletionTimer = setTimeout(() => {

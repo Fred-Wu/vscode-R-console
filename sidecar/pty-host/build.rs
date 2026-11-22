@@ -2,6 +2,13 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // C owns the R error/interrupt boundary: no R longjmp can cross Rust.
+    cc::Build::new()
+        .file("src/member_guard.c")
+        .warnings(true)
+        .compile("r_console_member_guard");
+    println!("cargo:rerun-if-changed=src/member_guard.c");
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let host = env::var("HOST").unwrap_or_default();
     if target_os != "windows" || !host.contains("windows") {

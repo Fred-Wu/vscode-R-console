@@ -9,16 +9,18 @@ import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
 export async function pickCompletion({
-  context, latestInput, initialEntries, delayedEntries, force, isCurrent, collect, signal,
+  context, latestInput, initialEntries, stagedEntries, delayedEntries, force, isCurrent, collect, signal,
 }: {
   context: CompletionContext;
   latestInput: InputSnapshot;
   initialEntries: CompletionEntries;
+  stagedEntries?: Promise<CompletionEntries | undefined>;
   delayedEntries?: Promise<CompletionEntries | undefined>;
   force: boolean;
   signal?: AbortSignal;
   isCurrent: () => boolean;
-  collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number) => Promise<CompletionEntries | undefined>;
+  collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number,
+    onStagedEntries: (entries: CompletionEntries) => void) => Promise<CompletionEntries | undefined>;
 }): Promise<CompletionPickItem | undefined> {
   const completionPlaceHolder = "R console completions";
   const shouldPrefillQuickPick =
@@ -32,6 +34,9 @@ export async function pickCompletion({
     return setTimeout(() => { if (pick.value.length === 0) { pick.value = context.prefix; } }, 0);
   };
   const searchValue = (value: string): string => {
+    // Filtering and grouping must rank the same query, including the empty
+    // search box shown initially (and after clearing) for member completion.
+    if (context.kind === "member" && !value) return context.prefix;
     if (context.kind === "package" && value.length > 0 && !value.startsWith(context.prefix)) {
       return context.prefix + value;
     }
@@ -66,6 +71,7 @@ export async function pickCompletion({
   };
   const showCompletionQuickPick = async (
     initialEntries: CompletionEntries,
+    stagedEntries?: Promise<CompletionEntries | undefined>,
     delayedEntries?: Promise<CompletionEntries | undefined>
   ): Promise<CompletionPickItem | undefined> => await new Promise((resolve) => {
     if (signal?.aborted) {
@@ -83,6 +89,7 @@ export async function pickCompletion({
     let baselineIncomplete = initialEntries.isIncomplete === true;
     let sourceEntries = initialEntries;
     let sourceIncomplete = baselineIncomplete;
+    let baselinePhase = 0;
     Object.assign(pick, {
       matchOnDescription: false,
       matchOnDetail: false,
@@ -90,17 +97,19 @@ export async function pickCompletion({
       placeholder: completionPlaceHolder,
     });
     setQuickPickItems(pick, sourceEntries, "");
-    void delayedEntries?.then((nextEntries) => {
-      if (!active || !nextEntries || !isCurrent()) {
-        return;
-      }
+    const updateBaseline = (phase: number, nextEntries: CompletionEntries | undefined): void => {
+      if (!active || !nextEntries || !isCurrent() || phase < baselinePhase) return;
+      // A slower native-only result must not replace the completed LSP merge.
+      baselinePhase = phase;
       baselineEntries = nextEntries;
       baselineIncomplete = nextEntries.isIncomplete === true;
       if (refinedPrefix !== undefined) return;
       sourceEntries = nextEntries;
       sourceIncomplete = baselineIncomplete;
       void changeValue(pick.value).catch(() => undefined);
-    }).catch(() => undefined);
+    };
+    void stagedEntries?.then(entries => updateBaseline(1, entries)).catch(() => undefined);
+    void delayedEntries?.then(entries => updateBaseline(2, entries)).catch(() => undefined);
     const changeValue = async (value: string): Promise<void> => {
       const refinesBlankContext =
         context.prefix.length === 0 &&
@@ -164,18 +173,28 @@ export async function pickCompletion({
       if (prefix.length > 0) {
         nextContext.triggerCharacter = undefined;
       }
-      const nextEntries = await collect(nextContext, nextInputText, lines, cursorCol);
-      if (!active || !nextEntries || !isCurrent()) return;
-      if (currentRequest === request) {
+      const publish = (nextEntries: CompletionEntries): boolean => {
+        if (!active || !isCurrent() || currentRequest !== request) return false;
         // LSP edits target the preview, but acceptance edits the actual input.
         sourceEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
-        // Typing may have refined a complete baseline while this request was
-        // pending. A truncated reply cannot cover that newer query locally.
-        if (sourceIncomplete && pick.value !== value && pick.value.startsWith(value)) {
-          await changeValue(pick.value);
-        }
+        return true;
+      };
+      let finished = false;
+      let nextEntries: CompletionEntries | undefined;
+      try {
+        nextEntries = await collect(nextContext, nextInputText, lines, cursorCol, staged => {
+          if (!finished) publish(staged);
+        });
+      } finally {
+        finished = true;
+      }
+      if (!nextEntries || !publish(nextEntries)) return;
+      // Typing may have refined a complete baseline while this request was
+      // pending. A truncated reply cannot cover that newer query locally.
+      if (sourceIncomplete && pick.value !== value && pick.value.startsWith(value)) {
+        await changeValue(pick.value);
       }
     };
     pick.onDidAccept(() => {
@@ -202,5 +221,5 @@ export async function pickCompletion({
     pick.show();
     if (active) prefillTimer = prefillQuickPick(pick);
   });
-  return showCompletionQuickPick(initialEntries, delayedEntries);
+  return showCompletionQuickPick(initialEntries, stagedEntries, delayedEntries);
 }

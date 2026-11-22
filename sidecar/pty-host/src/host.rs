@@ -10,6 +10,7 @@ pub(crate) fn run(_args: Vec<String>) -> Result<(), Box<dyn Error>> {
 mod unix_host {
     use crate::console_input::ConsoleInput;
     use crate::library_paths::{self, LibraryPathsApi};
+    use crate::member_inspection::{self, InspectorApi, MemberQuery};
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -29,6 +30,8 @@ mod unix_host {
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    // A result older than the frontend deadline cannot be applied to the input.
+    const MEMBER_REQUEST_TTL: Duration = Duration::from_millis(450);
     const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
 
@@ -131,6 +134,7 @@ mod unix_host {
         r_base_env_ptr: *mut Sexp,
         r_nil_value_ptr: *mut Sexp,
         library_paths_api: LibraryPathsApi,
+        inspector_api: Option<InspectorApi>,
     }
 
     struct HostRuntime {
@@ -174,6 +178,7 @@ mod unix_host {
         Submit(VecDeque<Vec<u8>>),
         Reply(Vec<u8>),
         ParseStatus { request_id: u32, code: String },
+        MemberNames { request_id: u32, query: MemberQuery, queued_at: Instant },
     }
 
     enum WaitKind {
@@ -189,6 +194,7 @@ mod unix_host {
     static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
     static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
     static LIBRARY_PATHS_API: OnceLock<LibraryPathsApi> = OnceLock::new();
+    static INSPECTOR_API: OnceLock<Option<InspectorApi>> = OnceLock::new();
     static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_CHECK_USER_INTERRUPT: AtomicUsize = AtomicUsize::new(0);
@@ -250,7 +256,9 @@ mod unix_host {
         let library_path = resolve_r_library_path(&r_executable)?;
         let api = unsafe { RApi::load(&library_path)? };
 
-        let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
+        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
             let _ =
@@ -284,6 +292,8 @@ mod unix_host {
         LIBRARY_PATHS_API
             .set(api.library_paths_api())
             .map_err(|_| "library paths api already initialized")?;
+        INSPECTOR_API.set(api.inspector_api)
+            .map_err(|_| "member inspection api already initialized")?;
 
         if let Some(width) = initial_console_width_from_env() {
             if let Err(error) = apply_console_width(width) {
@@ -605,6 +615,7 @@ mod unix_host {
             IncomingCommand::ParseStatus { request_id, code } => {
                 queue_parse_status(request_id, code)
             }
+            IncomingCommand::MemberNames { request_id, query } => queue_member_names(request_id, query),
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
@@ -615,10 +626,17 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
+            // A submission supersedes pending completion work, not vice versa.
+            let cancelled = discard_queued_member_requests(&mut state);
             state
                 .pending_commands
                 .push_back(PendingCommand::Submit(split_submission_lines(&code)));
             runtime.cv.notify_all();
+            drop(state);
+            for request_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    request_id, &member_inspection::Inspection::Unavailable);
+            }
         }
     }
 
@@ -646,10 +664,80 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
-            state
-                .pending_commands
-                .push_back(PendingCommand::ParseStatus { request_id, code });
+            let cancelled = enqueue_parse_status(&mut state, request_id, code);
             runtime.cv.notify_all();
+            drop(state);
+            for cancelled_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    cancelled_id, &member_inspection::Inspection::Unavailable);
+            }
+        }
+    }
+
+    // Parsing belongs to code submission. Cancel speculative inspection here,
+    // before Submit itself can be queued, so R cannot inspect between the
+    // parse result and the subsequent submission frame.
+    fn enqueue_parse_status(state: &mut SharedState, request_id: u32, code: String) -> Vec<u32> {
+        let cancelled = discard_queued_member_requests(state);
+        state.pending_commands.push_back(PendingCommand::ParseStatus { request_id, code });
+        cancelled
+    }
+
+
+    // Only the latest queued request can still match the user's current input.
+    // Return an unavailable result for displaced requests so callers never hang.
+    fn discard_queued_member_requests(state: &mut SharedState) -> Vec<u32> {
+        let cancelled = state.pending_commands.iter().filter_map(|command| {
+            match command {
+                PendingCommand::MemberNames { request_id, .. } => Some(*request_id),
+                _ => None,
+            }
+        }).collect();
+        state.pending_commands.retain(|command|
+            !matches!(command, PendingCommand::MemberNames { .. }));
+        cancelled
+    }
+
+    fn queue_member_names(request_id: u32, query: MemberQuery) {
+        let Some(runtime) = host_runtime() else { return };
+        let mut state = runtime.state.lock().expect("host state lock poisoned");
+        let cancelled = discard_queued_member_requests(&mut state);
+        let idle = !state.busy && !state.shutdown_requested &&
+            !state.startup_input_pending && state.active_submission_lines.is_empty() &&
+            state.pending_fragment.is_none() &&
+            matches!(state.wait_state.as_ref(), Some(StoredWaitState::TopLevel(PromptKind::Main))) &&
+            !state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_)));
+        if idle && INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id, query, queued_at: Instant::now(),
+            });
+            runtime.cv.notify_all();
+        }
+        drop(state);
+        for cancelled_id in cancelled {
+            let _ = runtime.output.emit_member_names_result(
+                cancelled_id, &member_inspection::Inspection::Unavailable);
+        }
+        if !idle || !INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            let _ = runtime.output.emit_member_names_result(
+                request_id, &member_inspection::Inspection::Unavailable);
+        }
+    }
+
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<(MemberQuery, Instant)>)> {
+        // Parse-status is part of code submission, before Submit is queued.
+        // Never let speculative completion preempt an accepted parse request.
+        if state.pending_commands.iter().any(|command| matches!(command,
+            PendingCommand::Submit(_) | PendingCommand::ParseStatus { .. })) {
+            return None;
+        }
+        let index = state.pending_commands.iter().position(|command|
+            matches!(command, PendingCommand::MemberNames { .. }))?;
+        match state.pending_commands.remove(index)? {
+            PendingCommand::MemberNames { request_id, query, queued_at } =>
+                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL)
+                    .then_some((query, queued_at + MEMBER_REQUEST_TTL)))),
+            _ => None,
         }
     }
 
@@ -961,12 +1049,26 @@ mod unix_host {
                 return 0;
             }
 
+
+            // Parsing an accepted submission must not wait behind completion.
             if let Some((request_id, code)) = take_next_parse_request(&mut state) {
                 drop(state);
                 let status = parse_status(code);
                 let _ = runtime.output.emit_parse_status_result(request_id, status);
                 state = runtime.state.lock().expect("host state lock poisoned");
                 continue;
+            }
+
+            if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+                if let Some((request_id, query)) = take_next_member_request(&mut state) {
+                    drop(state);
+                    let result = query.and_then(|(query, deadline)| INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query, deadline)))
+                        .unwrap_or(member_inspection::Inspection::Unavailable);
+                    let _ = runtime.output.emit_member_names_result(request_id, &result);
+                    state = runtime.state.lock().expect("host state lock poisoned");
+                    continue;
+                }
             }
 
             if let Some(width) = state.pending_width.take() {
@@ -1602,6 +1704,8 @@ mod unix_host {
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
                 r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                inspector_api: InspectorApi::load(|name| library.get::<*const c_void>(name).ok()
+                    .map(|value| *value as usize)),
                 library_paths_api: LibraryPathsApi {
                     install: load_function(&library, b"Rf_install\0")?,
                     lang1: load_function(&library, b"Rf_lang1\0")?,
@@ -1773,12 +1877,51 @@ mod unix_host {
 
         Ok(argv)
     }
+
+    #[cfg(test)]
+    mod member_priority_tests {
+        use super::{enqueue_parse_status, take_next_member_request, take_next_parse_request, PendingCommand, SharedState};
+        use crate::member_inspection::{MemberQuery, Target};
+        use std::time::Instant;
+
+        #[test]
+        fn expired_member_request_is_dropped_without_native_inspection() {
+            use super::{take_next_member_request, PendingCommand};
+            use crate::member_inspection::{MemberQuery, Target};
+            use std::time::Instant;
+
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 42,
+                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                queued_at: Instant::now() - super::MEMBER_REQUEST_TTL,
+            });
+            let (id, query) = take_next_member_request(&mut state).expect("queued request");
+            assert_eq!(id, 42);
+            assert!(query.is_none(), "expired work must not enter embedded R");
+        }
+
+        #[test]
+        fn code_parse_preempts_queued_member_completion() {
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 1,
+                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                queued_at: Instant::now(),
+            });
+            assert_eq!(enqueue_parse_status(&mut state, 2, "1 + 1".into()), vec![1]);
+            assert!(take_next_member_request(&mut state).is_none());
+            assert_eq!(take_next_parse_request(&mut state).map(|(id, _)| id), Some(2));
+            assert!(take_next_member_request(&mut state).is_none());
+        }
+    }
 }
 
 #[cfg(windows)]
 mod windows_host {
     use crate::console_input::ConsoleInput;
     use crate::library_paths::{self, LibraryPathsApi};
+    use crate::member_inspection::{self, InspectorApi, MemberQuery};
     use crate::protocol::{
         authenticate_session_stream, read_next_command, DialogRequest, DialogResult, IncomingCommand, OutputSink, OutputStream,
         PromptKind, SessionWaitState,
@@ -1807,6 +1950,8 @@ mod windows_host {
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    // A result older than the frontend deadline cannot be applied to the input.
+    const MEMBER_REQUEST_TTL: Duration = Duration::from_millis(450);
     const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
     const EMBEDDED_UTF8_PREFIX: &[u8] = &[0x02, 0xff, 0xfe];
@@ -1993,6 +2138,7 @@ mod windows_host {
         r_base_env_ptr: *mut Sexp,
         r_nil_value_ptr: *mut Sexp,
         library_paths_api: LibraryPathsApi,
+        inspector_api: Option<InspectorApi>,
         _r_start_storage: Option<Box<RStart>>,
         _r_home_storage: Option<CString>,
         _user_home_storage: Option<CString>,
@@ -2040,6 +2186,7 @@ mod windows_host {
         Submit(VecDeque<Vec<u8>>),
         Reply(Vec<u8>),
         ParseStatus { request_id: u32, code: String },
+        MemberNames { request_id: u32, query: MemberQuery, queued_at: Instant },
     }
 
     enum WaitKind {
@@ -2055,6 +2202,7 @@ mod windows_host {
     static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
     static PARSE_API: OnceLock<ParseApi> = OnceLock::new();
     static LIBRARY_PATHS_API: OnceLock<LibraryPathsApi> = OnceLock::new();
+    static INSPECTOR_API: OnceLock<Option<InspectorApi>> = OnceLock::new();
     static EVENT_LOOP_API: OnceLock<EventLoopApi> = OnceLock::new();
     static R_LOCALE_CP_PTR: AtomicUsize = AtomicUsize::new(0);
     static R_INTERRUPTS_PENDING_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -2119,7 +2267,9 @@ mod windows_host {
         let layout = resolve_r_layout(&r_executable)?;
         let mut api = unsafe { RApi::load(&layout)? };
 
-        let output = OutputSink::new_with_capabilities("embedded-r-host", SUPPORTED_CAPABILITIES);
+        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
             let _ =
@@ -2153,6 +2303,8 @@ mod windows_host {
         LIBRARY_PATHS_API
             .set(api.library_paths_api())
             .map_err(|_| "library paths api already initialized")?;
+        INSPECTOR_API.set(api.inspector_api)
+            .map_err(|_| "member inspection api already initialized")?;
 
         if let Some(width) = initial_console_width_from_env() {
             if let Err(error) = apply_console_width(width) {
@@ -2474,6 +2626,7 @@ mod windows_host {
             IncomingCommand::ParseStatus { request_id, code } => {
                 queue_parse_status(request_id, code)
             }
+            IncomingCommand::MemberNames { request_id, query } => queue_member_names(request_id, query),
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
@@ -2484,10 +2637,17 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
+            // A submission supersedes pending completion work, not vice versa.
+            let cancelled = discard_queued_member_requests(&mut state);
             state
                 .pending_commands
                 .push_back(PendingCommand::Submit(split_submission_lines(&code)));
             runtime.cv.notify_all();
+            drop(state);
+            for request_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    request_id, &member_inspection::Inspection::Unavailable);
+            }
         }
     }
 
@@ -2517,10 +2677,80 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
-            state
-                .pending_commands
-                .push_back(PendingCommand::ParseStatus { request_id, code });
+            let cancelled = enqueue_parse_status(&mut state, request_id, code);
             runtime.cv.notify_all();
+            drop(state);
+            for cancelled_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    cancelled_id, &member_inspection::Inspection::Unavailable);
+            }
+        }
+    }
+
+    // Parsing belongs to code submission. Cancel speculative inspection here,
+    // before Submit itself can be queued, so R cannot inspect between the
+    // parse result and the subsequent submission frame.
+    fn enqueue_parse_status(state: &mut SharedState, request_id: u32, code: String) -> Vec<u32> {
+        let cancelled = discard_queued_member_requests(state);
+        state.pending_commands.push_back(PendingCommand::ParseStatus { request_id, code });
+        cancelled
+    }
+
+
+    // Only the latest queued request can still match the user's current input.
+    // Return an unavailable result for displaced requests so callers never hang.
+    fn discard_queued_member_requests(state: &mut SharedState) -> Vec<u32> {
+        let cancelled = state.pending_commands.iter().filter_map(|command| {
+            match command {
+                PendingCommand::MemberNames { request_id, .. } => Some(*request_id),
+                _ => None,
+            }
+        }).collect();
+        state.pending_commands.retain(|command|
+            !matches!(command, PendingCommand::MemberNames { .. }));
+        cancelled
+    }
+
+    fn queue_member_names(request_id: u32, query: MemberQuery) {
+        let Some(runtime) = host_runtime() else { return };
+        let mut state = runtime.state.lock().expect("host state lock poisoned");
+        let cancelled = discard_queued_member_requests(&mut state);
+        let idle = !state.busy && !state.shutdown_requested &&
+            !state.startup_input_pending && state.active_submission_lines.is_empty() &&
+            state.pending_fragment.is_none() &&
+            matches!(state.wait_state.as_ref(), Some(StoredWaitState::TopLevel(PromptKind::Main))) &&
+            !state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_)));
+        if idle && INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id, query, queued_at: Instant::now(),
+            });
+            runtime.cv.notify_all();
+        }
+        drop(state);
+        for cancelled_id in cancelled {
+            let _ = runtime.output.emit_member_names_result(
+                cancelled_id, &member_inspection::Inspection::Unavailable);
+        }
+        if !idle || !INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            let _ = runtime.output.emit_member_names_result(
+                request_id, &member_inspection::Inspection::Unavailable);
+        }
+    }
+
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<(MemberQuery, Instant)>)> {
+        // Parse-status is part of code submission, before Submit is queued.
+        // Never let speculative completion preempt an accepted parse request.
+        if state.pending_commands.iter().any(|command| matches!(command,
+            PendingCommand::Submit(_) | PendingCommand::ParseStatus { .. })) {
+            return None;
+        }
+        let index = state.pending_commands.iter().position(|command|
+            matches!(command, PendingCommand::MemberNames { .. }))?;
+        match state.pending_commands.remove(index)? {
+            PendingCommand::MemberNames { request_id, query, queued_at } =>
+                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL)
+                    .then_some((query, queued_at + MEMBER_REQUEST_TTL)))),
+            _ => None,
         }
     }
 
@@ -2872,12 +3102,26 @@ mod windows_host {
                 return 0;
             }
 
+
+            // Parsing an accepted submission must not wait behind completion.
             if let Some((request_id, code)) = take_next_parse_request(&mut state) {
                 drop(state);
                 let status = parse_status(code);
                 let _ = runtime.output.emit_parse_status_result(request_id, status);
                 state = runtime.state.lock().expect("host state lock poisoned");
                 continue;
+            }
+
+            if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
+                if let Some((request_id, query)) = take_next_member_request(&mut state) {
+                    drop(state);
+                    let result = query.and_then(|(query, deadline)| INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query, deadline)))
+                        .unwrap_or(member_inspection::Inspection::Unavailable);
+                    let _ = runtime.output.emit_member_names_result(request_id, &result);
+                    state = runtime.state.lock().expect("host state lock poisoned");
+                    continue;
+                }
             }
 
             if let Some(width) = state.pending_width.take() {
@@ -3927,6 +4171,8 @@ mod windows_host {
                 rf_unprotect: load_function(&library, b"Rf_unprotect\0")?,
                 r_parse_vector: load_function(&library, b"R_ParseVector\0")?,
                 r_toplevel_exec: load_function(&library, b"R_ToplevelExec\0")?,
+                inspector_api: InspectorApi::load(|name| library.get::<*const c_void>(name).ok()
+                    .map(|value| *value as usize)),
                 library_paths_api: LibraryPathsApi {
                     install: load_function(&library, b"Rf_install\0")?,
                     lang1: load_function(&library, b"Rf_lang1\0")?,
@@ -4174,6 +4420,42 @@ mod windows_host {
             take_top_level_recovery_input, SharedState, TopLevelRecovery, WaitKind,
         };
         use crate::protocol::PromptKind;
+
+
+        #[test]
+        fn expired_member_request_is_dropped_without_native_inspection() {
+            use super::{take_next_member_request, PendingCommand};
+            use crate::member_inspection::{MemberQuery, Target};
+            use std::time::Instant;
+
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 42,
+                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                queued_at: Instant::now() - super::MEMBER_REQUEST_TTL,
+            });
+            let (id, query) = take_next_member_request(&mut state).expect("queued request");
+            assert_eq!(id, 42);
+            assert!(query.is_none(), "expired work must not enter embedded R");
+        }
+
+        #[test]
+        fn code_parse_preempts_queued_member_completion() {
+            use super::{enqueue_parse_status, take_next_member_request, take_next_parse_request, PendingCommand};
+            use crate::member_inspection::{MemberQuery, Target};
+            use std::time::Instant;
+
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 1,
+                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                queued_at: Instant::now(),
+            });
+            assert_eq!(enqueue_parse_status(&mut state, 2, "1 + 1".into()), vec![1]);
+            assert!(take_next_member_request(&mut state).is_none());
+            assert_eq!(take_next_parse_request(&mut state).map(|(id, _)| id), Some(2));
+            assert!(take_next_member_request(&mut state).is_none());
+        }
 
         #[test]
         fn decodes_embedded_utf8_console_segments() {

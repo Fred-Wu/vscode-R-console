@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry } from "./types";
 import { completionMatch } from "../completionMatch";
+import { decodeRArgumentName } from "./runtimeMembers";
 
 const R_SYNTACTIC_NAME_PATTERN = /^(?:[a-zA-Z]|\.(?![0-9]))[a-zA-Z0-9._]*$/;
 export const R_RESERVED_WORDS = new Set([
@@ -56,6 +57,32 @@ export function getFieldInsertText(name: string, context: CompletionContext, bar
     return quoteCompletionValue(name, context.bracketQuote);
   }
   return quoteRNameIfNeeded(name);
+}
+
+/** Stored columns are valid only in index/column arguments, not every option
+ * of an indexing method. Unknown named arguments conservatively get no fields.
+ * Keep this policy shared by fresh inspection and cached workspace metadata. */
+export function bracketFieldMode(
+  context: CompletionContext, kind?: "data.frame" | "data.table"
+): "bare" | "quoted" | undefined {
+  if (context.kind !== "bracket") return "quoted";
+  const spelling = context.bracketArgumentName;
+  const name = spelling === undefined ? undefined : decodeRArgumentName(spelling);
+  if (spelling !== undefined) {
+    if (context.bracketOperator !== "[") return undefined;
+    if (kind === "data.table") {
+      if (name === "i" || name === "j" || name === "by" || name === "keyby") return "bare";
+      if (name === ".SDcols" || name === "on") return "quoted";
+      return undefined;
+    }
+    // [.data.frame uses i for one-index column selection. In two-index
+    // selection i names rows and j names columns, even when tags are reordered.
+    const twoDimensions = (context.bracketDimensions ?? 1) > 1;
+    return kind === "data.frame" && name === (twoDimensions ? "j" : "i") ? "quoted" : undefined;
+  }
+  if (context.bracketOperator === "[" && kind !== "data.table" &&
+      (context.bracketDimensions ?? 1) > 1 && context.bracketDimension !== 1) return undefined;
+  return context.bracketOperator === "[" && kind === "data.table" ? "bare" : "quoted";
 }
 
 export function isCallableCompletionKind(kind: vscode.CompletionItemKind | undefined): boolean {

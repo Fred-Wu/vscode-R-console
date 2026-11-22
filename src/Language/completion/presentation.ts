@@ -51,11 +51,25 @@ function compareCompletionLabels(a: CompletionEntry, b: CompletionEntry): number
     (a.label < b.label ? -1 : a.label > b.label ? 1 : 0);
 }
 
-/** Rank symbols within groups; keep signature, value, and object-member order. */
 export function rankCompletionEntries(
   entries: CompletionEntry[], query: string, context?: CompletionContext
 ): CompletionEntry[] {
-  if (context?.kind === "member") return filterCompletionEntries(entries, query);
+  if (context?.kind === "member") {
+    const matched = filterCompletionEntries(entries, query);
+    if (!query) return matched;
+    const normalized = query.toLowerCase();
+    const rank = (label: string): number => {
+      const value = label.toLowerCase();
+      if (label === query) return 0;
+      if (value === normalized) return 1;
+      if (value.startsWith(normalized)) return 2;
+      if (value.includes(normalized)) return 3;
+      return 4;
+    };
+    return matched.map((entry, index) => ({ entry, index }))
+      .sort((a, b) => rank(a.entry.label) - rank(b.entry.label) || a.index - b.index)
+      .map(({ entry }) => entry);
+  }
   const groups = new Map<string, CompletionEntry[]>();
   for (const entry of entries) {
     const group = context ? getCompletionGroup(entry, context)
@@ -143,7 +157,15 @@ export function toCompletionQuickPickItems(
   const exactMatchGroups = getExactMatchGroups(grouped, context.prefix).filter(
     (group) => !pinnedGroups.includes(group)
   );
-  const groups = exactMatchGroups.length === 0
+  // Member kind groups must not undo the shared match ranking. In particular,
+  // a case-insensitive function match cannot precede an exact field, and a
+  // fuzzy field cannot precede a function whose name starts with the query.
+  // Order groups by their strongest candidate; retain normal browsing order
+  // when there is no query.
+  const groups = context.kind === "member" && context.prefix
+    ? [...new Set(rankCompletionEntries(entries, context.prefix, context)
+        .map(entry => getCompletionGroup(entry, context)))]
+    : exactMatchGroups.length === 0
     ? baseGroups
     : [
         ...pinnedGroups,

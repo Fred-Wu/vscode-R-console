@@ -1,12 +1,14 @@
+import type { WorkspaceStrings } from "./workspaceMetadata";
+
 export type GlobalEnvItem = {
-  class: string[];
+  class: WorkspaceStrings;
   type: string;
   length: number;
   str: string;
   size?: number;
   dim?: number[];
-  names?: string[];
-  slots?: string[];
+  names?: WorkspaceStrings;
+  slots?: WorkspaceStrings;
 };
 
 export type WorkspaceData = {

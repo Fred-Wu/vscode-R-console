@@ -6,15 +6,20 @@ import {
   type CompletionContext,
   type CompletionProvider,
   CompletionPickItem,
+  type RuntimeMemberCompletionRequester,
   collectCompletionEntries,
+  parseRuntimeMemberQuery,
   getCompletionContext,
   rankCompletionEntries,
   isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import { clearCompletionDiagnosticsScope, logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
+import { completionDecisionContext } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
+import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 
 export type InputSnapshot = {
   text: string;
@@ -33,6 +38,7 @@ type LangOptions = {
   getRecentSessionEntries?: () => string[];
   onPackagesChanged?: () => void;
   getStaticAnalysisEnabled?: () => boolean;
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
 };
 
 type AutocompleteRequest = {
@@ -67,6 +73,25 @@ export class RTermLang {
 
   constructor(private readonly options: LangOptions) {}
 
+  get completionDiagnosticsScope(): string { return this.completionDocumentId; }
+
+  // A native bracket lookup is independent of the language server. Start it
+  // immediately, but keep LSP active for method arguments such as DT[, keyby.
+  // Static-analysis mode continues to let source inference take precedence.
+  private prefetchBracketMembers(context: CompletionContext): Promise<MemberInspectionResult | undefined> | undefined {
+    const receiver = context.objectName;
+    if (context.kind !== "bracket" || !receiver || !parseRuntimeMemberQuery(receiver) ||
+        this.options.getStaticAnalysisEnabled?.() === true) return undefined;
+    const requester = this.options.requestRuntimeMemberCompletions;
+    if (!requester) return undefined;
+    try {
+      return Promise.resolve(requester(receiver, context.bracketOperator ?? "["))
+        .catch(() => undefined);
+    } catch {
+      return undefined;
+    }
+  }
+
   async start(): Promise<void> {
     const completionProvider = await this.ensureConsoleLspStarted();
     if (!completionProvider) {
@@ -90,6 +115,7 @@ export class RTermLang {
       return;
     }
     const requestId = ++this.completionRequestId;
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -104,6 +130,12 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
+    if (context?.rejectionReason) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
+        completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
+      onInlineEntries?.([]);
+      return;
+    }
     if (!context || context.suppressAutomatic) {
       onInlineEntries?.([]);
       return;
@@ -124,9 +156,28 @@ export class RTermLang {
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
 
       let completionProvider: CompletionProvider | undefined;
-      const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
+      // Runtime-only member inspection is owned by the guarded native backend.
+      // Do not make it wait for the separate language server to start or reply.
+      const runtimeMember = context.kind === "member" &&
+        this.options.requestRuntimeMemberCompletions !== undefined &&
+        this.options.getStaticAnalysisEnabled?.() !== true;
+      const prefetchedBracketMembers = this.prefetchBracketMembers(context);
+      // Publish guarded bracket names as soon as they arrive. Do not hold
+      // columns hostage to a slow or restarting language server; its method
+      // parameters can enrich the same suggestions afterward.
+      const stagedBracketEntries = prefetchedBracketMembers?.then(result =>
+        collectCompletionEntries(
+          context, undefined, undefined,
+          getWorkspaceData() ?? cachedSessionData,
+          latestInput.lines.slice(0, latestInput.cursorRow),
+          recentEntries, undefined, undefined, latestInput.text,
+          Promise.resolve(result)
+        )
+      );
+      const documentRequest = runtimeMember
+        ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
-        completionProvider = await this.ensureConsoleLspStarted();
+        completionProvider = runtimeMember ? undefined : await this.ensureConsoleLspStarted();
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
@@ -150,8 +201,9 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          undefined,
-          latestInput.text
+          this.options.requestRuntimeMemberCompletions,
+          latestInput.text,
+          prefetchedBracketMembers
         );
       })();
       // Argument candidates must await LSP parameters; early session-only
@@ -173,7 +225,8 @@ export class RTermLang {
         return;
       }
 
-      const opensBeforeFullResults = (force && context.kind !== "argument") || !!stagedEntries?.length;
+      const opensBeforeFullResults = (force && context.kind !== "argument") ||
+        !!stagedEntries?.length || !!stagedBracketEntries;
       const entries = stagedEntries?.length
         ? stagedEntries
         : opensBeforeFullResults
@@ -184,25 +237,32 @@ export class RTermLang {
       }
 
       if (!entries || entries.length === 0) {
-        if (!force && !onInlineEntries) {
+        // Tab may open an empty picker while bracket inspection is pending.
+        // Its staged columns and LSP method arguments populate it afterward.
+        if (!force && !onInlineEntries && !opensBeforeFullResults) {
           return;
         }
       }
       const initialEntries = entries ?? [];
 
       if (onInlineEntries) {
-        const publish = (results: CompletionEntries): void => {
-          if (!this.isCurrentCompletionRequest(requestId)) return;
+        let publishedPhase = -1;
+        const publish = (results: CompletionEntries, phase: number): void => {
+          if (phase < publishedPhase || !this.isCurrentCompletionRequest(requestId)) return;
           const current = getCurrentInput();
           if (current.text !== latestInput.text || current.cursorRow !== latestInput.cursorRow ||
               current.cursorCol !== context.snapshotCursor) return;
+          publishedPhase = phase;
           this.inlineCache = { input: latestInput, context, entries: results };
           onInlineEntries(toCompletionQuickPickItems(rankCompletionEntries(results, context.prefix, context), context));
         };
-        if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries);
+        if (initialEntries.length || !opensBeforeFullResults) publish(initialEntries, 0);
+        void stagedBracketEntries?.then(results => {
+          if (results) publish(results, 1);
+        }).catch(() => undefined);
         if (opensBeforeFullResults) {
           void fullEntriesPromise.then(results => {
-            if (results) publish(results);
+            if (results) publish(results, 2);
           }).catch(() => undefined);
         }
         return;
@@ -214,12 +274,26 @@ export class RTermLang {
       const selection = await pickCompletion({
         context, latestInput, initialEntries,
         signal: pickerAbort.signal,
+        stagedEntries: stagedBracketEntries,
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
-        collect: async (nextContext, nextInputText, lines, cursorCol) => {
+        collect: async (nextContext, nextInputText, lines, cursorCol, onStagedEntries) => {
 
-          const nextDocumentRequest = this.getOrOpenCompletionDocument(nextInputText);
-          if (!completionProvider) {
+          const nextRuntimeMember = nextContext.kind === "member" &&
+            this.options.requestRuntimeMemberCompletions !== undefined &&
+            this.options.getStaticAnalysisEnabled?.() !== true;
+          const nextBracketMembers = this.prefetchBracketMembers(nextContext);
+          // Refinements need the same early native results as the initial
+          // picker. The picker guards these against newer queries and the
+          // final LSP merge, and rebases edits to the actual console input.
+          void nextBracketMembers?.then(result => collectCompletionEntries(
+            nextContext, undefined, undefined, getWorkspaceData() ?? cachedSessionData,
+            lines.slice(0, latestInput.cursorRow), recentEntries, undefined, undefined,
+            nextInputText, Promise.resolve(result)
+          )).then(onStagedEntries).catch(() => undefined);
+          const nextDocumentRequest = nextRuntimeMember
+            ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(nextInputText);
+          if (!completionProvider && !nextRuntimeMember) {
             completionProvider = await this.ensureConsoleLspStarted();
           }
           const nextDocument = await nextDocumentRequest;
@@ -238,8 +312,9 @@ export class RTermLang {
             lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            undefined,
-            nextInputText
+            this.options.requestRuntimeMemberCompletions,
+            nextInputText,
+            nextBracketMembers
           );
           return nextEntries;
         },
@@ -281,6 +356,13 @@ export class RTermLang {
     return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix, context), context);
   }
 
+  /** True only after a successful, complete cache refinement in the same
+   * member context. A partial language-server result must still be refreshed. */
+  hasCompleteInlineMemberCache(): boolean {
+    return this.inlineCache?.context.kind === "member" &&
+      this.inlineCache.entries.isIncomplete !== true;
+  }
+
   cancelCompletion(): void {
     this.completionRequestId++;
     this.inlineCache = undefined;
@@ -294,6 +376,7 @@ export class RTermLang {
     }
 
     this.disposed = true;
+    clearCompletionDiagnosticsScope(this.completionDocumentId);
     this.cancelCompletion();
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;

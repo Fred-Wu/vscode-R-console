@@ -220,6 +220,61 @@ suite("Completion in the VS Code extension host", () => {
 });
 
 suite("Subscript completion in the VS Code extension host", () => {
+  test("live bracket arguments reach inline, Tab and F7 through the real language client", async () => {
+    const vscode = require('vscode');
+    let picker;
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      'vscode-languageclient/node': require('vscode-languageclient/node'),
+      // Copy descriptors without reading unrelated proposed-API getters.
+      vscode: Object.create(null, {
+        ...Object.getOwnPropertyDescriptors(vscode),
+        window: { value: Object.create(vscode.window, {
+          createQuickPick: { value: (...args) => (picker = vscode.window.createQuickPick(...args)) },
+        }) },
+      }),
+    });
+    const lang = new RTermLang({
+      extensionPath: path.resolve(__dirname, '../..'),
+      rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
+      getStaticAnalysisEnabled: () => false,
+      requestRuntimeMemberCompletions: async receiver => ({
+        status: 'available', names: ['alpha'],
+        bracketKind: receiver === 'DT' ? 'data.table' : 'data.frame',
+      }),
+    });
+    try {
+      for (const mode of ['inline', 'Tab', 'F7']) {
+        for (const [marked, expected] of [
+          ['DT[, key│', 'keyby = '], ['DT[, on│]', 'on = '], ['df[, dr│]', 'drop = '],
+          ['DT[, │]', 'keyby = '], ['df[, │', 'drop = '], ['DT[, .S│]', '.SD'],
+        ]) {
+          const cursorCol = marked.indexOf('│'), text = marked.replace('│', '');
+          const input = { text, currentLine: text, lines: [text], cursorRow: 0,
+            cursorCol, textBeforeCursor: text.slice(0, cursorCol) };
+          picker = undefined;
+          let items = [];
+          const showing = lang.handleAutocomplete({ input, force: mode === 'F7', getCurrentInput: () => input,
+            getWorkspaceData: () => undefined, applyCompletion() {},
+            onInlineEntries: mode === 'inline' ? result => { items = result; } : undefined });
+          try {
+            const deadline = Date.now() + 10000;
+            const results = () => mode === 'inline' ? items : picker?.items ?? [];
+            while (!results().some(item => item.insertText === expected) && Date.now() < deadline) {
+              await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            assert.ok(results().some(item => item.insertText === expected),
+              `${mode} ${marked}: missing ${expected}; received ${JSON.stringify(results().map(item => item.insertText ?? item.label))}`);
+          } finally {
+            picker?.hide();
+            await showing;
+          }
+        }
+      }
+    } finally {
+      await lang.dispose();
+    }
+  });
+
   test("workspace columns and source-inferred arguments retain separate groups", async () => {
     const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
       'vscode-languageclient/node': require('vscode-languageclient/node'),

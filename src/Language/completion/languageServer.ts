@@ -10,7 +10,8 @@ export async function getLanguageServerCompletions(
   doc: vscode.TextDocument,
   position: vscode.Position,
   multilineBuffer: string[],
-  completionProvider?: CompletionProvider
+  completionProvider?: CompletionProvider,
+  runtimeBracketKind?: "data.frame" | "data.table" | null
 ): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
@@ -19,7 +20,7 @@ export async function getLanguageServerCompletions(
     let result = await completionProvider.provideCompletionItems(
       doc,
       position,
-      context.triggerCharacter
+      context.triggerCharacter, undefined, runtimeBracketKind
     );
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
@@ -42,7 +43,7 @@ export async function getLanguageServerCompletions(
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter, position);
+        context.triggerCharacter, position, runtimeBracketKind);
       runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;
@@ -63,6 +64,7 @@ export async function getLanguageServerCompletions(
         kind: item.kind,
         detail: item.detail,
         role: getCompletionRole(item),
+        ...(isSubscriptSpecial(item) ? { bracketSpecial: true } : {}),
         source: "lsp",
         replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
         ...getCompletionReplaceEnd(item, doc, position),
@@ -81,9 +83,14 @@ export async function getLanguageServerCompletions(
   }
 }
 
+function isSubscriptSpecial(item: vscode.CompletionItem): boolean {
+  return (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_special";
+}
+
 function getCompletionRole(item: vscode.CompletionItem): CompletionEntry["role"] {
   const data = (item as vscode.CompletionItem & { data?: { type?: string; parameter?: string } }).data;
   const type = data?.type;
+  if (type === "subscript_special") return "scope";
   if (type?.endsWith("argument_value") || item.detail?.startsWith("value for ")) return "value";
   if (data?.parameter !== undefined || type?.endsWith("parameter") || item.detail === "parameter") return "argument";
   if (type === "member" || type === "scope") return type;

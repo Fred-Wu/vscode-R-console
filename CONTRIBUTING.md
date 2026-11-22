@@ -89,6 +89,17 @@ the authentication and protocol tests also require `Rscript` on `PATH`.
 The runtime smoke test starts an isolated R session using a temporary profile,
 checks evaluation, nested input, interruption, persistence, and shutdown, then
 cleans up. Set `R_TEST_EXECUTABLE` to choose the R executable used to locate R.
+The runtime member tests compile a temporary native safety fixture with
+`R CMD SHLIB`, so R's configured C compiler must be available (Rtools on
+Windows). The fixture verifies that completion never invokes ALTREP or
+custom-database callbacks. CI builds and runs it on Linux, macOS, and Windows.
+Live member inspection validates function lookup for every operator in the path
+and the final accessor before inspecting storage. Keep this query-wide check
+separate from object/method dispatch checks: an ordinary list does not imply
+that `$`, `@`, `[` or `[[` resolves to the standard primitive. The regression
+matrix covers masked operators, active and deferred bindings, forced promises,
+primitive aliases, and non-function bindings skipped by R's function lookup.
+Definitive safety refusals must not fall back to cached receiver suggestions.
 The package test inspects the generated VSIX for the current platform.
 
 CI runs on every pull request and pushes to `main` and `dev` on Linux, Windows,

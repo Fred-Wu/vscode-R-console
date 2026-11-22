@@ -41,6 +41,78 @@ test('Quick Pick re-queries incomplete results in every completion context', asy
   }
 });
 
+test('member Quick Pick ranks the console prefix on initial, delayed and cleared results', async t => {
+  for (const operator of ['$', '@']) {
+    for (const delayed of [false, true]) {
+      const candidates = entries(['alphabetagamma', 'beta']);
+      const picker = await openPicker(t, `obj${operator}beta`, delayed ? [] : candidates,
+        async () => candidates, delayed ? Promise.resolve(candidates) : undefined);
+      await tick();
+      assert.deepEqual(picker.labels(), ['beta', 'alphabetagamma']);
+      assert.equal(picker.pick.activeItems[0].insertText, 'beta');
+      await picker.type('alphabetagamma');
+      assert.deepEqual(picker.labels(), ['alphabetagamma']);
+      await picker.type('');
+      assert.deepEqual(picker.labels(), ['beta', 'alphabetagamma']);
+      assert.equal(picker.pick.activeItems[0].insertText, 'beta');
+    }
+  }
+});
+
+test('member Quick Pick keeps exact matches selected across field and function groups', async t => {
+  for (const operator of ['$', '@']) {
+    for (const delayed of [false, true]) {
+      for (const exactKind of [vscode.CompletionItemKind.Field, vscode.CompletionItemKind.Function]) {
+        const fuzzyKind = exactKind === vscode.CompletionItemKind.Field
+          ? vscode.CompletionItemKind.Function : vscode.CompletionItemKind.Field;
+        const candidates = [
+          { label: 'alphabetagamma', insertText: 'alphabetagamma', source: 'session', kind: fuzzyKind },
+          { label: 'beta', insertText: exactKind === 2 ? 'beta()' : 'beta', source: 'session', kind: exactKind },
+        ];
+        const expected = candidates[1].insertText;
+        const picker = await openPicker(t, `obj${operator}beta`, delayed ? [] : candidates,
+          async () => candidates, delayed ? Promise.resolve(candidates) : undefined);
+        await tick();
+        assert.equal(picker.labels()[0], expected);
+        assert.equal(picker.pick.activeItems[0].insertText, expected);
+        await picker.type('alphabetagamma');
+        assert.equal(picker.pick.activeItems[0].insertText, 'alphabetagamma');
+        await picker.type('');
+        assert.equal(picker.labels()[0], expected);
+        assert.equal(picker.pick.activeItems[0].insertText, expected);
+      }
+    }
+  }
+});
+
+test('member groups preserve the strongest match across kinds in both completion UIs', async t => {
+  for (const operator of ['$', '@']) {
+    for (const [field, callable, expected] of [
+      ['beta', 'BETA', 'beta'],
+      ['BETA', 'beta', 'beta()'],
+      ['alphabetagamma', 'betaMore', 'betaMore()'],
+      ['betaMore', 'alphabetagamma', 'betaMore'],
+    ]) {
+      const text = `obj${operator}beta`;
+      const context = completion.getCompletionContext(text, text.length);
+      const candidates = [
+        { label: field, insertText: field, source: 'session', kind: vscode.CompletionItemKind.Field },
+        { label: callable, insertText: callable + '()', source: 'session', kind: vscode.CompletionItemKind.Function },
+      ];
+      const inline = completion.toCompletionQuickPickItems(
+        completion.rankCompletionEntries(candidates, context.prefix, context), context);
+      assert.equal(inline.find(item => 'insertText' in item).insertText, expected);
+      const picker = await openPicker(t, text, [], async () => candidates, Promise.resolve(candidates));
+      await tick();
+      assert.equal(picker.pick.activeItems[0].insertText, expected);
+      await picker.type('beta');
+      assert.equal(picker.pick.activeItems[0].insertText, expected);
+      await picker.type('');
+      assert.equal(picker.pick.activeItems[0].insertText, expected);
+    }
+  }
+});
+
 test('package invalidation closes Quick Pick and discards delayed suggestions', async () => {
   let onHide, resolveEntries;
   let disposed = false;
@@ -68,6 +140,77 @@ test('package invalidation closes Quick Pick and discards delayed suggestions', 
   resolveEntries(entries(['lateExport']));
   await tick();
   assert.ok(!pick.items.some(item => item.label === 'lateExport'));
+});
+
+test('typing in a pending bracket picker publishes native columns before LSP startup', async t => {
+  let change, hide, releaseServer;
+  const startup = new Promise(resolve => { releaseServer = resolve; });
+  const nativeRequests = [];
+  const pick = { items: [], value: '', activeItems: [], selectedItems: [],
+    onDidChangeValue(fn) { change = fn; }, onDidAccept() {}, onDidHide(fn) { hide = fn; },
+    show() {}, hide() { hide(); }, dispose() {} };
+  const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+    vscode: { ...vscode, window: { createQuickPick: () => pick },
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } } },
+    '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
+    '../../Language/virtualRDocument': { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({ extensionPath: '', rPath: 'R', env: {},
+    getStaticAnalysisEnabled: () => false,
+    requestRuntimeMemberCompletions: () => new Promise(resolve => nativeRequests.push(resolve)),
+  });
+  lang.ensureConsoleLspStarted = () => startup;
+  lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
+  const text = 'DT[,';
+  const input = { text, currentLine: text, lines: [text], cursorRow: 0,
+    cursorCol: text.length, textBeforeCursor: text };
+  const showing = lang.handleAutocomplete({ input, force: true,
+    getCurrentInput: () => input, getWorkspaceData: () => undefined, applyCompletion() {} });
+  t.after(async () => { lang.cancelCompletion(); releaseServer(undefined); await showing; });
+  await tick();
+  pick.value = 'keyb'; change(pick.value);
+  await tick();
+  assert.equal(nativeRequests.length, 2);
+  for (const resolve of nativeRequests) {
+    resolve({ status: 'available', names: ['keyboard'], bracketKind: 'data.table' });
+  }
+  await tick();
+  const labels = () => pick.items.filter(item => 'insertText' in item).map(item => item.insertText);
+  assert.deepEqual(labels(), ['keyboard'], 'refining the picker must not block native columns on LSP');
+  releaseServer({ provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true, items: [
+    { label: 'keyby', insertText: 'keyby = ', kind: 5, detail: 'parameter',
+      data: { type: 'subscript_parameter' } },
+  ] }) });
+  await tick();
+  assert.deepEqual(labels().sort(), ['keyboard', 'keyby = ']);
+});
+
+test('refined staged results cannot replace newer queries or their final merge', async t => {
+  const requests = new Map();
+  const picker = await openPicker(t, 'df[,', [], (context, text, lines, cursor, stage) =>
+    new Promise(resolve => requests.set(context.prefix, { stage, resolve, cursor })));
+  await picker.type('a');
+  await picker.type('b');
+  requests.get('a').stage(entries(['betaStale']));
+  assert.deepEqual(picker.labels(), [], 'superseded staged reply is ignored');
+  const current = requests.get('b');
+  current.stage(entries(['beta']).map(entry => ({ ...entry, replaceEnd: current.cursor })));
+  assert.deepEqual(picker.labels(), ['beta']);
+  assert.equal(picker.pick.items.find(item => 'insertText' in item).replaceEnd, 4,
+    'staged edits target the console input, not the longer picker preview');
+  current.resolve(entries(['beta', 'bravo']));
+  await tick();
+  current.stage(entries(['betaOld']));
+  requests.get('a').resolve(entries(['betaStale']));
+  await tick();
+  assert.deepEqual(picker.labels(), ['beta', 'bravo'], 'final merge remains authoritative');
+  await picker.type('c');
+  const cleared = requests.get('c');
+  await picker.type('');
+  cleared.stage(entries(['cancelled']));
+  cleared.resolve(entries(['cancelled']));
+  await tick();
+  assert.deepEqual(picker.labels(), [], 'clearing the query cancels staged and final replies');
 });
 
 test('Quick Pick changing the first character refreshes a blank-context query', async t => {
@@ -163,6 +306,52 @@ test('Quick Pick rejects acceptance after another input line changes', async () 
   accept();
   await showing;
   assert.equal(applied, false);
+});
+
+test('Tab and F7 open bracket Quick Pick while native and LSP results are pending', async () => {
+  for (const force of [false, true]) {
+    let hide, releaseNative, releaseServer, shown = false;
+    const pick = { items: [], value: '', activeItems: [],
+      onDidChangeValue() {}, onDidAccept() {}, onDidHide(fn) { hide = fn; },
+      show() { shown = true; }, hide() { hide?.(); }, dispose() {} };
+    const native = new Promise(resolve => { releaseNative = resolve; });
+    const server = new Promise(resolve => { releaseServer = resolve; });
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      vscode: { ...vscode, Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+        window: { createQuickPick: () => pick } },
+      '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
+      '../../Language/virtualRDocument': { VirtualRDocument: class {} },
+    });
+    const lang = new RTermLang({ extensionPath: '', rPath: '', env: {},
+      getStaticAnalysisEnabled: () => false,
+      requestRuntimeMemberCompletions: () => native });
+    lang.ensureConsoleLspStarted = () => server;
+    lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
+    const text = 'DT[, key';
+    const input = { text, currentLine: text, lines: [text], cursorRow: 0,
+      cursorCol: text.length, textBeforeCursor: text };
+    const showing = lang.handleAutocomplete({ input, force, getCurrentInput: () => input,
+      getWorkspaceData: () => undefined, applyCompletion() {} });
+    try {
+      await tick();
+      assert.equal(shown, true, `force=${force}: picker opens before either result`);
+      releaseNative({ status: 'available', names: ['keyboard'], bracketKind: 'data.table' });
+      await tick();
+      assert.deepEqual(pick.items.filter(item => 'insertText' in item).map(item => item.insertText), ['keyboard']);
+      releaseServer({ provideCompletionItems: async () => ({ items: [
+        { label: 'keyby', insertText: 'keyby = ', kind: 5,
+          detail: 'parameter', data: { type: 'subscript_parameter' } },
+      ] }) });
+      await tick();
+      assert.deepEqual(pick.items.filter(item => 'insertText' in item).map(item => item.insertText).sort(),
+        ['keyboard', 'keyby = ']);
+    } finally {
+      pick.hide();
+      releaseNative(undefined);
+      releaseServer(undefined);
+      await showing;
+    }
+  }
 });
 
 test('an authoritative empty delayed response clears staged Quick Pick entries', async t => {

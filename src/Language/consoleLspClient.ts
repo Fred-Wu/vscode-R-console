@@ -30,13 +30,13 @@ import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
 import { backtickRName } from "./completion/candidates";
+import { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
+import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
+import { lifecycleOutputChannel } from "./completion/outputChannel";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
-const lifecycleOutputChannel = vscode.window.createOutputChannel(
-  "R Console Language Server"
-);
 
 function formatLogTimestamp(date = new Date()): string {
   const pad = (value: number): string => String(value).padStart(2, "0");
@@ -285,7 +285,8 @@ export class ConsoleLspClient implements CompletionProvider {
     doc: vscode.TextDocument,
     position: vscode.Position,
     triggerCharacter?: string,
-    contextPosition: vscode.Position = position
+    contextPosition: vscode.Position = position,
+    runtimeBracketKind?: "data.frame" | "data.table" | null
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await this.packageRefreshPromise;
@@ -320,6 +321,22 @@ export class ConsoleLspClient implements CompletionProvider {
         // Use the already-published workspace snapshot; completion must not
         // query sess to resolve or inspect runtime objects.
         const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
+        // A verified native result supplies the actual stored receiver class,
+        // even without a sess workspace snapshot (including nested receivers).
+        // Without it, only an existing cached top-level binding may contribute.
+        // The receiver grammar never evaluates calls, indices or assignments.
+        const bracketReceiver = !staticAnalysis && params.rConsoleSubscriptOperator === "[" &&
+          params.rConsoleDataObject ? parseRuntimeMemberQuery(params.rConsoleDataObject) : undefined;
+        if (bracketReceiver) {
+          const primaryClass = runtimeBracketKind !== undefined ? runtimeBracketKind :
+            bracketReceiver.steps.length === 0 && globals &&
+              Object.hasOwn(globals, bracketReceiver.root)
+              ? workspaceStrings(globals[bracketReceiver.root].class)[0] : undefined;
+          if (primaryClass === "data.table" || primaryClass === "data.frame") {
+            (params as typeof params & { rConsoleSubscriptClass?: "data.table" | "data.frame" })
+              .rConsoleSubscriptClass = primaryClass;
+          }
+        }
         if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
             !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
           const name = Object.hasOwn(globals, params.rConsoleCall)

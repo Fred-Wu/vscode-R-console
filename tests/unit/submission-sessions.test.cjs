@@ -37,7 +37,24 @@ function submit(terminal, input, code) {
     terminal.inputState.insertText(code);
     return terminal.handleEnterKey();
   }
-  terminal.handleInput(input === "editor" ? code + "\n" : `\x1b[200~${code}\n\x1b[201~`);
+  if (input === "paste") {
+    // The key handler starts handlePasteEnd() without awaiting its promise.
+    // Return that promise so assertions wait for the submission to finish.
+    const handlePasteEnd = terminal.handlePasteEnd;
+    let pendingPaste;
+    terminal.handlePasteEnd = function () {
+      pendingPaste = handlePasteEnd.call(this);
+      return pendingPaste;
+    };
+    try {
+      terminal.handleInput(`\x1b[200~${code}\n\x1b[201~`);
+    } finally {
+      terminal.handlePasteEnd = handlePasteEnd;
+    }
+    assert.ok(pendingPaste, "paste-end must dispatch its async handler");
+    return pendingPaste;
+  }
+  terminal.handleInput(code + "\n");
   return terminal.programmaticSubmissionQueue;
 }
 
@@ -55,6 +72,89 @@ for (const input of ["Enter", "editor", "paste"]) {
       assert.equal(b.terminal.mode, "executing");
     });
   }
+}
+
+test("native completion cannot enter the parse-to-submit gap", async () => {
+  const a = consoleSession();
+  a.connect();
+  const { terminal } = a;
+  const inspected = [];
+  terminal.runtimeBackend.inspectMemberNames = (session, query) => {
+    assert.equal(session, terminal.rProcess);
+    inspected.push(query);
+    return Promise.resolve({ status: "available", names: ["leaf"] });
+  };
+  const inspect = () => terminal.requestStoredMemberCompletions("obj$inner", "$");
+  assert.deepEqual((await inspect())?.names, ["leaf"], "idle R still supports completion");
+
+  const parse = deferred();
+  let checked = 0;
+  terminal.runtimeBackend.requestParseStatus = () => { checked++; return parse.promise; };
+  terminal.inputState.insertText("answer <- 42");
+  const pending = terminal.handleEnterKey();
+  assert.equal(terminal.submissionQueue.at(-1)?.kind, "parse");
+  assert.equal(inspect(), undefined, "accepted input suppresses new native inspection");
+  await settle();
+  assert.equal(checked, 1);
+  assert.equal(inspect(), undefined, "native parsing must not allow completion to race");
+
+  const originalSend = terminal.runtimeBackend.sendSessionCommand;
+  terminal.runtimeBackend.sendSessionCommand = (session, command) => {
+    if (command.type === "submit") {
+      assert.equal(inspect(), undefined, "inspection remains blocked after parsing and before Submit");
+    }
+    return originalSend(session, command);
+  };
+  parse.resolve(1);
+  await pending;
+  assert.deepEqual(a.commands.map(command => command.code), ["answer <- 42"]);
+  assert.equal(inspect(), undefined, "inspection remains blocked while code executes");
+  assert.equal(inspected.length, 1, "no extra native calls during submission");
+
+  nextPrompt(terminal);
+  assert.deepEqual((await inspect())?.names, ["leaf"], "completion resumes at the next idle prompt");
+  assert.equal(inspected.length, 2);
+});
+
+test("an incomplete parse releases native inspection for the restored input", async () => {
+  const a = consoleSession();
+  a.connect();
+  const { terminal } = a;
+  const parse = deferred();
+  terminal.runtimeBackend.requestParseStatus = () => parse.promise;
+  let inspected = 0;
+  terminal.runtimeBackend.inspectMemberNames = () => {
+    inspected++;
+    return Promise.resolve({ status: "available", names: ["child"] });
+  };
+  terminal.inputState.insertText("if");
+  const pending = terminal.handleEnterKey();
+  assert.equal(terminal.requestStoredMemberCompletions("obj", "$"), undefined);
+  parse.resolve(2);
+  await pending;
+  assert.deepEqual(a.commands, []);
+  assert.equal(terminal.submissionQueue.length, 0);
+  assert.equal(terminal.activeSubmission, null);
+  assert.equal((await terminal.requestStoredMemberCompletions("obj", "$"))?.status, "available");
+  assert.equal(inspected, 1);
+});
+
+for (const input of ["editor", "paste"]) {
+  test(`${input} reserves parsing before native completion can start`, async () => {
+    const a = consoleSession();
+    a.connect();
+    const parse = deferred();
+    a.terminal.runtimeBackend.requestParseStatus = () => parse.promise;
+    a.terminal.runtimeBackend.inspectMemberNames = () => {
+      assert.fail("reserved input must not reach the inspector");
+    };
+    const pending = submit(a.terminal, input, "42");
+    assert.equal(a.terminal.submissionQueue.at(-1)?.kind, "parse");
+    assert.equal(a.terminal.requestStoredMemberCompletions("obj", "$"), undefined);
+    parse.resolve(1);
+    await pending;
+    assert.deepEqual(a.commands.map(command => command.code), ["42"]);
+  });
 }
 
 const lifecycle = {

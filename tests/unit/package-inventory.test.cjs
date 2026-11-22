@@ -362,7 +362,7 @@ test("watcher recovery reconciles additions and removals made while watching was
 });
 
 test("a library scan failure keeps its changes pending for retry", async t => {
-  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
   inventory.setLibraryPaths([library]);
   await settle();
   const readPackage = inventory.readPackage.bind(inventory);
@@ -375,9 +375,18 @@ test("a library scan failure keeps its changes pending for retry", async t => {
     return readPackage(...args);
   };
   install(library);
+  // Idle is not proof that an OS watcher event has arrived. This test is
+  // about scan failure and recovery; explicitly queue the changed library
+  // instead of relying on macOS/Linux/Windows filesystem event timing.
+  inventory.dirtyLibraries.add(library);
+  await inventory.refresh();
+  assert.ok(failed, "the first scan must exercise the injected read failure");
+  assert.ok(logs.some(line => line.includes("Could not refresh package inventory: Error: Temporary read failure")));
+  assert.ok(logs.includes("[Libraries] Recovery retry scheduled in 1s"),
+    "a failed scan must schedule recovery without losing the changed library");
   await settle();
-  assert.ok(failed);
-  assert.ok(changes.at(-1).packages.has("example"));
+  assert.ok(changes.at(-1).packages.has("example"),
+    "the pending installation is published once the retry succeeds");
   assert.equal(inventory.retryTimer, undefined);
 });
 
