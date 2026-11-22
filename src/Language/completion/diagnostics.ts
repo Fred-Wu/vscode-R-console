@@ -1,5 +1,6 @@
 export type CompletionDecision =
-  | { kind: "StaticInferred" | "StaticUnavailable" }
+  | { kind: "StaticInferred" }
+  | { kind: "StaticUnavailable" }
   | { kind: "Rejected"; reason: "executable-receiver" }
   | { kind: "Suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
