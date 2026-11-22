@@ -35,7 +35,7 @@ test("real embedded R completion inspects nested storage without running user co
     backend.detach(session);
     await delay(100);
     if (pid) { try { process.kill(pid, "SIGKILL"); } catch {} }
-    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     fs.rmSync(path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`), { force: true });
   });
   backend.attach(session, {
@@ -70,6 +70,33 @@ test("real embedded R completion inspects nested storage without running user co
     return result?.status === "available" ? { status: "available", names: result.names } : result;
   };
   const available = (names) => ({ status: "available", names });
+  // Compile against this installation of R. CI installs Rtools on Windows;
+  // missing compilers or callback support fail the safety test, never skip it.
+  const fixture = `member_safety${process.platform === "win32" ? ".dll" : ".so"}`;
+  fs.copyFileSync(path.join(__dirname, "fixtures", "member_safety.c"), path.join(cwd, "member_safety.c"));
+  execFileSync(rPath, ["CMD", "SHLIB", "-o", fixture, "member_safety.c"],
+    { cwd, env, encoding: "utf8", timeout: 60000 });
+  await submit(`dyn.load(${JSON.stringify(path.join(cwd, fixture).replaceAll("\\", "/"))}); native_safety <- .Call("member_safety_objects"); alt_index <- native_safety$index; native_database <- attach(native_safety$database, name = "member_safety_database", warn.conflicts = FALSE); detach("member_safety_database"); native_holder <- list(db = native_database); .Call("member_safety_reset")`);
+  for (const expression of ["native_safety$names", "native_safety$class$inner",
+    "native_safety$list", "native_safety$list[[1]]", "native_safety[[alt_index]]"]) {
+    assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression)),
+      { status: "suppressed", reason: "unsafe-altrep" }, expression);
+  }
+  for (const expression of ["native_database", "native_database$inner",
+    'native_database[["inner"]]', "native_holder$db", "native_holder$db$inner"]) {
+    for (const target of ["$", "[["]) {
+      assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)),
+        { status: "suppressed", reason: "unsafe-environment" }, expression + target);
+    }
+  }
+  await submit('cat("NATIVE_SAFETY_COUNTS:", paste(.Call("member_safety_counts"), collapse = ","), "\\n")');
+  await until(() => output.includes("NATIVE_SAFETY_COUNTS:"), "native safety counters");
+  assert.match(output, /NATIVE_SAFETY_COUNTS:\s*0,0,0,0,0/,
+    "inspection must not run ALTREP length/element or database exists/get/objects callbacks");
+  // Positive controls prove these are live callbacks, not inert class labels.
+  await submit('invisible(length(alt_index)); invisible(alt_index[[1]]); invisible(exists("inner", envir = native_database, inherits = FALSE)); invisible(get("inner", envir = native_database, inherits = FALSE)); invisible(ls(native_database)); cat("NATIVE_CALLBACKS_LIVE:", all(.Call("member_safety_counts") > 0L), "\\n")');
+  await until(() => output.includes("NATIVE_CALLBACKS_LIVE:"), "native callback positive controls");
+  assert.match(output, /NATIVE_CALLBACKS_LIVE:\s*TRUE/);
   await submit('obj <- list(inner = list(alpha = 1, beta = 2), df = data.frame("a b" = 1, check.names = FALSE))');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["alpha", "beta"]));
   assert.deepEqual(await inspect("obj", [{ kind: "index", index: 2 }]), available(["a b"]));
@@ -333,6 +360,28 @@ test("real embedded R completion inspects nested storage without running user co
   assert.equal(tableBracket.status, "available");
   assert.equal(tableBracket.bracketKind, "data.table");
   assert.deepEqual(tableBracket.names, ["amount", "code"]);
+  // [ on data.table selects rows (or joins); it cannot use a list-column view.
+  await submit('slice_dt <- data.table::data.table(alpha = 1:3, beta = 4:6); slice_df <- as.data.frame(slice_dt); slice_list <- list(alpha = list(child = 1), beta = 2); slice_nested <- list(tbl = slice_dt); slice_index <- 2L; slice_name <- "alpha"; stopifnot(identical(names(slice_dt[1]), c("alpha", "beta")), identical(names(slice_dt[2]), c("alpha", "beta")))');
+  for (const expression of ["slice_dt[1]", "slice_dt[2]", "slice_dt[3]",
+    'slice_dt["alpha"]', "slice_dt[slice_index]", "slice_dt[slice_name]",
+    "slice_nested$tbl[1]", "slice_dt[1][[1]]"]) {
+    for (const target of ["$", "[", "[["]) {
+      const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target));
+      assert.deepEqual(result, { status: "suppressed", reason: "unsafe-dispatch" }, expression + target);
+      const input = expression + target;
+      const context = completion.getCompletionContext(input, input.length);
+      const items = await completion.collectCompletionEntries(context, undefined, undefined,
+        undefined, [], [], undefined, (receiver, operator) =>
+          backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver, operator)));
+      assert.deepEqual(items, [], "suppressed rows must not become cached columns: " + input);
+    }
+  }
+  for (const expression of ["slice_df[1]", "slice_list[1]"]) {
+    assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery(expression)), ["alpha"]);
+  }
+  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt")), ["alpha", "beta"]);
+  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt[[1]]")), []);
+  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_list[1][[1]]")), ["child"]);
   await submit('escaped <- list(); escaped[["a\\\"b"]] <- list(inner = TRUE)');
   const escapedQuery = parseRuntimeMemberQuery('escaped[["a\\"b"]]', "$");
   assert.equal(escapedQuery.steps[0].name, 'a"b');

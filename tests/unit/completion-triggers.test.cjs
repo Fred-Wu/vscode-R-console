@@ -58,6 +58,8 @@ test("unsupported bracket receivers reject unrelated global fallback without ins
     "make_object()[[│", "make_object()[[al│", "make_object()[al│",
     "make_object()[[in│", "make_object()[[al│]]",
     "obj[[choose_index()]][[al│", "make_object()$inner[[al│",
+    "print(make_object()[al│", "x <- obj[[choose_index()]][[al│",
+    "x <-\n  make_object()[al│",
   ]) {
     const context = contextAt(marked);
     assert.equal(context?.rejectionReason, "executable-receiver", marked);
@@ -81,6 +83,24 @@ test("unsupported bracket receivers reject unrelated global fallback without ins
   const computedIndex = contextAt("obj[[i + al│");
   assert.equal(computedIndex?.rejectionReason, undefined,
     "typing within a computed index may still complete ordinary variable names");
+});
+
+test("enclosing source never rejects ordinary completion inside safe subscripts", async () => {
+  for (const marked of [
+    "print(df[x + va│])", "x <- df[x + va│]", "print(df[drop = va│])",
+    "x <-\n  df[x + va│]", "print(\n  df[x +\n    va│])",
+    "earlier <- 1\nx <- df[x + va│]", "{ x <- df[x + va│] }",
+    "print(obj[[1]][x + va│])", "print(obj[[x + va│]])",
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context?.kind, "default", marked);
+    assert.equal(context.rejectionReason, undefined, marked);
+    assert.equal(context.prefix, "va", marked);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      { globalenv: { variable: { type: "double" } } }, [], [], undefined,
+      () => assert.fail("ordinary index variables must not inspect a receiver"));
+    assert.ok(entries.some(item => item.label === "variable"), marked);
+  }
 });
 
 test("bracket contexts retain the complete object, active dimension and quoted prefix", () => {

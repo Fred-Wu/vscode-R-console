@@ -873,6 +873,13 @@ impl Native {
                 if !self.ordinary_dispatch(value)? {
                     return Err(Suppression::UnsafeDispatch);
                 }
+                // data.table's [ selects rows or performs joins, unlike list
+                // and data.frame column slices. Do not invent a storage view
+                // of that result or execute its indexing method to obtain one.
+                if matches!(step, Step::SliceIndex(_) | Step::SliceName(_)) &&
+                    self.classes(value)?.iter().any(|class| class == "data.table") {
+                    return Err(Suppression::UnsafeDispatch);
+                }
                 match step {
                     Step::Field(name) | Step::NamedIndex(name) => {
                         let Some(index) = self.index_of(value, &name)? else { return Ok(None); };

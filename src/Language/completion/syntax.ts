@@ -1,6 +1,6 @@
 import type { CompletionContext } from "./types";
 import { TokenType, tokenize, isMemberAccessor } from "../lexer";
-import { getCompletionSyntax } from "./contextParser";
+import { getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
@@ -50,8 +50,11 @@ function hasUnsupportedBracketReceiver(before: string): boolean {
     }
   }
   const active = openings.at(-1);
-  return active?.delimiter === "[" &&
-    parseRuntimeMemberQuery(before.slice(0, active.position)) === undefined;
+  if (active?.delimiter !== "[") return false;
+  // Resolve only the receiver, excluding enclosing calls, assignments and
+  // earlier statements. The synthetic accessor is parsed, never evaluated.
+  const receiver = getQualifiedCompletionContext(before.slice(0, active.position) + "$");
+  return !receiver || parseRuntimeMemberQuery(receiver.objectName) === undefined;
 }
 
 export function getCompletionContext(

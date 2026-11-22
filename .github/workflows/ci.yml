@@ -45,7 +45,8 @@ jobs:
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: release
-          rtools-version: none
+          # Use matching Rtools on Windows to compile the native safety fixture.
+          rtools-version: ''
       - run: npm ci
       - name: Audit npm dependencies
         if: runner.os == 'Linux'
@@ -75,7 +76,7 @@ jobs:
         run: cargo test --locked --manifest-path sidecar/pty-host/Cargo.toml r_error_and_interrupt_jumps_are_caught_without_crossing_rust
       - name: Rust tests
         run: cargo test --locked --manifest-path sidecar/pty-host/Cargo.toml
-      - name: Real R runtime and frontend submission tests
+      - name: Real R runtime, native callback safety, and frontend submission tests
         run: npm run test:runtime
       - name: Package and verify VSIX
         run: |

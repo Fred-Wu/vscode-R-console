@@ -41,6 +41,24 @@ test('Quick Pick re-queries incomplete results in every completion context', asy
   }
 });
 
+test('member Quick Pick ranks the console prefix on initial, delayed and cleared results', async t => {
+  for (const operator of ['$', '@']) {
+    for (const delayed of [false, true]) {
+      const candidates = entries(['alphabetagamma', 'beta']);
+      const picker = await openPicker(t, `obj${operator}beta`, delayed ? [] : candidates,
+        async () => candidates, delayed ? Promise.resolve(candidates) : undefined);
+      await tick();
+      assert.deepEqual(picker.labels(), ['beta', 'alphabetagamma']);
+      assert.equal(picker.pick.activeItems[0].insertText, 'beta');
+      await picker.type('alphabetagamma');
+      assert.deepEqual(picker.labels(), ['alphabetagamma']);
+      await picker.type('');
+      assert.deepEqual(picker.labels(), ['beta', 'alphabetagamma']);
+      assert.equal(picker.pick.activeItems[0].insertText, 'beta');
+    }
+  }
+});
+
 test('package invalidation closes Quick Pick and discards delayed suggestions', async () => {
   let onHide, resolveEntries;
   let disposed = false;

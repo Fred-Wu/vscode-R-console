@@ -39,7 +39,8 @@ export async function pickCompletion({
     return value;
   };
   const filterEntries = (sourceEntries: CompletionEntry[], value: string): CompletionEntry[] =>
-    rankCompletionEntries(sourceEntries, searchValue(value), context);
+    rankCompletionEntries(sourceEntries,
+      context.kind === "member" && !value ? context.prefix : searchValue(value), context);
   const quickPickContext = (value: string) => ({
     ...context,
     prefix: searchValue(value),
