@@ -28,6 +28,7 @@ import {
   type RuntimeSessionHandle,
   type RuntimeSessionReconnectInfo,
 } from "../Runtime/runtimeBackend";
+import type { MemberInspectionResult, MemberInspectionTarget } from "../Runtime/backendProtocol";
 import type { WorkspaceData } from "../Runtime/VSCR";
 import {
   InputSnapshot,
@@ -287,39 +288,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       cwd: this.options.cwd,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       onPackagesChanged: () => this.dismissInlineCompletion(false),
-      requestRuntimeMemberCompletions: (expression, operator) => {
-        const query = parseRuntimeMemberQuery(expression, operator);
-        if (!query) {
-          logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
-            expression + operator, this.lang.completionDiagnosticsScope);
-          return undefined;
-        }
-        const reportUnavailable = () => {
-          // Top-level metadata may have a cached fallback; report failures
-          // to inspect nested paths, where an empty list would be ambiguous.
-          if (query.steps.length) {
-            logConsoleCompletionDecision({ kind: "Unavailable", reason: "runtime-unavailable" },
-              expression + operator, this.lang.completionDiagnosticsScope);
-          }
-        };
-        const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
-        if (!response) {
-          reportUnavailable();
-          return undefined;
-        }
-        return response.then(result => {
-          if (result.status === "suppressed") {
-            logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
-              expression + operator, this.lang.completionDiagnosticsScope);
-          } else if (result.status === "unavailable") {
-            reportUnavailable();
-          }
-          return result;
-        }, () => {
-          reportUnavailable();
-          return { status: "unavailable" as const };
-        });
-      },
+      requestRuntimeMemberCompletions: (expression, operator) =>
+        this.requestStoredMemberCompletions(expression, operator),
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
@@ -354,6 +324,48 @@ export class RTerminal implements vscode.Pseudoterminal {
       attachRuntimeSession(this.runtimeHost(), true);
       updateRuntimeTerminalName(this.runtimeHost());
     }
+  }
+
+  /** Never start native completion after input has been accepted for parsing.
+   * The reservation remains active across the parse-result/submit-frame gap. */
+  private requestStoredMemberCompletions(
+    expression: string, operator: MemberInspectionTarget
+  ): Promise<MemberInspectionResult | undefined> | undefined {
+    if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
+        this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) {
+      return undefined;
+    }
+    const query = parseRuntimeMemberQuery(expression, operator);
+    if (!query) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
+        expression + operator, this.lang.completionDiagnosticsScope);
+      return undefined;
+    }
+    const reportUnavailable = () => {
+      // Top-level metadata may have a cached fallback; report failures
+      // to inspect nested paths, where an empty list would be ambiguous.
+      if (query.steps.length) {
+        logConsoleCompletionDecision({ kind: "Unavailable", reason: "runtime-unavailable" },
+          expression + operator, this.lang.completionDiagnosticsScope);
+      }
+    };
+    const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
+    if (!response) {
+      reportUnavailable();
+      return undefined;
+    }
+    return response.then(result => {
+      if (result.status === "suppressed") {
+        logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+          expression + operator, this.lang.completionDiagnosticsScope);
+      } else if (result.status === "unavailable") {
+        reportUnavailable();
+      }
+      return result;
+    }, () => {
+      reportUnavailable();
+      return { status: "unavailable" as const };
+    });
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
