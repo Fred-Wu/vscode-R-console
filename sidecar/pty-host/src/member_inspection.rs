@@ -50,17 +50,35 @@ pub(crate) enum Step {
     VariableSlice(String),
 }
 
+impl Target {
+    fn accessor(self) -> &'static str {
+        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[" }
+    }
+}
+
+impl Step {
+    fn accessor(&self) -> &'static str {
+        match self {
+            Self::Field(_) => "$", Self::Slot(_) => "@",
+            Self::SliceIndex(_) | Self::SliceName(_) | Self::VariableSlice(_) => "[",
+            _ => "[[",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemberQuery {
     pub root: String,
     pub steps: Vec<Step>,
     pub target: Target,
+    pub utf8_byte_escapes: bool,
 }
 
 impl MemberQuery {
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 6 { return None; }
-        let target = match bytes[0] {
+        // 0x80 requests a native UTF-8 locale check before resolving any name.
+        let target = match bytes[0] & !0x80 {
             0 => Target::Dollar,
             1 => Target::Slot,
             2 => Target::Bracket,
@@ -89,7 +107,7 @@ impl MemberQuery {
             steps.push(step);
         }
         if at != bytes.len() { return None; }
-        Some(Self { root, steps, target })
+        Some(Self { root, steps, target, utf8_byte_escapes: bytes[0] & 0x80 != 0 })
     }
 }
 
@@ -156,8 +174,12 @@ pub(crate) struct InspectorApi {
     envlength: Option<usize>,
     enclosing_env: usize,
     promise_value: usize,
+    promise_expression: usize,
+    promise_environment: usize,
     empty_env: usize,
     base_namespace: usize,
+    namespace_registry: usize,
+    utf8_locale: Option<usize>,
     vmaxget: usize,
     vmaxset: usize,
 }
@@ -206,8 +228,12 @@ impl InspectorApi {
             envlength: symbol(b"Rf_envlength\0"),
             enclosing_env: symbol(b"ENCLOS\0")?,
             promise_value: symbol(b"PRVALUE\0")?,
+            promise_expression: symbol(b"R_PromiseExpr\0")?,
+            promise_environment: symbol(b"PRENV\0")?,
             empty_env: symbol(b"R_EmptyEnv\0")?,
             base_namespace: symbol(b"R_BaseNamespace\0")?,
+            namespace_registry: symbol(b"R_NamespaceRegistry\0")?,
+            utf8_locale: symbol(b"utf8locale\0"),
             // Required for bounded copies of R_alloc-backed UTF-8 translations.
             vmaxget: symbol(b"vmaxget\0")?,
             vmaxset: symbol(b"vmaxset\0")?,
@@ -281,6 +307,8 @@ const RMG_REAL_ELT: c_int = 23;
 const RMG_ENVLENGTH: c_int = 24;
 const RMG_ENCLOS: c_int = 28;
 const RMG_PRVALUE: c_int = 29;
+const RMG_PREXPR: c_int = 30;
+const RMG_PRENV: c_int = 31;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
@@ -387,8 +415,15 @@ unsafe extern "C" fn guard_promise_value(a: Sexp) -> Sexp {
     guarded(RMG_PRVALUE, a as usize, 0, 0) as usize as Sexp
 }
 
+unsafe extern "C" fn guard_promise_expression(a: Sexp) -> Sexp {
+    guarded(RMG_PREXPR, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_promise_environment(a: Sexp) -> Sexp {
+    guarded(RMG_PRENV, a as usize, 0, 0) as usize as Sexp
+}
+
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 30] = [
+    let funcs: [usize; 32] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
@@ -396,7 +431,7 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.protect, api.unprotect, api.ls3.unwrap_or(0), api.ls2.unwrap_or(0),
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
-        api.char_ce, api.enclosing_env, api.promise_value,
+        api.char_ce, api.enclosing_env, api.promise_value, api.promise_expression, api.promise_environment,
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
         api.raw_protect, api.raw_unprotect,
@@ -441,8 +476,11 @@ struct Native {
     envlength: Option<unsafe extern "C" fn(Sexp) -> c_int>,
     enclosing_env: Unary,
     promise_value: Unary,
+    promise_expression: Unary,
+    promise_environment: Unary,
     empty_env: Sexp,
     base_namespace: Sexp,
+    namespace_registry: Sexp,
     global: Sexp,
     nil: Sexp,
     na_string: Sexp,
@@ -495,8 +533,11 @@ impl Native {
             envlength: api.envlength.map(|_| guard_envlength as _),
             enclosing_env: guard_enclosing_env,
             promise_value: guard_promise_value,
+            promise_expression: guard_promise_expression,
+            promise_environment: guard_promise_environment,
             empty_env: *(api.empty_env as *const Sexp),
             base_namespace: *(api.base_namespace as *const Sexp),
+            namespace_registry: *(api.namespace_registry as *const Sexp),
             global,
             nil,
             na_string: *(api.na_string as *const Sexp),
@@ -561,14 +602,15 @@ impl Native {
             (self.get_attrib)(value, self.symbol("_S7_class").ok_or(Suppression::UnsafeDispatch)?) != self.nil)
     }
 
-    unsafe fn ordinary_dispatch(&self, value: Sexp) -> Result<bool, Suppression> {
+    unsafe fn ordinary_dispatch(&self, value: Sexp, accessor: &str) -> Result<bool, Suppression> {
         if (self.is_s4)(value) != 0 { return Ok(false); }
         if (self.is_object)(value) == 0 { return Ok(true); }
         let classes = self.classes(value)?;
         // Only the exact built-in storage layouts are eligible for direct
         // element traversal. Other classes may invoke custom accessors.
-        Ok((classes.len() == 1 && classes[0] == "data.frame") ||
-            (classes.len() == 2 && classes[0] == "data.table" && classes[1] == "data.frame"))
+        let supported = (classes.len() == 1 && classes[0] == "data.frame") ||
+            (classes.len() == 2 && classes[0] == "data.table" && classes[1] == "data.frame");
+        Ok(supported && self.ordinary_s3_dispatch(value, accessor, true)?)
     }
 
     unsafe fn stored_binding(&self, env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
@@ -590,52 +632,125 @@ impl Native {
         Ok(value)
     }
 
-    // Environment classes (including R6) do not necessarily override access.
-    // Check for possible S3 dispatch without fetching or forcing any method.
-    // Primitive accessors consult the calling search path and base's S3 table.
+    // Read only an already-forced value, never force a package/method promise.
+    unsafe fn cached_value(&self, value: Sexp) -> Option<Sexp> {
+        let value = if (self.type_of)(value) == PROMISE { (self.promise_value)(value) } else { value };
+        if value.is_null() || value == self.unbound { None } else { Some(value) }
+    }
+
+    // Only installed methods whose storage semantics we support may dispatch.
+    // Match identity against the defining namespace; a same-named method in the
+    // search path or S3 registry is not evidence of the installed implementation.
+    unsafe fn installed_accessor(&self, class: &str, accessor: &str) -> Result<Option<Sexp>, Suppression> {
+        let namespace = match (class, accessor) {
+            ("data.frame", "[" | "[[") => self.base_namespace,
+            ("data.table", "[") => {
+                let Some(value) = self.stored_binding(self.namespace_registry, "data.table")? else {
+                    return Ok(None);
+                };
+                let Some(namespace) = self.cached_value(value) else { return Ok(None); };
+                if (self.type_of)(namespace) != ENV { return Ok(None); }
+                namespace
+            }
+            _ => return Ok(None),
+        };
+        Ok(self.stored_binding(namespace, &format!("{accessor}.{class}"))?
+            .map(|value| self.cached_value(value).unwrap_or(value)))
+    }
+
+    // registerS3method stores an inert forwarding promise for a method named
+    // by string: get(method, envir = home). Recognize only that exact AST and
+    // already-forced method/home bindings, and verify get itself resolves to
+    // base::get. No promise expression or arbitrary call is evaluated here.
+    unsafe fn registered_forwarder(&self, value: Sexp, installed: Sexp) -> Result<bool, Suppression> {
+        if (self.type_of)(value) != PROMISE { return Ok(false); }
+        let Some(car) = self.car else { return Ok(false); };
+        let expr = (self.promise_expression)(value);
+        if (self.type_of)(expr) != LANGUAGE || Some(car(expr)) != self.symbol("get") { return Ok(false); }
+        let first = (self.cdr)(expr);
+        if (self.type_of)(first) != LIST || (self.tag)(first) != self.nil ||
+            Some(car(first)) != self.symbol("method") { return Ok(false); }
+        let second = (self.cdr)(first);
+        if (self.type_of)(second) != LIST || Some((self.tag)(second)) != self.symbol("envir") ||
+            Some(car(second)) != self.symbol("home") || (self.cdr)(second) != self.nil { return Ok(false); }
+        let env = (self.promise_environment)(value);
+        if (self.type_of)(env) != ENV { return Ok(false); }
+        let cached_binding = |name| -> Result<Option<Sexp>, Suppression> {
+            Ok(self.stored_binding(env, name)?.and_then(|value| self.cached_value(value)))
+        };
+        let (Some(method), Some(home)) = (cached_binding("method")?, cached_binding("home")?) else { return Ok(false); };
+        if (self.type_of)(method) != STRING || (self.altrep)(method) != 0 ||
+            (self.xlength)(method) != 1 || (self.type_of)(home) != ENV { return Ok(false); }
+        let Some(name) = self.text((self.string_elt)(method, 0)) else { return Ok(false); };
+        let target = self.stored_binding(home, &name)?
+            .map(|value| self.cached_value(value).unwrap_or(value));
+        if target != Some(installed) { return Ok(false); }
+        let canonical_get = self.stored_binding(self.base_namespace, "get")?
+            .and_then(|value| self.cached_value(value));
+        let mut cursor = env;
+        for _ in 0..128 {
+            self.check_deadline()?;
+            if cursor == self.empty_env { break; }
+            if (self.type_of)(cursor) != ENV { return Ok(false); }
+            if let Some(get) = self.stored_binding(cursor, "get")? {
+                return Ok(canonical_get.is_some() && self.cached_value(get) == canonical_get);
+            }
+            cursor = (self.enclosing_env)(cursor);
+        }
+        Ok(false)
+    }
+
     unsafe fn ordinary_environment_dispatch(&self, value: Sexp, accessor: &str)
+        -> Result<bool, Suppression> {
+        self.ordinary_s3_dispatch(value, accessor, false)
+    }
+
+    unsafe fn ordinary_s3_dispatch(&self, value: Sexp, accessor: &str, storage: bool)
         -> Result<bool, Suppression> {
         if (self.is_s4)(value) != 0 { return Ok(false); }
         if (self.is_object)(value) == 0 { return Ok(true); }
         let mut classes = self.classes(value)?;
         classes.push("default".into());
-        let mut symbols = Vec::with_capacity(classes.len());
+        let mut methods = Vec::with_capacity(classes.len());
         for class in classes {
             self.check_deadline()?;
             let method = format!("{accessor}.{class}");
             if method.len() > MAX_NAME_BYTES { return Err(Suppression::InspectionLimit); }
-            symbols.push(self.symbol(&method).ok_or(Suppression::UnsafeDispatch)?);
+            let symbol = self.symbol(&method).ok_or(Suppression::UnsafeDispatch)?;
+            let installed = if storage { self.installed_accessor(&class, accessor)? } else { None };
+            methods.push((symbol, installed));
         }
-        let has_method = |env: Sexp| -> Result<bool, Suppression> {
+        let safe_methods = |env: Sexp| -> Result<bool, Suppression> {
             self.check_deadline()?;
             if env.is_null() || (self.type_of)(env) != ENV {
                 return Err(Suppression::UnsafeEnvironment);
             }
             if self.custom_database(env)? { return Err(Suppression::UnsafeEnvironment); }
-            for symbol in &symbols {
+            for (symbol, installed) in &methods {
                 self.check_deadline()?;
-                // Existence alone is sufficient to suppress: even inspecting
-                // an active or lazy method binding could execute user code.
-                if (self.exists)(env, *symbol) != 0 { return Ok(true); }
+                if (self.exists)(env, *symbol) == 0 { continue; }
+                // Check active bindings before fetching, and promises before
+                // comparing: the inspection must never execute a method loader.
+                if installed.is_none() || (self.active)(*symbol, env) != 0 { return Ok(false); }
+                let raw = (self.find)(env, *symbol);
+                let candidate = self.cached_value(raw).unwrap_or(raw);
+                if Some(candidate) != *installed && !self.registered_forwarder(raw, installed.unwrap())? {
+                    return Ok(false);
+                }
             }
-            Ok(false)
+            Ok(true)
         };
         let mut env = self.global;
         let mut depth = 0;
         while env != self.empty_env {
             if depth >= 128 { return Err(Suppression::InspectionLimit); }
-            if has_method(env)? { return Ok(false); }
+            if !safe_methods(env)? { return Ok(false); }
             env = (self.enclosing_env)(env);
             depth += 1;
         }
-        if let Some(mut table) = self.stored_binding(self.base_namespace, ".__S3MethodsTable__.")? {
-            // Base publishes this table through an already-forced lazy binding.
-            // Read only its cached value; never evaluate an unforced promise.
-            if (self.type_of)(table) == PROMISE {
-                table = (self.promise_value)(table);
-                if table == self.unbound { return Err(Suppression::DeferredBinding); }
-            }
-            if has_method(table)? { return Ok(false); }
+        if let Some(table) = self.stored_binding(self.base_namespace, ".__S3MethodsTable__.")? {
+            let table = self.cached_value(table).ok_or(Suppression::DeferredBinding)?;
+            if !safe_methods(table)? { return Ok(false); }
         }
         Ok(true)
     }
@@ -651,7 +766,7 @@ impl Native {
         }
     }
 
-    unsafe fn vector_members(&self, value: Sexp) -> Result<Members, Suppression> {
+    unsafe fn vector_members(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
         self.check_deadline()?;
         if value == self.nil || (self.type_of)(value) == 9 { return Ok(Members::empty()); }
         let names = (self.get_attrib)(value, self.names);
@@ -661,7 +776,7 @@ impl Native {
         if length < 0 { return Ok(Members::empty()); }
         if length as usize > MAX_NAMES { return Err(Suppression::InspectionLimit); }
         let type_ = (self.type_of)(value);
-        let direct = matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(value)?;
+        let direct = matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(value, target.accessor())?;
         let mut members = Members::empty();
         let mut seen = HashSet::new();
         for index in 0..length.min(MAX_NAMES as isize) {
@@ -688,13 +803,13 @@ impl Native {
         Ok(self.text((self.string_elt)(names, index as isize)))
     }
 
-    unsafe fn pair_members(&self, value: Sexp) -> Result<Members, Suppression> {
+    unsafe fn pair_members(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
         let mut cursor = value;
         let mut members = Members::empty();
         let mut seen = HashSet::new();
         let mut scanned = 0;
         let type_ = (self.type_of)(value);
-        let direct = matches!(type_, LIST | LANGUAGE) && self.ordinary_dispatch(value)?;
+        let direct = matches!(type_, LIST | LANGUAGE) && self.ordinary_dispatch(value, target.accessor())?;
         while cursor != self.nil && members.names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
             if scanned % 32 == 0 { self.check_deadline()?; }
             scanned += 1;
@@ -788,6 +903,7 @@ impl Native {
     }
 
     unsafe fn bracket_kind(&self, value: Sexp) -> Result<u8, Suppression> {
+        if !self.ordinary_dispatch(value, "[")? { return Ok(0); }
         let classes = self.classes(value)?;
         // Custom subclasses can override bracket semantics. Only exact
         // built-in class sequences supply installed method metadata.
@@ -834,9 +950,9 @@ impl Native {
             return Ok(Members::empty());
         }
         let mut members = if matches!(kind, LIST | LANGUAGE | DOTS) {
-            self.pair_members(value)?
+            self.pair_members(value, target)?
         } else if matches!(kind, VECTOR | EXPRESSION | LOGICAL | INTEGER | REAL | COMPLEX | STRING | RAW) {
-            self.vector_members(value)?
+            self.vector_members(value, target)?
         } else {
             Members::empty()
         };
@@ -967,6 +1083,9 @@ impl Native {
         let Some(step) = checked else { return Ok(None); };
         match view {
             View::Slice { source, index } => {
+                if !self.ordinary_dispatch(source, step.accessor())? {
+                    return Err(Suppression::UnsafeDispatch);
+                }
                 let selected_name = self.name_at(source, index)?;
                 match &step {
                     Step::Index(1) | Step::SliceIndex(1) => {
@@ -1024,7 +1143,7 @@ impl Native {
                 if !matches!(kind, VECTOR | EXPRESSION | LIST | LANGUAGE) {
                     return Ok(None);
                 }
-                if !self.ordinary_dispatch(value)? {
+                if !self.ordinary_dispatch(value, step.accessor())? {
                     return Err(Suppression::UnsafeDispatch);
                 }
                 // data.table's [ selects rows or performs joins, unlike list
@@ -1109,7 +1228,7 @@ impl Native {
                             return Ok(Members::empty());
                         }
                         let names: Vec<String> = self.name_at(source, index)?.into_iter().collect();
-                        let kind = if matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(source)? {
+                        let kind = if matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(source, query.target.accessor())? {
                             self.item(source, index)?.map(|stored| self.stored_kind(stored)).unwrap_or(0)
                         } else { 0 };
                         let kinds = names.iter().map(|_| kind).collect();
@@ -1135,6 +1254,11 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) 
     // Rust code as an R_ToplevelExec callback: R errors/interrupts use longjmp.
     if Instant::now() >= deadline { return Inspection::Unavailable; }
     unsafe {
+        // The locale can change during a session. Recheck on the R thread for
+        // every escaped-byte query, and fail closed on older R exports.
+        if query.utf8_byte_escapes && !api.utf8_locale.is_some_and(|ptr| *(ptr as *const c_int) != 0) {
+            return Inspection::Unavailable;
+        }
         begin_inspection_guard(api);
         let result = Native::new(api, deadline).map(|native| native.inspect(&query));
         if rmg_end() != 0 {
@@ -1201,15 +1325,20 @@ mod tests {
             root: "obj".to_owned(),
             steps: vec![Step::Field("inner".to_owned()),
                 Step::NamedIndex("a b".to_owned()), Step::Index(1)],
-            target: Target::DoubleBracket,
+            target: Target::DoubleBracket, utf8_byte_escapes: false,
         }));
+        bytes[0] |= 0x80;
+        assert!(MemberQuery::decode(&bytes).unwrap().utf8_byte_escapes);
+        bytes[0] = 0x40;
+        assert_eq!(MemberQuery::decode(&bytes), None);
+        bytes[0] = 3;
         assert_eq!(MemberQuery::decode(&bytes[..bytes.len()-1]), None);
         bytes[1] = 13;
         assert_eq!(MemberQuery::decode(&bytes), None);
         let mut root = vec![0, 0];
         name("task", &mut root);
         assert_eq!(MemberQuery::decode(&root), Some(MemberQuery {
-            root: "task".to_owned(), steps: Vec::new(), target: Target::Dollar,
+            root: "task".to_owned(), steps: Vec::new(), target: Target::Dollar, utf8_byte_escapes: false,
         }));
     }
 }

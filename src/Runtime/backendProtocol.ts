@@ -59,7 +59,8 @@ export type BackendCapability =
   | "nested-input"
   | "parse-status"
   | "set-width"
-  | "member-inspection";
+  | "member-inspection"
+  | "member-inspection-utf8-escapes";
 
 export type BackendDialogRequest =
   | {
@@ -105,6 +106,8 @@ export type MemberInspectionQuery = {
   root: string;
   steps: MemberInspectionStep[];
   target: MemberInspectionTarget;
+  // Non-ASCII byte escapes require R's current native locale to be UTF-8.
+  utf8ByteEscapes?: boolean;
 };
 
 export type BackendControlEvent =
@@ -202,7 +205,8 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "nested-input" ||
     value === "parse-status" ||
     value === "set-width" ||
-    value === "member-inspection"
+    value === "member-inspection" ||
+    value === "member-inspection-utf8-escapes"
   );
 }
 
@@ -627,7 +631,8 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
     field: 0, slot: 1, index: 2, "named-index": 3,
     "slice-index": 4, "slice-name": 5, "variable-index": 6, "variable-slice": 7,
   } as const;
-  const parts: Buffer[] = [Buffer.from([targetCodes[query.target], query.steps.length]), encodeString(query.root)];
+  // The high bit is negotiated separately for older persistent backends.
+  const parts: Buffer[] = [Buffer.from([targetCodes[query.target] | (query.utf8ByteEscapes ? 0x80 : 0), query.steps.length]), encodeString(query.root)];
   for (const step of query.steps) {
     if ("index" in step) {
       if (!Number.isSafeInteger(step.index) || step.index < 1 || step.index > 100000) {

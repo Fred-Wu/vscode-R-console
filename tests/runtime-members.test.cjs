@@ -631,6 +631,84 @@ test("real embedded R completion inspects nested storage without running user co
   const escapedQuery = parseRuntimeMemberQuery('escaped[["a\\"b"]]', "$");
   assert.equal(escapedQuery.steps[0].name, 'a"b');
   assert.deepEqual(await inspect(escapedQuery.root, escapedQuery.steps), available(["inner"]));
+
+  // Exact storage classes are not proof that their accessors are unchanged.
+  // Exercise each supported accessor through global, attached and registered
+  // replacements, including slices and unforced/active method bindings.
+  await submit('method_hits <- 0L; override_df <- structure(list(inner = list(storage = 1)), class = "data.frame", row.names = 1L); override_dt <- data.table::data.table(inner = list(list(storage = 1))); override_method <- function(x, ...) { method_hits <<- method_hits + 1L; list(actual = 2) }; method_table <- get(".__S3MethodsTable__.", asNamespace("base"))');
+  for (const [klass, root] of [["data.frame", "override_df"], ["data.table", "override_dt"]]) {
+    for (const [accessor, suffix] of [["$", "$inner"], ["[[", '[["inner"]]'], ["[", "[1]"]]) {
+      const name = accessor + "." + klass;
+      for (const location of ["global", "attached", "registry"]) {
+        const code = location === "global" ? `assign(${JSON.stringify(name)}, override_method, .GlobalEnv)`
+          : location === "attached" ? `attach(setNames(list(override_method), ${JSON.stringify(name)}), name="override_methods")`
+          : `saved_method <- get0(${JSON.stringify(name)}, method_table, inherits=FALSE); registerS3method(${JSON.stringify(accessor)}, ${JSON.stringify(klass)}, override_method, envir=asNamespace("base"))`;
+        await submit(code);
+        assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(root + suffix)),
+          {status: "suppressed", reason: "unsafe-dispatch"}, location + " " + name);
+        if (accessor === "$") {
+          assert.deepEqual(await inspect("override_df", [{kind:"slice-index", index:1}, {kind:"field", name:"inner"}]),
+            klass === "data.frame" ? {status:"suppressed",reason:"unsafe-dispatch"} : available(["storage"]));
+        }
+        if (accessor === "[") {
+          assert.equal((await inspectTyped(root, [], "[")).bracketKind, undefined,
+            "overridden bracket methods cannot borrow installed method metadata");
+        }
+        await submit(location === "global" ? `rm(list=${JSON.stringify(name)}, envir=.GlobalEnv)`
+          : location === "attached" ? 'detach("override_methods")'
+          : `if (is.null(saved_method)) rm(list=${JSON.stringify(name)}, envir=method_table) else assign(${JSON.stringify(name)}, saved_method, method_table)`);
+      }
+    }
+  }
+  await submit('delayedAssign("$.data.frame", { method_hits <<- method_hits + 1L; override_method })');
+  assert.deepEqual(await inspect("override_df", [{kind:"field",name:"inner"}]), unsafeDispatch);
+  await submit('rm("$.data.frame"); makeActiveBinding("$.data.frame", function() { method_hits <<- method_hits + 1L; override_method }, .GlobalEnv)');
+  assert.deepEqual(await inspect("override_df", [{kind:"field",name:"inner"}]), unsafeDispatch);
+  await submit('rm("$.data.frame"); `$.default` <- override_method');
+  assert.deepEqual(await inspect("override_df", [{kind:"field",name:"inner"}]), unsafeDispatch);
+  await submit('rm("$.default"); saved_method <- get("[[.data.frame", method_table); local({ method <- "[[.data.frame"; home <- baseenv(); get <- function(...) { method_hits <<- method_hits + 1L; base::get(...) }; delayedAssign("[[.data.frame", get(method, envir=home), assign.env=method_table) })');
+  assert.deepEqual(await inspect("override_df", [{kind:"named-index",name:"inner"}]), unsafeDispatch,
+    "a lookalike registration promise with a replaced get must not be trusted or forced");
+  await submit('assign("[[.data.frame", saved_method, method_table); stopifnot(method_hits == 0L); `$.data.frame` <- override_method; stopifnot(identical(names(override_df$inner), "actual"), method_hits == 1L); rm("$.data.frame"); cat("OVERRIDDEN_METHODS_VERIFIED\\n")');
+  assert.match(output, /OVERRIDDEN_METHODS_VERIFIED/);
+  assert.deepEqual(await inspect("override_df", [{kind:"field",name:"inner"}]), available(["storage"]));
+  assert.deepEqual(await inspect("override_df", [{kind:"named-index",name:"inner"}]), available(["storage"]));
+
+  // Feed the actual insertion spelling back through the parser and native
+  // inspector. Test both UI insertion paths, nested roots, and R's locale at
+  // request time; never infer a legacy encoding from UTF-8-looking bytes.
+  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/candidates.ts", {vscode:{}});
+  await submit('escaped_names <- c("line\\u2028name", "para\\u2029name", "bidi\\u202ename", "c1\\u0085name"); escaped_holder <- setNames(rep(list(list(child=1)), length(escaped_names)), escaped_names); escaped_index <- escaped_names[[1]]; assign(escaped_index, list(child=1), .GlobalEnv); assign("selector\\u2028key", escaped_index, .GlobalEnv); saved_ctype <- Sys.getlocale("LC_CTYPE"); stopifnot(l10n_info()[["UTF-8"]])');
+  const escapedEntries = await completion.collectCompletionEntries(
+    completion.getCompletionContext("escaped_holder$", 15), undefined, undefined, undefined, [], [], undefined,
+    (receiver, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver, target)));
+  assert.equal(escapedEntries.length, 4);
+  const paths = [];
+  for (const entry of escapedEntries) {
+    for (const receiver of ["escaped_holder$" + entry.insertText,
+      "escaped_holder[[" + quoteCompletionValue(entry.label) + "]]"]) {
+      paths.push(receiver);
+      const input = receiver + "$";
+      const entries = await completion.collectCompletionEntries(
+        completion.getCompletionContext(input, input.length), undefined, undefined, undefined, [], [], undefined,
+        (expression, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
+      assert.deepEqual(entries.map(entry => entry.insertText), ["child"], input);
+      await submit('stopifnot(identical(names(' + receiver + '), "child"))');
+    }
+  }
+  paths.push(backtickRName("line\u2028name"), "escaped_holder[[" + backtickRName("selector\u2028key") + "]]");
+  for (const receiver of paths.slice(-2)) {
+    assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver)),
+      {status:"available",names:["child"],kinds:[0]}, receiver);
+  }
+  await submit('invisible(Sys.setlocale("LC_CTYPE", "C"))');
+  for (const receiver of paths) {
+    assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver)),
+      {status:"unavailable"}, receiver);
+  }
+  await submit('invisible(Sys.setlocale("LC_CTYPE", saved_ctype))');
+  assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(paths[0])),
+    {status:"available",names:["child"],kinds:[0]});
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');
   await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");

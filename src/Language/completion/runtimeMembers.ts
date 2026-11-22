@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { TokenType, tokenize, type Token } from "../lexer";
 import type { MemberInspectionQuery, MemberInspectionStep, MemberInspectionTarget } from "../../Runtime/backendProtocol";
 
@@ -17,14 +18,15 @@ export function parseRuntimeMemberQuery(
   const tokens = tokenize(expression).filter(token => token.type !== TokenType.Newline &&
     token.type !== TokenType.EOF);
   if (!tokens.length || tokens.length > 40) return undefined;
-  const root = memberName(tokens[0]);
+  const encoding = { utf8ByteEscapes: false };
+  const root = memberName(tokens[0], encoding);
   if (root === undefined) return undefined;
   const steps: MemberInspectionStep[] = [];
   let index = 1;
   while (index < tokens.length && steps.length < 12) {
     const token = tokens[index++];
     if (token.type === TokenType.Operator && (token.value === "$" || token.value === "@")) {
-      const name = memberName(tokens[index++]);
+      const name = memberName(tokens[index++], encoding);
       if (name === undefined) return undefined;
       steps.push({ kind: token.value === "$" ? "field" : "slot", name });
     } else if (token.type === TokenType.LeftBracket && (token.value === "[[" || token.value === "[")) {
@@ -32,7 +34,7 @@ export function parseRuntimeMemberQuery(
       const value = tokens[index++];
       if (!value) return undefined;
       if (value.type === TokenType.String && value.closed) {
-        const name = literalName(value.value);
+        const name = literalName(value.value, encoding);
         if (name === undefined) return undefined;
         steps.push({ kind: double ? "named-index" : "slice-name", name });
       } else if (value.type === TokenType.Number && /^(?:[1-9]\d{0,5})L?$/.test(value.value)) {
@@ -40,7 +42,7 @@ export function parseRuntimeMemberQuery(
         if (number > 100000) return undefined;
         steps.push({ kind: double ? "index" : "slice-index", index: number });
       } else if (value.type === TokenType.Identifier) {
-        const name = memberName(value);
+        const name = memberName(value, encoding);
         if (name === undefined) return undefined;
         steps.push({ kind: double ? "variable-index" : "variable-slice", name });
       } else {
@@ -55,70 +57,83 @@ export function parseRuntimeMemberQuery(
     }
   }
   if (index !== tokens.length) return undefined;
-  return { root, steps, target };
+  return { root, steps, target, ...(encoding.utf8ByteEscapes ? { utf8ByteEscapes: true } : {}) };
 }
 
-function memberName(token: Token | undefined): string | undefined {
+type NameEncoding = { utf8ByteEscapes: boolean };
+
+function memberName(token: Token | undefined, encoding?: NameEncoding): string | undefined {
   if (token?.type !== TokenType.Identifier || token.closed === false) return undefined;
   return token.value.startsWith("\x60")
-    ? decodeQuotedName(token.value, "\x60") : validName(token.value);
+    ? decodeQuotedName(token.value, "\x60", encoding) : validName(token.value);
 }
 
-function literalName(value: string): string | undefined {
+function literalName(value: string, encoding?: NameEncoding): string | undefined {
   const quote = value[0];
-  return quote === "'" || quote === '"' ? decodeQuotedName(value, quote) : undefined;
+  return quote === "'" || quote === '"' ? decodeQuotedName(value, quote, encoding) : undefined;
 }
 
-// Decode only known R string escapes; never parse or evaluate an R expression.
-// Unsupported or locale-dependent byte escapes are rejected.
-function decodeQuotedName(value: string, quote: string): string | undefined {
+// Byte escapes form a byte stream, not individual Unicode code points. Accept
+// only strict UTF-8, and require the backend to verify R's current UTF-8 locale
+// before using non-ASCII escaped bytes. Never guess a legacy encoding.
+function decodeQuotedName(value: string, quote: string, encoding?: NameEncoding): string | undefined {
   if (value.length < 3 || !value.startsWith(quote) || !value.endsWith(quote)) return undefined;
   const raw = value.slice(1, -1);
-  let name = "";
+  const bytes: number[] = [];
+  let byteEscape = false, unicodeEscape = false, nonAsciiByte = false;
   const simpleEscapes: Record<string, string> = {
     "\\": "\\", "'": "'", '"': '"', a: "\x07", b: "\b",
     f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
   };
   if (quote === "\x60") simpleEscapes["\x60"] = "\x60";
   for (let i = 0; i < raw.length; i++) {
-    const char = raw[i];
-    if (char !== "\\") {
-      name += char;
+    if (raw[i] !== "\\") {
+      const code = raw.codePointAt(i)!;
+      if (code >= 0xd800 && code <= 0xdfff) return undefined;
+      const char = String.fromCodePoint(code);
+      bytes.push(...Buffer.from(char, "utf8"));
+      i += char.length - 1;
     } else {
       const next = raw[++i];
       if (next === undefined) return undefined;
       if (Object.hasOwn(simpleEscapes, next)) {
-        name += simpleEscapes[next];
-      } else if (/^[0-7]$/.test(next)) {
-        let digits = next;
-        while (digits.length < 3 && /^[0-7]$/.test(raw[i + 1] ?? "")) digits += raw[++i];
-        const code = parseInt(digits, 8);
-        if (code > 0x7f) return undefined; // R's native-encoding bytes are locale-dependent.
-        name += String.fromCharCode(code);
-      } else if (next === "x" || next === "u" || next === "U") {
-        const braced = next !== "x" && raw[i + 1] === "{";
-        const width = braced ? 8 : next === "x" ? 2 : next === "u" ? 4 : 8;
+        bytes.push(...Buffer.from(simpleEscapes[next], "utf8"));
+      } else if (/^[0-7]$/.test(next) || next === "x") {
+        byteEscape = true;
+        const octal = next !== "x";
+        const pattern = octal ? /^[0-7]$/ : /^[0-9a-fA-F]$/;
+        let digits = octal ? next : "";
+        while (digits.length < (octal ? 3 : 2) && pattern.test(raw[i + 1] ?? "")) digits += raw[++i];
+        if (!digits) return undefined;
+        const code = parseInt(digits, octal ? 8 : 16);
+        if (code > 255) return undefined;
+        nonAsciiByte ||= code > 127;
+        bytes.push(code);
+      } else if (next === "u" || next === "U") {
+        if (quote === "\x60") return undefined; // R forbids Unicode escapes in backticks.
+        unicodeEscape = true;
+        const braced = raw[i + 1] === "{";
+        const width = next === "u" ? 4 : 8;
         let digits = "";
-        if (braced) {
-          i++;
-          while (digits.length < width && /^[0-9a-fA-F]$/.test(raw[i + 1] ?? "")) digits += raw[++i];
-          if (raw[++i] !== "}" || !digits) return undefined;
-        } else {
-          while (digits.length < width && /^[0-9a-fA-F]$/.test(raw[i + 1] ?? "")) digits += raw[++i];
-          if (digits.length !== width && next !== "x") return undefined;
-          if (!digits) return undefined;
-        }
+        if (braced) i++;
+        while (digits.length < width && /^[0-9a-fA-F]$/.test(raw[i + 1] ?? "")) digits += raw[++i];
+        if (!digits || (braced ? raw[++i] !== "}" : digits.length !== width)) return undefined;
         const code = parseInt(digits, 16);
-        if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) ||
-            (next === "x" && code > 0x7f)) return undefined;
-        name += String.fromCodePoint(code);
+        if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return undefined;
+        bytes.push(...Buffer.from(String.fromCodePoint(code), "utf8"));
       } else {
         return undefined;
       }
     }
-    if (Buffer.byteLength(name, "utf8") > 4096) return undefined;
+    if (bytes.length > 4096 || (byteEscape && unicodeEscape)) return undefined;
   }
-  return validName(name);
+  const buffer = Buffer.from(bytes);
+  if (!isUtf8(buffer)) return undefined;
+  if (nonAsciiByte) {
+    if (!encoding) return undefined;
+    encoding.utf8ByteEscapes = true;
+  }
+  return validName(buffer.toString("utf8"));
 }
 
 function validName(name: string): string | undefined {

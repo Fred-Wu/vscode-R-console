@@ -44,7 +44,7 @@ test("quoted member selectors decode R escapes safely and reject invalid express
     ['obj[["a\\\\b"]]', "a\\b"],
     ['obj[["a\\u0020b"]]', "a b"],
     ['obj[["line\\nfeed"]]', "line\nfeed"],
-    ['obj[["\\u{1F642}"]]', "🙂"],
+    ['obj[["\\U{1F642}"]]', "🙂"],
     ["obj$" + backtick + "a\\" + backtick + "b" + backtick, "a" + backtick + "b"],
   ];
   for (const [receiver, name] of cases) {
@@ -115,4 +115,65 @@ test("native results distinguish silent empty from unavailable and unsafe access
       result: { status: "suppressed", reason: labels[byte - 2] },
     }]);
   }
+});
+
+
+test("emitted UTF-8 byte escapes round-trip without aliasing malformed names", () => {
+  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/candidates.ts", { vscode: {} });
+  for (const name of ["line\u2028name", "para\u2029name", "bidi\u202ename", "c1\u0085name", "\ufeff", "🙂", "`\\'\"\n"]) {
+    for (const [spelling, steps] of [
+      [backtickRName(name), []],
+      ["obj$" + backtickRName(name), [{ kind: "field", name }]],
+      ["obj[[" + quoteCompletionValue(name) + "]]", [{ kind: "named-index", name }]],
+    ]) {
+      const query = parseRuntimeMemberQuery(spelling);
+      assert.ok(query, spelling);
+      assert.equal(query.root, steps.length ? "obj" : name);
+      assert.deepEqual(query.steps, steps);
+      assert.equal(query.utf8ByteEscapes === true, /\\x(?:[89a-f])/i.test(spelling));
+    }
+  }
+  const query = parseRuntimeMemberQuery('obj[["\\342\\x80\\250"]]');
+  assert.deepEqual(query, {root: "obj", steps: [{kind: "named-index", name: "\u2028"}],
+    target: "$", utf8ByteEscapes: true});
+  assert.equal(encodeMemberNamesRequestFrame(1, query)[12], 0x80);
+  for (const receiver of [
+    'obj[["\\xc0\\xaf"]]', 'obj[["\\xe2\\x80"]]', 'obj[["\\xed\\xa0\\x80"]]',
+    'obj[["\\xf4\\x90\\x80\\x80"]]', 'obj[["\\777"]]', 'obj[["\\x61\\u0062"]]',
+    'obj$`\\u0061`', 'obj[["\\u{1F642}"]]', 'obj[["\ud800"]]',
+  ]) assert.equal(parseRuntimeMemberQuery(receiver), undefined, receiver);
+});
+
+test("UTF-8 escape requests never reach an older persistent backend", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource("src/Runtime/runtimeBackend.ts");
+  const backend = new RustSidecarRuntimeBackend("unused");
+  const session = {sessionId: "escaped-names"};
+  const state = {hostConnected: true, capabilities: new Set(["member-inspection"]),
+    pendingMemberRequests: new Map(), nextRequestId: 0};
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const query = parseRuntimeMemberQuery('obj[["\\xe2\\x80\\xa8"]]');
+  assert.equal(backend.inspectMemberNames(session, query), undefined);
+  assert.equal(frames.length, 0);
+  state.capabilities.add("member-inspection-utf8-escapes");
+  const pending = backend.inspectMemberNames(session, query);
+  assert.equal(frames[0][12], 0x80);
+  backend.handleSessionControlEvent(state, {type: "member-names-result", requestId: 1,
+    result: {status: "available", names: ["child"]}});
+  assert.deepEqual(await pending, {status: "available", names: ["child"]});
+});
+
+
+test("escaped root metadata cannot bypass the native locale check", async () => {
+  const completion = loadSource("src/Language/completion.ts", { vscode: {
+    CompletionItemKind: {Field:4, Function:2, Property:9}, SnippetString: class {},
+  } });
+  const input = '`line\\xe2\\x80\\xa8name`$';
+  const context = completion.getCompletionContext(input, input.length);
+  const workspace = {globalenv: {['line\u2028name']: {names:["wrong_locale"]}}};
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    workspace, [], [], undefined, async () => ({status:"unavailable"}));
+  assert.equal(entries.length, 0);
+  assert.equal(entries.isIncomplete, true);
 });

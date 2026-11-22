@@ -31,7 +31,8 @@ export function getSessionCompletions(
 
   if (context.kind === "member" && context.objectName) {
     const receiver = parseRuntimeMemberQuery(context.objectName);
-    if (!receiver || receiver.steps.length || !Object.hasOwn(data.globalenv, receiver.root)) {
+    // Workspace snapshots cannot establish R's current locale for byte escapes.
+    if (!receiver || receiver.utf8ByteEscapes || receiver.steps.length || !Object.hasOwn(data.globalenv, receiver.root)) {
       return [];
     }
     const obj = data.globalenv[receiver.root];
