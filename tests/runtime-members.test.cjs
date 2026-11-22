@@ -152,6 +152,10 @@ test("real embedded R completion inspects nested storage without running user co
   await submit('delayedAssign("pending_member", { hits <<- hits + 1L; function() NULL }, assign.env = env)');
   const deferredMembers = await inspectTyped("env");
   assert.equal(classify(deferredMembers).pending_member, 3);
+  // A nested promise must be suppressed without running its initializer.
+  await submit('delayedAssign("lazy", { hits <<- hits + 1L; list(inner = 42) }, assign.env = env)');
+  assert.deepEqual(await inspect("env", [{ kind: "field", name: "lazy" }]),
+    { status: "suppressed", reason: "deferred-binding" });
   output = "";
   await submit('cat("SAFE_HITS:", hits, "\\n")');
   await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");

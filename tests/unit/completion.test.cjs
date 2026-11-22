@@ -22,6 +22,48 @@ test("automatic member completion uses cached workspace names without calling se
   }
 });
 
+test("native nested completion reaches Rust without awaiting the language server", async () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Field: 4, Function: 2, Property: 9, Variable: 5, Text: 0 },
+    },
+    "../../Language/completion": completion,
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  for (const [outcome, expected] of [
+    [{ status: "suppressed", reason: "deferred-binding" }, []],
+    [{ status: "available", names: ["inner"] }, ["inner"]],
+    [{ status: "unavailable" }, []],
+  ]) {
+    let requested = 0;
+    const lang = new RTermLang({
+      extensionPath: "", rPath: "R", env: {},
+      getStaticAnalysisEnabled: () => false,
+      requestRuntimeMemberCompletions: async (expression, operator) => {
+        requested++;
+        assert.equal(expression, "a$lazy");
+        assert.equal(operator, "$");
+        return outcome;
+      },
+    });
+    lang.ensureConsoleLspStarted = () => { throw Error("runtime completion must not start LSP"); };
+    lang.getOrOpenCompletionDocument = () => { throw Error("runtime completion must not open a virtual document"); };
+    const text = "a$lazy$";
+    const input = { text, currentLine: text, cursorCol: text.length,
+      cursorRow: 0, lines: [text], textBeforeCursor: text };
+    const published = [];
+    await lang.handleAutocomplete({
+      input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
+      onInlineEntries: items => published.push(items.filter(item => "insertText" in item).map(item => item.insertText)),
+      applyCompletion() {},
+    });
+    assert.equal(requested, 1);
+    assert.deepEqual(published.at(-1), expected);
+  }
+});
+
 test("runtime-only member lookup uses cached names, never live completion", async () => {
   const input = "obj$";
   const entries = await completion.collectCompletionEntries(

@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
 import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
-import { logConsoleCompletionDecision } from "../Language/completion/outputChannel";
+import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
 import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
@@ -294,13 +294,30 @@ export class RTerminal implements vscode.Pseudoterminal {
             expression + operator);
           return undefined;
         }
+        const reportUnavailable = () => {
+          // Top-level metadata may have a cached fallback; report failures
+          // to inspect nested paths, where an empty list would be ambiguous.
+          if (query.steps.length) {
+            logConsoleCompletionDecision({ kind: "Unavailable", reason: "runtime-unavailable" },
+              expression + operator);
+          }
+        };
         const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
-        return response?.then(result => {
+        if (!response) {
+          reportUnavailable();
+          return undefined;
+        }
+        return response.then(result => {
           if (result.status === "suppressed") {
             logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
               expression + operator);
+          } else if (result.status === "unavailable") {
+            reportUnavailable();
           }
           return result;
+        }, () => {
+          reportUnavailable();
+          return { status: "unavailable" as const };
         });
       },
       getStaticAnalysisEnabled: () =>
@@ -2125,6 +2142,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
     if (!this.inlineCompletion.visible && !typing) return;
     const input = this.getInputSnapshot();
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor));
     const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
     this.inlineCompletion.setQuery(context?.prefix ?? "");

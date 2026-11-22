@@ -14,7 +14,7 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
-import { logConsoleCompletionDecision } from "../../Language/completion/outputChannel";
+import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
 import { completionDecisionContext } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
@@ -94,6 +94,7 @@ export class RTermLang {
       return;
     }
     const requestId = ++this.completionRequestId;
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor));
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -134,9 +135,15 @@ export class RTermLang {
       const recentEntries = this.options.getRecentSessionEntries?.() ?? [];
 
       let completionProvider: CompletionProvider | undefined;
-      const documentRequest = this.getOrOpenCompletionDocument(latestInput.text);
+      // Runtime-only member inspection is owned by the guarded native backend.
+      // Do not make it wait for the separate language server to start or reply.
+      const runtimeMember = context.kind === "member" &&
+        this.options.requestRuntimeMemberCompletions !== undefined &&
+        this.options.getStaticAnalysisEnabled?.() !== true;
+      const documentRequest = runtimeMember
+        ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
-        completionProvider = await this.ensureConsoleLspStarted();
+        completionProvider = runtimeMember ? undefined : await this.ensureConsoleLspStarted();
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
@@ -228,8 +235,12 @@ export class RTermLang {
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
 
-          const nextDocumentRequest = this.getOrOpenCompletionDocument(nextInputText);
-          if (!completionProvider) {
+          const nextRuntimeMember = nextContext.kind === "member" &&
+            this.options.requestRuntimeMemberCompletions !== undefined &&
+            this.options.getStaticAnalysisEnabled?.() !== true;
+          const nextDocumentRequest = nextRuntimeMember
+            ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(nextInputText);
+          if (!completionProvider && !nextRuntimeMember) {
             completionProvider = await this.ensureConsoleLspStarted();
           }
           const nextDocument = await nextDocumentRequest;

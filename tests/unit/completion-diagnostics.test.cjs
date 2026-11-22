@@ -3,23 +3,31 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { formatCompletionDecision } = loadSource("src/Language/completion/diagnostics.ts");
 
-test("runtime completion refusal logs explain the inspection decision without user input", () => {
+test("runtime completion diagnostics consistently report reason and action without user input", () => {
   const reasons = [
-    ["Rejected", "executable-receiver", "Receiver contains unsupported or executable syntax; runtime inspection was not attempted."],
-    ["Suppressed", "active-binding", "Active binding would invoke a getter; inspection stopped without reading it."],
-    ["Suppressed", "deferred-binding", "Deferred binding would be forced; inspection stopped without evaluating it."],
-    ["Suppressed", "unsafe-dispatch", "Object requires unsupported or custom accessor dispatch; inspection was stopped."],
-    ["Suppressed", "unsafe-altrep", "ALTREP data could require materialization; inspection was stopped."],
-    ["Suppressed", "unsafe-environment", "User-defined database environment cannot be inspected safely."],
+    ["Rejected", "executable-receiver", "receiver contains unsupported or executable syntax",
+      "runtime inspection was not attempted"],
+    ["Suppressed", "active-binding", "active binding would invoke a getter",
+      "inspection stopped without evaluating the receiver"],
+    ["Suppressed", "deferred-binding", "deferred binding would require forcing a promise",
+      "inspection stopped without evaluating the receiver"],
+    ["Suppressed", "unsafe-dispatch", "unsupported or custom accessor dispatch is required",
+      "inspection stopped without evaluating the receiver"],
+    ["Suppressed", "unsafe-altrep", "ALTREP storage could require materialization",
+      "inspection stopped without evaluating the receiver"],
+    ["Suppressed", "unsafe-environment", "user-defined database environment could invoke custom access",
+      "inspection stopped without evaluating the receiver"],
+    ["Unavailable", "runtime-unavailable", "native inspector was unavailable, busy, or did not respond",
+      "no native inspection result was used"],
   ];
-  for (const [kind, reason, message] of reasons) {
+  for (const [kind, reason, description, action] of reasons) {
     const output = formatCompletionDecision({ kind, reason });
-    assert.equal(output, `[Runtime Completion - ${kind}]: ${message}`);
+    assert.equal(output, `[Runtime Completion - ${kind}]: Reason: ${description}. Action: ${action}.`);
     assert.doesNotMatch(output, /eval\(|make_object|active_obj|\$inner|=\s*['"]/);
   }
 });
 
-test("rejected and suppressed completion messages are not repeated as a member prefix grows", t => {
+test("runtime completion logs deduplicate each reason and context across prefixes", t => {
   const lines = [];
   const { logConsoleCompletionDecision } = loadSource("src/Language/completion/outputChannel.ts", {
     vscode: { window: { createOutputChannel: () => ({
@@ -44,4 +52,10 @@ test("rejected and suppressed completion messages are not repeated as a member p
   }
   assert.equal(lines.length, 3);
   assert.ok(lines.every(line => !line.includes("custom$inner") && !line.includes("task$data")));
+  const unavailable = { kind: "Unavailable", reason: "runtime-unavailable" };
+  logConsoleCompletionDecision(unavailable, completionDecisionContext("a$lazy$"));
+  logConsoleCompletionDecision(unavailable, completionDecisionContext("a$lazy$a"));
+  assert.equal(lines.length, 4, "unavailable diagnostics are not repeated for typed prefixes");
+  assert.match(lines[3], /Reason: native inspector was unavailable/);
+  assert.match(lines[3], /Action: no native inspection result was used/);
 });

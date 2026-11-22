@@ -18,7 +18,17 @@ export const lifecycleOutputChannel = {
 
 const lastDecision = new Map<string, number>();
 let lastContext: string | undefined;
+let currentContext: string | undefined;
+// A new completion target starts a new decision. Keep a growing member prefix
+// in one context so it does not emit the same refusal on every keystroke.
+export function noteConsoleCompletionContext(context: string): void {
+  if (context === currentContext) return;
+  currentContext = context;
+  lastContext = undefined;
+}
+
 export function logConsoleCompletionDecision(decision: CompletionDecision, context?: string): void {
+  if (context !== undefined) noteConsoleCompletionContext(context);
   const message = formatCompletionDecision(decision);
   const now = Date.now();
   const identity = context === undefined ? undefined : message + "\u0000" + context;
