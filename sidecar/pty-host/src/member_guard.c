@@ -11,7 +11,7 @@ enum {
   RMG_ATTRIB, RMG_GET_ATTRIB, RMG_TAG, RMG_CAR, RMG_CDR, RMG_PRINTNAME,
   RMG_VECTOR_ELT, RMG_XLENGTH, RMG_STRING_ELT, RMG_UTF8, RMG_IS_S4,
   RMG_IS_OBJECT, RMG_PROTECT, RMG_UNPROTECT, RMG_LS3, RMG_LS2,
-  RMG_INTEGER_ELT, RMG_REAL_ELT, RMG_ENVLENGTH, RMG_COUNT
+  RMG_INTEGER_ELT, RMG_REAL_ELT, RMG_ENVLENGTH, RMG_VMAXGET, RMG_VMAXSET, RMG_COUNT
 };
 
 typedef void *RmgSexp;
@@ -61,8 +61,26 @@ static void rmg_invoke(void *opaque) {
       call->result = (uintptr_t)((RmgSexp (*)(RmgSexp, ptrdiff_t))ptr)((RmgSexp)call->a, (ptrdiff_t)call->b); break;
     case RMG_XLENGTH:
       call->result = (uint64_t)((ptrdiff_t (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
-    case RMG_UTF8:
-      call->result = (uintptr_t)((const char *(*)(RmgSexp))ptr)((RmgSexp)call->a); break;
+    case RMG_UTF8: {
+      // translateCharUTF8 may use R_alloc. Return only a copy in caller-owned
+      // storage: no transient R pointer or allocation escapes this C callback.
+      void *(*get_mark)(void) = (void *(*)(void))rmg_guard.funcs[RMG_VMAXGET];
+      void (*restore_mark)(const void *) = (void (*)(const void *))rmg_guard.funcs[RMG_VMAXSET];
+      if (!get_mark || !restore_mark || !call->b || !call->c) break;
+      void *mark = get_mark();
+      const char *utf8 = ((const char *(*)(RmgSexp))ptr)((RmgSexp)call->a);
+      if (utf8) {
+        size_t capacity = (size_t)call->c;
+        size_t length = 0;
+        while (length < capacity && utf8[length] != '\0') ++length;
+        if (length < capacity) {
+          memcpy((void *)call->b, utf8, length);
+          call->result = (uint64_t)(length + 1);
+        }
+      }
+      restore_mark(mark);
+      break;
+    }
     case RMG_PROTECT:
       // R_PreserveObject retains a reachable root/member across C callbacks.
       ((void (*)(RmgSexp))ptr)((RmgSexp)call->a);
@@ -122,6 +140,7 @@ int rmg_call(int method, uintptr_t a, uintptr_t b, uintptr_t c, uint64_t *out) {
   if (!out || method < 0 || method >= RMG_COUNT || !rmg_guard.initialized ||
       !rmg_guard.funcs[method] || (rmg_guard.failed && method != RMG_UNPROTECT) ||
       (method == RMG_PROTECT && rmg_guard.preserved_count >= RMG_MAX_PRESERVED) ||
+      (method == RMG_UTF8 && (!rmg_guard.funcs[RMG_VMAXGET] || !rmg_guard.funcs[RMG_VMAXSET])) ||
       ((method == RMG_LS2 || method == RMG_LS3) &&
         (!rmg_guard.raw_protect || !rmg_guard.raw_unprotect ||
          !rmg_guard.funcs[RMG_PROTECT] || !rmg_guard.funcs[RMG_UNPROTECT] ||
@@ -270,4 +289,45 @@ int rmg_test_enumeration_protection(void) {
   return balanced && recovered && failed_as_expected && !rmg_test_order_error &&
       rmg_test_temp_protects == 3 && rmg_test_temp_unprotects == 3 &&
       rmg_test_preserves == 3 && rmg_test_releases == 3;
+}
+
+// Exercise transient R_alloc cleanup without requiring a linked R runtime.
+// A fake translator invalidates its scratch buffer when vmaxset restores it:
+// the returned bytes must already be copied into caller-owned storage.
+static int rmg_test_vmax_gets, rmg_test_vmax_sets;
+static char rmg_test_utf8_scratch[32];
+static void *rmg_test_vmaxget(void) {
+  ++rmg_test_vmax_gets;
+  return rmg_test_utf8_scratch;
+}
+static void rmg_test_vmaxset(const void *mark) {
+  if (mark != rmg_test_utf8_scratch) rmg_test_order_error = 1;
+  ++rmg_test_vmax_sets;
+  memset(rmg_test_utf8_scratch, 0, sizeof(rmg_test_utf8_scratch));
+}
+static const char *rmg_test_translate(RmgSexp unused) {
+  (void)unused;
+  memcpy(rmg_test_utf8_scratch, "caf\303\251", 6);
+  return rmg_test_utf8_scratch;
+}
+int rmg_test_utf8_copy_and_transient_cleanup(void) {
+  uintptr_t funcs[RMG_COUNT] = {0};
+  uint64_t result = 0;
+  char copied[16] = {0};
+  rmg_test_vmax_gets = rmg_test_vmax_sets = rmg_test_order_error = 0;
+  funcs[RMG_UTF8] = (uintptr_t)rmg_test_translate;
+  funcs[RMG_VMAXGET] = (uintptr_t)rmg_test_vmaxget;
+  funcs[RMG_VMAXSET] = (uintptr_t)rmg_test_vmaxset;
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0);
+  for (int i = 0; i < 128; ++i) {
+    memset(copied, 0, sizeof(copied));
+    if (!rmg_call(RMG_UTF8, 0, (uintptr_t)copied, sizeof(copied), &result) ||
+        result != 6 || memcmp(copied, "caf\303\251", 5) != 0)
+      return 0;
+  }
+  // A short destination must be rejected while still resetting R_alloc.
+  if (!rmg_call(RMG_UTF8, 0, (uintptr_t)copied, 3, &result) || result != 0)
+    return 0;
+  return !rmg_end() && !rmg_test_order_error &&
+    rmg_test_vmax_gets == 129 && rmg_test_vmax_sets == 129;
 }

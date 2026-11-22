@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::time::Instant;
 
 type Sexp = *mut c_void;
@@ -149,6 +149,8 @@ pub(crate) struct InspectorApi {
     integer_elt: Option<usize>,
     real_elt: Option<usize>,
     envlength: Option<usize>,
+    vmaxget: usize,
+    vmaxset: usize,
 }
 
 impl InspectorApi {
@@ -189,6 +191,9 @@ impl InspectorApi {
             integer_elt: symbol(b"INTEGER_ELT\0"),
             real_elt: symbol(b"REAL_ELT\0"),
             envlength: symbol(b"Rf_envlength\0"),
+            // Required for bounded copies of R_alloc-backed UTF-8 translations.
+            vmaxget: symbol(b"vmaxget\0")?,
+            vmaxset: symbol(b"vmaxset\0")?,
         })
     }
 }
@@ -257,6 +262,9 @@ const RMG_LS2: c_int = 21;
 const RMG_INTEGER_ELT: c_int = 22;
 const RMG_REAL_ELT: c_int = 23;
 const RMG_ENVLENGTH: c_int = 24;
+// These entries are used inside the guarded UTF-8 copy, not dispatched as methods.
+const RMG_VMAXGET: c_int = 25;
+const RMG_VMAXSET: c_int = 26;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
@@ -267,6 +275,8 @@ unsafe extern "C" {
     fn rmg_test_error_and_recovery() -> c_int;
     #[cfg(test)]
     fn rmg_test_enumeration_protection() -> c_int;
+    #[cfg(test)]
+    fn rmg_test_utf8_copy_and_transient_cleanup() -> c_int;
 }
 
 unsafe fn guarded(method: c_int, a: usize, b: usize, c: usize) -> u64 {
@@ -320,8 +330,11 @@ unsafe extern "C" fn guard_xlength(a: Sexp) -> isize {
 unsafe extern "C" fn guard_string_elt(a: Sexp, i: isize) -> Sexp {
     guarded(RMG_STRING_ELT, a as usize, i as usize, 0) as usize as Sexp
 }
-unsafe extern "C" fn guard_utf8(a: Sexp) -> *const c_char {
-    guarded(RMG_UTF8, a as usize, 0, 0) as usize as *const c_char
+unsafe fn guard_utf8_copy(a: Sexp, buffer: &mut [u8]) -> Option<usize> {
+    // A zero result means failure or a translation exceeding the buffer.
+    let copied = guarded(RMG_UTF8, a as usize, buffer.as_mut_ptr() as usize, buffer.len());
+    if copied == 0 || copied as usize > buffer.len() { None }
+    else { Some(copied as usize - 1) }
 }
 unsafe extern "C" fn guard_is_s4(a: Sexp) -> c_int {
     guarded(RMG_IS_S4, a as usize, 0, 0) as u32 as c_int
@@ -352,14 +365,14 @@ unsafe extern "C" fn guard_envlength(a: Sexp) -> c_int {
 }
 
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 25] = [
+    let funcs: [usize; 27] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
         api.xlength, api.string_elt, api.utf8, api.is_s4, api.is_object,
         api.protect, api.unprotect, api.ls3.unwrap_or(0), api.ls2.unwrap_or(0),
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
-        api.envlength.unwrap_or(0),
+        api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
         api.raw_protect, api.raw_unprotect);
@@ -372,7 +385,7 @@ type Install = unsafe extern "C" fn(*const c_char) -> Sexp;
 type Attrib = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
 type Element = unsafe extern "C" fn(Sexp, isize) -> Sexp;
 type Size = unsafe extern "C" fn(Sexp) -> isize;
-type Utf8 = unsafe extern "C" fn(Sexp) -> *const c_char;
+type Utf8 = unsafe fn(Sexp, &mut [u8]) -> Option<usize>;
 type Unprotect = unsafe extern "C" fn(c_int);
 
 struct Native {
@@ -440,7 +453,7 @@ impl Native {
             vector_elt: guard_vector_elt,
             xlength: guard_xlength,
             string_elt: guard_string_elt,
-            utf8: guard_utf8,
+            utf8: guard_utf8_copy,
             is_s4: guard_is_s4,
             is_object: guard_is_object,
             protect: guard_protect,
@@ -475,11 +488,12 @@ impl Native {
         if stored_bytes < 0 || stored_bytes as usize > MAX_NAME_BYTES {
             return None;
         }
-        let pointer = (self.utf8)(value);
-        if pointer.is_null() { return None; }
-        let bytes = CStr::from_ptr(pointer).to_bytes();
-        if bytes.len() > MAX_NAME_BYTES { return None; }
-        Some(String::from_utf8_lossy(bytes).into_owned())
+        // R_alloc memory from re-encoding is reset inside the C callback.
+        // The bytes have already been copied to a Rust-owned buffer.
+        let mut buffer = [0u8; MAX_NAME_BYTES + 1];
+        let count = (self.utf8)(value, &mut buffer)?;
+        if count > MAX_NAME_BYTES { return None; }
+        Some(String::from_utf8_lossy(&buffer[..count]).into_owned())
     }
 
     unsafe fn classes(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
@@ -981,6 +995,11 @@ mod tests {
     #[test]
     fn enumeration_is_protected_before_returning_to_rust() {
         assert_eq!(unsafe { rmg_test_enumeration_protection() }, 1);
+    }
+
+    #[test]
+    fn utf8_translation_copies_before_releasing_temporary_r_memory() {
+        assert_eq!(unsafe { rmg_test_utf8_copy_and_transient_cleanup() }, 1);
     }
 
     #[test]

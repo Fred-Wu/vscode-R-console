@@ -228,6 +228,16 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("long_label"), available(["short"]));
   assert.deepEqual(await inspect("long_label", [{ kind: "field", name: "short" }]),
     available([]));
+  // Latin-1 CHARSXPs require R_alloc-backed UTF-8 conversion. Repeated idle
+  // completion must copy their names before resetting transient R storage.
+  await submit('latin_names <- iconv(sprintf("caf\\u00e9_%03d", seq_len(80L)), from = "UTF-8", to = "latin1"); Encoding(latin_names) <- "latin1"; latin <- as.list(seq_along(latin_names)); names(latin) <- latin_names; rm(latin_names)');
+  for (let iteration = 0; iteration < 80; ++iteration) {
+    const names = await inspect("latin");
+    assert.equal(names.status, "available");
+    assert.equal(names.names.length, 80);
+    assert.ok(names.names.includes("café_001"));
+    assert.ok(names.names.includes("café_080"));
+  }
   // A wide list must classify each member in a single pass, without repeatedly
   // looking up each name in the R thread. Include a callable at the last index.
   await submit('wide <- as.list(seq_len(999L)); names(wide) <- sprintf("column_%04d", seq_len(999L)); wide$method <- function() TRUE');
