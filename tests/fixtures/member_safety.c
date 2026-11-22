@@ -5,9 +5,12 @@
 #include <R_ext/Altrep.h>
 #include <R_ext/ObjectTable.h>
 #include <R_ext/Rdynload.h>
-#include <Rinterface.h>
 #include <string.h>
 #include "member_guard.c"
+
+/* This public embedding function is exported by R on all supported systems,
+   but its declaring header, Rinterface.h, is not shipped by Windows R. */
+extern void Rf_jump_to_toplevel(void);
 
 static RmgSexp guarded_test_error(const char *unused) {
     (void)unused;
