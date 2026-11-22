@@ -3,26 +3,20 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { formatCompletionDecision } = loadSource("src/Language/completion/diagnostics.ts");
 
-test("runtime completion diagnostics consistently report reason and action without user input", () => {
+test("runtime completion diagnostics use a plain-language reason followed by the same action for each decision", () => {
   const reasons = [
-    ["Rejected", "executable-receiver", "receiver contains unsupported or executable syntax",
-      "runtime inspection was not attempted"],
-    ["Suppressed", "active-binding", "active binding would invoke a getter",
-      "inspection stopped without evaluating the receiver"],
-    ["Suppressed", "deferred-binding", "deferred binding would require forcing a promise",
-      "inspection stopped without evaluating the receiver"],
-    ["Suppressed", "unsafe-dispatch", "unsupported or custom accessor dispatch is required",
-      "inspection stopped without evaluating the receiver"],
-    ["Suppressed", "unsafe-altrep", "ALTREP storage could require materialization",
-      "inspection stopped without evaluating the receiver"],
-    ["Suppressed", "unsafe-environment", "user-defined database environment could invoke custom access",
-      "inspection stopped without evaluating the receiver"],
-    ["Unavailable", "runtime-unavailable", "native inspector was unavailable, busy, or did not respond",
-      "no native inspection result was used"],
+    ["Rejected", "executable-receiver", "This expression includes code or operations that cannot be safely inspected", "Runtime inspection was not attempted"],
+    ["Suppressed", "active-binding", "Reading this value could run a function automatically", "Inspection stopped without evaluating it"],
+    ["Suppressed", "deferred-binding", "This value has not been calculated yet", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-dispatch", "Reading this object could run a custom function", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-altrep", "Reading this data could trigger additional computation", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-environment", "This environment uses a custom data source", "Inspection stopped without evaluating it"],
+    ["Unavailable", "runtime-unavailable", "The R session could not complete the inspection", "No inspection result was used"],
   ];
   for (const [kind, reason, description, action] of reasons) {
     const output = formatCompletionDecision({ kind, reason });
-    assert.equal(output, `[Runtime Completion - ${kind}]: Reason: ${description}. Action: ${action}.`);
+    assert.equal(output, `[Runtime Completion - ${kind}]: ${description}. ${action}.`);
+    assert.doesNotMatch(output, /(?:Reason:|Action:|promise|ALTREP|dispatch|binding|receiver|syntax|inspector)/i);
     assert.doesNotMatch(output, /eval\(|make_object|active_obj|\$inner|=\s*['"]/);
   }
 });
@@ -56,6 +50,6 @@ test("runtime completion logs deduplicate each reason and context across prefixe
   logConsoleCompletionDecision(unavailable, completionDecisionContext("a$lazy$"));
   logConsoleCompletionDecision(unavailable, completionDecisionContext("a$lazy$a"));
   assert.equal(lines.length, 4, "unavailable diagnostics are not repeated for typed prefixes");
-  assert.match(lines[3], /Reason: native inspector was unavailable/);
-  assert.match(lines[3], /Action: no native inspection result was used/);
+  assert.match(lines[3], /The R session could not complete the inspection/);
+  assert.match(lines[3], /No inspection result was used/);
 });
