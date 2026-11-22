@@ -10,7 +10,8 @@ export async function getLanguageServerCompletions(
   doc: vscode.TextDocument,
   position: vscode.Position,
   multilineBuffer: string[],
-  completionProvider?: CompletionProvider
+  completionProvider?: CompletionProvider,
+  runtimeBracketKind?: "data.frame" | "data.table" | null
 ): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false };
@@ -19,7 +20,7 @@ export async function getLanguageServerCompletions(
     let result = await completionProvider.provideCompletionItems(
       doc,
       position,
-      context.triggerCharacter
+      context.triggerCharacter, undefined, runtimeBracketKind
     );
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
@@ -42,7 +43,7 @@ export async function getLanguageServerCompletions(
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter, position);
+        context.triggerCharacter, position, runtimeBracketKind);
       runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;

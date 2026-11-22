@@ -284,7 +284,8 @@ export class ConsoleLspClient implements CompletionProvider {
     doc: vscode.TextDocument,
     position: vscode.Position,
     triggerCharacter?: string,
-    contextPosition: vscode.Position = position
+    contextPosition: vscode.Position = position,
+    runtimeBracketKind?: "data.frame" | "data.table" | null
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await this.packageRefreshPromise;
@@ -319,13 +320,17 @@ export class ConsoleLspClient implements CompletionProvider {
         // Use the already-published workspace snapshot; completion must not
         // query sess to resolve or inspect runtime objects.
         const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
-        // Only an already-submitted global binding supplies this class hint.
-        // The receiver parser rejects calls, assignments and computed indices.
+        // A verified native result supplies the actual stored receiver class,
+        // even without a sess workspace snapshot (including nested receivers).
+        // Without it, only an existing cached top-level binding may contribute.
+        // The receiver grammar never evaluates calls, indices or assignments.
         const bracketReceiver = !staticAnalysis && params.rConsoleSubscriptOperator === "[" &&
           params.rConsoleDataObject ? parseRuntimeMemberQuery(params.rConsoleDataObject) : undefined;
-        if (bracketReceiver?.steps.length === 0 && globals &&
-            Object.hasOwn(globals, bracketReceiver.root)) {
-          const primaryClass = globals[bracketReceiver.root].class?.[0];
+        if (bracketReceiver) {
+          const primaryClass = runtimeBracketKind !== undefined ? runtimeBracketKind :
+            bracketReceiver.steps.length === 0 && globals &&
+              Object.hasOwn(globals, bracketReceiver.root)
+              ? globals[bracketReceiver.root].class?.[0] : undefined;
           if (primaryClass === "data.table" || primaryClass === "data.frame") {
             (params as typeof params & { rConsoleSubscriptClass?: "data.table" | "data.frame" })
               .rConsoleSubscriptClass = primaryClass;

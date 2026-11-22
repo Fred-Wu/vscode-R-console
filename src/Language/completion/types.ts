@@ -82,7 +82,9 @@ export interface CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string,
     // Keep the user's cursor when position is moved to broaden matching.
-    contextPosition?: vscode.Position
+    contextPosition?: vscode.Position,
+    // Safe, already-inspected receiver class; null means no supported class.
+    runtimeBracketKind?: "data.frame" | "data.table" | null
   ): Promise<CompletionResult | undefined>;
 }
 

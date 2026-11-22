@@ -79,6 +79,36 @@ test("guarded bracket names merge verified package symbols and method formals wi
   assert.ok(unavailable.some(item => item.label === ".SD" && item.bracketSpecial));
 });
 
+test("bracket metadata comes from guarded inspection even when sess workspace state is unavailable", async () => {
+  const observed = [];
+  for (const [input, nativeKind] of [
+    ['test[, xtest, key', 'data.table'],
+    ['test2[, "xtest", dr', 'data.frame'],
+    ['test[, .S', 'data.table'],
+  ]) {
+    const context = completion.getCompletionContext(input, input.length);
+    assert.equal(context.kind, 'bracket', input);
+    await completion.collectCompletionEntries(
+      context, { getText: () => input }, { line: 0, character: input.length },
+      undefined, [], [], { provideCompletionItems: async (...args) => {
+        observed.push([input, args[4]]);
+        return { rConsoleRuntimeOnly: true, items: [
+          { label: "keyby", kind: 5, detail: "parameter", insertText: "keyby = ",
+            data: { type: "subscript_parameter" } },
+          { label: "drop", kind: 5, detail: "parameter", insertText: "drop = ",
+            data: { type: "subscript_parameter" } },
+          { label: ".SD", kind: 4, data: { type: "subscript_special" } },
+        ] };
+      } }, undefined, input, Promise.resolve({ status: 'available', names: ['xtest'],
+        bracketKind: nativeKind }));
+  }
+  assert.deepEqual(observed, [
+    ['test[, xtest, key', 'data.table'],
+    ['test2[, "xtest", dr', 'data.frame'],
+    ['test[, .S', 'data.table'],
+  ]);
+});
+
 test("stored environment fields complete through the guarded double-bracket path", async () => {
   const text = "env[[";
   const requested = [];

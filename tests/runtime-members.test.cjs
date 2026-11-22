@@ -104,6 +104,8 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("plain", [{ kind: "slice-index", index: 1 }]), available(["inner"]));
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "empty" }]), available([]));
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "scalar" }]), available([]));
+  assert.deepEqual(await inspect("plain", [{ kind: "field", name: "scalar" },
+    { kind: "field", name: "further" }]), available([]));
   assert.deepEqual(await inspect("plain", [{ kind: "field", name: "missing" }]), available([]));
   assert.deepEqual(await inspect("named", [], "$"), available([]));
   assert.deepEqual(await inspect("named", [], "[["), available(["alpha", "beta"]));
@@ -280,7 +282,48 @@ test("real embedded R completion inspects nested storage without running user co
 
   // Ordinary safe environments still complete within the preflight budget.
   assert.ok((await inspect("env")).names.includes("inner"));
-  await submit('test <- data.table::data.table(xtest = 1:100)');
+  await submit('test <- data.table::data.table(xtest = 1:100); test2 <- as.data.frame(test)');
+  assert.deepEqual(await inspect("test", [{ kind: "field", name: "xtest" }], "$"), available([]),
+    "data.table stored scalar fields exhaust completion without suppression");
+  assert.deepEqual(await inspect("test2", [{ kind: "field", name: "xtest" }], "$"), available([]),
+    "data.frame stored scalar fields exhaust completion without suppression");
+  assert.deepEqual(await inspect("test", [{ kind: "field", name: "xtest" },
+    { kind: "field", name: "other" }], "$"), available([]),
+    "further access on a scalar leaf exhausts completion without suppression");
+  await submit('nested_table <- list(inner = data.table::data.table(value = 1L)); classed_table <- structure(list(value = 1L), class = c("custom", "data.table", "data.frame"))');
+  assert.deepEqual(await inspect("nested_table", [{ kind: "field", name: "inner" },
+    { kind: "field", name: "value" }], "$"), available([]),
+    "nested stored scalar fields exhaust silently");
+  assert.deepEqual(await inspect("classed_table", [{ kind: "field", name: "value" }], "$"),
+    { status: "suppressed", reason: "unsafe-dispatch" },
+    "custom-class accessor dispatch remains suppressed");
+  const customBracket = await inspectTyped("classed_table", [], "[");
+  assert.equal(customBracket.status, "available");
+  assert.equal(customBracket.bracketKind, undefined,
+    "custom classes must not masquerade as built-in method providers");
+  // Native scalar exhaustion and the frontend decision log are both checked:
+  // available-but-empty is not an unsafe completion rejection.
+  const priorDiagnostics = logLines.length;
+  for (const expression of ["plain$scalar", "test$xtest", "test2$xtest",
+    "nested_table$inner$value"]) {
+    const context = completion.getCompletionContext(expression + "$", expression.length + 1);
+    assert.equal(context?.kind, "member", expression);
+    const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+      undefined, [], [], undefined, async (receiver, operator) => {
+        assert.equal(receiver, expression);
+        const result = await backend.inspectMemberNames(session,
+          parseRuntimeMemberQuery(receiver, operator));
+        if (result.status === "suppressed") {
+          logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+            receiver + operator);
+        }
+        return result;
+      });
+    assert.deepEqual(entries, [], expression);
+  }
+  assert.equal(logLines.length, priorDiagnostics,
+    "proven scalar leaves never log suppression");
+
   const realTable = await inspectTyped("test", [], "[");
   assert.equal(realTable.status, "available");
   assert.equal(realTable.bracketKind, "data.table");

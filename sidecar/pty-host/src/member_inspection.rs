@@ -524,7 +524,10 @@ impl Native {
         if (self.is_s4)(value) != 0 { return Ok(false); }
         if (self.is_object)(value) == 0 { return Ok(true); }
         let classes = self.classes(value)?;
-        Ok(classes.len() == 1 && classes[0] == "data.frame")
+        // Only the exact built-in storage layouts are eligible for direct
+        // element traversal. Other classes may invoke custom accessors.
+        Ok((classes.len() == 1 && classes[0] == "data.frame") ||
+            (classes.len() == 2 && classes[0] == "data.table" && classes[1] == "data.frame"))
     }
 
     unsafe fn binding(&self, env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
@@ -712,9 +715,12 @@ impl Native {
         };
         if target == Target::Bracket {
             let classes = self.classes(value)?;
-            members.bracket_kind = if classes.iter().any(|name| name == "data.table") {
+            // Custom subclasses can override bracket semantics. Only exact
+            // built-in class sequences supply installed method metadata.
+            members.bracket_kind = if classes.len() == 2 &&
+                classes[0] == "data.table" && classes[1] == "data.frame" {
                 2
-            } else if classes.iter().any(|name| name == "data.frame") {
+            } else if classes.len() == 1 && classes[0] == "data.frame" {
                 1
             } else {
                 0

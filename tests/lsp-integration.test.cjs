@@ -1870,6 +1870,37 @@ test("safe runtime bracket completion retains installed method arguments and spe
     () => assert.fail("rejected receiver reached native inspector")), []);
 });
 
+test("installed bracket methods use guarded receiver classification without sess class metadata", { timeout: 90000 }, async t => {
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { staticAnalysis: false });
+  await client.syncSessionState({ attachedPackages: ["stats", "base"] });
+  const collect = async (marked, nativeKind) => {
+    const cursor = marked.indexOf("│"), input = marked.replace("│", "");
+    const context = completion.getCompletionContext(input, cursor);
+    assert.equal(context.kind, "bracket", marked);
+    assert.ok(context.objectName === "test" || context.objectName === "test2");
+    return completion.collectCompletionEntries(
+      context, { getText: () => input, uri: client.inputDocument.uri },
+      { line: 0, character: cursor }, undefined, [], [], {
+        provideCompletionItems: async (...args) => {
+          const response = await client.provideCompletionItems(...args);
+          return { ...response, items: response.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+        },
+      }, undefined, input, Promise.resolve({
+        status: "available", names: ["xtest"], bracketKind: nativeKind,
+      }));
+  };
+  // Neither receiver exists in the LSP's cached globals. Only the prior,
+  // safely bounded native inspection supplies reliable class metadata.
+  const table = await collect("test[, xtest, key│]", "data.table");
+  assert.ok(table.some(item => item.label === "keyby" && item.insertText === "keyby = "));
+  const symbols = await collect("test[, .S│]", "data.table");
+  assert.ok(symbols.some(item => item.label === ".SD" && item.bracketSpecial));
+  const frame = await collect('test2[, "xtest", dr│]', "data.frame");
+  assert.ok(frame.some(item => item.label === "drop" && item.insertText === "drop = "));
+  const completed = await collect('test2[, "xtest", │]', "data.frame");
+  assert.ok(completed.some(item => item.label === "drop" && item.insertText === "drop = "));
+});
+
 test("subscript symbols and fields come from the real language server", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   await client.syncSessionState({ attachedPackages: ['data.table', 'stats', 'base'] });

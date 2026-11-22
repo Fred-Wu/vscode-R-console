@@ -27,6 +27,14 @@ export async function collectCompletionEntries(
     (context.functionOperator === "$" || context.functionOperator === "@");
   const includeLspItems =
     !!doc && !!position;
+  // The bracket inspector starts independently of LSP startup. Its confirmed
+  // receiver class is authoritative when sess workspace metadata is missing;
+  // only await the bounded prefetched result on the final LSP-enriched pass.
+  const prefetchedResult = context.kind === "bracket" && prefetchedBracketMembers
+    ? await Promise.resolve(prefetchedBracketMembers).catch(() => undefined)
+    : undefined;
+  const runtimeBracketKind = context.kind === "bracket" && context.bracketOperator === "[" &&
+    prefetchedResult?.status === "available" ? prefetchedResult.bracketKind ?? null : undefined;
   const rawLspItemsRequest =
     !includeLspItems
       ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, runtimeOnly: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
@@ -35,7 +43,8 @@ export async function collectCompletionEntries(
           doc,
           position,
           multilineBuffer,
-          completionProvider
+          completionProvider,
+          runtimeBracketKind
         );
   const bufferItems = getConsoleBufferCompletions(
     context,
