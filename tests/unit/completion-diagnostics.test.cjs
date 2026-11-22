@@ -5,17 +5,21 @@ const { formatCompletionDecision } = loadSource("src/Language/completion/diagnos
 
 test("runtime completion diagnostics use a plain-language reason followed by the same action for each decision", () => {
   const reasons = [
-    ["Rejected", "executable-receiver", "This expression includes code or operations that cannot be safely inspected", "Runtime inspection was not attempted"],
-    ["Suppressed", "active-binding", "Reading this value could run a function automatically", "Inspection stopped without evaluating it"],
-    ["Suppressed", "deferred-binding", "This value has not been calculated yet", "Inspection stopped without evaluating it"],
-    ["Suppressed", "unsafe-dispatch", "Reading this object could run a custom function", "Inspection stopped without evaluating it"],
-    ["Suppressed", "unsafe-altrep", "Reading this data could trigger additional computation", "Inspection stopped without evaluating it"],
-    ["Suppressed", "unsafe-environment", "This environment uses a custom data source", "Inspection stopped without evaluating it"],
+    ["Rejected", "executable-receiver", "Request completion includes an expression that cannot be inspected safely", "Runtime inspection was not attempted"],
+    ["Suppressed", "active-binding", "Request completion could run a function automatically linked to this variable", "Inspection stopped without evaluating it"],
+    ["Suppressed", "deferred-binding", "Request completion could run R code delayed until this value is first used", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-dispatch", "Request completion could run a custom method used to access this object's members", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-altrep", "Request completion could run code to access this object's data", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-environment", "Request completion could run code supplied by a custom data source", "Inspection stopped without evaluating it"],
     ["Unavailable", "runtime-unavailable", "The R session could not complete the inspection", "No inspection result was used"],
   ];
   for (const [kind, reason, description, action] of reasons) {
     const output = formatCompletionDecision({ kind, reason });
     assert.equal(output, `[Runtime Completion - ${kind}]: ${description}. ${action}.`);
+    if (kind === "Suppressed") {
+      assert.match(description, /^Request completion could run /);
+      assert.equal(action, "Inspection stopped without evaluating it");
+    }
     assert.doesNotMatch(output, /(?:Reason:|Action:|promise|ALTREP|dispatch|binding|receiver|syntax|inspector)/i);
     assert.doesNotMatch(output, /eval\(|make_object|active_obj|\$inner|=\s*['"]/);
   }

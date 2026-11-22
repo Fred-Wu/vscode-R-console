@@ -5,12 +5,12 @@ export type CompletionDecision =
   | { kind: "Unavailable"; reason: "runtime-unavailable" };
 
 const descriptions = {
-  "executable-receiver": "This expression includes code or operations that cannot be safely inspected",
-  "active-binding": "Reading this value could run a function automatically",
-  "deferred-binding": "This value has not been calculated yet",
-  "unsafe-dispatch": "Reading this object could run a custom function",
-  "unsafe-altrep": "Reading this data could trigger additional computation",
-  "unsafe-environment": "This environment uses a custom data source",
+  "executable-receiver": "Request completion includes an expression that cannot be inspected safely",
+  "active-binding": "Request completion could run a function automatically linked to this variable",
+  "deferred-binding": "Request completion could run R code delayed until this value is first used",
+  "unsafe-dispatch": "Request completion could run a custom method used to access this object's members",
+  "unsafe-altrep": "Request completion could run code to access this object's data",
+  "unsafe-environment": "Request completion could run code supplied by a custom data source",
   "runtime-unavailable": "The R session could not complete the inspection",
 } as const;
 
