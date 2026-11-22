@@ -1,6 +1,7 @@
 // R uses non-local jumps for errors and interrupts. All potentially
 // erroring R API calls used by the Rust member inspector execute entirely in
-// a C callback inside R_ToplevelExec. No jump can cross a Rust stack frame.
+// a C callback inside R_ToplevelExec. A calling error handler exits before
+// global R error hooks can run. No jump can cross a Rust stack frame.
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -11,11 +12,14 @@ enum {
   RMG_ATTRIB, RMG_GET_ATTRIB, RMG_TAG, RMG_CAR, RMG_CDR, RMG_PRINTNAME,
   RMG_VECTOR_ELT, RMG_XLENGTH, RMG_STRING_ELT, RMG_UTF8, RMG_IS_S4,
   RMG_IS_OBJECT, RMG_PROTECT, RMG_UNPROTECT, RMG_LS3, RMG_LS2,
-  RMG_INTEGER_ELT, RMG_REAL_ELT, RMG_ENVLENGTH, RMG_VMAXGET, RMG_VMAXSET, RMG_COUNT
+  RMG_INTEGER_ELT, RMG_REAL_ELT, RMG_ENVLENGTH, RMG_VMAXGET, RMG_VMAXSET,
+  RMG_CHAR_CE, RMG_COUNT
 };
 
 typedef void *RmgSexp;
 typedef int (*RmgToplevel)(void (*)(void *), void *);
+typedef RmgSexp (*RmgWithErrorHandler)(RmgSexp (*)(void *), void *,
+                                     RmgSexp (*)(RmgSexp, void *), void *);
 // Preserved values survive separate R_ToplevelExec calls. Each call to
 // R_ToplevelExec uses its own PROTECT stack entries; ordinary PROTECT must
 // never remain outstanding when that call returns.
@@ -24,6 +28,9 @@ typedef struct {
   RmgToplevel toplevel;
   uintptr_t funcs[RMG_COUNT];
   uintptr_t raw_protect, raw_unprotect;
+  RmgWithErrorHandler with_error_handler;
+  void (*jump_to_toplevel)(void);
+  RmgSexp nil;
   RmgSexp preserved[RMG_MAX_PRESERVED];
   int preserved_count;
   int failed;
@@ -63,6 +70,10 @@ static void rmg_invoke(void *opaque) {
     case RMG_XLENGTH:
       call->result = (uint64_t)((ptrdiff_t (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
     case RMG_UTF8: {
+      // CE_BYTES strings cannot be translated. Reject them before R reports
+      // an error, rather than executing any of the user's condition hooks.
+      if (((int (*)(RmgSexp))rmg_guard.funcs[RMG_CHAR_CE])((RmgSexp)call->a) == 3)
+        break;
       // translateCharUTF8 may use R_alloc. Return only a copy in caller-owned
       // storage: no transient R pointer or allocation escapes this C callback.
       void *(*get_mark)(void) = (void *(*)(void))rmg_guard.funcs[RMG_VMAXGET];
@@ -122,10 +133,40 @@ static void rmg_invoke(void *opaque) {
   }
 }
 
+typedef struct {
+  void (*body)(void *);
+  void *data;
+} RmgInvocation;
+
+static RmgSexp rmg_body(void *opaque) {
+  RmgInvocation *invocation = (RmgInvocation *)opaque;
+  invocation->body(invocation->data);
+  return rmg_guard.nil;
+}
+
+static RmgSexp rmg_error(RmgSexp condition, void *unused) {
+  (void)condition; (void)unused;
+  rmg_guard.failed = 1;
+  // Unlike an unhandled error, this public R API skips options(error).
+  // R restores its handler/protection stacks at the enclosing C-only boundary.
+  rmg_guard.jump_to_toplevel();
+  return rmg_guard.nil; // The production jump never returns.
+}
+
+static void rmg_with_error_handler(void *opaque) {
+  rmg_guard.with_error_handler(rmg_body, opaque, rmg_error, NULL);
+}
+
+static int rmg_execute(void (*body)(void *), void *data) {
+  RmgInvocation invocation = {body, data};
+  return rmg_guard.toplevel(rmg_with_error_handler, &invocation);
+}
+
 void rmg_begin(uintptr_t toplevel, const uintptr_t *funcs, size_t count,
-               uintptr_t raw_protect, uintptr_t raw_unprotect) {
+               uintptr_t raw_protect, uintptr_t raw_unprotect,
+               uintptr_t with_error_handler, uintptr_t jump_to_toplevel, RmgSexp nil) {
   memset(&rmg_guard, 0, sizeof(rmg_guard));
-  if (!toplevel || !funcs || count != RMG_COUNT) {
+  if (!toplevel || !funcs || count != RMG_COUNT || !with_error_handler || !jump_to_toplevel) {
     rmg_guard.failed = 1;
     return;
   }
@@ -133,6 +174,9 @@ void rmg_begin(uintptr_t toplevel, const uintptr_t *funcs, size_t count,
   memcpy(rmg_guard.funcs, funcs, sizeof(rmg_guard.funcs));
   rmg_guard.raw_protect = raw_protect;
   rmg_guard.raw_unprotect = raw_unprotect;
+  rmg_guard.with_error_handler = (RmgWithErrorHandler)with_error_handler;
+  rmg_guard.jump_to_toplevel = (void (*)(void))jump_to_toplevel;
+  rmg_guard.nil = nil;
   rmg_guard.initialized = 1;
 }
 
@@ -141,7 +185,8 @@ int rmg_call(int method, uintptr_t a, uintptr_t b, uintptr_t c, uint64_t *out) {
   if (!out || method < 0 || method >= RMG_COUNT || !rmg_guard.initialized ||
       !rmg_guard.funcs[method] || (rmg_guard.failed && method != RMG_UNPROTECT) ||
       (method == RMG_PROTECT && rmg_guard.preserved_count >= RMG_MAX_PRESERVED) ||
-      (method == RMG_UTF8 && (!rmg_guard.funcs[RMG_VMAXGET] || !rmg_guard.funcs[RMG_VMAXSET])) ||
+      (method == RMG_UTF8 && (!rmg_guard.funcs[RMG_VMAXGET] || !rmg_guard.funcs[RMG_VMAXSET] ||
+                             !rmg_guard.funcs[RMG_CHAR_CE])) ||
       ((method == RMG_LS2 || method == RMG_LS3) &&
         (!rmg_guard.raw_protect || !rmg_guard.raw_unprotect ||
          !rmg_guard.funcs[RMG_PROTECT] || !rmg_guard.funcs[RMG_UNPROTECT] ||
@@ -159,7 +204,7 @@ int rmg_call(int method, uintptr_t a, uintptr_t b, uintptr_t c, uint64_t *out) {
     a = (uintptr_t)n;
   }
   RmgCall call = {method, a, b, c, 0};
-  if (!rmg_guard.toplevel(rmg_invoke, &call)) {
+  if (!rmg_execute(rmg_invoke, &call)) {
     rmg_guard.failed = 1;
     return 0;
   }
@@ -182,7 +227,7 @@ int rmg_end(void) {
   int failed = rmg_guard.failed;
   if (rmg_guard.preserved_count > 0 &&
       (!rmg_guard.toplevel || !rmg_guard.funcs[RMG_UNPROTECT] ||
-       !rmg_guard.toplevel(rmg_release_remaining, NULL))) {
+       !rmg_execute(rmg_release_remaining, NULL))) {
     failed = 1;
   }
   memset(&rmg_guard, 0, sizeof(rmg_guard));
@@ -202,6 +247,13 @@ static int rmg_test_toplevel(void (*fn)(void *), void *data) {
   rmg_test_inside_callback = 0;
   return 1;
 }
+static RmgSexp rmg_test_with_error_handler(RmgSexp (*body)(void *), void *data,
+                                         RmgSexp (*handler)(RmgSexp, void *), void *hdata) {
+  (void)handler; (void)hdata;
+  return body(data);
+}
+static void rmg_test_jump(void) { longjmp(rmg_test_jmp, 1); }
+static int rmg_test_char_ce(RmgSexp value) { (void)value; return 0; }
 static RmgSexp rmg_test_fail(const char *name) {
   (void)name;
   longjmp(rmg_test_jmp, 1);
@@ -214,10 +266,12 @@ int rmg_test_error_and_recovery(void) {
   uintptr_t funcs[RMG_COUNT] = {0};
   uint64_t out = 0;
   funcs[RMG_INSTALL] = (uintptr_t)rmg_test_fail;
-  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0);
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0,
+            (uintptr_t)rmg_test_with_error_handler, (uintptr_t)rmg_test_jump, NULL);
   if (rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &out) || !rmg_end()) return 0;
   funcs[RMG_INSTALL] = (uintptr_t)rmg_test_good;
-  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0);
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0,
+            (uintptr_t)rmg_test_with_error_handler, (uintptr_t)rmg_test_jump, NULL);
   if (!rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &out) || rmg_end()) return 0;
   return out == 0x1234;
 }
@@ -267,7 +321,8 @@ int rmg_test_enumeration_protection(void) {
   funcs[RMG_PROTECT] = (uintptr_t)rmg_test_preserve;
   funcs[RMG_UNPROTECT] = (uintptr_t)rmg_test_release;
   rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT,
-            (uintptr_t)rmg_test_temp_protect, (uintptr_t)rmg_test_temp_unprotect);
+            (uintptr_t)rmg_test_temp_protect, (uintptr_t)rmg_test_temp_unprotect,
+            (uintptr_t)rmg_test_with_error_handler, (uintptr_t)rmg_test_jump, NULL);
   int ok = rmg_call(RMG_LS2, 0, 1, 0, &out) &&
       out == 0x5678 && rmg_guard.preserved_count == 1 &&
       rmg_test_temp_protects == 1 && rmg_test_temp_unprotects == 1 &&
@@ -284,7 +339,8 @@ int rmg_test_enumeration_protection(void) {
   // A later R error must also release any previously preserved object.
   funcs[RMG_INSTALL] = (uintptr_t)rmg_test_fail;
   rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT,
-            (uintptr_t)rmg_test_temp_protect, (uintptr_t)rmg_test_temp_unprotect);
+            (uintptr_t)rmg_test_temp_protect, (uintptr_t)rmg_test_temp_unprotect,
+            (uintptr_t)rmg_test_with_error_handler, (uintptr_t)rmg_test_jump, NULL);
   int recovered = rmg_call(RMG_LS2, 0, 1, 0, &out) &&
       rmg_guard.preserved_count == 1 &&
       !rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &out);
@@ -319,9 +375,11 @@ int rmg_test_utf8_copy_and_transient_cleanup(void) {
   char copied[16] = {0};
   rmg_test_vmax_gets = rmg_test_vmax_sets = rmg_test_order_error = 0;
   funcs[RMG_UTF8] = (uintptr_t)rmg_test_translate;
+  funcs[RMG_CHAR_CE] = (uintptr_t)rmg_test_char_ce;
   funcs[RMG_VMAXGET] = (uintptr_t)rmg_test_vmaxget;
   funcs[RMG_VMAXSET] = (uintptr_t)rmg_test_vmaxset;
-  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0);
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0,
+            (uintptr_t)rmg_test_with_error_handler, (uintptr_t)rmg_test_jump, NULL);
   for (int i = 0; i < 128; ++i) {
     memset(copied, 0, sizeof(copied));
     if (!rmg_call(RMG_UTF8, 0, (uintptr_t)copied, sizeof(copied), &result) ||

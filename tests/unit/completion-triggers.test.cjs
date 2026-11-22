@@ -17,7 +17,8 @@ function contextAt(marked) {
 }
 
 test("R keyword prefixes stay in member and namespace completion while typing", () => {
-  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function"];
+  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function",
+    "TRUE", "FALSE", "NA", "NA_integer_", "NA_real_", "NA_complex_", "NA_character_", "Inf", "NaN"];
   for (const operator of ["$", "@", "::", ":::"]) {
     for (const keyword of keywords) {
       const input = `custom_obj${operator}${keyword}│`;
@@ -37,7 +38,8 @@ test("R keyword prefixes stay in member and namespace completion while typing", 
 });
 
 test("unsupported executable receivers with keyword prefixes cannot fall back to global completion", async () => {
-  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function"];
+  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function",
+    "TRUE", "FALSE", "NA", "NA_integer_", "NA_real_", "NA_complex_", "NA_character_", "Inf", "NaN"];
   for (const operator of ["$", "@"]) {
     for (const keyword of keywords) {
       const input = "make_object()" + operator + keyword;
@@ -50,6 +52,28 @@ test("unsupported executable receivers with keyword prefixes cannot fall back to
         () => assert.fail("must not inspect R"));
       assert.deepEqual(entries, [], input);
     }
+  }
+});
+
+test("constant prefixes keep live members throughout typing and preserve the replacement span", async () => {
+  const names = ["NA_value", "TRUE_value", "FALSE_value", "Inf_value", "NaN_value"];
+  for (const name of names) {
+    for (let length = 1; length <= name.length; length++) {
+      const prefix = name.slice(0, length);
+      const input = "obj$" + prefix;
+      const context = completion.getCompletionContext(input, input.length);
+      assert.equal(context.kind, "member", input);
+      assert.equal(context.replaceStart, 4, input);
+      const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+        undefined, [], [], undefined, async () => ({ status: "available", names }));
+      assert.ok(entries.some(item => item.label === name), input);
+    }
+  }
+  const middle = contextAt("obj$NA│_value");
+  assert.equal(middle.prefix, "NA");
+  assert.equal(middle.replaceEnd, "obj$NA_value".length);
+  for (const literal of ["1", "1L", "1e3", "0xff"]) {
+    assert.notEqual(contextAt(`obj$${literal}│`)?.kind, "member");
   }
 });
 

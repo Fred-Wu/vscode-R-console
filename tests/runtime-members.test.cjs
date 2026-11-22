@@ -74,6 +74,7 @@ test("real embedded R completion inspects nested storage without running user co
   // missing compilers or callback support fail the safety test, never skip it.
   const fixture = `member_safety${process.platform === "win32" ? ".dll" : ".so"}`;
   fs.copyFileSync(path.join(__dirname, "fixtures", "member_safety.c"), path.join(cwd, "member_safety.c"));
+  fs.copyFileSync(path.join(root, "sidecar", "pty-host", "src", "member_guard.c"), path.join(cwd, "member_guard.c"));
   execFileSync(rPath, ["CMD", "SHLIB", "-o", fixture, "member_safety.c"],
     { cwd, env, encoding: "utf8", timeout: 60000 });
   await submit(`dyn.load(${JSON.stringify(path.join(cwd, fixture).replaceAll("\\", "/"))}); native_safety <- .Call("member_safety_objects"); alt_index <- native_safety$index; native_database <- attach(native_safety$database, name = "member_safety_database", warn.conflicts = FALSE); detach("member_safety_database"); native_holder <- list(db = native_database); .Call("member_safety_reset")`);
@@ -97,6 +98,21 @@ test("real embedded R completion inspects nested storage without running user co
   await submit('invisible(length(alt_index)); invisible(alt_index[[1]]); invisible(exists("inner", envir = native_database, inherits = FALSE)); invisible(get("inner", envir = native_database, inherits = FALSE)); invisible(ls(native_database)); cat("NATIVE_CALLBACKS_LIVE:", all(.Call("member_safety_counts") > 0L), "\\n")');
   await until(() => output.includes("NATIVE_CALLBACKS_LIVE:"), "native callback positive controls");
   assert.match(output, /NATIVE_CALLBACKS_LIVE:\s*TRUE/);
+  // R_ToplevelExec alone catches jumps only after options(error) has run.
+  // Both invalid selectors and untranslatable names must remain inert, and
+  // an unexpected API error must be caught before either global error hook.
+  await submit('error_hits <- 0L; global_error_hits <- 0L; options(error = function() { error_hits <<- error_hits + 1L }); globalCallingHandlers(error = function(e) { global_error_hits <<- global_error_hits + 1L }); index_obj <- list(inner = list(alpha = 1)); null_index <- NULL; function_index <- function() 1; environment_index <- new.env(); symbol_index <- quote(inner); call_index <- quote(f(x)); bytes_name <- rawToChar(as.raw(255)); Encoding(bytes_name) <- "bytes"; bytes_obj <- setNames(list(1, 2), c(bytes_name, "safe"))');
+  output = "";
+  for (const name of ["null_index", "function_index", "environment_index", "symbol_index", "call_index"]) {
+    assert.deepEqual(await inspect("index_obj", [{ kind: "variable-index", name }]), available([]), name);
+  }
+  assert.deepEqual(await inspect("bytes_obj"), available(["safe"]));
+  await submit('cat("ERROR_GUARD:", .Call("member_safety_error_guard"), error_hits, global_error_hits, "\\n")');
+  assert.match(output, /ERROR_GUARD:\s*TRUE\s+0\s+0/);
+  assert.doesNotMatch(output, /Error:|native guard test error|LENGTH or similar|translating strings/);
+  await submit('stop("error hook positive control")');
+  await submit('cat("ERROR_HOOKS_LIVE:", error_hits, global_error_hits, "\\n"); options(error = NULL); globalCallingHandlers(NULL)');
+  assert.match(output, /ERROR_HOOKS_LIVE:\s*1\s+1/);
   await submit('obj <- list(inner = list(alpha = 1, beta = 2), df = data.frame("a b" = 1, check.names = FALSE))');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["alpha", "beta"]));
   assert.deepEqual(await inspect("obj", [{ kind: "index", index: 2 }]), available(["a b"]));
@@ -155,6 +171,16 @@ test("real embedded R completion inspects nested storage without running user co
   assert.match(output, /S4_READY:\s*TRUE\s+TRUE/, "S4 object must exist before native inspection");
   assert.deepEqual(await inspect("s4", [], "@"), available(["inner"]), output);
   assert.deepEqual(await inspect("s4", [{ kind: "slot", name: "inner" }]), available(["slot_value"]));
+  await submit('methods::setClass("CompletionNumeric", contains = "numeric", slots = c(inner = "list")); s4data <- methods::new("CompletionNumeric", 1:3, inner = list(child = 1)); cat("DATA_SLOTS:", paste(methods::slotNames(s4data), collapse = ","), "\\n")');
+  assert.match(output, /DATA_SLOTS:\s*\.Data,inner/);
+  assert.deepEqual(await inspect("s4data", [], "@"), { status: "unavailable" },
+    "raw attributes must not masquerade as the complete schema of a data-bearing S4 class");
+  const s4input = "s4data@";
+  const s4entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(s4input, s4input.length), undefined, undefined,
+    { globalenv: { s4data: { slots: [".Data", "inner"] } } }, [], [], undefined,
+    (expression, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
+  assert.deepEqual(s4entries.map(entry => entry.label), [".Data", "inner"]);
   await submit('methods::setClass("CompletionDotSlot", slots = c(.hidden = "list"), where = .GlobalEnv); s4dot <- methods::new("CompletionDotSlot", .hidden = list(child = TRUE))');
   assert.deepEqual(await inspect("s4dot", [], "@"), available([".hidden"]));
   assert.deepEqual(await inspect("s4dot", [{ kind: "slot", name: ".hidden" }]),

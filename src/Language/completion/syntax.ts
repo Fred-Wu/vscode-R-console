@@ -1,5 +1,5 @@
 import type { CompletionContext } from "./types";
-import { TokenType, tokenize, isMemberAccessor } from "../lexer";
+import { TokenType, tokenize, isMemberAccessor, isAccessorNamePrefix } from "../lexer";
 import { getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
@@ -19,12 +19,7 @@ function hasUnsupportedMemberReceiver(before: string): boolean {
   if (isMemberAccessor(last)) {
     return before.slice(last.position + last.value.length).trim().length === 0;
   }
-  const keyword = last.type === TokenType.Function || last.type === TokenType.If ||
-    last.type === TokenType.Else || last.type === TokenType.For ||
-    last.type === TokenType.While || last.type === TokenType.Repeat ||
-    last.type === TokenType.In || last.type === TokenType.Next ||
-    last.type === TokenType.Break;
-  if (!(last.type === TokenType.Identifier || keyword) || last.closed === false ||
+  if (!isAccessorNamePrefix(last) || last.closed === false ||
       last.position + last.value.length !== before.length) return false;
   const preceding = tokens.at(-3);
   return preceding !== undefined && isMemberAccessor(preceding) &&

@@ -22,6 +22,33 @@ test("automatic member completion uses cached workspace names without calling se
   }
 });
 
+test("cached S4 slot schemas survive incomplete native attributes and retain guarded kinds", async () => {
+  const workspace = { globalenv: { obj: { slots: [".Data", "inner", "method"] } } };
+  const context = completion.getCompletionContext("obj@", 4);
+  const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+    workspace, [], [], undefined, async () => ({ status: "available",
+      names: ["inner", "method", "dim"], kinds: [0, 1, 0] }));
+  assert.deepEqual(entries.map(item => item.label), [".Data", "inner", "method"]);
+  assert.equal(entries[0].insertText, ".Data");
+  assert.equal(entries[2].insertText, "method()");
+  const filtered = await completion.collectCompletionEntries(
+    completion.getCompletionContext("obj@.D", 6), undefined, undefined,
+    workspace, [], [], undefined, async () => ({ status: "available", names: ["inner"] }));
+  assert.deepEqual(filtered.map(item => item.label), [".Data"]);
+  const nested = await completion.collectCompletionEntries(
+    completion.getCompletionContext("obj@inner@", 10), undefined, undefined,
+    workspace, [], [], undefined, async () => ({ status: "available", names: ["child"] }));
+  assert.deepEqual(nested.map(item => item.label), ["child"], "a nested object must not inherit its root's slots");
+  for (const [root, receiver] of [["a b", "`a b`"], ["变量", "变量"], ["a\nb", "`a\\nb`"]]) {
+    const input = receiver + "@";
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length), undefined, undefined,
+      { globalenv: { [root]: { slots: [".Data", "inner"] } } }, [], [], undefined,
+      async () => ({ status: "unavailable" }));
+    assert.deepEqual(entries.map(item => item.label), [".Data", "inner"], receiver);
+  }
+});
+
 test("native nested completion reaches Rust without awaiting the language server", async () => {
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {

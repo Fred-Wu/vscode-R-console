@@ -63,6 +63,13 @@ const NUMERIC_CONSTANTS = new Set([
   "NaN",
 ]);
 
+/** A reserved word can be an unfinished name after an accessor. */
+export function isAccessorNamePrefix(token: Token | undefined): boolean {
+  return !!token && (token.type === TokenType.Identifier ||
+    KEYWORDS.get(token.value) === token.type ||
+    (token.type === TokenType.Number && NUMERIC_CONSTANTS.has(token.value)));
+}
+
 const MULTI_CHAR_OPS = [
   "<<-",
   "->>",

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, WorkspaceData, GlobalEnvItem } from "./types";
 import { backtickRName, quoteRNameIfNeeded, getFieldInsertText } from "./candidates";
 import { allowsSymbolCompletions } from "./policy";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isSessionFunction(item: GlobalEnvItem): boolean {
   return item.type === "closure" || item.type === "builtin" || item.type === "special" ||
@@ -19,7 +20,6 @@ export function isSessionFunctionCall(context: CompletionContext, data: Workspac
       context.functionName === backtickRName(name)));
 }
 
-const TOP_LEVEL_SYMBOL_PATTERN = /^[a-zA-Z._][a-zA-Z0-9._]*$/;
 export function getSessionCompletions(
   context: CompletionContext,
   data: WorkspaceData | undefined
@@ -29,10 +29,11 @@ export function getSessionCompletions(
   }
 
   if (context.kind === "member" && context.objectName) {
-    if (!TOP_LEVEL_SYMBOL_PATTERN.test(context.objectName)) {
+    const receiver = parseRuntimeMemberQuery(context.objectName);
+    if (!receiver || receiver.steps.length || !Object.hasOwn(data.globalenv, receiver.root)) {
       return [];
     }
-    const obj = data.globalenv[context.objectName];
+    const obj = data.globalenv[receiver.root];
     if (!obj) {
       return [];
     }

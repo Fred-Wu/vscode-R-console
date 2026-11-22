@@ -111,8 +111,14 @@ export async function collectCompletionEntries(
     !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
   if (context.kind === "member") {
-    const entries = runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
-      : nativeMembers ? rawLspResult.entries : sessionItems;
+    // Published S4 slot metadata describes the class schema; raw attributes
+    // cannot replace it (notably the implicit .Data slot). Retain its order
+    // and names, using guarded results only to enrich matching slot kinds.
+    const cachedSlots = runtimeRequested && context.operator === "@" && sessionItems.length > 0
+      ? sessionItems.map(item => runtimeMembers?.find(member => member.label === item.label) ?? item)
+      : undefined;
+    const entries = cachedSlots ?? (runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
+      : nativeMembers ? rawLspResult.entries : sessionItems);
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete || retryableRuntime);
   }

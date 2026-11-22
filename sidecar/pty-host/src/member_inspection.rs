@@ -20,6 +20,7 @@ const DOTS: c_int = 17;
 const VECTOR: c_int = 19;
 const EXPRESSION: c_int = 20;
 const RAW: c_int = 24;
+const S4: c_int = 25;
 const MAX_DEPTH: usize = 12;
 const MAX_NAMES: usize = 1000;
 const MAX_NAME_BYTES: usize = 4096;
@@ -140,6 +141,9 @@ pub(crate) struct InspectorApi {
     raw_protect: usize,
     raw_unprotect: usize,
     top_level: usize,
+    with_error_handler: usize,
+    jump_to_toplevel: usize,
+    char_ce: usize,
     global_env: usize,
     unbound: usize,
     nil: usize,
@@ -182,6 +186,9 @@ impl InspectorApi {
             raw_protect: symbol(b"Rf_protect\0")?,
             raw_unprotect: symbol(b"Rf_unprotect\0")?,
             top_level: symbol(b"R_ToplevelExec\0")?,
+            with_error_handler: symbol(b"R_withCallingErrorHandler\0")?,
+            jump_to_toplevel: symbol(b"Rf_jump_to_toplevel\0")?,
+            char_ce: symbol(b"Rf_getCharCE\0")?,
             global_env: symbol(b"R_GlobalEnv\0")?,
             unbound: symbol(b"R_UnboundValue\0")?,
             nil: symbol(b"R_NilValue\0")?,
@@ -265,7 +272,8 @@ const RMG_ENVLENGTH: c_int = 24;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
-        raw_protect: usize, raw_unprotect: usize);
+        raw_protect: usize, raw_unprotect: usize,
+        with_error_handler: usize, jump_to_toplevel: usize, nil: Sexp);
     fn rmg_call(method: c_int, a: usize, b: usize, c: usize, out: *mut u64) -> c_int;
     fn rmg_end() -> c_int;
     #[cfg(test)]
@@ -362,7 +370,7 @@ unsafe extern "C" fn guard_envlength(a: Sexp) -> c_int {
 }
 
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 27] = [
+    let funcs: [usize; 28] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
@@ -370,9 +378,11 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.protect, api.unprotect, api.ls3.unwrap_or(0), api.ls2.unwrap_or(0),
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
+        api.char_ce,
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
-        api.raw_protect, api.raw_unprotect);
+        api.raw_protect, api.raw_unprotect,
+        api.with_error_handler, api.jump_to_toplevel, *(api.nil as *const Sexp));
 }
 
 type Unary = unsafe extern "C" fn(Sexp) -> Sexp;
@@ -694,6 +704,13 @@ impl Native {
         if value == self.nil { return Ok(Members::empty()); }
         let kind = (self.type_of)(value);
         if target == Target::Slot {
+            // S4 extensions of basic storage have an implicit .Data slot,
+            // and attributes such as dim are not necessarily declared slots.
+            // Without evaluating class definitions this is not a full schema;
+            // let the frontend retain its already-published slot metadata.
+            if (self.is_s4)(value) != 0 && kind != S4 {
+                return Err(Suppression::InspectionLimit);
+            }
             return if (self.is_s4)(value) != 0 || self.is_s7(value)? {
                 self.classify_unindexed(value, target, self.slot_names(value)?)
             } else { Ok(Members::empty()) };
@@ -789,8 +806,10 @@ impl Native {
         let Some(value) = self.binding(self.global, name)? else { return Ok(None); };
         if (self.altrep)(value) != 0 { return Err(Suppression::UnsafeAltRep); }
         if (self.is_object)(value) != 0 { return Err(Suppression::UnsafeDispatch); }
+        let kind = (self.type_of)(value);
+        if !matches!(kind, INTEGER | REAL | STRING) { return Ok(None); }
         if (self.xlength)(value) != 1 { return Ok(None); }
-        match (self.type_of)(value) {
+        match kind {
             INTEGER if self.integer_elt.is_some() => {
                 let number = self.integer_elt.unwrap()(value, 0);
                 if number > 0 && number <= 100_000 { Ok(Some(Step::Index(number as u32))) }

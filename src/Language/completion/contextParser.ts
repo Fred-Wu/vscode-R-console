@@ -1,4 +1,4 @@
-import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isCompleteIdentifier, type Token } from "../lexer";
+import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isAccessorNamePrefix, isCompleteIdentifier, type Token } from "../lexer";
 import { getDataCompletionObject } from "./dataScope";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
@@ -324,12 +324,7 @@ export function getQualifiedCompletionContext(code: string, sourceTokens?: Token
   // R keywords such as "in" are valid *partial* names immediately after
   // an accessor (e.g. obj$in while typing obj$inner). Treat them as a prefix
   // here, not as completed receiver members or ordinary global tokens.
-  const keywordPrefix = last && isNameAccessor(tokens[index - 1]) &&
-    (last.type === TokenType.Function || last.type === TokenType.If ||
-      last.type === TokenType.Else || last.type === TokenType.For ||
-      last.type === TokenType.While || last.type === TokenType.Repeat ||
-      last.type === TokenType.In || last.type === TokenType.Next ||
-      last.type === TokenType.Break);
+  const keywordPrefix = isNameAccessor(tokens[index - 1]) && isAccessorNamePrefix(last);
   if ((isCompleteIdentifier(last) || keywordPrefix) && !last.value.startsWith("`") &&
       last.position + last.value.length === code.length) {
     if (!continuations[index]) return undefined;

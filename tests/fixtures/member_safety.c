@@ -5,7 +5,43 @@
 #include <R_ext/Altrep.h>
 #include <R_ext/ObjectTable.h>
 #include <R_ext/Rdynload.h>
+#include <Rinterface.h>
 #include <string.h>
+#include "member_guard.c"
+
+static RmgSexp guarded_test_error(const char *unused) {
+    (void)unused;
+    Rf_error("native guard test error");
+    return R_NilValue;
+}
+
+/* Exercise the shipped C boundary with an actual R error, including cleanup
+   of a preserved object and a successful request immediately afterward. */
+static SEXP member_safety_error_guard(void) {
+    uintptr_t funcs[RMG_COUNT] = {0};
+    uint64_t result = 0;
+    funcs[RMG_INSTALL] = (uintptr_t)guarded_test_error;
+    funcs[RMG_PROTECT] = (uintptr_t)R_PreserveObject;
+    funcs[RMG_UNPROTECT] = (uintptr_t)R_ReleaseObject;
+    SEXP value = PROTECT(Rf_ScalarInteger(42));
+    rmg_begin((uintptr_t)R_ToplevelExec, funcs, RMG_COUNT,
+              (uintptr_t)Rf_protect, (uintptr_t)Rf_unprotect,
+              (uintptr_t)R_withCallingErrorHandler, (uintptr_t)Rf_jump_to_toplevel, R_NilValue);
+    int retained = rmg_call(RMG_PROTECT, (uintptr_t)value, 0, 0, &result) &&
+        rmg_guard.preserved_count == 1;
+    int caught = !rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &result);
+    int failed = rmg_end();
+    int released = rmg_guard.preserved_count == 0;
+    funcs[RMG_INSTALL] = (uintptr_t)Rf_install;
+    rmg_begin((uintptr_t)R_ToplevelExec, funcs, RMG_COUNT,
+              (uintptr_t)Rf_protect, (uintptr_t)Rf_unprotect,
+              (uintptr_t)R_withCallingErrorHandler, (uintptr_t)Rf_jump_to_toplevel, R_NilValue);
+    int recovered = rmg_call(RMG_INSTALL, (uintptr_t)"guard_recovered", 0, 0, &result);
+    int recovery_failed = rmg_end();
+    UNPROTECT(1);
+    return Rf_ScalarLogical(retained && caught && failed && released &&
+                           recovered && !recovery_failed);
+}
 
 static R_altrep_class_t string_class, integer_class, list_class;
 static int length_calls, element_calls, exists_calls, get_calls, objects_calls;
@@ -124,6 +160,7 @@ void R_init_member_safety(DllInfo *dll) {
         {"member_safety_objects", (DL_FUNC)&member_safety_objects, 0},
         {"member_safety_reset", (DL_FUNC)&member_safety_reset, 0},
         {"member_safety_counts", (DL_FUNC)&member_safety_counts, 0},
+        {"member_safety_error_guard", (DL_FUNC)&member_safety_error_guard, 0},
         {NULL, NULL, 0}
     };
     R_registerRoutines(dll, NULL, methods, NULL, NULL);
