@@ -664,11 +664,23 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
-            state
-                .pending_commands
-                .push_back(PendingCommand::ParseStatus { request_id, code });
+            let cancelled = enqueue_parse_status(&mut state, request_id, code);
             runtime.cv.notify_all();
+            drop(state);
+            for cancelled_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    cancelled_id, &member_inspection::Inspection::Unavailable);
+            }
         }
+    }
+
+    // Parsing belongs to code submission. Cancel speculative inspection here,
+    // before Submit itself can be queued, so R cannot inspect between the
+    // parse result and the subsequent submission frame.
+    fn enqueue_parse_status(state: &mut SharedState, request_id: u32, code: String) -> Vec<u32> {
+        let cancelled = discard_queued_member_requests(state);
+        state.pending_commands.push_back(PendingCommand::ParseStatus { request_id, code });
+        cancelled
     }
 
 
@@ -1867,7 +1879,7 @@ mod unix_host {
 
     #[cfg(test)]
     mod member_priority_tests {
-        use super::{take_next_member_request, take_next_parse_request, PendingCommand, SharedState};
+        use super::{enqueue_parse_status, take_next_member_request, take_next_parse_request, PendingCommand, SharedState};
         use crate::member_inspection::{MemberQuery, Target};
         use std::time::Instant;
 
@@ -1879,12 +1891,10 @@ mod unix_host {
                 query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar },
                 queued_at: Instant::now(),
             });
-            state.pending_commands.push_back(PendingCommand::ParseStatus {
-                request_id: 2, code: "1 + 1".into(),
-            });
+            assert_eq!(enqueue_parse_status(&mut state, 2, "1 + 1".into()), vec![1]);
             assert!(take_next_member_request(&mut state).is_none());
             assert_eq!(take_next_parse_request(&mut state).map(|(id, _)| id), Some(2));
-            assert_eq!(take_next_member_request(&mut state).map(|(id, _)| id), Some(1));
+            assert!(take_next_member_request(&mut state).is_none());
         }
     }
 }
@@ -2649,11 +2659,23 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
-            state
-                .pending_commands
-                .push_back(PendingCommand::ParseStatus { request_id, code });
+            let cancelled = enqueue_parse_status(&mut state, request_id, code);
             runtime.cv.notify_all();
+            drop(state);
+            for cancelled_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    cancelled_id, &member_inspection::Inspection::Unavailable);
+            }
         }
+    }
+
+    // Parsing belongs to code submission. Cancel speculative inspection here,
+    // before Submit itself can be queued, so R cannot inspect between the
+    // parse result and the subsequent submission frame.
+    fn enqueue_parse_status(state: &mut SharedState, request_id: u32, code: String) -> Vec<u32> {
+        let cancelled = discard_queued_member_requests(state);
+        state.pending_commands.push_back(PendingCommand::ParseStatus { request_id, code });
+        cancelled
     }
 
 
@@ -4383,7 +4405,7 @@ mod windows_host {
 
         #[test]
         fn code_parse_preempts_queued_member_completion() {
-            use super::{take_next_member_request, take_next_parse_request, PendingCommand};
+            use super::{enqueue_parse_status, take_next_member_request, take_next_parse_request, PendingCommand};
             use crate::member_inspection::{MemberQuery, Target};
             use std::time::Instant;
 
@@ -4393,12 +4415,10 @@ mod windows_host {
                 query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar },
                 queued_at: Instant::now(),
             });
-            state.pending_commands.push_back(PendingCommand::ParseStatus {
-                request_id: 2, code: "1 + 1".into(),
-            });
+            assert_eq!(enqueue_parse_status(&mut state, 2, "1 + 1".into()), vec![1]);
             assert!(take_next_member_request(&mut state).is_none());
             assert_eq!(take_next_parse_request(&mut state).map(|(id, _)| id), Some(2));
-            assert_eq!(take_next_member_request(&mut state).map(|(id, _)| id), Some(1));
+            assert!(take_next_member_request(&mut state).is_none());
         }
 
         #[test]
