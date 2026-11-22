@@ -291,6 +291,13 @@ export class RTermLang {
     return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix, context), context);
   }
 
+  /** True only after a successful, complete cache refinement in the same
+   * member context. A partial language-server result must still be refreshed. */
+  hasCompleteInlineMemberCache(): boolean {
+    return this.inlineCache?.context.kind === "member" &&
+      this.inlineCache.entries.isIncomplete !== true;
+  }
+
   cancelCompletion(): void {
     this.completionRequestId++;
     this.inlineCache = undefined;
