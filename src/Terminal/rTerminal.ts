@@ -2143,6 +2143,15 @@ export class RTerminal implements vscode.Pseudoterminal {
     const refined = this.lang.refineInlineCompletion(input, context);
     if (refined) {
       this.inlineCompletion.set(refined, this.inlineCompletion.token, context?.prefix ?? "");
+      // A complete member list can be filtered locally as the user types.
+      // Refreshing it for each prefix can replace valid results with a transient
+      // empty LSP response and close the popup below the top-level threshold.
+      if (context?.kind === "member" && context.prefix &&
+          this.lang.hasCompleteInlineMemberCache()) {
+        if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
+        this.inlineCompletionTimer = undefined;
+        return;
+      }
     }
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
     this.inlineCompletionTimer = setTimeout(() => {
