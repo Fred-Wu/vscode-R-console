@@ -88,6 +88,77 @@ test('package invalidation closes Quick Pick and discards delayed suggestions', 
   assert.ok(!pick.items.some(item => item.label === 'lateExport'));
 });
 
+test('typing in a pending bracket picker publishes native columns before LSP startup', async t => {
+  let change, hide, releaseServer;
+  const startup = new Promise(resolve => { releaseServer = resolve; });
+  const nativeRequests = [];
+  const pick = { items: [], value: '', activeItems: [], selectedItems: [],
+    onDidChangeValue(fn) { change = fn; }, onDidAccept() {}, onDidHide(fn) { hide = fn; },
+    show() {}, hide() { hide(); }, dispose() {} };
+  const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+    vscode: { ...vscode, window: { createQuickPick: () => pick },
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } } },
+    '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
+    '../../Language/virtualRDocument': { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({ extensionPath: '', rPath: 'R', env: {},
+    getStaticAnalysisEnabled: () => false,
+    requestRuntimeMemberCompletions: () => new Promise(resolve => nativeRequests.push(resolve)),
+  });
+  lang.ensureConsoleLspStarted = () => startup;
+  lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
+  const text = 'DT[,';
+  const input = { text, currentLine: text, lines: [text], cursorRow: 0,
+    cursorCol: text.length, textBeforeCursor: text };
+  const showing = lang.handleAutocomplete({ input, force: true,
+    getCurrentInput: () => input, getWorkspaceData: () => undefined, applyCompletion() {} });
+  t.after(async () => { lang.cancelCompletion(); releaseServer(undefined); await showing; });
+  await tick();
+  pick.value = 'keyb'; change(pick.value);
+  await tick();
+  assert.equal(nativeRequests.length, 2);
+  for (const resolve of nativeRequests) {
+    resolve({ status: 'available', names: ['keyboard'], bracketKind: 'data.table' });
+  }
+  await tick();
+  const labels = () => pick.items.filter(item => 'insertText' in item).map(item => item.insertText);
+  assert.deepEqual(labels(), ['keyboard'], 'refining the picker must not block native columns on LSP');
+  releaseServer({ provideCompletionItems: async () => ({ rConsoleRuntimeOnly: true, items: [
+    { label: 'keyby', insertText: 'keyby = ', kind: 5, detail: 'parameter',
+      data: { type: 'subscript_parameter' } },
+  ] }) });
+  await tick();
+  assert.deepEqual(labels().sort(), ['keyboard', 'keyby = ']);
+});
+
+test('refined staged results cannot replace newer queries or their final merge', async t => {
+  const requests = new Map();
+  const picker = await openPicker(t, 'df[,', [], (context, text, lines, cursor, stage) =>
+    new Promise(resolve => requests.set(context.prefix, { stage, resolve, cursor })));
+  await picker.type('a');
+  await picker.type('b');
+  requests.get('a').stage(entries(['betaStale']));
+  assert.deepEqual(picker.labels(), [], 'superseded staged reply is ignored');
+  const current = requests.get('b');
+  current.stage(entries(['beta']).map(entry => ({ ...entry, replaceEnd: current.cursor })));
+  assert.deepEqual(picker.labels(), ['beta']);
+  assert.equal(picker.pick.items.find(item => 'insertText' in item).replaceEnd, 4,
+    'staged edits target the console input, not the longer picker preview');
+  current.resolve(entries(['beta', 'bravo']));
+  await tick();
+  current.stage(entries(['betaOld']));
+  requests.get('a').resolve(entries(['betaStale']));
+  await tick();
+  assert.deepEqual(picker.labels(), ['beta', 'bravo'], 'final merge remains authoritative');
+  await picker.type('c');
+  const cleared = requests.get('c');
+  await picker.type('');
+  cleared.stage(entries(['cancelled']));
+  cleared.resolve(entries(['cancelled']));
+  await tick();
+  assert.deepEqual(picker.labels(), [], 'clearing the query cancels staged and final replies');
+});
+
 test('Quick Pick changing the first character refreshes a blank-context query', async t => {
   const calls = [];
   const picker = await openPicker(t, '', entries([]), async context => {

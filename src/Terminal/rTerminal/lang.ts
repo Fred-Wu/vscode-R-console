@@ -277,12 +277,20 @@ export class RTermLang {
         stagedEntries: stagedBracketEntries,
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
-        collect: async (nextContext, nextInputText, lines, cursorCol) => {
+        collect: async (nextContext, nextInputText, lines, cursorCol, onStagedEntries) => {
 
           const nextRuntimeMember = nextContext.kind === "member" &&
             this.options.requestRuntimeMemberCompletions !== undefined &&
             this.options.getStaticAnalysisEnabled?.() !== true;
           const nextBracketMembers = this.prefetchBracketMembers(nextContext);
+          // Refinements need the same early native results as the initial
+          // picker. The picker guards these against newer queries and the
+          // final LSP merge, and rebases edits to the actual console input.
+          void nextBracketMembers?.then(result => collectCompletionEntries(
+            nextContext, undefined, undefined, getWorkspaceData() ?? cachedSessionData,
+            lines.slice(0, latestInput.cursorRow), recentEntries, undefined, undefined,
+            nextInputText, Promise.resolve(result)
+          )).then(onStagedEntries).catch(() => undefined);
           const nextDocumentRequest = nextRuntimeMember
             ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(nextInputText);
           if (!completionProvider && !nextRuntimeMember) {

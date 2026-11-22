@@ -19,7 +19,8 @@ export async function pickCompletion({
   force: boolean;
   signal?: AbortSignal;
   isCurrent: () => boolean;
-  collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number) => Promise<CompletionEntries | undefined>;
+  collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number,
+    onStagedEntries: (entries: CompletionEntries) => void) => Promise<CompletionEntries | undefined>;
 }): Promise<CompletionPickItem | undefined> {
   const completionPlaceHolder = "R console completions";
   const shouldPrefillQuickPick =
@@ -170,18 +171,28 @@ export async function pickCompletion({
       if (prefix.length > 0) {
         nextContext.triggerCharacter = undefined;
       }
-      const nextEntries = await collect(nextContext, nextInputText, lines, cursorCol);
-      if (!active || !nextEntries || !isCurrent()) return;
-      if (currentRequest === request) {
+      const publish = (nextEntries: CompletionEntries): boolean => {
+        if (!active || !isCurrent() || currentRequest !== request) return false;
         // LSP edits target the preview, but acceptance edits the actual input.
         sourceEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
-        // Typing may have refined a complete baseline while this request was
-        // pending. A truncated reply cannot cover that newer query locally.
-        if (sourceIncomplete && pick.value !== value && pick.value.startsWith(value)) {
-          await changeValue(pick.value);
-        }
+        return true;
+      };
+      let finished = false;
+      let nextEntries: CompletionEntries | undefined;
+      try {
+        nextEntries = await collect(nextContext, nextInputText, lines, cursorCol, staged => {
+          if (!finished) publish(staged);
+        });
+      } finally {
+        finished = true;
+      }
+      if (!nextEntries || !publish(nextEntries)) return;
+      // Typing may have refined a complete baseline while this request was
+      // pending. A truncated reply cannot cover that newer query locally.
+      if (sourceIncomplete && pick.value !== value && pick.value.startsWith(value)) {
+        await changeValue(pick.value);
       }
     };
     pick.onDidAccept(() => {
