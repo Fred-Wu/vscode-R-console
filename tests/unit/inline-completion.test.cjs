@@ -1229,6 +1229,46 @@ test("qualified operators open suggestions in typing mode and keep filtering bel
   }
 });
 
+test("a complete accessor list stays visible through the first two typed characters", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { terminal } = createTerminal(t, 80, 24, "typing",
+    { "inlineCompletion.minCharacters": 3 });
+  const requests = [];
+  const receiver = "custom_obj$";
+  terminal.inputState.insertText(receiver);
+  terminal.inlineCompletion.set([
+    { ...item("inner"), replaceStart: receiver.length,
+      snapshotInput: receiver, snapshotCursor: receiver.length },
+    { ...item("index"), replaceStart: receiver.length,
+      snapshotInput: receiver, snapshotCursor: receiver.length },
+  ], terminal.inlineCompletion.token);
+  terminal.lang.refineInlineCompletion = (input, context) => {
+    if (context?.kind !== "member" || context.objectName !== "custom_obj") return undefined;
+    return ["inner", "index"].filter(label => label.startsWith(context.prefix)).map(label => ({
+      ...item(label), replaceStart: receiver.length,
+      snapshotInput: input.currentLine, snapshotCursor: input.cursorCol,
+    }));
+  };
+  terminal.lang.hasCompleteInlineMemberCache = () => true;
+  terminal.lang.handleAutocomplete = request => { requests.push(request.input.text); };
+  for (const character of "inn") {
+    terminal.applyKeyAction({ type: "text", text: character });
+    assert.equal(terminal.inlineCompletion.visible, true, terminal.inputState.text);
+    assert.equal(terminal.inlineCompletion.current()?.label, "inner");
+    assert.equal(terminal.inlineCompletionTimer, undefined, "complete member results filter without a new request");
+    t.mock.timers.tick(150);
+  }
+  assert.deepEqual(requests, [], "no redundant native/LSP requests per accessor character");
+  terminal.applyKeyAction({ type: "text", text: "z" });
+  assert.equal(terminal.inlineCompletion.visible, false, "no matching field should close the list");
+
+  terminal.lang.hasCompleteInlineMemberCache = () => false;
+  terminal.applyKeyAction({ type: "backspace" });
+  assert.ok(terminal.inlineCompletionTimer, "incomplete member results must refresh");
+  t.mock.timers.tick(150);
+  assert.deepEqual(requests, ["custom_obj$inn"]);
+});
+
 test("qualified operators preserve manual Tab mode and Quick Pick", t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   for (const operator of ["$", "@", "::", ":::"]) {
@@ -1873,4 +1913,28 @@ test("namespace kind groups produce clickable buttons and survive filtering", ()
       assert.equal(state.current().insertText, '.N');
     }
   }
+});
+
+test("accessor prefixes bypass top-level character threshold even without a visible panel", mock => {
+  mock.mock.timers.enable({ apis: ["setTimeout"] });
+  const { terminal } = createTerminal(mock, 80, 24, "typing", { "inlineCompletion.minCharacters": 99 });
+  const requests = [];
+  terminal.lang.handleAutocomplete = request => {
+    requests.push(request.input.textBeforeCursor);
+    request.onInlineEntries?.([]);
+  };
+  terminal.applyKeyAction({ type: "text", text: "task$" });
+  mock.mock.timers.tick(150);
+  for (const character of "dat") {
+    terminal.applyKeyAction({ type: "text", text: character });
+    mock.mock.timers.tick(150);
+  }
+  assert.deepEqual(requests, ["task$", "task$d", "task$da", "task$dat"]);
+  assert.equal(terminal.inlineCompletion.visible, false);
+  terminal.dismissInlineCompletion(false);
+  terminal.inputState.text = "normal";
+  terminal.inputState.cursorPosition = 6;
+  terminal.applyKeyAction({ type: "text", text: "x" });
+  mock.mock.timers.tick(150);
+  assert.equal(requests.length, 4);
 });

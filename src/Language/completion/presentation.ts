@@ -51,11 +51,25 @@ function compareCompletionLabels(a: CompletionEntry, b: CompletionEntry): number
     (a.label < b.label ? -1 : a.label > b.label ? 1 : 0);
 }
 
-/** Rank symbols within groups; keep signature, value, and object-member order. */
 export function rankCompletionEntries(
   entries: CompletionEntry[], query: string, context?: CompletionContext
 ): CompletionEntry[] {
-  if (context?.kind === "member") return filterCompletionEntries(entries, query);
+  if (context?.kind === "member") {
+    const matched = filterCompletionEntries(entries, query);
+    if (!query) return matched;
+    const normalized = query.toLowerCase();
+    const rank = (label: string): number => {
+      const value = label.toLowerCase();
+      if (label === query) return 0;
+      if (value === normalized) return 1;
+      if (value.startsWith(normalized)) return 2;
+      if (value.includes(normalized)) return 3;
+      return 4;
+    };
+    return matched.map((entry, index) => ({ entry, index }))
+      .sort((a, b) => rank(a.entry.label) - rank(b.entry.label) || a.index - b.index)
+      .map(({ entry }) => entry);
+  }
   const groups = new Map<string, CompletionEntry[]>();
   for (const entry of entries) {
     const group = context ? getCompletionGroup(entry, context)

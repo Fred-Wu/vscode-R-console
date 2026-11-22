@@ -327,7 +327,16 @@ export function getQualifiedCompletionContext(code: string, sourceTokens?: Token
   const last = tokens[index];
   let prefix = "";
   let replaceStart = code.length;
-  if (isCompleteIdentifier(last) && !last.value.startsWith("`") &&
+  // R keywords such as "in" are valid *partial* names immediately after
+  // an accessor (e.g. obj$in while typing obj$inner). Treat them as a prefix
+  // here, not as completed receiver members or ordinary global tokens.
+  const keywordPrefix = last && isNameAccessor(tokens[index - 1]) &&
+    (last.type === TokenType.Function || last.type === TokenType.If ||
+      last.type === TokenType.Else || last.type === TokenType.For ||
+      last.type === TokenType.While || last.type === TokenType.Repeat ||
+      last.type === TokenType.In || last.type === TokenType.Next ||
+      last.type === TokenType.Break);
+  if ((isCompleteIdentifier(last) || keywordPrefix) && !last.value.startsWith("`") &&
       last.position + last.value.length === code.length) {
     if (!continuations[index]) return undefined;
     prefix = last.value;

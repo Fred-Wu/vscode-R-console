@@ -6,6 +6,7 @@ import {
   type CompletionContext,
   type CompletionProvider,
   CompletionPickItem,
+  type RuntimeMemberCompletionRequester,
   collectCompletionEntries,
   getCompletionContext,
   rankCompletionEntries,
@@ -13,6 +14,8 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import { logConsoleCompletionDecision } from "../../Language/completion/outputChannel";
+import { completionDecisionContext } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
 
@@ -33,6 +36,7 @@ type LangOptions = {
   getRecentSessionEntries?: () => string[];
   onPackagesChanged?: () => void;
   getStaticAnalysisEnabled?: () => boolean;
+  requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
 };
 
 type AutocompleteRequest = {
@@ -104,6 +108,12 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
+    if (context?.rejectionReason) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
+        completionDecisionContext(input.textBeforeCursor));
+      onInlineEntries?.([]);
+      return;
+    }
     if (!context || context.suppressAutomatic) {
       onInlineEntries?.([]);
       return;
@@ -150,7 +160,7 @@ export class RTermLang {
           linesBefore,
           recentEntries,
           completionProvider,
-          undefined,
+          this.options.requestRuntimeMemberCompletions,
           latestInput.text
         );
       })();
@@ -238,7 +248,7 @@ export class RTermLang {
             lines.slice(0, latestInput.cursorRow),
             recentEntries,
             completionProvider,
-            undefined,
+            this.options.requestRuntimeMemberCompletions,
             nextInputText
           );
           return nextEntries;
@@ -279,6 +289,13 @@ export class RTermLang {
     const safeEntries = refineCompletionEntries(cached, input, context);
     if (!safeEntries) return undefined;
     return toCompletionQuickPickItems(rankCompletionEntries(safeEntries, context.prefix, context), context);
+  }
+
+  /** True only after a successful, complete cache refinement in the same
+   * member context. A partial language-server result must still be refreshed. */
+  hasCompleteInlineMemberCache(): boolean {
+    return this.inlineCache?.context.kind === "member" &&
+      this.inlineCache.entries.isIncomplete !== true;
   }
 
   cancelCompletion(): void {

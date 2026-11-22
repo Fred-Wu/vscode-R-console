@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
+import { logConsoleCompletionDecision } from "../Language/completion/outputChannel";
+import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
 import { InlineCompletion, resolveInlineCompletionColors } from "./inlineCompletion";
 import {
@@ -285,6 +287,22 @@ export class RTerminal implements vscode.Pseudoterminal {
       cwd: this.options.cwd,
       getRecentSessionEntries: () => this.rHistory.getRecentSessionEntries(),
       onPackagesChanged: () => this.dismissInlineCompletion(false),
+      requestRuntimeMemberCompletions: (expression, operator) => {
+        const query = parseRuntimeMemberQuery(expression, operator);
+        if (!query) {
+          logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
+            expression + operator);
+          return undefined;
+        }
+        const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
+        return response?.then(result => {
+          if (result.status === "suppressed") {
+            logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+              expression + operator);
+          }
+          return result;
+        });
+      },
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
@@ -2112,14 +2130,28 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    if (context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
-        !context?.autoTrigger && (!context || [...context.prefix].length < minimum))) {
+    if (context?.rejectionReason) {
+      logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
+        completionDecisionContext(input.textBeforeCursor));
+    }
+    if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
+        (!context || ((context.kind === "default" || context.kind === "argument") &&
+          !context.autoTrigger && [...context.prefix].length < minimum)))) {
       this.dismissInlineCompletion(false);
       return;
     }
     const refined = this.lang.refineInlineCompletion(input, context);
     if (refined) {
       this.inlineCompletion.set(refined, this.inlineCompletion.token, context?.prefix ?? "");
+      // A complete member list can be filtered locally as the user types.
+      // Refreshing it for each prefix can replace valid results with a transient
+      // empty LSP response and close the popup below the top-level threshold.
+      if (context?.kind === "member" && context.prefix &&
+          this.lang.hasCompleteInlineMemberCache()) {
+        if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
+        this.inlineCompletionTimer = undefined;
+        return;
+      }
     }
     if (this.inlineCompletionTimer) clearTimeout(this.inlineCompletionTimer);
     this.inlineCompletionTimer = setTimeout(() => {

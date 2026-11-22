@@ -16,6 +16,26 @@ function contextAt(marked) {
     before, text.slice(cursor));
 }
 
+test("R keyword prefixes stay in member and namespace completion while typing", () => {
+  const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function"];
+  for (const operator of ["$", "@", "::", ":::"]) {
+    for (const keyword of keywords) {
+      const input = `custom_obj${operator}${keyword}│`;
+      const context = contextAt(input);
+      assert.equal(context?.kind, operator === "$" || operator === "@" ? "member" : "package", input);
+      assert.equal(context?.prefix, keyword, input);
+      if (context.kind === "member") assert.equal(context.objectName, "custom_obj", input);
+      assert.equal(context.autoTrigger, true, input);
+    }
+  }
+  for (const prefix of ["i", "in", "inn", "inne", "inner"]) {
+    const context = contextAt(`custom_obj$${prefix}│`);
+    assert.equal(context?.kind, "member", prefix);
+    assert.equal(context?.prefix, prefix);
+  }
+  assert.equal(contextAt("if│")?.kind, "default", "top-level names remain unchanged");
+});
+
 test("bracket contexts retain the complete object, active dimension and quoted prefix", () => {
   for (const [marked, object, prefix, dimension, dimensions] of [
     ["obj[[│]]", "obj", "", 0, 1], ["obj[[\"a b│\"]]", "obj", "a b", 0, 1],

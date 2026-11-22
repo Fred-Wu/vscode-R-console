@@ -1,5 +1,6 @@
 import type * as vscode from "vscode";
 import type { CallCompletionContext } from "./contextParser";
+import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
@@ -19,6 +20,7 @@ export type CompletionContext = {
   pipe?: boolean;
   autoTrigger?: boolean;
   suppressAutomatic?: boolean;
+  rejectionReason?: "executable-receiver";
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
   // Source tags from the lexer, available only at an argument-name position.
@@ -84,13 +86,9 @@ export interface CompletionProvider {
 
 export type RuntimeMemberCompletionRequester = (
   expression: string,
-  operator: "$" | "@"
+  operator: "$" | "@" | "[" | "[["
 ) => Promise<
-  Array<{
-    name: string;
-    type?: string;
-    str?: string;
-  }> | undefined
+  MemberInspectionResult | undefined
 > | undefined;
 
 export type GlobalEnvItem = {

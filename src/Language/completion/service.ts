@@ -3,7 +3,8 @@ import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionP
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
-import { filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import { getFieldInsertText, filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
 
 export async function collectCompletionEntries(
   context: CompletionContext,
@@ -16,7 +17,7 @@ export async function collectCompletionEntries(
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string
 ): Promise<CompletionEntries> {
-  if (context.suppressAutomatic) return [];
+  if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
   const sessionArguments = context.kind === "argument" && isSessionFunctionCall(context, sessionData) &&
     !(doc && position && completionProvider?.getCallContext?.(doc, position)?.operator);
@@ -43,7 +44,32 @@ export async function collectCompletionEntries(
   // cannot contribute here and may wait on an unrelated busy R session.
   const includeColumns = context.kind !== "member" && !context.argumentValue?.quote;
   const cachedColumnItems = includeColumns ? getDataColumnCompletions(context, sessionData) : [];
+  const runtimeReceiver = !!context.objectName && parseRuntimeMemberQuery(context.objectName) !== undefined;
   const rawLspResult = await rawLspItemsRequest;
+  const inferred = rawLspResult.memberResolved ||
+    rawLspResult.entries.some(entry => entry.role === "member");
+  const runtimeRequest = runtimeReceiver &&
+    (context.kind === "member" || (context.kind === "bracket" && context.bracketOperator === "[[")) &&
+    (rawLspResult.runtimeOnly || !inferred)
+    ? requestRuntimeMemberCompletions?.(context.objectName!,
+        context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")
+    : undefined;
+  const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
+  const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
+  const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
+  const runtimeMembers = runtimeNames?.map((name, index) => {
+    const kind = runtimeKinds?.[index] === 1 ? vscode.CompletionItemKind.Function
+      : runtimeKinds?.[index] === 2 ? vscode.CompletionItemKind.Property
+      : vscode.CompletionItemKind.Field;
+    return {
+      label: name,
+      insertText: getFieldInsertText(name, context) +
+        (kind === vscode.CompletionItemKind.Function && context.kind === "member" ? "()" : ""),
+      kind,
+      detail: context.objectName,
+      source: "session" as const,
+    };
+  });
   const runtimeOnly = rawLspResult.runtimeOnly === true;
   const nativeMembers = !runtimeOnly &&
     (rawLspResult.memberResolved || rawLspResult.entries.some(entry => entry.role === "member"));
@@ -51,12 +77,11 @@ export async function collectCompletionEntries(
   // A package-inferred exhaustion must not override an unresolved live member.
   if (context.argumentTags && rawLspResult.argumentsExhausted &&
       !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
-  // Live member/child inspection can invoke user-defined R methods. Only
-  // cached top-level names and non-executing LSP inference are automatic.
-  const dataItems = !includeColumns || nativeFields ||
+  const dataItems = runtimeMembers !== undefined && context.kind === "bracket" ? runtimeMembers :
+    !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
   if (context.kind === "member") {
-    const entries = runtimeOnly ? sessionItems
+    const entries = runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
       : nativeMembers ? rawLspResult.entries : sessionItems;
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete);

@@ -242,7 +242,7 @@ test("Unicode member and argument prefixes preserve the object and full replacem
   }
 });
 
-test("member completion parses token-derived objects without live inspection", async () => {
+test("member completion parses token-derived objects without evaluating draft code", async () => {
   for (const [input, objectName, prefix] of [
     ["obj $ nested @ sl", "obj$nested", "sl"],
     ["obj$ # comment\n nested$fi", "obj$nested", "fi"],
@@ -258,7 +258,7 @@ test("member completion parses token-derived objects without live inspection", a
     assert.equal(context.prefix, prefix, input);
     assert.equal(context.replaceStart, line.length - prefix.length, input);
     await completion.collectCompletionEntries(context, undefined, undefined, undefined, [], [], undefined,
-      async () => assert.fail("automatic member completion must not send sess requests"));
+      async () => undefined /* Optional guarded native completion, never sess evaluation */);
   }
 });
 
@@ -273,20 +273,16 @@ test("subscript member detection preserves the receiver without evaluating indic
   assert.deepEqual(entries, []);
 });
 
-test("computed subscript slot completion uses only slots inferred by the language server", async () => {
+test("computed subscript receiver is rejected before LSP or native inspection", async () => {
   const input = "objects[[choose_index()]]@sl";
   const context = completion.getCompletionContext(input, input.length);
-  assert.equal(context.kind, "member");
-  let liveRequests = 0;
-  const request = async () => { liveRequests++; return []; };
-  for (const labels of [[], ["slotName"]]) {
-    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-      { line: 0, character: input.length }, { globalenv: { objects: { slots: ["slotOnContainer"] } } },
-      [], [], { provideCompletionItems: async () =>
-        labels.map(label => ({ label, kind: 4, data: { type: "member" } })) }, request);
-    assert.deepEqual(entries.map(entry => entry.label), labels);
-  }
-  assert.equal(liveRequests, 0);
+  assert.equal(context?.kind, "member");
+  assert.equal(context?.rejectionReason, "executable-receiver");
+  const entries = await completion.collectCompletionEntries(context, { getText: () => input },
+    { line: 0, character: input.length }, { globalenv: { objects: { slots: ["slotOnContainer"] } } },
+    [], [], { provideCompletionItems: async () => assert.fail("no LSP evaluation or inference") },
+    async () => assert.fail("no native inspection"));
+  assert.deepEqual(entries, []);
 });
 
 test("member-like text in literals and comments does not request runtime members", async () => {
@@ -1490,7 +1486,7 @@ test("dollar and slot members retain cached workspace order without R extraction
       undefined, async () => assert.fail("must not execute custom R accessors"));
     for (const query of ["", "a", "b"]) {
       assert.deepEqual(completion.rankCompletionEntries(entries, query, context).map(e => e.label),
-        query === "b" ? ["zebra", "beta"] : names);
+        query === "b" ? ["beta", "zebra"] : query === "a" ? ["alpha", "zebra", "beta"] : names);
     }
   }
 });
@@ -1560,6 +1556,7 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
   await lang.handleAutocomplete({ input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
     applyCompletion() {}, onInlineEntries() {} });
   const refined = lang.refineInlineCompletion(snapshot("x <- df$al"));
+  assert.equal(lang.hasCompleteInlineMemberCache(), true, "complete member suggestions can be filtered locally");
   const choices = refined.filter(entry => "insertText" in entry);
   assert.deepEqual(choices.map(entry => entry.insertText), ["alpha"]);
   assert.equal(choices[0].snapshotInput, "x <- df$al");
@@ -1616,12 +1613,14 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
     const request = { input, getCurrentInput: () => input, getWorkspaceData: () => undefined, applyCompletion() {} };
     const labels = items => items.filter(item => "insertText" in item).map(item => item.insertText);
     const ordered = text.startsWith("pkg:") ? ["alpha", "beta", "zebra"] : ["zebra", "alpha", "beta"];
+    const refinedOrder = ["df$", "obj@"].includes(text) ? ["beta", "zebra"]
+      : ordered.filter(label => label.includes("b"));
     let published;
     await lang.handleAutocomplete({ ...request, onInlineEntries: items => { published = items; } });
     assert.deepEqual(labels(published), ordered, `inline: ${text}`);
     const refined = lang.refineInlineCompletion(snapshot(text + "b"));
     if (["df$", "obj@", "pkg::", "pkg:::"].includes(text)) {
-      assert.deepEqual(labels(refined), ordered.filter(label => label.includes("b")), `cache: ${text}`);
+      assert.deepEqual(labels(refined), refinedOrder, `cache: ${text}`);
     } else {
       assert.equal(refined, undefined, `first typed token must fetch newly eligible symbols: ${text}`);
     }
@@ -1633,9 +1632,9 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
       pick.value = "b";
       changeValue("b");
       // Check both the immediate local filter and any asynchronous refresh.
-      assert.deepEqual(labels(pick.items), ordered.filter(label => label.includes("b")), text);
+      assert.deepEqual(labels(pick.items), refinedOrder, text);
       await new Promise(resolve => setImmediate(resolve));
-      assert.deepEqual(labels(pick.items), ordered.filter(label => label.includes("b")), text);
+      assert.deepEqual(labels(pick.items), refinedOrder, text);
     } finally {
       pick.hide();
       await showing;
@@ -1864,4 +1863,20 @@ test("bracket methods preserve native parameter suggestions and column fields", 
     });
   assert.ok(entries.some(item => item.insertText === "keyby = "), "bracket context must accept method parameters");
   assert.ok(entries.some(item => item.label === "keyboard"), "ordinary native fields remain available");
+});
+
+test("accessor completion ranks exact and prefix matches before fuzzy members", () => {
+  const context = completion.getCompletionContext("task$data", "task$data".length);
+  const entries = [
+    { label: "add_strata", insertText: "add_strata()", kind: 2, source: "session" },
+    { label: "dataset", insertText: "dataset", kind: 4, source: "session" },
+    { label: "data", insertText: "data()", kind: 2, source: "session" },
+  ];
+  const ranked = completion.rankCompletionEntries(entries, "data", context);
+  assert.deepEqual(ranked.map(entry => entry.label), ["data", "dataset", "add_strata"]);
+  const picker = completion.toCompletionQuickPickItems(ranked, context);
+  assert.equal(picker.find(item => "insertText" in item).insertText, "data()");
+  assert.deepEqual(entries.map(entry => entry.label), ["add_strata", "dataset", "data"]);
+  const prefix = completion.rankCompletionEntries(entries, "da", { ...context, prefix: "da" });
+  assert.deepEqual(prefix.map(entry => entry.label), ["dataset", "data", "add_strata"]);
 });
