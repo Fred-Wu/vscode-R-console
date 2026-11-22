@@ -197,6 +197,22 @@ test("real embedded R completion inspects nested storage without running user co
   assert.match(logLines[0], /Request completion could run R code delayed until this value is first used/);
   assert.match(logLines[0], /Inspection stopped without evaluating it/);
 
+  // Exercise the R-owned names vector across repeated allocations and GC.
+  // The enumeration result must be protected inside its C callback before
+  // control returns to Rust (the next R API call is too late).
+  await submit('gc_env <- new.env(parent = emptyenv()); for (i in seq_len(200L)) assign(sprintf("entry_%03d", i), i, envir = gc_env)');
+  for (let iteration = 0; iteration < 12; iteration++) {
+    const result = await inspect("gc_env");
+    assert.equal(result?.status, "available");
+    assert.equal(result.names.length, 200);
+    assert.ok(result.names.includes("entry_001"));
+    assert.ok(result.names.includes("entry_200"));
+    if (iteration % 4 === 3) await submit('invisible(gc())');
+  }
+  await submit('gc_env_limit <- new.env(parent = emptyenv()); for (i in seq_len(1001L)) assign(paste0("member", i), i, envir = gc_env_limit)');
+  assert.deepEqual(await inspect("gc_env_limit"), { status: "unavailable" },
+    "avoid sorting more environment names than the protocol can return");
+
   // Bound native work before allocating names for large environments and
   // before traversing long, mostly unnamed pairlists.
   await submit('large_env <- new.env(hash = TRUE, size = 8192L); for (i in seq_len(4200L)) assign(paste0("entry", i), i, envir = large_env); large_pair <- as.pairlist(setNames(rep(list(1L), 4200L), c(rep("", 4199L), "late"))); cat("LARGE_READY\\n")');

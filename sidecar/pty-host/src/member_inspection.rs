@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::time::Instant;
 
 type Sexp = *mut c_void;
 const LIST: c_int = 2;
@@ -24,7 +25,9 @@ const MAX_NAMES: usize = 1000;
 const MAX_NAME_BYTES: usize = 4096;
 // Cap native traversal before collecting names or walking indexed pairlists.
 const MAX_SCANNED_ENTRIES: usize = 4096;
-const MAX_ENV_BINDINGS: c_int = 4096;
+// Preflight at the same limit as the names we can return: never sort
+// thousands of entries only to discard the result.
+const MAX_ENV_BINDINGS: c_int = MAX_NAMES as c_int;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -134,6 +137,8 @@ pub(crate) struct InspectorApi {
     class_symbol: usize,
     protect: usize,
     unprotect: usize,
+    raw_protect: usize,
+    raw_unprotect: usize,
     top_level: usize,
     global_env: usize,
     unbound: usize,
@@ -168,8 +173,12 @@ impl InspectorApi {
             is_s4: symbol(b"Rf_isS4\0")?,
             is_object: symbol(b"Rf_isObject\0")?,
             class_symbol: symbol(b"R_ClassSymbol\0")?,
-            protect: symbol(b"Rf_protect\0")?,
-            unprotect: symbol(b"Rf_unprotect\0")?,
+            // The C guard retains objects across R_ToplevelExec callbacks
+            // with R_PreserveObject, not a cross-callback PROTECT stack entry.
+            protect: symbol(b"R_PreserveObject\0")?,
+            unprotect: symbol(b"R_ReleaseObject\0")?,
+            raw_protect: symbol(b"Rf_protect\0")?,
+            raw_unprotect: symbol(b"Rf_unprotect\0")?,
             top_level: symbol(b"R_ToplevelExec\0")?,
             global_env: symbol(b"R_GlobalEnv\0")?,
             unbound: symbol(b"R_UnboundValue\0")?,
@@ -250,11 +259,14 @@ const RMG_REAL_ELT: c_int = 23;
 const RMG_ENVLENGTH: c_int = 24;
 
 unsafe extern "C" {
-    fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize);
+    fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
+        raw_protect: usize, raw_unprotect: usize);
     fn rmg_call(method: c_int, a: usize, b: usize, c: usize, out: *mut u64) -> c_int;
     fn rmg_end() -> c_int;
     #[cfg(test)]
     fn rmg_test_error_and_recovery() -> c_int;
+    #[cfg(test)]
+    fn rmg_test_enumeration_protection() -> c_int;
 }
 
 unsafe fn guarded(method: c_int, a: usize, b: usize, c: usize) -> u64 {
@@ -349,7 +361,8 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0),
     ];
-    rmg_begin(api.top_level, funcs.as_ptr(), funcs.len());
+    rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
+        api.raw_protect, api.raw_unprotect);
 }
 
 type Unary = unsafe extern "C" fn(Sexp) -> Sexp;
@@ -393,10 +406,21 @@ struct Native {
     unbound: Sexp,
     names: Sexp,
     class: Sexp,
+    deadline: Instant,
 }
 
 impl Native {
-    unsafe fn new(api: InspectorApi) -> Option<Self> {
+    // The request carries the host's existing TTL. Check it during bounded
+    // traversal, without timers, extra R calls or interrupting submitted code.
+    fn check_deadline(&self) -> Result<(), Suppression> {
+        if Instant::now() >= self.deadline {
+            Err(Suppression::InspectionLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn new(api: InspectorApi, deadline: Instant) -> Option<Self> {
         let global = *(api.global_env as *const Sexp);
         let nil = *(api.nil as *const Sexp);
         if global.is_null() || nil.is_null() { return None; }
@@ -431,6 +455,7 @@ impl Native {
             unbound: *(api.unbound as *const Sexp),
             names: *(api.names as *const Sexp),
             class: *(api.class_symbol as *const Sexp),
+            deadline,
         })
     }
 
@@ -458,6 +483,7 @@ impl Native {
     }
 
     unsafe fn classes(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
+        self.check_deadline()?;
         let class = (self.get_attrib)(value, self.class);
         if class == self.nil { return Ok(Vec::new()); }
         if (self.type_of)(class) != STRING { return Ok(Vec::new()); }
@@ -466,6 +492,7 @@ impl Native {
         if size < 0 || size > 128 { return Err(Suppression::UnsafeDispatch); }
         let mut names = Vec::new();
         for index in 0..size {
+            if index % 32 == 0 { self.check_deadline()?; }
             if let Some(name) = self.text((self.string_elt)(class, index)) {
                 names.push(name);
             }
@@ -490,6 +517,7 @@ impl Native {
     }
 
     unsafe fn binding(&self, env: Sexp, name: &str) -> Result<Option<Sexp>, Suppression> {
+        self.check_deadline()?;
         if self.custom_database(env)? { return Err(Suppression::UnsafeEnvironment); }
         let Some(sym) = self.symbol(name) else { return Ok(None); };
         if (self.exists)(env, sym) == 0 { return Ok(None); }
@@ -512,6 +540,7 @@ impl Native {
     }
 
     unsafe fn vector_members(&self, value: Sexp) -> Result<Members, Suppression> {
+        self.check_deadline()?;
         if value == self.nil || (self.type_of)(value) == 9 { return Ok(Members::empty()); }
         let names = (self.get_attrib)(value, self.names);
         if names == self.nil || (self.type_of)(names) != STRING { return Ok(Members::empty()); }
@@ -524,6 +553,7 @@ impl Native {
         let mut members = Members::empty();
         let mut seen = HashSet::new();
         for index in 0..length.min(MAX_NAMES as isize) {
+            if index % 32 == 0 { self.check_deadline()?; }
             let Some(name) = self.text((self.string_elt)(names, index)) else { continue; };
             if name.is_empty() || name.len() > MAX_NAME_BYTES || !seen.insert(name.clone()) { continue; }
             let kind = if direct {
@@ -537,6 +567,7 @@ impl Native {
     }
 
     unsafe fn name_at(&self, value: Sexp, index: usize) -> Result<Option<String>, Suppression> {
+        self.check_deadline()?;
         let names = (self.get_attrib)(value, self.names);
         if names == self.nil || (self.type_of)(names) != STRING { return Ok(None); }
         if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
@@ -553,6 +584,7 @@ impl Native {
         let type_ = (self.type_of)(value);
         let direct = matches!(type_, LIST | LANGUAGE) && self.ordinary_dispatch(value)?;
         while cursor != self.nil && members.names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
+            if scanned % 32 == 0 { self.check_deadline()?; }
             scanned += 1;
             let tag = (self.tag)(cursor);
             if tag != self.nil {
@@ -577,6 +609,7 @@ impl Native {
         let mut names = Vec::new();
         let mut scanned = 0;
         while cursor != self.nil && names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
+            if scanned % 32 == 0 { self.check_deadline()?; }
             scanned += 1;
             let tag = (self.tag)(cursor);
             if tag != self.nil {
@@ -594,6 +627,7 @@ impl Native {
     }
 
     unsafe fn environment_names(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
+        self.check_deadline()?;
         if self.custom_database(value)? { return Err(Suppression::UnsafeEnvironment); }
         // R_lsInternal allocates and sorts every binding before returning.
         // Refuse large environments first; when the preflight API is unavailable,
@@ -601,11 +635,17 @@ impl Native {
         let Some(envlength) = self.envlength else { return Err(Suppression::InspectionLimit); };
         let bindings = envlength(value);
         if bindings < 0 || bindings > MAX_ENV_BINDINGS { return Err(Suppression::InspectionLimit); }
+        self.check_deadline()?;
+        // The C callback temporarily PROTECTs the allocation while adding
+        // it to R's precious list; release it after converting the names.
         let names = if let Some(ls) = self.ls3 { ls(value, 1, 1) }
             else if let Some(ls) = self.ls2 { ls(value, 1) }
             else { return Err(Suppression::InspectionLimit); };
-        if names.is_null() || names == self.nil { return Ok(Vec::new()); }
-        (self.protect)(names);
+        if names.is_null() { return Ok(Vec::new()); }
+        if names == self.nil {
+            (self.unprotect)(1); // The C guard also preserves a non-null R_NilValue.
+            return Ok(Vec::new());
+        }
         let result = (|| -> Result<Vec<String>, Suppression> {
             unsafe {
                 if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
@@ -614,6 +654,7 @@ impl Native {
                 if count as usize > MAX_NAMES { return Err(Suppression::InspectionLimit); }
                 let mut members = Vec::new();
                 for index in 0..count.min(MAX_NAMES as isize) {
+                    if index % 32 == 0 { self.check_deadline()?; }
                     let Some(name) = self.text((self.string_elt)(names, index)) else { continue; };
                     if !name.is_empty() && name.len() <= MAX_NAME_BYTES { members.push(name); }
                 }
@@ -627,13 +668,15 @@ impl Native {
     unsafe fn classify_unindexed(&self, value: Sexp, target: Target, names: Vec<String>)
         -> Result<Members, Suppression> {
         let mut kinds = Vec::with_capacity(names.len());
-        for name in &names {
+        for (index, name) in names.iter().enumerate() {
+            if index % 32 == 0 { self.check_deadline()?; }
             kinds.push(self.member_kind(value, target, name)?);
         }
         Ok(Members { names, kinds, bracket_kind: 0 })
     }
 
     unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
+        self.check_deadline()?;
         if value == self.nil { return Ok(Members::empty()); }
         let kind = (self.type_of)(value);
         if target == Target::Slot {
@@ -675,6 +718,7 @@ impl Native {
             let mut cursor = value;
             let mut index = 0;
             while cursor != self.nil && index < MAX_SCANNED_ENTRIES {
+                if index % 32 == 0 { self.check_deadline()?; }
                 let tag = (self.tag)(cursor);
                 if tag != self.nil && self.text((self.printname)(tag)).as_deref() == Some(name) {
                     return Ok(Some(index));
@@ -692,6 +736,7 @@ impl Native {
         let len = (self.xlength)(names);
         if len < 0 { return Ok(None); }
         for index in 0..len.min(MAX_SCANNED_ENTRIES as isize) {
+            if index % 32 == 0 { self.check_deadline()?; }
             if self.text((self.string_elt)(names, index)).as_deref() == Some(name) {
                 return Ok(Some(index as usize));
             }
@@ -710,7 +755,8 @@ impl Native {
         if matches!(kind, LIST | LANGUAGE | DOTS) {
             if index >= MAX_SCANNED_ENTRIES { return Ok(None); }
             let mut cursor = value;
-            for _ in 0..index {
+            for offset in 0..index {
+                if offset % 32 == 0 { self.check_deadline()?; }
                 if cursor == self.nil { return Ok(None); }
                 cursor = (self.cdr)(cursor);
             }
@@ -722,6 +768,7 @@ impl Native {
     }
 
     unsafe fn scalar_index(&self, name: &str) -> Result<Option<Step>, Suppression> {
+        self.check_deadline()?;
         let Some(value) = self.binding(self.global, name)? else { return Ok(None); };
         if (self.altrep)(value) != 0 { return Err(Suppression::UnsafeAltRep); }
         if (self.is_object)(value) != 0 { return Err(Suppression::UnsafeDispatch); }
@@ -748,6 +795,7 @@ impl Native {
     }
 
     unsafe fn step(&self, view: View, step: &Step) -> Result<Option<View>, Suppression> {
+        self.check_deadline()?;
         let checked = match step {
             Step::VariableIndex(name) => self.scalar_index(name)?,
             Step::VariableSlice(name) => self.scalar_index(name)?.map(|index| match index {
@@ -850,6 +898,7 @@ impl Native {
     }
 
     unsafe fn inspect(&self, query: &MemberQuery) -> Result<Members, Suppression> {
+        self.check_deadline()?;
         let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Members::empty()); };
         (self.protect)(root);
         let mut protected = 1;
@@ -857,6 +906,7 @@ impl Native {
             unsafe {
                 let mut current = View::Object(root);
                 for step in &query.steps {
+                    self.check_deadline()?;
                     let Some(next) = self.step(current, step)? else { return Ok(Members::empty()); };
                     if let View::Object(value) = next {
                         if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
@@ -895,12 +945,13 @@ impl Native {
     }
 }
 
-pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Inspection {
+pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) -> Inspection {
     // Every R API call is made in the C guard. In particular, do not execute
     // Rust code as an R_ToplevelExec callback: R errors/interrupts use longjmp.
+    if Instant::now() >= deadline { return Inspection::Unavailable; }
     unsafe {
         begin_inspection_guard(api);
-        let result = Native::new(api).map(|native| native.inspect(&query));
+        let result = Native::new(api, deadline).map(|native| native.inspect(&query));
         if rmg_end() != 0 {
             return Inspection::Unavailable;
         }
@@ -925,6 +976,11 @@ mod tests {
     #[test]
     fn r_error_and_interrupt_jumps_are_caught_without_crossing_rust() {
         assert_eq!(unsafe { rmg_test_error_and_recovery() }, 1);
+    }
+
+    #[test]
+    fn enumeration_is_protected_before_returning_to_rust() {
+        assert_eq!(unsafe { rmg_test_enumeration_protection() }, 1);
     }
 
     #[test]

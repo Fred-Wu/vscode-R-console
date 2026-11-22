@@ -19,6 +19,7 @@ import { clearCompletionDiagnosticsScope, logConsoleCompletionDecision, noteCons
 import { completionDecisionContext } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
+import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 
 export type InputSnapshot = {
   text: string;
@@ -73,6 +74,23 @@ export class RTermLang {
   constructor(private readonly options: LangOptions) {}
 
   get completionDiagnosticsScope(): string { return this.completionDocumentId; }
+
+  // A native bracket lookup is independent of the language server. Start it
+  // immediately, but keep LSP active for method arguments such as DT[, keyby.
+  // Static-analysis mode continues to let source inference take precedence.
+  private prefetchBracketMembers(context: CompletionContext): Promise<MemberInspectionResult | undefined> | undefined {
+    const receiver = context.objectName;
+    if (context.kind !== "bracket" || !receiver || !parseRuntimeMemberQuery(receiver) ||
+        this.options.getStaticAnalysisEnabled?.() === true) return undefined;
+    const requester = this.options.requestRuntimeMemberCompletions;
+    if (!requester) return undefined;
+    try {
+      return Promise.resolve(requester(receiver, context.bracketOperator ?? "["))
+        .catch(() => undefined);
+    } catch {
+      return undefined;
+    }
+  }
 
   async start(): Promise<void> {
     const completionProvider = await this.ensureConsoleLspStarted();
@@ -140,11 +158,10 @@ export class RTermLang {
       let completionProvider: CompletionProvider | undefined;
       // Runtime-only member inspection is owned by the guarded native backend.
       // Do not make it wait for the separate language server to start or reply.
-      const runtimeMember = (context.kind === "member" ||
-        (context.kind === "bracket" &&
-          !!context.objectName && !!parseRuntimeMemberQuery(context.objectName))) &&
+      const runtimeMember = context.kind === "member" &&
         this.options.requestRuntimeMemberCompletions !== undefined &&
         this.options.getStaticAnalysisEnabled?.() !== true;
+      const prefetchedBracketMembers = this.prefetchBracketMembers(context);
       const documentRequest = runtimeMember
         ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
@@ -173,7 +190,8 @@ export class RTermLang {
           recentEntries,
           completionProvider,
           this.options.requestRuntimeMemberCompletions,
-          latestInput.text
+          latestInput.text,
+          prefetchedBracketMembers
         );
       })();
       // Argument candidates must await LSP parameters; early session-only
@@ -240,11 +258,10 @@ export class RTermLang {
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
 
-          const nextRuntimeMember = (nextContext.kind === "member" ||
-            (nextContext.kind === "bracket" &&
-              !!nextContext.objectName && !!parseRuntimeMemberQuery(nextContext.objectName))) &&
+          const nextRuntimeMember = nextContext.kind === "member" &&
             this.options.requestRuntimeMemberCompletions !== undefined &&
             this.options.getStaticAnalysisEnabled?.() !== true;
+          const nextBracketMembers = this.prefetchBracketMembers(nextContext);
           const nextDocumentRequest = nextRuntimeMember
             ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(nextInputText);
           if (!completionProvider && !nextRuntimeMember) {
@@ -267,7 +284,8 @@ export class RTermLang {
             recentEntries,
             completionProvider,
             this.options.requestRuntimeMemberCompletions,
-            nextInputText
+            nextInputText,
+            nextBracketMembers
           );
           return nextEntries;
         },

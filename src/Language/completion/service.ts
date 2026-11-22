@@ -4,6 +4,7 @@ import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions 
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 import { getFieldInsertText, filterCompletionEntries, filterShadowedBufferEntries, filterShadowedWorkspaceEntries, dedupeCompletionEntries, isGlobalSymbolContext, isArgumentCompletionEntry } from "./candidates";
 
 export async function collectCompletionEntries(
@@ -15,7 +16,8 @@ export async function collectCompletionEntries(
   recentConsoleEntries: string[] = [],
   completionProvider?: CompletionProvider,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
-  consoleInputText?: string
+  consoleInputText?: string,
+  prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>
 ): Promise<CompletionEntries> {
   if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -48,12 +50,14 @@ export async function collectCompletionEntries(
   const rawLspResult = await rawLspItemsRequest;
   const inferred = rawLspResult.memberResolved ||
     rawLspResult.entries.some(entry => entry.role === "member");
-  const runtimeRequest = runtimeReceiver &&
+  // Bracket requests can start native inspection while the language server
+  // starts. Keep its parameter candidates, and avoid a second native probe.
+  const runtimeRequest = prefetchedBracketMembers ?? (runtimeReceiver &&
     (context.kind === "member" || context.kind === "bracket") &&
     (rawLspResult.runtimeOnly || !inferred)
     ? requestRuntimeMemberCompletions?.(context.objectName!,
         context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")
-    : undefined;
+    : undefined);
   const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
   const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
   const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
@@ -116,7 +120,12 @@ export async function collectCompletionEntries(
 
   if (context.kind === "bracket") {
     const columnFiltered = filterCompletionEntries(dataItems, context.prefix);
-    const lspFiltered = filterCompletionEntries(lspItems, context.prefix);
+    // Live stored fields supersede inferred LSP fields, not bracket-method
+    // arguments. Mixing stale source fields with runtime names is misleading.
+    const bracketLspItems = runtimeMembers === undefined ? lspItems : lspItems.filter(entry =>
+      entry.role !== "member" &&
+      !(entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field));
+    const lspFiltered = filterCompletionEntries(bracketLspItems, context.prefix);
     const sessionFiltered = filterCompletionEntries(sessionItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
     return asCompletionEntries(dedupeCompletionEntries([

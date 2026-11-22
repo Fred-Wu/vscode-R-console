@@ -16,12 +16,18 @@ enum {
 
 typedef void *RmgSexp;
 typedef int (*RmgToplevel)(void (*)(void *), void *);
+// Preserved values survive separate R_ToplevelExec calls. Each call to
+// R_ToplevelExec uses its own PROTECT stack entries; ordinary PROTECT must
+// never remain outstanding when that call returns.
+enum { RMG_MAX_PRESERVED = 32 };
 typedef struct {
   RmgToplevel toplevel;
   uintptr_t funcs[RMG_COUNT];
+  uintptr_t raw_protect, raw_unprotect;
+  RmgSexp preserved[RMG_MAX_PRESERVED];
+  int preserved_count;
   int failed;
   int initialized;
-  int protected_count;
 } RmgGuard;
 #if defined(_MSC_VER)
 static __declspec(thread) RmgGuard rmg_guard;
@@ -49,7 +55,7 @@ static void rmg_invoke(void *opaque) {
       call->result = (uint64_t)(uint32_t)((int (*)(RmgSexp, RmgSexp))ptr)((RmgSexp)call->a, (RmgSexp)call->b); break;
     case RMG_TYPEOF: case RMG_ALTREP: case RMG_IS_S4: case RMG_IS_OBJECT: case RMG_ENVLENGTH:
       call->result = (uint64_t)(uint32_t)((int (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
-    case RMG_ATTRIB: case RMG_TAG: case RMG_CAR: case RMG_CDR: case RMG_PRINTNAME: case RMG_PROTECT:
+    case RMG_ATTRIB: case RMG_TAG: case RMG_CAR: case RMG_CDR: case RMG_PRINTNAME:
       call->result = (uintptr_t)((RmgSexp (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
     case RMG_VECTOR_ELT: case RMG_STRING_ELT:
       call->result = (uintptr_t)((RmgSexp (*)(RmgSexp, ptrdiff_t))ptr)((RmgSexp)call->a, (ptrdiff_t)call->b); break;
@@ -57,12 +63,35 @@ static void rmg_invoke(void *opaque) {
       call->result = (uint64_t)((ptrdiff_t (*)(RmgSexp))ptr)((RmgSexp)call->a); break;
     case RMG_UTF8:
       call->result = (uintptr_t)((const char *(*)(RmgSexp))ptr)((RmgSexp)call->a); break;
+    case RMG_PROTECT:
+      // R_PreserveObject retains a reachable root/member across C callbacks.
+      ((void (*)(RmgSexp))ptr)((RmgSexp)call->a);
+      rmg_guard.preserved[rmg_guard.preserved_count++] = (RmgSexp)call->a;
+      call->result = call->a;
+      break;
     case RMG_UNPROTECT:
-      ((void (*)(int))ptr)((int)call->a); break;
-    case RMG_LS3:
-      call->result = (uintptr_t)((RmgSexp (*)(RmgSexp, int, int))ptr)((RmgSexp)call->a, (int)call->b, (int)call->c); break;
-    case RMG_LS2:
-      call->result = (uintptr_t)((RmgSexp (*)(RmgSexp, int))ptr)((RmgSexp)call->a, (int)call->b); break;
+      for (int n = (int)call->a; n > 0; --n) {
+        RmgSexp item = rmg_guard.preserved[rmg_guard.preserved_count - 1];
+        ((void (*)(RmgSexp))ptr)(item);
+        --rmg_guard.preserved_count;
+      }
+      break;
+    case RMG_LS3: case RMG_LS2: {
+      // R_lsInternal allocates a *new* character vector. PROTECT it before
+      // R_PreserveObject can allocate, and UNPROTECT in this same C callback.
+      // Keeping a PROTECT entry across R_ToplevelExec would unbalance R's stack.
+      RmgSexp names = call->method == RMG_LS3
+          ? ((RmgSexp (*)(RmgSexp, int, int))ptr)((RmgSexp)call->a, (int)call->b, (int)call->c)
+          : ((RmgSexp (*)(RmgSexp, int))ptr)((RmgSexp)call->a, (int)call->b);
+      if (names) {
+        ((RmgSexp (*)(RmgSexp))rmg_guard.raw_protect)(names);
+        ((void (*)(RmgSexp))rmg_guard.funcs[RMG_PROTECT])(names);
+        rmg_guard.preserved[rmg_guard.preserved_count++] = names;
+        ((void (*)(int))rmg_guard.raw_unprotect)(1);
+      }
+      call->result = (uintptr_t)names;
+      break;
+    }
     case RMG_INTEGER_ELT:
       call->result = (uint64_t)(uint32_t)((int (*)(RmgSexp, ptrdiff_t))ptr)((RmgSexp)call->a, (ptrdiff_t)call->b); break;
     case RMG_REAL_ELT: {
@@ -74,7 +103,8 @@ static void rmg_invoke(void *opaque) {
   }
 }
 
-void rmg_begin(uintptr_t toplevel, const uintptr_t *funcs, size_t count) {
+void rmg_begin(uintptr_t toplevel, const uintptr_t *funcs, size_t count,
+               uintptr_t raw_protect, uintptr_t raw_unprotect) {
   memset(&rmg_guard, 0, sizeof(rmg_guard));
   if (!toplevel || !funcs || count != RMG_COUNT) {
     rmg_guard.failed = 1;
@@ -82,22 +112,29 @@ void rmg_begin(uintptr_t toplevel, const uintptr_t *funcs, size_t count) {
   }
   rmg_guard.toplevel = (RmgToplevel)toplevel;
   memcpy(rmg_guard.funcs, funcs, sizeof(rmg_guard.funcs));
+  rmg_guard.raw_protect = raw_protect;
+  rmg_guard.raw_unprotect = raw_unprotect;
   rmg_guard.initialized = 1;
 }
 
 int rmg_call(int method, uintptr_t a, uintptr_t b, uintptr_t c, uint64_t *out) {
   if (out) *out = 0;
   if (!out || method < 0 || method >= RMG_COUNT || !rmg_guard.initialized ||
-      !rmg_guard.funcs[method] || (rmg_guard.failed && method != RMG_UNPROTECT)) {
+      !rmg_guard.funcs[method] || (rmg_guard.failed && method != RMG_UNPROTECT) ||
+      (method == RMG_PROTECT && rmg_guard.preserved_count >= RMG_MAX_PRESERVED) ||
+      ((method == RMG_LS2 || method == RMG_LS3) &&
+        (!rmg_guard.raw_protect || !rmg_guard.raw_unprotect ||
+         !rmg_guard.funcs[RMG_PROTECT] || !rmg_guard.funcs[RMG_UNPROTECT] ||
+         rmg_guard.preserved_count >= RMG_MAX_PRESERVED))) {
     rmg_guard.failed = 1;
     return 0;
   }
-  // A failed protect is not added to Rust's effective protect count. Cleanup
-  // may still run after an error; never unprotect more than actually protected.
+  // A failed preserve is not added to the guard. Cleanup after a native R
+  // error can release only values successfully recorded in this request.
   if (method == RMG_UNPROTECT) {
     int n = (int)a;
     if (n < 0) { rmg_guard.failed = 1; return 0; }
-    if (n > rmg_guard.protected_count) n = rmg_guard.protected_count;
+    if (n > rmg_guard.preserved_count) n = rmg_guard.preserved_count;
     if (n == 0) return 1;
     a = (uintptr_t)n;
   }
@@ -106,14 +143,28 @@ int rmg_call(int method, uintptr_t a, uintptr_t b, uintptr_t c, uint64_t *out) {
     rmg_guard.failed = 1;
     return 0;
   }
-  if (method == RMG_PROTECT) ++rmg_guard.protected_count;
-  if (method == RMG_UNPROTECT) rmg_guard.protected_count -= (int)a;
   *out = call.result;
   return 1;
 }
 
+// Even when a guarded R API reports an error, release all preserved values
+// before resetting this request's state. Rust never owns R protection entries.
+static void rmg_release_remaining(void *opaque) {
+  (void)opaque;
+  while (rmg_guard.preserved_count > 0) {
+    RmgSexp item = rmg_guard.preserved[rmg_guard.preserved_count - 1];
+    ((void (*)(RmgSexp))rmg_guard.funcs[RMG_UNPROTECT])(item);
+    --rmg_guard.preserved_count;
+  }
+}
+
 int rmg_end(void) {
   int failed = rmg_guard.failed;
+  if (rmg_guard.preserved_count > 0 &&
+      (!rmg_guard.toplevel || !rmg_guard.funcs[RMG_UNPROTECT] ||
+       !rmg_guard.toplevel(rmg_release_remaining, NULL))) {
+    failed = 1;
+  }
   memset(&rmg_guard, 0, sizeof(rmg_guard));
   return failed;
 }
@@ -121,9 +172,12 @@ int rmg_end(void) {
 // A test-only local longjmp simulates an R error/interrupt inside a C frame.
 // Also verify the guard works on the next request after an error.
 static jmp_buf rmg_test_jmp;
+static int rmg_test_inside_callback;
 static int rmg_test_toplevel(void (*fn)(void *), void *data) {
-  if (setjmp(rmg_test_jmp)) return 0;
+  if (setjmp(rmg_test_jmp)) { rmg_test_inside_callback = 0; return 0; }
+  rmg_test_inside_callback = 1;
   fn(data);
+  rmg_test_inside_callback = 0;
   return 1;
 }
 static RmgSexp rmg_test_fail(const char *name) {
@@ -138,10 +192,82 @@ int rmg_test_error_and_recovery(void) {
   uintptr_t funcs[RMG_COUNT] = {0};
   uint64_t out = 0;
   funcs[RMG_INSTALL] = (uintptr_t)rmg_test_fail;
-  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT);
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0);
   if (rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &out) || !rmg_end()) return 0;
   funcs[RMG_INSTALL] = (uintptr_t)rmg_test_good;
-  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT);
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT, 0, 0);
   if (!rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &out) || rmg_end()) return 0;
   return out == 0x1234;
+}
+
+/* Test-only native functions check that PROTECT/UNPROTECT are balanced inside
+   one C callback, that the returned vector remains preserved across calls,
+   and that rmg_end releases any outstanding values after an error. */
+static int rmg_test_temp_protects, rmg_test_temp_unprotects;
+static int rmg_test_preserves, rmg_test_releases, rmg_test_order_error;
+static RmgSexp rmg_test_ls2(RmgSexp env, int all) {
+  (void)env; (void)all;
+  return (RmgSexp)(uintptr_t)0x5678;
+}
+static RmgSexp rmg_test_ls3(RmgSexp env, int all, int sorted) {
+  (void)env; (void)all; (void)sorted;
+  return (RmgSexp)(uintptr_t)0x5678;
+}
+static RmgSexp rmg_test_temp_protect(RmgSexp value) {
+  if (!rmg_test_inside_callback || value != (RmgSexp)(uintptr_t)0x5678)
+    rmg_test_order_error = 1;
+  ++rmg_test_temp_protects;
+  return value;
+}
+static void rmg_test_temp_unprotect(int n) {
+  if (!rmg_test_inside_callback || n != 1 || rmg_test_preserves <= rmg_test_temp_unprotects)
+    rmg_test_order_error = 1;
+  rmg_test_temp_unprotects += n;
+}
+static void rmg_test_preserve(RmgSexp value) {
+  if (!rmg_test_inside_callback || value != (RmgSexp)(uintptr_t)0x5678 ||
+      rmg_test_temp_protects <= rmg_test_preserves)
+    rmg_test_order_error = 1;
+  ++rmg_test_preserves;
+}
+static void rmg_test_release(RmgSexp value) {
+  if (!rmg_test_inside_callback || value != (RmgSexp)(uintptr_t)0x5678)
+    rmg_test_order_error = 1;
+  ++rmg_test_releases;
+}
+int rmg_test_enumeration_protection(void) {
+  uintptr_t funcs[RMG_COUNT] = {0};
+  uint64_t out = 0;
+  rmg_test_temp_protects = rmg_test_temp_unprotects = 0;
+  rmg_test_preserves = rmg_test_releases = rmg_test_order_error = 0;
+  funcs[RMG_LS2] = (uintptr_t)rmg_test_ls2;
+  funcs[RMG_LS3] = (uintptr_t)rmg_test_ls3;
+  funcs[RMG_PROTECT] = (uintptr_t)rmg_test_preserve;
+  funcs[RMG_UNPROTECT] = (uintptr_t)rmg_test_release;
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT,
+            (uintptr_t)rmg_test_temp_protect, (uintptr_t)rmg_test_temp_unprotect);
+  int ok = rmg_call(RMG_LS2, 0, 1, 0, &out) &&
+      out == 0x5678 && rmg_guard.preserved_count == 1 &&
+      rmg_test_temp_protects == 1 && rmg_test_temp_unprotects == 1 &&
+      rmg_call(RMG_UNPROTECT, 1, 0, 0, &out) &&
+      rmg_guard.preserved_count == 0 && rmg_test_releases == 1 &&
+      rmg_call(RMG_LS3, 0, 1, 1, &out) &&
+      out == 0x5678 && rmg_guard.preserved_count == 1;
+  // Leave one object preserved on the successful path: end releases it.
+  int failed = rmg_end();
+  int balanced = ok && !failed && !rmg_test_order_error &&
+      rmg_test_temp_protects == 2 && rmg_test_temp_unprotects == 2 &&
+      rmg_test_preserves == 2 && rmg_test_releases == 2;
+
+  // A later R error must also release any previously preserved object.
+  funcs[RMG_INSTALL] = (uintptr_t)rmg_test_fail;
+  rmg_begin((uintptr_t)rmg_test_toplevel, funcs, RMG_COUNT,
+            (uintptr_t)rmg_test_temp_protect, (uintptr_t)rmg_test_temp_unprotect);
+  int recovered = rmg_call(RMG_LS2, 0, 1, 0, &out) &&
+      rmg_guard.preserved_count == 1 &&
+      !rmg_call(RMG_INSTALL, (uintptr_t)"test", 0, 0, &out);
+  int failed_as_expected = rmg_end();
+  return balanced && recovered && failed_as_expected && !rmg_test_order_error &&
+      rmg_test_temp_protects == 3 && rmg_test_temp_unprotects == 3 &&
+      rmg_test_preserves == 3 && rmg_test_releases == 3;
 }

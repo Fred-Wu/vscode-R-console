@@ -724,7 +724,7 @@ mod unix_host {
         }
     }
 
-    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<MemberQuery>)> {
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<(MemberQuery, Instant)>)> {
         // Parse-status is part of code submission, before Submit is queued.
         // Never let speculative completion preempt an accepted parse request.
         if state.pending_commands.iter().any(|command| matches!(command,
@@ -735,7 +735,8 @@ mod unix_host {
             matches!(command, PendingCommand::MemberNames { .. }))?;
         match state.pending_commands.remove(index)? {
             PendingCommand::MemberNames { request_id, query, queued_at } =>
-                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL).then_some(query))),
+                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL)
+                    .then_some((query, queued_at + MEMBER_REQUEST_TTL)))),
             _ => None,
         }
     }
@@ -1061,8 +1062,8 @@ mod unix_host {
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
-                    let result = query.and_then(|query| INSPECTOR_API.get().copied().flatten()
-                        .map(|api| member_inspection::inspect(api, query)))
+                    let result = query.and_then(|(query, deadline)| INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query, deadline)))
                         .unwrap_or(member_inspection::Inspection::Unavailable);
                     let _ = runtime.output.emit_member_names_result(request_id, &result);
                     state = runtime.state.lock().expect("host state lock poisoned");
@@ -1882,6 +1883,23 @@ mod unix_host {
         use super::{enqueue_parse_status, take_next_member_request, take_next_parse_request, PendingCommand, SharedState};
         use crate::member_inspection::{MemberQuery, Target};
         use std::time::Instant;
+
+        #[test]
+        fn expired_member_request_is_dropped_without_native_inspection() {
+            use super::{take_next_member_request, PendingCommand};
+            use crate::member_inspection::{MemberQuery, Target};
+            use std::time::Instant;
+
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 42,
+                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar },
+                queued_at: Instant::now() - super::MEMBER_REQUEST_TTL,
+            });
+            let (id, query) = take_next_member_request(&mut state).expect("queued request");
+            assert_eq!(id, 42);
+            assert!(query.is_none(), "expired work must not enter embedded R");
+        }
 
         #[test]
         fn code_parse_preempts_queued_member_completion() {
@@ -2719,7 +2737,7 @@ mod windows_host {
         }
     }
 
-    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<MemberQuery>)> {
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<(MemberQuery, Instant)>)> {
         // Parse-status is part of code submission, before Submit is queued.
         // Never let speculative completion preempt an accepted parse request.
         if state.pending_commands.iter().any(|command| matches!(command,
@@ -2730,7 +2748,8 @@ mod windows_host {
             matches!(command, PendingCommand::MemberNames { .. }))?;
         match state.pending_commands.remove(index)? {
             PendingCommand::MemberNames { request_id, query, queued_at } =>
-                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL).then_some(query))),
+                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL)
+                    .then_some((query, queued_at + MEMBER_REQUEST_TTL)))),
             _ => None,
         }
     }
@@ -3096,8 +3115,8 @@ mod windows_host {
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
-                    let result = query.and_then(|query| INSPECTOR_API.get().copied().flatten()
-                        .map(|api| member_inspection::inspect(api, query)))
+                    let result = query.and_then(|(query, deadline)| INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query, deadline)))
                         .unwrap_or(member_inspection::Inspection::Unavailable);
                     let _ = runtime.output.emit_member_names_result(request_id, &result);
                     state = runtime.state.lock().expect("host state lock poisoned");
@@ -4402,6 +4421,23 @@ mod windows_host {
         };
         use crate::protocol::PromptKind;
 
+
+        #[test]
+        fn expired_member_request_is_dropped_without_native_inspection() {
+            use super::{take_next_member_request, PendingCommand};
+            use crate::member_inspection::{MemberQuery, Target};
+            use std::time::Instant;
+
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 42,
+                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar },
+                queued_at: Instant::now() - super::MEMBER_REQUEST_TTL,
+            });
+            let (id, query) = take_next_member_request(&mut state).expect("queued request");
+            assert_eq!(id, 42);
+            assert!(query.is_none(), "expired work must not enter embedded R");
+        }
 
         #[test]
         fn code_parse_preempts_queued_member_completion() {

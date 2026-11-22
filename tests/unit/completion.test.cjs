@@ -64,6 +64,57 @@ test("native nested completion reaches Rust without awaiting the language server
   }
 });
 
+test("default bracket completion preserves method parameters alongside prefetched live names", async () => {
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      CompletionItemKind: { Field: 4, Function: 2, Property: 9, Variable: 5, Text: 0 },
+    },
+    "../../Language/completion": completion,
+    "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
+    "../../Language/virtualRDocument": { VirtualRDocument: class {} },
+  });
+  let nativeRequests = 0;
+  let lspRequests = 0;
+  const lang = new RTermLang({
+    extensionPath: "", rPath: "R", env: {},
+    getStaticAnalysisEnabled: () => false,
+    requestRuntimeMemberCompletions: async (expression, operator) => {
+      nativeRequests++;
+      assert.deepEqual([expression, operator], ["DT", "["]);
+      return { status: "available", names: ["keyboard"], bracketKind: "data.table" };
+    },
+  });
+  lang.ensureConsoleLspStarted = async () => {
+    assert.equal(nativeRequests, 1, "guarded inspection must start before LSP startup");
+    return { provideCompletionItems: async () => {
+      lspRequests++;
+      return { items: [
+        { label: "keyby", insertText: "keyby = ", kind: 5,
+          detail: "parameter", data: { type: "subscript_parameter" } },
+        { label: "keybird", kind: 4, data: { type: "scope" } },
+      ] };
+    } };
+  };
+  lang.getOrOpenCompletionDocument = async text => ({
+    getText: () => text, uri: { toString: () => "r-console:/completion" },
+  });
+  const text = "DT[, keyb";
+  const input = { text, currentLine: text, cursorCol: text.length,
+    cursorRow: 0, lines: [text], textBeforeCursor: text };
+  let published;
+  await lang.handleAutocomplete({
+    input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
+    onInlineEntries: items => { published = items.filter(item => "insertText" in item); },
+    applyCompletion() {},
+  });
+  assert.equal(nativeRequests, 1, "prefetched inspection must not be repeated");
+  assert.equal(lspRequests, 1, "bracket-method parameters still come from languageserver");
+  assert.deepEqual(published.map(item => item.insertText).sort(), ["keyboard", "keyby = "]);
+  assert.ok(!published.some(item => item.label === "keybird"),
+    "stale inferred field names must not override the live result");
+});
+
 test("runtime-only member lookup uses cached names, never live completion", async () => {
   const input = "obj$";
   const entries = await completion.collectCompletionEntries(
