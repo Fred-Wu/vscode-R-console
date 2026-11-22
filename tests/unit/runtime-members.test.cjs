@@ -86,6 +86,13 @@ test("native results distinguish silent empty from unavailable and unsafe access
   assert.deepEqual(parseBackendFrames(frame(Buffer.from([1, 0, 0, 0, 0]))).events, [{
     type: "member-names-result", requestId: 42, result: { status: "available", names: [] },
   }]);
+  assert.deepEqual(parseBackendFrames(frame(Buffer.from([9]))).events, [{
+    type: "member-names-result", requestId: 42, result: { status: "missing" },
+  }], "code 9 is a proven absent root, not a stored object with no members");
+  assert.match(parseBackendFrames(frame(Buffer.from([9, 0]))).error,
+    /invalid member inspection status/);
+  assert.match(parseBackendFrames(frame(Buffer.from([10]))).error,
+    /invalid member inspection result/);
   const typed = Buffer.concat([Buffer.from([1, 2, 0, 0, 0]),
     Buffer.from([6, 0, 0, 0]), Buffer.from("method"),
     Buffer.from([5, 0, 0, 0]), Buffer.from("value"), Buffer.from([1, 0])]);

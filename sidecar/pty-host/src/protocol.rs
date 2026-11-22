@@ -247,6 +247,9 @@ impl OutputSink {
                 Suppression::UnsafeEnvironment => 6,
                 Suppression::InspectionLimit => 0,
             }),
+            // Code 9 proves the root is unbound; successful inspection of an
+            // existing empty object must remain code 1.
+            Inspection::Available(members) if members.root_missing => payload.push(9),
             Inspection::Available(members) if members.names.len() <= 1000 &&
                 members.kinds.len() == members.names.len() &&
                 members.names.iter().all(|name| name.len() <= 4096) &&

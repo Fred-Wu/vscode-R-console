@@ -79,6 +79,9 @@ export async function collectCompletionEntries(
   // A definitive safety refusal must not be undone by cached receiver names
   // or package method suggestions. In particular, a masked accessor need not
   // accept the stored object's members or the installed method's arguments.
+  // A confirmed absent root is authoritative for runtime candidates too.
+  // Cached workspace names must not revive a binding missing from live R.
+  if (runtimeResult?.status === "missing") return asCompletionEntries([], false);
   const runtimeSuppressed = runtimeResult?.status === "suppressed";
   if (runtimeSuppressed && context.kind === "member") return [];
   // An unavailable inspection is not a complete member list: later typing
@@ -237,12 +240,10 @@ export async function collectStaticFallbackEntries(
   const result = await getLanguageServerCompletions(
     context, doc, position, multilineBuffer, completionProvider, undefined, "static"
   );
-  const memberItems = result.entries.filter(entry =>
-    entry.role === "member" ||
-    (context.kind === "bracket" &&
-      (entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field ||
-       entry.role === "argument" && context.bracketOperator === "["))
-  );
+  // Only a receiver-specific member has sufficiently strong provenance.
+  // Lexical scope fields and indexing parameters are not verified receiver
+  // members, even when they are labeled as fields by the language server.
+  const memberItems = result.entries.filter(entry => entry.role === "member");
   const entries = asCompletionEntries(
     dedupeCompletionEntries(filterCompletionEntries(memberItems, context.prefix)),
     result.isIncomplete

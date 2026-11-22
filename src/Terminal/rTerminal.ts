@@ -2146,6 +2146,21 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (wasVisible && redraw && this.mode === "ready") this.renderInput();
   }
 
+  // Resolve the same static/runtime context for scheduling, caching and
+  // presenting asynchronous inline suggestions. Re-parsing only with the
+  // strict runtime grammar would discard prefixes on executable receivers.
+  private inlineCompletionContext(input: InputSnapshot): ReturnType<typeof getCompletionContext> {
+    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
+    const staticEnabled = vscode.workspace.getConfiguration("r.console")
+      .get<boolean>("completion.staticAnalysis", false);
+    return staticEnabled && (context?.rejectionReason ||
+      (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))
+      ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+          input.text.slice(input.textBeforeCursor.length)) ?? context
+      : context;
+  }
+
   private scheduleInlineCompletion(): void {
     if (!this.inlineCompletion) return;
     // An empty command must close the panel and cancel pending async completions.
@@ -2161,13 +2176,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
       this.lang.completionDiagnosticsScope);
     const staticEnabled = settings.get<boolean>("completion.staticAnalysis", false);
-    const runtimeContext = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-      input.text.slice(input.textBeforeCursor.length));
-    const context = staticEnabled && (runtimeContext?.rejectionReason ||
-      (runtimeContext?.suppressAutomatic && input.textBeforeCursor.includes("[")))
-      ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length)) ?? runtimeContext
-      : runtimeContext;
+    const context = this.inlineCompletionContext(input);
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
@@ -2222,8 +2231,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         if (this.mode !== "ready" || this.inlineCompletionMode() !== "inline" ||
             token !== this.inlineCompletion.token) return;
         const input = this.getInputSnapshot();
-        const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length));
+        const context = this.inlineCompletionContext(input);
         if (!this.inlineCompletion.set(items, token, context?.prefix ?? "")) return;
         this.renderInput();
       },

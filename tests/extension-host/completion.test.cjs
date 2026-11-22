@@ -342,6 +342,8 @@ suite("Static fallback routing in the VS Code extension host", () => {
       getStaticAnalysisEnabled: () => staticEnabled,
       requestRuntimeMemberCompletions: async (receiver, target) => {
         native.push([receiver, target]);
+        if (receiver === "new_obj") return { status: "missing" };
+        if (receiver === "empty_obj") return { status: "available", names: [] };
         return { status: "suppressed", reason: "unsafe-dispatch" };
       },
     });
@@ -365,10 +367,18 @@ suite("Static fallback routing in the VS Code extension host", () => {
         "source-defined factory members are inferred without evaluating the call");
       assert.equal(native.length, 1, "executable receivers must never reach the native inspector");
 
+      const missing = await complete("new_obj <- list(alpha = 1)\nnew_obj$");
+      assert.ok(missing.includes("alpha"), "only native-confirmed absence permits unsubmitted source members");
+      assert.deepEqual(native.at(-1), ["new_obj", "$"]);
+
+      const empty = await complete("empty_obj <- list(alpha = 1)\nempty_obj$");
+      assert.deepEqual(empty, [], "empty stored members override conflicting unsubmitted source without metadata");
+      assert.deepEqual(native.at(-1), ["empty_obj", "$"]);
+
       staticEnabled = false;
       assert.deepEqual(await complete("make_data()$"), [],
         "the default runtime-only policy still rejects executable receivers");
-      assert.equal(native.length, 1);
+      assert.equal(native.length, 3);
     } finally {
       await lang.dispose();
     }

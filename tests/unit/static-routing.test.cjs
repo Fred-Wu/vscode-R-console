@@ -131,11 +131,19 @@ test("safe live members take precedence without any language-server request", as
   assert.equal(h.requests.length, 0);
 });
 
-test("empty live members stay authoritative for a known stored receiver", async () => {
-  const h = harness({ inspected: { status: "available", names: [] },
-    sessionData: { globalenv: { obj: { type: "list", names: [] } } } });
-  assert.deepEqual(labels(await h.complete("obj$")), []);
-  assert.equal(h.requests.length, 0);
+test("empty live members stay authoritative even when workspace metadata is missing or stale", async () => {
+  for (const sessionData of [
+    { globalenv: { obj: { type: "list", names: [] } } },
+    { globalenv: {} },
+    undefined,
+  ]) {
+    const h = harness({ inspected: { status: "available", names: [] }, sessionData });
+    const input = "obj <- list(alpha = 1)\nobj$";
+    assert.deepEqual(labels(await h.complete(input)), [],
+      "an unsubmitted reassignment cannot replace confirmed empty live storage");
+    assert.deepEqual(h.native, [["obj", "$"]]);
+    assert.equal(h.requests.length, 0, "native available([]) is authoritative without cached evidence");
+  }
 });
 
 test("rejected calls route directly to static LSP without executing or probing the receiver", async () => {
@@ -159,24 +167,47 @@ test("native suppression routes to static LSP and never publishes cached unsafe 
   assert.ok(h.logs.every(line => !line.includes("secret")));
 });
 
-test("suppressed bracket completion routes to static rather than restoring global symbols", async () => {
+test("suppressed bracket completion keeps only receiver-specific source members", async () => {
   const h = harness({ inspected: { status: "suppressed", reason: "unsafe-dispatch" },
     lspItems: { rConsoleMemberResolved: true, items: [
       { label: "alpha", kind: 4, data: { type: "member" } },
       { label: "unrelated", kind: 5 },
+      { label: "scope_field", kind: 4, data: { type: "scope" } },
+      { label: "index_argument", kind: 5, data: { type: "subscript_parameter" } },
     ] } });
   assert.deepEqual(labels(await h.complete("obj[[")), ["alpha"]);
   assert.deepEqual(h.native, [["obj", "[["]]);
   assert.deepEqual(h.requests.map(r => r.mode), ["static"]);
 });
 
-test("unknown live roots retain opt-in source completions from the current input", async () => {
-  const h = harness({ inspected: { status: "available", names: [] },
-    sessionData: { globalenv: {} } });
+test("executable single brackets do not borrow method arguments or lexical fields", async () => {
+  const h = harness({ lspItems: { items: [
+    { label: "drop", kind: 5, data: { type: "subscript_parameter" } },
+    { label: "scope_field", kind: 4, data: { type: "scope" } },
+  ] } });
+  assert.deepEqual(labels(await h.complete("make_data()[")), []);
+  assert.deepEqual(h.native, [], "executable receivers never reach the inspector");
+  assert.deepEqual(h.requests.map(r => r.mode), ["static"]);
+});
+
+test("native-confirmed missing roots retain opt-in source completions from the current input", async () => {
+  const h = harness({ inspected: { status: "missing" },
+    sessionData: { globalenv: { new_obj: { type: "list", names: ["stale"] } } } });
   const input = "new_obj <- list(alpha = 1)\nnew_obj$";
   assert.deepEqual(labels(await h.complete(input)), ["alpha"]);
   assert.deepEqual(h.native, [["new_obj", "$"]]);
   assert.deepEqual(h.requests.map(r => r.mode), ["static"]);
+});
+
+test("missing live roots cannot resurrect stale cached session names", async () => {
+  for (const staticAnalysis of [false, true]) {
+    const h = harness({ staticAnalysis, inspected: { status: "missing" },
+      sessionData: { globalenv: { obj: { type: "list", names: ["stale"] } } },
+      lspItems: { items: [{ label: "ambient", kind: 5 }] } });
+    assert.deepEqual(labels(await h.complete("obj$")), []);
+    assert.deepEqual(h.native, [["obj", "$"]]);
+    assert.equal(h.requests.length, staticAnalysis ? 1 : 0);
+  }
 });
 
 test("disabled static analysis keeps the existing rejected path without LSP requests", async () => {

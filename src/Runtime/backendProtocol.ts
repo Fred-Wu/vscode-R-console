@@ -98,6 +98,7 @@ export type MemberInspectionTarget = "$" | "@" | "[" | "[[";
 
 export type MemberInspectionResult =
   | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
+  | { status: "missing" }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
   | { status: "unavailable" };
@@ -355,11 +356,14 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 8) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 9) {
         throw new Error("invalid member inspection result");
       }
       if (payload[0] !== 1 && payload[0] !== 7 && payload[0] !== 8) {
         if (payload.length !== 1) throw new Error("invalid member inspection status");
+        if (payload[0] === 9) {
+          return { type: "member-names-result", requestId, result: { status: "missing" } };
+        }
         const reasons = {
           2: "active-binding", 3: "deferred-binding",
           4: "unsafe-dispatch", 5: "unsafe-altrep", 6: "unsafe-environment",

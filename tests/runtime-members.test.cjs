@@ -70,6 +70,14 @@ test("real embedded R completion inspects nested storage without running user co
     return result?.status === "available" ? { status: "available", names: result.names } : result;
   };
   const available = (names) => ({ status: "available", names });
+  // The wire protocol must distinguish a non-existent live root from an
+  // existing root whose storage is authoritatively empty.
+  assert.deepEqual(await inspect("unbound_completion_root"), { status: "missing" });
+  await submit("empty_completion_root <- list()");
+  assert.deepEqual(await inspect("empty_completion_root"), available([]));
+  await submit("rm(empty_completion_root)");
+  assert.deepEqual(await inspect("empty_completion_root"), { status: "missing" });
+
   // Compile against this installation of R. CI installs Rtools on Windows;
   // missing compilers or callback support fail the safety test, never skip it.
   const fixture = `member_safety${process.platform === "win32" ? ".dll" : ".so"}`;

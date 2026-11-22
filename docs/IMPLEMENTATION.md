@@ -1348,11 +1348,15 @@ stored receivers, including stored receivers with no members. If the runtime
 parser rejects an executable receiver or native inspection suppresses unsafe
 access, enabling static analysis routes that request to the existing console
 language server without executing the receiver. The source-only result is
-filtered to its member/index context and logged as static inference rather
-than a native rejection. When a root is not present in cached session metadata,
-positive source inference can still complete an unsubmitted declaration.
-The existing virtual document describes the editable input; it does not
-preserve a journal of previously submitted function bodies.
+filtered to receiver-specific inferred members, never unrelated scope fields,
+global symbols or indexing-method arguments after a safety refusal. Safe live
+bracket completion still retains the existing method-argument path. The
+native response distinguishes a missing root from a stored empty receiver,
+so source inference for unsubmitted definitions is eligible only when the
+native inspector confirms the root is not bound; cached session metadata is
+not proof of absence. Source-only results are logged as static inference rather
+than a native rejection. The existing virtual document describes the editable
+input; it does not preserve a journal of previously submitted function bodies.
 
 #### Completion Frontends
 

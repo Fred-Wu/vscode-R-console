@@ -180,7 +180,8 @@ export class RTermLang {
       // columns hostage to a slow or restarting language server; its method
       // parameters can enrich the same suggestions afterward.
       const stagedBracketEntries = prefetchedBracketMembers?.then(result =>
-        staticEnabled && result?.status === "suppressed" ? undefined : collectCompletionEntries(
+        staticEnabled && (result?.status === "suppressed" || result?.status === "missing")
+          ? undefined : collectCompletionEntries(
           context, undefined, undefined,
           getWorkspaceData() ?? cachedSessionData,
           latestInput.lines.slice(0, latestInput.cursorRow),
@@ -300,7 +301,8 @@ export class RTermLang {
           // Refinements need the same early native results as the initial
           // picker. The picker guards these against newer queries and the
           // final LSP merge, and rebases edits to the actual console input.
-          void nextBracketMembers?.then(result => staticEnabled && result?.status === "suppressed"
+          void nextBracketMembers?.then(result => staticEnabled &&
+            (result?.status === "suppressed" || result?.status === "missing")
             ? undefined : collectCompletionEntries(
             nextContext, undefined, undefined, getWorkspaceData() ?? cachedSessionData,
             lines.slice(0, latestInput.cursorRow), recentEntries, undefined, undefined,
@@ -392,30 +394,16 @@ export class RTermLang {
 
     if (context.staticFallback) return staticEnabled ? fallback() : [];
     const requester = this.options.requestRuntimeMemberCompletions;
-    const parsed = staticEnabled && (context.kind === "member" || context.kind === "bracket") &&
-      context.objectName ? parseRuntimeMemberQuery(context.objectName) : undefined;
-    const rootMissingFromSnapshot = parsed !== undefined &&
-      !(sessionData?.globalenv && Object.hasOwn(sessionData.globalenv, parsed.root));
-    // Opt-in static analysis already covers unsubmitted source declarations.
-    // A native empty result for an absent root must not erase that existing
-    // source completion. Only accept positively inferred names in this case.
-    const sourceForMissingRoot = async (
-      result: MemberInspectionResult | undefined
-    ): Promise<CompletionEntries | undefined> => {
-      if (!rootMissingFromSnapshot ||
-          (result?.status === "available" && result.names.length > 0) ||
-          result?.status === "suppressed") return undefined;
-      const inferred = await fallback(false);
-      return inferred?.length && inferred.staticResolved ? inferred : undefined;
-    };
+    // A cached workspace snapshot may be stale or unavailable. Only the
+    // native inspector's explicit missing-root status authorizes source
+    // inference for an unsubmitted definition; available([]) stays live.
     if (staticEnabled && context.kind === "member" && requester &&
         context.objectName && parseRuntimeMemberQuery(context.objectName)) {
       const result = await Promise.resolve(requester(context.objectName, context.operator ?? "$"))
         .catch(() => undefined);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       if (result?.status === "suppressed") return fallback();
-      const source = await sourceForMissingRoot(result);
-      if (source) return source;
+      if (result?.status === "missing") return fallback(false);
       return collectCompletionEntries(context, undefined, undefined, sessionData,
         linesBefore, recentEntries, undefined, () => Promise.resolve(result), inputText);
     }
@@ -423,8 +411,7 @@ export class RTermLang {
       const result = await bracketInspection.catch(() => undefined);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       if (result?.status === "suppressed") return fallback();
-      const source = await sourceForMissingRoot(result);
-      if (source) return source;
+      if (result?.status === "missing") return fallback(false);
       bracketInspection = Promise.resolve(result);
     }
     return collectCompletionEntries(context, document, document ? position : undefined,

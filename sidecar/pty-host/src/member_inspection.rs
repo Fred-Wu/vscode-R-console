@@ -254,11 +254,17 @@ pub(crate) struct Members {
     pub(crate) kinds: Vec<u8>,
     // 0 = ordinary, 1 = data.frame, 2 = data.table; only used for [ insertion.
     pub(crate) bracket_kind: u8,
+    // The root is absent, rather than a stored object with zero members.
+    pub(crate) root_missing: bool,
 }
 
 impl Members {
     fn empty() -> Self {
-        Self { names: Vec::new(), kinds: Vec::new(), bracket_kind: 0 }
+        Self { names: Vec::new(), kinds: Vec::new(), bracket_kind: 0, root_missing: false }
+    }
+
+    fn missing() -> Self {
+        Self { root_missing: true, ..Self::empty() }
     }
 }
 
@@ -941,7 +947,7 @@ impl Native {
             if index % 32 == 0 { self.check_deadline()?; }
             kinds.push(self.member_kind(value, target, name)?);
         }
-        Ok(Members { names, kinds, bracket_kind: 0 })
+        Ok(Members { names, kinds, bracket_kind: 0, root_missing: false })
     }
 
     unsafe fn bracket_kind(&self, value: Sexp) -> Result<u8, Suppression> {
@@ -982,7 +988,7 @@ impl Native {
                     // Names remain safe storage metadata, like a custom list.
                     // A stored function need not be callable through its method.
                     let kinds = vec![0; names.len()];
-                    Ok(Members { names, kinds, bracket_kind: 0 })
+                    Ok(Members { names, kinds, bracket_kind: 0, root_missing: false })
                 } else {
                     self.classify_unindexed(value, target, names)
                 }
@@ -1242,7 +1248,7 @@ impl Native {
     unsafe fn inspect(&self, query: &MemberQuery) -> Result<Members, Suppression> {
         self.check_deadline()?;
         self.validate_accessors(query)?;
-        let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Members::empty()); };
+        let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Members::missing()); };
         (self.protect)(root);
         let mut protected = 1;
         let outcome = (|| -> Result<Members, Suppression> {
@@ -1282,7 +1288,7 @@ impl Native {
                         let bracket_kind = if query.target == Target::Bracket {
                             self.bracket_kind(source)?
                         } else { 0 };
-                        Ok(Members { names, kinds, bracket_kind })
+                        Ok(Members { names, kinds, bracket_kind, root_missing: false })
                     }
                 }
             }
