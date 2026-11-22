@@ -1556,6 +1556,7 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
   await lang.handleAutocomplete({ input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
     applyCompletion() {}, onInlineEntries() {} });
   const refined = lang.refineInlineCompletion(snapshot("x <- df$al"));
+  assert.equal(lang.hasCompleteInlineMemberCache(), true, "complete member suggestions can be filtered locally");
   const choices = refined.filter(entry => "insertText" in entry);
   assert.deepEqual(choices.map(entry => entry.insertText), ["alpha"]);
   assert.equal(choices[0].snapshotInput, "x <- df$al");
