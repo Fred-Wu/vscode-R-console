@@ -183,6 +183,52 @@ test('Quick Pick rejects acceptance after another input line changes', async () 
   assert.equal(applied, false);
 });
 
+test('Tab and F7 open bracket Quick Pick while native and LSP results are pending', async () => {
+  for (const force of [false, true]) {
+    let hide, releaseNative, releaseServer, shown = false;
+    const pick = { items: [], value: '', activeItems: [],
+      onDidChangeValue() {}, onDidAccept() {}, onDidHide(fn) { hide = fn; },
+      show() { shown = true; }, hide() { hide?.(); }, dispose() {} };
+    const native = new Promise(resolve => { releaseNative = resolve; });
+    const server = new Promise(resolve => { releaseServer = resolve; });
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      vscode: { ...vscode, Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+        window: { createQuickPick: () => pick } },
+      '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
+      '../../Language/virtualRDocument': { VirtualRDocument: class {} },
+    });
+    const lang = new RTermLang({ extensionPath: '', rPath: '', env: {},
+      getStaticAnalysisEnabled: () => false,
+      requestRuntimeMemberCompletions: () => native });
+    lang.ensureConsoleLspStarted = () => server;
+    lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
+    const text = 'DT[, key';
+    const input = { text, currentLine: text, lines: [text], cursorRow: 0,
+      cursorCol: text.length, textBeforeCursor: text };
+    const showing = lang.handleAutocomplete({ input, force, getCurrentInput: () => input,
+      getWorkspaceData: () => undefined, applyCompletion() {} });
+    try {
+      await tick();
+      assert.equal(shown, true, `force=${force}: picker opens before either result`);
+      releaseNative({ status: 'available', names: ['keyboard'], bracketKind: 'data.table' });
+      await tick();
+      assert.deepEqual(pick.items.filter(item => 'insertText' in item).map(item => item.insertText), ['keyboard']);
+      releaseServer({ provideCompletionItems: async () => ({ items: [
+        { label: 'keyby', insertText: 'keyby = ', kind: 5,
+          detail: 'parameter', data: { type: 'subscript_parameter' } },
+      ] }) });
+      await tick();
+      assert.deepEqual(pick.items.filter(item => 'insertText' in item).map(item => item.insertText).sort(),
+        ['keyboard', 'keyby = ']);
+    } finally {
+      pick.hide();
+      releaseNative(undefined);
+      releaseServer(undefined);
+      await showing;
+    }
+  }
+});
+
 test('an authoritative empty delayed response clears staged Quick Pick entries', async t => {
   let resolve;
   const delayed = new Promise(done => { resolve = done; });

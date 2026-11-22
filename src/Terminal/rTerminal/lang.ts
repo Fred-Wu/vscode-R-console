@@ -237,7 +237,9 @@ export class RTermLang {
       }
 
       if (!entries || entries.length === 0) {
-        if (!force && !onInlineEntries) {
+        // Tab may open an empty picker while bracket inspection is pending.
+        // Its staged columns and LSP method arguments populate it afterward.
+        if (!force && !onInlineEntries && !opensBeforeFullResults) {
           return;
         }
       }
