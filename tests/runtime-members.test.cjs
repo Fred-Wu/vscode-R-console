@@ -565,6 +565,40 @@ test("real embedded R completion inspects nested storage without running user co
   for (const expression of ["slice_df[1]", "slice_list[1]"]) {
     assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery(expression)), ["alpha"]);
   }
+  // Safe slices retain R's receiver semantics through literal, stored and
+  // repeated selectors. Check the native result and the frontend merge without
+  // sess metadata, so cached top-level columns cannot conceal a regression.
+  await submit('slice_frames <- list(frame = slice_df); slice_expr <- expression(inner = stop("must not evaluate"), other = 2); slice_expr_name <- "inner"; stopifnot(identical(class(slice_df[1][1]), "data.frame"), identical(slice_df[1][, j = "alpha"], slice_df$alpha), identical(names(slice_expr[1]), "inner"), identical(slice_expr[1]$inner, quote(stop("must not evaluate")))); cat("SLICE_SEMANTICS_VERIFIED\\n")');
+  assert.match(output, /SLICE_SEMANTICS_VERIFIED/);
+  for (const receiver of ["slice_df[1]", 'slice_df["alpha"]', "slice_df[slice_name]",
+    "slice_df[1][1]", 'slice_frames$frame[1]["alpha"]']) {
+    const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver, "["));
+    assert.equal(result.bracketKind, "data.frame", receiver);
+    assert.deepEqual(result.names, ["alpha"], receiver);
+    for (const [suffix, expected] of [['[, j = "a│', 'alpha'], ['[i = a│', '"alpha"'],
+      ['[i = a│, ]', undefined]]) {
+      const marked = receiver + suffix;
+      const cursor = marked.indexOf("│"), input = marked.replace("│", "");
+      const entries = await completion.collectCompletionEntries(
+        completion.getCompletionContext(input, cursor), undefined, undefined, undefined, [], [], undefined,
+        (expression, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
+      assert.equal(entries.find(entry => entry.label === "alpha")?.insertText, expected, input);
+    }
+  }
+  const ordinarySlice = await backend.inspectMemberNames(session, parseRuntimeMemberQuery("slice_list[1]", "["));
+  assert.equal(ordinarySlice.bracketKind, undefined, "list slices must not acquire data-frame semantics");
+  for (const receiver of ["slice_expr[1]", 'slice_expr["inner"]', "slice_expr[slice_expr_name]",
+    "slice_expr[1][1]", 'slice_expr[1]["inner"]']) {
+    const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(receiver));
+    assert.equal(result.status, "available", receiver);
+    assert.deepEqual(result.names, ["inner"], receiver);
+    assert.equal(result.bracketKind, undefined, receiver);
+    const input = receiver + "$in";
+    const entries = await completion.collectCompletionEntries(
+      completion.getCompletionContext(input, input.length), undefined, undefined, undefined, [], [], undefined,
+      (expression, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
+    assert.deepEqual(entries.map(entry => entry.insertText), ["inner"], input);
+  }
   assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt")), ["alpha", "beta"]);
   assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt[[1]]")), []);
   assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_list[1][[1]]")), ["child"]);

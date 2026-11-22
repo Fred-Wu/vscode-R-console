@@ -785,6 +785,19 @@ impl Native {
         Ok(Members { names, kinds, bracket_kind: 0 })
     }
 
+    unsafe fn bracket_kind(&self, value: Sexp) -> Result<u8, Suppression> {
+        let classes = self.classes(value)?;
+        // Custom subclasses can override bracket semantics. Only exact
+        // built-in class sequences supply installed method metadata.
+        Ok(if classes.len() == 2 && classes[0] == "data.table" && classes[1] == "data.frame" {
+            2
+        } else if classes.len() == 1 && classes[0] == "data.frame" {
+            1
+        } else {
+            0
+        })
+    }
+
     unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
         self.check_deadline()?;
         if value == self.nil { return Ok(Members::empty()); }
@@ -826,17 +839,7 @@ impl Native {
             Members::empty()
         };
         if target == Target::Bracket {
-            let classes = self.classes(value)?;
-            // Custom subclasses can override bracket semantics. Only exact
-            // built-in class sequences supply installed method metadata.
-            members.bracket_kind = if classes.len() == 2 &&
-                classes[0] == "data.table" && classes[1] == "data.frame" {
-                2
-            } else if classes.len() == 1 && classes[0] == "data.frame" {
-                1
-            } else {
-                0
-            };
+            members.bracket_kind = self.bracket_kind(value)?;
         }
         Ok(members)
     }
@@ -1099,19 +1102,23 @@ impl Native {
                     }
                     View::Slice { source, index } => {
                         if query.target == Target::Slot { return Ok(Members::empty()); }
-                        if query.target == Target::Dollar && (self.type_of)(source) != VECTOR {
+                        let type_ = (self.type_of)(source);
+                        if query.target == Target::Dollar && !matches!(type_, VECTOR | EXPRESSION) {
                             return Ok(Members::empty());
                         }
                         let names: Vec<String> = self.name_at(source, index)?.into_iter().collect();
-                        let kind = if (self.type_of)(source) == VECTOR && self.ordinary_dispatch(source)? {
-                            self.item(source, index)?.map(|stored| match (self.type_of)(stored) {
-                                CLOSURE | SPECIAL | BUILTIN => 1,
-                                PROMISE => 3,
-                                _ => 0,
-                            }).unwrap_or(0)
+                        let kind = if matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(source)? {
+                            self.item(source, index)?.map(|stored| self.stored_kind(stored)).unwrap_or(0)
                         } else { 0 };
                         let kinds = names.iter().map(|_| kind).collect();
-                        Ok(Members { names, kinds, bracket_kind: 0 })
+                        // Supported one-column data.frame slices retain their
+                        // class, including repeated slices of the same view.
+                        // step() rejects custom dispatch and data.table slices
+                        // before creating a view; no extraction method runs here.
+                        let bracket_kind = if query.target == Target::Bracket {
+                            self.bracket_kind(source)?
+                        } else { 0 };
+                        Ok(Members { names, kinds, bracket_kind })
                     }
                 }
             }
