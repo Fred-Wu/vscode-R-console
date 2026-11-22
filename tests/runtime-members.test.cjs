@@ -121,6 +121,17 @@ test("real embedded R completion inspects nested storage without running user co
   assert.equal(frameBracket.bracketKind, "data.frame");
   assert.deepEqual(frameBracket.names, ["a b"]);
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "missing" }]), available([]));
+  await submit('missing_names <- setNames(list(list(wrong = 1), list(right = 2), list(child = 3)), c(NA_character_, "NA", "inner")); missing_index <- NA_character_; literal_index <- "NA"; stopifnot(identical(names(missing_names[["NA"]]), "right"), is.null(missing_names[[missing_index]]), identical(names(missing_names$inn), "child"))');
+  assert.deepEqual(await inspect("missing_names"), available(["NA", "inner"]));
+  for (const step of [{ kind: "named-index", name: "NA" }, { kind: "field", name: "NA" },
+    { kind: "variable-index", name: "literal_index" }]) {
+    assert.deepEqual(await inspect("missing_names", [step]), available(["right"]));
+  }
+  for (const kind of ["variable-index", "variable-slice"]) {
+    assert.deepEqual(await inspect("missing_names", [{ kind, name: "missing_index" }]), available([]));
+  }
+  assert.deepEqual(await inspect("missing_names", [{ kind: "field", name: "inn" }]), available(["child"]));
+  assert.deepEqual(await inspect("missing_names", [{ kind: "slice-index", index: 1 }]), available([]));
   await submit('obj$inner <- list(changed = TRUE)');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["changed"]));
 

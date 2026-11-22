@@ -147,6 +147,7 @@ pub(crate) struct InspectorApi {
     global_env: usize,
     unbound: usize,
     nil: usize,
+    na_string: usize,
     names: usize,
     ls3: Option<usize>,
     ls2: Option<usize>,
@@ -192,6 +193,7 @@ impl InspectorApi {
             global_env: symbol(b"R_GlobalEnv\0")?,
             unbound: symbol(b"R_UnboundValue\0")?,
             nil: symbol(b"R_NilValue\0")?,
+            na_string: symbol(b"R_NaString\0")?,
             names: symbol(b"R_NamesSymbol\0")?,
             ls3: symbol(b"R_lsInternal3\0"),
             ls2: symbol(b"R_lsInternal\0"),
@@ -423,6 +425,7 @@ struct Native {
     envlength: Option<unsafe extern "C" fn(Sexp) -> c_int>,
     global: Sexp,
     nil: Sexp,
+    na_string: Sexp,
     unbound: Sexp,
     names: Sexp,
     class: Sexp,
@@ -472,6 +475,7 @@ impl Native {
             envlength: api.envlength.map(|_| guard_envlength as _),
             global,
             nil,
+            na_string: *(api.na_string as *const Sexp),
             unbound: *(api.unbound as *const Sexp),
             names: *(api.names as *const Sexp),
             class: *(api.class_symbol as *const Sexp),
@@ -485,7 +489,9 @@ impl Native {
     }
 
     unsafe fn text(&self, value: Sexp) -> Option<String> {
-        if value.is_null() || value == self.nil || (self.type_of)(value) != CHAR {
+        // NA_STRING prints as "NA", but is never a literal member name or
+        // character selector. Preserve that distinction before translation.
+        if value.is_null() || value == self.nil || value == self.na_string || (self.type_of)(value) != CHAR {
             return None;
         }
         // XLENGTH on CHARSXP gives its stored byte length. Check before UTF-8
@@ -514,9 +520,8 @@ impl Native {
         let mut names = Vec::new();
         for index in 0..size {
             if index % 32 == 0 { self.check_deadline()?; }
-            if let Some(name) = self.text((self.string_elt)(class, index)) {
-                names.push(name);
-            }
+            names.push(self.text((self.string_elt)(class, index))
+                .ok_or(Suppression::UnsafeDispatch)?);
         }
         Ok(names)
     }
@@ -787,7 +792,11 @@ impl Native {
             if len < 0 { return Ok(None); }
             for index in 0..len.min(MAX_SCANNED_ENTRIES as isize) {
                 if index % 32 == 0 { self.check_deadline()?; }
-                if matches(self.text((self.string_elt)(names, index)), index as usize) {
+                let stored = (self.string_elt)(names, index);
+                // A missing name is a known non-match, not an undecodable
+                // name that might conceal another partial match.
+                if stored == self.na_string { continue; }
+                if matches(self.text(stored), index as usize) {
                     return Ok(Some(index as usize));
                 }
             }
