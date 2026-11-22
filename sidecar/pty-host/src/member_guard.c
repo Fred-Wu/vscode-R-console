@@ -30,10 +30,11 @@ typedef struct {
   int initialized;
 } RmgGuard;
 #if defined(_MSC_VER)
-static __declspec(thread) RmgGuard rmg_guard;
+#define RMG_THREAD_LOCAL __declspec(thread)
 #else
-static _Thread_local RmgGuard rmg_guard;
+#define RMG_THREAD_LOCAL _Thread_local
 #endif
+static RMG_THREAD_LOCAL RmgGuard rmg_guard;
 
 typedef struct {
   int method;
@@ -190,8 +191,10 @@ int rmg_end(void) {
 
 // A test-only local longjmp simulates an R error/interrupt inside a C frame.
 // Also verify the guard works on the next request after an error.
-static jmp_buf rmg_test_jmp;
-static int rmg_test_inside_callback;
+// Rust runs tests in parallel: fake jump targets and all fixture state must
+// remain private to each thread, just like the production guard.
+static RMG_THREAD_LOCAL jmp_buf rmg_test_jmp;
+static RMG_THREAD_LOCAL int rmg_test_inside_callback;
 static int rmg_test_toplevel(void (*fn)(void *), void *data) {
   if (setjmp(rmg_test_jmp)) { rmg_test_inside_callback = 0; return 0; }
   rmg_test_inside_callback = 1;
@@ -222,8 +225,8 @@ int rmg_test_error_and_recovery(void) {
 /* Test-only native functions check that PROTECT/UNPROTECT are balanced inside
    one C callback, that the returned vector remains preserved across calls,
    and that rmg_end releases any outstanding values after an error. */
-static int rmg_test_temp_protects, rmg_test_temp_unprotects;
-static int rmg_test_preserves, rmg_test_releases, rmg_test_order_error;
+static RMG_THREAD_LOCAL int rmg_test_temp_protects, rmg_test_temp_unprotects;
+static RMG_THREAD_LOCAL int rmg_test_preserves, rmg_test_releases, rmg_test_order_error;
 static RmgSexp rmg_test_ls2(RmgSexp env, int all) {
   (void)env; (void)all;
   return (RmgSexp)(uintptr_t)0x5678;
@@ -294,8 +297,8 @@ int rmg_test_enumeration_protection(void) {
 // Exercise transient R_alloc cleanup without requiring a linked R runtime.
 // A fake translator invalidates its scratch buffer when vmaxset restores it:
 // the returned bytes must already be copied into caller-owned storage.
-static int rmg_test_vmax_gets, rmg_test_vmax_sets;
-static char rmg_test_utf8_scratch[32];
+static RMG_THREAD_LOCAL int rmg_test_vmax_gets, rmg_test_vmax_sets;
+static RMG_THREAD_LOCAL char rmg_test_utf8_scratch[32];
 static void *rmg_test_vmaxget(void) {
   ++rmg_test_vmax_gets;
   return rmg_test_utf8_scratch;

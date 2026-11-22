@@ -58,6 +58,27 @@ test("runtime completion logs deduplicate each reason and context across prefixe
   assert.match(lines[3], /No inspection result was used/);
 });
 
+test("unsupported subscript diagnostics remain deduplicated while typing", () => {
+  const lines = [];
+  const { logConsoleCompletionDecision } = loadSource("src/Language/completion/outputChannel.ts", {
+    vscode: { window: { createOutputChannel: () => ({
+      appendLine: text => lines.push(text), dispose() {},
+    }) } },
+  });
+  const { completionDecisionContext } = loadSource("src/Language/completion/diagnostics.ts");
+  const rejected = { kind: "Rejected", reason: "executable-receiver" };
+  const scope = "subscript-regression";
+  for (const input of ["make_object()[[", "make_object()[[a", "make_object()[[al", "make_object()[[alp"]) {
+    assert.equal(completionDecisionContext(input), "make_object()[[");
+    logConsoleCompletionDecision(rejected, completionDecisionContext(input), scope);
+  }
+  assert.equal(lines.length, 1);
+  assert.equal(completionDecisionContext("make_object()$inner[[al"), "make_object()$inner[[");
+  assert.equal(completionDecisionContext("task$data()$abc"), "task$data()$");
+  logConsoleCompletionDecision(rejected, completionDecisionContext("other()[[al"), scope);
+  assert.equal(lines.length, 2, "a different rejected receiver gets its own diagnostic");
+});
+
 test("runtime completion decisions are deduplicated separately for each console", () => {
   const lines = [];
   const { logConsoleCompletionDecision, noteConsoleCompletionContext, clearCompletionDiagnosticsScope } =

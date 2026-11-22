@@ -1000,6 +1000,23 @@ mod tests {
     }
 
     #[test]
+    fn native_guard_tests_are_thread_isolated() {
+        // C-only jump, protection and temporary-memory fixtures must work
+        // correctly while other Rust test threads run concurrently.
+        std::thread::scope(|threads| {
+            for _ in 0..8 {
+                threads.spawn(|| {
+                    for _ in 0..30 {
+                        assert_eq!(unsafe { rmg_test_error_and_recovery() }, 1);
+                        assert_eq!(unsafe { rmg_test_enumeration_protection() }, 1);
+                        assert_eq!(unsafe { rmg_test_utf8_copy_and_transient_cleanup() }, 1);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn structured_paths_and_targets() {
         let mut bytes = vec![3, 3];
         name("obj", &mut bytes);

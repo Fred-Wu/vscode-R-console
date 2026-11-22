@@ -25,5 +25,12 @@ export function formatCompletionDecision(decision: CompletionDecision): string {
 }
 
 export function completionDecisionContext(text: string): string {
-  return text.replace(/([$@])[^$@]*$/, "$1");
+  // Keep one identity while a rejected receiver's member or subscript prefix
+  // grows. Prefer the final unfinished bracket over an earlier $/@ accessor.
+  const bracket = /(\[\[?)[^\[\]]*$/.exec(text);
+  const member = /([$@])[^$@]*$/.exec(text);
+  if (bracket && (!member || bracket.index > member.index)) {
+    return text.slice(0, bracket.index + bracket[1].length);
+  }
+  return member ? text.slice(0, member.index + 1) : text;
 }

@@ -53,6 +53,36 @@ test("unsupported executable receivers with keyword prefixes cannot fall back to
   }
 });
 
+test("unsupported bracket receivers reject unrelated global fallback without inspecting R", async () => {
+  for (const marked of [
+    "make_object()[[│", "make_object()[[al│", "make_object()[al│",
+    "make_object()[[in│", "make_object()[[al│]]",
+    "obj[[choose_index()]][[al│", "make_object()$inner[[al│",
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context?.rejectionReason, "executable-receiver", marked);
+    assert.notEqual(context.kind, "default", marked);
+    const entries = await completion.collectCompletionEntries(context,
+      { getText: () => marked.replace("│", "") },
+      { line: 0, character: marked.indexOf("│") },
+      { globalenv: { alpha: { type: "double" }, algorithm: { type: "double" } } },
+      [], [], { provideCompletionItems: () => assert.fail("no LSP fallback for rejected receiver") },
+      () => assert.fail("no R inspection for rejected receiver"));
+    assert.deepEqual(entries, [], marked);
+  }
+  for (const marked of [
+    "obj[[1]][[│", "obj[[1]][[al│", "obj[[i]][[al│",
+    "obj$inner[[al│", "df[, al│", "outer(obj[[al│",
+  ]) {
+    const context = contextAt(marked);
+    assert.equal(context?.kind, "bracket", marked);
+    assert.equal(context.rejectionReason, undefined, marked);
+  }
+  const computedIndex = contextAt("obj[[i + al│");
+  assert.equal(computedIndex?.rejectionReason, undefined,
+    "typing within a computed index may still complete ordinary variable names");
+});
+
 test("bracket contexts retain the complete object, active dimension and quoted prefix", () => {
   for (const [marked, object, prefix, dimension, dimensions] of [
     ["obj[[│]]", "obj", "", 0, 1], ["obj[[\"a b│\"]]", "obj", "a b", 0, 1],

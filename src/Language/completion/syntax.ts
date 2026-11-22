@@ -31,6 +31,29 @@ function hasUnsupportedMemberReceiver(before: string): boolean {
     before.slice(preceding.position + preceding.value.length, last.position).trim().length === 0;
 }
 
+/** An unfinished subscript on an unsupported receiver must not fall back
+ * to unrelated global symbols. Valid bracket contexts return earlier.
+ */
+function hasUnsupportedBracketReceiver(before: string): boolean {
+  if (!before.includes("[")) return false;
+  const openings: { delimiter: string; position: number }[] = [];
+  const matching: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  for (const token of tokenize(before)) {
+    if (token.type === TokenType.LeftBracket || token.type === TokenType.LeftParen ||
+        token.type === TokenType.LeftBrace) {
+      for (const delimiter of token.value) openings.push({ delimiter, position: token.position });
+    } else if (token.type === TokenType.RightBracket || token.type === TokenType.RightParen ||
+        token.type === TokenType.RightBrace) {
+      for (const delimiter of token.value) {
+        if (openings.pop()?.delimiter !== matching[delimiter]) return false;
+      }
+    }
+  }
+  const active = openings.at(-1);
+  return active?.delimiter === "[" &&
+    parseRuntimeMemberQuery(before.slice(0, active.position)) === undefined;
+}
+
 export function getCompletionContext(
   inputBuffer: string,
   cursorPosition: number,
@@ -121,6 +144,19 @@ export function getCompletionContext(
       bracketArgumentName: bracket.argumentName,
       dataObjectName: effectiveDataObject,
       operator: undefined,
+      snapshotInput,
+      snapshotCursor,
+    };
+  }
+
+  // If the bracket parser refused an executable receiver, do not reinterpret
+  // its unfinished index as an unrelated global-symbol completion.
+  if (!inLiteral && hasUnsupportedBracketReceiver(textForDataContext)) {
+    return {
+      kind: "member",
+      prefix: "",
+      replaceStart: beforeCursor.length,
+      rejectionReason: "executable-receiver",
       snapshotInput,
       snapshotCursor,
     };
