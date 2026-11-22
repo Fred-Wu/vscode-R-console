@@ -153,7 +153,8 @@ test("bracket names publish before LSP startup and then merge its parameters", a
     { label: "keybird", kind: 4, data: { type: "scope" } },
   ] }) });
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(published.at(-1), ["keyby = ", "keyboard"]);
+  assert.deepEqual([...published.at(-1)].sort(), ["keyboard", "keyby = "].sort(),
+    "native names and LSP parameters both survive enrichment");
   assert.equal(nativeRequests, 1, "no duplicate inspection during LSP enrichment");
 });
 

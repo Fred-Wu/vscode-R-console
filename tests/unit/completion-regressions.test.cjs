@@ -447,7 +447,7 @@ test("member chains never request live runtime inspectors", async () => {
       undefined, [], ['alpha_unrelated <- 1'], undefined,
       async () => assert.fail("must not call live member completion"),
       'alpha_unrelated', async () => assert.fail("must not call nested child inspection"));
-    assert.deepEqual(entries, [], marked);
+    assert.equal(entries.length, 0, marked);
   }
 });
 
@@ -505,7 +505,7 @@ test("named subscript values do not invent cached columns", async () => {
     const entries = await completion.collectCompletionEntries(context, undefined, undefined,
       { globalenv: { DT: { class: ['data.table', 'data.frame'], names: ['alpha'] } } }, [], [], undefined,
       async () => assert.fail("bracket completion must not query sess"));
-    assert.deepEqual(entries, [], marked);
+    assert.equal(entries.length, 0, marked);
   }
 });
 
