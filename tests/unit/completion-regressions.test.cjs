@@ -441,13 +441,24 @@ test("typed indices preserve expression variables including self references", as
   }
 });
 
-test("member chains never request live runtime inspectors", async () => {
-  for (const marked of ['lst[[1]]$│', 'lst[[1]]$al│', 'obj$│', 'obj@│']) {
+test("stored member chains request only guarded native inspection, without ambient fallback", async () => {
+  for (const [marked, receiver, operator] of [
+    ['lst[[1]]$│', 'lst[[1]]', '$'],
+    ['lst[[1]]$al│', 'lst[[1]]', '$'],
+    ['obj$│', 'obj', '$'],
+    ['obj@│', 'obj', '@'],
+  ]) {
+    const requested = [];
     const entries = await completion.collectCompletionEntries(contextAt(marked), undefined, undefined,
-      undefined, [], ['alpha_unrelated <- 1'], undefined,
-      async () => assert.fail("must not call live member completion"),
-      'alpha_unrelated', async () => assert.fail("must not call nested child inspection"));
-    assert.equal(entries.length, 0, marked);
+      { globalenv: { alpha_unrelated: { type: 'double' } } },
+      [], ['alpha_unrelated <- 1'], undefined,
+      async (expression, target) => {
+        requested.push([expression, target]);
+        return { status: 'available', names: ['alpha'] };
+      });
+    assert.deepEqual(requested, [[receiver, operator]], marked);
+    assert.deepEqual(entries.map(entry => entry.label), ['alpha'], marked);
+    assert.ok(entries.every(entry => entry.source === 'session'), marked);
   }
 });
 
@@ -499,25 +510,35 @@ test("subscript contexts keep names, values and quoted options distinct", () => 
   }
 });
 
-test("named subscript values do not invent cached columns", async () => {
+test("named subscript values do not invent cached columns when inspection is unavailable", async () => {
+  const requested = [];
   for (const marked of ['DT[, mult = │]', 'DT[, mult = "│"]']) {
     const context = contextAt(marked);
     const entries = await completion.collectCompletionEntries(context, undefined, undefined,
       { globalenv: { DT: { class: ['data.table', 'data.frame'], names: ['alpha'] } } }, [], [], undefined,
-      async () => assert.fail("bracket completion must not query sess"));
+      async (expression, target) => {
+        requested.push([expression, target]);
+        return { status: 'unavailable' };
+      });
     assert.equal(entries.length, 0, marked);
   }
+  assert.deepEqual(requested, [['DT', '['], ['DT', '[']]);
 });
 
-test("cached member names do not run live object inspectors", async () => {
+test("cached top-level member names remain available when native inspection is unavailable", async () => {
   const session = { globalenv: { obj: { names: ['alpha'], slots: ['alpha'] } } };
+  const requested = [];
   for (const text of ['obj$', 'obj$al', 'obj@al']) {
     const entries = await completion.collectCompletionEntries(
       completion.getCompletionContext(text, text.length),
       undefined, undefined, session, [], [], undefined,
-      async () => assert.fail("automatic completion must not execute R methods"));
+      async (expression, target) => {
+        requested.push([expression, target]);
+        return { status: 'unavailable' };
+      });
     assert.deepEqual(entries.map(entry => entry.label), ['alpha'], text);
   }
+  assert.deepEqual(requested, [['obj', '$'], ['obj', '$'], ['obj', '@']]);
 });
 
 test("subscript supplements preserve symbols and fields supplied by the R provider", async () => {

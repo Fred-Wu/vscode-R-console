@@ -114,7 +114,11 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("duplicate", [], "$"), available(["same"]));
   assert.deepEqual(await inspect("duplicate", [{ kind: "slice-index", index: 2 }]), available(["same"]));
   assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["empty", "inner"]);
+  const envBracket = await inspectTyped("env", [], "[[");
+  assert.equal(envBracket.status, "available");
+  assert.deepEqual([...envBracket.names].sort(), ["empty", "inner"]);
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "inner" }]), available(["value"]));
+  assert.deepEqual(await inspect("env", [{ kind: "named-index", name: "inner" }]), available(["value"]));
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "empty" }]), available([]));
   output = "";
   await submit('cat("S4_READY:", exists("s4", envir = .GlobalEnv, inherits = FALSE), if (exists("s4", envir = .GlobalEnv, inherits = FALSE)) isS4(s4) else FALSE, if (exists("s4", envir = .GlobalEnv, inherits = FALSE)) paste(names(attributes(s4)), collapse = ",") else "", "\\n")');
@@ -129,6 +133,11 @@ test("real embedded R completion inspects nested storage without running user co
   await submit('makeActiveBinding("active_child", function() { hits <<- hits + 1L; list(secret = 1) }, env); delayedAssign("pending_idx", { hits <<- hits + 1L; 1L })');
   assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["active_child", "empty", "inner"]);
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "active_child" }]),
+    { status: "suppressed", reason: "active-binding" });
+  const envBracketActive = await inspectTyped("env", [], "[[");
+  assert.equal(envBracketActive.status, "available");
+  assert.equal(envBracketActive.kinds[envBracketActive.names.indexOf("active_child")], 2);
+  assert.deepEqual(await inspect("env", [{ kind: "named-index", name: "active_child" }]),
     { status: "suppressed", reason: "active-binding" });
   assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "pending_idx" }]),
     { status: "suppressed", reason: "deferred-binding" });
@@ -168,6 +177,8 @@ test("real embedded R completion inspects nested storage without running user co
   // A nested promise must be suppressed without running its initializer.
   await submit('delayedAssign("lazy", { hits <<- hits + 1L; list(inner = 42) }, assign.env = env)');
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "lazy" }]),
+    { status: "suppressed", reason: "deferred-binding" });
+  assert.deepEqual(await inspect("env", [{ kind: "named-index", name: "lazy" }]),
     { status: "suppressed", reason: "deferred-binding" });
   // Test the native response and frontend logging together for the exact
   // nested delayed-value scenario that previously produced no log.

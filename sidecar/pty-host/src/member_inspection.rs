@@ -696,7 +696,7 @@ impl Native {
             } else { Ok(Members::empty()) };
         }
         if kind == ENV {
-            return if target == Target::Dollar {
+            return if matches!(target, Target::Dollar | Target::DoubleBracket) {
                 self.classify_unindexed(value, target, self.environment_names(value)?)
             } else { Ok(Members::empty()) };
         }

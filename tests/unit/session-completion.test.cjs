@@ -34,6 +34,21 @@ test("nested objects cannot trigger live extraction or hover", async () => {
   }
 });
 
+test("stored environment fields complete through the guarded double-bracket path", async () => {
+  const text = "env[[";
+  const requested = [];
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(text, text.length), undefined, undefined,
+    undefined, [], [], undefined, async (receiver, target) => {
+      requested.push([receiver, target]);
+      return { status: "available", names: ["child", "a b"], kinds: [0, 0] };
+    });
+  assert.deepEqual(requested, [["env", "[["]]);
+  assert.deepEqual(entries.map(item => [item.label, item.insertText]), [
+    ["child", '"child"'], ["a b", '"a b"'],
+  ]);
+});
+
 test("LSP source-inferred nested members remain available in opt-in static mode", async () => {
   const input = "obj$inner$";
   const entries = await completion.collectCompletionEntries(
@@ -47,21 +62,25 @@ test("LSP source-inferred nested members remain available in opt-in static mode"
   assert.deepEqual(entries.map(item => item.label), ["alpha"]);
 });
 
-test("truncated workspace names never cause child-page requests", async () => {
+test("truncated workspace cache remains bounded if guarded member inspection is unavailable", async () => {
   const names = Array.from({ length: 1501 }, (_, i) => "field" + String(i).padStart(4, "0"));
   const workspace = { globalenv: { df: {
     class: ["data.frame"], type: "list", length: names.length, names: names.slice(0, 1000),
   } } };
-  const reject = async () => assert.fail("child paging must not run");
+  const requested = [];
   for (const [input, label, present] of [
     ["df[[field000", "field0000", true],
     ["df[[field1500", "field1500", false],
   ]) {
     const entries = await completion.collectCompletionEntries(
       completion.getCompletionContext(input, input.length), undefined, undefined,
-      workspace, [], [], undefined, reject, undefined, reject);
+      workspace, [], [], undefined, async (expression, target) => {
+        requested.push([expression, target]);
+        return { status: "unavailable" };
+      });
     assert.equal(entries.some(item => item.label === label), present, input);
   }
+  assert.deepEqual(requested, [["df", "[["], ["df", "[["]]);
 });
 
 test("safe existing-session nested members override runtime-only LSP and retain quoting", async () => {
