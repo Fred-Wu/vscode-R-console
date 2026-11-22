@@ -196,6 +196,22 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("large_env"), available([]));
   assert.deepEqual(await inspect("large_pair"), available([]));
   assert.deepEqual(await inspect("large_pair", [{ kind: "field", name: "late" }]), available([]));
+  // A wide list must classify each member in a single pass, without repeatedly
+  // looking up each name in the R thread. Include a callable at the last index.
+  await submit('wide <- as.list(seq_len(999L)); names(wide) <- sprintf("column_%04d", seq_len(999L)); wide$method <- function() TRUE');
+  const wideMembers = await inspectTyped("wide");
+  assert.equal(wideMembers.status, "available");
+  assert.equal(wideMembers.names.length, 1000);
+  assert.equal(wideMembers.kinds[wideMembers.names.indexOf("method")], 1);
+  assert.ok(wideMembers.names.includes("column_0999"));
+
+  // Submitting R code invalidates stale completion work; inspecting the new
+  // state must not be delayed by requests queued for the previous state.
+  const obsolete = Array.from({ length: 12 }, () => inspectTyped("wide"));
+  await submit('submission_priority <- list(ready = TRUE)');
+  await Promise.all(obsolete);
+  assert.deepEqual(await inspect("submission_priority"), available(["ready"]));
+
   // Ordinary safe environments still complete within the preflight budget.
   assert.ok((await inspect("env")).names.includes("inner"));
   await submit('escaped <- list(); escaped[["a\\\"b"]] <- list(inner = TRUE)');

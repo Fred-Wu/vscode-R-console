@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 type Sexp = *mut c_void;
@@ -484,23 +485,39 @@ impl Native {
         Ok(Some(value))
     }
 
-    unsafe fn vector_names(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
-        if value == self.nil { return Ok(Vec::new()); }
-        if (self.type_of)(value) == 9 { return Ok(Vec::new()); }
+    // Collect names and stored-member kinds in the same linear pass. Looking
+    // each name up again would rescan all preceding names on wide data frames.
+    unsafe fn stored_kind(&self, value: Sexp) -> u8 {
+        if value.is_null() || value == self.nil || value == self.unbound { return 0; }
+        match (self.type_of)(value) {
+            CLOSURE | SPECIAL | BUILTIN => 1,
+            PROMISE => 3,
+            _ => 0,
+        }
+    }
+
+    unsafe fn vector_members(&self, value: Sexp) -> Result<Members, Suppression> {
+        if value == self.nil || (self.type_of)(value) == 9 { return Ok(Members::empty()); }
         let names = (self.get_attrib)(value, self.names);
-        if names == self.nil { return Ok(Vec::new()); }
-        if (self.type_of)(names) != STRING { return Ok(Vec::new()); }
+        if names == self.nil || (self.type_of)(names) != STRING { return Ok(Members::empty()); }
         if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
         let length = (self.xlength)(names);
-        if length < 0 { return Ok(Vec::new()); }
-        let mut result = Vec::new();
+        if length < 0 { return Ok(Members::empty()); }
+        let type_ = (self.type_of)(value);
+        let direct = matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(value)?;
+        let mut members = Members::empty();
+        let mut seen = HashSet::new();
         for index in 0..length.min(MAX_NAMES as isize) {
             let Some(name) = self.text((self.string_elt)(names, index)) else { continue; };
-            if !name.is_empty() && name.len() <= MAX_NAME_BYTES && !result.contains(&name) {
-                result.push(name);
-            }
+            if name.is_empty() || name.len() > MAX_NAME_BYTES || !seen.insert(name.clone()) { continue; }
+            let kind = if direct {
+                self.item(value, index as usize)?
+                    .map(|stored| self.stored_kind(stored)).unwrap_or(0)
+            } else { 0 };
+            members.names.push(name);
+            members.kinds.push(kind);
         }
-        Ok(result)
+        Ok(members)
     }
 
     unsafe fn name_at(&self, value: Sexp, index: usize) -> Result<Option<String>, Suppression> {
@@ -512,23 +529,30 @@ impl Native {
         Ok(self.text((self.string_elt)(names, index as isize)))
     }
 
-    unsafe fn pair_names(&self, value: Sexp) -> Vec<String> {
+    unsafe fn pair_members(&self, value: Sexp) -> Result<Members, Suppression> {
         let mut cursor = value;
-        let mut names = Vec::new();
+        let mut members = Members::empty();
+        let mut seen = HashSet::new();
         let mut scanned = 0;
-        while cursor != self.nil && names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
+        let type_ = (self.type_of)(value);
+        let direct = matches!(type_, LIST | LANGUAGE) && self.ordinary_dispatch(value)?;
+        while cursor != self.nil && members.names.len() < MAX_NAMES && scanned < MAX_SCANNED_ENTRIES {
             scanned += 1;
             let tag = (self.tag)(cursor);
             if tag != self.nil {
                 if let Some(name) = self.text((self.printname)(tag)) {
-                    if !name.is_empty() && name.len() <= MAX_NAME_BYTES && !names.contains(&name) {
-                        names.push(name);
+                    if !name.is_empty() && name.len() <= MAX_NAME_BYTES && seen.insert(name.clone()) {
+                        let kind = if direct {
+                            self.car.map(|car| self.stored_kind(car(cursor))).unwrap_or(0)
+                        } else { 0 };
+                        members.names.push(name);
+                        members.kinds.push(kind);
                     }
                 }
             }
             cursor = (self.cdr)(cursor);
         }
-        names
+        Ok(members)
     }
 
     unsafe fn slot_names(&self, value: Sexp) -> Vec<String> {
@@ -581,31 +605,38 @@ impl Native {
         result
     }
 
-    unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Vec<String>, Suppression> {
-        if value == self.nil { return Ok(Vec::new()); }
+    unsafe fn classify_unindexed(&self, value: Sexp, target: Target, names: Vec<String>)
+        -> Result<Members, Suppression> {
+        let mut kinds = Vec::with_capacity(names.len());
+        for name in &names {
+            kinds.push(self.member_kind(value, target, name)?);
+        }
+        Ok(Members { names, kinds })
+    }
+
+    unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
+        if value == self.nil { return Ok(Members::empty()); }
         let kind = (self.type_of)(value);
         if target == Target::Slot {
-            if (self.is_s4)(value) != 0 || self.is_s7(value)? {
-                return Ok(self.slot_names(value));
-            }
-            return Ok(Vec::new());
+            return if (self.is_s4)(value) != 0 || self.is_s7(value)? {
+                self.classify_unindexed(value, target, self.slot_names(value))
+            } else { Ok(Members::empty()) };
         }
         if kind == ENV {
-            if target == Target::Dollar {
-                return self.environment_names(value);
-            }
-            return Ok(Vec::new());
+            return if target == Target::Dollar {
+                self.classify_unindexed(value, target, self.environment_names(value)?)
+            } else { Ok(Members::empty()) };
         }
         if target == Target::Dollar && !matches!(kind, VECTOR | EXPRESSION | LIST | LANGUAGE) {
-            return Ok(Vec::new());
+            return Ok(Members::empty());
         }
         if matches!(kind, LIST | LANGUAGE | DOTS) {
-            return Ok(self.pair_names(value));
+            return self.pair_members(value);
         }
         if matches!(kind, VECTOR | EXPRESSION | LOGICAL | INTEGER | REAL | COMPLEX | STRING | RAW) {
-            return self.vector_names(value);
+            return self.vector_members(value);
         }
-        Ok(Vec::new())
+        Ok(Members::empty())
     }
 
     unsafe fn index_of(&self, value: Sexp, name: &str) -> Result<Option<usize>, Suppression> {
@@ -782,20 +813,10 @@ impl Native {
             if (self.is_s4)(value) == 0 { return Ok(0); }
             let Some(symbol) = self.symbol(name) else { return Ok(0); };
             (self.get_attrib)(value, symbol)
-        } else if matches!(kind, VECTOR | EXPRESSION | LIST | LANGUAGE) &&
-            self.ordinary_dispatch(value)? {
-            let Some(index) = self.index_of(value, name)? else { return Ok(0); };
-            let Some(stored) = self.item(value, index)? else { return Ok(0); };
-            stored
         } else {
             return Ok(0);
         };
-        if stored.is_null() || stored == self.unbound || stored == self.nil { return Ok(0); }
-        Ok(match (self.type_of)(stored) {
-            CLOSURE | SPECIAL | BUILTIN => 1,
-            PROMISE => 3,
-            _ => 0,
-        })
+        Ok(self.stored_kind(stored))
     }
 
     unsafe fn inspect(&self, query: &MemberQuery) -> Result<Members, Suppression> {
@@ -818,12 +839,7 @@ impl Native {
                 match current {
                     View::Object(value) => {
                         if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
-                        let names = self.names_for(value, query.target)?;
-                        let mut kinds = Vec::with_capacity(names.len());
-                        for name in &names {
-                            kinds.push(self.member_kind(value, query.target, name)?);
-                        }
-                        Ok(Members { names, kinds })
+                        self.names_for(value, query.target)
                     }
                     View::Slice { source, index } => {
                         if query.target == Target::Slot { return Ok(Members::empty()); }

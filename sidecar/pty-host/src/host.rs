@@ -30,6 +30,8 @@ mod unix_host {
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    // A result older than the frontend deadline cannot be applied to the input.
+    const MEMBER_REQUEST_TTL: Duration = Duration::from_millis(450);
     const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
 
@@ -176,7 +178,7 @@ mod unix_host {
         Submit(VecDeque<Vec<u8>>),
         Reply(Vec<u8>),
         ParseStatus { request_id: u32, code: String },
-        MemberNames { request_id: u32, query: MemberQuery },
+        MemberNames { request_id: u32, query: MemberQuery, queued_at: Instant },
     }
 
     enum WaitKind {
@@ -624,10 +626,17 @@ mod unix_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
+            // A submission supersedes pending completion work, not vice versa.
+            let cancelled = discard_queued_member_requests(&mut state);
             state
                 .pending_commands
                 .push_back(PendingCommand::Submit(split_submission_lines(&code)));
             runtime.cv.notify_all();
+            drop(state);
+            for request_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    request_id, &member_inspection::Inspection::Unavailable);
+            }
         }
     }
 
@@ -663,31 +672,55 @@ mod unix_host {
     }
 
 
+    // Only the latest queued request can still match the user's current input.
+    // Return an unavailable result for displaced requests so callers never hang.
+    fn discard_queued_member_requests(state: &mut SharedState) -> Vec<u32> {
+        let cancelled = state.pending_commands.iter().filter_map(|command| {
+            match command {
+                PendingCommand::MemberNames { request_id, .. } => Some(*request_id),
+                _ => None,
+            }
+        }).collect();
+        state.pending_commands.retain(|command|
+            !matches!(command, PendingCommand::MemberNames { .. }));
+        cancelled
+    }
+
     fn queue_member_names(request_id: u32, query: MemberQuery) {
         let Some(runtime) = host_runtime() else { return };
         let mut state = runtime.state.lock().expect("host state lock poisoned");
+        let cancelled = discard_queued_member_requests(&mut state);
         let idle = !state.busy && !state.shutdown_requested &&
             !state.startup_input_pending && state.active_submission_lines.is_empty() &&
             state.pending_fragment.is_none() &&
             matches!(state.wait_state.as_ref(), Some(StoredWaitState::TopLevel(PromptKind::Main))) &&
             !state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_)));
         if idle && INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
-            state.pending_commands.push_back(PendingCommand::MemberNames { request_id, query });
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id, query, queued_at: Instant::now(),
+            });
             runtime.cv.notify_all();
-        } else {
-            drop(state);
-            let _ = runtime.output.emit_member_names_result(request_id, &member_inspection::Inspection::Unavailable);
+        }
+        drop(state);
+        for cancelled_id in cancelled {
+            let _ = runtime.output.emit_member_names_result(
+                cancelled_id, &member_inspection::Inspection::Unavailable);
+        }
+        if !idle || !INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            let _ = runtime.output.emit_member_names_result(
+                request_id, &member_inspection::Inspection::Unavailable);
         }
     }
 
-    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, MemberQuery)> {
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<MemberQuery>)> {
         if state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_))) {
             return None;
         }
         let index = state.pending_commands.iter().position(|command|
             matches!(command, PendingCommand::MemberNames { .. }))?;
         match state.pending_commands.remove(index)? {
-            PendingCommand::MemberNames { request_id, query } => Some((request_id, query)),
+            PendingCommand::MemberNames { request_id, query, queued_at } =>
+                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL).then_some(query))),
             _ => None,
         }
     }
@@ -1004,8 +1037,8 @@ mod unix_host {
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
-                    let result = INSPECTOR_API.get().copied().flatten()
-                        .map(|api| member_inspection::inspect(api, query))
+                    let result = query.and_then(|query| INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query)))
                         .unwrap_or(member_inspection::Inspection::Unavailable);
                     let _ = runtime.output.emit_member_names_result(request_id, &result);
                     state = runtime.state.lock().expect("host state lock poisoned");
@@ -1862,6 +1895,8 @@ mod windows_host {
 
     const CONT_PROMPT: &str = "+ ";
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    // A result older than the frontend deadline cannot be applied to the input.
+    const MEMBER_REQUEST_TTL: Duration = Duration::from_millis(450);
     const SESSION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_ACTIVITY_HANDLER_DRAIN: usize = 64;
     const EMBEDDED_UTF8_PREFIX: &[u8] = &[0x02, 0xff, 0xfe];
@@ -2096,7 +2131,7 @@ mod windows_host {
         Submit(VecDeque<Vec<u8>>),
         Reply(Vec<u8>),
         ParseStatus { request_id: u32, code: String },
-        MemberNames { request_id: u32, query: MemberQuery },
+        MemberNames { request_id: u32, query: MemberQuery, queued_at: Instant },
     }
 
     enum WaitKind {
@@ -2547,10 +2582,17 @@ mod windows_host {
         if let Some(runtime) = host_runtime() {
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.suppress_idle_event_pump = false;
+            // A submission supersedes pending completion work, not vice versa.
+            let cancelled = discard_queued_member_requests(&mut state);
             state
                 .pending_commands
                 .push_back(PendingCommand::Submit(split_submission_lines(&code)));
             runtime.cv.notify_all();
+            drop(state);
+            for request_id in cancelled {
+                let _ = runtime.output.emit_member_names_result(
+                    request_id, &member_inspection::Inspection::Unavailable);
+            }
         }
     }
 
@@ -2588,31 +2630,55 @@ mod windows_host {
     }
 
 
+    // Only the latest queued request can still match the user's current input.
+    // Return an unavailable result for displaced requests so callers never hang.
+    fn discard_queued_member_requests(state: &mut SharedState) -> Vec<u32> {
+        let cancelled = state.pending_commands.iter().filter_map(|command| {
+            match command {
+                PendingCommand::MemberNames { request_id, .. } => Some(*request_id),
+                _ => None,
+            }
+        }).collect();
+        state.pending_commands.retain(|command|
+            !matches!(command, PendingCommand::MemberNames { .. }));
+        cancelled
+    }
+
     fn queue_member_names(request_id: u32, query: MemberQuery) {
         let Some(runtime) = host_runtime() else { return };
         let mut state = runtime.state.lock().expect("host state lock poisoned");
+        let cancelled = discard_queued_member_requests(&mut state);
         let idle = !state.busy && !state.shutdown_requested &&
             !state.startup_input_pending && state.active_submission_lines.is_empty() &&
             state.pending_fragment.is_none() &&
             matches!(state.wait_state.as_ref(), Some(StoredWaitState::TopLevel(PromptKind::Main))) &&
             !state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_)));
         if idle && INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
-            state.pending_commands.push_back(PendingCommand::MemberNames { request_id, query });
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id, query, queued_at: Instant::now(),
+            });
             runtime.cv.notify_all();
-        } else {
-            drop(state);
-            let _ = runtime.output.emit_member_names_result(request_id, &member_inspection::Inspection::Unavailable);
+        }
+        drop(state);
+        for cancelled_id in cancelled {
+            let _ = runtime.output.emit_member_names_result(
+                cancelled_id, &member_inspection::Inspection::Unavailable);
+        }
+        if !idle || !INSPECTOR_API.get().is_some_and(|api| api.is_some()) {
+            let _ = runtime.output.emit_member_names_result(
+                request_id, &member_inspection::Inspection::Unavailable);
         }
     }
 
-    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, MemberQuery)> {
+    fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<MemberQuery>)> {
         if state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_))) {
             return None;
         }
         let index = state.pending_commands.iter().position(|command|
             matches!(command, PendingCommand::MemberNames { .. }))?;
         match state.pending_commands.remove(index)? {
-            PendingCommand::MemberNames { request_id, query } => Some((request_id, query)),
+            PendingCommand::MemberNames { request_id, query, queued_at } =>
+                Some((request_id, (queued_at.elapsed() < MEMBER_REQUEST_TTL).then_some(query))),
             _ => None,
         }
     }
@@ -2969,8 +3035,8 @@ mod windows_host {
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
-                    let result = INSPECTOR_API.get().copied().flatten()
-                        .map(|api| member_inspection::inspect(api, query))
+                    let result = query.and_then(|query| INSPECTOR_API.get().copied().flatten()
+                        .map(|api| member_inspection::inspect(api, query)))
                         .unwrap_or(member_inspection::Inspection::Unavailable);
                     let _ = runtime.output.emit_member_names_result(request_id, &result);
                     state = runtime.state.lock().expect("host state lock poisoned");
