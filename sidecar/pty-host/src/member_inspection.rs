@@ -8,6 +8,7 @@ const SPECIAL: c_int = 7;
 const BUILTIN: c_int = 8;
 const ENV: c_int = 4;
 const PROMISE: c_int = 5;
+const CHAR: c_int = 9;
 const LANGUAGE: c_int = 6;
 const LOGICAL: c_int = 10;
 const INTEGER: c_int = 13;
@@ -194,11 +195,13 @@ pub(crate) enum Inspection {
 pub(crate) struct Members {
     pub(crate) names: Vec<String>,
     pub(crate) kinds: Vec<u8>,
+    // 0 = ordinary, 1 = data.frame, 2 = data.table; only used for [ insertion.
+    pub(crate) bracket_kind: u8,
 }
 
 impl Members {
     fn empty() -> Self {
-        Self { names: Vec::new(), kinds: Vec::new() }
+        Self { names: Vec::new(), kinds: Vec::new(), bracket_kind: 0 }
     }
 }
 
@@ -437,10 +440,21 @@ impl Native {
     }
 
     unsafe fn text(&self, value: Sexp) -> Option<String> {
-        if value.is_null() || value == self.nil { return None; }
+        if value.is_null() || value == self.nil || (self.type_of)(value) != CHAR {
+            return None;
+        }
+        // XLENGTH on CHARSXP gives its stored byte length. Check before UTF-8
+        // translation, which otherwise allocates for arbitrarily long names
+        // on the R thread even if the name is discarded afterwards.
+        let stored_bytes = (self.xlength)(value);
+        if stored_bytes < 0 || stored_bytes as usize > MAX_NAME_BYTES {
+            return None;
+        }
         let pointer = (self.utf8)(value);
         if pointer.is_null() { return None; }
-        Some(CStr::from_ptr(pointer).to_string_lossy().into_owned())
+        let bytes = CStr::from_ptr(pointer).to_bytes();
+        if bytes.len() > MAX_NAME_BYTES { return None; }
+        Some(String::from_utf8_lossy(bytes).into_owned())
     }
 
     unsafe fn classes(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
@@ -558,7 +572,7 @@ impl Native {
         Ok(members)
     }
 
-    unsafe fn slot_names(&self, value: Sexp) -> Vec<String> {
+    unsafe fn slot_names(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
         let mut cursor = (self.attrib)(value);
         let mut names = Vec::new();
         let mut scanned = 0;
@@ -567,7 +581,7 @@ impl Native {
             let tag = (self.tag)(cursor);
             if tag != self.nil {
                 if let Some(name) = self.text((self.printname)(tag)) {
-                    if name != "class" && name != "_S7_class" && !name.starts_with('.') &&
+                    if name != "class" && name != "_S7_class" &&
                         !name.is_empty() && name.len() <= MAX_NAME_BYTES {
                         names.push(name);
                     }
@@ -575,7 +589,8 @@ impl Native {
             }
             cursor = (self.cdr)(cursor);
         }
-        names
+        if cursor != self.nil { return Err(Suppression::InspectionLimit); }
+        Ok(names)
     }
 
     unsafe fn environment_names(&self, value: Sexp) -> Result<Vec<String>, Suppression> {
@@ -615,7 +630,7 @@ impl Native {
         for name in &names {
             kinds.push(self.member_kind(value, target, name)?);
         }
-        Ok(Members { names, kinds })
+        Ok(Members { names, kinds, bracket_kind: 0 })
     }
 
     unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
@@ -623,7 +638,7 @@ impl Native {
         let kind = (self.type_of)(value);
         if target == Target::Slot {
             return if (self.is_s4)(value) != 0 || self.is_s7(value)? {
-                self.classify_unindexed(value, target, self.slot_names(value))
+                self.classify_unindexed(value, target, self.slot_names(value)?)
             } else { Ok(Members::empty()) };
         }
         if kind == ENV {
@@ -634,13 +649,24 @@ impl Native {
         if target == Target::Dollar && !matches!(kind, VECTOR | EXPRESSION | LIST | LANGUAGE) {
             return Ok(Members::empty());
         }
-        if matches!(kind, LIST | LANGUAGE | DOTS) {
-            return self.pair_members(value);
+        let mut members = if matches!(kind, LIST | LANGUAGE | DOTS) {
+            self.pair_members(value)?
+        } else if matches!(kind, VECTOR | EXPRESSION | LOGICAL | INTEGER | REAL | COMPLEX | STRING | RAW) {
+            self.vector_members(value)?
+        } else {
+            Members::empty()
+        };
+        if target == Target::Bracket {
+            let classes = self.classes(value)?;
+            members.bracket_kind = if classes.iter().any(|name| name == "data.table") {
+                2
+            } else if classes.iter().any(|name| name == "data.frame") {
+                1
+            } else {
+                0
+            };
         }
-        if matches!(kind, VECTOR | EXPRESSION | LOGICAL | INTEGER | REAL | COMPLEX | STRING | RAW) {
-            return self.vector_members(value);
-        }
-        Ok(Members::empty())
+        Ok(members)
     }
 
     unsafe fn index_of(&self, value: Sexp, name: &str) -> Result<Option<usize>, Suppression> {
@@ -761,7 +787,7 @@ impl Native {
                     if self.is_s7(value)? { return Err(Suppression::UnsafeDispatch); }
                     if (self.is_s4)(value) == 0 { return Ok(None); }
                     if let Step::Slot(name) = step {
-                        if !self.slot_names(value).iter().any(|part| part == &name) {
+                        if !self.slot_names(value)?.iter().any(|part| part == &name) {
                             return Ok(None);
                         }
                         let Some(symbol) = self.symbol(&name) else { return Ok(None); };
@@ -859,7 +885,7 @@ impl Native {
                             }).unwrap_or(0)
                         } else { 0 };
                         let kinds = names.iter().map(|_| kind).collect();
-                        Ok(Members { names, kinds })
+                        Ok(Members { names, kinds, bracket_kind: 0 })
                     }
                 }
             }

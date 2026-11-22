@@ -49,7 +49,7 @@ export async function collectCompletionEntries(
   const inferred = rawLspResult.memberResolved ||
     rawLspResult.entries.some(entry => entry.role === "member");
   const runtimeRequest = runtimeReceiver &&
-    (context.kind === "member" || (context.kind === "bracket" && context.bracketOperator === "[[")) &&
+    (context.kind === "member" || context.kind === "bracket") &&
     (rawLspResult.runtimeOnly || !inferred)
     ? requestRuntimeMemberCompletions?.(context.objectName!,
         context.kind === "bracket" ? context.bracketOperator ?? "[" : context.operator ?? "$")
@@ -57,13 +57,20 @@ export async function collectCompletionEntries(
   const runtimeResult = await Promise.resolve(runtimeRequest).catch(() => undefined);
   const runtimeNames = runtimeResult?.status === "available" ? runtimeResult.names : undefined;
   const runtimeKinds = runtimeResult?.status === "available" ? runtimeResult.kinds : undefined;
-  const runtimeMembers = runtimeNames?.map((name, index) => {
+  const bracketKind = runtimeResult?.status === "available" ? runtimeResult.bracketKind : undefined;
+  // For two-dimensional data frames, column names belong to the second index.
+  // data.table treats the first index as a column-expression context as well.
+  const suppressRowColumns = context.kind === "bracket" && context.bracketOperator === "[" &&
+    (context.bracketDimensions ?? 1) > 1 && context.bracketDimension !== 1 &&
+    bracketKind !== "data.table";
+  const runtimeMembers = runtimeNames === undefined ? undefined : suppressRowColumns ? [] :
+    runtimeNames.map((name, index) => {
     const kind = runtimeKinds?.[index] === 1 ? vscode.CompletionItemKind.Function
       : runtimeKinds?.[index] === 2 ? vscode.CompletionItemKind.Property
       : vscode.CompletionItemKind.Field;
     return {
       label: name,
-      insertText: getFieldInsertText(name, context) +
+      insertText: getFieldInsertText(name, context, bracketKind === "data.table") +
         (kind === vscode.CompletionItemKind.Function && context.kind === "member" ? "()" : ""),
       kind,
       detail: context.objectName,

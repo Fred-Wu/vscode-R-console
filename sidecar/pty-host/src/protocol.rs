@@ -251,7 +251,13 @@ impl OutputSink {
                 members.kinds.len() == members.names.len() &&
                 members.names.iter().all(|name| name.len() <= 4096) &&
                 members.names.iter().map(|name| name.len() + 5).sum::<usize>() <= 1024 * 1024 - 5 => {
-                    payload.push(1);
+                    // Normal names use 1; 7/8 carry the safe [ insertion
+                    // rules for nested data.frames and data.tables.
+                    payload.push(match members.bracket_kind {
+                        1 => 7,
+                        2 => 8,
+                        _ => 1,
+                    });
                     encode_string_array(&members.names, &mut payload);
                     payload.extend_from_slice(&members.kinds);
                 }

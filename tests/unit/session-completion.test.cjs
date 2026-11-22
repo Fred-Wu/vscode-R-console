@@ -92,6 +92,48 @@ test("nested bracket fields use the same safe session result and quote names", a
   assert.deepEqual(entries.filter(item => item.label === "a b").map(item => item.insertText), ['"a b"']);
 });
 
+test("nested single brackets use guarded live names with correct data-frame insertion", async () => {
+  for (const [input, bracketKind, expected] of [
+    ["obj$inner[", "data.frame", '"a b"'],
+    ["obj$inner[, ", "data.frame", '"a b"'],
+    ["obj$inner[", "data.table", '`a b`'],
+    ["obj$inner[, ", "data.table", '`a b`'],
+  ]) {
+    const context = completion.getCompletionContext(input, input.length);
+    assert.equal(context?.kind, "bracket", input);
+    const called = [];
+    const entries = await completion.collectCompletionEntries(
+      context, undefined, undefined, undefined, [], [], undefined,
+      async (expression, target) => {
+        called.push([expression, target]);
+        return { status: "available", names: ["a b"], bracketKind };
+      });
+    assert.deepEqual(called, [["obj$inner", "["]], input);
+    assert.deepEqual(entries.filter(item => item.label === "a b").map(item => item.insertText),
+      [expected], input);
+  }
+});
+
+test("two-dimensional nested data-frame row indexing does not suggest columns", async () => {
+  for (const [marked, bracketKind, shouldInclude] of [
+    ["obj$inner[│, ]", "data.frame", false],
+    ["obj$inner[, │]", "data.frame", true],
+    ["obj$inner[│, ]", "data.table", true],
+    ["obj$inner[, │]", "data.table", true],
+  ]) {
+    const position = marked.indexOf("│");
+    const input = marked.replace("│", "");
+    const context = completion.getCompletionContext(input, position, input.slice(0, position),
+      input.slice(position));
+    assert.equal(context?.kind, "bracket", marked);
+    assert.equal(context.bracketDimensions, 2, marked);
+    const entries = await completion.collectCompletionEntries(
+      context, undefined, undefined, undefined, [], [], undefined,
+      async () => ({ status: "available", names: ["column"], bracketKind }));
+    assert.equal(entries.some(entry => entry.label === "column"), shouldInclude, marked);
+  }
+});
+
 test("static source member resolution remains authoritative without a native probe", async () => {
   const input = "obj$inner$";
   const entries = await completion.collectCompletionEntries(

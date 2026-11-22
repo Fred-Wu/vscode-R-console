@@ -99,6 +99,14 @@ test("native results distinguish silent empty from unavailable and unsafe access
   oversized[0] = 1;
   oversized.writeUInt32LE(1001, 1);
   assert.match(parseBackendFrames(frame(oversized)).error, /too many inspected members/);
+  for (const [kind, bracketKind] of [[7, "data.frame"], [8, "data.table"]]) {
+    const decorated = Buffer.from(typed);
+    decorated[0] = kind;
+    assert.deepEqual(parseBackendFrames(frame(decorated)).events, [{
+      type: "member-names-result", requestId: 42,
+      result: { status: "available", names: ["method", "value"], kinds: [1, 0], bracketKind },
+    }]);
+  }
   const labels = ["active-binding", "deferred-binding", "unsafe-dispatch",
     "unsafe-altrep", "unsafe-environment"];
   for (let byte = 2; byte <= 6; byte++) {

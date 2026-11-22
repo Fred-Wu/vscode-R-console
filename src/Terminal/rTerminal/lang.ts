@@ -141,7 +141,7 @@ export class RTermLang {
       // Runtime-only member inspection is owned by the guarded native backend.
       // Do not make it wait for the separate language server to start or reply.
       const runtimeMember = (context.kind === "member" ||
-        (context.kind === "bracket" && context.bracketOperator === "[[" &&
+        (context.kind === "bracket" &&
           !!context.objectName && !!parseRuntimeMemberQuery(context.objectName))) &&
         this.options.requestRuntimeMemberCompletions !== undefined &&
         this.options.getStaticAnalysisEnabled?.() !== true;
@@ -241,7 +241,7 @@ export class RTermLang {
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
 
           const nextRuntimeMember = (nextContext.kind === "member" ||
-            (nextContext.kind === "bracket" && nextContext.bracketOperator === "[[" &&
+            (nextContext.kind === "bracket" &&
               !!nextContext.objectName && !!parseRuntimeMemberQuery(nextContext.objectName))) &&
             this.options.requestRuntimeMemberCompletions !== undefined &&
             this.options.getStaticAnalysisEnabled?.() !== true;

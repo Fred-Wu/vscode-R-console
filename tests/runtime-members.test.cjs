@@ -73,6 +73,10 @@ test("real embedded R completion inspects nested storage without running user co
   await submit('obj <- list(inner = list(alpha = 1, beta = 2), df = data.frame("a b" = 1, check.names = FALSE))');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["alpha", "beta"]));
   assert.deepEqual(await inspect("obj", [{ kind: "index", index: 2 }]), available(["a b"]));
+  const frameBracket = await inspectTyped("obj", [{ kind: "field", name: "df" }], "[");
+  assert.equal(frameBracket.status, "available");
+  assert.equal(frameBracket.bracketKind, "data.frame");
+  assert.deepEqual(frameBracket.names, ["a b"]);
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "missing" }]), available([]));
   await submit('obj$inner <- list(changed = TRUE)');
   assert.deepEqual(await inspect("obj", [{ kind: "field", name: "inner" }]), available(["changed"]));
@@ -118,6 +122,10 @@ test("real embedded R completion inspects nested storage without running user co
   assert.match(output, /S4_READY:\s*TRUE\s+TRUE/, "S4 object must exist before native inspection");
   assert.deepEqual(await inspect("s4", [], "@"), available(["inner"]), output);
   assert.deepEqual(await inspect("s4", [{ kind: "slot", name: "inner" }]), available(["slot_value"]));
+  await submit('methods::setClass("CompletionDotSlot", slots = c(.hidden = "list"), where = .GlobalEnv); s4dot <- methods::new("CompletionDotSlot", .hidden = list(child = TRUE))');
+  assert.deepEqual(await inspect("s4dot", [], "@"), available([".hidden"]));
+  assert.deepEqual(await inspect("s4dot", [{ kind: "slot", name: ".hidden" }]),
+    available(["child"]));
   await submit('makeActiveBinding("active_child", function() { hits <<- hits + 1L; list(secret = 1) }, env); delayedAssign("pending_idx", { hits <<- hits + 1L; 1L })');
   assert.deepEqual((await inspect("env", [], "$")).names.sort(), ["active_child", "empty", "inner"]);
   assert.deepEqual(await inspect("env", [{ kind: "field", name: "active_child" }]),
@@ -198,6 +206,12 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("large_pair", [{ kind: "field", name: "late" }]), available([]));
   await submit('wide_limit <- as.list(seq_len(1001L)); names(wide_limit) <- paste0("column", seq_len(1001L))');
   assert.deepEqual(await inspect("wide_limit"), { status: "unavailable" });
+  // A single oversized label must be rejected before allocating a translated
+  // UTF-8 string; completion may still report the other bounded labels.
+  await submit('long_label <- setNames(list(1L, 2L), c(strrep("é", 6000L), "short"))');
+  assert.deepEqual(await inspect("long_label"), available(["short"]));
+  assert.deepEqual(await inspect("long_label", [{ kind: "field", name: "short" }]),
+    available([]));
   // A wide list must classify each member in a single pass, without repeatedly
   // looking up each name in the R thread. Include a callable at the last index.
   await submit('wide <- as.list(seq_len(999L)); names(wide) <- sprintf("column_%04d", seq_len(999L)); wide$method <- function() TRUE');
@@ -213,9 +227,19 @@ test("real embedded R completion inspects nested storage without running user co
   await submit('submission_priority <- list(ready = TRUE)');
   await Promise.all(obsolete);
   assert.deepEqual(await inspect("submission_priority"), available(["ready"]));
+  // Parse-status requests belong to submission and must beat queued member
+  // completions, even before the executable Submit frame is sent.
+  const pendingCompletion = Array.from({ length: 12 }, () => inspectTyped("wide"));
+  assert.equal(await backend.requestParseStatus(session, 'submission_priority$ready <- TRUE'), 1);
+  await Promise.all(pendingCompletion);
 
   // Ordinary safe environments still complete within the preflight budget.
   assert.ok((await inspect("env")).names.includes("inner"));
+  await submit('nested_dt <- list(tbl = data.table::data.table(amount = 1, code = "a"))');
+  const tableBracket = await inspectTyped("nested_dt", [{ kind: "field", name: "tbl" }], "[");
+  assert.equal(tableBracket.status, "available");
+  assert.equal(tableBracket.bracketKind, "data.table");
+  assert.deepEqual(tableBracket.names, ["amount", "code"]);
   await submit('escaped <- list(); escaped[["a\\\"b"]] <- list(inner = TRUE)');
   const escapedQuery = parseRuntimeMemberQuery('escaped[["a\\"b"]]', "$");
   assert.equal(escapedQuery.steps[0].name, 'a"b');

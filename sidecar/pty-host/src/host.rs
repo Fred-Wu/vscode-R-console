@@ -713,7 +713,10 @@ mod unix_host {
     }
 
     fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<MemberQuery>)> {
-        if state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_))) {
+        // Parse-status is part of code submission, before Submit is queued.
+        // Never let speculative completion preempt an accepted parse request.
+        if state.pending_commands.iter().any(|command| matches!(command,
+            PendingCommand::Submit(_) | PendingCommand::ParseStatus { .. })) {
             return None;
         }
         let index = state.pending_commands.iter().position(|command|
@@ -1034,6 +1037,15 @@ mod unix_host {
             }
 
 
+            // Parsing an accepted submission must not wait behind completion.
+            if let Some((request_id, code)) = take_next_parse_request(&mut state) {
+                drop(state);
+                let status = parse_status(code);
+                let _ = runtime.output.emit_parse_status_result(request_id, status);
+                state = runtime.state.lock().expect("host state lock poisoned");
+                continue;
+            }
+
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
@@ -1044,14 +1056,6 @@ mod unix_host {
                     state = runtime.state.lock().expect("host state lock poisoned");
                     continue;
                 }
-            }
-
-            if let Some((request_id, code)) = take_next_parse_request(&mut state) {
-                drop(state);
-                let status = parse_status(code);
-                let _ = runtime.output.emit_parse_status_result(request_id, status);
-                state = runtime.state.lock().expect("host state lock poisoned");
-                continue;
             }
 
             if let Some(width) = state.pending_width.take() {
@@ -1859,6 +1863,29 @@ mod unix_host {
         }
 
         Ok(argv)
+    }
+
+    #[cfg(test)]
+    mod member_priority_tests {
+        use super::{take_next_member_request, take_next_parse_request, PendingCommand, SharedState};
+        use crate::member_inspection::{MemberQuery, Target};
+        use std::time::Instant;
+
+        #[test]
+        fn code_parse_preempts_queued_member_completion() {
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 1,
+                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar },
+                queued_at: Instant::now(),
+            });
+            state.pending_commands.push_back(PendingCommand::ParseStatus {
+                request_id: 2, code: "1 + 1".into(),
+            });
+            assert!(take_next_member_request(&mut state).is_none());
+            assert_eq!(take_next_parse_request(&mut state).map(|(id, _)| id), Some(2));
+            assert_eq!(take_next_member_request(&mut state).map(|(id, _)| id), Some(1));
+        }
     }
 }
 
@@ -2671,7 +2698,10 @@ mod windows_host {
     }
 
     fn take_next_member_request(state: &mut SharedState) -> Option<(u32, Option<MemberQuery>)> {
-        if state.pending_commands.iter().any(|command| matches!(command, PendingCommand::Submit(_))) {
+        // Parse-status is part of code submission, before Submit is queued.
+        // Never let speculative completion preempt an accepted parse request.
+        if state.pending_commands.iter().any(|command| matches!(command,
+            PendingCommand::Submit(_) | PendingCommand::ParseStatus { .. })) {
             return None;
         }
         let index = state.pending_commands.iter().position(|command|
@@ -3032,6 +3062,15 @@ mod windows_host {
             }
 
 
+            // Parsing an accepted submission must not wait behind completion.
+            if let Some((request_id, code)) = take_next_parse_request(&mut state) {
+                drop(state);
+                let status = parse_status(code);
+                let _ = runtime.output.emit_parse_status_result(request_id, status);
+                state = runtime.state.lock().expect("host state lock poisoned");
+                continue;
+            }
+
             if matches!(wait_kind, WaitKind::TopLevel(PromptKind::Main)) {
                 if let Some((request_id, query)) = take_next_member_request(&mut state) {
                     drop(state);
@@ -3042,14 +3081,6 @@ mod windows_host {
                     state = runtime.state.lock().expect("host state lock poisoned");
                     continue;
                 }
-            }
-
-            if let Some((request_id, code)) = take_next_parse_request(&mut state) {
-                drop(state);
-                let status = parse_status(code);
-                let _ = runtime.output.emit_parse_status_result(request_id, status);
-                state = runtime.state.lock().expect("host state lock poisoned");
-                continue;
             }
 
             if let Some(width) = state.pending_width.take() {
@@ -4348,6 +4379,27 @@ mod windows_host {
             take_top_level_recovery_input, SharedState, TopLevelRecovery, WaitKind,
         };
         use crate::protocol::PromptKind;
+
+
+        #[test]
+        fn code_parse_preempts_queued_member_completion() {
+            use super::{take_next_member_request, take_next_parse_request, PendingCommand};
+            use crate::member_inspection::{MemberQuery, Target};
+            use std::time::Instant;
+
+            let mut state = SharedState::default();
+            state.pending_commands.push_back(PendingCommand::MemberNames {
+                request_id: 1,
+                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar },
+                queued_at: Instant::now(),
+            });
+            state.pending_commands.push_back(PendingCommand::ParseStatus {
+                request_id: 2, code: "1 + 1".into(),
+            });
+            assert!(take_next_member_request(&mut state).is_none());
+            assert_eq!(take_next_parse_request(&mut state).map(|(id, _)| id), Some(2));
+            assert_eq!(take_next_member_request(&mut state).map(|(id, _)| id), Some(1));
+        }
 
         #[test]
         fn decodes_embedded_utf8_console_segments() {

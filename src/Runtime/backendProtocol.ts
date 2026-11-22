@@ -96,7 +96,7 @@ export type MemberInspectionStep =
 export type MemberInspectionTarget = "$" | "@" | "[" | "[[";
 
 export type MemberInspectionResult =
-  | { status: "available"; names: string[]; kinds?: number[] }
+  | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
   | { status: "unavailable" };
@@ -351,10 +351,10 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 6) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 8) {
         throw new Error("invalid member inspection result");
       }
-      if (payload[0] !== 1) {
+      if (payload[0] !== 1 && payload[0] !== 7 && payload[0] !== 8) {
         if (payload.length !== 1) throw new Error("invalid member inspection status");
         const reasons = {
           2: "active-binding", 3: "deferred-binding",
@@ -376,6 +376,8 @@ function parseControlFrame(
       return { type: "member-names-result", requestId, result: {
         status: "available", names: parsed.values,
         ...(trailing.length ? { kinds: [...trailing] } : {}),
+        ...(payload[0] === 7 ? { bracketKind: "data.frame" as const } :
+          payload[0] === 8 ? { bracketKind: "data.table" as const } : {}),
       } };
     }
     case FrameKind.ParseStatusResult:
