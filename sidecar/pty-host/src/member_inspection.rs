@@ -211,6 +211,132 @@ enum View {
     Slice { source: Sexp, index: usize },
 }
 
+// R API calls are guarded by a C-only callback. R errors/interrupts use
+// non-local jumps and must never cross Rust frames.
+const RMG_INSTALL: c_int = 0;
+const RMG_FIND: c_int = 1;
+const RMG_EXISTS: c_int = 2;
+const RMG_ACTIVE: c_int = 3;
+const RMG_TYPEOF: c_int = 4;
+const RMG_ALTREP: c_int = 5;
+const RMG_ATTRIB: c_int = 6;
+const RMG_GET_ATTRIB: c_int = 7;
+const RMG_TAG: c_int = 8;
+const RMG_CAR: c_int = 9;
+const RMG_CDR: c_int = 10;
+const RMG_PRINTNAME: c_int = 11;
+const RMG_VECTOR_ELT: c_int = 12;
+const RMG_XLENGTH: c_int = 13;
+const RMG_STRING_ELT: c_int = 14;
+const RMG_UTF8: c_int = 15;
+const RMG_IS_S4: c_int = 16;
+const RMG_IS_OBJECT: c_int = 17;
+const RMG_PROTECT: c_int = 18;
+const RMG_UNPROTECT: c_int = 19;
+const RMG_LS3: c_int = 20;
+const RMG_LS2: c_int = 21;
+const RMG_INTEGER_ELT: c_int = 22;
+const RMG_REAL_ELT: c_int = 23;
+
+unsafe extern "C" {
+    fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize);
+    fn rmg_call(method: c_int, a: usize, b: usize, c: usize, out: *mut u64) -> c_int;
+    fn rmg_end() -> c_int;
+    #[cfg(test)]
+    fn rmg_test_error_and_recovery() -> c_int;
+}
+
+unsafe fn guarded(method: c_int, a: usize, b: usize, c: usize) -> u64 {
+    let mut result = 0_u64;
+    let _ = rmg_call(method, a, b, c, &mut result);
+    result
+}
+
+unsafe extern "C" fn guard_install(s: *const c_char) -> Sexp {
+    guarded(RMG_INSTALL, s as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_find(a: Sexp, b: Sexp) -> Sexp {
+    guarded(RMG_FIND, a as usize, b as usize, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_exists(a: Sexp, b: Sexp) -> c_int {
+    guarded(RMG_EXISTS, a as usize, b as usize, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_active(a: Sexp, b: Sexp) -> c_int {
+    guarded(RMG_ACTIVE, a as usize, b as usize, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_typeof(a: Sexp) -> c_int {
+    guarded(RMG_TYPEOF, a as usize, 0, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_altrep(a: Sexp) -> c_int {
+    guarded(RMG_ALTREP, a as usize, 0, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_attrib(a: Sexp) -> Sexp {
+    guarded(RMG_ATTRIB, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_get_attrib(a: Sexp, b: Sexp) -> Sexp {
+    guarded(RMG_GET_ATTRIB, a as usize, b as usize, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_tag(a: Sexp) -> Sexp {
+    guarded(RMG_TAG, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_car(a: Sexp) -> Sexp {
+    guarded(RMG_CAR, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_cdr(a: Sexp) -> Sexp {
+    guarded(RMG_CDR, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_printname(a: Sexp) -> Sexp {
+    guarded(RMG_PRINTNAME, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_vector_elt(a: Sexp, i: isize) -> Sexp {
+    guarded(RMG_VECTOR_ELT, a as usize, i as usize, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_xlength(a: Sexp) -> isize {
+    guarded(RMG_XLENGTH, a as usize, 0, 0) as usize as isize
+}
+unsafe extern "C" fn guard_string_elt(a: Sexp, i: isize) -> Sexp {
+    guarded(RMG_STRING_ELT, a as usize, i as usize, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_utf8(a: Sexp) -> *const c_char {
+    guarded(RMG_UTF8, a as usize, 0, 0) as usize as *const c_char
+}
+unsafe extern "C" fn guard_is_s4(a: Sexp) -> c_int {
+    guarded(RMG_IS_S4, a as usize, 0, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_is_object(a: Sexp) -> c_int {
+    guarded(RMG_IS_OBJECT, a as usize, 0, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_protect(a: Sexp) -> Sexp {
+    guarded(RMG_PROTECT, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_unprotect(count: c_int) {
+    let _ = guarded(RMG_UNPROTECT, count as usize, 0, 0);
+}
+unsafe extern "C" fn guard_ls3(a: Sexp, b: c_int, c: c_int) -> Sexp {
+    guarded(RMG_LS3, a as usize, b as usize, c as usize) as usize as Sexp
+}
+unsafe extern "C" fn guard_ls2(a: Sexp, b: c_int) -> Sexp {
+    guarded(RMG_LS2, a as usize, b as usize, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_integer_elt(a: Sexp, i: isize) -> c_int {
+    guarded(RMG_INTEGER_ELT, a as usize, i as usize, 0) as u32 as c_int
+}
+unsafe extern "C" fn guard_real_elt(a: Sexp, i: isize) -> f64 {
+    f64::from_bits(guarded(RMG_REAL_ELT, a as usize, i as usize, 0))
+}
+
+unsafe fn begin_inspection_guard(api: InspectorApi) {
+    let funcs: [usize; 24] = [
+        api.install, api.find_var, api.exists, api.active, api.typeof_,
+        api.altrep, api.attrib, api.get_attrib, api.tag,
+        api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
+        api.xlength, api.string_elt, api.utf8, api.is_s4, api.is_object,
+        api.protect, api.unprotect, api.ls3.unwrap_or(0), api.ls2.unwrap_or(0),
+        api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
+    ];
+    rmg_begin(api.top_level, funcs.as_ptr(), funcs.len());
+}
+
 type Unary = unsafe extern "C" fn(Sexp) -> Sexp;
 type Test = unsafe extern "C" fn(Sexp) -> c_int;
 type Find = unsafe extern "C" fn(Sexp, Sexp) -> Sexp;
@@ -259,30 +385,30 @@ impl Native {
         let nil = *(api.nil as *const Sexp);
         if global.is_null() || nil.is_null() { return None; }
         Some(Self {
-            install: std::mem::transmute(api.install),
-            find: std::mem::transmute(api.find_var),
-            exists: std::mem::transmute(api.exists),
-            active: std::mem::transmute(api.active),
-            type_of: std::mem::transmute(api.typeof_),
-            altrep: std::mem::transmute(api.altrep),
-            attrib: std::mem::transmute(api.attrib),
-            get_attrib: std::mem::transmute(api.get_attrib),
-            tag: std::mem::transmute(api.tag),
-            car: api.car.map(|p| std::mem::transmute(p)),
-            cdr: std::mem::transmute(api.cdr),
-            printname: std::mem::transmute(api.printname),
-            vector_elt: std::mem::transmute(api.vector_elt),
-            xlength: std::mem::transmute(api.xlength),
-            string_elt: std::mem::transmute(api.string_elt),
-            utf8: std::mem::transmute(api.utf8),
-            is_s4: std::mem::transmute(api.is_s4),
-            is_object: std::mem::transmute(api.is_object),
-            protect: std::mem::transmute(api.protect),
-            unprotect: std::mem::transmute(api.unprotect),
-            ls3: api.ls3.map(|p| std::mem::transmute(p)),
-            ls2: api.ls2.map(|p| std::mem::transmute(p)),
-            integer_elt: api.integer_elt.map(|p| std::mem::transmute(p)),
-            real_elt: api.real_elt.map(|p| std::mem::transmute(p)),
+            install: guard_install,
+            find: guard_find,
+            exists: guard_exists,
+            active: guard_active,
+            type_of: guard_typeof,
+            altrep: guard_altrep,
+            attrib: guard_attrib,
+            get_attrib: guard_get_attrib,
+            tag: guard_tag,
+            car: api.car.map(|_| guard_car as _),
+            cdr: guard_cdr,
+            printname: guard_printname,
+            vector_elt: guard_vector_elt,
+            xlength: guard_xlength,
+            string_elt: guard_string_elt,
+            utf8: guard_utf8,
+            is_s4: guard_is_s4,
+            is_object: guard_is_object,
+            protect: guard_protect,
+            unprotect: guard_unprotect,
+            ls3: api.ls3.map(|_| guard_ls3 as _),
+            ls2: api.ls2.map(|_| guard_ls2 as _),
+            integer_elt: api.integer_elt.map(|_| guard_integer_elt as _),
+            real_elt: api.real_elt.map(|_| guard_real_elt as _),
             global,
             nil,
             unbound: *(api.unbound as *const Sexp),
@@ -701,24 +827,19 @@ impl Native {
 }
 
 pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Inspection {
-    struct Context {
-        api: InspectorApi,
-        query: MemberQuery,
-        result: Option<Result<Members, Suppression>>,
-    }
-    unsafe extern "C" fn invoke(data: *mut c_void) {
-        let context = &mut *(data as *mut Context);
-        context.result = Native::new(context.api).map(|native| native.inspect(&context.query));
-    }
-    let mut context = Context { api, query, result: None };
-    let top: unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> c_int =
-        unsafe { std::mem::transmute(api.top_level) };
-    let ok = unsafe { top(invoke, &mut context as *mut Context as *mut c_void) };
-    if ok == 0 { return Inspection::Unavailable; }
-    match context.result {
-        Some(Ok(names)) => Inspection::Available(names),
-        Some(Err(reason)) => Inspection::Suppressed(reason),
-        None => Inspection::Unavailable,
+    // Every R API call is made in the C guard. In particular, do not execute
+    // Rust code as an R_ToplevelExec callback: R errors/interrupts use longjmp.
+    unsafe {
+        begin_inspection_guard(api);
+        let result = Native::new(api).map(|native| native.inspect(&query));
+        if rmg_end() != 0 {
+            return Inspection::Unavailable;
+        }
+        match result {
+            Some(Ok(names)) => Inspection::Available(names),
+            Some(Err(reason)) => Inspection::Suppressed(reason),
+            None => Inspection::Unavailable,
+        }
     }
 }
 
@@ -729,6 +850,11 @@ mod tests {
     fn name(s: &str, out: &mut Vec<u8>) {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
+    }
+
+    #[test]
+    fn r_error_and_interrupt_jumps_are_caught_without_crossing_rust() {
+        assert_eq!(unsafe { rmg_test_error_and_recovery() }, 1);
     }
 
     #[test]
