@@ -245,6 +245,7 @@ impl OutputSink {
                 Suppression::UnsafeDispatch => 4,
                 Suppression::UnsafeAltRep => 5,
                 Suppression::UnsafeEnvironment => 6,
+                Suppression::InspectionLimit => 0,
             }),
             Inspection::Available(members) if members.names.len() <= 1000 &&
                 members.kinds.len() == members.names.len() &&

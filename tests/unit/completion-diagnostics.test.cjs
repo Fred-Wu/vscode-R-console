@@ -57,3 +57,26 @@ test("runtime completion logs deduplicate each reason and context across prefixe
   assert.match(lines[3], /The R session could not complete the inspection/);
   assert.match(lines[3], /No inspection result was used/);
 });
+
+test("runtime completion decisions are deduplicated separately for each console", () => {
+  const lines = [];
+  const { logConsoleCompletionDecision, noteConsoleCompletionContext, clearCompletionDiagnosticsScope } =
+    loadSource("src/Language/completion/outputChannel.ts", {
+      vscode: { window: { createOutputChannel: () => ({
+        appendLine: text => lines.push(text), dispose() {},
+      }) } },
+    });
+  const decision = { kind: "Suppressed", reason: "unsafe-dispatch" };
+  for (const scope of ["console-A", "console-B"]) {
+    noteConsoleCompletionContext("obj$", scope);
+    logConsoleCompletionDecision(decision, "obj$", scope);
+    logConsoleCompletionDecision(decision, "obj$", scope);
+  }
+  assert.equal(lines.length, 2);
+  noteConsoleCompletionContext("next$", "console-A");
+  logConsoleCompletionDecision(decision, "next$", "console-A");
+  assert.equal(lines.length, 3);
+  clearCompletionDiagnosticsScope("console-A");
+  logConsoleCompletionDecision(decision, "obj$", "console-A");
+  assert.equal(lines.length, 4);
+});

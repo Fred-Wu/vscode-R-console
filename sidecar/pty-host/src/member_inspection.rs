@@ -209,6 +209,7 @@ pub(crate) enum Suppression {
     UnsafeDispatch,
     UnsafeAltRep,
     UnsafeEnvironment,
+    InspectionLimit,
 }
 
 #[derive(Clone, Copy)]
@@ -503,6 +504,7 @@ impl Native {
         if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
         let length = (self.xlength)(names);
         if length < 0 { return Ok(Members::empty()); }
+        if length as usize > MAX_NAMES { return Err(Suppression::InspectionLimit); }
         let type_ = (self.type_of)(value);
         let direct = matches!(type_, VECTOR | EXPRESSION) && self.ordinary_dispatch(value)?;
         let mut members = Members::empty();
@@ -552,6 +554,7 @@ impl Native {
             }
             cursor = (self.cdr)(cursor);
         }
+        if cursor != self.nil { return Err(Suppression::InspectionLimit); }
         Ok(members)
     }
 
@@ -580,12 +583,12 @@ impl Native {
         // R_lsInternal allocates and sorts every binding before returning.
         // Refuse large environments first; when the preflight API is unavailable,
         // avoid full enumeration rather than guessing about its cost.
-        let Some(envlength) = self.envlength else { return Ok(Vec::new()); };
+        let Some(envlength) = self.envlength else { return Err(Suppression::InspectionLimit); };
         let bindings = envlength(value);
-        if bindings < 0 || bindings > MAX_ENV_BINDINGS { return Ok(Vec::new()); }
+        if bindings < 0 || bindings > MAX_ENV_BINDINGS { return Err(Suppression::InspectionLimit); }
         let names = if let Some(ls) = self.ls3 { ls(value, 1, 1) }
             else if let Some(ls) = self.ls2 { ls(value, 1) }
-            else { return Ok(Vec::new()); };
+            else { return Err(Suppression::InspectionLimit); };
         if names.is_null() || names == self.nil { return Ok(Vec::new()); }
         (self.protect)(names);
         let result = (|| -> Result<Vec<String>, Suppression> {
@@ -593,6 +596,7 @@ impl Native {
                 if (self.altrep)(names) != 0 { return Err(Suppression::UnsafeAltRep); }
                 let count = (self.xlength)(names);
                 if count < 0 { return Ok(Vec::new()); }
+                if count as usize > MAX_NAMES { return Err(Suppression::InspectionLimit); }
                 let mut members = Vec::new();
                 for index in 0..count.min(MAX_NAMES as isize) {
                     let Some(name) = self.text((self.string_elt)(names, index)) else { continue; };
@@ -876,6 +880,7 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery) -> Inspection {
         }
         match result {
             Some(Ok(names)) => Inspection::Available(names),
+            Some(Err(Suppression::InspectionLimit)) => Inspection::Unavailable,
             Some(Err(reason)) => Inspection::Suppressed(reason),
             None => Inspection::Unavailable,
         }

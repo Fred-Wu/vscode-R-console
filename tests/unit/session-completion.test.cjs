@@ -240,3 +240,13 @@ test("member kind metadata remains optional for legacy inspector results", async
     ["field", 4, "field"],
   ]);
 });
+
+test("an unavailable bounded native result keeps cached top-level names", async () => {
+  const input = "obj$";
+  const workspace = { globalenv: { obj: { type: "list", names: ["cached"] } } };
+  const entries = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length),
+    undefined, undefined, workspace, [], [], undefined,
+    async () => ({ status: "unavailable" }));
+  assert.deepEqual(entries.map(entry => entry.label), ["cached"]);
+});

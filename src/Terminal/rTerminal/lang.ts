@@ -8,13 +8,14 @@ import {
   CompletionPickItem,
   type RuntimeMemberCompletionRequester,
   collectCompletionEntries,
+  parseRuntimeMemberQuery,
   getCompletionContext,
   rankCompletionEntries,
   isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
-import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
+import { clearCompletionDiagnosticsScope, logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
 import { completionDecisionContext } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
@@ -71,6 +72,8 @@ export class RTermLang {
 
   constructor(private readonly options: LangOptions) {}
 
+  get completionDiagnosticsScope(): string { return this.completionDocumentId; }
+
   async start(): Promise<void> {
     const completionProvider = await this.ensureConsoleLspStarted();
     if (!completionProvider) {
@@ -94,7 +97,7 @@ export class RTermLang {
       return;
     }
     const requestId = ++this.completionRequestId;
-    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor));
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
     const context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -111,7 +114,7 @@ export class RTermLang {
       : undefined);
     if (context?.rejectionReason) {
       logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
-        completionDecisionContext(input.textBeforeCursor));
+        completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
       onInlineEntries?.([]);
       return;
     }
@@ -137,7 +140,9 @@ export class RTermLang {
       let completionProvider: CompletionProvider | undefined;
       // Runtime-only member inspection is owned by the guarded native backend.
       // Do not make it wait for the separate language server to start or reply.
-      const runtimeMember = context.kind === "member" &&
+      const runtimeMember = (context.kind === "member" ||
+        (context.kind === "bracket" && context.bracketOperator === "[[" &&
+          !!context.objectName && !!parseRuntimeMemberQuery(context.objectName))) &&
         this.options.requestRuntimeMemberCompletions !== undefined &&
         this.options.getStaticAnalysisEnabled?.() !== true;
       const documentRequest = runtimeMember
@@ -235,7 +240,9 @@ export class RTermLang {
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol) => {
 
-          const nextRuntimeMember = nextContext.kind === "member" &&
+          const nextRuntimeMember = (nextContext.kind === "member" ||
+            (nextContext.kind === "bracket" && nextContext.bracketOperator === "[[" &&
+              !!nextContext.objectName && !!parseRuntimeMemberQuery(nextContext.objectName))) &&
             this.options.requestRuntimeMemberCompletions !== undefined &&
             this.options.getStaticAnalysisEnabled?.() !== true;
           const nextDocumentRequest = nextRuntimeMember
@@ -322,6 +329,7 @@ export class RTermLang {
     }
 
     this.disposed = true;
+    clearCompletionDiagnosticsScope(this.completionDocumentId);
     this.cancelCompletion();
     const lsp = this.consoleLsp;
     this.consoleLsp = undefined;

@@ -1922,3 +1922,13 @@ test("accessor completion ranks exact and prefix matches before fuzzy members", 
   const prefix = completion.rankCompletionEntries(entries, "da", { ...context, prefix: "da" });
   assert.deepEqual(prefix.map(entry => entry.label), ["dataset", "data", "add_strata"]);
 });
+
+test("nested bracket completion accepts safe scalar index names but rejects calls", () => {
+  const valid = completion.getCompletionContext("obj[[i]][[", "obj[[i]][[".length);
+  assert.equal(valid?.kind, "bracket");
+  assert.equal(valid?.objectName, "obj[[i]]");
+  assert.equal(valid?.bracketOperator, "[[");
+  assert.equal(valid?.rejectionReason, undefined);
+  const invalid = completion.getCompletionContext("obj[[f()]][[", "obj[[f()]][[".length);
+  assert.ok(!invalid || invalid.rejectionReason || invalid.kind !== "bracket");
+});

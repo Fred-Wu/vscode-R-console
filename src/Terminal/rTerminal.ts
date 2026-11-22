@@ -291,7 +291,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         const query = parseRuntimeMemberQuery(expression, operator);
         if (!query) {
           logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
-            expression + operator);
+            expression + operator, this.lang.completionDiagnosticsScope);
           return undefined;
         }
         const reportUnavailable = () => {
@@ -299,7 +299,7 @@ export class RTerminal implements vscode.Pseudoterminal {
           // to inspect nested paths, where an empty list would be ambiguous.
           if (query.steps.length) {
             logConsoleCompletionDecision({ kind: "Unavailable", reason: "runtime-unavailable" },
-              expression + operator);
+              expression + operator, this.lang.completionDiagnosticsScope);
           }
         };
         const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
@@ -310,7 +310,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         return response.then(result => {
           if (result.status === "suppressed") {
             logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
-              expression + operator);
+              expression + operator, this.lang.completionDiagnosticsScope);
           } else if (result.status === "unavailable") {
             reportUnavailable();
           }
@@ -2142,7 +2142,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
     if (!this.inlineCompletion.visible && !typing) return;
     const input = this.getInputSnapshot();
-    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor));
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
+      this.lang.completionDiagnosticsScope);
     const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
     this.inlineCompletion.setQuery(context?.prefix ?? "");
@@ -2150,7 +2151,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
     if (context?.rejectionReason) {
       logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
-        completionDecisionContext(input.textBeforeCursor));
+        completionDecisionContext(input.textBeforeCursor), this.lang.completionDiagnosticsScope);
     }
     if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
         (!context || ((context.kind === "default" || context.kind === "argument") &&

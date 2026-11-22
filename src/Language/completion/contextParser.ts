@@ -1,5 +1,6 @@
 import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isCompleteIdentifier, type Token } from "../lexer";
 import { getDataCompletionObject } from "./dataScope";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 // Retain only the latest completion input. Adjacent tokens can merge after an
 // edit (notably r + a quote + a raw-string delimiter, or an exponent's sign).
@@ -108,16 +109,9 @@ export type BracketCompletionContext = {
   argumentTags?: (string | null)[];
 };
 
-/** Literal indices can be inspected without running index expressions. */
+/** The bracket and member paths share a single non-evaluating selector grammar. */
 function hasOnlyLiteralSubscripts(code: string): boolean {
-  let depth = 0;
-  for (const token of tokenize(code)) {
-    if (token.type === TokenType.LeftBracket) depth += token.value.length;
-    else if (token.type === TokenType.RightBracket) depth -= token.value.length;
-    else if (depth && token.type !== TokenType.Number && token.type !== TokenType.String &&
-      token.type !== TokenType.RawString && token.type !== TokenType.Comma && token.type !== TokenType.Newline) return false;
-  }
-  return depth === 0;
+  return parseRuntimeMemberQuery(code) !== undefined;
 }
 
 export function isCompletionInLiteral(code: string, cursor = code.length, tokens?: Token[]): boolean {

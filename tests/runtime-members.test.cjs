@@ -193,9 +193,11 @@ test("real embedded R completion inspects nested storage without running user co
   // before traversing long, mostly unnamed pairlists.
   await submit('large_env <- new.env(hash = TRUE, size = 8192L); for (i in seq_len(4200L)) assign(paste0("entry", i), i, envir = large_env); large_pair <- as.pairlist(setNames(rep(list(1L), 4200L), c(rep("", 4199L), "late"))); cat("LARGE_READY\\n")');
   await until(() => output.includes("LARGE_READY"), "large-object fixtures ready");
-  assert.deepEqual(await inspect("large_env"), available([]));
-  assert.deepEqual(await inspect("large_pair"), available([]));
+  assert.deepEqual(await inspect("large_env"), { status: "unavailable" });
+  assert.deepEqual(await inspect("large_pair"), { status: "unavailable" });
   assert.deepEqual(await inspect("large_pair", [{ kind: "field", name: "late" }]), available([]));
+  await submit('wide_limit <- as.list(seq_len(1001L)); names(wide_limit) <- paste0("column", seq_len(1001L))');
+  assert.deepEqual(await inspect("wide_limit"), { status: "unavailable" });
   // A wide list must classify each member in a single pass, without repeatedly
   // looking up each name in the R thread. Include a callable at the last index.
   await submit('wide <- as.list(seq_len(999L)); names(wide) <- sprintf("column_%04d", seq_len(999L)); wide$method <- function() TRUE');
