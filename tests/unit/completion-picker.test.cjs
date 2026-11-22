@@ -85,6 +85,34 @@ test('member Quick Pick keeps exact matches selected across field and function g
   }
 });
 
+test('member groups preserve the strongest match across kinds in both completion UIs', async t => {
+  for (const operator of ['$', '@']) {
+    for (const [field, callable, expected] of [
+      ['beta', 'BETA', 'beta'],
+      ['BETA', 'beta', 'beta()'],
+      ['alphabetagamma', 'betaMore', 'betaMore()'],
+      ['betaMore', 'alphabetagamma', 'betaMore'],
+    ]) {
+      const text = `obj${operator}beta`;
+      const context = completion.getCompletionContext(text, text.length);
+      const candidates = [
+        { label: field, insertText: field, source: 'session', kind: vscode.CompletionItemKind.Field },
+        { label: callable, insertText: callable + '()', source: 'session', kind: vscode.CompletionItemKind.Function },
+      ];
+      const inline = completion.toCompletionQuickPickItems(
+        completion.rankCompletionEntries(candidates, context.prefix, context), context);
+      assert.equal(inline.find(item => 'insertText' in item).insertText, expected);
+      const picker = await openPicker(t, text, [], async () => candidates, Promise.resolve(candidates));
+      await tick();
+      assert.equal(picker.pick.activeItems[0].insertText, expected);
+      await picker.type('beta');
+      assert.equal(picker.pick.activeItems[0].insertText, expected);
+      await picker.type('');
+      assert.equal(picker.pick.activeItems[0].insertText, expected);
+    }
+  }
+});
+
 test('package invalidation closes Quick Pick and discards delayed suggestions', async () => {
   let onHide, resolveEntries;
   let disposed = false;

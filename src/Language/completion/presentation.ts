@@ -157,7 +157,15 @@ export function toCompletionQuickPickItems(
   const exactMatchGroups = getExactMatchGroups(grouped, context.prefix).filter(
     (group) => !pinnedGroups.includes(group)
   );
-  const groups = exactMatchGroups.length === 0
+  // Member kind groups must not undo the shared match ranking. In particular,
+  // a case-insensitive function match cannot precede an exact field, and a
+  // fuzzy field cannot precede a function whose name starts with the query.
+  // Order groups by their strongest candidate; retain normal browsing order
+  // when there is no query.
+  const groups = context.kind === "member" && context.prefix
+    ? [...new Set(rankCompletionEntries(entries, context.prefix, context)
+        .map(entry => getCompletionGroup(entry, context)))]
+    : exactMatchGroups.length === 0
     ? baseGroups
     : [
         ...pinnedGroups,

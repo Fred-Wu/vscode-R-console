@@ -153,13 +153,17 @@ export function getCompletionParseSuffix(code: string): string | undefined {
   return suffix + stack.reverse().join("");
 }
 
-function completionPrefix(tokens: Token[], start: number, end: number, cursor: number):
+function completionPrefix(tokens: Token[], start: number, end: number, cursor: number, accessorPrefix = false):
   { prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" } | undefined {
   const before = tokens.slice(start, end).filter(token => token.position < cursor);
   if (!before.length) return start === end ? { prefix: "", replaceStart: cursor } : undefined;
   if (before.length !== 1) return undefined;
   const token = before[0];
-  if (token.type === TokenType.Identifier && !token.value.startsWith("`") && token.value !== "..." &&
+  // As with obj$in, a keyword can be a transient prefix in obj[[in while
+  // typing a stored member name. Keep the receiver and its insertion rules;
+  // this does not extend the grammar of completed runtime selector paths.
+  if ((accessorPrefix ? isAccessorNamePrefix(token) : token.type === TokenType.Identifier) &&
+      !token.value.startsWith("`") && token.value !== "..." &&
       token.position + token.value.length >= cursor) {
     const end = token.position + token.value.length;
     return { prefix: token.value.slice(0, cursor - token.position), replaceStart: token.position,
@@ -229,7 +233,7 @@ export function getBracketCompletionContext(code: string, cursor = code.length, 
       argumentTags.push(active ? null : named ? first.value :
         slotStart + 1 === index && first?.value === "..." ? "..." : "");
       if (!option && active) {
-        selected = completionPrefix(tokens, slotStart + (named ? 2 : 0), index, cursor);
+        selected = completionPrefix(tokens, slotStart + (named ? 2 : 0), index, cursor, true);
         // Retain source spelling so quoted/escaped argument tags remain valid R.
         argumentName = named ? first.value : undefined;
         dimension = dimensions;

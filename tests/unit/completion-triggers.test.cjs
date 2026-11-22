@@ -37,6 +37,48 @@ test("R keyword prefixes stay in member and namespace completion while typing", 
   assert.equal(contextAt("if│")?.kind, "default", "top-level names remain unchanged");
 });
 
+test("bracket keyword prefixes retain guarded receivers and quoted insertion throughout typing", async () => {
+  const keywords = ['in', 'if', 'else', 'for', 'while', 'repeat', 'next', 'break', 'function',
+    'TRUE', 'FALSE', 'NULL', 'NA', 'NA_integer_', 'NA_real_', 'NA_complex_', 'NA_character_', 'Inf', 'NaN'];
+  for (const receiver of ['obj', 'box$inner', 'box[[1]]']) {
+    for (const operator of ['[', '[[']) {
+      for (const keyword of keywords) {
+        const name = keyword + '_field';
+        for (const prefix of [keyword.slice(0, -1), keyword, name]) {
+          const input = receiver + operator + prefix;
+          const context = completion.getCompletionContext(input, input.length);
+          assert.equal(context.kind, 'bracket', input);
+          assert.equal(context.objectName, receiver, input);
+          assert.equal(context.prefix, prefix, input);
+          let probes = 0;
+          const entries = await completion.collectCompletionEntries(context, undefined, undefined,
+            undefined, [], [], undefined, async (expression, target) => {
+              probes++;
+              assert.deepEqual([expression, target], [receiver, operator]);
+              return { status:'available', names:[name] };
+            });
+          assert.equal(probes, 1, input);
+          assert.deepEqual(entries.map(entry => entry.insertText), [JSON.stringify(name)], input);
+        }
+      }
+    }
+  }
+  for (const marked of ['box$inner[[in│tegerColumn]]', 'df[, in│tegerColumn]', 'df[, j = in│tegerColumn]']) {
+    const context = contextAt(marked);
+    assert.equal(context.kind, 'bracket', marked);
+    assert.equal(context.prefix, 'in', marked);
+    assert.equal(context.replaceEnd, marked.indexOf('│') + 'tegerColumn'.length, marked);
+  }
+  // A keyword prefix must still reach the safety decision instead of falling
+  // back to stale, unquoted workspace fields in an ordinary symbol context.
+  const input = 'obj[in';
+  const rejected = await completion.collectCompletionEntries(
+    completion.getCompletionContext(input, input.length), undefined, undefined,
+    { globalenv: { obj: { names:['integerColumn'] } } }, [], [], undefined,
+    async () => ({ status:'suppressed', reason:'unsafe-dispatch' }));
+  assert.deepEqual(rejected, []);
+});
+
 test("unsupported executable receivers with keyword prefixes cannot fall back to global completion", async () => {
   const keywords = ["in", "if", "else", "for", "while", "repeat", "next", "break", "function",
     "TRUE", "FALSE", "NA", "NA_integer_", "NA_real_", "NA_complex_", "NA_character_", "Inf", "NaN"];
