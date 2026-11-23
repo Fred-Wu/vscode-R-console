@@ -378,7 +378,11 @@ export class RTermLang {
           logConsoleCompletionDecision({ kind: "StaticUnavailable" },
             completionDecisionContext(inputText), this.completionDocumentId);
         }
-        return [];
+        // A missing language server or document is not an authoritative empty
+        // result. Keep inline completion retryable after the provider recovers.
+        const pending = [] as CompletionEntries;
+        pending.isIncomplete = true;
+        return pending;
       }
       const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp);
       if (this.isCurrentCompletionRequest(requestId) && logOutcome &&

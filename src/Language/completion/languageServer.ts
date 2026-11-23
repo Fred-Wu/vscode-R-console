@@ -233,6 +233,12 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
   const result = (typeof item.insertText === "object" && "value" in item.insertText) || protocolFormat === 2
     ? stripSnippetSyntax(text) : text;
   const role = getCompletionRole(item);
+  // Inferred members may supply only a display label. A raw label is not
+  // necessarily valid R code: quote $/@ names and escape quoted [[ keys.
+  // Preserve explicitly formatted LSP insertion text.
+  if (role === "member" && result === label) {
+    return getFieldInsertText(label, context);
+  }
   if (role === "member" || item.kind === vscode.CompletionItemKind.Field) {
     if (result === label && escapeRControls(label) !== label) {
       return getFieldInsertText(label, context, role === "scope");

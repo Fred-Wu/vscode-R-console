@@ -145,6 +145,67 @@ test("decoded quoted fallback prefixes select escaped source member labels", asy
   }
 });
 
+
+test("source-only completion remains retryable until the language server recovers", async () => {
+  for (const missing of ["server", "document"]) {
+    const h = harness();
+    const server = await h.lang.ensureConsoleLspStarted();
+    const getDocument = h.lang.getOrOpenCompletionDocument.bind(h.lang);
+    if (missing === "server") h.lang.ensureConsoleLspStarted = async () => undefined;
+    else h.lang.getOrOpenCompletionDocument = async () => undefined;
+    assert.deepEqual(labels(await h.complete("make_data()$")), []);
+    assert.equal(h.lang.inlineCache?.entries.isIncomplete, true, missing);
+    assert.equal(h.lang.hasCompleteInlineMemberCache(), false, missing);
+    h.lang.ensureConsoleLspStarted = async () => server;
+    h.lang.getOrOpenCompletionDocument = getDocument;
+    assert.deepEqual(labels(await h.complete("make_data()$al")), ["alpha"]);
+    assert.deepEqual(h.requests.map(request => request.mode), ["static"]);
+  }
+});
+
+test("unformatted inferred member names are escaped for R accessors and quoted indices", async () => {
+  const infer = async (source, cursor, items) => {
+    const context = completion.getStaticFallbackContext(source, cursor,
+      source.slice(0, cursor), source.slice(cursor));
+    assert.ok(context?.staticFallback, source);
+    const entries = await completion.collectStaticFallbackEntries(context, {
+      getText: () => source, uri: { toString: () => "r-console://test/console.R" },
+    }, new Position(0, cursor), [], {
+      provideCompletionItems: async () => ({ rConsoleMemberResolved: true, items }),
+    });
+    return entries.map(entry => completion.toCompletionPick(entry, context));
+  };
+  const memberItems = [
+    ["simple", "simple"],
+    ["a b", "`a b`"],
+    ["a`b", "`a\\`b`"],
+    ["a\\b", "`a\\\\b`"],
+    ["line\nitem", "`line\\nitem`"],
+  ];
+  const memberPicks = await infer("make_data()$", "make_data()$".length,
+    memberItems.map(([label]) => ({ label, kind: 4, data: { type: "member" } })));
+  assert.deepEqual(memberPicks.map(item => item.insertText), memberItems.map(([, text]) => text));
+  for (const [source, label, expected] of [
+    ['make_data()[["old"]]', 'a"b', 'make_data()[["a\\"b"]]'],
+    ['make_data()[["old"]]', 'a\\b', 'make_data()[["a\\\\b"]]'],
+    ["make_data()[['old']]", "a'b", "make_data()[['a\\'b']]"],
+  ]) {
+    const cursor = source.indexOf("old");
+    const picks = await infer(source, cursor, [
+      { label, kind: 4, data: { type: "member" } },
+    ]);
+    assert.equal(picks.length, 1, source);
+    const pick = picks[0];
+    assert.equal(source.slice(0, pick.replaceStart) + pick.insertText +
+      source.slice(pick.replaceEnd ?? cursor), expected, source);
+  }
+  // Provider-supplied R insertion edits must not be double-quoted.
+  const explicit = await infer("make_data()$", "make_data()$".length, [
+    { label: "a b", kind: 4, data: { type: "member" }, insertText: "`a b`" },
+  ]);
+  assert.equal(explicit[0].insertText, "`a b`");
+});
+
 test("static fallback uses only inferred member results and the requested analysis mode", async () => {
   const input = "make_data()$al";
   const context = completion.getStaticFallbackContext(input, input.length);

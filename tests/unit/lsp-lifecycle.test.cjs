@@ -81,7 +81,7 @@ function change() {
 
 test("explicit completion mode uses the existing virtual document and controls source inference", async t => {
   const { client, instances } = createClient(t, { staticAnalysis: true });
-  const source = "object <- list(alpha = 1)\\nobject$";
+  const source = "object <- list(alpha = 1)\nobject$";
   const doc = { getText: () => source };
   const cursor = new Position(1, 7);
   await client.provideCompletionItems(doc, cursor, undefined, undefined, undefined, "runtime");
@@ -90,8 +90,14 @@ test("explicit completion mode uses the existing virtual document and controls s
   assert.equal(requests.length, 2);
   assert.equal(requests[0].params.rConsoleStaticAnalysis, undefined);
   assert.equal(requests[1].params.rConsoleStaticAnalysis, true);
-  assert.ok(requests[1].params.text.includes("object <- list"),
-    "static projection retains the current source");
+  assert.equal(requests[1].params.text, source,
+    "static projection retains the original multiline input");
+  assert.equal(requests[0].params.text.includes("object <- list"), false,
+    "runtime projection hides unsubmitted definitions");
+  for (const request of requests) {
+    assert.equal(request.params.position.line, 1, "projected cursor stays on the second line");
+    assert.equal(request.params.position.character, 7, "projected cursor preserves its column");
+  }
   assert.equal(client.syncedDocuments.size, 1,
     "fallback reuses the existing document instead of creating another");
 });
