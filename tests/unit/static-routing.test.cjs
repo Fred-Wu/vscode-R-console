@@ -652,3 +652,19 @@ test("structural inference failures skip prefix retries while pending analysis s
     assert.equal(h.requests.length, reason === 'analysis-pending' || reason === undefined ? 2 : 1, reason);
   }
 });
+
+test('static bracket fallback accepts only a standalone key prefix', async () => {
+  for (const text of ['make_data()[[index + "al', 'make_data()[[1, "al',
+    'make_data()[[name = "al', 'make_data()[[index + al', 'make_data()[[1, al',
+    'make_data()[["al" # comment']) {
+    assert.equal(completion.getStaticFallbackContext(text, text.length), undefined, text);
+    const h = harness();
+    await h.complete(text);
+    assert.equal(h.requests.length, 0, text);
+    assert.equal(h.native.length, 0, text);
+  }
+  for (const text of ['make_data()[["al', 'make_data()[[ # key\n "al']) {
+    const line = text.split('\n').at(-1);
+    assert.equal(completion.getStaticFallbackContext(line, line.length, text)?.prefix, 'al', text);
+  }
+});

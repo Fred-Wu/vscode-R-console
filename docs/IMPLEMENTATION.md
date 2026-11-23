@@ -1419,7 +1419,11 @@ byte budget without allocating a temporary string for each ordinary character.
 The edit adapter requires replacement starts on the current console line, so
 literal names begun on an earlier line are suppressed instead of exposing
 negative replacement columns. Names containing escaped newlines on one source
-line remain supported. Bracket routing counts each delimiter independently,
+line remain supported. Quick Pick escapes decoded search text when projecting
+quoted keys and argument values, and maps replacement ends back to the original
+input. Static bracket fallback accepts standalone key prefixes; operators,
+argument tags and dimension separators keep the surrounding index unsupported.
+Bracket routing counts each delimiter independently,
 including adjacent closing brackets shared by nested single/double indices.
 
 #### Completion Frontends

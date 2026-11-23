@@ -267,7 +267,11 @@ export function getStaticFallbackContext(
   }
   const active = frames.at(-1);
   if (!active?.operator || active.start === 0) return undefined;
-  const tail = before.slice(active.start + active.operator.length);
+  const keyStart = active.start + active.operator.length;
+  // A key prefix occupies the first slot by itself. Operators, tags and
+  // dimension separators belong to an expression rather than a member name.
+  if (tokens.filter(token => token.position >= keyStart).length > 1) return undefined;
+  const tail = before.slice(keyStart);
   let prefix = "";
   let quote: "\"" | "'" | undefined;
   let replaceStart = before.length - shift;

@@ -434,3 +434,26 @@ test('quoted member picker refinements preserve R spelling and rebase edits', as
     }
   }
 });
+
+test('quoted picker refinements preserve literal search text and original edit bounds', async t => {
+  for (const head of ['obj[[', 'make_data()[[', 'f(mode = ']) {
+    for (const quote of ['"', "'"]) {
+      for (const label of ['a\\b', 'a"b', "a'b", 'a\nb', 'a\tb']) {
+        const text = head + quote + 'zold' + quote + (head.includes('[[') ? ']]' : ')');
+        const cursor = head.length + 2;
+        let captured;
+        const picker = await openPicker(t, text, [], async (context, preview, lines, col) => {
+          captured = { context, preview, col };
+          return [{ label, insertText: label, source: 'lsp', kind: 4,
+            replaceStart: context.replaceStart, replaceEnd: context.replaceEnd }];
+        }, undefined, cursor);
+        await picker.type(label);
+        assert.ok(captured, text);
+        assert.equal(captured.context.prefix, label, text);
+        assert.equal(captured.preview.split('\n').length, 1, 'literal newlines stay escaped in the preview');
+        assert.equal(picker.pick.items.find(item => 'insertText' in item).replaceEnd,
+          text.indexOf('old') + 3, 'replacement end maps back to the original suffix');
+      }
+    }
+  }
+});
