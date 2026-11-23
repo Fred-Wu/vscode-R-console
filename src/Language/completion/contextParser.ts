@@ -89,7 +89,8 @@ export function getCompletionParseInsertion(code: string, cursor: number): { off
 
 export type CallCompletionContext = {
   // Callable source reconstructed from tokens, without inter-token whitespace
-  // or comments. Quoted identifiers retain their spelling and escapes.
+  // or comments between selectors. Balanced receiver expressions retain their
+  // original source, including statement boundaries inside blocks.
   name: string;
   operator?: "$" | "@" | "::" | ":::";
   // R source tags; "" is positional, "..." is unknown forwarded dots, null is the cursor. Undefined
@@ -462,38 +463,69 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
     }
   }
   const stack: { opening: string; index: number }[] = [];
+  const openings = new Map<number, number>();
+  const continuations: boolean[] = [];
   for (let index = 0; index < tokens.length && tokens[index].position < cursor; index++) {
     const token = tokens[index];
+    continuations[index] = continuesExpressionLine(lineBreaks.has(index), stack.at(-1)?.opening, tokens[index - 1]);
     if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
       for (const opening of token.value.slice(0, cursor - token.position)) {
         stack.push({ opening, index });
       }
     } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace || token.type === TokenType.RightBracket) {
+      let opening = -1;
       for (const closing of token.value.slice(0, cursor - token.position)) {
         const expected = closing === ")" ? "(" : closing === "}" ? "{" : "[";
-        if (stack.pop()?.opening !== expected) return undefined;
+        const matched = stack.pop();
+        if (matched?.opening !== expected) return undefined;
+        opening = matched.index;
       }
+      if (stack.at(-1)?.index !== opening) openings.set(index, opening);
     }
   }
   const frame = stack.at(-1);
   if (frame?.opening !== "(") return undefined;
-  // Parentheses and subscripts allow continuation across newlines; a brace
-  // starts a statement context even when it is itself inside parentheses.
-  const parent = stack.at(-2)?.opening;
-  const continuesLine = (index: number): boolean =>
-    continuesExpressionLine(lineBreaks.has(index), parent, tokens[index - 1]);
+  const continuesLine = (index: number): boolean => continuations[index];
   let start = frame.index - 1;
   const last = tokens[start];
-  if (last?.type !== TokenType.Identifier || !continuesLine(frame.index)) return undefined;
+  if (!isCompleteIdentifier(last) || !continuesLine(frame.index)) return undefined;
   let operator: CallCompletionContext["operator"];
-  while (start >= 1) {
+  const parts: string[] = [];
+  // Find the complete receiver of a named method, including calls, grouping
+  // and subscripts. This is syntax for source inference, not authorization to
+  // evaluate a chain; the native inspector retains its separate strict grammar.
+  const canEndReceiver = (index: number): boolean => {
+    const token = tokens[index];
+    if (isCompleteIdentifier(token)) return true;
+    if (!openings.has(index)) return false;
+    const head = tokens[openings.get(index)! - 1];
+    return token.type !== TokenType.RightParen || !head ||
+      !([TokenType.If, TokenType.For, TokenType.While, TokenType.Function].includes(head.type) ||
+        (head.type === TokenType.Operator && head.value === "\\"));
+  };
+  while (start >= 0) {
+    const token = tokens[start];
+    if (isCompleteIdentifier(token)) parts.push(token.value);
+    else {
+      const opening = openings.get(start);
+      if (opening === undefined) return undefined;
+      parts.push(code.slice(tokens[opening].position, token.position + token.value.length));
+      start = opening;
+      if (token.type === TokenType.RightBracket || (token.type === TokenType.RightParen &&
+          continuesLine(start) && canEndReceiver(start - 1))) {
+        if (!continuesLine(start)) return undefined;
+        start--;
+        continue;
+      }
+    }
     const previous = tokens[start - 1];
     if (!isNameAccessor(previous)) break;
-    if (tokens[start - 2]?.type !== TokenType.Identifier ||
-        !continuesLine(start) || !continuesLine(start - 1)) return undefined;
+    if (!continuesLine(start) || !continuesLine(start - 1)) return undefined;
     operator ??= previous.value as CallCompletionContext["operator"];
+    parts.push(previous.value);
     start -= 2;
   }
+  if (start < 0) return undefined;
   // Never reinterpret the ASCII suffix of an unsupported token as a callable.
   const preceding = tokens[start - 1];
   if (preceding?.type === TokenType.Unknown &&
@@ -564,7 +596,7 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
   }
   if (piped && !hasPipePlaceholder) argumentTags.unshift("");
   return {
-    name: tokens.slice(start, frame.index).map(token => token.value).join(""),
+    name: parts.reverse().join(""),
     operator,
     argumentTags: namePosition && !inComment ? argumentTags : undefined,
     ...(argumentValue && !inComment ? { argumentValue: { ...argumentValue,

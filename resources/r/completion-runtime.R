@@ -10,17 +10,27 @@ console_parse_signature <- function(signature) {
 
 # A guarded native argument-name snapshot describes any stored closure.
 # Reconstruct inert formals for matching; never copy or evaluate defaults/body.
-console_call_root <- function(source) {
+console_call_root <- function(source, include_calls = FALSE) {
+    # NULL denotes a namespace-qualified root; an empty static root means
+    # analysis could not verify its scope and must not borrow package metadata.
+    unknown <- if (include_calls) "" else NULL
+    max_bytes <- if (include_calls) 65536L else 4096L
     if (!is.character(source) || length(source) != 1L || is.na(source) ||
-        nchar(source, type = "bytes") > 4096L) return(NULL)
+        nchar(source, type = "bytes") > max_bytes) return(unknown)
     root <- tryCatch(str2lang(source), error = function(e) NULL)
-    for (i in seq_len(13L)) {
+    for (i in seq_len(if (include_calls) 64L else 13L)) {
         if (is.symbol(root)) return(as.character(root))
-        if (!is.call(root) || !is.symbol(root[[1L]]) || length(root) < 2L ||
-            !as.character(root[[1L]]) %in% c("$", "@", "[[", "[")) return(NULL)
-        root <- root[[2L]]
+        if (!is.call(root)) return(unknown)
+        head <- root[[1L]]
+        if (is.symbol(head) && as.character(head) %in% c("$", "@", "[[", "[", "(")) {
+            if (length(root) < 2L) return(unknown)
+            root <- root[[2L]]
+        } else if (is.symbol(head) && as.character(head) %in% c("::", ":::")) return(NULL)
+        else if (include_calls) {
+            root <- head
+        } else return(unknown)
     }
-    NULL
+    unknown
 }
 
 console_runtime_arguments <- function(params) {

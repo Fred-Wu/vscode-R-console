@@ -120,7 +120,7 @@ console_supplement_completion <- function(reply, self, params) {
         isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")) ||
             (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
-    method_root <- if (member_call) console_call_root(params$rConsoleCall) else NULL
+    method_root <- if (member_call) console_call_root(params$rConsoleCall, include_calls = TRUE) else NULL
     member_source <- if (static_analysis && member_call)
         console_member_function(uri, workspace, document, point, method_root) else NULL
     # A current source binding (including an unresolved factory or a formal)
@@ -131,7 +131,7 @@ console_supplement_completion <- function(reply, self, params) {
     # Static source inference is explicitly opt-in. Live sess signatures take
     # precedence in normal console mode regardless of native package inference.
     source <- if (is.null(call) || !is.null(call$package) || !static_analysis) NULL else if (member_call) {
-        if (native_arguments) NULL else member_source
+        if (native_arguments && !isTRUE(member_source$unknown)) NULL else member_source
     } else console_source_function(document, point, call$token)
     source_is_static <- !is.null(source)
     if (source_is_static) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE

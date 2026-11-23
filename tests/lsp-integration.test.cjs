@@ -246,6 +246,60 @@ test("typing and accepting package functions opens real argument suggestions wit
   piped.dismissInlineCompletion(false);
 });
 
+test("accepting a chained method opens its inferred arguments without executing the receiver", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require('./helpers/console-lsp.cjs');
+  const { createTerminal } = require('./helpers/inline-terminal.cjs');
+  let inspections = 0;
+  const { client } = createConsoleLsp(t, { requestRuntimeFunctionArguments: () => {
+    inspections++;
+    return { status: 'unavailable' };
+  } });
+  const provide = client.provideCompletionItems.bind(client);
+  client.provideCompletionItems = async (...args) => {
+    const response = await provide(...args);
+    return { ...response, items: response.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+  };
+  const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      Uri: { parse: value => ({ toString: () => value }) },
+      CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+    },
+    '../../Language/consoleLspClient': { ConsoleLspClient: class { constructor() { return client; } } },
+  });
+  const { terminal } = createTerminal(t, 100, 24, 'typing', { 'completion.staticAnalysis': true });
+  delete terminal.applyCompletion;
+  terminal.lang = new RTermLang({ extensionPath: '', rPath: '', env: {}, getStaticAnalysisEnabled: () => true });
+  t.after(() => terminal.lang.cancelCompletion());
+  const marker = path.join(os.tmpdir(), 'r-console-chain-' + randomBytes(8).toString('hex'));
+  t.after(() => fs.rmSync(marker, { force: true }));
+  const definition = `api <- list(scan = function() { file.create(${JSON.stringify(marker)}); list(collect = function(engine, optimize = TRUE) NULL) })`;
+  terminal.inputState.text = definition + '\napi$scan()$collec';
+  terminal.inputState.cursorPosition = terminal.inputState.text.length;
+  terminal.applyKeyAction({ type: 'text', text: 't' });
+  const choices = () => terminal.inlineCompletion.items.filter(item => 'insertText' in item);
+  const until = async (predicate, label) => {
+    const deadline = Date.now() + 15000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, label);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  };
+  await until(() => choices().some(item => item.insertText === 'collect()'), 'method popup');
+  const method = choices().find(item => item.insertText === 'collect()');
+  assert.match(method.detail, /engine/);
+  terminal.inlineCompletion.move(choices().indexOf(method) - terminal.inlineCompletion.selected);
+  terminal.applyKeyAction({ type: 'tab' });
+  assert.equal(terminal.inputState.textBeforeCursor, definition + '\napi$scan()$collect(');
+  await until(() => choices().some(item => item.insertText === 'engine = '), 'arguments after accepting chained method');
+  assert.deepEqual(choices().filter(item => item.detail === 'parameter').map(item => item.insertText),
+    ['engine = ', 'optimize = ']);
+  assert.equal(terminal.submitted, undefined);
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(inspections, 0);
+});
+
 test("real LSP excludes supplied argument names while retaining signature order", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const { client } = createConsoleLsp(t);

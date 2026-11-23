@@ -1533,6 +1533,14 @@ Completion data comes from one shared flow:
   precedence, including unresolved factories that shadow older session objects.
   Unavailable method arguments produce a reason-and-action completion log;
   a known zero-argument or fully supplied signature is silently complete.
+- with static analysis enabled, chained method calls retain their complete
+  receiver syntax, including balanced calls and subscripts. Argument completion
+  uses the same receiver-specific package signature as the member popup when
+  the resolver refers to a catalog definition instead of inline function syntax.
+  For example, `api$scan()$collect(` can offer the declared `collect` arguments
+  without invoking `scan()`. An unrelated global `collect` cannot supply them.
+  The native receiver grammar remains unchanged; executable chains are never
+  sent to the stored-function inspector.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
 

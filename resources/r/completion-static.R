@@ -94,12 +94,40 @@ console_source_function <- function(document, point, name) {
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
 console_member_function <- function(uri, workspace, document, point, root = NULL) {
+    if (identical(root, "")) return(list(unknown = TRUE))
     if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
     location <- languageserver:::member_call_location(document, point)
     if (is.null(location)) return(NULL)
     resolved <- languageserver:::member_resolve_cursor(uri, workspace, document,
         location$point, location$cursor, location$cursor$token)
+    if (!is.null(root) && !is.null(console_source_function(document, point, root))) {
+        # A draft assignment or formal may shadow an attached package object.
+        # Verify that binding independently before following a catalog method;
+        # an unresolved source root is not the same as its package namesake.
+        if (!exists("member_infer", asNamespace("languageserver"), inherits = FALSE))
+            return(list(unknown = TRUE))
+        binding <- languageserver:::member_infer(as.name(root), resolved$index,
+            resolved$bindings, budget = resolved$budget)
+        if (!length(binding$type) && is.null(binding$function_expr) && is.null(binding$function_key))
+            return(list(unknown = TRUE))
+    }
     definition <- resolved$value$function_expr
+    if (is.null(definition) && !is.null(resolved$value) &&
+        exists("member_symbol_info", asNamespace("languageserver"), inherits = FALSE)) {
+        # Package methods can refer to a catalog definition instead of carrying
+        # inline function syntax. Reuse the receiver-specific signature that
+        # supplies the member popup, including its package/alias resolution.
+        # A fixed display name makes the declaration parseable as function
+        # syntax; neither the receiver nor its defaults/body is evaluated.
+        label <- ".r_console_callable"
+        symbol <- languageserver:::member_symbol_info(label, resolved$value,
+            resolved$value$function_key, resolved$index)
+        signature <- symbol$signature
+        if (is.character(signature) && length(signature) == 1L && !is.na(signature) &&
+            nchar(signature, type = "bytes") <= 65536L && startsWith(signature, paste0(label, "("))) {
+            definition <- console_parse_signature(paste0("function", substring(signature, nchar(label) + 1L)))
+        }
+    }
     if (is.null(definition)) {
         # A source-defined factory can have an unknown result while still
         # shadowing a live object. Reuse native binding history even when the
