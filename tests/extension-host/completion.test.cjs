@@ -389,6 +389,9 @@ suite("Static fallback routing in the VS Code extension host", () => {
 
       storedDefinition = "function() list(alpha = 1, `odd field` = 2)";
       for (const [marked, expected] of [
+        ["(make_data())$al│old", "(make_data())$alpha"],
+        ["((make_data()))$al│", "((make_data()))$alpha"],
+        ["( # group\n  make_data()\n)$al│old", ")$alpha"],
         ["make_data()$\n  al│old", "  alpha"],
         ["make_data()$ # continuation\n# comment\n  al│", "  alpha"],
         ["make_data()$`odd│", "make_data()$`odd field`"],

@@ -375,16 +375,48 @@ test("source receiver selection targets only a direct global closure, not nested
     ["make_data()$nested$", "make_data"],
     ['make_data()[["inner"]]$', "make_data"],
     ['make_data()[["al', "make_data"],
+    ["(make_data())$", "make_data"],
+    ["((make_data()))$al", "make_data"],
+    ["(make_data())$nested$", "make_data"],
+    ["((make_data())$nested)$", "make_data"],
+    ['((make_data())[["inner"]])$', "make_data"],
+    ['((make_data()))[["al', "make_data"],
+    ['(make_data()[[x[1]]])$', "make_data"],
+    ["other <- ((make_data()))$", "make_data"],
+    ["print((make_data())$", "make_data"],
+    ["( # group\n  `make data`()\n)$", "make data"],
+    ["other\n(make_data())$", "make_data"],
+    ["if (TRUE) (make_data())$", "make_data"],
+    ["function(x) (make_data())$", "make_data"],
     ["wrapper(make_data())$", "wrapper"],
+    ["(wrapper((make_data())))$", "wrapper"],
     ["obj[[side_effect()]]$", undefined],
     ["obj$make_data()$", undefined],
     ["pkg::make_data()$", undefined],
+    ["(obj$make_data())$", undefined],
+    ["((pkg::make_data()))$", undefined],
+    ["(make_data())()$", undefined],
+    ["(make_data)()$", undefined],
+    ["(obj[[make_data()]])$", undefined],
+    ["(other + make_data())$", undefined],
+    ["((make_data() + other))$", undefined],
+    ["(-make_data())$", undefined],
+    ["(if (TRUE) make_data())$", undefined],
+    ["(1(make_data()))$", undefined],
     ["obj$", undefined],
   ];
   for (const [text, expected] of sourceNames) {
     const context = completion.getStaticFallbackContext(text, text.length);
     assert.equal(completion.storedFunctionReceiver(context ?? { kind: "default" }, text, text.length),
       expected, text);
+  }
+});
+
+test("deep receiver grouping uses an iterative walk without borrowing a compound expression's call", () => {
+  const context = { kind: "member", staticFallback: true };
+  for (const [body, expected] of [["make_data()", "make_data"], ["other + make_data()", undefined]]) {
+    const input = "(".repeat(5000) + body + ")".repeat(5000) + "$";
+    assert.equal(completion.storedFunctionReceiver(context, input, input.length), expected);
   }
 });
 

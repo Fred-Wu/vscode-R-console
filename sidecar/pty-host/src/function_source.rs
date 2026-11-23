@@ -114,7 +114,8 @@ impl Native {
             let car = self.car.ok_or(Suppression::InspectionLimit)?;
             let head = car(value);
             let args = (self.cdr)(value);
-            if (self.type_of)(head) == SYMBOL && self.source_symbol(head)? == "function" {
+            let head_name = if (self.type_of)(head) == SYMBOL { Some(self.source_symbol(head)?) } else { None };
+            if head_name.as_deref() == Some("function") {
                 if (self.type_of)(args) != LIST { return Err(Suppression::InspectionLimit); }
                 let tail = (self.cdr)(args);
                 if (self.type_of)(tail) != LIST { return Err(Suppression::InspectionLimit); }
@@ -122,10 +123,16 @@ impl Native {
             }
             // Prefix-call syntax preserves the AST of operators and control
             // structures as well as ordinary functions, including missing args.
-            let named_head = (self.type_of)(head) == SYMBOL;
-            if !named_head { source.push("(")?; }
-            self.source_node(head, depth + 1, source)?;
-            source.push(if named_head { "(" } else { ")(" })?;
+            if let Some(name) = head_name {
+                // Reuse the decoded head while retaining its node/depth budget.
+                self.source_step(depth + 1, source)?;
+                source.quote(&name, '`')?;
+                source.push("(")?;
+            } else {
+                source.push("(")?;
+                self.source_node(head, depth + 1, source)?;
+                source.push(")(")?;
+            }
             self.source_arguments(args, false, depth + 1, source)?;
             return source.push(")");
         }

@@ -1378,6 +1378,12 @@ literal objects are unavailable. Traversal is limited to 4,096 nodes, 64 levels
 and 64 KiB of output, using the existing request deadline and C error boundary.
 Only direct global closure receivers are eligible; methods, namespace calls and
 computed call heads continue to use the existing source/package analysis route.
+Named call results can be wrapped in grouping parentheses, including grouping
+within member/index chains. The detector matches delimiters once and unwraps
+groups iteratively, requiring each whole group to be a supported receiver;
+compound expressions such as `(other + fn())$` cannot borrow `fn`'s source.
+The serializer reuses decoded call-head names while retaining the same node,
+depth, byte and deadline limits.
 
 Member context recognition retains prefixes continued after an accessor across
 newlines/comments and unfinished backticked names. A quoted name's replacement

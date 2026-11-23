@@ -105,6 +105,17 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("make_data", [], "source"), first,
     "separate unrelated submissions do not lose stored closure source");
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["alpha"]);
+  for (const marked of [
+    "(make_data())$│", "((make_data()))$al│old",
+    "( # group\n  make_data()\n)$al│old",
+  ]) {
+    const cursor = marked.indexOf("│"), text = marked.replace("│", "");
+    const entries = await completeStored(text, cursor);
+    assert.deepEqual(entries.map(item => item.label), ["alpha"], marked);
+    const line = text.split("\n").at(-1), col = text.slice(0, cursor).split("\n").at(-1).length;
+    assert.equal(line.slice(0, entries[0].replaceStart) + entries[0].insertText +
+      line.slice(entries[0].replaceEnd ?? col), line.slice(0, line.lastIndexOf("$") + 1) + "alpha", marked);
+  }
   const middle = (await completeStored("make_data()$alold", "make_data()$al".length))[0];
   assert.equal(middle?.insertText, "alpha");
   assert.equal(middle.replaceStart, "make_data()$".length);
@@ -146,9 +157,11 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("active_source", [], "source"),
     { status: "suppressed", reason: "active-binding" });
   assert.deepEqual(Array.from(await completeStored("active_source()$")), []);
+  assert.deepEqual(Array.from(await completeStored("((active_source()))$")), []);
   await submit('delayedAssign("deferred_source", { stop("forced promise"); function() list(secret = 1) })');
   assert.deepEqual(await inspect("deferred_source", [], "source"),
     { status: "suppressed", reason: "deferred-binding" });
+  assert.deepEqual(Array.from(await completeStored("((deferred_source()))$")), []);
   await submit("not_a_closure <- list(alpha = 1)");
   assert.deepEqual(await inspect("not_a_closure", [], "source"), { status: "unavailable" });
   await submit('wide_source <- function() NULL; body(wide_source) <- as.call(c(list(as.name("list")), rep(list(1L), 5000L))); deep_source <- function() NULL; deep_expr <- quote(list(alpha = 1)); for (i in 1:80) deep_expr <- as.call(list(as.name("identity"), deep_expr)); body(deep_source) <- deep_expr');

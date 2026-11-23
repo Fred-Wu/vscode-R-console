@@ -1,4 +1,4 @@
-import { TokenType, isAccessorNamePrefix } from "../lexer";
+import { TokenType, continuesExpressionLine, isAccessorNamePrefix, isNameAccessor } from "../lexer";
 import { getCompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
 import type { CompletionContext } from "./types";
@@ -14,19 +14,30 @@ export function storedFunctionReceiver(
   }
   const tokens = getCompletionSyntax(input, cursor).prefixTokens.filter(token =>
     token.type !== TokenType.EOF && token.type !== TokenType.Newline && token.type !== TokenType.Comment);
-  const matchingOpen = (end: number, left: TokenType, right: TokenType): number | undefined => {
-    let depth = 0;
-    for (let index = end; index >= 0; index--) {
-      const token = tokens[index];
-      if (token.type === right) depth += token.value.length;
-      else if (token.type === left) {
-        depth -= token.value.length;
-        if (depth === 0) return index;
-        if (depth < 0) return undefined;
+  // Match delimiters once. Grouping can be arbitrarily nested, and a closing
+  // bracket token can finish more than one nested single/double subscript.
+  const openings = new Map<number, number>();
+  const continuations: boolean[] = [];
+  const stack: Array<{ type: string; index: number }> = [];
+  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index], previous = tokens[index - 1];
+    const lineBreak = !!previous && input.slice(previous.position + previous.value.length, token.position).includes("\n");
+    continuations.push(continuesExpressionLine(lineBreak, stack.at(-1)?.type, previous));
+    if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBracket ||
+        token.type === TokenType.LeftBrace) {
+      for (const ch of token.value) stack.push({ type: ch, index });
+    } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBracket ||
+               token.type === TokenType.RightBrace) {
+      let opening = -1;
+      for (const ch of token.value) {
+        const frame = stack.pop();
+        if (frame?.type !== pairs[ch]) return undefined;
+        opening = frame.index;
       }
+      if (stack.at(-1)?.index !== opening) openings.set(index, opening);
     }
-    return undefined;
-  };
+  }
 
   let receiverEnd: number;
   if (context.kind === "member") {
@@ -39,30 +50,21 @@ export function storedFunctionReceiver(
         !["$", "@"].includes(tokens[accessor].value)) return undefined;
     receiverEnd = accessor - 1;
   } else {
-    const stack: Array<{ type: string; index: number }> = [];
-    const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
-    for (let index = 0; index < tokens.length; index++) {
-      const token = tokens[index];
-      if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBracket ||
-          token.type === TokenType.LeftBrace) {
-        for (const ch of token.value) stack.push({ type: ch, index });
-      } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBracket ||
-                 token.type === TokenType.RightBrace) {
-        for (const ch of token.value) if (stack.pop()?.type !== pairs[ch]) return undefined;
-      }
-    }
     const active = stack.at(-1);
     if (active?.type !== "[" || tokens[active.index].value !== context.bracketOperator) return undefined;
     receiverEnd = active.index - 1;
   }
 
-  // Strip suffixes on the result of a direct call: fn()$a, fn()[["a"]]$b.
+  // Strip suffixes and grouping on the result of a direct call. Each group
+  // must contain that entire receiver, not a compound expression ending in
+  // a call, such as (other + fn()). Keep this walk iterative as well.
   // Reject computed call heads and methods rather than retrieving an unrelated
   // global function with the same name.
+  const groups: number[] = [];
   for (let index = receiverEnd; index >= 0;) {
     const token = tokens[index];
     if (token.type === TokenType.RightBracket) {
-      const opening = matchingOpen(index, TokenType.LeftBracket, TokenType.RightBracket);
+      const opening = openings.get(index);
       if (opening === undefined) return undefined;
       index = opening - 1;
     } else if (token.type === TokenType.Identifier &&
@@ -70,14 +72,33 @@ export function storedFunctionReceiver(
         ["$", "@"].includes(tokens[index - 1].value)) {
       index -= 2;
     } else if (token.type === TokenType.RightParen) {
-      const opening = matchingOpen(index, TokenType.LeftParen, TokenType.RightParen);
+      const opening = openings.get(index);
       if (opening === undefined) return undefined;
-      const name = tokens[opening - 1];
+      const name = continuations[opening] ? tokens[opening - 1] : undefined;
       const preceding = tokens[opening - 2];
-      if (name?.type !== TokenType.Identifier ||
-          (preceding?.type === TokenType.Operator &&
-           ["$", "@", "::", ":::"].includes(preceding.value))) return undefined;
-      return decodeRArgumentName(name.value);
+      if (name?.type === TokenType.Identifier) {
+        if (isNameAccessor(preceding)) return undefined;
+        let start = opening - 1;
+        for (let group = groups.length - 1; group >= 0; group--) {
+          if (start !== groups[group] + 1) return undefined;
+          start = groups[group];
+        }
+        return decodeRArgumentName(name.value);
+      }
+      // Parentheses after a value are a computed call. A control condition or
+      // function's formals, however, can be followed by a grouped body.
+      const previousOpening = openings.get(opening - 1);
+      const control = previousOpening === undefined ? undefined : tokens[previousOpening - 1];
+      const afterControl = name?.type === TokenType.RightParen && control &&
+        ([TokenType.If, TokenType.For, TokenType.While, TokenType.Function].includes(control.type) ||
+         (control.type === TokenType.Operator && control.value === "\\"));
+      const grouping = !name || afterControl ||
+        [TokenType.LeftParen, TokenType.LeftBracket, TokenType.LeftBrace, TokenType.Comma,
+          TokenType.Semicolon, TokenType.Else, TokenType.Repeat, TokenType.In].includes(name.type) ||
+        (name.type === TokenType.Operator && !isNameAccessor(name) && name.value !== "\\");
+      if (!grouping) return undefined;
+      groups.push(opening);
+      index--;
     } else return undefined;
   }
   return undefined;
