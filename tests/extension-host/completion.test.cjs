@@ -347,16 +347,19 @@ suite("Static fallback routing in the VS Code extension host", () => {
         return { status: "suppressed", reason: "unsafe-dispatch" };
       },
     });
-    const complete = async text => {
+    const completeItems = async (text, cursor = text.length) => {
       const lines = text.split("\n");
-      const input = { text, lines, cursorRow: lines.length - 1,
-        currentLine: lines.at(-1), cursorCol: lines.at(-1).length, textBeforeCursor: text };
+      const before = text.slice(0, cursor).split("\n");
+      const cursorRow = before.length - 1;
+      const input = { text, lines, cursorRow, currentLine: lines[cursorRow],
+        cursorCol: before.at(-1).length, textBeforeCursor: text.slice(0, cursor) };
       let entries = [];
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
         getWorkspaceData: () => ({ search: [], globalenv: {} }),
         applyCompletion() {}, onInlineEntries: items => { entries = items; } });
-      return entries.filter(item => "insertText" in item).map(item => item.insertText);
+      return entries.filter(item => "insertText" in item);
     };
+    const complete = async text => (await completeItems(text)).map(item => item.insertText);
     try {
       const suppressed = await complete("obj <- list(alpha = 1)\nobj$");
       assert.ok(suppressed.includes("alpha"), "suppressed live inspection uses the existing R source analyzer");
@@ -367,6 +370,33 @@ suite("Static fallback routing in the VS Code extension host", () => {
         "source-defined factory members are inferred without evaluating the call");
       assert.equal(native.length, 1, "executable receivers must never reach the native inspector");
 
+      // Exercise the real languageserver and VS Code converters for quoted [[.
+      // Unquoted [[ and single [ must remain safe without invented source fields.
+      for (const [definition, marked, expected, memberSuffix] of [
+        ["make_data <- function() list(alpha = 1)",
+          String.raw`make_data()[["al│old"]]`, 'make_data()[["alpha"]]', "alpha"],
+        ["make_data <- function() list(alpha = 1)",
+          String.raw`make_data()[['al│old']]`, "make_data()[['alpha']]", "alpha"],
+        [String.raw`make_data <- function() list("line\nitem" = 1)`,
+          String.raw`make_data()[["line\n│old"]]`, String.raw`make_data()[["line\nitem"]]`, "item"],
+      ]) {
+        const caret = marked.indexOf("│");
+        const line = marked.replace("│", "");
+        const source = definition + "\n" + line;
+        const items = await completeItems(source, definition.length + 1 + caret);
+        const member = items.find(item => item.insertText.includes(memberSuffix));
+        assert.ok(member, `quoted source member for ${marked}`);
+        assert.equal(line.slice(0, member.replaceStart) + member.insertText +
+          line.slice(member.replaceEnd ?? caret), expected,
+          `real-provider replacement must preserve the whole quoted key: ${marked}`);
+        assert.equal(native.length, 1, "static quoted keys never inspect executable receivers");
+      }
+      for (const input of ["make_data()[[al", "make_data()[al"]) {
+        assert.deepEqual(await complete("make_data <- function() list(alpha = 1)\n" + input), [],
+          `${input} cannot borrow symbols or claim unsupported source member inference`);
+        assert.equal(native.length, 1, "unquoted executable indices must remain source-only");
+      }
+
       const missing = await complete("new_obj <- list(alpha = 1)\nnew_obj$");
       assert.ok(missing.includes("alpha"), "only native-confirmed absence permits unsubmitted source members");
       assert.deepEqual(native.at(-1), ["new_obj", "$"]);
@@ -375,10 +405,15 @@ suite("Static fallback routing in the VS Code extension host", () => {
       assert.deepEqual(empty, [], "empty stored members override conflicting unsubmitted source without metadata");
       assert.deepEqual(native.at(-1), ["empty_obj", "$"]);
 
+      const suppressedBracket = await complete('obj <- list(alpha = 1)\nobj[["al');
+      assert.ok(suppressedBracket.some(item => item.includes("alpha")),
+        "a suppressed stored bracket receiver uses real source-only [[ inference");
+      assert.deepEqual(native.at(-1), ["obj", "[["]);
+
       staticEnabled = false;
       assert.deepEqual(await complete("make_data()$"), [],
         "the default runtime-only policy still rejects executable receivers");
-      assert.equal(native.length, 3);
+      assert.equal(native.length, 4);
     } finally {
       await lang.dispose();
     }

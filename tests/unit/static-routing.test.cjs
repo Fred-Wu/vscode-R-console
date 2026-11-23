@@ -101,6 +101,27 @@ test("source-only context retains the correct prefix and replacement location fo
   assert.equal(completion.getStaticFallbackContext("obj$al", 6), undefined);
 });
 
+test("escaped quoted [[ prefixes decode without evaluation and keep mid-key edit bounds", () => {
+  for (const [marked, expected, quote] of [
+    [String.raw`make_data()[["line\n│old"]]`, "line\n", '"'],
+    [String.raw`make_data()[['tab\t│old']]`, "tab\t", "'"],
+    [String.raw`make_data()[["na\x6d│e"]]`, "nam", '"'],
+    [String.raw`make_data()[["a\"│rest"]]`, 'a"', '"'],
+    [String.raw`make_data()[["back\\│rest"]]`, "back\\", '"'],
+    [String.raw`make_data()[["A\u0042│rest"]]`, "AB", '"'],
+  ]) {
+    const caret = marked.indexOf("│");
+    const text = marked.replace("│", "");
+    const context = completion.getStaticFallbackContext(text, caret,
+      text.slice(0, caret), text.slice(caret));
+    assert.equal(context?.kind, "bracket", marked);
+    assert.equal(context?.prefix, expected, marked);
+    assert.equal(context?.bracketQuote, quote, marked);
+    assert.equal(context?.replaceStart, text.indexOf("[[") + 3, marked);
+    assert.equal(context?.replaceEnd, text.lastIndexOf(quote + "]]"), marked);
+  }
+});
+
 test("static fallback uses only inferred member results and the requested analysis mode", async () => {
   const input = "make_data()$al";
   const context = completion.getStaticFallbackContext(input, input.length);
@@ -175,19 +196,21 @@ test("suppressed bracket completion keeps only receiver-specific source members"
       { label: "scope_field", kind: 4, data: { type: "scope" } },
       { label: "index_argument", kind: 5, data: { type: "subscript_parameter" } },
     ] } });
-  assert.deepEqual(labels(await h.complete("obj[[")), ["alpha"]);
+  assert.deepEqual(labels(await h.complete('obj[["al')), ["alpha"]);
   assert.deepEqual(h.native, [["obj", "[["]]);
   assert.deepEqual(h.requests.map(r => r.mode), ["static"]);
 });
 
-test("executable single brackets do not borrow method arguments or lexical fields", async () => {
+test("unsupported unquoted bracket positions do not borrow method arguments or lexical fields", async () => {
   const h = harness({ lspItems: { items: [
     { label: "drop", kind: 5, data: { type: "subscript_parameter" } },
     { label: "scope_field", kind: 4, data: { type: "scope" } },
   ] } });
-  assert.deepEqual(labels(await h.complete("make_data()[")), []);
+  for (const expression of ["make_data()[", "make_data()[al", "make_data()[[al"]) {
+    assert.deepEqual(labels(await h.complete(expression)), [], expression);
+  }
   assert.deepEqual(h.native, [], "executable receivers never reach the inspector");
-  assert.deepEqual(h.requests.map(r => r.mode), ["static"]);
+  assert.deepEqual(h.requests.map(r => r.mode), ["static", "static", "static"]);
 });
 
 test("native-confirmed missing roots retain opt-in source completions from the current input", async () => {

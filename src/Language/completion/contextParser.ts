@@ -1,6 +1,6 @@
 import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isAccessorNamePrefix, isCompleteIdentifier, type Token } from "../lexer";
 import { getDataCompletionObject } from "./dataScope";
-import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import { decodeRArgumentName, parseRuntimeMemberQuery } from "./runtimeMembers";
 
 // Retain only the latest completion input. Adjacent tokens can merge after an
 // edit (notably r + a quote + a raw-string delimiter, or an exponent's sign).
@@ -153,6 +153,16 @@ export function getCompletionParseSuffix(code: string): string | undefined {
   return suffix + stack.reverse().join("");
 }
 
+/** Decode typed R string keys without evaluation. Valid complete escapes use the
+ * same strict selector parser as guarded live completion. Keep incomplete
+ * spellings usable while the user is still typing an escape.
+ */
+export function decodeQuotedCompletionPrefix(quote: "\"" | "'", fragment: string): string {
+  return decodeRArgumentName(quote + fragment + quote) ??
+    fragment.replace(/\\([\\"'nrt])/g,
+      (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
+}
+
 function completionPrefix(tokens: Token[], start: number, end: number, cursor: number, accessorPrefix = false):
   { prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" } | undefined {
   const before = tokens.slice(start, end).filter(token => token.position < cursor);
@@ -170,8 +180,8 @@ function completionPrefix(tokens: Token[], start: number, end: number, cursor: n
       ...(end > cursor ? { replaceEnd: end } : {}) };
   }
   if (token.type === TokenType.String && (cursor < token.position + token.value.length || token.closed === false)) {
-    const prefix = token.value.slice(1, cursor - token.position).replace(/\\([\\"'nrt])/g,
-      (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
+    const prefix = decodeQuotedCompletionPrefix(token.value[0] as "\"" | "'",
+      token.value.slice(1, cursor - token.position));
     return { prefix, replaceStart: token.position + 1,
       replaceEnd: token.position + token.value.length - Number(token.closed === true),
       quote: token.value[0] as "\"" | "'" };

@@ -1,6 +1,6 @@
 import type { CompletionContext } from "./types";
 import { TokenType, tokenize, isMemberAccessor, isAccessorNamePrefix } from "../lexer";
-import { getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
+import { decodeQuotedCompletionPrefix, getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
@@ -294,7 +294,7 @@ export function getStaticFallbackContext(
              end.position >= active.start + active.operator.length &&
              (end.value.startsWith("'") || end.value.startsWith('"'))) {
     quote = end.value[0] as "\"" | "'";
-    prefix = end.value.slice(1);
+    prefix = decodeQuotedCompletionPrefix(quote, end.value.slice(1));
     replaceStart = end.position + 1 - shift;
   } else if (tail.trim().length !== 0) {
     // Do not suggest members inside an index expression or after a comma.
