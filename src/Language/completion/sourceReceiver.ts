@@ -15,7 +15,8 @@ export function storedFunctionReceiver(
 export function storedFunctionCall(
   context: CompletionContext, input: string, cursor: number
 ): { name: string; start: number } | undefined {
-  return receiverRoot(context, input, cursor, false);
+  const receiver = storedCompletionReceiver(context, input, cursor);
+  return receiver?.target === "source" ? { name: receiver.name, start: receiver.start } : undefined;
 }
 
 // Locate the value root of a computed receiver for binding identity checks.
@@ -23,12 +24,16 @@ export function storedFunctionCall(
 export function storedReceiverRoot(
   context: CompletionContext, input: string, cursor: number
 ): { name: string; start: number } | undefined {
-  return receiverRoot(context, input, cursor, true);
+  const receiver = storedCompletionReceiver(context, input, cursor);
+  return receiver && { name: receiver.name, start: receiver.start };
 }
 
-function receiverRoot(
-  context: CompletionContext, input: string, cursor: number, valueRoot: boolean
-): { name: string; start: number } | undefined {
+// One delimiter scan and one backwards walk classify a receiver. Only a
+// direct named call is eligible for source retrieval; computed call heads
+// and quoted selectors retain the more conservative binding-only check.
+export function storedCompletionReceiver(
+  context: CompletionContext, input: string, cursor: number
+): { name: string; start: number; target: "source" | "binding" } | undefined {
   const methodArguments = context.kind === "argument" &&
     (context.functionOperator === "$" || context.functionOperator === "@");
   if (!methodArguments && (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket"))) {
@@ -87,14 +92,15 @@ function receiverRoot(
   // Source retrieval accepts direct named calls. Binding checks can also
   // follow method calls and computed heads back to their named value root.
   const groups: number[] = [];
-  const result = (index: number) => {
+  let sourceEligible = true;
+  const result = (index: number, target: "source" | "binding") => {
     let start = index;
     for (let group = groups.length - 1; group >= 0; group--) {
       if (start !== groups[group] + 1) return undefined;
       start = groups[group];
     }
     const decoded = decodeRArgumentName(tokens[index].value);
-    return decoded === undefined ? undefined : { name: decoded, start: tokens[index].position };
+    return decoded === undefined ? undefined : { name: decoded, start: tokens[index].position, target };
   };
   for (let index = receiverEnd; index >= 0;) {
     const token = tokens[index];
@@ -102,22 +108,24 @@ function receiverRoot(
       const opening = openings.get(index);
       if (opening === undefined) return undefined;
       index = opening - 1;
-    } else if ((token.type === TokenType.Identifier || (valueRoot && token.type === TokenType.String && token.closed)) &&
+    } else if ((token.type === TokenType.Identifier || (token.type === TokenType.String && token.closed)) &&
         tokens[index - 1]?.type === TokenType.Operator &&
         ["$", "@"].includes(tokens[index - 1].value)) {
+      if (token.type === TokenType.String) sourceEligible = false;
       index -= 2;
     } else if (token.type === TokenType.RightParen) {
       const opening = openings.get(index);
       if (opening === undefined) return undefined;
       const name = continuations[opening] ? tokens[opening - 1] : undefined;
       const preceding = tokens[opening - 2];
-      if (name?.type === TokenType.Identifier || (valueRoot && name?.type === TokenType.String && name.closed)) {
-        if (valueRoot && preceding?.type === TokenType.Operator && ["$", "@"].includes(preceding.value)) {
+      if (name?.type === TokenType.Identifier || (name?.type === TokenType.String && name.closed)) {
+        if (preceding?.type === TokenType.Operator && ["$", "@"].includes(preceding.value)) {
+          sourceEligible = false;
           index = opening - 1;
           continue;
         }
         if (isNameAccessor(preceding)) return undefined;
-        return result(opening - 1);
+        return result(opening - 1, sourceEligible && name.type === TokenType.Identifier ? "source" : "binding");
       }
       // Parentheses after a value are a computed call. A control condition or
       // function's formals, however, can be followed by a grouped body.
@@ -126,8 +134,9 @@ function receiverRoot(
       const afterControl = name?.type === TokenType.RightParen && control &&
         ([TokenType.If, TokenType.For, TokenType.While, TokenType.Function].includes(control.type) ||
          (control.type === TokenType.Operator && control.value === "\\"));
-      if (valueRoot && !afterControl && name &&
+      if (!afterControl && name &&
           [TokenType.RightParen, TokenType.RightBracket].includes(name.type)) {
+        sourceEligible = false;
         index = opening - 1;
         continue;
       }
@@ -138,8 +147,8 @@ function receiverRoot(
       if (!grouping) return undefined;
       groups.push(opening);
       index--;
-    } else if (valueRoot && token.type === TokenType.Identifier && !isNameAccessor(tokens[index - 1])) {
-      return result(index);
+    } else if (token.type === TokenType.Identifier && !isNameAccessor(tokens[index - 1])) {
+      return result(index, "binding");
     } else return undefined;
   }
   return undefined;

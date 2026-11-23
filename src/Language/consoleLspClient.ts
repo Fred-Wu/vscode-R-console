@@ -38,7 +38,7 @@ import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
 import { staticCompletionUnavailableReason } from "./completion/diagnostics";
 import { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
-import { storedFunctionCall, storedReceiverRoot } from "./completion/sourceReceiver";
+import { storedCompletionReceiver } from "./completion/sourceReceiver";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -352,20 +352,16 @@ export class ConsoleLspClient implements CompletionProvider {
           const fallback = getStaticFallbackContext(line, line.length, before, text.slice(offset));
           const visibleContext = getCompletionContext(line, line.length, before, text.slice(offset));
           const receiverContext = fallback ?? visibleContext;
-          const call = receiverContext && storedFunctionCall(receiverContext, text, offset);
+          const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, offset);
           const root = visibleContext?.objectName && parseRuntimeMemberQuery(visibleContext.objectName)?.root;
-          const computedRoot = receiverContext && storedReceiverRoot(receiverContext, text, offset);
           if (sourceBinding.opaqueReceiver && root === sourceBinding.name) {
             Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
               rConsoleOpaqueFunctionPosition: projection.toServerPosition(contextPosition) });
           }
-          if (sourceBinding.opaqueReceiver && computedRoot?.name === sourceBinding.name) {
+          if (receiver?.name === sourceBinding.name &&
+              (sourceBinding.opaqueReceiver || receiver.target === "source")) {
             Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
-              rConsoleOpaqueFunctionPosition: projection.document.positionAt(computedRoot.start) });
-          }
-          if (call?.name === sourceBinding.name) {
-            Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
-              rConsoleOpaqueFunctionPosition: projection.document.positionAt(call.start) });
+              rConsoleOpaqueFunctionPosition: projection.document.positionAt(receiver.start) });
           }
         }
         const documentVersion = projection.document.version;
@@ -420,8 +416,12 @@ export class ConsoleLspClient implements CompletionProvider {
             if (cached.expression !== params.rConsoleCall || !cached.isCurrent()) return undefined;
             functionInspection = cached.result;
           } else {
-            try { functionInspection = await this.options.requestRuntimeFunctionArguments(params.rConsoleCall!); }
-            catch { functionInspection = { status: "unavailable" }; }
+            try {
+              // A requester can decline an inspection (busy session, missing
+              // capability or queue limit) without returning a status.
+              functionInspection = (await this.options.requestRuntimeFunctionArguments(params.rConsoleCall!)) ??
+                { status: "unavailable" };
+            } catch { functionInspection = { status: "unavailable" }; }
             if (!isCurrent()) return undefined;
             this.argumentInspections.set(requestScope, { expression: params.rConsoleCall!,
               isCurrent, result: functionInspection });

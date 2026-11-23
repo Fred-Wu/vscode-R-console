@@ -339,16 +339,20 @@ test("method refusal and resolution metadata survive conversion but source shado
 });
 
 test("unknown live argument inspection cannot authorize package signatures", async t => {
-  let status;
+  let response;
   const { client, instances } = createClient(t, { staticAnalysis: true,
-    requestRuntimeFunctionArguments: () => ({ status }),
+    requestRuntimeFunctionArguments: () => response,
   });
-  for (status of ['opaque', 'unavailable', 'not-callable', 'missing', 'package']) {
+  for (response of [
+    ...['opaque', 'unavailable', 'not-callable', 'missing', 'package'].map(status => ({ status })),
+    undefined, Promise.resolve(undefined),
+  ]) {
+    const status = (await response)?.status;
     for (const text of ['data.frame(', 'api$scan(']) {
       await client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
       const params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
       assert.equal(params.rConsoleRuntimeArgumentsRefused,
-        ['opaque', 'unavailable', 'not-callable'].includes(status) ? true : undefined, status + ': ' + text);
+        !status || ['opaque', 'unavailable', 'not-callable'].includes(status) ? true : undefined, status + ': ' + text);
       assert.equal(params.rConsoleRuntimeArgumentNames, undefined);
     }
   }

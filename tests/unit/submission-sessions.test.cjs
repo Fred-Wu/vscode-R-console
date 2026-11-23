@@ -74,19 +74,24 @@ for (const input of ["Enter", "editor", "paste"]) {
   }
 }
 
-for (const target of ['members', 'arguments']) test(`native ${target} completion cannot enter the parse-to-submit gap`, async () => {
+for (const target of ['members', 'arguments', 'source', 'binding']) test(`native ${target} completion cannot enter the parse-to-submit gap`, async () => {
   const a = consoleSession();
   a.connect();
   const { terminal } = a;
   const inspected = [];
+  const expected = target === 'source' ? { status: "source", text: "function() list(leaf = 1)" } :
+    target === 'binding' ? { status: "opaque" } :
+    { status: target === 'arguments' ? "arguments" : "available", names: ["leaf"] };
   terminal.runtimeBackend.inspectMemberNames = (session, query) => {
     assert.equal(session, terminal.rProcess);
     inspected.push(query);
-    return Promise.resolve({ status: "available", names: ["leaf"] });
+    assert.equal(query.target, target === 'members' ? '$' : target);
+    return Promise.resolve(expected);
   };
   const inspect = () => target === 'arguments' ? terminal.requestStoredFunctionArguments('obj$method') :
+    target === 'source' || target === 'binding' ? terminal.requestStoredFunctionSource("make_data", target) :
     terminal.requestStoredMemberCompletions("obj$inner", "$");
-  assert.deepEqual((await inspect())?.names, ["leaf"], "idle R still supports completion");
+  assert.deepEqual(await inspect(), expected, "idle R still supports completion");
 
   const parse = deferred();
   let checked = 0;
@@ -113,7 +118,7 @@ for (const target of ['members', 'arguments']) test(`native ${target} completion
   assert.equal(inspected.length, 1, "no extra native calls during submission");
 
   nextPrompt(terminal);
-  assert.deepEqual((await inspect())?.names, ["leaf"], "completion resumes at the next idle prompt");
+  assert.deepEqual(await inspect(), expected, "completion resumes at the next idle prompt");
   assert.equal(inspected.length, 2);
 });
 

@@ -518,6 +518,31 @@ test("computed receiver identity follows only its outer named root", () => {
   }
 });
 
+test("one receiver classification preserves source eligibility and root identity", () => {
+  for (const [text, name, target] of [
+    ['((make_data()))$inner$', 'make_data', 'source'],
+    ['make_data()[["inner"]]$', 'make_data', 'source'],
+    ['make_data()$"inner"$', 'make_data', 'binding'],
+    ['make_data()$method()$', 'make_data', 'binding'],
+    ['(make_data())()$', 'make_data', 'binding'],
+    ['obj[[side_effect()]]$method(', 'obj', 'binding'],
+    ['obj$"method"()$', 'obj', 'binding'],
+    ['`odd root`[f()]$', 'odd root', 'binding'],
+    ['if (TRUE) (make_data())$', 'make_data', 'source'],
+    ['pkg::make_data()$', undefined, undefined],
+    ['(other + make_data())$', undefined, undefined],
+  ]) {
+    const context = completion.getStaticFallbackContext(text, text.length) ??
+      completion.getCompletionContext(text, text.length);
+    const receiver = completion.storedCompletionReceiver(context, text, text.length);
+    assert.equal(receiver?.name, name, text);
+    assert.equal(receiver?.target, target, text);
+    if (receiver) {
+      assert.equal(receiver.start, text.indexOf(name === 'odd root' ? '`odd root`' : name), text);
+    }
+  }
+});
+
 test("binding-only refusal preserves computed identity and stored methods avoid redundant inspection", async () => {
   for (const status of ['opaque', 'unavailable', 'package', 'missing']) {
     const h = harness({ storedSources: { iris: { status } } });

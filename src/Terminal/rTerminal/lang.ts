@@ -10,8 +10,7 @@ import {
   type RuntimeFunctionSourceRequester,
   type CompletionSourceBinding,
   type RuntimeFunctionArgumentsRequester,
-  storedFunctionReceiver,
-  storedReceiverRoot,
+  storedCompletionReceiver,
   collectCompletionEntries,
   collectStaticFallbackEntries,
   getStaticFallbackContext,
@@ -368,14 +367,14 @@ export class RTermLang {
     // Stored methods already receive a full argument inspection in the client.
     if (context.kind === "argument" && context.functionName &&
         parseRuntimeMemberQuery(context.functionName, "arguments")) return undefined;
-    const source = storedFunctionReceiver(context, input, cursor);
-    const receiver = source ?? storedReceiverRoot(context, input, cursor)?.name;
+    const receiver = storedCompletionReceiver(context, input, cursor);
     const requester = this.options.requestRuntimeFunctionSource;
-    if (!receiver || !requester) return undefined;
+    if (!receiver?.name || !requester) return undefined;
+    const source = receiver.target === "source";
     return (async () => {
-      const binding: CompletionSourceBinding = { name: receiver, ...(!source ? { opaqueReceiver: true } : {}) };
+      const binding: CompletionSourceBinding = { name: receiver.name, ...(!source ? { opaqueReceiver: true } : {}) };
       try {
-        const result = await requester(receiver, source ? "source" : "binding");
+        const result = await requester(receiver.name, receiver.target);
         if (source && result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
           return { binding: { ...binding, body: result.text } };
         }
