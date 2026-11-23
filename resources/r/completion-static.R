@@ -93,13 +93,26 @@ console_source_function <- function(document, point, name) {
 
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
-console_member_function <- function(uri, workspace, document, point) {
+console_member_function <- function(uri, workspace, document, point, root = NULL) {
     if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
     location <- languageserver:::member_call_location(document, point)
     if (is.null(location)) return(NULL)
     resolved <- languageserver:::member_resolve_cursor(uri, workspace, document,
         location$point, location$cursor, location$cursor$token)
     definition <- resolved$value$function_expr
-    if (is.null(definition)) return(NULL)
+    if (is.null(definition)) {
+        # A source-defined factory can have an unknown result while still
+        # shadowing a live object. Reuse native binding history even when the
+        # recovery XML contains only the unfinished call at the cursor.
+        if (!is.null(root)) {
+            history <- resolved$index$document_bindings[[root]]
+            at <- resolved$bindings$.__member_position__
+            if (root %in% names(resolved$bindings) || (length(history) &&
+                (is.null(at) || languageserver:::member_history_position(history, at) > 0L))) {
+                return(list(unknown = TRUE))
+            }
+        }
+        return(NULL)
+    }
     list(formals = definition[[2L]])
 }

@@ -25,7 +25,8 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
 } from "vscode-languageclient/node";
-import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult, CompletionSourceDefinition } from "./completion";
+import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult, CompletionSourceDefinition, RuntimeFunctionArgumentsRequester } from "./completion";
+import type { MemberInspectionResult } from "../Runtime/backendProtocol";
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
@@ -58,6 +59,7 @@ type ConsoleLspClientOptions = {
   onPackagesChanged?: () => void;
   getCachedWorkspaceData?: () => WorkspaceData | undefined;
   getStaticAnalysisEnabled?: () => boolean;
+  requestRuntimeFunctionArguments?: RuntimeFunctionArgumentsRequester;
 };
 
 type ConsoleLspSessionState = {
@@ -353,6 +355,22 @@ export class ConsoleLspClient implements CompletionProvider {
             (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = item.str;
           }
         }
+        // Read stored method formals through the idle native host, never sess
+        // expression evaluation. Match the snapshot to this exact call; source
+        // bindings take precedence in the R adapter. Do not cache method names.
+        const methodQuery = params.rConsoleCall ? parseRuntimeMemberQuery(params.rConsoleCall, "arguments") : undefined;
+        let methodInspection: MemberInspectionResult | undefined;
+        if (methodQuery?.steps.length && this.options.requestRuntimeFunctionArguments) {
+          try { methodInspection = await this.options.requestRuntimeFunctionArguments(params.rConsoleCall!); }
+          catch { methodInspection = { status: "unavailable" }; }
+          if (this.disposed || this.client !== client || revision !== this.packageRevision ||
+              runtimeRevision !== this.runtimeRevision || this.sessionState !== sessionState ||
+              this.syncedDocuments.get(projection.document.uri.toString())?.version !== documentVersion) return undefined;
+          if (methodInspection?.status === "arguments") {
+            Object.assign(params, { rConsoleRuntimeArgumentNames: methodInspection.names,
+              rConsoleRuntimeArgumentRoot: methodQuery.root });
+          }
+        }
         const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client || revision !== this.packageRevision) continue;
         const isCurrent = () => !this.disposed && this.client === client &&
@@ -379,6 +397,14 @@ export class ConsoleLspClient implements CompletionProvider {
         const staticReason = staticCompletionUnavailableReason(
           (result as { rConsoleStaticUnavailableReason?: unknown } | null)?.rConsoleStaticUnavailableReason);
         if (completions && staticReason) completions.rConsoleStaticUnavailableReason = staticReason;
+        const argumentsResolved = (result as { rConsoleArgumentsResolved?: unknown } | null)?.rConsoleArgumentsResolved;
+        if (completions && typeof argumentsResolved === "boolean") {
+          completions.rConsoleArgumentsResolved = argumentsResolved;
+        }
+        if (completions && methodInspection?.status === "suppressed" &&
+            (result as { rConsoleRuntimeArgumentsIgnored?: boolean } | null)?.rConsoleRuntimeArgumentsIgnored !== true) {
+          completions.rConsoleArgumentSuppressionReason = methodInspection.reason;
+        }
         if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
           completions.rConsoleNativeArguments = true;
         }

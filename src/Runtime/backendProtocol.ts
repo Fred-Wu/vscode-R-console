@@ -61,7 +61,8 @@ export type BackendCapability =
   | "set-width"
   | "member-inspection"
   | "member-inspection-utf8-escapes"
-  | "function-source";
+  | "function-source"
+  | "function-arguments";
 
 export type BackendDialogRequest =
   | {
@@ -95,12 +96,13 @@ export type MemberInspectionStep =
   | { kind: "field" | "slot" | "named-index" | "slice-name" | "variable-index" | "variable-slice"; name: string }
   | { kind: "index" | "slice-index"; index: number };
 
-export type MemberInspectionTarget = "$" | "@" | "[" | "[[" | "source";
+export type MemberInspectionTarget = "$" | "@" | "[" | "[[" | "source" | "arguments";
 
 export type MemberInspectionResult =
   | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
   | { status: "missing" }
   | { status: "source"; text: string }
+  | { status: "arguments"; names: string[] }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
   | { status: "unavailable" };
@@ -210,7 +212,8 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "set-width" ||
     value === "member-inspection" ||
     value === "member-inspection-utf8-escapes" ||
-    value === "function-source"
+    value === "function-source" ||
+    value === "function-arguments"
   );
 }
 
@@ -266,13 +269,17 @@ function parseStringListPayload(payload: Buffer): StringListPayload {
 
 function parseStringArray(
   payload: Buffer,
-  offset: number = 0
+  offset: number = 0,
+  strictUtf8 = false
 ): { values: string[]; offset: number } {
   const count = parseU32(payload, offset);
   offset += 4;
   const values: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const result = parseString(payload, offset);
+    if (strictUtf8 && !Buffer.from(result.value, "utf8").equals(payload.subarray(offset + 4, result.offset))) {
+      throw new Error("invalid inspected argument encoding");
+    }
     values.push(result.value);
     offset = result.offset;
   }
@@ -359,8 +366,17 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 10) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 11) {
         throw new Error("invalid member inspection result");
+      }
+      if (payload[0] === 11) {
+        if (parseU32(payload, 1) > 128) throw new Error("too many inspected arguments");
+        const parsed = parseStringArray(payload, 1, true);
+        if (parsed.offset !== payload.length || new Set(parsed.values).size !== parsed.values.length ||
+            parsed.values.some(name => !name || name.includes("\0") || Buffer.byteLength(name, "utf8") > 4096)) {
+          throw new Error("invalid inspected arguments");
+        }
+        return { type: "member-names-result", requestId, result: { status: "arguments", names: parsed.values } };
       }
       if (payload[0] === 10) {
         const bytes = payload.subarray(1);
@@ -642,7 +658,7 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
     bytes.copy(result, 4);
     return result;
   };
-  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3, source: 4 };
+  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3, source: 4, arguments: 5 };
   const stepCodes = {
     field: 0, slot: 1, index: 2, "named-index": 3,
     "slice-index": 4, "slice-name": 5, "variable-index": 6, "variable-slice": 7,

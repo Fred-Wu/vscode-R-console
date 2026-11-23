@@ -14,6 +14,7 @@ const staticDescriptions = {
   "analysis-pending": "Source or package information is still loading",
   "inference-cycle": "Recursive definitions could not be resolved",
   "no-receiver-members": "No members could be inferred from source",
+  "method-arguments-unavailable": "Request completion could not determine this method's arguments",
 } as const;
 
 export type StaticCompletionUnavailableReason = keyof typeof staticDescriptions;
@@ -29,7 +30,8 @@ export type CompletionDecision =
   | { kind: "StaticUnavailable"; reason?: StaticCompletionUnavailableReason; runtimeReason?: CompletionSuppressionReason }
   | { kind: "Rejected"; reason: "executable-receiver" }
   | { kind: "Suppressed"; reason: CompletionSuppressionReason }
-  | { kind: "Unavailable"; reason: "runtime-unavailable" };
+  | { kind: "Unavailable"; reason: "runtime-unavailable" }
+  | { kind: "ArgumentsUnavailable" };
 
 const descriptions = {
   "executable-receiver": "Request completion includes an expression that cannot be inspected safely",
@@ -56,6 +58,9 @@ const runtimeRefusals: Record<CompletionSuppressionReason, string> = {
 };
 
 export function formatCompletionDecision(decision: CompletionDecision): string {
+  if (decision.kind === "ArgumentsUnavailable") {
+    return `[Runtime Completion - Unavailable]: ${staticDescriptions["method-arguments-unavailable"]}. No completion suggestions were returned.`;
+  }
   if (decision.kind === "StaticInferred") {
     return "[Static Completion - Inferred]: Members were inferred from source. The inferred result was used for completion.";
   }
@@ -64,7 +69,7 @@ export function formatCompletionDecision(decision: CompletionDecision): string {
     // Reuse the established runtime safety reason when that refusal prompted
     // fallback. Otherwise report the native source-inference reason. Keep one
     // reason and one consistent outcome; completion never executes user code.
-    const inferFailed = ["receiver-unresolved", "unresolved-dispatch", "no-receiver-members"].includes(reason);
+    const inferFailed = ["receiver-unresolved", "unresolved-dispatch", "no-receiver-members", "method-arguments-unavailable"].includes(reason);
     const description = inferFailed && decision.runtimeReason && Object.hasOwn(runtimeRefusals, decision.runtimeReason)
       ? runtimeRefusals[decision.runtimeReason] : staticDescriptions[reason];
     return `[Static Completion - Unavailable]: ${description}. No completion suggestions were returned.`;

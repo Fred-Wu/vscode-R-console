@@ -1496,16 +1496,18 @@ the console document.
 
 `RTermLang` owns the console completion flow. It detects the completion
 context, builds fast runtime suggestions from cached session data and the
-current input, then merges the full language-server result. Autocompletion does not request
-fresh session inspection data.
+current input, then merges the full language-server result. Session metadata comes
+from the cache; stored members and method arguments use guarded native inspection
+while R is idle.
 
 Completion data comes from one shared flow:
 
 - runtime/global-environment symbols come from the selected session integration's
   cached workspace data
-- `$` and `@` member completion uses native language-server inference where
-  available and cached top-level workspace metadata otherwise. It does not
-  automatically request live member values.
+- `$` and `@` member completion uses guarded native storage inspection. Published
+  top-level schemas remain available where appropriate; a safety refusal cannot
+  be replaced by cached names. Optional source inference follows the fallback
+  rules above.
 - data-aware bracket and pipe-placeholder contexts use cached workspace names.
   Nested runtime-only names are omitted instead of using sess workspace_children,
   which can invoke user-defined extraction or formatting methods. Static LSP
@@ -1513,10 +1515,21 @@ Completion data comes from one shared flow:
 - function arguments for existing top-level R functions use signatures already
   recorded in the cached workspace snapshot. The language server parses those
   signatures without evaluating function bodies or defaults, applies R argument
-  matching, and supplies literal choices. Member-function and custom subscript
-  signatures requiring runtime extraction are not inspected automatically.
+  matching, and supplies literal choices.
   Truncated signatures remain unavailable, and obsolete replies are discarded
   after session changes.
+- stored member-function arguments use a guarded native request while R is idle.
+  For example, after `task <- mlr3::tsk("iris")`, `task$levels(` can offer `cols = `.
+  The inspector follows the existing safe receiver rules, then reads only the
+  closure's formal names, bounded to 128 names. It never reads the body or default
+  values. Active bindings, deferred values and custom access methods remain
+  refused. The `function-arguments` capability gates requests to persistent
+  backends; signatures are fetched per request and discarded after runtime changes.
+  The R adapter applies its usual positional, partial-name and `...` matching to
+  inert formals. With static analysis enabled, current source bindings take
+  precedence, including unresolved factories that shadow older session objects.
+  Unavailable method arguments produce a reason-and-action completion log;
+  a known zero-argument or fully supplied signature is silently complete.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
 

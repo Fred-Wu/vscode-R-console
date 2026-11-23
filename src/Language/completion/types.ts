@@ -2,7 +2,7 @@ import type * as vscode from "vscode";
 import type { CallCompletionContext } from "./contextParser";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 import type { WorkspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
-import type { StaticCompletionUnavailableReason } from "./diagnostics";
+import type { CompletionSuppressionReason, StaticCompletionUnavailableReason } from "./diagnostics";
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
@@ -53,6 +53,8 @@ export type CompletionEntries = CompletionEntry[] & {
   // Whether static analysis resolved the requested member/column receiver.
   staticResolved?: boolean;
   staticUnavailableReason?: StaticCompletionUnavailableReason;
+  argumentsResolved?: boolean;
+  argumentSuppressionReason?: CompletionSuppressionReason;
   // An empty but successful sess column inspection is authoritative.
   columnsResolved?: boolean;
 };
@@ -79,6 +81,8 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
   rConsoleStaticUnavailableReason?: StaticCompletionUnavailableReason;
   rConsoleNativeArguments?: boolean;
   rConsoleArgumentsExhausted?: boolean;
+  rConsoleArgumentsResolved?: boolean;
+  rConsoleArgumentSuppressionReason?: CompletionSuppressionReason;
 };
 
 export type CompletionAnalysisMode = "runtime" | "static";
@@ -105,6 +109,9 @@ export interface CompletionProvider {
 
 export type RuntimeFunctionSourceRequester = (name: string) =>
   Promise<string | undefined> | undefined;
+
+export type RuntimeFunctionArgumentsRequester = (expression: string) =>
+  Promise<MemberInspectionResult | undefined> | undefined;
 
 export type RuntimeMemberCompletionRequester = (
   expression: string,

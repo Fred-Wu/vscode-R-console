@@ -3,6 +3,51 @@ const path = require("node:path");
 const loadSource = require("../helpers/load-source.cjs");
 
 suite("Completion in the VS Code extension host", () => {
+  test("stored method argument names use the real converter and preserve source precedence", async () => {
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      'vscode-languageclient/node': require('vscode-languageclient/node'),
+    });
+    let staticMode = true;
+    const inspected = [];
+    const lang = new RTermLang({
+      extensionPath: path.resolve(__dirname, '../..'), rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
+      getStaticAnalysisEnabled: () => staticMode,
+      requestRuntimeFunctionArguments: async expression => {
+        inspected.push(expression);
+        return { status: 'arguments', names: ['cols'] };
+      },
+    });
+    try {
+      for (const mode of [true, false]) {
+        staticMode = mode;
+        for (const [marked, expected] of [
+          ['task$levels(│)', ['cols = ']], ['task$levels(co│)', ['cols = ']],
+          ['task$levels(NULL, │)', []],
+          ['task <- list(levels = function(source_arg) NULL)\ntask$levels(│)', mode ? ['source_arg = '] : ['cols = ']],
+          ['task <- unknown_factory()\ntask$levels(│)', mode ? [] : ['cols = ']],
+          ['{ task <- unknown_factory(); task$levels(│', mode ? [] : ['cols = ']],
+        ]) {
+          const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+          const lines = text.split('\n'), before = text.slice(0, cursor);
+          const cursorRow = before.split('\n').length - 1;
+          const input = { text, lines, cursorRow, currentLine: lines[cursorRow],
+            cursorCol: before.split('\n').at(-1).length, textBeforeCursor: before };
+          let entries;
+          await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+            getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries: value => { entries = value; } });
+          const picks = entries.filter(item => 'insertText' in item && item.detail === 'parameter');
+          assert.deepEqual(picks.map(item => item.insertText), expected, marked);
+          for (const item of picks) {
+            assert.equal(item.replaceStart, input.currentLine.lastIndexOf('(') + 1);
+            assert.equal(item.isCallable, false);
+          }
+        }
+      }
+      assert.ok(inspected.length >= 10);
+      assert.ok(inspected.every(expression => expression === 'task$levels'));
+    } finally { await lang.dispose(); }
+  });
+
   test("real language-client results preserve argument order and alphabetize namespaces", async () => {
     // Use the actual VS Code API and language-client converters, not the Node
     // integration suite's host adapter or injected completion candidates.

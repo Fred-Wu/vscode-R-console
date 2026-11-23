@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, CompletionSourceDefinition } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
-import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason } from "./diagnostics";
+import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
 import { isCallableName } from "./contextParser";
 import { backtickRName, escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
 
@@ -15,7 +15,7 @@ export async function getLanguageServerCompletions(
   runtimeBracketKind?: "data.frame" | "data.table" | null,
   analysisMode?: CompletionAnalysisMode,
   sourceDefinition?: CompletionSourceDefinition
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
   }
@@ -32,6 +32,8 @@ export async function getLanguageServerCompletions(
     let staticReason = staticCompletionUnavailableReason(result?.rConsoleStaticUnavailableReason);
     let nativeArguments = result?.rConsoleNativeArguments === true;
     let argumentsExhausted = result?.rConsoleArgumentsExhausted === true;
+    let argumentsResolved = result?.rConsoleArgumentsResolved;
+    let argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
 
     let items = Array.isArray(result) ? result : result?.items || [];
     const usable = (item: vscode.CompletionItem): boolean =>
@@ -55,6 +57,8 @@ export async function getLanguageServerCompletions(
       staticReason = staticCompletionUnavailableReason(result?.rConsoleStaticUnavailableReason);
       nativeArguments ||= result?.rConsoleNativeArguments === true;
       argumentsExhausted ||= result?.rConsoleArgumentsExhausted === true;
+      argumentsResolved = result?.rConsoleArgumentsResolved ?? argumentsResolved;
+      argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
       items = Array.isArray(result) ? result : result?.items || [];
     }
 
@@ -83,6 +87,8 @@ export async function getLanguageServerCompletions(
       workspaceFunction,
       nativeArguments,
       argumentsExhausted,
+      argumentsResolved,
+      argumentSuppressionReason,
     };
   } catch {
     return { entries: [], isIncomplete: false, staticUnavailableReason: "request-failed" };

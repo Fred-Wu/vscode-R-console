@@ -258,6 +258,9 @@ mod unix_host {
 
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
+            capabilities.push("function-arguments");
+        }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
             capabilities.push("function-source");
         }
@@ -2272,6 +2275,9 @@ mod windows_host {
 
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
+            capabilities.push("function-arguments");
+        }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
             capabilities.push("function-source");
         }

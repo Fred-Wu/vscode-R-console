@@ -73,6 +73,26 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
   return { lang, complete, logs, native, requests, sourceRequests };
 }
 
+test("unavailable stored method arguments log the reason and remain retryable", async () => {
+  for (const staticAnalysis of [true, false]) {
+    const h = harness({ staticAnalysis, lspItems: { items: [], rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: 'method-arguments-unavailable' } });
+    await h.complete('task$levels(');
+    await h.complete('task$levels(co');
+    assert.equal(h.logs.length, 1, 'typing a prefix does not repeat the diagnostic');
+    assert.match(h.logs[0], /Request completion could not determine this method's arguments\. No completion suggestions were returned\./);
+    assert.ok(h.requests.length >= 2, 'unavailable signatures are retried');
+    const refused = harness({ staticAnalysis, lspItems: { items: [], rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: 'method-arguments-unavailable', rConsoleArgumentSuppressionReason: 'unsafe-dispatch' } });
+    await refused.complete('task$levels(');
+    assert.match(refused.logs[0], /Request completion could run a custom method\./);
+    const known = harness({ staticAnalysis, lspItems: { items: [], rConsoleArgumentsResolved: true,
+      rConsoleWorkspaceFunction: true, rConsoleArgumentsExhausted: true } });
+    await known.complete('task$levels(cols = NULL, ');
+    assert.deepEqual(known.logs, [], 'a fully supplied or zero-argument signature is a successful result');
+  }
+});
+
 test("source-only context retains the correct prefix and replacement location for unsafe receivers", () => {
   for (const [text, expectedKind, prefix, start] of [
     ["make_data()$", "member", "", 12],

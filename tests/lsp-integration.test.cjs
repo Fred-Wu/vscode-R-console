@@ -817,7 +817,7 @@ test("unknown runtime member signatures do not request expressions or borrow glo
     const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),
       undefined, undefined, undefined, [], [], undefined,
       async () => assert.fail("member arguments must not evaluate expressions through sess"));
-    assert.deepEqual(entries, []);
+    assert.deepEqual(Array.from(entries), []);
   }
 });
 

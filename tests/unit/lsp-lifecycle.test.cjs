@@ -7,7 +7,7 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false } = {}) {
+function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments } = {}) {
   const instances = [];
   const logs = [];
   class LanguageClient {
@@ -68,6 +68,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     consoleId: "lifecycle-test", extensionPath: path.resolve(__dirname, "../.."),
     rPath: "R", env: {}, getCachedWorkspaceData,
     getStaticAnalysisEnabled: () => staticAnalysis,
+    requestRuntimeFunctionArguments,
   });
   client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
@@ -138,6 +139,66 @@ test("native member signatures never wait for runtime inspection", async t => {
   });
   const result = await client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
   assert.equal(result.rConsoleLocalFunction, true);
+});
+
+test("stored method arguments are fetched afresh and never borrowed from global signatures", async t => {
+  const inspected = [];
+  let names = ['cols'];
+  const { client, instances } = createClient(t, {
+    getCachedWorkspaceData: () => ({ globalenv: { levels: { type: 'closure', str: 'function(wrong)' } } }),
+    requestRuntimeFunctionArguments: expression => {
+      inspected.push(expression); return { status: 'arguments', names };
+    },
+  });
+  const text = 'task$levels(';
+  for (const expected of [['cols'], ['replacement']]) {
+    names = expected;
+    await client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
+    const params = instances[0].requests.filter(request => request.method === 'completion').at(-1).params;
+    assert.deepEqual(params.rConsoleRuntimeArgumentNames, expected);
+    assert.equal(params.rConsoleRuntimeArgumentRoot, 'task');
+    assert.equal(params.rConsoleRuntimeSignature, undefined);
+  }
+  assert.deepEqual(inspected, ['task$levels', 'task$levels']);
+  for (const source of ['levels(', 'factory()$levels(', 'task[[side_effect()]]$levels(']) {
+    await client.provideCompletionItems({ getText: () => source }, new Position(0, source.length));
+  }
+  assert.equal(inspected.length, 2, 'executable receivers cannot reach native inspection');
+});
+
+test("runtime changes while reading stored arguments discard the snapshot before sending it to LSP", async t => {
+  let finish, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const { client, instances } = createClient(t, {
+    requestRuntimeFunctionArguments: () => new Promise(resolve => { finish = resolve; started(); }),
+  });
+  const text = 'task$levels(';
+  const pending = client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
+  await ready;
+  client.invalidateRuntimeCompletion();
+  finish({ status: 'arguments', names: ['stale'] });
+  assert.equal(await pending, undefined);
+  assert.equal(instances[0].requests.filter(request => request.method === 'completion').length, 0);
+});
+
+test("method refusal and resolution metadata survive conversion but source shadowing discards the old refusal", async t => {
+  let ignored = false;
+  const { client } = createClient(t, { staticAnalysis: true,
+    requestRuntimeFunctionArguments: () => ({ status: 'suppressed', reason: 'unsafe-dispatch' }),
+    completion: instance => {
+      instance.protocol2CodeConverter.asCompletionResult = async result => ({ items: result.items });
+      return { items: [], rConsoleArgumentsResolved: false, rConsoleRuntimeArgumentsIgnored: ignored,
+        rConsoleStaticUnavailableReason: 'method-arguments-unavailable' };
+    },
+  });
+  const text = 'task$levels(';
+  const complete = () => client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
+  const first = await complete();
+  assert.equal(first.rConsoleArgumentsResolved, false);
+  assert.equal(first.rConsoleArgumentSuppressionReason, 'unsafe-dispatch');
+  assert.equal(first.rConsoleStaticUnavailableReason, 'method-arguments-unavailable');
+  ignored = true;
+  assert.equal((await complete()).rConsoleArgumentSuppressionReason, undefined);
 });
 
 test("static diagnostic metadata survives VS Code conversion without forwarding arbitrary text", async t => {

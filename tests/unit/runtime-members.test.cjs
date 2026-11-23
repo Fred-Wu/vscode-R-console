@@ -72,6 +72,47 @@ test("native request includes only parsed selectors and target operator", () => 
   assert.ok(!frame.toString("utf8").includes("eval("));
 });
 
+test("stored argument snapshots validate bounded names and preserve zero-argument functions", () => {
+  const u32 = value => { const bytes = Buffer.alloc(4); bytes.writeUInt32LE(value); return bytes; };
+  const encode = names => Buffer.concat([Buffer.from([11]), u32(names.length), ...names.flatMap(name => {
+    const bytes = Buffer.from(name); return [u32(bytes.length), bytes];
+  })]);
+  const parse = payload => {
+    const header = Buffer.alloc(12);
+    header.writeUInt32LE(payload.length); header.writeUInt16LE(26, 4);
+    return parseBackendFrames(Buffer.concat([header, payload]));
+  };
+  for (const names of [[], ['cols'], ['first', '...', 'after dots', '中文'], ['a'.repeat(128)]]) {
+    assert.deepEqual(parse(encode(names)).events[0].result, { status: 'arguments', names });
+  }
+  for (const payload of [encode(['']), encode(['x', 'x']), encode(['x\0y']), encode(['x'.repeat(4097)]),
+    encode(Array.from({ length: 129 }, (_, i) => 'arg' + i)), encode([Buffer.from([255])]),
+    Buffer.concat([encode(['cols']), Buffer.from([0])]), encode(['cols']).subarray(0, 6)]) {
+    assert.ok(parse(payload).error, 'malformed signatures must not produce suggestions');
+  }
+  const query = parseRuntimeMemberQuery('task$levels', 'arguments');
+  assert.equal(encodeMemberNamesRequestFrame(1, query)[12], 5);
+});
+
+test("stored argument requests require the negotiated capability on persistent backends", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource('src/Runtime/runtimeBackend.ts');
+  const backend = new RustSidecarRuntimeBackend('unused');
+  const session = { sessionId: 'method-arguments' };
+  const state = { hostConnected: true, capabilities: new Set(['member-inspection']),
+    pendingMemberRequests: new Map(), nextRequestId: 0 };
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const query = parseRuntimeMemberQuery('task$levels', 'arguments');
+  assert.equal(backend.inspectMemberNames(session, query), undefined);
+  assert.equal(frames.length, 0);
+  state.capabilities.add('function-arguments');
+  const pending = backend.inspectMemberNames(session, query);
+  backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: 1,
+    result: { status: 'arguments', names: ['cols'] } });
+  assert.deepEqual(await pending, { status: 'arguments', names: ['cols'] });
+});
+
 test("native results distinguish silent empty from unavailable and unsafe access", () => {
   function frame(payload) {
     const header = Buffer.alloc(12);

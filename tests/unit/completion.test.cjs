@@ -577,7 +577,7 @@ test("missing session formals never fall back to arguments of a same-name global
           { label: "value", insertText: "value", kind: 5, detail: "value for formula" },
         ],
       }, request);
-    assert.deepEqual(entries, []);
+    assert.deepEqual(Array.from(entries), []);
   }
 });
 

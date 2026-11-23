@@ -74,7 +74,7 @@ for (const input of ["Enter", "editor", "paste"]) {
   }
 }
 
-test("native completion cannot enter the parse-to-submit gap", async () => {
+for (const target of ['members', 'arguments']) test(`native ${target} completion cannot enter the parse-to-submit gap`, async () => {
   const a = consoleSession();
   a.connect();
   const { terminal } = a;
@@ -84,7 +84,8 @@ test("native completion cannot enter the parse-to-submit gap", async () => {
     inspected.push(query);
     return Promise.resolve({ status: "available", names: ["leaf"] });
   };
-  const inspect = () => terminal.requestStoredMemberCompletions("obj$inner", "$");
+  const inspect = () => target === 'arguments' ? terminal.requestStoredFunctionArguments('obj$method') :
+    terminal.requestStoredMemberCompletions("obj$inner", "$");
   assert.deepEqual((await inspect())?.names, ["leaf"], "idle R still supports completion");
 
   const parse = deferred();

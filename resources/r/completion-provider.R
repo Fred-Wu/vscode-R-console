@@ -120,16 +120,30 @@ console_supplement_completion <- function(reply, self, params) {
         isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")) ||
             (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
+    method_root <- if (member_call) console_method_root(params$rConsoleCall) else NULL
+    member_source <- if (static_analysis && member_call)
+        console_member_function(uri, workspace, document, point, method_root) else NULL
+    # A current source binding (including an unresolved factory or a formal)
+    # must not borrow arguments from an older, same-named live object.
+    source_method_root <- static_analysis && (!is.null(member_source) ||
+        (!is.null(method_root) && !is.null(console_source_function(document, point, method_root))))
+    if (source_method_root) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE
     # Static source inference is explicitly opt-in. Live sess signatures take
     # precedence in normal console mode regardless of native package inference.
     source <- if (is.null(call) || !is.null(call$package) || !static_analysis) NULL else if (member_call) {
-        if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
+        if (native_arguments) NULL else member_source
     } else console_source_function(document, point, call$token)
     source_is_static <- !is.null(source)
-    runtime <- if (is.null(source) && !is.null(call) && is.null(call$package))
-        console_parse_signature(params$rConsoleRuntimeSignature) else NULL
+    runtime <- if (is.null(source) && !is.null(call) && is.null(call$package)) {
+        if (member_call) {
+            if (!source_method_root) console_runtime_method_arguments(params) else NULL
+        } else {
+            parsed <- console_parse_signature(params$rConsoleRuntimeSignature)
+            if (!is.null(parsed)) list(formals = parsed[[2L]]) else NULL
+        }
+    } else NULL
     if (!is.null(runtime)) {
-        source <- list(formals = runtime[[2L]])
+        source <- runtime
         reply$result$rConsoleWorkspaceFunction <- TRUE
     }
     # Cached workspace signatures override package inference; unsubmitted source
@@ -153,6 +167,11 @@ console_supplement_completion <- function(reply, self, params) {
                 signature <- console_source_signature(list(formals = constructor$value$function_expr[[2L]]), uri)
             }
         }
+    }
+    if (member_call) {
+        reply$result$rConsoleArgumentsResolved <- !is.null(signature)
+        reply$result$rConsoleStaticUnavailableReason <- if (is.null(signature))
+            "method-arguments-unavailable" else NULL
     }
     if (is.null(call) && !is.null(params$rConsoleCall)) {
         # A name accepted by the frontend lexer may be invalid in R's locale

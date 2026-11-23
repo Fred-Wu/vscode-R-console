@@ -291,6 +291,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       requestRuntimeMemberCompletions: (expression, operator) =>
         this.requestStoredMemberCompletions(expression, operator),
       requestRuntimeFunctionSource: name => this.requestStoredFunctionSource(name),
+      requestRuntimeFunctionArguments: expression => this.requestStoredFunctionArguments(expression),
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
@@ -385,6 +386,14 @@ export class RTerminal implements vscode.Pseudoterminal {
       { root: name, steps: [], target: "source" });
     return response?.then(result => result.status === "source" ? result.text : undefined,
       () => undefined);
+  }
+
+  private requestStoredFunctionArguments(expression: string): Promise<MemberInspectionResult | undefined> | undefined {
+    if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
+        this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) return undefined;
+    const query = parseRuntimeMemberQuery(expression, "arguments");
+    if (!query) return undefined;
+    return this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {

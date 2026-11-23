@@ -244,6 +244,12 @@ impl OutputSink {
                 payload.extend_from_slice(source.as_bytes());
             }
             Inspection::FunctionSource(_) => payload.push(0),
+            Inspection::FunctionArguments(names) if names.len() <= 128 &&
+                names.iter().all(|name| !name.is_empty() && name.len() <= 4096) => {
+                payload.push(11);
+                encode_string_array(names, &mut payload);
+            }
+            Inspection::FunctionArguments(_) => payload.push(0),
             Inspection::Suppressed(reason) => payload.push(match reason {
                 Suppression::ActiveBinding => 2,
                 Suppression::DeferredBinding => 3,

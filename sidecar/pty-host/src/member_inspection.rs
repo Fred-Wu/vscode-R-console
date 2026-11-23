@@ -41,6 +41,8 @@ pub(crate) enum Target {
     DoubleBracket,
     // Inspect a stored closure's syntax without invoking it.
     FunctionSource,
+    // Read only the tags of a stored closure's formals, never defaults/body.
+    FunctionArguments,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +59,7 @@ pub(crate) enum Step {
 
 impl Target {
     fn accessor(self) -> &'static str {
-        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSource => "" }
+        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSource | Self::FunctionArguments => "" }
     }
 }
 
@@ -90,6 +92,7 @@ impl MemberQuery {
             2 => Target::Bracket,
             3 => Target::DoubleBracket,
             4 if depth == 0 => Target::FunctionSource,
+            5 => Target::FunctionArguments,
             _ => return None,
         };
         if depth > MAX_DEPTH { return None; }
@@ -195,6 +198,10 @@ pub(crate) struct InspectorApi {
 }
 
 impl InspectorApi {
+    pub(crate) fn supports_function_arguments(&self) -> bool {
+        self.formals.is_some()
+    }
+
     pub(crate) fn supports_function_source(&self) -> bool {
         self.formals.is_some() && self.body.is_some() && self.car.is_some() &&
             self.logical_elt.is_some() && self.integer_elt.is_some() && self.real_elt.is_some() && self.is_na.is_some()
@@ -265,6 +272,7 @@ impl InspectorApi {
 pub(crate) enum Inspection {
     Available(Members),
     FunctionSource(String),
+    FunctionArguments(Vec<String>),
     Suppressed(Suppression),
     Unavailable,
 }
@@ -721,6 +729,7 @@ impl Native {
         let mut checked = HashSet::new();
         for accessor in query.steps.iter().map(Step::accessor)
             .chain(std::iter::once(query.target.accessor())) {
+            if accessor.is_empty() { continue; }
             if !checked.insert(accessor) { continue; }
             let primitive = self.stored_binding(self.base_namespace, accessor)?
                 .and_then(|value| self.cached_value(value))
@@ -1011,8 +1020,32 @@ impl Native {
         })
     }
 
+    unsafe fn function_arguments(&self, value: Sexp) -> Result<Members, Suppression> {
+        if (self.type_of)(value) != CLOSURE { return Err(Suppression::InspectionLimit); }
+        let formals = self.formals.ok_or(Suppression::InspectionLimit)?;
+        let mut cursor = formals(value);
+        let mut members = Members::empty();
+        let mut seen = HashSet::new();
+        while cursor != self.nil {
+            self.check_deadline()?;
+            if cursor.is_null() || (self.type_of)(cursor) != LIST || members.names.len() >= 128 {
+                return Err(Suppression::InspectionLimit);
+            }
+            let tag = (self.tag)(cursor);
+            if tag.is_null() || (self.type_of)(tag) != 1 { return Err(Suppression::InspectionLimit); }
+            let name = self.text((self.printname)(tag)).ok_or(Suppression::InspectionLimit)?;
+            if name.is_empty() || !seen.insert(name.clone()) { return Err(Suppression::InspectionLimit); }
+            members.names.push(name);
+            // Do not read CAR: defaults may contain arbitrary callback-bearing
+            // objects. Only the argument names are needed for matching.
+            cursor = (self.cdr)(cursor);
+        }
+        Ok(members)
+    }
+
     unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
         self.check_deadline()?;
+        if target == Target::FunctionArguments { return self.function_arguments(value); }
         if value == self.nil { return Ok(Members::empty()); }
         let kind = (self.type_of)(value);
         if target == Target::Slot {
@@ -1303,10 +1336,13 @@ impl Native {
                 let mut current = View::Object(root);
                 for step in &query.steps {
                     self.check_deadline()?;
-                    let Some(next) = self.step(current, step)? else { return Ok(Members::empty()); };
+                    let Some(next) = self.step(current, step)? else {
+                        return if query.target == Target::FunctionArguments { Err(Suppression::InspectionLimit) }
+                            else { Ok(Members::empty()) };
+                    };
                     if let View::Object(value) = next {
+                        if value.is_null() { return Err(Suppression::InspectionLimit); }
                         if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
-                        if value.is_null() { return Ok(Members::empty()); }
                         (self.protect)(value);
                         protected += 1;
                     }
@@ -1318,6 +1354,7 @@ impl Native {
                         self.names_for(value, query.target)
                     }
                     View::Slice { source, index } => {
+                        if query.target == Target::FunctionArguments { return Err(Suppression::InspectionLimit); }
                         if query.target == Target::Slot { return Ok(Members::empty()); }
                         let type_ = (self.type_of)(source);
                         if query.target == Target::Dollar && !matches!(type_, VECTOR | EXPRESSION) {
@@ -1360,7 +1397,11 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) 
             if query.target == Target::FunctionSource {
                 native.inspect_function_source(&query).map(Inspection::FunctionSource)
             } else {
-                native.inspect(&query).map(Inspection::Available)
+                native.inspect(&query).map(|members| {
+                    if query.target == Target::FunctionArguments && !members.root_missing {
+                        Inspection::FunctionArguments(members.names)
+                    } else { Inspection::Available(members) }
+                })
             }
         });
         if rmg_end() != 0 {

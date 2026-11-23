@@ -8,6 +8,7 @@ import {
   CompletionPickItem,
   type RuntimeMemberCompletionRequester,
   type RuntimeFunctionSourceRequester,
+  type RuntimeFunctionArgumentsRequester,
   storedFunctionReceiver,
   collectCompletionEntries,
   collectStaticFallbackEntries,
@@ -44,6 +45,7 @@ type LangOptions = {
   getStaticAnalysisEnabled?: () => boolean;
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
   requestRuntimeFunctionSource?: RuntimeFunctionSourceRequester;
+  requestRuntimeFunctionArguments?: RuntimeFunctionArgumentsRequester;
 };
 
 type AutocompleteRequest = {
@@ -124,7 +126,6 @@ export class RTermLang {
         this.lastStaticAnalysisEnabled !== staticEnabled) this.cancelCompletion();
     this.lastStaticAnalysisEnabled = staticEnabled;
     const requestId = ++this.completionRequestId;
-    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
     let context = getCompletionContext(
       input.currentLine,
       input.cursorCol,
@@ -145,6 +146,9 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
+    noteConsoleCompletionContext(context?.kind === "argument" &&
+      (context.functionOperator === "$" || context.functionOperator === "@")
+      ? context.functionName + "(" : completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
     if (context?.rejectionReason) {
       logConsoleCompletionDecision(staticEnabled
         ? { kind: "StaticUnavailable", reason: "unsupported-context" }
@@ -439,10 +443,21 @@ export class RTermLang {
       if (result?.status === "missing") return fallback(false);
       bracketInspection = Promise.resolve(result);
     }
-    return collectCompletionEntries(context, document, document ? position : undefined,
+    const entries = await collectCompletionEntries(context, document, document ? position : undefined,
       sessionData, linesBefore, recentEntries, provider, requester, inputText,
       bracketInspection, staticEnabled && context.kind === "bracket" && bracketInspection
         ? "runtime" : undefined);
+    if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+    if (logOutcome && context.kind === "argument" && context.argumentTags &&
+        (context.functionOperator === "$" || context.functionOperator === "@") &&
+        entries.argumentsResolved === false && !entries.length) {
+      const decision = staticEnabled ? { kind: "StaticUnavailable" as const,
+        reason: entries.staticUnavailableReason, runtimeReason: entries.argumentSuppressionReason }
+        : entries.argumentSuppressionReason ? { kind: "Suppressed" as const, reason: entries.argumentSuppressionReason }
+        : { kind: "ArgumentsUnavailable" as const };
+      logConsoleCompletionDecision(decision, context.functionName + "(", this.completionDocumentId);
+    }
+    return entries;
   }
 
   /** Reuse candidates only for a refinement of the same replacement span.
@@ -637,6 +652,7 @@ export class RTermLang {
         cwd: this.options.cwd,
         getCachedWorkspaceData: () => this.cachedSessionData,
         getStaticAnalysisEnabled: this.options.getStaticAnalysisEnabled,
+        requestRuntimeFunctionArguments: this.options.requestRuntimeFunctionArguments,
         onPackagesChanged: () => {
           this.cancelCompletion();
           this.options.onPackagesChanged?.();

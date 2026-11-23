@@ -188,6 +188,9 @@ test("real embedded R completion inspects nested storage without running user co
   for (const name of ["alt_body", "alt_default", "alt_string"]) {
     assert.deepEqual(await inspect(name, [], "source"), { status: "suppressed", reason: "unsafe-altrep" },
       "source inspection rejects embedded ALTREP before length/element callbacks");
+    assert.deepEqual(await inspect(name, [], "arguments"), {
+      status: 'arguments', names: name === 'alt_default' ? ['x'] : [],
+    }, 'argument inspection never reads callback-bearing defaults or bodies');
   }
   for (const expression of ["native_safety$names", "native_safety$class$inner",
     "native_safety$list", "native_safety$list[[1]]", "native_safety[[alt_index]]"]) {
@@ -459,6 +462,74 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("plain", [{ kind: "variable-index", name: "pending_idx" }]),
     { status: "suppressed", reason: "deferred-binding" });
   await submit('R6Foo <- R6::R6Class("R6Foo", public = list(inner = list(item = 1), method = function() stop("must not call")), active = list(active = function(value) { hits <<- hits + 1L; 1L })); r6 <- R6Foo$new()');
+  assert.equal(backend.hasCapability(session, "function-arguments"), true);
+  const argumentsFor = expression => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, "arguments"));
+  const { client: methodClient } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, {
+    requestRuntimeFunctionArguments: argumentsFor,
+  });
+  await submit('argument_hits <- 0L; MethodParent <- R6::R6Class("MethodParent", public = list(levels = function(cols = { argument_hits <<- argument_hits + 1L; NULL }) { argument_hits <<- argument_hits + 1L; NULL })); MethodChild <- R6::R6Class("MethodChild", inherit = MethodParent); task <- MethodChild$new(); methods_obj <- new.env(parent = emptyenv()); methods_obj$method <- function(first, second = { argument_hits <<- argument_hits + 1L; NULL }, ..., after_dots = NULL) { argument_hits <<- argument_hits + 1L }; methods_obj$zero <- function() { argument_hits <<- argument_hits + 1L }; methods_obj$scalar <- 1; makeActiveBinding("active_method", function() { argument_hits <<- argument_hits + 1L; function(active_arg) NULL }, methods_obj); delayedAssign("lazy_method", { argument_hits <<- argument_hits + 1L; function(lazy_arg) NULL }, assign.env = methods_obj)');
+  assert.deepEqual(await argumentsFor('task$levels'), { status: 'arguments', names: ['cols'] });
+  assert.deepEqual(await argumentsFor('methods_obj$method'), { status: 'arguments', names: ['first', 'second', '...', 'after_dots'] });
+  assert.deepEqual(await argumentsFor('methods_obj$zero'), { status: 'arguments', names: [] });
+  await submit('method_holder <- list(inner = methods_obj); method_index <- "inner"; quoted_method <- list(method = function(`a b`, `中文`, ...) stop("must not call")); too_many_args <- function() NULL; formals(too_many_args) <- as.pairlist(setNames(rep(list(NULL), 129L), paste0("arg", seq_len(129L))))');
+  for (const expression of ['method_holder$inner$method', 'method_holder[["inner"]]$method',
+    'method_holder[[method_index]]$method', 'method_holder[1][[1]]$method']) {
+    assert.deepEqual(await argumentsFor(expression), { status: 'arguments', names: ['first', 'second', '...', 'after_dots'] }, expression);
+  }
+  assert.deepEqual(await argumentsFor('quoted_method$method'), { status: 'arguments', names: ['a b', '中文', '...'] });
+  assert.deepEqual(await argumentsFor('too_many_args'), { status: 'unavailable' });
+  for (const expression of ['methods_obj$scalar', 'methods_obj$absent', 'methods_obj$absent$method']) {
+    assert.deepEqual(await argumentsFor(expression), { status: 'unavailable' }, expression);
+  }
+  assert.deepEqual(await argumentsFor('methods_obj$active_method'), { status: 'suppressed', reason: 'active-binding' });
+  assert.deepEqual(await argumentsFor('methods_obj$lazy_method'), { status: 'suppressed', reason: 'deferred-binding' });
+  await submit('class(methods_obj) <- "unsafe_method_container"; `$.unsafe_method_container` <- function(x, name) { argument_hits <<- argument_hits + 1L; function(wrong) NULL }');
+  assert.deepEqual(await argumentsFor('methods_obj$method'), { status: 'suppressed', reason: 'unsafe-dispatch' });
+  await submit('rm("$.unsafe_method_container"); class(methods_obj) <- NULL');
+  const completeArguments = async text => {
+    const lines = text.split('\n'), line = lines.at(-1);
+    const context = completion.getCompletionContext(line, line.length, text);
+    return completion.collectCompletionEntries(context, {
+      getText: () => text, uri: methodClient.inputDocument.uri,
+    }, { line: lines.length - 1, character: line.length }, undefined, lines.slice(0, -1), [], methodClient);
+  };
+  for (const [text, expected] of [
+    ['task$levels(', ['cols']], ['task$levels(co', ['cols']], ['task$levels(cols = NULL, ', []],
+    ['task$levels(NULL, ', []], ['methods_obj$zero(', []],
+    ['methods_obj$method(first = 1, ', ['second', '...', 'after_dots']],
+    ['methods_obj$method(1, sec = 2, ', ['...', 'after_dots']],
+    ['task <- list(levels = function(source_arg) NULL)\ntask$levels(', ['source_arg']],
+    ['task <- unknown_factory()\ntask$levels(', []],
+    ['task = unknown_factory()\ntask$levels(', []],
+    ['unknown_factory() -> task\ntask$levels(', []],
+    ['{ task <- unknown_factory(); task$levels(', []],
+    ['task$levels <- unknown_factory()\ntask$levels(', []],
+    ['f <- function(task) task$levels(', []],
+    ['methods_obj$active_method(', []], ['methods_obj$lazy_method(', []],
+    ['methods_obj <- list(active_method = function(source_arg) NULL)\nmethods_obj$active_method(', ['source_arg']],
+    ['quoted_method$method(', ['`a b`', '中文', '...']],
+  ]) {
+    const entries = await completeArguments(text);
+    assert.deepEqual(entries.filter(entry => entry.role === 'argument').map(entry => entry.label), expected, text);
+  }
+  for (const staticAnalysis of [false, true]) {
+    methodClient.setStaticAnalysis(staticAnalysis);
+    assert.deepEqual((await completeArguments('task$levels(')).map(entry => entry.insertText), ['cols = ']);
+    const refused = await completeArguments('methods_obj$active_method(');
+    assert.equal(refused.argumentsResolved, false);
+    assert.equal(refused.argumentSuppressionReason, 'active-binding');
+    assert.deepEqual((await completeArguments('task <- unknown_factory()\ntask$levels('))
+      .filter(entry => entry.role === 'argument').map(entry => entry.label), staticAnalysis ? [] : ['cols']);
+  }
+  await submit('methods_obj$method <- function(replaced) stop("must not call"); stopifnot(argument_hits == 0L); cat("ARGUMENTS_NOT_EVALUATED\\n")');
+  assert.match(output, /ARGUMENTS_NOT_EVALUATED/);
+  assert.deepEqual((await completeArguments('methods_obj$method(')).map(entry => entry.label), ['replaced']);
+  await submit('if (requireNamespace("mlr3", quietly=TRUE)) { task <- mlr3::tsk("iris"); cat("MLR3_METHOD_READY\\n") }');
+  if (output.includes('MLR3_METHOD_READY')) {
+    assert.deepEqual(await argumentsFor('task$levels'), { status: 'arguments', names: ['cols'] });
+    assert.deepEqual((await completeArguments('task$levels(')).map(entry => entry.label), ['cols']);
+  }
+  await methodClient.dispose();
   const r6names = await inspect("r6", [], "$");
   assert.equal(r6names.status, "available");
   for (const name of ["inner", "method", "active"]) assert.ok(r6names.names.includes(name));
@@ -498,6 +569,7 @@ test("real embedded R completion inspects nested storage without running user co
   assert.equal(slotMembers.status, "available");
   assert.equal(classify(slotMembers).method, 1);
   assert.equal(classify(slotMembers).value, 0);
+  assert.deepEqual(await argumentsFor('sf@method'), { status: 'arguments', names: [] });
   await submit('delayedAssign("pending_member", { hits <<- hits + 1L; function() NULL }, assign.env = env)');
   const deferredMembers = await inspectTyped("env");
   assert.equal(classify(deferredMembers).pending_member, 3);
@@ -532,7 +604,7 @@ test("real embedded R completion inspects nested storage without running user co
     });
   assert.deepEqual(entries, []);
   assert.equal(logLines.length, 1, "native suppression must be visible in completion diagnostics");
-  assert.match(logLines[0], /Request completion could run R code delayed until this value is first used/);
+  assert.match(logLines[0], /Request completion could evaluate a deferred value/);
   assert.match(logLines[0], /Inspection stopped without evaluating it/);
 
   // Exercise the R-owned names vector across repeated allocations and GC.

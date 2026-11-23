@@ -357,6 +357,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     const state = this.sessionStates.get(session);
     if (!state?.hostConnected || !state.capabilities.has("member-inspection") ||
         (query.target === "source" && !state.capabilities.has("function-source")) ||
+        (query.target === "arguments" && !state.capabilities.has("function-arguments")) ||
         (query.utf8ByteEscapes && !state.capabilities.has("member-inspection-utf8-escapes")) ||
         state.pendingMemberRequests.size >= 16) return undefined;
     return new Promise<MemberInspectionResult>(resolve => {

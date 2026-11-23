@@ -38,7 +38,7 @@ export async function collectCompletionEntries(
   const runtimeBracketKind = context.kind === "bracket" && context.bracketOperator === "[" &&
     prefetchedResult?.status === "available" ? prefetchedResult.bracketKind ?? null :
     prefetchedResult?.status === "suppressed" ? null : undefined;
-  const rawLspItemsRequest =
+  const rawLspItemsRequest: ReturnType<typeof getLanguageServerCompletions> =
     !includeLspItems
       ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, runtimeOnly: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
       : getLanguageServerCompletions(
@@ -115,7 +115,11 @@ export async function collectCompletionEntries(
     entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field && !entry.bracketSpecial);
   // A package-inferred exhaustion must not override an unresolved live member.
   if (context.argumentTags && rawLspResult.argumentsExhausted &&
-      !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
+      !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) {
+    const empty = [] as CompletionEntries;
+    if (memberArguments) empty.argumentsResolved = true;
+    return empty;
+  }
   const dataItems = runtimeMembers !== undefined && context.kind === "bracket" ? runtimeMembers :
     !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
@@ -192,11 +196,21 @@ export async function collectCompletionEntries(
     const columnFiltered = filterCompletionEntries(dataItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
-    return asCompletionEntries(dedupeCompletionEntries([
+    const entries = asCompletionEntries(dedupeCompletionEntries([
       ...(!context.argumentValue?.quote ? columnFiltered : []),
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),
     ]), rawLspResult.isIncomplete);
+    if (memberArguments) {
+      entries.argumentsResolved = rawLspResult.argumentsResolved ?? (rawLspResult.rConsoleLocalFunction === true ||
+        rawLspResult.workspaceFunction === true || rawLspItems.some(isArgumentCompletionEntry));
+      entries.argumentSuppressionReason = rawLspResult.argumentSuppressionReason;
+      if (!entries.argumentsResolved) {
+        entries.staticUnavailableReason = rawLspResult.staticUnavailableReason ?? "method-arguments-unavailable";
+        entries.isIncomplete = true;
+      }
+    }
+    return entries;
   }
 
   const defaultColumnFiltered = filterCompletionEntries(dataItems, context.prefix);
