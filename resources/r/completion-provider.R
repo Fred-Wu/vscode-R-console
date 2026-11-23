@@ -50,6 +50,22 @@ console_subscript_completion <- function(params, workspace, uri, point) {
     c(parameters, specials)
 }
 
+# Diagnostic metadata only: preserve the native inference and candidate list.
+# Reasons are a bounded vocabulary, never source text or exception messages.
+console_static_unavailable_reason <- function(resolved) {
+    if (isTRUE(resolved$budget$exhausted)) return("analysis-limit")
+    if (isTRUE(resolved$budget$transient)) return("analysis-pending")
+    reason <- resolved$value$reason
+    if (isTRUE(reason %in% c("unresolved_dollar_dispatch", "unresolved_subset_dispatch")))
+        return("unresolved-dispatch")
+    if (isTRUE(reason %in% c("budget", "snapshot_budget", "snapshot_depth",
+        "s4_slot_limit", "s7_property_limit"))) return("analysis-limit")
+    if (isTRUE(reason %in% c("cycle", "alias_cycle", "recursion", "binding_cycle",
+        "binding_recursion", "inheritance_cycle", "s4_cycle", "s7_recursion"))) return("inference-cycle")
+    if (is.null(resolved$value) || !length(resolved$value$type)) return("receiver-unresolved")
+    NULL
+}
+
 console_supplement_completion <- function(reply, self, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
@@ -64,12 +80,22 @@ console_supplement_completion <- function(reply, self, params) {
     # Ask the native resolver whether an empty member list is authoritative.
     # This uses its cached receiver and avoids probing stale live objects when
     # the current source defines an empty list or the prefix has no matches.
-    if (static_analysis && exists("member_cursor", asNamespace("languageserver"), inherits = FALSE)) {
-        cursor <- languageserver:::member_cursor(document, point)
+    if (static_analysis) {
+        cursor <- if (exists("member_cursor", asNamespace("languageserver"), inherits = FALSE) &&
+            exists("member_resolve_cursor", asNamespace("languageserver"), inherits = FALSE))
+            languageserver:::member_cursor(document, point) else NULL
+        reason <- "unsupported-context"
         if (!is.null(cursor)) {
             resolved <- languageserver:::member_resolve_cursor(uri, workspace, document, point, cursor)
             reply$result$rConsoleMemberResolved <- !is.null(resolved$value) &&
                 (length(resolved$value$type) > 0L || identical(resolved$value$reason, "unresolved_dollar_dispatch"))
+            reason <- console_static_unavailable_reason(resolved)
+        }
+        # A known empty list or a prefix with no matches is still resolved.
+        # Inferred candidates take precedence over an uncertain receiver shape.
+        if (!any(vapply(reply$result$items, function(item)
+            identical(item$data$type, "member"), logical(1)))) {
+            reply$result$rConsoleStaticUnavailableReason <- reason
         }
     }
 

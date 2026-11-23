@@ -140,6 +140,24 @@ test("native member signatures never wait for runtime inspection", async t => {
   assert.equal(result.rConsoleLocalFunction, true);
 });
 
+test("static diagnostic metadata survives VS Code conversion without forwarding arbitrary text", async t => {
+  let reason = "unresolved-dispatch";
+  const { client } = createClient(t, { staticAnalysis: true,
+    completion: instance => {
+      // VS Code discards custom fields while converting the standard result.
+      instance.protocol2CodeConverter.asCompletionResult = async result => ({ items: result.items });
+      return { items: [], rConsoleMemberResolved: true, rConsoleStaticUnavailableReason: reason };
+    },
+  });
+  const doc = { getText: () => "custom_obj$inner$" };
+  const cursor = new Position(0, doc.getText().length);
+  const result = await client.provideCompletionItems(doc, cursor);
+  assert.equal(result.rConsoleMemberResolved, true);
+  assert.equal(result.rConsoleStaticUnavailableReason, "unresolved-dispatch");
+  reason = "secret_source\nINJECTED";
+  assert.equal((await client.provideCompletionItems(doc, cursor)).rConsoleStaticUnavailableReason, undefined);
+});
+
 test("cached workspace functions use one LSP request without sess inspection", async t => {
   const { client, instances } = createClient(t, {
     getCachedWorkspaceData: () => ({ globalenv: {

@@ -8,7 +8,7 @@ test("runtime completion diagnostics use a plain-language reason followed by the
     ["Rejected", "executable-receiver", "Request completion includes an expression that cannot be inspected safely", "Runtime inspection was not attempted"],
     ["Suppressed", "active-binding", "Request completion could run a function automatically linked to this variable", "Inspection stopped without evaluating it"],
     ["Suppressed", "deferred-binding", "Request completion could run R code delayed until this value is first used", "Inspection stopped without evaluating it"],
-    ["Suppressed", "unsafe-dispatch", "Request completion could run a custom method used to access this object's members", "Inspection stopped without evaluating it"],
+    ["Suppressed", "unsafe-dispatch", "Request completion could run a custom method", "Inspection stopped without evaluating it"],
     ["Suppressed", "unsafe-altrep", "Request completion could run code to access this object's data", "Inspection stopped without evaluating it"],
     ["Suppressed", "unsafe-environment", "Request completion could run code supplied by a custom data source", "Inspection stopped without evaluating it"],
     ["Unavailable", "runtime-unavailable", "The R session could not complete the inspection", "No inspection result was used"],
@@ -56,6 +56,53 @@ test("runtime completion logs deduplicate each reason and context across prefixe
   assert.equal(lines.length, 4, "unavailable diagnostics are not repeated for typed prefixes");
   assert.match(lines[3], /The R session could not complete the inspection/);
   assert.match(lines[3], /No inspection result was used/);
+});
+
+test("static diagnostics reuse safety reasons with one consistent outcome and no provider text", () => {
+  const message = formatCompletionDecision({ kind: "StaticUnavailable",
+    reason: "receiver-unresolved", runtimeReason: "unsafe-dispatch" });
+  assert.equal(message, "[Static Completion - Unavailable]: Request completion could run a custom method. No completion suggestions were returned.");
+  const method = formatCompletionDecision({ kind: "StaticUnavailable", reason: "unresolved-dispatch" });
+  assert.match(method, /Custom method results could not be inferred from source/);
+  for (const output of [message, method]) {
+    assert.doesNotMatch(output, /traversal|dispatch|receiver|binding|AST|S3|rConsole|unsafe-/);
+  }
+  const unexpected = formatCompletionDecision({ kind: "StaticUnavailable",
+    reason: "secret_object$inner\nINJECTED", runtimeReason: "toString" });
+  assert.doesNotMatch(unexpected, /secret_object|INJECTED|toString|undefined/);
+  assert.match(unexpected, /No members could be inferred from source/);
+  for (const output of [message, method, unexpected]) {
+    assert.equal(output.split('. ').length, 2, 'one reason sentence and one action sentence');
+    assert.ok(output.endsWith('No completion suggestions were returned.'));
+    assert.doesNotMatch(output, /was not executed|definition.*missing|Insufficient source/);
+  }
+  for (const runtimeReason of ['active-binding', 'deferred-binding', 'unsafe-dispatch', 'unsafe-altrep', 'unsafe-environment']) {
+    const runtime = formatCompletionDecision({ kind: 'Suppressed', reason: runtimeReason }).split(']: ')[1].split('. ')[0];
+    const fallback = formatCompletionDecision({ kind: 'StaticUnavailable', reason: 'receiver-unresolved', runtimeReason });
+    assert.equal(fallback, `[Static Completion - Unavailable]: ${runtime}. No completion suggestions were returned.`);
+  }
+  assert.equal(formatCompletionDecision({ kind: 'StaticUnavailable', reason: 'provider-unavailable',
+    runtimeReason: 'unsafe-dispatch' }),
+    '[Static Completion - Unavailable]: The language server is not available. No completion suggestions were returned.',
+    'a known service failure must not be hidden by the earlier safety refusal');
+});
+
+test("static diagnostics deduplicate typed prefixes but report a changed cause", () => {
+  const lines = [];
+  const { logConsoleCompletionDecision } = loadSource("src/Language/completion/outputChannel.ts", {
+    vscode: { window: { createOutputChannel: () => ({
+      appendLine: line => lines.push(line), dispose() {},
+    }) } },
+  });
+  const { completionDecisionContext } = loadSource("src/Language/completion/diagnostics.ts");
+  for (const reason of ["receiver-unresolved", "unresolved-dispatch"]) {
+    for (const prefix of ["", "s", "se"]) {
+      logConsoleCompletionDecision({ kind: "StaticUnavailable", reason },
+        completionDecisionContext("custom_obj$inner$" + prefix), "static-reasons");
+    }
+  }
+  assert.equal(lines.length, 2);
+  assert.ok(lines.every(line => !line.includes("custom_obj") && !line.includes("$inner")));
 });
 
 test("unsupported subscript diagnostics remain deduplicated while typing", () => {

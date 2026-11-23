@@ -35,6 +35,7 @@ import { PackageInventory, type PackageInventoryChange } from "./packageInventor
 import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
+import { staticCompletionUnavailableReason } from "./completion/diagnostics";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -375,6 +376,9 @@ export class ConsoleLspClient implements CompletionProvider {
         if (completions && (result as { rConsoleMemberResolved?: boolean } | null)?.rConsoleMemberResolved === true) {
           completions.rConsoleMemberResolved = true;
         }
+        const staticReason = staticCompletionUnavailableReason(
+          (result as { rConsoleStaticUnavailableReason?: unknown } | null)?.rConsoleStaticUnavailableReason);
+        if (completions && staticReason) completions.rConsoleStaticUnavailableReason = staticReason;
         if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
           completions.rConsoleNativeArguments = true;
         }

@@ -1371,6 +1371,25 @@ statements: intervening submissions do not discard the definition, and later
 redefinitions take effect on the next request. Unsupported or unsafe stored
 functions simply leave the ordinary source-only inference route in place.
 
+Static completion logs retain the language server's inference reason when one
+is available. Missing receiver information, unresolved class-specific member
+access, analysis limits and recursive definitions have distinct explanations;
+unavailable services or failed requests are distinguished from inference gaps.
+After a runtime safety refusal, an unavailable static result reuses the existing
+runtime safety reason. For example, after submitting
+`custom_obj <- structure(list(inner = list(secret = 123)), class = "dangerous")`
+and `\`$.dangerous\` <- function(x, name) unclass(x)[[name]]`, request
+`custom_obj$inner$`. The log reads: "Request completion could run a custom method.
+No completion suggestions were returned."
+Every unavailable result has one brief reason sentence followed by that same
+action sentence. Without a runtime safety refusal, the reason comes from native
+source inference when available, including unresolved custom method results.
+The log does not describe an existing R object as missing. Known empty receivers and prefixes with no
+matching members remain successful inference; unresolved custom methods do not.
+Diagnostic metadata uses fixed reason codes and plain R-facing messages, without
+logging object names, submitted code or raw errors. Candidate selection and the
+no-execution safety rule are unchanged.
+
 The native source adapter serializes bounded stored syntax directly, rather
 than using R's general deparser. Embedded ALTREP values and promises are
 rejected before any callback or forcing operation, and attributed or unsupported

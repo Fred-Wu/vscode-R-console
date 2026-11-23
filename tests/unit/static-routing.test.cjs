@@ -341,6 +341,56 @@ test("an unresolved static receiver never becomes a global symbol completion", a
   assert.ok(h.logs.every(line => !line.includes("[Runtime Completion - Rejected]")));
 });
 
+test("static fallback explains unresolved methods without calling an empty result inferred", async () => {
+  for (const reason of ["receiver-unresolved", "unresolved-dispatch"]) {
+    const h = harness({ inspected: { status: "suppressed", reason: "unsafe-dispatch" },
+      sessionData: { globalenv: { custom_obj: { names: ["stale_secret"] } } },
+      lspItems: { rConsoleMemberResolved: true, rConsoleStaticUnavailableReason: reason, items: [] } });
+    assert.deepEqual(labels(await h.complete("custom_obj$inner$")), []);
+    const log = h.logs.find(line => line.includes("[Static Completion - Unavailable]"));
+    assert.match(log, /Request completion could run a custom method/);
+    assert.match(log, /No completion suggestions were returned\.$/);
+    assert.ok(h.logs.every(line => !line.includes("Inferred") && !line.includes("stale_secret")));
+  }
+  const empty = harness({ lspItems: { rConsoleMemberResolved: true, items: [] } });
+  assert.deepEqual(labels(await empty.complete("make_data()$")), []);
+  assert.ok(empty.logs.some(line => line.includes("[Static Completion - Inferred]")),
+    "a known empty receiver remains an authoritative successful inference");
+});
+
+test("static fallback distinguishes missing services, failed requests and absent inference evidence", async () => {
+  for (const [setup, expected] of [
+    [h => { h.lang.ensureConsoleLspStarted = async () => undefined; }, /language server is not available/],
+    [h => { h.lang.getOrOpenCompletionDocument = async () => undefined; }, /console input is not available/],
+    [() => {}, /returned no completion result/],
+  ]) {
+    const h = harness({ lspItems: () => undefined });
+    setup(h);
+    assert.deepEqual(labels(await h.complete("make_data()$")), []);
+    assert.ok(h.logs.some(line => expected.test(line)), h.logs.join("\n"));
+  }
+  const failed = harness({ lspItems: () => { throw Error("private source\nINJECTED"); } });
+  await failed.complete("make_data()$");
+  assert.ok(failed.logs.some(line => /completion request failed/.test(line)));
+  assert.ok(failed.logs.every(line => !/private source|INJECTED/.test(line)));
+});
+
+test("static fallback retains only validated diagnostic metadata across matching retries", async () => {
+  let requests = 0;
+  const h = harness({ lspItems: () => ++requests === 1
+    ? { items: [], rConsoleStaticUnavailableReason: "receiver-unresolved" }
+    : { items: [], rConsoleMemberResolved: true } });
+  await h.complete("make_data()$al");
+  assert.equal(requests, 2);
+  assert.ok(h.logs.some(line => line.includes("[Static Completion - Inferred]")),
+    "a successful retry must clear the earlier failure reason");
+
+  const unknown = harness({ lspItems: { items: [], rConsoleStaticUnavailableReason: "private_name\nINJECTED" } });
+  await unknown.complete("make_data()$");
+  assert.ok(unknown.logs.some(line => /No members could be inferred from source/.test(line)));
+  assert.ok(unknown.logs.every(line => !/private_name|INJECTED/.test(line)));
+});
+
 test("cancelled or superseded static responses cannot publish or log inferred candidates", async () => {
   for (const cancelMode of ["cancel", "setting"]) {
     let release;

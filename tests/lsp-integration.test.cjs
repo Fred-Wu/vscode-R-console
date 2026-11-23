@@ -1452,6 +1452,40 @@ test("native member inference owns edits, callable snippets and empty source obj
   }
 });
 
+test("static completion explains missing source and unresolved accessors using native inference evidence", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const definition = [
+    'probe <- new.env(parent = emptyenv())',
+    'probe$calls <- 0L',
+    'custom_obj <- structure(list(inner = list(secret = 123)), class = "dangerous")',
+    '`$.dangerous` <- function(x, name) { probe$calls <- probe$calls + 1L; unclass(x)[[name]] }',
+    'make_object <- function() { probe$calls <- probe$calls + 1L; list(inner = list(secret = 456)) }',
+  ].join('\n');
+  for (const [text, reason, resolved, labels] of [
+    ['custom_obj$inner$', 'receiver-unresolved', false, []],
+    [definition + '\ncustom_obj$inner$', 'unresolved-dispatch', false, []],
+    [definition + '\nmake_object()$inner$', undefined, true, ['secret']],
+    ['obj <- list()\nobj$', undefined, true, []],
+    ['obj <- list(alpha = 1)\nobj$missing', undefined, true, []],
+    ['make_object()[["se', 'unsupported-context', false, []],
+    ['again <- function() again()\nagain()$', 'analysis-limit', false, []],
+  ]) {
+    const lines = text.split('\n'), line = lines.at(-1);
+    const position = { line: lines.length - 1, character: line.length };
+    const doc = { getText: () => text, uri: client.inputDocument.uri };
+    const context = completion.getStaticFallbackContext(line, line.length, text) ??
+      completion.getCompletionContext(line, line.length, text);
+    const result = await client.provideCompletionItems(doc, position, context.triggerCharacter,
+      undefined, undefined, 'static');
+    assert.equal(result.rConsoleStaticUnavailableReason, reason, text);
+    const entries = await completion.collectStaticFallbackEntries(context, doc, position,
+      lines.slice(0, -1), { provideCompletionItems: async () => result });
+    assert.equal(entries.staticResolved, resolved, text);
+    assert.equal(entries.staticUnavailableReason, reason, text);
+    assert.deepEqual(entries.map(entry => entry.label), labels, text);
+  }
+});
+
 test("native S3 arguments retain their resolved method and presentation role", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   const text = 'df <- data.frame(alpha = 1)\nsubset(df, )';

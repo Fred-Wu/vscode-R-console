@@ -20,7 +20,7 @@ import {
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
 import { clearCompletionDiagnosticsScope, logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
-import { completionDecisionContext } from "../../Language/completion/diagnostics";
+import { completionDecisionContext, type CompletionSuppressionReason } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
 import type { WorkspaceData } from "../../Runtime/VSCR";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
@@ -147,7 +147,7 @@ export class RTermLang {
       : undefined);
     if (context?.rejectionReason) {
       logConsoleCompletionDecision(staticEnabled
-        ? { kind: "StaticUnavailable" }
+        ? { kind: "StaticUnavailable", reason: "unsupported-context" }
         : { kind: "Rejected", reason: context.rejectionReason },
         completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
       onInlineEntries?.([]);
@@ -371,14 +371,15 @@ export class RTermLang {
     logOutcome = true
   ): Promise<CompletionEntries | undefined> {
     const staticEnabled = this.options.getStaticAnalysisEnabled?.() === true;
-    const fallback = async (logUnresolved = true): Promise<CompletionEntries | undefined> => {
+    const fallback = async (logUnresolved = true, runtimeReason?: CompletionSuppressionReason): Promise<CompletionEntries | undefined> => {
       const lsp = provider ?? await this.ensureConsoleLspStarted();
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       const doc = document ?? await this.getOrOpenCompletionDocument(inputText);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       if (!doc || !lsp) {
         if (logOutcome && logUnresolved) {
-          logConsoleCompletionDecision({ kind: "StaticUnavailable" },
+          logConsoleCompletionDecision({ kind: "StaticUnavailable",
+            reason: !lsp ? "provider-unavailable" : "document-unavailable", runtimeReason },
             completionDecisionContext(inputText), this.completionDocumentId);
         }
         // A missing language server or document is not an authoritative empty
@@ -407,8 +408,8 @@ export class RTermLang {
       const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, sourceDefinition);
       if (this.isCurrentCompletionRequest(requestId) && logOutcome &&
           (entries.staticResolved || logUnresolved)) {
-        logConsoleCompletionDecision({
-          kind: entries.staticResolved ? "StaticInferred" : "StaticUnavailable",
+        logConsoleCompletionDecision(entries.staticResolved ? { kind: "StaticInferred" } : {
+          kind: "StaticUnavailable", reason: entries.staticUnavailableReason, runtimeReason,
         }, completionDecisionContext(inputText.slice(0,
           linesBefore.join("\n").length + (linesBefore.length ? 1 : 0) + position.character)),
         this.completionDocumentId);
@@ -426,7 +427,7 @@ export class RTermLang {
       const result = await Promise.resolve(requester(context.objectName, context.operator ?? "$"))
         .catch(() => undefined);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
-      if (result?.status === "suppressed") return fallback();
+      if (result?.status === "suppressed") return fallback(true, result.reason);
       if (result?.status === "missing") return fallback(false);
       return collectCompletionEntries(context, undefined, undefined, sessionData,
         linesBefore, recentEntries, undefined, () => Promise.resolve(result), inputText);
@@ -434,7 +435,7 @@ export class RTermLang {
     if (staticEnabled && context.kind === "bracket" && bracketInspection) {
       const result = await bracketInspection.catch(() => undefined);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
-      if (result?.status === "suppressed") return fallback();
+      if (result?.status === "suppressed") return fallback(true, result.reason);
       if (result?.status === "missing") return fallback(false);
       bracketInspection = Promise.resolve(result);
     }

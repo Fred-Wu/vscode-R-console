@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, CompletionSourceDefinition } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
+import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason } from "./diagnostics";
 import { isCallableName } from "./contextParser";
 import { backtickRName, escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
 
@@ -14,9 +15,9 @@ export async function getLanguageServerCompletions(
   runtimeBracketKind?: "data.frame" | "data.table" | null,
   analysisMode?: CompletionAnalysisMode,
   sourceDefinition?: CompletionSourceDefinition
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
   if (!completionProvider) {
-    return { entries: [], isIncomplete: false };
+    return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
   }
   try {
     let result = await completionProvider.provideCompletionItems(
@@ -28,6 +29,7 @@ export async function getLanguageServerCompletions(
     let localFunction = result?.rConsoleLocalFunction === true;
     let workspaceFunction = result?.rConsoleWorkspaceFunction === true;
     let memberResolved = result?.rConsoleMemberResolved === true;
+    let staticReason = staticCompletionUnavailableReason(result?.rConsoleStaticUnavailableReason);
     let nativeArguments = result?.rConsoleNativeArguments === true;
     let argumentsExhausted = result?.rConsoleArgumentsExhausted === true;
 
@@ -50,6 +52,7 @@ export async function getLanguageServerCompletions(
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;
       memberResolved ||= result?.rConsoleMemberResolved === true;
+      staticReason = staticCompletionUnavailableReason(result?.rConsoleStaticUnavailableReason);
       nativeArguments ||= result?.rConsoleNativeArguments === true;
       argumentsExhausted ||= result?.rConsoleArgumentsExhausted === true;
       items = Array.isArray(result) ? result : result?.items || [];
@@ -76,12 +79,13 @@ export async function getLanguageServerCompletions(
       rConsoleLocalFunction: localFunction,
       runtimeOnly,
       memberResolved,
+      staticUnavailableReason: result == null ? "no-response" : staticReason,
       workspaceFunction,
       nativeArguments,
       argumentsExhausted,
     };
   } catch {
-    return { entries: [], isIncomplete: false };
+    return { entries: [], isIncomplete: false, staticUnavailableReason: "request-failed" };
   }
 }
 

@@ -249,8 +249,12 @@ export async function collectStaticFallbackEntries(
     dedupeCompletionEntries(filterCompletionEntries(memberItems, context.prefix)),
     result.isIncomplete
   );
-  // An authoritative empty receiver is still a successful resolution.
-  entries.staticResolved = result.memberResolved || memberItems.length > 0;
-  if (!entries.staticResolved) entries.isIncomplete = true;
+  // An authoritative empty receiver is still a successful resolution. A
+  // recognized but unresolved method must not be reported as inferred.
+  entries.staticResolved = memberItems.length > 0 || !!(result.memberResolved && !result.staticUnavailableReason);
+  if (!entries.staticResolved) {
+    entries.staticUnavailableReason = result.staticUnavailableReason ?? "no-receiver-members";
+    entries.isIncomplete = true;
+  }
   return entries;
 }

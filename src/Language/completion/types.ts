@@ -2,6 +2,7 @@ import type * as vscode from "vscode";
 import type { CallCompletionContext } from "./contextParser";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 import type { WorkspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
+import type { StaticCompletionUnavailableReason } from "./diagnostics";
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
@@ -51,6 +52,7 @@ export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
   // Whether static analysis resolved the requested member/column receiver.
   staticResolved?: boolean;
+  staticUnavailableReason?: StaticCompletionUnavailableReason;
   // An empty but successful sess column inspection is authoritative.
   columnsResolved?: boolean;
 };
@@ -74,6 +76,7 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
   rConsoleLocalFunction?: boolean;
   rConsoleWorkspaceFunction?: boolean;
   rConsoleMemberResolved?: boolean;
+  rConsoleStaticUnavailableReason?: StaticCompletionUnavailableReason;
   rConsoleNativeArguments?: boolean;
   rConsoleArgumentsExhausted?: boolean;
 };
