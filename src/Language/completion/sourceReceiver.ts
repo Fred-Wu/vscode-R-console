@@ -15,6 +15,20 @@ export function storedFunctionReceiver(
 export function storedFunctionCall(
   context: CompletionContext, input: string, cursor: number
 ): { name: string; start: number } | undefined {
+  return receiverRoot(context, input, cursor, false);
+}
+
+// Locate the value root of a computed receiver for binding identity checks.
+// Subscripts and method calls are skipped syntactically, never evaluated.
+export function storedReceiverRoot(
+  context: CompletionContext, input: string, cursor: number
+): { name: string; start: number } | undefined {
+  return receiverRoot(context, input, cursor, true);
+}
+
+function receiverRoot(
+  context: CompletionContext, input: string, cursor: number, valueRoot: boolean
+): { name: string; start: number } | undefined {
   const methodArguments = context.kind === "argument" &&
     (context.functionOperator === "$" || context.functionOperator === "@");
   if (!methodArguments && (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket"))) {
@@ -67,19 +81,28 @@ export function storedFunctionCall(
     receiverEnd = active.index - 1;
   }
 
-  // Strip suffixes and grouping on the result of a direct call. Each group
+  // Strip suffixes and grouping on the receiver. Each group
   // must contain that entire receiver, not a compound expression ending in
   // a call, such as (other + fn()). Keep this walk iterative as well.
-  // Reject computed call heads and methods rather than retrieving an unrelated
-  // global function with the same name.
+  // Source retrieval accepts direct named calls. Binding checks can also
+  // follow method calls and computed heads back to their named value root.
   const groups: number[] = [];
+  const result = (index: number) => {
+    let start = index;
+    for (let group = groups.length - 1; group >= 0; group--) {
+      if (start !== groups[group] + 1) return undefined;
+      start = groups[group];
+    }
+    const decoded = decodeRArgumentName(tokens[index].value);
+    return decoded === undefined ? undefined : { name: decoded, start: tokens[index].position };
+  };
   for (let index = receiverEnd; index >= 0;) {
     const token = tokens[index];
     if (token.type === TokenType.RightBracket) {
       const opening = openings.get(index);
       if (opening === undefined) return undefined;
       index = opening - 1;
-    } else if (token.type === TokenType.Identifier &&
+    } else if ((token.type === TokenType.Identifier || (valueRoot && token.type === TokenType.String && token.closed)) &&
         tokens[index - 1]?.type === TokenType.Operator &&
         ["$", "@"].includes(tokens[index - 1].value)) {
       index -= 2;
@@ -88,15 +111,13 @@ export function storedFunctionCall(
       if (opening === undefined) return undefined;
       const name = continuations[opening] ? tokens[opening - 1] : undefined;
       const preceding = tokens[opening - 2];
-      if (name?.type === TokenType.Identifier) {
-        if (isNameAccessor(preceding)) return undefined;
-        let start = opening - 1;
-        for (let group = groups.length - 1; group >= 0; group--) {
-          if (start !== groups[group] + 1) return undefined;
-          start = groups[group];
+      if (name?.type === TokenType.Identifier || (valueRoot && name?.type === TokenType.String && name.closed)) {
+        if (valueRoot && preceding?.type === TokenType.Operator && ["$", "@"].includes(preceding.value)) {
+          index = opening - 1;
+          continue;
         }
-        const decoded = decodeRArgumentName(name.value);
-        return decoded === undefined ? undefined : { name: decoded, start: name.position };
+        if (isNameAccessor(preceding)) return undefined;
+        return result(opening - 1);
       }
       // Parentheses after a value are a computed call. A control condition or
       // function's formals, however, can be followed by a grouped body.
@@ -105,6 +126,11 @@ export function storedFunctionCall(
       const afterControl = name?.type === TokenType.RightParen && control &&
         ([TokenType.If, TokenType.For, TokenType.While, TokenType.Function].includes(control.type) ||
          (control.type === TokenType.Operator && control.value === "\\"));
+      if (valueRoot && !afterControl && name &&
+          [TokenType.RightParen, TokenType.RightBracket].includes(name.type)) {
+        index = opening - 1;
+        continue;
+      }
       const grouping = !name || afterControl ||
         [TokenType.LeftParen, TokenType.LeftBracket, TokenType.LeftBrace, TokenType.Comma,
           TokenType.Semicolon, TokenType.Else, TokenType.Repeat, TokenType.In].includes(name.type) ||
@@ -112,6 +138,8 @@ export function storedFunctionCall(
       if (!grouping) return undefined;
       groups.push(opening);
       index--;
+    } else if (valueRoot && token.type === TokenType.Identifier && !isNameAccessor(tokens[index - 1])) {
+      return result(index);
     } else return undefined;
   }
   return undefined;

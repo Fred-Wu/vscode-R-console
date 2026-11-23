@@ -43,6 +43,8 @@ pub(crate) enum Target {
     FunctionSource,
     // Read only the tags of a stored closure's formals, never defaults/body.
     FunctionArguments,
+    // Check a computed receiver's root identity without traversing its value.
+    Binding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +61,7 @@ pub(crate) enum Step {
 
 impl Target {
     fn accessor(self) -> &'static str {
-        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSource | Self::FunctionArguments => "" }
+        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSource | Self::FunctionArguments | Self::Binding => "" }
     }
 }
 
@@ -94,6 +96,7 @@ impl MemberQuery {
             3 => Target::DoubleBracket,
             4 if depth == 0 => Target::FunctionSource,
             5 => Target::FunctionArguments,
+            6 if depth == 0 && bytes[0] & 0x40 != 0 => Target::Binding,
             _ => return None,
         };
         if depth > MAX_DEPTH { return None; }
@@ -1430,7 +1433,7 @@ impl Native {
             RootBinding::Missing => return Ok(Inspection::Available(Members::missing())),
             RootBinding::NotCallable => return Ok(Inspection::NotCallable),
             RootBinding::Package(raw) => {
-                if query.target == Target::FunctionArguments && query.steps.is_empty() {
+                if query.target == Target::Binding || (query.target == Target::FunctionArguments && query.steps.is_empty()) {
                     return Ok(Inspection::PackageBinding);
                 }
                 // Already materialized package receivers have ordinary live
@@ -1438,6 +1441,7 @@ impl Native {
                 let Some(value) = self.cached_value(raw) else { return Ok(Inspection::PackageBinding); };
                 value
             }
+            RootBinding::Stored(_) if query.target == Target::Binding => return Ok(Inspection::Opaque),
             RootBinding::Stored(value) => value,
         };
         (self.protect)(root);
@@ -1603,5 +1607,11 @@ mod tests {
         assert_eq!(MemberQuery::decode(&root), Some(MemberQuery {
             root: "task".to_owned(), steps: Vec::new(), target: Target::FunctionSource, utf8_byte_escapes: false, search_path: false,
         }));
+        root[0] = 6;
+        assert_eq!(MemberQuery::decode(&root), None, "binding queries require search-path semantics");
+        root[0] = 0x46;
+        assert_eq!(MemberQuery::decode(&root).unwrap().target, Target::Binding);
+        root[1] = 1;
+        assert_eq!(MemberQuery::decode(&root), None, "binding queries never traverse selectors");
     }
 }

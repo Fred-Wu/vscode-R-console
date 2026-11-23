@@ -290,7 +290,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestRuntimeMemberCompletions: (expression, operator) =>
         this.requestStoredMemberCompletions(expression, operator),
-      requestRuntimeFunctionSource: name => this.requestStoredFunctionSource(name),
+      requestRuntimeFunctionSource: (name, target) => this.requestStoredFunctionSource(name, target),
       requestRuntimeFunctionArguments: expression => this.requestStoredFunctionArguments(expression),
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
@@ -374,16 +374,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     });
   }
 
-  // Only retrieve a global closure already stored in R, never evaluate a call.
+  // Retrieve stored closure syntax or check a receiver's root binding identity.
   // The backend uses the same idle/submission gate and native C error guard as
   // member inspection. Unsupported or unsafe bindings have no source result.
-  private requestStoredFunctionSource(name: string): Promise<MemberInspectionResult | undefined> | undefined {
+  private requestStoredFunctionSource(name: string, target: "source" | "binding" = "source"): Promise<MemberInspectionResult | undefined> | undefined {
     if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
         this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) {
       return undefined;
     }
     const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess,
-      { root: name, steps: [], target: "source" });
+      { root: name, steps: [], target });
     return response;
   }
 

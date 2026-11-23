@@ -1124,7 +1124,7 @@ test("static routing preserves search-path identity, opaque callables and stored
   const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, {
     libraries: [library], requestRuntimeFunctionArguments: (e) => inspect(e, "arguments"),
   });
-  const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name) => backend.inspectMemberNames(session, { root: name, steps: [], target: "source" }) });
+  const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name, target = "source") => backend.inspectMemberNames(session, { root: name, steps: [], target }) });
   lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: async (...args) => {
     const r = await client.provideCompletionItems(...args);
     return r && { ...r, items: r.items.map((x) => ({ ...x, kind: x.kind - 1 })) };
@@ -1144,6 +1144,8 @@ test("static routing preserves search-path identity, opaque callables and stored
   assert.deepEqual(await inspect('iris', '$'), { status: 'package' }, 'lazy package datasets remain unforced');
   assert.deepEqual(await inspect('data.frame', 'source'), { status: 'package' });
   assert.ok((await complete('iris$')).some(x => x.insert === 'Sepal.Length'));
+  assert.deepEqual(await inspect('iris', 'binding'), { status: 'package' });
+  assert.ok((await complete('iris[1,,drop=FALSE]$')).some(x => x.insert === 'Sepal.Length'));
   assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['fake']);
   for (const name of ['review_attached', 'package:datasets']) {
     // Even a spoofed package name cannot authorize a namespace's different object.
@@ -1151,6 +1153,10 @@ test("static routing preserves search-path identity, opaque callables and stored
     assert.deepEqual((await inspect('iris', '$')).names, ['actual']);
     assert.equal((await inspect('data.frame', 'source')).status, 'source');
     assert.deepEqual((await complete('iris$')).map(x => x.insert), ['actual']);
+    assert.deepEqual(await inspect('iris', 'binding'), { status: 'opaque' });
+    for (const text of ['iris[1,,drop=FALSE]$', '(iris[seq_len(1),,drop=FALSE])$', 'iris[[identity(1)]]$']) {
+      assert.deepEqual(await complete(text), [], text);
+    }
     assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['actual']);
     await submit('data.frame <- 1');
     assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['actual'],
@@ -1168,11 +1174,19 @@ test("static routing preserves search-path identity, opaque callables and stored
     } else {
       assert.deepEqual(await complete('iris$'), []);
     }
+    assert.deepEqual(await complete('iris[1,,drop=FALSE]$'), [], 'computed roots preserve inherited refusals');
     assert.deepEqual(await complete('data.frame(fake=1)$'), [], 'uninspectable inherited callables stay opaque');
     assert.deepEqual((await complete('data.frame <- function(...) list(draft=1)\ndata.frame(fake=1)$')).map(x => x.insert), ['draft']);
     await submit('stopifnot(review_hits == 0L); detach("review_inherited")');
   }
   assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['fake'], 'detach restores package lookup');
+
+  await submit('iris <- data.frame(actual=1); computed_index <- function() { review_hits <<- review_hits+1L; 1L }');
+  for (const text of ['iris[1,,drop=FALSE]$', 'iris[computed_index(),,drop=FALSE]$']) {
+    assert.deepEqual(await complete(text), [], text);
+    assert.deepEqual((await complete('iris <- data.frame(draft=1)\n' + text)).map(x => x.insert), ['draft']);
+  }
+  await submit('stopifnot(review_hits == 0L); rm(iris, computed_index)');
 
   await submit(`library(rconsolebindingtest, lib.loc=${JSON.stringify(library.replaceAll('\\', '/'))})`);
   await client.syncSessionState({ attachedPackages: ['rconsolebindingtest', 'stats', 'graphics', 'grDevices', 'utils', 'datasets', 'methods', 'base'] });
@@ -1197,6 +1211,9 @@ test("static routing preserves search-path identity, opaque callables and stored
   }
   await submit('api <- list(scan=function(actual) NULL)');
   assert.deepEqual((await complete('api$scan(')).map(x => x.insert), ['actual = ']);
+  assert.deepEqual(await complete('api[[identity("scan")]]('), [], 'computed callable selectors cannot borrow package formals');
+  assert.deepEqual(await complete('api[identity(1)]$scan('), [], 'computed method receivers retain their live root');
+  assert.deepEqual((await complete('api <- list(scan=function(draft) NULL)\napi[identity(1)]$scan(')).map(x => x.insert), ['draft = ']);
   await submit('rm(api); detach("package:rconsolebindingtest")');
   await client.syncSessionState({ attachedPackages: ['stats', 'graphics', 'grDevices', 'utils', 'datasets', 'methods', 'base'] });
 

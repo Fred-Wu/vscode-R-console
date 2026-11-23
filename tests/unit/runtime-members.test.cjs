@@ -122,6 +122,9 @@ test("search-path outcomes are negotiated and older absence results remain unkno
   backend.sessionStates.set(session, state);
   const frames = [];
   backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const binding = { root: 'iris', steps: [], target: 'binding' };
+  assert.equal(backend.inspectMemberNames(session, binding), undefined);
+  assert.equal(frames.length, 0, 'older backends cannot accept binding-only requests');
   for (const status of ['missing', 'not-callable']) {
     const request = backend.inspectMemberNames(session, { root: 'factory', steps: [], target: 'source' });
     assert.equal(frames.at(-1)[12], 4);
@@ -130,6 +133,11 @@ test("search-path outcomes are negotiated and older absence results remain unkno
     assert.deepEqual(await request, { status: 'unavailable' }, 'older backends checked only .GlobalEnv');
   }
   state.capabilities.add('member-inspection-search-path');
+  const identity = backend.inspectMemberNames(session, binding);
+  assert.equal(frames.at(-1)[12], 0x46);
+  backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: state.nextRequestId,
+    result: { status: 'opaque' } });
+  assert.deepEqual(await identity, { status: 'opaque' });
   for (const status of ['missing', 'package', 'opaque']) {
     const request = backend.inspectMemberNames(session, { root: 'factory', steps: [], target: 'source' });
     assert.equal(frames.at(-1)[12], 0x44);

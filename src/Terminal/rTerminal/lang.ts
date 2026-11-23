@@ -11,6 +11,7 @@ import {
   type CompletionSourceBinding,
   type RuntimeFunctionArgumentsRequester,
   storedFunctionReceiver,
+  storedReceiverRoot,
   collectCompletionEntries,
   collectStaticFallbackEntries,
   getStaticFallbackContext,
@@ -364,14 +365,18 @@ export class RTermLang {
   private prefetchFunctionSource(context: CompletionContext, input: string, cursor: number):
     Promise<{ binding?: CompletionSourceBinding; reason?: CompletionSuppressionReason }> | undefined {
     // Start independently of LSP startup; every completion owns a fresh snapshot.
-    const receiver = storedFunctionReceiver(context, input, cursor);
+    // Stored methods already receive a full argument inspection in the client.
+    if (context.kind === "argument" && context.functionName &&
+        parseRuntimeMemberQuery(context.functionName, "arguments")) return undefined;
+    const source = storedFunctionReceiver(context, input, cursor);
+    const receiver = source ?? storedReceiverRoot(context, input, cursor)?.name;
     const requester = this.options.requestRuntimeFunctionSource;
     if (!receiver || !requester) return undefined;
     return (async () => {
-      const binding: CompletionSourceBinding = { name: receiver };
+      const binding: CompletionSourceBinding = { name: receiver, ...(!source ? { opaqueReceiver: true } : {}) };
       try {
-        const result = await requester(receiver);
-        if (result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
+        const result = await requester(receiver, source ? "source" : "binding");
+        if (source && result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
           return { binding: { ...binding, body: result.text } };
         }
         if (result?.status === "missing" || result?.status === "not-callable" || result?.status === "package") return {};

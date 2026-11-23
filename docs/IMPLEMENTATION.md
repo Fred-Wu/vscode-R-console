@@ -1365,8 +1365,12 @@ receivers. An inherited package binding can authorize installed metadata after
 its identity is verified against the loaded namespace, imports or lazy-data
 environment. This comparison reads stored pointers without forcing package
 promises. Materialized package receivers use guarded live storage inspection.
-The `member-inspection-search-path` capability negotiates a request flag and
-package/opaque response statuses. Absence reported by an older backend remains
+The `member-inspection-search-path` capability negotiates a request flag,
+root-binding inspection and package/opaque response statuses. Computed receivers
+with a named root use a binding-only request to preserve that root's identity
+without traversing selectors or evaluating calls. A live root requires an
+independently inferred draft override before package metadata can contribute.
+Absence reported by an older backend remains
 unknown to the source adapter. Source-only results carry static inference diagnostics.
 The existing virtual document continues to describe the editable input, and
 source-only fallback can also retrieve the *current stored closure definition*

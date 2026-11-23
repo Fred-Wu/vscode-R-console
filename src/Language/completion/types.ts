@@ -109,7 +109,7 @@ export interface CompletionProvider {
   ): Promise<CompletionResult | undefined>;
 }
 
-export type RuntimeFunctionSourceRequester = (name: string) =>
+export type RuntimeFunctionSourceRequester = (name: string, target?: "source" | "binding") =>
   Promise<MemberInspectionResult | undefined> | undefined;
 
 export type RuntimeFunctionArgumentsRequester = (expression: string) =>

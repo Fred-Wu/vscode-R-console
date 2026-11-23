@@ -358,6 +358,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (!state?.hostConnected || !state.capabilities.has("member-inspection") ||
         (query.target === "source" && !state.capabilities.has("function-source")) ||
         (query.target === "arguments" && !state.capabilities.has("function-arguments")) ||
+        (query.target === "binding" && !state.capabilities.has("member-inspection-search-path")) ||
         (query.utf8ByteEscapes && !state.capabilities.has("member-inspection-utf8-escapes")) ||
         state.pendingMemberRequests.size >= 16) return undefined;
     const searchPath = state.capabilities.has("member-inspection-search-path");

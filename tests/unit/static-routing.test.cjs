@@ -491,6 +491,46 @@ test("deep receiver grouping uses an iterative walk without borrowing a compound
   }
 });
 
+test("computed receiver identity follows only its outer named root", () => {
+  for (const [text, expected] of [
+    ['iris[1,,drop=FALSE]$', 'iris'],
+    ['(iris[side_effect(),,drop=FALSE])$', 'iris'],
+    ['obj[[side_effect()]]$method(', 'obj'],
+    ['obj$method()$child$', 'obj'],
+    ['obj$"method"()$child$', 'obj'],
+    ['(obj$method)()$', 'obj'],
+    ['obj[[side_effect()]]()$', 'obj'],
+    ['(obj[side_effect()])[["na', 'obj'],
+    ['`odd root`[f()]$', 'odd root'],
+    ['other\n(iris[1,,drop=FALSE])$', 'iris'],
+    ['if (TRUE) (iris[1,,drop=FALSE])$', 'iris'],
+    ['pkg::iris[1,,drop=FALSE]$', undefined],
+    ['(pkg::obj$method())$', undefined],
+    ['(other + iris[1,,drop=FALSE])$', undefined],
+    ['(-iris[1,,drop=FALSE])$', undefined],
+  ]) {
+    const line = text.split('\n').at(-1);
+    const context = completion.getStaticFallbackContext(line, line.length, text) ??
+      completion.getCompletionContext(line, line.length, text);
+    const root = completion.storedReceiverRoot(context, text, text.length);
+    assert.equal(root?.name, expected, text);
+    if (root) assert.ok(text.slice(root.start).startsWith(expected === 'odd root' ? '`odd root`' : expected));
+  }
+});
+
+test("binding-only refusal preserves computed identity and stored methods avoid redundant inspection", async () => {
+  for (const status of ['opaque', 'unavailable', 'package', 'missing']) {
+    const h = harness({ storedSources: { iris: { status } } });
+    await h.complete('iris[1,,drop=FALSE]$');
+    assert.deepEqual(h.sourceRequests, ['iris']);
+    assert.deepEqual(h.requests.at(-1).sourceDefinition,
+      ['package', 'missing'].includes(status) ? undefined : { name: 'iris', opaqueReceiver: true });
+  }
+  const h = harness({ storedSources: {} });
+  await h.complete('obj$method(');
+  assert.deepEqual(h.sourceRequests, [], 'stored argument inspection owns this receiver');
+});
+
 test("stored function source is requested on demand for earlier submissions and redefinitions", async () => {
   const definitions = {
     make_data: "function() list(alpha = 1)",
@@ -500,9 +540,9 @@ test("stored function source is requested on demand for earlier submissions and 
     storedSources: definitions,
     lspItems: (_mode, definition) => ({
       rConsoleMemberResolved: true,
-      items: definition?.body.includes("alpha") ? [
+      items: definition?.body?.includes("alpha") ? [
         { label: "alpha", kind: 4, data: { type: "member" } },
-      ] : definition?.body.includes("beta") ? [
+      ] : definition?.body?.includes("beta") ? [
         { label: "beta", kind: 4, data: { type: "member" } },
       ] : [{ label: "outer", kind: 4, data: { type: "member" } }],
     }),
@@ -518,7 +558,8 @@ test("stored function source is requested on demand for earlier submissions and 
   assert.deepEqual(labels(await h.complete("wrapper(make_data())$")), ["outer"]);
   const before = h.sourceRequests.length;
   assert.deepEqual(labels(await h.complete("obj[[side_effect()]]$")), ["outer"]);
-  assert.equal(h.sourceRequests.length, before, "computed indices cannot borrow their inner call's source");
+  assert.deepEqual(h.sourceRequests.slice(before), ['obj'], "computed indices inspect only their root binding");
+  assert.deepEqual(h.requests.at(-1).sourceDefinition, { name: 'obj', opaqueReceiver: true });
 });
 
 test("unsafe or unavailable source retrieval preserves an opaque binding for static fallback", async () => {
