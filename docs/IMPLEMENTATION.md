@@ -1515,10 +1515,13 @@ Completion data comes from one shared flow:
 - function arguments for existing top-level R functions use signatures already
   recorded in the cached workspace snapshot. The language server parses those
   signatures without evaluating function bodies or defaults, applies R argument
-  matching, and supplies literal choices.
-  Truncated signatures remain unavailable, and obsolete replies are discarded
-  after session changes.
-- stored member-function arguments use a guarded native request while R is idle.
+  matching, and supplies literal choices. When the snapshot has no recognizable
+  signature, the same guarded reader used for member functions retrieves formal
+  names directly. This works independently of the function's class or custom
+  display format, including S3 classed closures and S4/S7 generics. It does not
+  call `str()`, infer a signature from class-specific output, or select a method
+  by running generic dispatch. Obsolete replies are discarded after session changes.
+- stored function arguments use a guarded native request while R is idle.
   For example, after `task <- mlr3::tsk("iris")`, `task$levels(` can offer `cols = `.
   The inspector follows the existing safe receiver rules, then reads only the
   closure's formal names, bounded to 128 names. It never reads the body or default
@@ -1532,6 +1535,21 @@ Completion data comes from one shared flow:
   a known zero-argument or fully supplied signature is silently complete.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
+
+The storage reader and completion adapters do not need a new implementation for
+each object system. They read stored names and function formals, retain published
+top-level schemas where appropriate, and use the existing language server for
+source inference. They never call `.DollarNames` or `.AtNames` to discover new
+names during completion: those hooks can execute arbitrary class-supplied code.
+An inferred member must belong to the requested receiver after a safety refusal.
+
+This does not guarantee discovery of every virtual property on a submitted
+object. For example, an S7 getter-only `computed` property has no stored value;
+it needs declared schema metadata or a source definition available to the
+language server. The console does not guess schema layouts from arbitrary
+attributes or add object-system-specific property lookups. Cached workspace
+schemas can intentionally omit internal storage, so they are not blindly unioned
+with every attribute or environment binding.
 
 #### Language Server Lifecycle
 

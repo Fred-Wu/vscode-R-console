@@ -8,9 +8,9 @@ console_parse_signature <- function(signature) {
     parsed[[1L]]
 }
 
-# Only a guarded native argument-name snapshot may describe a stored method.
+# A guarded native argument-name snapshot describes any stored closure.
 # Reconstruct inert formals for matching; never copy or evaluate defaults/body.
-console_method_root <- function(source) {
+console_call_root <- function(source) {
     if (!is.character(source) || length(source) != 1L || is.na(source) ||
         nchar(source, type = "bytes") > 4096L) return(NULL)
     root <- tryCatch(str2lang(source), error = function(e) NULL)
@@ -23,13 +23,13 @@ console_method_root <- function(source) {
     NULL
 }
 
-console_runtime_method_arguments <- function(params) {
+console_runtime_arguments <- function(params) {
     argument_names <- params$rConsoleRuntimeArgumentNames
     if (!is.list(argument_names) || length(argument_names) > 128L ||
         !all(vapply(argument_names, function(name) is.character(name) &&
             length(name) == 1L && !is.na(name) && nzchar(name) &&
             nchar(name, type = "bytes") <= 4096L, logical(1)))) return(NULL)
-    root <- console_method_root(params$rConsoleCall)
+    root <- console_call_root(params$rConsoleCall)
     if (is.null(root) || !identical(root, params$rConsoleRuntimeArgumentRoot)) return(NULL)
     argument_names <- vapply(argument_names, identity, character(1))
     if (anyDuplicated(argument_names)) return(NULL)

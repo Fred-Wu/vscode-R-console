@@ -17,10 +17,10 @@ export function createCompletionParams(
     ? getEnclosingCall(text, contextOffset) : undefined;
   const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
   const bracket = text.includes("[") ? getBracketCompletionContext(text, contextOffset) : undefined;
-  // Method snapshots must respect source bindings even without a function
+  // Stored signatures must respect source bindings even without a function
   // literal, such as an unfinished block that assigns a factory result.
   const parseSuffix = getCompletionParseSuffix(text,
-    staticAnalysis && (call?.operator === "$" || call?.operator === "@"));
+    staticAnalysis && call !== undefined);
   const parseInsertion = parseSuffix !== undefined && pipe
     ? getCompletionParseInsertion(text, contextOffset) : undefined;
   // Fuzzy requests move within a prefix. Preserve the original cursor

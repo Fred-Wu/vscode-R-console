@@ -344,6 +344,7 @@ export class ConsoleLspClient implements CompletionProvider {
               .rConsoleSubscriptClass = primaryClass;
           }
         }
+        let cachedSignature: string | undefined;
         if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
             !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
           const name = Object.hasOwn(globals, params.rConsoleCall)
@@ -352,23 +353,29 @@ export class ConsoleLspClient implements CompletionProvider {
           const item = name === undefined ? undefined : globals[name];
           if (item && ["closure", "builtin", "special"].includes(item.type) &&
               typeof item.str === "string" && /^\s*function\s*\(/.test(item.str)) {
-            (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = item.str;
+            cachedSignature = item.str;
+            (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = cachedSignature;
           }
         }
-        // Read stored method formals through the idle native host, never sess
-        // expression evaluation. Match the snapshot to this exact call; source
-        // bindings take precedence in the R adapter. Do not cache method names.
-        const methodQuery = params.rConsoleCall ? parseRuntimeMemberQuery(params.rConsoleCall, "arguments") : undefined;
-        let methodInspection: MemberInspectionResult | undefined;
-        if (methodQuery?.steps.length && this.options.requestRuntimeFunctionArguments) {
-          try { methodInspection = await this.options.requestRuntimeFunctionArguments(params.rConsoleCall!); }
-          catch { methodInspection = { status: "unavailable" }; }
+        // Stored functions share one argument-name reader regardless of class.
+        // Retain ordinary cached signatures (including literal default choices),
+        // but never parse class-specific display text to recover a signature.
+        // Source bindings take precedence and native snapshots stay request-local.
+        const functionQuery = params.rConsoleCall ? parseRuntimeMemberQuery(params.rConsoleCall, "arguments") : undefined;
+        let functionInspection: MemberInspectionResult | undefined;
+        if (functionQuery && (functionQuery.steps.length || !cachedSignature) &&
+            this.options.requestRuntimeFunctionArguments) {
+          try { functionInspection = await this.options.requestRuntimeFunctionArguments(params.rConsoleCall!); }
+          catch { functionInspection = { status: "unavailable" }; }
           if (this.disposed || this.client !== client || revision !== this.packageRevision ||
               runtimeRevision !== this.runtimeRevision || this.sessionState !== sessionState ||
               this.syncedDocuments.get(projection.document.uri.toString())?.version !== documentVersion) return undefined;
-          if (methodInspection?.status === "arguments") {
-            Object.assign(params, { rConsoleRuntimeArgumentNames: methodInspection.names,
-              rConsoleRuntimeArgumentRoot: methodQuery.root });
+          if (functionInspection?.status === "arguments") {
+            Object.assign(params, { rConsoleRuntimeArgumentNames: functionInspection.names,
+              rConsoleRuntimeArgumentRoot: functionQuery.root });
+          } else if (functionInspection?.status === "suppressed") {
+            // A refused binding cannot borrow a same-named package signature.
+            Object.assign(params, { rConsoleRuntimeArgumentsRefused: true });
           }
         }
         const result = await client.sendRequest(CompletionRequest.type, params);
@@ -401,9 +408,9 @@ export class ConsoleLspClient implements CompletionProvider {
         if (completions && typeof argumentsResolved === "boolean") {
           completions.rConsoleArgumentsResolved = argumentsResolved;
         }
-        if (completions && methodInspection?.status === "suppressed" &&
+        if (completions && functionInspection?.status === "suppressed" &&
             (result as { rConsoleRuntimeArgumentsIgnored?: boolean } | null)?.rConsoleRuntimeArgumentsIgnored !== true) {
-          completions.rConsoleArgumentSuppressionReason = methodInspection.reason;
+          completions.rConsoleArgumentSuppressionReason = functionInspection.reason;
         }
         if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
           completions.rConsoleNativeArguments = true;

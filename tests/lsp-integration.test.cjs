@@ -1610,6 +1610,35 @@ test("source-defined member arguments use native inference without a live-sessio
   }
 });
 
+test("receiver-only static inference uses the shared path across object systems", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const marker = path.join(os.tmpdir(), 'r-console-oop-getter-' + randomBytes(8).toString('hex'));
+  t.after(() => fs.rmSync(marker, { force: true }));
+  const effect = `file.create(${JSON.stringify(marker)})`;
+  for (const [definition, input, expected] of [
+    ['obj <- list(stored = 1)', 'obj$', ['stored']],
+    [`Example <- R6::R6Class("Example", public = list(stored = 1), active = list(computed = function(value) { ${effect}; 1 })); obj <- Example$new()`,
+      'obj$', ['stored', 'computed']],
+    ['methods::setClass("Example", slots = c(stored = "numeric")); obj <- methods::new("Example", stored = 1)',
+      'obj@', ['stored']],
+    [`Example <- S7::new_class("Example", properties = list(stored = S7::class_numeric, computed = S7::new_property(S7::class_numeric, getter = function(self) { ${effect}; 1 }))); obj <- Example(stored = 1)`,
+      'obj@', ['stored', 'computed']],
+  ]) {
+    const text = definition + '\n' + input;
+    const context = completion.getCompletionContext(input, input.length, text);
+    const entries = await completion.collectStaticFallbackEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: input.length },
+      [definition], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } });
+    assert.equal(entries.staticResolved, true, definition);
+    for (const label of expected) assert.ok(entries.some(item => item.label === label), definition + ': ' + label);
+    assert.ok(entries.every(item => item.role === 'member'), definition);
+    assert.equal(fs.existsSync(marker), false, 'inference must not run a getter');
+  }
+});
+
 test("native constructor signatures exclude supplied arguments without runtime fallbacks", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const [line, expected] of [

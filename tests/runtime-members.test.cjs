@@ -493,6 +493,34 @@ test("real embedded R completion inspects nested storage without running user co
       getText: () => text, uri: methodClient.inputDocument.uri,
     }, { line: lines.length - 1, character: line.length }, undefined, lines.slice(0, -1), [], methodClient);
   };
+  await submit('plain_callable <- function(x, cols = { argument_hits <<- argument_hits + 1L }) stop("must not call"); decorated_callable <- structure(plain_callable, class = "completion_callable"); str.completion_callable <- function(...) { argument_hits <<- argument_hits + 1L; cat("custom display") }; methods::setGeneric("completion_generic4", function(x, cols = NULL) methods::standardGeneric("completion_generic4")); GenericClass7 <- S7::new_class("GenericClass7"); generic_obj7 <- GenericClass7(); completion_generic7 <- S7::new_generic("completion_generic7", "x", function(x, cols = NULL) S7::S7_dispatch()); S7::method(completion_generic7, GenericClass7) <- function(x, cols = NULL) stop("must not call"); delayedAssign("deferred_callable", { argument_hits <<- argument_hits + 1L; function(cols) NULL }); makeActiveBinding("lm", function() { argument_hits <<- argument_hits + 1L; function(secret) NULL }, .GlobalEnv)');
+  methodClient.setRuntimeSignatures({ decorated_callable: '<custom display>',
+    completion_generic7: '<S7_generic> function (x, cols = NULL)\n @ name: chr "completion_generic7"' });
+  for (const staticAnalysis of [true, false]) {
+    methodClient.setStaticAnalysis(staticAnalysis);
+    for (const name of ['plain_callable', 'decorated_callable', 'completion_generic4', 'completion_generic7']) {
+      assert.deepEqual(await argumentsFor(name), { status: 'arguments', names: ['x', 'cols'] });
+      assert.deepEqual((await completeArguments(name + '(1, ')).filter(entry => entry.role === 'argument')
+        .map(entry => entry.label), ['cols'], name);
+    }
+    for (const text of ['lm(', 'deferred_callable(']) {
+      assert.deepEqual((await completeArguments(text)).filter(entry => entry.role === 'argument'), [], text);
+    }
+  }
+  methodClient.setStaticAnalysis(true);
+  const draft = 'lm <- function(local_arg) NULL\nlm(';
+  const draftResult = await methodClient.provideCompletionItems({ getText: () => draft,
+    uri: methodClient.inputDocument.uri }, { line: 1, character: 3 });
+  assert.equal(draftResult.rConsoleArgumentSuppressionReason, undefined,
+    'a refused older binding does not describe a new source definition');
+  assert.deepEqual((await completeArguments(draft)).filter(entry => entry.role === 'argument')
+    .map(entry => entry.label), ['local_arg']);
+  await submit('rm(lm); stopifnot(argument_hits == 0L)');
+  for (const text of ['decorated_callable <- unknown_factory()\ndecorated_callable(',
+    '{ decorated_callable <- unknown_factory(); decorated_callable(',
+    'function(decorated_callable) decorated_callable(']) {
+    assert.deepEqual((await completeArguments(text)).filter(entry => entry.role === 'argument'), [], text);
+  }
   for (const [text, expected] of [
     ['task$levels(', ['cols']], ['task$levels(co', ['cols']], ['task$levels(cols = NULL, ', []],
     ['task$levels(NULL, ', []], ['methods_obj$zero(', []],

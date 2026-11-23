@@ -181,6 +181,36 @@ test("runtime changes while reading stored arguments discard the snapshot before
   assert.equal(instances[0].requests.filter(request => request.method === 'completion').length, 0);
 });
 
+test("any stored callable can supply arguments independently of its display class", async t => {
+  const inspected = [];
+  const { client, instances } = createClient(t, {
+    getCachedWorkspaceData: () => ({ globalenv: {
+      decorated: { type: 'closure', str: '<arbitrary class> custom display' },
+      ordinary: { type: 'closure', str: 'function(x, mode = "auto")' },
+    } }),
+    requestRuntimeFunctionArguments: name => {
+      inspected.push(name);
+      return name === 'refused' ? { status: 'suppressed', reason: 'active-binding' }
+        : { status: 'arguments', names: ['x', 'cols'] };
+    },
+  });
+  for (const name of ['decorated', 'without_metadata', 'ordinary', 'refused']) {
+    const text = name + '(';
+    await client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
+    const params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
+    if (name === 'ordinary') {
+      assert.equal(params.rConsoleRuntimeSignature, 'function(x, mode = "auto")');
+    } else if (name === 'refused') {
+      assert.equal(params.rConsoleRuntimeArgumentsRefused, true);
+      assert.equal(params.rConsoleRuntimeArgumentNames, undefined);
+    } else {
+      assert.deepEqual(params.rConsoleRuntimeArgumentNames, ['x', 'cols']);
+      assert.equal(params.rConsoleRuntimeArgumentRoot, name);
+    }
+  }
+  assert.deepEqual(inspected, ['decorated', 'without_metadata', 'refused']);
+});
+
 test("method refusal and resolution metadata survive conversion but source shadowing discards the old refusal", async t => {
   let ignored = false;
   const { client } = createClient(t, { staticAnalysis: true,
