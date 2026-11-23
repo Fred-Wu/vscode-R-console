@@ -19,7 +19,8 @@ export async function collectCompletionEntries(
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string,
   prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>,
-  analysisMode?: CompletionAnalysisMode
+  analysisMode?: CompletionAnalysisMode,
+  sourceBinding?: CompletionSourceBinding
 ): Promise<CompletionEntries> {
   if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -48,7 +49,7 @@ export async function collectCompletionEntries(
           multilineBuffer,
           completionProvider,
           runtimeBracketKind,
-          analysisMode
+          analysisMode, sourceBinding
         );
   const bufferItems = getConsoleBufferCompletions(
     context,

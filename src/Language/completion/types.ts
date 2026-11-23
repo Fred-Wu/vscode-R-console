@@ -87,8 +87,8 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
 
 export type CompletionAnalysisMode = "runtime" | "static";
 
-/** A guarded closure snapshot. An absent body preserves an opaque live binding. */
-export type CompletionSourceBinding = { name: string; body?: string };
+/** A guarded closure snapshot or opaque live binding. Receiver refusals also preserve root identity. */
+export type CompletionSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
 
 export interface CompletionProvider {
   // A selected package function can be qualified in the LSP projection while

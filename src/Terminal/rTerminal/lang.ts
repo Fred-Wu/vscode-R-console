@@ -183,6 +183,8 @@ export class RTermLang {
       const runtimeMember = context.kind === "member" && !context.staticFallback &&
         this.options.requestRuntimeMemberCompletions !== undefined &&
         (!staticEnabled || !!(context.objectName && parseRuntimeMemberQuery(context.objectName)));
+      const sourceRequest = staticEnabled
+        ? this.prefetchFunctionSource(context, latestInput.text, latestInput.textBeforeCursor.length) : undefined;
       const prefetchedBracketMembers = this.prefetchBracketMembers(context);
       // Publish guarded bracket names as soon as they arrive. Do not hold
       // columns hostage to a slow or restarting language server; its method
@@ -218,7 +220,7 @@ export class RTermLang {
           getWorkspaceData() ?? cachedSessionData;
         return await this.collectRoutedEntries(
           context, document, position, sessionData, linesBefore, recentEntries,
-          completionProvider, latestInput.text, prefetchedBracketMembers, requestId
+          completionProvider, latestInput.text, prefetchedBracketMembers, requestId, true, sourceRequest
         );
       })();
       // Argument candidates must await LSP parameters; early session-only
@@ -305,6 +307,8 @@ export class RTermLang {
           const nextRuntimeMember = nextContext.kind === "member" && !nextContext.staticFallback &&
             this.options.requestRuntimeMemberCompletions !== undefined &&
             (!staticEnabled || !!(nextContext.objectName && parseRuntimeMemberQuery(nextContext.objectName)));
+          const nextSource = staticEnabled ? this.prefetchFunctionSource(nextContext, nextInputText,
+            lines.slice(0, latestInput.cursorRow).reduce((sum, line) => sum + line.length + 1, 0) + cursorCol) : undefined;
           const nextBracketMembers = this.prefetchBracketMembers(nextContext);
           // Refinements need the same early native results as the initial
           // picker. The picker guards these against newer queries and the
@@ -331,7 +335,7 @@ export class RTermLang {
             nextContext, nextDocument, new vscode.Position(latestInput.cursorRow, cursorCol),
             refinedSessionData, lines.slice(0, latestInput.cursorRow),
             recentEntries, completionProvider, nextInputText, nextBracketMembers,
-            requestId, false
+            requestId, false, nextSource
           );
         },
       });
@@ -357,6 +361,25 @@ export class RTermLang {
     }
   }
 
+  private prefetchFunctionSource(context: CompletionContext, input: string, cursor: number):
+    Promise<{ binding?: CompletionSourceBinding; reason?: CompletionSuppressionReason }> | undefined {
+    // Start independently of LSP startup; every completion owns a fresh snapshot.
+    const receiver = storedFunctionReceiver(context, input, cursor);
+    const requester = this.options.requestRuntimeFunctionSource;
+    if (!receiver || !requester) return undefined;
+    return (async () => {
+      const binding: CompletionSourceBinding = { name: receiver };
+      try {
+        const result = await requester(receiver);
+        if (result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
+          return { binding: { ...binding, body: result.text } };
+        }
+        if (result?.status === "missing" || result?.status === "not-callable") return {};
+        return { binding, reason: result?.status === "suppressed" ? result.reason : undefined };
+      } catch { return { binding }; }
+    })();
+  }
+
   /**
    * Preserve native completion for stored receivers. Only a definitive safety
    * refusal is routed to static source inference, never a successful empty
@@ -373,7 +396,8 @@ export class RTermLang {
     inputText: string,
     bracketInspection: Promise<MemberInspectionResult | undefined> | undefined,
     requestId: number,
-    logOutcome = true
+    logOutcome = true,
+    sourceRequest?: ReturnType<RTermLang["prefetchFunctionSource"]>
   ): Promise<CompletionEntries | undefined> {
     const staticEnabled = this.options.getStaticAnalysisEnabled?.() === true;
     const fallback = async (logUnresolved = true, runtimeReason?: CompletionSuppressionReason): Promise<CompletionEntries | undefined> => {
@@ -393,29 +417,10 @@ export class RTermLang {
         pending.isIncomplete = true;
         return pending;
       }
-      // Source inference must also see functions defined in earlier submissions.
-      // Request their *current* stored closure AST from the guarded idle R host;
-      // never execute a call or persist submitted function bodies.
-      const cursorOffset = linesBefore.join("\n").length + (linesBefore.length ? 1 : 0) + position.character;
-      const receiver = storedFunctionReceiver(context, inputText, cursorOffset);
-      let sourceBinding: CompletionSourceBinding | undefined;
-      if (receiver && this.options.requestRuntimeFunctionSource) {
-        // Until the inspector proves absence or a skipped non-callable, keep
-        // the callable opaque so package metadata cannot replace it.
-        sourceBinding = { name: receiver };
-        try {
-          const result = await this.options.requestRuntimeFunctionSource(receiver);
-          if (result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
-            sourceBinding = { name: receiver, body: result.text };
-          } else if (result?.status === "missing" || result?.status === "not-callable") {
-            sourceBinding = undefined;
-          } else if (result?.status === "suppressed") {
-            runtimeReason ??= result.reason;
-          }
-        } catch {
-          // An unavailable, active or deferred binding is not source evidence.
-        }
-      }
+      const source = await sourceRequest;
+      const sourceBinding = source?.binding ?? (runtimeReason && context.objectName
+        ? { name: parseRuntimeMemberQuery(context.objectName)!.root, opaqueReceiver: true } : undefined);
+      runtimeReason ??= source?.reason;
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, sourceBinding);
       if (this.isCurrentCompletionRequest(requestId) && logOutcome &&
@@ -451,10 +456,12 @@ export class RTermLang {
       if (result?.status === "missing") return fallback(false);
       bracketInspection = Promise.resolve(result);
     }
+    const source = await sourceRequest;
+    if (!this.isCurrentCompletionRequest(requestId)) return undefined;
     const entries = await collectCompletionEntries(context, document, document ? position : undefined,
       sessionData, linesBefore, recentEntries, provider, requester, inputText,
       bracketInspection, staticEnabled && context.kind === "bracket" && bracketInspection
-        ? "runtime" : undefined);
+        ? "runtime" : undefined, source?.binding);
     if (!this.isCurrentCompletionRequest(requestId)) return undefined;
     if (logOutcome && context.kind === "argument" && context.argumentTags &&
         (context.functionOperator === "$" || context.functionOperator === "@") &&

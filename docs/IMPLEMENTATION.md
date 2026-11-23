@@ -1376,6 +1376,12 @@ checks the native lexical scope at the callable's position before accepting a
 draft override; otherwise it returns an unresolved result. Explicit namespace
 calls and selected package qualifications retain their package identity.
 The opaque-binding check uses request metadata and leaves the input unchanged.
+Refused member and bracket receivers carry their root binding identity through
+static fallback. Package members are eligible only when editable source proves
+a replacement binding. Stored factory definitions also accompany method argument
+and value requests, with the same receiver identity and scope checks. Retrieval
+starts alongside language-server startup and document preparation; cancellation
+and setting changes discard obsolete snapshots before they reach the provider.
 
 Static completion logs retain the language server's inference reason when one
 is available. Missing receiver information, unresolved class-specific member

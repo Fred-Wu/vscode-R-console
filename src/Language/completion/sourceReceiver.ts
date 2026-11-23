@@ -15,7 +15,9 @@ export function storedFunctionReceiver(
 export function storedFunctionCall(
   context: CompletionContext, input: string, cursor: number
 ): { name: string; start: number } | undefined {
-  if (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket")) {
+  const methodArguments = context.kind === "argument" &&
+    (context.functionOperator === "$" || context.functionOperator === "@");
+  if (!methodArguments && (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket"))) {
     return undefined;
   }
   const tokens = getCompletionSyntax(input, cursor).prefixTokens.filter(token =>
@@ -46,7 +48,11 @@ export function storedFunctionCall(
   }
 
   let receiverEnd: number;
-  if (context.kind === "member") {
+  if (methodArguments) {
+    const active = stack.at(-1);
+    if (active?.type !== "(") return undefined;
+    receiverEnd = active.index - 1;
+  } else if (context.kind === "member") {
     let accessor = tokens.length - 1;
     const last = tokens[accessor];
     if (isAccessorNamePrefix(last) &&

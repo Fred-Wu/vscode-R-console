@@ -677,3 +677,44 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
     assert.equal(completion.getStaticFallbackContext(line, line.length, text)?.prefix, 'al', text);
   }
 });
+
+test("stored source retrieval overlaps LSP startup and cancellation discards its result", { timeout: 3000 }, async () => {
+  for (const text of ['make_data()$', 'make_data()$method(']) {
+    let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const waiting = new Promise(resolve => { release = resolve; });
+    const h = harness({ storedSources: () => { entered(); return 'function() list(method=function(alpha) NULL)'; } });
+    const provider = h.lang.ensureConsoleLspStarted;
+    h.lang.ensureConsoleLspStarted = async () => { await waiting; return provider(); };
+    const pending = h.complete(text);
+    await started;
+    assert.equal(h.requests.length, 0, 'source starts while the LSP is still unavailable');
+    h.lang.cancelCompletion();
+    release();
+    await pending;
+    assert.equal(h.requests.length, 0, 'cancelled source cannot reach the provider');
+  }
+});
+
+test("factory argument source selection preserves complete receiver identity", () => {
+  for (const [text, expected] of [
+    ['make_data()$method(', 'make_data'],
+    ['((make_data()))$inner[[1]]$method(', 'make_data'],
+    ['make_data()$method(alpha = "a', 'make_data'],
+    ['pkg::make_data()$method(', undefined],
+    ['obj$make_data()$method(', undefined],
+    ['(other + make_data())$method(', undefined],
+    ['obj[[make_data()]]$method(', undefined],
+  ]) {
+    const context = completion.getCompletionContext(text, text.length);
+    assert.equal(completion.storedFunctionReceiver(context, text, text.length), expected, text);
+  }
+});
+
+test("refused live receivers carry their root identity into source fallback", async () => {
+  for (const text of ['iris$', 'iris$nested$', 'iris[["na']) {
+    const h = harness({ inspected: { status: 'suppressed', reason: 'active-binding' } });
+    await h.complete(text);
+    assert.deepEqual(h.requests.at(-1).sourceDefinition, { name: 'iris', opaqueReceiver: true });
+  }
+});

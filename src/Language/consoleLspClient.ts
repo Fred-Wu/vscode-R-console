@@ -37,7 +37,7 @@ import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
 import { staticCompletionUnavailableReason } from "./completion/diagnostics";
-import { getStaticFallbackContext } from "./completion/syntax";
+import { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
 import { storedFunctionCall } from "./completion/sourceReceiver";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
@@ -340,7 +340,14 @@ export class ConsoleLspClient implements CompletionProvider {
           const offset = projection.document.offsetAt(projection.toServerPosition(contextPosition));
           const before = text.slice(0, offset), line = before.split("\n").at(-1)!;
           const fallback = getStaticFallbackContext(line, line.length, before, text.slice(offset));
-          const call = fallback && storedFunctionCall(fallback, text, offset);
+          const visibleContext = getCompletionContext(line, line.length, before, text.slice(offset));
+          const receiverContext = fallback ?? visibleContext;
+          const call = receiverContext && storedFunctionCall(receiverContext, text, offset);
+          const root = visibleContext?.objectName && parseRuntimeMemberQuery(visibleContext.objectName)?.root;
+          if (sourceBinding.opaqueReceiver && root === sourceBinding.name) {
+            Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
+              rConsoleOpaqueFunctionPosition: projection.toServerPosition(contextPosition) });
+          }
           if (call?.name === sourceBinding.name) {
             Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
               rConsoleOpaqueFunctionPosition: projection.document.positionAt(call.start) });

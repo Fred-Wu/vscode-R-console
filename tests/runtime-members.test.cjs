@@ -1048,3 +1048,108 @@ test("real embedded R completion inspects nested storage without running user co
   await until(() => /SAFE_HITS:\s*0/.test(output), "counter output");
   assert.match(output, /SAFE_HITS:\s*0/);
 });
+
+
+test("static routing preserves refused receivers and stored factory method signatures", { timeout: 60000 }, async (t) => {
+  const root = path.resolve(__dirname, "..");
+  const vscode = { Position: class {
+    constructor(line, character) {
+      Object.assign(this, { line, character });
+    }
+  }, CompletionItemKind: { Method: 1, Function: 2, Field: 4, Variable: 5, Property: 9, Text: 0, Snippet: 14 }, QuickPickItemKind: { Separator: -1 }, SnippetString: class {
+    constructor(value) {
+      this.value = value;
+    }
+  }, window: { createOutputChannel: () => ({ appendLine() {
+  }, dispose() {
+  } }) } };
+  const completion = loadSource("src/Language/completion.ts", { vscode });
+  const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", { vscode, "../../Language/consoleLspClient": { ConsoleLspClient: class {
+  } }, "../../Language/virtualRDocument": { VirtualRDocument: class {
+  } } });
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-static-routing-"));
+  const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"], { encoding: "utf8" }).trim();
+  const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(root));
+  const rPath = path.join(rHome, "bin", process.platform === "win32" ? "R.exe" : "R");
+  const env = { ...process.env, R_HOME: rHome };
+  if (process.platform === "linux") env.LD_LIBRARY_PATH = [path.join(rHome, "lib"), env.LD_LIBRARY_PATH].filter(Boolean).join(":");
+  const session = backend.start([rPath, "--vanilla", "--quiet"], { cwd, env });
+  let prompts = 0, output = "", failure;
+  backend.attach(session, { onStdout: (s) => output += s, onStderr: (s) => output += s, onControl: (e) => {
+    if (e.type === "prompt" && e.kind === "main") prompts++;
+  }, onError: (e) => { failure = e; } });
+  t.after(async () => {
+    const pid = backend.getPid(session);
+    backend.close(session);
+    backend.detach(session);
+    await delay(100);
+    if (pid) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+      }
+    }
+    fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    fs.rmSync(path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`), { force: true });
+  });
+  const until = async (p) => {
+    const end = Date.now() + 15e3;
+    while (!p()) {
+      if (failure) throw failure;
+      if (Date.now() > end) throw Error(output);
+      await delay(20, undefined, { signal: t.signal });
+    }
+  };
+  await until(() => prompts);
+  const submit = async (code) => {
+    const old = prompts;
+    backend.sendSessionCommand(session, { type: "submit", code });
+    await until(() => prompts > old);
+  };
+  const inspect = async (expression, target) => {
+    const q = completion.parseRuntimeMemberQuery(expression, target);
+    return q ? backend.inspectMemberNames(session, q) : void 0;
+  };
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { requestRuntimeFunctionArguments: (e) => inspect(e, "arguments") });
+  const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name) => backend.inspectMemberNames(session, { root: name, steps: [], target: "source" }) });
+  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: async (...args) => {
+    const r = await client.provideCompletionItems(...args);
+    return r && { ...r, items: r.items.map((x) => ({ ...x, kind: x.kind - 1 })) };
+  } });
+  lang.getOrOpenCompletionDocument = async (text) => ({ getText: () => text, uri: client.inputDocument.uri });
+  const complete = async (text) => {
+    const lines = text.split("\n"), input = { text, lines, currentLine: lines.at(-1), cursorRow: lines.length - 1, cursorCol: lines.at(-1).length, textBeforeCursor: text };
+    let entries = [];
+    await lang.handleAutocomplete({ input, getCurrentInput: () => input, getWorkspaceData: () => void 0, applyCompletion() {
+    }, onInlineEntries: (e) => {
+      entries = e;
+    } });
+    return entries.filter((x) => "insertText" in x).map((x) => ({ label: x.label, insert: x.insertText }));
+  };
+  await submit("review_hits <- 0L");
+  for (const setup of [
+    'makeActiveBinding("iris", function() { review_hits <<- review_hits+1L; list(actual=1) }, .GlobalEnv)',
+    'delayedAssign("iris", { review_hits <<- review_hits+1L; list(actual=1) })',
+    'iris <- structure(list(actual=1), class="review_object"); `$.review_object` <- function(x, name) { review_hits <<- review_hits+1L; NULL }'
+  ]) {
+    await submit(setup);
+    const query = setup.startsWith("iris <-") ? "iris$actual$" : "iris$";
+    assert.equal((await inspect(query.slice(0, -1), "$")).status, "suppressed");
+    assert.deepEqual(await complete(query), []);
+    assert.deepEqual((await complete(setup.startsWith("iris <-") ? "iris <- list(actual=list(draft=1))\niris$actual$" : "iris <- list(draft=1)\niris$")).map((x) => x.insert), ["draft"]);
+    assert.deepEqual(await complete("iris <- unknown_factory()\n" + query), []);
+    await submit("stopifnot(review_hits == 0L); rm(iris)");
+  }
+  await submit("make_data <- function() { review_hits <<- review_hits+1L; list(method=function(alpha=c(\"first\", \"second\")) NULL) }");
+  assert.ok((await complete("make_data()$")).some((x) => x.insert === "method()"));
+  for (const text of ["make_data()$method(", "(make_data())$method("]) {
+    assert.deepEqual((await complete(text)).map((x) => x.insert).filter(value => value.endsWith(" = ")), ["alpha = "], text);
+  }
+  assert.ok((await complete("make_data()$method(al")).some(x => x.insert === "alpha = "));
+  assert.ok((await complete('make_data()$method(alpha="se')).some(x => x.insert === "second"));
+  await submit("make_data <- function() list(method=function(beta) NULL)");
+  assert.deepEqual((await complete("make_data()$method(")).map((x) => x.insert), ["beta = "]);
+  assert.deepEqual((await complete("make_data <- function() list(method=function(draft) NULL)\nmake_data()$method(")).map((x) => x.insert), ["draft = "]);
+  await submit(' { stopifnot(review_hits == 0L); cat("STATIC_ROUTING_SAFE\\n") }');
+  assert.ok(output.includes("STATIC_ROUTING_SAFE\r\n") || output.includes("STATIC_ROUTING_SAFE\n"));
+});
