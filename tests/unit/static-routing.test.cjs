@@ -122,6 +122,29 @@ test("escaped quoted [[ prefixes decode without evaluation and keep mid-key edit
   }
 });
 
+test("decoded quoted fallback prefixes select escaped source member labels", async () => {
+  for (const [marked, label] of [
+    [String.raw`make_data()[["line\n│old"]]`, "line\nitem"],
+    [String.raw`make_data()[["na\x6d│old"]]`, "name"],
+  ]) {
+    const caret = marked.indexOf("│");
+    const input = marked.replace("│", "");
+    const context = completion.getStaticFallbackContext(input, caret,
+      input.slice(0, caret), input.slice(caret));
+    assert.equal(context?.kind, "bracket", marked);
+    const entries = await completion.collectStaticFallbackEntries(context, {
+      getText: () => input, uri: { toString: () => "r-console://test/console.R" },
+    }, new Position(0, caret), [], {
+      provideCompletionItems: async () => ({ rConsoleMemberResolved: true, items: [
+        { label, kind: 4, data: { type: "member" } },
+        { label: "ambient", kind: 5, data: { type: "scope" } },
+      ] }),
+    });
+    assert.deepEqual(entries.map(entry => entry.label), [label], marked);
+    assert.equal(entries.staticResolved, true, marked);
+  }
+});
+
 test("static fallback uses only inferred member results and the requested analysis mode", async () => {
   const input = "make_data()$al";
   const context = completion.getStaticFallbackContext(input, input.length);

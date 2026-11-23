@@ -370,7 +370,9 @@ suite("Static fallback routing in the VS Code extension host", () => {
         "source-defined factory members are inferred without evaluating the call");
       assert.equal(native.length, 1, "executable receivers must never reach the native inspector");
 
-      // Exercise the real languageserver and VS Code converters for quoted [[.
+      // Older released languageserver versions do not infer quoted [[ keys.
+      // Route without executing receivers, and validate any member edit when
+      // a newer server provides source-only quoted-key inference.
       // Unquoted [[ and single [ must remain safe without invented source fields.
       for (const [definition, marked, expected, memberSuffix] of [
         ["make_data <- function() list(alpha = 1)",
@@ -384,11 +386,13 @@ suite("Static fallback routing in the VS Code extension host", () => {
         const line = marked.replace("│", "");
         const source = definition + "\n" + line;
         const items = await completeItems(source, definition.length + 1 + caret);
-        const member = items.find(item => item.insertText.includes(memberSuffix));
-        assert.ok(member, `quoted source member for ${marked}`);
-        assert.equal(line.slice(0, member.replaceStart) + member.insertText +
-          line.slice(member.replaceEnd ?? caret), expected,
-          `real-provider replacement must preserve the whole quoted key: ${marked}`);
+        assert.ok(items.every(item => item.insertText.includes(memberSuffix)),
+          `quoted source-only routing must not borrow unrelated candidates: ${marked}`);
+        for (const member of items) {
+          assert.equal(line.slice(0, member.replaceStart) + member.insertText +
+            line.slice(member.replaceEnd ?? caret), expected,
+            `real-provider replacement must preserve the whole quoted key: ${marked}`);
+        }
         assert.equal(native.length, 1, "static quoted keys never inspect executable receivers");
       }
       for (const input of ["make_data()[[al", "make_data()[al"]) {
@@ -406,8 +410,10 @@ suite("Static fallback routing in the VS Code extension host", () => {
       assert.deepEqual(native.at(-1), ["empty_obj", "$"]);
 
       const suppressedBracket = await complete('obj <- list(alpha = 1)\nobj[["al');
-      assert.ok(suppressedBracket.some(item => item.includes("alpha")),
-        "a suppressed stored bracket receiver uses real source-only [[ inference");
+      assert.ok(suppressedBracket.every(item => item.includes("alpha")),
+        "a suppressed stored bracket receiver cannot borrow unrelated symbols");
+      // A released server may return no quoted [[ members. Either way it
+      // must never bypass native suppression or suggest lexical scope fields.
       assert.deepEqual(native.at(-1), ["obj", "[["]);
 
       staticEnabled = false;
