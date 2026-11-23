@@ -34,7 +34,7 @@ export type CompletionDecision =
 const descriptions = {
   "executable-receiver": "Request completion includes an expression that cannot be inspected safely",
   "active-binding": "Request completion could run a function automatically linked to this variable",
-  "deferred-binding": "Request completion could run R code delayed until this value is first used",
+  "deferred-binding": "Request completion could run code to compute this value",
   "unsafe-dispatch": "Request completion could run a custom method",
   "unsafe-altrep": "Request completion could run code to access this object's data",
   "unsafe-environment": "Request completion could run code supplied by a custom data source",

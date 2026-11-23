@@ -7,7 +7,7 @@ test("runtime completion diagnostics use a plain-language reason followed by the
   const reasons = [
     ["Rejected", "executable-receiver", "Request completion includes an expression that cannot be inspected safely", "Runtime inspection was not attempted"],
     ["Suppressed", "active-binding", "Request completion could run a function automatically linked to this variable", "Inspection stopped without evaluating it"],
-    ["Suppressed", "deferred-binding", "Request completion could run R code delayed until this value is first used", "Inspection stopped without evaluating it"],
+    ["Suppressed", "deferred-binding", "Request completion could run code to compute this value", "Inspection stopped without evaluating it"],
     ["Suppressed", "unsafe-dispatch", "Request completion could run a custom method", "Inspection stopped without evaluating it"],
     ["Suppressed", "unsafe-altrep", "Request completion could run code to access this object's data", "Inspection stopped without evaluating it"],
     ["Suppressed", "unsafe-environment", "Request completion could run code supplied by a custom data source", "Inspection stopped without evaluating it"],
