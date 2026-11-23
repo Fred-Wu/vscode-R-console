@@ -121,6 +121,13 @@ export class ConsoleLspClient implements CompletionProvider {
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
   private startupPackages: string[] = [];
+  private preparedPackages: {
+    client: ConsoleLanguageClient;
+    stateKey: string;
+    staticAnalysis: boolean;
+    startupPackages: string[];
+    pending: Promise<void>;
+  } | undefined;
   private readonly packageInventory: PackageInventory;
   private runtimeLibraryPaths: string[] | undefined;
   private serverLibraryPaths: string[] | undefined;
@@ -175,6 +182,7 @@ export class ConsoleLspClient implements CompletionProvider {
           throw new Error("Cannot stop the previous console language server process.");
         }
         this.syncedDocuments.clear();
+        this.preparedPackages = undefined;
         this.syncedSessionStateKey = undefined;
         this.sessionStateSyncPromise = undefined;
       }
@@ -230,6 +238,7 @@ export class ConsoleLspClient implements CompletionProvider {
         return false;
       }
       this.syncedDocuments.clear();
+      this.preparedPackages = undefined;
       this.syncedSessionStateKey = undefined;
       this.sessionStateSyncPromise = undefined;
       return true;
@@ -245,6 +254,7 @@ export class ConsoleLspClient implements CompletionProvider {
       }
     }
     this.syncedDocuments.clear();
+    this.preparedPackages = undefined;
     try {
       await client.stop();
     } catch {
@@ -414,8 +424,12 @@ export class ConsoleLspClient implements CompletionProvider {
           if (functionInspection?.status === "arguments") {
             Object.assign(params, { rConsoleRuntimeArgumentNames: functionInspection.names,
               rConsoleRuntimeArgumentRoot: functionQuery.root });
-          } else if (functionInspection?.status === "suppressed") {
-            // A refused binding cannot borrow a same-named package signature.
+          } else if (functionInspection?.status === "suppressed" ||
+              functionInspection?.status === "opaque" || functionInspection?.status === "unavailable" ||
+              functionInspection?.status === "not-callable") {
+            // Preserve unknown live callable identity, including unsupported
+            // primitives and inspection limits. Only verified package/missing
+            // outcomes authorize package inference without a source override.
             Object.assign(params, { rConsoleRuntimeArgumentsRefused: true });
           }
         }
@@ -605,20 +619,34 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private async prepareAttachedPackages(client: ConsoleLanguageClient, state: ConsoleLspSessionState): Promise<void> {
     if (this.disposed || this.client !== client || this.sessionState !== state) return;
+    const stateKey = this.getSessionStateKey(state);
+    const staticAnalysis = this.options.getStaticAnalysisEnabled?.() === true;
+    const previous = this.preparedPackages;
+    if (previous?.client === client && previous.stateKey === stateKey &&
+        previous.staticAnalysis === staticAnalysis && previous.startupPackages === this.startupPackages) {
+      await previous.pending;
+      return;
+    }
     // Namespace references start languageserver's own asynchronous metadata
     // tasks without attaching packages in its workers. The sentinel needs no
     // matching export: this document requests metadata, never completions or
     // evaluation. Keep it stable to reuse native tasks and disk caches.
-    const packages = this.options.getStaticAnalysisEnabled?.() === true
+    const packages = staticAnalysis
       ? [...new Set(state.attachedPackages)].filter(name =>
         !this.startupPackages.includes(name) && /^[A-Za-z][A-Za-z0-9.]*$/.test(name)).reverse()
       : [];
     this.packageDocument.update(packages.map(name => `${name}::\`.__r_console_metadata__\``).join("\n"));
-    if (!packages.length) {
-      await this.closeCompletionDocuments(client, this.packageDocument.uri.toString());
-      return;
-    }
-    await this.syncDocument(client, this.packageDocument as unknown as vscode.TextDocument);
+    const prepared = { client, stateKey, staticAnalysis, startupPackages: this.startupPackages,
+      pending: Promise.resolve() };
+    this.preparedPackages = prepared;
+    prepared.pending = (packages.length
+      ? this.syncDocument(client, this.packageDocument as unknown as vscode.TextDocument)
+      : this.closeCompletionDocuments(client, this.packageDocument.uri.toString()))
+      .catch(error => {
+        if (this.preparedPackages === prepared) this.preparedPackages = undefined;
+        throw error;
+      });
+    await prepared.pending;
   }
 
   private closeCompletionDocuments(client: ConsoleLanguageClient, uri?: string): Promise<void> {

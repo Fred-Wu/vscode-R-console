@@ -190,7 +190,7 @@ export class RTermLang {
       // columns hostage to a slow or restarting language server; its method
       // parameters can enrich the same suggestions afterward.
       const stagedBracketEntries = prefetchedBracketMembers?.then(result =>
-        staticEnabled && (result?.status === "suppressed" || result?.status === "missing")
+        staticEnabled && (result?.status === "suppressed" || result?.status === "missing" || result?.status === "package")
           ? undefined : collectCompletionEntries(
           context, undefined, undefined,
           getWorkspaceData() ?? cachedSessionData,
@@ -314,7 +314,7 @@ export class RTermLang {
           // picker. The picker guards these against newer queries and the
           // final LSP merge, and rebases edits to the actual console input.
           void nextBracketMembers?.then(result => staticEnabled &&
-            (result?.status === "suppressed" || result?.status === "missing")
+            (result?.status === "suppressed" || result?.status === "missing" || result?.status === "package")
             ? undefined : collectCompletionEntries(
             nextContext, undefined, undefined, getWorkspaceData() ?? cachedSessionData,
             lines.slice(0, latestInput.cursorRow), recentEntries, undefined, undefined,
@@ -374,7 +374,7 @@ export class RTermLang {
         if (result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
           return { binding: { ...binding, body: result.text } };
         }
-        if (result?.status === "missing" || result?.status === "not-callable") return {};
+        if (result?.status === "missing" || result?.status === "not-callable" || result?.status === "package") return {};
         return { binding, reason: result?.status === "suppressed" ? result.reason : undefined };
       } catch { return { binding }; }
     })();
@@ -445,7 +445,7 @@ export class RTermLang {
         .catch(() => undefined);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       if (result?.status === "suppressed") return fallback(true, result.reason);
-      if (result?.status === "missing") return fallback(false);
+      if (result?.status === "missing" || result?.status === "package") return fallback(false);
       return collectCompletionEntries(context, undefined, undefined, sessionData,
         linesBefore, recentEntries, undefined, () => Promise.resolve(result), inputText);
     }
@@ -453,7 +453,7 @@ export class RTermLang {
       const result = await bracketInspection.catch(() => undefined);
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
       if (result?.status === "suppressed") return fallback(true, result.reason);
-      if (result?.status === "missing") return fallback(false);
+      if (result?.status === "missing" || result?.status === "package") return fallback(false);
       bracketInspection = Promise.resolve(result);
     }
     const source = await sourceRequest;

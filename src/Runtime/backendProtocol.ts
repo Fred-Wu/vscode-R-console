@@ -61,6 +61,7 @@ export type BackendCapability =
   | "set-width"
   | "member-inspection"
   | "member-inspection-utf8-escapes"
+  | "member-inspection-search-path"
   | "function-source"
   | "function-arguments";
 
@@ -102,6 +103,8 @@ export type MemberInspectionResult =
   | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
   | { status: "missing" }
   | { status: "not-callable" }
+  | { status: "package" }
+  | { status: "opaque" }
   | { status: "source"; text: string }
   | { status: "arguments"; names: string[] }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
@@ -114,6 +117,8 @@ export type MemberInspectionQuery = {
   target: MemberInspectionTarget;
   // Non-ASCII byte escapes require R's current native locale to be UTF-8.
   utf8ByteEscapes?: boolean;
+  // Negotiates search-path lookup and its package/opaque response statuses.
+  searchPath?: boolean;
 };
 
 export type BackendControlEvent =
@@ -213,6 +218,7 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "set-width" ||
     value === "member-inspection" ||
     value === "member-inspection-utf8-escapes" ||
+    value === "member-inspection-search-path" ||
     value === "function-source" ||
     value === "function-arguments"
   );
@@ -367,7 +373,7 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 12) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 14) {
         throw new Error("invalid member inspection result");
       }
       if (payload[0] === 11) {
@@ -395,6 +401,10 @@ function parseControlFrame(
         }
         if (payload[0] === 12) {
           return { type: "member-names-result", requestId, result: { status: "not-callable" } };
+        }
+        if (payload[0] === 13 || payload[0] === 14) {
+          return { type: "member-names-result", requestId,
+            result: { status: payload[0] === 13 ? "package" : "opaque" } };
         }
         const reasons = {
           2: "active-binding", 3: "deferred-binding",
@@ -667,8 +677,9 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
     field: 0, slot: 1, index: 2, "named-index": 3,
     "slice-index": 4, "slice-name": 5, "variable-index": 6, "variable-slice": 7,
   } as const;
-  // The high bit is negotiated separately for older persistent backends.
-  const parts: Buffer[] = [Buffer.from([targetCodes[query.target] | (query.utf8ByteEscapes ? 0x80 : 0), query.steps.length]), encodeString(query.root)];
+  // Both flags are negotiated separately for persistent backends.
+  const parts: Buffer[] = [Buffer.from([targetCodes[query.target] |
+    (query.utf8ByteEscapes ? 0x80 : 0) | (query.searchPath ? 0x40 : 0), query.steps.length]), encodeString(query.root)];
   for (const step of query.steps) {
     if ("index" in step) {
       if (!Number.isSafeInteger(step.index) || step.index < 1 || step.index > 100000) {

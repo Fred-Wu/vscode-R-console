@@ -1356,21 +1356,29 @@ keys can only be inferred if the installed languageserver version provides
 receiver-specific members (this is not yet available in released v0.3.22);
 unquoted [[ and single [ indices do not gain inferred member fields through
 this routing-only change. Unsupported source inference returns no unrelated
-suggestions. The native response distinguishes a missing root from a stored
-empty receiver, so source inference for unsubmitted definitions is eligible only when the
-native inspector confirms the root is not bound; cached session metadata is
-not proof of absence. Source-only results are logged as static inference rather
-than a native rejection. The existing virtual document continues to describe the editable input, but
+suggestions. Native root lookup follows the R search path through at most 128
+environments. Value lookup selects the first binding; bare function lookup skips
+ordinary non-callable values. Active bindings, unforced user promises and custom
+database environments stop lookup. A missing result confirms absence through
+that search path. Attached objects retain their stored members, including empty
+receivers. An inherited package binding can authorize installed metadata after
+its identity is verified against the loaded namespace, imports or lazy-data
+environment. This comparison reads stored pointers without forcing package
+promises. Materialized package receivers use guarded live storage inspection.
+The `member-inspection-search-path` capability negotiates a request flag and
+package/opaque response statuses. Absence reported by an older backend remains
+unknown to the source adapter. Source-only results carry static inference diagnostics.
+The existing virtual document continues to describe the editable input, and
 source-only fallback can also retrieve the *current stored closure definition*
-for a direct global function call in that expression. A dedicated guarded,
+for a direct named function call in that expression. A dedicated guarded,
 idle-only native request extracts the closure's syntax without evaluating its
 body, defaults, active bindings or promises. The source is projected ahead of
 the current input for that one LSP request, with console edit positions mapped
 back to the original buffer. Each request reads the current stored definition,
 so intervening submissions preserve it and redefinitions take effect on the
 next request. Source requests retain their structured native outcome.
-Missing bindings and confirmed non-callable values
-permit inherited package lookup, following R's function-lookup rules.
+Verified inherited package bindings permit installed package inference.
+Missing bindings and confirmed non-callable values permit editable source inference.
 Unavailable or refused callables remain opaque to source inference. The adapter
 checks the native lexical scope at the callable's position before accepting a
 draft override; otherwise it returns an unresolved result. Explicit namespace
@@ -1407,8 +1415,8 @@ than using R's general deparser. Embedded ALTREP values and promises are
 rejected before any callback or forcing operation, and attributed or unsupported
 literal objects are unavailable. Traversal is limited to 4,096 nodes, 64 levels
 and 64 KiB of output, using the existing request deadline and C error boundary.
-Only direct global closure receivers whose enclosing environment is the global
-environment are eligible. Closures capturing a local or namespace environment
+Direct named closures found in the search path whose enclosing environment is
+the global environment are eligible. Closures capturing a local or namespace environment
 return unavailable source because the projection cannot preserve that scope.
 Methods, namespace calls and
 computed call heads continue to use the existing source/package analysis route.
@@ -1551,8 +1559,11 @@ Completion data comes from one shared flow:
   inert formals. With static analysis enabled, current source bindings take
   precedence, including unresolved factories that shadow older session objects.
   Package catalog signatures yield to verified live argument snapshots and
-  explicit inspection refusals when the editable input has no binding for that
-  receiver. Explicit namespace receivers retain their package identity.
+  opaque or refused outcomes when the editable input has no binding for that
+  receiver. Stored primitives, missing methods and closures exceeding the formal
+  inspection limit retain an opaque receiver outcome. Transient unavailable
+  argument inspection also prevents borrowing a package signature. Explicit
+  namespace receivers retain their package identity.
   Unavailable method arguments produce a reason-and-action completion log;
   a known zero-argument or fully supplied signature is silently complete.
 - with static analysis enabled, chained method calls retain their complete
@@ -1611,7 +1622,9 @@ Its fixed sentinel names only identify namespaces; no matching export is require
 Namespace references avoid attaching packages in the metadata worker or changing
 the completion search order. Packages already covered by native startup metadata
 are excluded, using the startup list reported by the R adapter.
-Repeated snapshots reuse the same document. Detach, library replacement, server
+Package preparation is memoized by client, attachment state, static-analysis mode
+and startup-package metadata. Concurrent requests share preparation; failed
+document synchronization remains retryable. Detach, library replacement, server
 restart and disabling static analysis update or clear it. The console does not
 copy package snapshots, alter their construction or override package-size limits.
 

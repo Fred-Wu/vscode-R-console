@@ -81,7 +81,7 @@ test("real embedded R completion inspects nested storage without running user co
     const context = completion.getStaticFallbackContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
     const name = completion.storedFunctionReceiver(context, text, cursor);
     const result = name ? await inspect(name, [], "source") : undefined;
-    const definition = !name || result?.status === "missing" || result?.status === "not-callable" ? undefined
+    const definition = !name || result?.status === "missing" || result?.status === "not-callable" || result?.status === "package" ? undefined
       : { name, ...(result?.status === "source" ? { body: result.text } : {}) };
     return completion.collectStaticFallbackEntries(context, {
       getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
@@ -530,9 +530,9 @@ test("real embedded R completion inspects nested storage without running user co
     assert.deepEqual(await argumentsFor(expression), { status: 'arguments', names: ['first', 'second', '...', 'after_dots'] }, expression);
   }
   assert.deepEqual(await argumentsFor('quoted_method$method'), { status: 'arguments', names: ['a b', '中文', '...'] });
-  assert.deepEqual(await argumentsFor('too_many_args'), { status: 'unavailable' });
+  assert.deepEqual(await argumentsFor('too_many_args'), { status: 'opaque' });
   for (const expression of ['methods_obj$scalar', 'methods_obj$absent', 'methods_obj$absent$method']) {
-    assert.deepEqual(await argumentsFor(expression), { status: 'unavailable' }, expression);
+    assert.deepEqual(await argumentsFor(expression), { status: 'opaque' }, expression);
   }
   assert.deepEqual(await argumentsFor('methods_obj$active_method'), { status: 'suppressed', reason: 'active-binding' });
   assert.deepEqual(await argumentsFor('methods_obj$lazy_method'), { status: 'suppressed', reason: 'deferred-binding' });
@@ -1050,7 +1050,7 @@ test("real embedded R completion inspects nested storage without running user co
 });
 
 
-test("static routing preserves refused receivers and stored factory method signatures", { timeout: 60000 }, async (t) => {
+test("static routing preserves search-path identity, opaque callables and stored factory signatures", { timeout: 60000 }, async (t) => {
   const root = path.resolve(__dirname, "..");
   const vscode = { Position: class {
     constructor(line, character) {
@@ -1110,7 +1110,20 @@ test("static routing preserves refused receivers and stored factory method signa
     const q = completion.parseRuntimeMemberQuery(expression, target);
     return q ? backend.inspectMemberNames(session, q) : void 0;
   };
-  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, { requestRuntimeFunctionArguments: (e) => inspect(e, "arguments") });
+  const library = path.join(cwd, 'library'), pkg = path.join(cwd, 'rconsolebindingtest');
+  fs.mkdirSync(library);
+  fs.mkdirSync(path.join(pkg, 'R'), { recursive: true });
+  fs.writeFileSync(path.join(pkg, 'DESCRIPTION'), [
+    'Package: rconsolebindingtest', 'Version: 1.0', 'Title: Binding Inspection Test',
+    'Description: A test package.', 'Author: Test', 'Maintainer: Test <test@example.org>', 'License: MIT', '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(pkg, 'NAMESPACE'), 'export(api)\n');
+  fs.writeFileSync(path.join(pkg, 'R', 'api.R'), 'api <- list(scan = function(path) NULL)\n');
+  execFileSync(rPath, ['CMD', 'INSTALL', '--no-byte-compile', '--no-test-load', '-l', library, pkg],
+    { stdio: 'pipe', timeout: 30000 });
+  const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t, {
+    libraries: [library], requestRuntimeFunctionArguments: (e) => inspect(e, "arguments"),
+  });
   const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name) => backend.inspectMemberNames(session, { root: name, steps: [], target: "source" }) });
   lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: async (...args) => {
     const r = await client.provideCompletionItems(...args);
@@ -1127,6 +1140,66 @@ test("static routing preserves refused receivers and stored factory method signa
     return entries.filter((x) => "insertText" in x).map((x) => ({ label: x.label, insert: x.insertText }));
   };
   await submit("review_hits <- 0L");
+  assert.equal(backend.hasCapability(session, 'member-inspection-search-path'), true);
+  assert.deepEqual(await inspect('iris', '$'), { status: 'package' }, 'lazy package datasets remain unforced');
+  assert.deepEqual(await inspect('data.frame', 'source'), { status: 'package' });
+  assert.ok((await complete('iris$')).some(x => x.insert === 'Sepal.Length'));
+  assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['fake']);
+  for (const name of ['review_attached', 'package:datasets']) {
+    // Even a spoofed package name cannot authorize a namespace's different object.
+    await submit(`attach(list(iris=list(actual=1), data.frame=function(...) { review_hits <<- review_hits+1L; list(actual=1) }), name=${JSON.stringify(name)})`);
+    assert.deepEqual((await inspect('iris', '$')).names, ['actual']);
+    assert.equal((await inspect('data.frame', 'source')).status, 'source');
+    assert.deepEqual((await complete('iris$')).map(x => x.insert), ['actual']);
+    assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['actual']);
+    await submit('data.frame <- 1');
+    assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['actual'],
+      'bare function lookup skips a non-callable global and finds the attached closure');
+    await submit(`rm(data.frame); stopifnot(review_hits == 0L); detach(${JSON.stringify(name)})`);
+  }
+  for (const setup of [
+    'assign("iris", list(actual=1), envir=inherited_env); assign("data.frame", local({ function(...) list(actual=1) }), envir=inherited_env)',
+    'makeActiveBinding("iris", function() { review_hits <<- review_hits+1L; list(actual=1) }, inherited_env); makeActiveBinding("data.frame", function() { review_hits <<- review_hits+1L; function(...) list(actual=1) }, inherited_env)',
+    'delayedAssign("iris", { review_hits <<- review_hits+1L; list(actual=1) }, assign.env=inherited_env); delayedAssign("data.frame", { review_hits <<- review_hits+1L; function(...) list(actual=1) }, assign.env=inherited_env)',
+  ]) {
+    await submit('inherited_env <- attach(NULL, name="review_inherited"); ' + setup);
+    if (setup.startsWith('assign')) {
+      assert.deepEqual((await complete('iris$')).map(x => x.insert), ['actual']);
+    } else {
+      assert.deepEqual(await complete('iris$'), []);
+    }
+    assert.deepEqual(await complete('data.frame(fake=1)$'), [], 'uninspectable inherited callables stay opaque');
+    assert.deepEqual((await complete('data.frame <- function(...) list(draft=1)\ndata.frame(fake=1)$')).map(x => x.insert), ['draft']);
+    await submit('stopifnot(review_hits == 0L); detach("review_inherited")');
+  }
+  assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['fake'], 'detach restores package lookup');
+
+  await submit(`library(rconsolebindingtest, lib.loc=${JSON.stringify(library.replaceAll('\\', '/'))})`);
+  await client.syncSessionState({ attachedPackages: ['rconsolebindingtest', 'stats', 'graphics', 'grDevices', 'utils', 'datasets', 'methods', 'base'] });
+  assert.deepEqual(await inspect('api$scan', 'arguments'), { status: 'package' });
+  const deadline = Date.now() + 15000;
+  while (!(await complete('rconsolebindingtest::api$scan(')).some(x => x.insert === 'path = ')) {
+    assert.ok(Date.now() < deadline, 'installed fixture metadata is available');
+    await delay(50);
+  }
+  assert.deepEqual((await complete('api$scan(')).map(x => x.insert), ['path = ']);
+  for (const setup of [
+    'api <- list(scan = base::sum)',
+    'api <- list(scan = 1)',
+    'api <- list()',
+    'api <- list(scan = function() NULL); formals(api$scan) <- as.pairlist(setNames(rep(list(NULL),129L),paste0("arg",seq_len(129L))))',
+  ]) {
+    await submit(setup);
+    assert.deepEqual(await inspect('api$scan', 'arguments'), { status: 'opaque' });
+    assert.deepEqual(await complete('api$scan('), [], setup);
+    assert.deepEqual((await complete('api <- list(scan=function(draft) NULL)\napi$scan(')).map(x => x.insert), ['draft = ']);
+    assert.deepEqual((await complete('rconsolebindingtest::api$scan(')).map(x => x.insert), ['path = ']);
+  }
+  await submit('api <- list(scan=function(actual) NULL)');
+  assert.deepEqual((await complete('api$scan(')).map(x => x.insert), ['actual = ']);
+  await submit('rm(api); detach("package:rconsolebindingtest")');
+  await client.syncSessionState({ attachedPackages: ['stats', 'graphics', 'grDevices', 'utils', 'datasets', 'methods', 'base'] });
+
   for (const setup of [
     'makeActiveBinding("iris", function() { review_hits <<- review_hits+1L; list(actual=1) }, .GlobalEnv)',
     'delayedAssign("iris", { review_hits <<- review_hits+1L; list(actual=1) })',

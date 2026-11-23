@@ -45,8 +45,11 @@ impl Native {
     pub(super) unsafe fn inspect_function_source(&self, query: &MemberQuery) -> Result<Inspection, Suppression> {
         self.check_deadline()?;
         if !query.steps.is_empty() { return Err(Suppression::InspectionLimit); }
-        let Some(root) = self.binding(self.global, &query.root)? else {
-            return Ok(Inspection::Available(Members::missing()));
+        let root = match self.root_binding(query)? {
+            RootBinding::Missing => return Ok(Inspection::Available(Members::missing())),
+            RootBinding::NotCallable => return Ok(Inspection::NotCallable),
+            RootBinding::Package(_) => return Ok(Inspection::PackageBinding),
+            RootBinding::Stored(value) => value,
         };
         let kind = (self.type_of)(root);
         // R's function lookup skips ordinary non-callable bindings. Callable

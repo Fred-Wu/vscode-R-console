@@ -338,6 +338,40 @@ test("method refusal and resolution metadata survive conversion but source shado
   assert.equal((await complete()).rConsoleArgumentSuppressionReason, undefined);
 });
 
+test("unknown live argument inspection cannot authorize package signatures", async t => {
+  let status;
+  const { client, instances } = createClient(t, { staticAnalysis: true,
+    requestRuntimeFunctionArguments: () => ({ status }),
+  });
+  for (status of ['opaque', 'unavailable', 'not-callable', 'missing', 'package']) {
+    for (const text of ['data.frame(', 'api$scan(']) {
+      await client.provideCompletionItems({ getText: () => text }, new Position(0, text.length));
+      const params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
+      assert.equal(params.rConsoleRuntimeArgumentsRefused,
+        ['opaque', 'unavailable', 'not-callable'].includes(status) ? true : undefined, status + ': ' + text);
+      assert.equal(params.rConsoleRuntimeArgumentNames, undefined);
+    }
+  }
+});
+
+test("failed package-document preparation is retryable on the same client and state", async t => {
+  const { client, instances } = createClient(t, { staticAnalysis: true });
+  await client.start();
+  const instance = instances[0];
+  const send = instance.sendNotification.bind(instance);
+  let failures = 1;
+  instance.sendNotification = async (method, params) => {
+    if (method === 'open' && failures-- > 0) throw new Error('temporary document failure');
+    return send(method, params);
+  };
+  const state = { attachedPackages: ['polars'] };
+  await assert.rejects(client.syncSessionState(state), /temporary document failure/);
+  await client.syncSessionState(state);
+  assert.deepEqual(instance.documents, ['polars::`.__r_console_metadata__`']);
+  await Promise.all([client.syncSessionState(state), client.syncSessionState({ ...state })]);
+  assert.equal(instance.documents.length, 1);
+});
+
 test("static diagnostic metadata survives VS Code conversion without forwarding arbitrary text", async t => {
   let reason = "unresolved-dispatch";
   const { client } = createClient(t, { staticAnalysis: true,

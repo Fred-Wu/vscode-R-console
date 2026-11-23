@@ -113,6 +113,32 @@ test("stored argument requests require the negotiated capability on persistent b
   assert.deepEqual(await pending, { status: 'arguments', names: ['cols'] });
 });
 
+test("search-path outcomes are negotiated and older absence results remain unknown", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource('src/Runtime/runtimeBackend.ts');
+  const backend = new RustSidecarRuntimeBackend('unused');
+  const session = { sessionId: 'search-path' };
+  const state = { hostConnected: true, capabilities: new Set(['member-inspection', 'function-source']),
+    pendingMemberRequests: new Map(), nextRequestId: 0 };
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  for (const status of ['missing', 'not-callable']) {
+    const request = backend.inspectMemberNames(session, { root: 'factory', steps: [], target: 'source' });
+    assert.equal(frames.at(-1)[12], 4);
+    backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: state.nextRequestId,
+      result: { status } });
+    assert.deepEqual(await request, { status: 'unavailable' }, 'older backends checked only .GlobalEnv');
+  }
+  state.capabilities.add('member-inspection-search-path');
+  for (const status of ['missing', 'package', 'opaque']) {
+    const request = backend.inspectMemberNames(session, { root: 'factory', steps: [], target: 'source' });
+    assert.equal(frames.at(-1)[12], 0x44);
+    backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: state.nextRequestId,
+      result: { status } });
+    assert.deepEqual(await request, { status });
+  }
+});
+
 test("native results distinguish silent empty from unavailable and unsafe access", () => {
   function frame(payload) {
     const header = Buffer.alloc(12);
@@ -136,7 +162,11 @@ test("native results distinguish silent empty from unavailable and unsafe access
     { status: "not-callable" });
   assert.match(parseBackendFrames(frame(Buffer.from([12, 0]))).error,
     /invalid member inspection status/);
-  assert.match(parseBackendFrames(frame(Buffer.from([13]))).error,
+  for (const [code, status] of [[13, 'package'], [14, 'opaque']]) {
+    assert.deepEqual(parseBackendFrames(frame(Buffer.from([code]))).events[0].result, { status });
+    assert.match(parseBackendFrames(frame(Buffer.from([code, 0]))).error, /invalid member inspection status/);
+  }
+  assert.match(parseBackendFrames(frame(Buffer.from([15]))).error,
     /invalid member inspection result/);
   assert.match(parseBackendFrames(frame(Buffer.from([10]))).error,
     /invalid function source length/);
