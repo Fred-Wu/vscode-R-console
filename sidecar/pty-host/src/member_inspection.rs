@@ -273,6 +273,7 @@ impl InspectorApi {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Inspection {
     Available(Members),
+    NotCallable,
     FunctionSource(String),
     FunctionArguments(Vec<String>),
     Suppressed(Suppression),
@@ -1403,7 +1404,7 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) 
         begin_inspection_guard(api);
         let result = Native::new(api, deadline).map(|native| {
             if query.target == Target::FunctionSource {
-                native.inspect_function_source(&query).map(Inspection::FunctionSource)
+                native.inspect_function_source(&query)
             } else {
                 native.inspect(&query).map(|members| {
                     if query.target == Target::FunctionArguments && !members.root_missing {

@@ -80,8 +80,9 @@ test("real embedded R completion inspects nested storage without running user co
     const row = before.length - 1, col = before.at(-1).length;
     const context = completion.getStaticFallbackContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
     const name = completion.storedFunctionReceiver(context, text, cursor);
-    const result = await inspect(name, [], "source");
-    const definition = result?.status === "source" ? { name, body: result.text } : undefined;
+    const result = name ? await inspect(name, [], "source") : undefined;
+    const definition = !name || result?.status === "missing" || result?.status === "not-callable" ? undefined
+      : { name, ...(result?.status === "source" ? { body: result.text } : {}) };
     return completion.collectStaticFallbackEntries(context, {
       getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
     }, { line: row, character: col }, lines.slice(0, row), sourceClient, definition);
@@ -151,6 +152,43 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect('captured_source', [], 'source'), { status: 'unavailable' });
   await submit('captured_source <- function() list(global = 1)');
   assert.deepEqual((await completeStored('captured_source()$')).map(item => item.label), ['global']);
+  // A refused/unavailable live callable still shadows its package namesake.
+  // Counters cover active bindings, promises and function bodies independently.
+  await submit('shadow_hits <- 0L');
+  for (const setup of [
+    'data.frame <- local({ function(...) { shadow_hits <<- shadow_hits + 1L; list(actual = 1) } })',
+    'data.frame <- local({ compiler::cmpfun(function(...) list(actual = 1)) })',
+    'makeActiveBinding("data.frame", function() { shadow_hits <<- shadow_hits + 1L; function(...) list(actual = 1) }, .GlobalEnv)',
+    'delayedAssign("data.frame", { shadow_hits <<- shadow_hits + 1L; function(...) list(actual = 1) })',
+    'data.frame <- base::list',
+  ]) {
+    await submit(setup);
+    for (const text of ['data.frame(fake = 1)$', '(data.frame(fake = 1))$fa',
+      'label <- "🙂"; `data.frame`(fake = 1)$']) {
+      const entries = await completeStored(text);
+      assert.deepEqual(Array.from(entries), [], setup + ': ' + text);
+      assert.equal(entries.staticResolved, false);
+      assert.equal(entries.isIncomplete, true);
+    }
+    for (const text of [
+      'data.frame <- function(...) list(draft = 1)\ndata.frame(fake = 1)$',
+      '{ data.frame <- function(...) list(draft = 1); data.frame(fake = 1)$',
+      'fresh_factory <- function(...) list(draft = 1)\ndata.frame <- fresh_factory\ndata.frame(fake = 1)$',
+    ]) {
+      assert.deepEqual((await completeStored(text)).map(item => item.label), ['draft'], text);
+    }
+    for (const text of ['function(data.frame) data.frame(fake = 1)$',
+      'data.frame <- unknown_factory()\ndata.frame(fake = 1)$',
+      'quote(data.frame <- function(...) list(wrong = 1)); data.frame(fake = 1)$']) {
+      assert.deepEqual(Array.from(await completeStored(text)), [], text);
+    }
+    await submit('stopifnot(shadow_hits == 0L); rm(data.frame)');
+  }
+  for (const setup of ['', 'data.frame <- 1']) {
+    if (setup) await submit(setup);
+    assert.deepEqual((await completeStored('data.frame(inherited = 1)$')).map(item => item.label), ['inherited']);
+  }
+  await submit('rm(data.frame)');
   await submit("make_data <- compiler::cmpfun(function(x = stop('default executed')) list(compiled = 1))");
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["compiled"]);
   await submit("make_data <- function() { local_fn <- function(x = NA_real_) list(nested = x); local_fn() }");
@@ -178,7 +216,7 @@ test("real embedded R completion inspects nested storage without running user co
     { status: "suppressed", reason: "deferred-binding" });
   assert.deepEqual(Array.from(await completeStored("((deferred_source()))$")), []);
   await submit("not_a_closure <- list(alpha = 1)");
-  assert.deepEqual(await inspect("not_a_closure", [], "source"), { status: "unavailable" });
+  assert.deepEqual(await inspect("not_a_closure", [], "source"), { status: "not-callable" });
   await submit('wide_source <- function() NULL; body(wide_source) <- as.call(c(list(as.name("list")), rep(list(1L), 5000L))); deep_source <- function() NULL; deep_expr <- quote(list(alpha = 1)); for (i in 1:80) deep_expr <- as.call(list(as.name("identity"), deep_expr)); body(deep_source) <- deep_expr');
   for (const name of ["wide_source", "deep_source"]) {
     assert.deepEqual(await inspect(name, [], "source"), { status: "unavailable" },
@@ -187,7 +225,7 @@ test("real embedded R completion inspects nested storage without running user co
   assert.equal((await inspect("make_data", [], "source"))?.status, "source",
     "a bounded refusal releases native state for the next request");
   await submit("rm(make_data)");
-  assert.deepEqual(await inspect("make_data", [], "source"), { status: "unavailable" });
+  assert.deepEqual(await inspect("make_data", [], "source"), { status: "missing" });
   assert.deepEqual(Array.from(await completeStored("make_data()$")), []);
   await sourceClient.dispose();
 

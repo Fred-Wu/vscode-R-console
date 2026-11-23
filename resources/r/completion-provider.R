@@ -77,6 +77,15 @@ console_supplement_completion <- function(reply, self, params) {
     point <- document$from_lsp_position(params$position)
     static_analysis <- isTRUE(params$rConsoleStaticAnalysis)
     reply$result$rConsoleRuntimeOnly <- !static_analysis
+    if (static_analysis && !is.null(params$rConsoleOpaqueFunction) &&
+        !isTRUE(tryCatch(console_source_overrides_opaque(params$rConsoleOpaqueFunction,
+            uri, workspace, document, params$rConsoleOpaqueFunctionPosition), error = function(e) FALSE))) {
+        reply$result$items <- list()
+        reply$result$isIncomplete <- TRUE
+        reply$result$rConsoleMemberResolved <- FALSE
+        reply$result$rConsoleStaticUnavailableReason <- "receiver-unresolved"
+        return(reply)
+    }
     # Ask the native resolver whether an empty member list is authoritative.
     # This uses its cached receiver and avoids probing stale live objects when
     # the current source defines an empty list or the prefix has no matches.

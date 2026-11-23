@@ -87,8 +87,8 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
 
 export type CompletionAnalysisMode = "runtime" | "static";
 
-/** A guarded snapshot of an already-stored R closure; never an expression to evaluate. */
-export type CompletionSourceDefinition = { name: string; body: string };
+/** A guarded closure snapshot. An absent body preserves an opaque live binding. */
+export type CompletionSourceBinding = { name: string; body?: string };
 
 export interface CompletionProvider {
   // A selected package function can be qualified in the LSP projection while
@@ -103,12 +103,14 @@ export interface CompletionProvider {
     // Safe, already-inspected receiver class; null means no supported class.
     runtimeBracketKind?: "data.frame" | "data.table" | null,
     analysisMode?: CompletionAnalysisMode,
-    sourceDefinition?: CompletionSourceDefinition
+    sourceBinding?: CompletionSourceBinding,
+    // Shared only by the initial query and its prefix retry.
+    requestScope?: object
   ): Promise<CompletionResult | undefined>;
 }
 
 export type RuntimeFunctionSourceRequester = (name: string) =>
-  Promise<string | undefined> | undefined;
+  Promise<MemberInspectionResult | undefined> | undefined;
 
 export type RuntimeFunctionArgumentsRequester = (expression: string) =>
   Promise<MemberInspectionResult | undefined> | undefined;

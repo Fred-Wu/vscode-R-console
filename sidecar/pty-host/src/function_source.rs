@@ -42,11 +42,17 @@ impl Source {
 }
 
 impl Native {
-    pub(super) unsafe fn inspect_function_source(&self, query: &MemberQuery) -> Result<String, Suppression> {
+    pub(super) unsafe fn inspect_function_source(&self, query: &MemberQuery) -> Result<Inspection, Suppression> {
         self.check_deadline()?;
         if !query.steps.is_empty() { return Err(Suppression::InspectionLimit); }
-        let Some(root) = self.binding(self.global, &query.root)? else { return Err(Suppression::InspectionLimit); };
-        if (self.type_of)(root) != CLOSURE { return Err(Suppression::InspectionLimit); }
+        let Some(root) = self.binding(self.global, &query.root)? else {
+            return Ok(Inspection::Available(Members::missing()));
+        };
+        let kind = (self.type_of)(root);
+        // R's function lookup skips ordinary non-callable bindings. Callable
+        // aliases and uninspectable values still require an opaque binding.
+        if !matches!(kind, CLOSURE | SPECIAL | BUILTIN) { return Ok(Inspection::NotCallable); }
+        if kind != CLOSURE { return Err(Suppression::InspectionLimit); }
         // Projection defines the closure in global scope. Only closures whose
         // enclosing environment is that same scope can retain their bindings.
         // Read the environment pointer through the C guard without traversing it.
@@ -59,7 +65,7 @@ impl Native {
         let mut source = Source { text: String::new(), remaining: MAX_SCANNED_ENTRIES };
         self.source_function(formals(root), body(root), 0, &mut source)?;
         (self.unprotect)(1);
-        Ok(source.text)
+        Ok(Inspection::FunctionSource(source.text))
     }
 
     unsafe fn source_step(&self, depth: usize, source: &mut Source) -> Result<(), Suppression> {

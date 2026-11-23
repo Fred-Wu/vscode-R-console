@@ -35,9 +35,10 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
     getStaticAnalysisEnabled: () => typeof staticAnalysis === "function" ? staticAnalysis() : staticAnalysis,
-    requestRuntimeFunctionSource: storedSources === undefined ? undefined : name => {
+    requestRuntimeFunctionSource: storedSources === undefined ? undefined : async name => {
       sourceRequests.push(name);
-      return Promise.resolve(typeof storedSources === "function" ? storedSources(name) : storedSources[name]);
+      const result = await (typeof storedSources === "function" ? storedSources(name) : storedSources[name]);
+      return typeof result === "string" ? { status: "source", text: result } : result;
     },
     requestRuntimeMemberCompletions: (receiver, operator) => {
       native.push([receiver, operator]);
@@ -520,12 +521,20 @@ test("stored function source is requested on demand for earlier submissions and 
   assert.equal(h.sourceRequests.length, before, "computed indices cannot borrow their inner call's source");
 });
 
-test("unsafe or unavailable source retrieval never prevents static fallback", async () => {
-  for (const storedSources of [() => undefined, () => Promise.reject(new Error("unsafe binding"))]) {
+test("unsafe or unavailable source retrieval preserves an opaque binding for static fallback", async () => {
+  for (const storedSources of [() => undefined, () => ({ status: 'unavailable' }),
+    () => ({ status: 'suppressed', reason: 'active-binding' }),
+    () => ({ status: 'suppressed', reason: 'deferred-binding' }),
+    () => Promise.reject(new Error("unsafe binding"))]) {
     const h = harness({ storedSources, lspItems: { items: [{ label: "global", kind: 5 }] } });
     assert.deepEqual(labels(await h.complete("make_data()$")), []);
     assert.deepEqual(h.sourceRequests, ["make_data"]);
-    assert.deepEqual(h.requests[0].sourceDefinition, undefined);
+    assert.deepEqual(h.requests[0].sourceDefinition, { name: "make_data" });
+  }
+  for (const status of ['missing', 'not-callable']) {
+    const h = harness({ storedSources: () => ({ status }) });
+    await h.complete('make_data()$');
+    assert.equal(h.requests[0].sourceDefinition, undefined, status);
   }
 });
 

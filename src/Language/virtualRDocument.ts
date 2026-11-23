@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { getCallOpenings, tokenizeForHighlighting } from "./parser";
 import { runtimeCompletionText } from "./completion/runtimeDocument";
 import { backtickRName } from "./completion/candidates";
-import type { CompletionSourceDefinition } from "./completion/types";
+import type { CompletionSourceBinding } from "./completion/types";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 
@@ -50,7 +50,7 @@ export class VirtualRDocument {
   }
 
   project(content: string, staticAnalysis = true, cursor?: vscode.Position,
-    sourceDefinition?: CompletionSourceDefinition) {
+    sourceBinding?: CompletionSourceBinding) {
     // Picker previews must not change the selections saved with the actual input.
     const visible = new VirtualRDocument(this.id, content);
     const selections = this.getSelections(content);
@@ -70,8 +70,8 @@ export class VirtualRDocument {
     // A guarded live closure definition is projected ahead of the editable
     // source. The user input remains last so draft redefinitions still win.
     // All mapping is local to this request; no session source journal exists.
-    const prelude = staticAnalysis && sourceDefinition
-      ? `${backtickRName(sourceDefinition.name)} <- ${sourceDefinition.body}\n` : "";
+    const prelude = staticAnalysis && sourceBinding?.body
+      ? `${backtickRName(sourceBinding.name)} <- ${sourceBinding.body}\n` : "";
     const completionText = staticAnalysis ? prelude + text : runtimeCompletionText(text, projectedOffset);
     if (!this.projectedDocument || this.projectedDocument.getText() !== completionText) {
       const version = (this.projectedDocument?.version ?? 0) + 1;

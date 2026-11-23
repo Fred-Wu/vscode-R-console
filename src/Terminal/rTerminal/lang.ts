@@ -8,6 +8,7 @@ import {
   CompletionPickItem,
   type RuntimeMemberCompletionRequester,
   type RuntimeFunctionSourceRequester,
+  type CompletionSourceBinding,
   type RuntimeFunctionArgumentsRequester,
   storedFunctionReceiver,
   collectCompletionEntries,
@@ -397,19 +398,26 @@ export class RTermLang {
       // never execute a call or persist submitted function bodies.
       const cursorOffset = linesBefore.join("\n").length + (linesBefore.length ? 1 : 0) + position.character;
       const receiver = storedFunctionReceiver(context, inputText, cursorOffset);
-      let sourceDefinition: { name: string; body: string } | undefined;
+      let sourceBinding: CompletionSourceBinding | undefined;
       if (receiver && this.options.requestRuntimeFunctionSource) {
+        // Until the inspector proves absence or a skipped non-callable, keep
+        // the callable opaque so package metadata cannot replace it.
+        sourceBinding = { name: receiver };
         try {
-          const body = await this.options.requestRuntimeFunctionSource(receiver);
-          if (body && Buffer.byteLength(body, "utf8") <= 64 * 1024) {
-            sourceDefinition = { name: receiver, body };
+          const result = await this.options.requestRuntimeFunctionSource(receiver);
+          if (result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
+            sourceBinding = { name: receiver, body: result.text };
+          } else if (result?.status === "missing" || result?.status === "not-callable") {
+            sourceBinding = undefined;
+          } else if (result?.status === "suppressed") {
+            runtimeReason ??= result.reason;
           }
         } catch {
           // An unavailable, active or deferred binding is not source evidence.
         }
       }
       if (!this.isCurrentCompletionRequest(requestId)) return undefined;
-      const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, sourceDefinition);
+      const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, sourceBinding);
       if (this.isCurrentCompletionRequest(requestId) && logOutcome &&
           (entries.staticResolved || logUnresolved)) {
         logConsoleCompletionDecision(entries.staticResolved ? { kind: "StaticInferred" } : {

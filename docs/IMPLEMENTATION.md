@@ -1366,10 +1366,16 @@ for a direct global function call in that expression. A dedicated guarded,
 idle-only native request extracts the closure's syntax without evaluating its
 body, defaults, active bindings or promises. The source is projected ahead of
 the current input for that one LSP request, with console edit positions mapped
-back to the original buffer. It is not a journal of previously submitted
-statements: intervening submissions do not discard the definition, and later
-redefinitions take effect on the next request. Unsupported or unsafe stored
-functions simply leave the ordinary source-only inference route in place.
+back to the original buffer. Each request reads the current stored definition,
+so intervening submissions preserve it and redefinitions take effect on the
+next request. Source requests retain their structured native outcome.
+Missing bindings and confirmed non-callable values
+permit inherited package lookup, following R's function-lookup rules.
+Unavailable or refused callables remain opaque to source inference. The adapter
+checks the native lexical scope at the callable's position before accepting a
+draft override; otherwise it returns an unresolved result. Explicit namespace
+calls and selected package qualifications retain their package identity.
+The opaque-binding check uses request metadata and leaves the input unchanged.
 
 Static completion logs retain the language server's inference reason when one
 is available. Missing receiver information, unresolved class-specific member
@@ -1555,10 +1561,12 @@ Completion data comes from one shared flow:
   reused by the console adapter. It resolves a member again only when it needs
   evidence for an empty reply or a source-shadowing check. Within one request,
   argument prefix filtering, value matching and validation share a full native
-  argument lookup; complete input reuses the existing parse. These optimizations
-  do not cache runtime argument snapshots across requests. An unresolved method
-  signature does not trigger a second inspection just to broaden its argument
-  prefix; known signatures still support abbreviation matching. Static
+  argument lookup; complete input reuses the existing parse. The initial
+  completion and its prefix retry share one guarded argument snapshot through
+  a request-scoped token. Runtime, session, document, package and client changes
+  invalidate that snapshot; each new completion retrieves fresh arguments.
+  An unresolved method signature does not trigger a second inspection just to
+  broaden its argument prefix; known signatures still support abbreviation matching. Static
   receiver failures also skip prefix broadening when inference reports an
   unresolved receiver, unsupported context, dispatch failure, cycle or analysis
   limit. Pending metadata remains eligible for retry.

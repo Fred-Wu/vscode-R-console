@@ -388,7 +388,8 @@ suite("Static fallback routing in the VS Code extension host", () => {
       getStaticAnalysisEnabled: () => staticEnabled,
       requestRuntimeFunctionSource: async name => {
         sourceRequests.push(name);
-        return name === "make_data" ? storedDefinition : undefined;
+        if (name === "data.frame") return { status: "unavailable" };
+        return name === "make_data" ? { status: "source", text: storedDefinition } : { status: "missing" };
       },
       requestRuntimeMemberCompletions: async (receiver, target) => {
         native.push([receiver, target]);
@@ -452,6 +453,9 @@ suite("Static fallback routing in the VS Code extension host", () => {
         assert.equal(sourceRequests.at(-1), "make_data");
       }
       assert.deepEqual(native, [["obj", "$"]], "continued and quoted receivers remain source-only");
+      assert.deepEqual(await complete('data.frame(fake = 1)$'), [],
+        'an opaque live callable cannot borrow the package function');
+      assert.deepEqual(await complete('{ data.frame <- function(...) list(draft = 1); data.frame(fake = 1)$'), ['draft']);
       storedDefinition = 'function() list("odd\\nfield" = 1)';
       assert.deepEqual(await complete("make_data()$`odd\nfi"), [],
         "literal names begun on another line must not expose invalid replacement columns");

@@ -101,6 +101,7 @@ export type MemberInspectionTarget = "$" | "@" | "[" | "[[" | "source" | "argume
 export type MemberInspectionResult =
   | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
   | { status: "missing" }
+  | { status: "not-callable" }
   | { status: "source"; text: string }
   | { status: "arguments"; names: string[] }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
@@ -366,7 +367,7 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 11) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 12) {
         throw new Error("invalid member inspection result");
       }
       if (payload[0] === 11) {
@@ -391,6 +392,9 @@ function parseControlFrame(
         if (payload.length !== 1) throw new Error("invalid member inspection status");
         if (payload[0] === 9) {
           return { type: "member-names-result", requestId, result: { status: "missing" } };
+        }
+        if (payload[0] === 12) {
+          return { type: "member-names-result", requestId, result: { status: "not-callable" } };
         }
         const reasons = {
           2: "active-binding", 3: "deferred-binding",

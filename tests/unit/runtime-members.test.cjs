@@ -132,6 +132,12 @@ test("native results distinguish silent empty from unavailable and unsafe access
   }], "code 9 is a proven absent root, not a stored object with no members");
   assert.match(parseBackendFrames(frame(Buffer.from([9, 0]))).error,
     /invalid member inspection status/);
+  assert.deepEqual(parseBackendFrames(frame(Buffer.from([12]))).events[0].result,
+    { status: "not-callable" });
+  assert.match(parseBackendFrames(frame(Buffer.from([12, 0]))).error,
+    /invalid member inspection status/);
+  assert.match(parseBackendFrames(frame(Buffer.from([13]))).error,
+    /invalid member inspection result/);
   assert.match(parseBackendFrames(frame(Buffer.from([10]))).error,
     /invalid function source length/);
   const source = "function() list(alpha = 1)";

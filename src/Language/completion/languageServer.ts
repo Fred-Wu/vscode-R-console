@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, CompletionSourceDefinition } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, CompletionSourceBinding } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
@@ -14,16 +14,17 @@ export async function getLanguageServerCompletions(
   completionProvider?: CompletionProvider,
   runtimeBracketKind?: "data.frame" | "data.table" | null,
   analysisMode?: CompletionAnalysisMode,
-  sourceDefinition?: CompletionSourceDefinition
+  sourceBinding?: CompletionSourceBinding
 ): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
   }
   try {
+    const requestScope = {};
     let result = await completionProvider.provideCompletionItems(
       doc,
       position,
-      context.triggerCharacter, undefined, runtimeBracketKind, analysisMode, sourceDefinition
+      context.triggerCharacter, undefined, runtimeBracketKind, analysisMode, sourceBinding, requestScope
     );
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
@@ -56,7 +57,7 @@ export async function getLanguageServerCompletions(
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter, position, runtimeBracketKind, analysisMode, sourceDefinition);
+        context.triggerCharacter, position, runtimeBracketKind, analysisMode, sourceBinding, requestScope);
       runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;

@@ -9,6 +9,12 @@ import type { CompletionContext } from "./types";
 export function storedFunctionReceiver(
   context: CompletionContext, input: string, cursor: number
 ): string | undefined {
+  return storedFunctionCall(context, input, cursor)?.name;
+}
+
+export function storedFunctionCall(
+  context: CompletionContext, input: string, cursor: number
+): { name: string; start: number } | undefined {
   if (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket")) {
     return undefined;
   }
@@ -83,7 +89,8 @@ export function storedFunctionReceiver(
           if (start !== groups[group] + 1) return undefined;
           start = groups[group];
         }
-        return decodeRArgumentName(name.value);
+        const decoded = decodeRArgumentName(name.value);
+        return decoded === undefined ? undefined : { name: decoded, start: name.position };
       }
       // Parentheses after a value are a computed call. A control condition or
       // function's formals, however, can be followed by a grouped body.

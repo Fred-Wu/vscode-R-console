@@ -91,6 +91,34 @@ console_source_function <- function(document, point, name) {
 }
 
 
+# Verify a draft binding before permitting native results for an opaque live
+# callable. Read the native source index, including unfinished lexical scopes.
+console_source_overrides_opaque <- function(name, uri, workspace, document, position) {
+    if (!is.character(name) || length(name) != 1L || is.na(name) || !nzchar(name) ||
+        !is.list(position) ||
+        !exists("member_resolve_cursor", asNamespace("languageserver"), inherits = FALSE) ||
+        !exists("member_infer", asNamespace("languageserver"), inherits = FALSE)) return(FALSE)
+    # Resolve lexical scope immediately before the callable. This also covers
+    # assignments and formals inside an unfinished block/function. The native
+    # scope resolver owns recovery, budgets and binding inference.
+    point <- document$from_lsp_position(position)
+    cursor <- list(operator = point$col + 1L, operator_row = point$row,
+        start = point$col, end = point$col, accessor = NULL,
+        before = substr(document$line0(point$row), 1L, point$col))
+    resolved <- languageserver:::member_resolve_cursor(uri, workspace, document, point, cursor)
+    fields <- resolved$value$fields
+    history <- resolved$index$document_bindings[[name]]
+    at <- resolved$bindings$.__member_position__
+    has_binding <- name %in% names(fields) || name %in% names(resolved$bindings) ||
+        (length(history) && (is.null(at) || languageserver:::member_history_position(history, at) > 0L))
+    if (!has_binding) return(FALSE)
+    bindings <- resolved$bindings
+    bindings[names(fields)] <- fields
+    binding <- languageserver:::member_infer(as.name(name), resolved$index,
+        bindings, budget = resolved$budget)
+    length(binding$type) > 0L || !is.null(binding$function_expr) || !is.null(binding$function_key)
+}
+
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
 console_member_function <- function(uri, workspace, document, point, root = NULL,

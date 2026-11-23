@@ -209,6 +209,70 @@ test("stored method arguments are fetched afresh and never borrowed from global 
   assert.equal(inspected.length, 2, 'executable receivers cannot reach native inspection');
 });
 
+test("prefix retries share native argument snapshots only within the current request", async t => {
+  const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', {
+    vscode: { Position, CompletionItemKind: { Text: 0, Field: 4 } },
+  });
+  let inspections = 0;
+  const { client, instances } = createClient(t, {
+    requestRuntimeFunctionArguments: () => {
+      inspections++; return { status: 'arguments', names: ['alpha_beta'] };
+    },
+    completion: () => ({ items: [], rConsoleWorkspaceFunction: true, rConsoleArgumentsResolved: true }),
+  });
+  const text = 'obj$fun(alpha_beta = "zzz';
+  const doc = { getText: () => text };
+  const position = new Position(0, text.length);
+  const context = { kind: 'argument', prefix: 'zzz', replaceStart: text.length - 3,
+    snapshotInput: text, snapshotCursor: text.length, functionName: 'obj$fun', functionOperator: '$',
+    argumentValue: { quote: '"', name: 'alpha_beta', prefix: 'zzz', replaceStart: text.length - 3 } };
+  for (let request = 1; request <= 2; request++) {
+    await getLanguageServerCompletions(context, doc, position, [], client);
+    assert.equal(inspections, request, 'each new completion reads fresh live arguments');
+    assert.equal(instances[0].requests.filter(item => item.method === 'completion').length, request * 2,
+      'the prefix retry remains available but shares its native snapshot');
+  }
+});
+
+test("a shared request never reuses arguments after runtime, document or session changes", async t => {
+  for (const change of ['runtime', 'document', 'session', 'packages', 'client']) {
+    let inspections = 0;
+    const { client, instances } = createClient(t, {
+      requestRuntimeFunctionArguments: () => { inspections++; return { status: 'arguments', names: ['old'] }; },
+      completion: () => ({ items: [] }),
+    });
+    const scope = {}, text = 'obj$fun(zzz';
+    const doc = { getText: () => text }, position = new Position(0, text.length);
+    const complete = (document = doc) => client.provideCompletionItems(document, position,
+      undefined, position, undefined, undefined, undefined, scope);
+    await complete();
+    const sent = instances.reduce((n, instance) => n + instance.requests.filter(r => r.method === 'completion').length, 0);
+    if (change === 'runtime') client.invalidateRuntimeCompletion();
+    if (change === 'session') await client.syncSessionState({ attachedPackages: ['base'] });
+    if (change === 'packages') client.packageRevision++;
+    if (change === 'client') { client.client = undefined; client.startPromise = undefined; }
+    assert.equal(await complete(change === 'document' ? { getText: () => 'obj$fun(zzzz' } : doc), undefined, change);
+    assert.equal(inspections, 1, change);
+    assert.equal(instances.reduce((n, instance) => n + instance.requests.filter(r => r.method === 'completion').length, 0), sent, change);
+  }
+});
+
+test("opaque source bindings preserve input and respect projected package selections", async t => {
+  const { client, instances } = createClient(t, { staticAnalysis: true });
+  const text = 'data.frame(fake = 1)$';
+  const doc = { getText: () => text }, position = new Position(0, text.length);
+  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', { name: 'data.frame' });
+  let params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
+  assert.equal(params.text, text, 'an opaque binding adds no invented R source');
+  assert.equal(params.rConsoleOpaqueFunction, 'data.frame');
+  client.updateInput(text);
+  client.recordCompletion(text, 0, { insertText: 'data.frame()', packageName: 'base' });
+  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', { name: 'data.frame' });
+  params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
+  assert.equal(params.text, 'base::' + text);
+  assert.equal(params.rConsoleOpaqueFunction, undefined);
+});
+
 test("runtime changes while reading stored arguments discard the snapshot before sending it to LSP", async t => {
   let finish, started;
   const ready = new Promise(resolve => { started = resolve; });
