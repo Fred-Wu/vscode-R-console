@@ -68,9 +68,15 @@ test("installed package chain signatures also supply arguments without running t
     'CMD', 'INSTALL', '--no-byte-compile', '--no-test-load', '-l', session, source,
   ], { stdio: 'pipe' });
   let inspections = 0;
+  const cache = path.join(path.dirname(session), 'package-cache');
   const { client } = createConsoleLsp(t, { libraries: [session],
+    env: { ...process.env, R_LANGSVR_PACKAGE_CACHE_DIR: cache },
     requestRuntimeFunctionArguments: () => { inspections++; return { status: 'unavailable' }; } });
   await client.syncSessionState({ attachedPackages: [pkg] });
+  await waitFor(() => fs.existsSync(path.join(cache, 'package-metadata')) &&
+    fs.readdirSync(path.join(cache, 'package-metadata')).some(name => name.startsWith(pkg + '-members-')),
+  'native member metadata must be prepared before the first completion request');
+  assert.equal(fs.existsSync(marker), false, 'background preparation must not run receiver expressions');
   const { getCompletionContext, collectCompletionEntries } = loadSource('src/Language/completion.ts', {
     vscode: { CompletionItemKind: { Method: 1, Function: 2, Field: 4, Variable: 5, Text: 0 }, SnippetString: class {} },
   });
@@ -117,6 +123,9 @@ test("installed package chain signatures also supply arguments without running t
     'function(api) api$scan()$collect(│)']) {
     assert.deepEqual((await collect(marked)).filter(item => item.role === 'argument'), [], marked);
   }
+  await client.syncSessionState({ attachedPackages: [] });
+  assert.deepEqual((await collect('api$scan()$collect(│)')).filter(item => item.role === 'argument'), [],
+    'preparation must not retain members of a detached package');
   client.setStaticAnalysis(false);
   assert.deepEqual((await collect(pkg + '::api$scan()$collect(│)'))
     .filter(item => item.role === 'argument'), [], 'source inference stays opt-in');

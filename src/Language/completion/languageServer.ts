@@ -43,7 +43,9 @@ export async function getLanguageServerCompletions(
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
     // its replacement start intact; never rewrite code to manufacture results.
-    if (context.prefix.length > 1 && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
+    // Broadening a prefix cannot recover an unresolved method signature. It
+    // would repeat both the native inspection and the same LSP lookup.
+    if (context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];

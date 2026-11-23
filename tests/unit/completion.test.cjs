@@ -325,6 +325,23 @@ test("runtime-only unresolved member signatures do not borrow native arguments o
   assert.deepEqual(live.filter(item => item.detail === "parameter").map(item => item.label), ["new_arg"]);
 });
 
+test("an unresolved method signature does not repeat inspection for a broader prefix", async () => {
+  const input = 'task$levels(co';
+  for (const resolved of [false, true, undefined]) {
+    let requests = 0;
+    await completion.collectCompletionEntries(completion.getCompletionContext(input, input.length),
+      { getText: () => input }, { line: 0, character: input.length }, undefined, [], [], {
+        provideCompletionItems: async () => {
+          requests++;
+          return { items: [], rConsoleArgumentsResolved: resolved,
+            ...(resolved === false ? { rConsoleArgumentSuppressionReason: 'unsafe-dispatch' } : {}) };
+        },
+      });
+    assert.equal(requests, resolved === false ? 1 : 2,
+      'known signatures and older providers must retain abbreviation fallback');
+  }
+});
+
 test("namespace completion normalizes bare callable names and preserves existing calls", async () => {
   for (const operator of ["::", ":::"]) {
     const input = `pkg${operator}`;

@@ -99,6 +99,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private readonly outputChannel: vscode.OutputChannel;
   private readonly workingDirectory: string;
   private readonly inputDocument: VirtualRDocument;
+  private readonly packageDocument: VirtualRDocument;
 
   private client: ConsoleLanguageClient | undefined;
   private startPromise: Promise<void> | undefined;
@@ -112,6 +113,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
+  private startupPackages: string[] = [];
   private readonly packageInventory: PackageInventory;
   private runtimeLibraryPaths: string[] | undefined;
   private serverLibraryPaths: string[] | undefined;
@@ -123,6 +125,7 @@ export class ConsoleLspClient implements CompletionProvider {
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
+    this.packageDocument = new VirtualRDocument(`${options.consoleId}-packages`);
     this.outputChannel = new SilentOutputChannel("R Console");
     // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
@@ -305,11 +308,11 @@ export class ConsoleLspClient implements CompletionProvider {
           ? this.options.getStaticAnalysisEnabled?.() === true : analysisMode === "static";
         const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition,
           staticAnalysis ? sourceDefinition : undefined);
-        await this.syncDocument(client, projection.document);
         await this.applySessionState(client);
         if (this.client !== client) {
           continue;
         }
+        await this.syncDocument(client, projection.document);
         const context: vscode.CompletionContext = triggerCharacter
           ? {
               triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
@@ -518,18 +521,25 @@ export class ConsoleLspClient implements CompletionProvider {
     const state = this.sessionState;
     const stateKey = this.getSessionStateKey(state);
     if (this.syncedSessionStateKey === stateKey) {
+      await this.prepareAttachedPackages(client, state);
       return;
     }
 
     let syncPromise = this.sessionStateSyncPromise;
     if (!syncPromise) {
-      syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", state)
+      syncPromise = (async () => {
+        // Retire documents and their pending metadata tasks before changing
+        // the search path. Completion reopens the current input afterwards.
+        await this.closeCompletionDocuments(client);
+        return client.sendRequest<{ libraryPaths: string[]; startupPackages?: string[] }>("rConsole/syncSessionState", state);
+      })()
         .then((reply) => {
           if (this.client === client && typeof reply === "object" && Array.isArray(reply?.libraryPaths)) {
             this.packageInventory.setLibraryPaths(this.runtimeLibraryPaths ?? reply.libraryPaths);
           }
           const synced = this.client === client;
           if (synced) {
+            this.startupPackages = Array.isArray(reply?.startupPackages) ? reply.startupPackages : [];
             this.syncedSessionStateKey = stateKey;
           }
           return { synced, stateKey };
@@ -554,6 +564,41 @@ export class ConsoleLspClient implements CompletionProvider {
     ) {
       await this.applySessionState(client);
     }
+    if (this.syncedSessionStateKey === currentStateKey) {
+      await this.prepareAttachedPackages(client, this.sessionState);
+    }
+  }
+
+  private async prepareAttachedPackages(client: ConsoleLanguageClient, state: ConsoleLspSessionState): Promise<void> {
+    if (this.disposed || this.client !== client || this.sessionState !== state) return;
+    // Namespace references start languageserver's own asynchronous metadata
+    // tasks without attaching packages in its workers. The sentinel needs no
+    // matching export: this document requests metadata, never completions or
+    // evaluation. Keep it stable to reuse native tasks and disk caches.
+    const packages = this.options.getStaticAnalysisEnabled?.() === true
+      ? [...new Set(state.attachedPackages)].filter(name =>
+        !this.startupPackages.includes(name) && /^[A-Za-z][A-Za-z0-9.]*$/.test(name)).reverse()
+      : [];
+    this.packageDocument.update(packages.map(name => `${name}::\`.__r_console_metadata__\``).join("\n"));
+    if (!packages.length) {
+      await this.closeCompletionDocuments(client, this.packageDocument.uri.toString());
+      return;
+    }
+    await this.syncDocument(client, this.packageDocument as unknown as vscode.TextDocument);
+  }
+
+  private closeCompletionDocuments(client: ConsoleLanguageClient, uri?: string): Promise<void> {
+    const close = this.documentSyncPromise.then(async () => {
+      for (const [key, { document }] of this.syncedDocuments) {
+        if (uri !== undefined && key !== uri) continue;
+        if (this.client !== client) return;
+        await client.sendNotification(DidCloseTextDocumentNotification.type,
+          client.code2ProtocolConverter.asCloseTextDocumentParams(document));
+        if (this.client === client) this.syncedDocuments.delete(key);
+      }
+    });
+    this.documentSyncPromise = close.catch(() => {});
+    return close;
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {

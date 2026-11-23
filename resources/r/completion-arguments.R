@@ -45,6 +45,25 @@ console_source_signature <- function(source, uri) {
     })
 }
 
+# Native constructor/S3 items already carry their complete signature. Reuse
+# that evidence instead of resolving the receiver and its constructor again.
+# The native signature parser handles quoted names; defaults remain inert.
+console_native_signature <- function(items, uri) {
+    for (item in items) {
+        formals <- item$data$s3$method$formals
+        if (!is.null(formals)) return(console_source_signature(list(formals = formals), uri))
+        declaration <- item$data$signature
+        if (!identical(item$data$type, "member") || is.null(item$data$parameter) ||
+            !is.character(declaration) || length(declaration) != 1L || is.na(declaration) ||
+            nchar(declaration, type = "bytes") > 65536L ||
+            !exists("signature_info", asNamespace("languageserver"), inherits = FALSE)) next
+        names <- languageserver:::signature_info(declaration)$names
+        definition <- console_parse_signature(paste0("function(", paste(names, collapse = ","), ")"))
+        if (!is.null(definition)) return(console_source_signature(list(formals = definition[[2L]]), uri))
+    }
+    NULL
+}
+
 # Read literal choices without inspecting a computed call head as a scalar
 # name. Defaults such as c(pkg::fun()) and c((function() ...)()) are valid R
 # syntax, but cannot supply known values and must never be evaluated.
@@ -87,7 +106,7 @@ console_valid_argument_items <- function(items, tags, call, uri, workspace, poin
     # Ask the same provider for the complete signature, including local source
     # definitions and dots. Defaults and function bodies are never evaluated.
     forwarded_dots <- "..." %in% unlist(tags, use.names = FALSE)
-    known_signature <- !is.null(signature)
+    known_signature <- !is.null(signature) && !identical(attr(signature, "known_signature"), FALSE)
     if (is.null(signature)) signature <- languageserver:::arg_completion(uri, workspace, point, "", call$token,
         call$package, exported_only = call$accessor != ":::")
     formal_names <- unique(vapply(signature, console_argument_name, character(1)))

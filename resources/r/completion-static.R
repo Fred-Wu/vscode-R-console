@@ -93,14 +93,15 @@ console_source_function <- function(document, point, name) {
 
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
-console_member_function <- function(uri, workspace, document, point, root = NULL) {
+console_member_function <- function(uri, workspace, document, point, root = NULL,
+    source_root = if (!is.null(root)) console_source_function(document, point, root)) {
     if (identical(root, "")) return(list(unknown = TRUE))
     if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
     location <- languageserver:::member_call_location(document, point)
     if (is.null(location)) return(NULL)
     resolved <- languageserver:::member_resolve_cursor(uri, workspace, document,
         location$point, location$cursor, location$cursor$token)
-    if (!is.null(root) && !is.null(console_source_function(document, point, root))) {
+    if (!is.null(source_root)) {
         # A draft assignment or formal may shadow an attached package object.
         # Verify that binding independently before following a catalog method;
         # an unresolved source root is not the same as its package namesake.

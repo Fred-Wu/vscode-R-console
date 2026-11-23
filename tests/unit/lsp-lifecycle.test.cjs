@@ -15,6 +15,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
       this.running = false;
       this.requests = [];
       this.documents = [];
+      this.closed = 0;
       this.code2ProtocolConverter = {
         asOpenTextDocumentParams: (doc) => ({ text: doc.getText() }),
         asChangeTextDocumentParams: (doc) => ({ text: doc.getText() }),
@@ -31,6 +32,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     async sendNotification(method, params) {
       if (!this.running) throw new Error("Client is not running");
       if (method === "open" || method === "change") this.documents.push(params.text);
+      if (method === "close") this.closed++;
     }
     async sendRequest(method, params) {
       if (!this.running) throw new Error("Client is not running");
@@ -139,6 +141,47 @@ test("native member signatures never wait for runtime inspection", async t => {
   });
   const result = await client.provideCompletionItems({ getText: () => "obj$fun(" }, new Position(0, 8));
   assert.equal(result.rConsoleLocalFunction, true);
+});
+
+test("attached packages prepare native metadata once, track detach and survive server replacement", async t => {
+  const { client, instances } = createClient(t, { staticAnalysis: true, packageChanges: () => ['stats'] });
+  await client.syncSessionState({ attachedPackages: ['polars', 'stats', 'polars', 'bad\";stop(1)'] });
+  assert.deepEqual(instances[0].documents, ['stats::`.__r_console_metadata__`\npolars::`.__r_console_metadata__`']);
+  assert.equal(instances[0].requests.some(item => item.method === 'completion'), false,
+    'preparation only opens source for native background analysis');
+  await client.syncSessionState({ attachedPackages: ['polars', 'stats', 'polars', 'bad\";stop(1)'] });
+  assert.equal(instances[0].documents.length, 1, 'unchanged snapshots do not repeat preparation');
+  await client.syncSessionState({ attachedPackages: ['stats'] });
+  assert.equal(instances[0].closed, 1, 'remove old declarations before changing the search path');
+  assert.equal(instances[0].documents.at(-1), 'stats::`.__r_console_metadata__`');
+  await client.refreshPackages(change());
+  assert.ok(instances[1].documents.includes('stats::`.__r_console_metadata__`'), 'replacement restores the current packages');
+  assert.ok(!instances[1].documents.some(text => text.includes('polars')), 'detached packages stay detached');
+  await client.syncSessionState({ attachedPackages: [] });
+  assert.equal(client.packageDocument.getText(), '', 'detach clears package source');
+});
+
+test("package preparation is opt-in and can start after static analysis is enabled", async t => {
+  const { client, instances } = createClient(t);
+  const state = { attachedPackages: ['polars'] };
+  await client.syncSessionState(state);
+  assert.deepEqual(instances[0].documents, []);
+  client.options.getStaticAnalysisEnabled = () => true;
+  await client.syncSessionState(state);
+  assert.deepEqual(instances[0].documents, ['polars::`.__r_console_metadata__`']);
+  client.options.getStaticAnalysisEnabled = () => false;
+  await client.syncSessionState(state);
+  assert.equal(instances[0].closed, 1);
+  assert.equal(client.syncedDocuments.size, 0);
+});
+
+test("background preparation reuses the native startup package metadata", async t => {
+  const { client, instances } = createClient(t, { staticAnalysis: true,
+    reply: () => ({ libraryPaths: [], startupPackages: ['base', 'stats'] }),
+  });
+  await client.syncSessionState({ attachedPackages: ['polars', 'stats', 'base'] });
+  assert.deepEqual(instances[0].documents, ['polars::`.__r_console_metadata__`'],
+    'do not build full namespace indexes for packages already covered by native startup');
 });
 
 test("stored method arguments are fetched afresh and never borrowed from global signatures", async t => {
@@ -418,6 +461,7 @@ test("a superseded session update applies the latest attached packages", async (
   t.after(() => releaseReply({ libraryPaths: ["/obsolete"] }));
   let requests = 0;
   const { client, instances } = createClient(t, {
+    staticAnalysis: true,
     reply: async () => { if (++requests === 1) { enteredRequest(); return replyGate; } return { libraryPaths: ["/current"] }; },
   });
   const first = client.syncSessionState({ attachedPackages: ["stats"] });
@@ -427,6 +471,8 @@ test("a superseded session update applies the latest attached packages", async (
   await Promise.all([first, latest]);
   assert.equal(instances.length, 1);
   assert.equal(requests, 2, "check the latest state before deciding to restart");
+  assert.deepEqual(instances[0].documents, ['utils::`.__r_console_metadata__`'],
+    'an obsolete session reply must not start metadata preparation for detached packages');
 });
 
 test("cached session state reaches the LSP before its first launch", async () => {

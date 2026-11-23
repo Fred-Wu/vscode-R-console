@@ -1541,6 +1541,14 @@ Completion data comes from one shared flow:
   without invoking `scan()`. An unrelated global `collect` cannot supply them.
   The native receiver grammar remains unchanged; executable chains are never
   sent to the stored-function inspector.
+- successful native member replies and constructor/S3 signature metadata are
+  reused by the console adapter. It resolves a member again only when it needs
+  evidence for an empty reply or a source-shadowing check. Within one request,
+  argument prefix filtering, value matching and validation share a full native
+  argument lookup; complete input reuses the existing parse. These optimizations
+  do not cache runtime argument snapshots across requests. An unresolved method
+  signature does not trigger a second inspection just to broaden its argument
+  prefix; known signatures still support abbreviation matching.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
 
@@ -1568,6 +1576,29 @@ so R reads the project startup files and discovers its package libraries.
 The LSP workspace remains a separate temporary folder to avoid project indexing.
 Opening the console starts the client and issues a silent completion request
 to initialize completion caches. Runtime start and attach events reuse the client.
+With static analysis enabled, session package changes also synchronize a separate
+in-memory document containing only namespace references for attached packages. Native
+language-server background tasks prepare their metadata before a member request;
+the document contains no submitted expressions or stored function definitions.
+Its fixed sentinel names only identify namespaces; no matching export is required.
+Namespace references avoid attaching packages in the metadata worker or changing
+the completion search order. Packages already covered by native startup metadata
+are excluded, using the startup list reported by the R adapter.
+Repeated snapshots reuse the same document. Detach, library replacement, server
+restart and disabling static analysis update or clear it. The console does not
+copy package snapshots, alter their construction or override package-size limits.
+
+Search-path changes close the old completion documents before synchronizing the
+new attachment order. The adapter drops detached packages' in-memory member
+catalogs so their names cannot survive as inferred members of a bare receiver.
+The current input is then reopened; native disk metadata remains available for
+reattachment and explicit namespace requests.
+
+Upstream metadata failures can still prevent inferred completions. For example,
+languageserver 0.3.22 with Polars 1.12.0 can exceed its 32 MiB member snapshot
+budget for `polars::pl$scan_csv()$`. Background preparation moves work earlier,
+but cannot make that failed snapshot usable; fixing its size requires an upstream
+change. No receiver expression is executed to work around this failure.
 
 Windows uses an authenticated loopback TCP connection. On Unix,
 `r.lsp.use_stdio` selects stdio or TCP. For TCP, the R server initializes its

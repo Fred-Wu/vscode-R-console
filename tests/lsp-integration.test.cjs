@@ -18,6 +18,98 @@ const completion = loadSource("src/Language/completion.ts", { vscode: {
   Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
 } });
 
+test("closing a virtual completion document cancels native tasks and answers pending requests", () => {
+  assert.deepEqual(runRJson(String.raw`
+    code <- parse("resources/r/console-language-server.R")
+    definition <- Filter(function(node) is.call(node) && identical(node[[1L]], as.name("<-")) &&
+        identical(node[[2L]], quote(console_text_document_did_close)), as.list(code))[[1L]]
+    eval(definition)
+    cancelled <- delivered <- integer()
+    removed <- closed <- FALSE
+    manager <- function(index) list(cancel = function(uri) { cancelled <<- c(cancelled, index) })
+    ids <- c(101L, 102L)
+    queue <- list(size = function() length(ids), pop = function() {
+        id <- ids[[1L]]; ids <<- ids[-1L]; list(id = id)
+    })
+    document <- list(did_close = function() { closed <<- TRUE })
+    workspace <- list(documents = list(has = function(uri) TRUE, get = function(uri) document,
+        remove = function(uri) { removed <<- TRUE }), update_loaded_packages = function() NULL)
+    self <- list(parse_task_manager = manager(1L), resolve_task_manager = manager(2L), member_task_manager = manager(3L),
+        get_workspace = function(uri) workspace, deliver = function(reply) { delivered <<- c(delivered, reply$id) },
+        pending_replies = list(get = function(...) list(queue), remove = function(uri) NULL))
+    console_text_document_did_close(self, list(textDocument = list(uri = "r-console://cancel/console.R")))
+    stopifnot(closed, removed, !length(ids))
+    cat(jsonlite::toJSON(list(cancelled = cancelled, delivered = delivered)))
+  `), { cancelled: [1, 2, 3], delivered: [101, 102] });
+});
+
+test("console supplements reuse native members, constructor signatures and package argument lookups", () => {
+  const result = runRJson(String.raw`
+    server <- list(request_handlers = list("textDocument/completion" = function(...) NULL))
+    for (file in c("completion-runtime.R", "completion-arguments.R", "completion-static.R", "completion-provider.R"))
+        source(file.path("resources/r", file))
+    uri <- "r-console://reuse/console.R"
+    point <- list(row = 0L, col = 0L)
+    # A successful native member reply needs no second receiver analysis.
+    document <- list(from_lsp_position = function(position) point)
+    workspace <- list(documents = list(get = function(uri) document))
+    self <- list(get_workspace = function(uri) workspace)
+    member <- list(label = "secret", data = list(type = "member"))
+    reply <- console_supplement_completion(list(result = list(items = list(member))), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = 0L), rConsoleStaticAnalysis = TRUE))
+    stopifnot(isTRUE(reply$result$rConsoleMemberResolved), identical(reply$result$items, list(member)))
+
+    text <- "pkg::Factory$new("
+    document <- languageserver:::Document$new(uri, language = "r", version = 1L, content = text)
+    document$update_parse_data(languageserver:::parse_document(uri, text))
+    console_member_function <- function(...) stop("duplicate receiver inspection")
+    console_completion_parse <- function(...) stop("duplicate parse of complete input")
+    signature <- 'new(cols, \x60a b\x60 = stop("defaults stay inert"), ...)'
+    constructor <- list(label = "cols", kind = languageserver:::CompletionItemKind$Variable,
+        data = list(type = "member", parameter = "cols", signature = signature))
+    reply <- console_supplement_completion(list(result = list(items = list(constructor))), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = nchar(text)),
+            rConsoleStaticAnalysis = TRUE, rConsoleCall = "pkg::Factory$new", rConsoleArgumentTags = list(NULL),
+            rConsoleParseSuffix = ""))
+    stopifnot(isTRUE(reply$result$rConsoleArgumentsResolved), isTRUE(reply$result$rConsoleNativeArguments))
+    names <- vapply(console_native_signature(list(constructor), uri), console_argument_name, character(1))
+    stopifnot(identical(names, c("cols", "a b", "...")))
+
+    # S3 arguments alone do not establish the identity of a member receiver.
+    # They must never replace an explicit refusal from the runtime inspector.
+    text <- "task$levels("
+    document <- languageserver:::Document$new(uri, language = "r", version = 1L, content = text)
+    document$update_parse_data(languageserver:::parse_document(uri, text))
+    console_member_function <- function(...) NULL
+    unrelated <- list(label = "wrong", kind = languageserver:::CompletionItemKind$Variable,
+        data = list(type = "s3_parameter", parameter = "wrong", s3 = list(method = list(formals = list(wrong = NULL)))))
+    refused <- console_supplement_completion(list(result = list(items = list(unrelated))), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = nchar(text)),
+            rConsoleStaticAnalysis = TRUE, rConsoleCall = "task$levels", rConsoleArgumentTags = list(NULL),
+            rConsoleRuntimeArgumentsRefused = TRUE))
+    stopifnot(identical(refused$result$rConsoleArgumentsResolved, FALSE), !length(refused$result$items),
+        !isTRUE(refused$result$rConsoleRuntimeArgumentsIgnored))
+
+    # Recovery of a lexer-selected call must share the full package signature
+    # between prefix filtering and validation. Value lookup is a separate native API.
+    calls <- 0L
+    workspace$get_formals <- function(...) { calls <<- calls + 1L; list(cols = NULL, mode = quote(c("auto", "stream"))) }
+    workspace$get_signature <- function(...) "target(cols, mode)"
+    document <- list(from_lsp_position = function(position) point,
+        detect_call = function(point) list(token = "other", accessor = "", package = NULL),
+        detect_token = function(...) list(token = ""))
+    reply <- console_supplement_completion(list(result = list(items = list())), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = 0L),
+            rConsoleCall = "pkg::target", rConsoleArgumentTags = list(NULL)))
+    stopifnot(calls == 2L)
+    labels <- vapply(reply$result$items, function(item) item$label, character(1))
+    stopifnot(identical(labels, c("cols", "mode")))
+    cat(jsonlite::toJSON(list(lookups = calls, parameters = names), auto_unbox = TRUE))
+  `);
+  assert.equal(result.lookups, 2);
+  assert.deepEqual(result.parameters, ['cols', 'a b', '...']);
+});
+
 test("accepting a column completion inserts R source that selects the original field", async () => {
   const names = ["total\rUSD", "total\\rUSD", "total\nUSD", "total\tUSD", "total\u0085USD", "total'\"\x7f`USD"];
   const workspace = { globalenv: { sales: { names, type: "list" } } };

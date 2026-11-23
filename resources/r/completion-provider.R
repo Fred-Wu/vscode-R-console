@@ -80,7 +80,11 @@ console_supplement_completion <- function(reply, self, params) {
     # Ask the native resolver whether an empty member list is authoritative.
     # This uses its cached receiver and avoids probing stale live objects when
     # the current source defines an empty list or the prefix has no matches.
-    if (static_analysis) {
+    has_members <- any(vapply(reply$result$items, function(item)
+        identical(item$data$type, "member") && is.null(item$data$parameter), logical(1)))
+    if (static_analysis && has_members) {
+        reply$result$rConsoleMemberResolved <- TRUE
+    } else if (static_analysis) {
         cursor <- if (exists("member_cursor", asNamespace("languageserver"), inherits = FALSE) &&
             exists("member_resolve_cursor", asNamespace("languageserver"), inherits = FALSE))
             languageserver:::member_cursor(document, point) else NULL
@@ -93,14 +97,12 @@ console_supplement_completion <- function(reply, self, params) {
         }
         # A known empty list or a prefix with no matches is still resolved.
         # Inferred candidates take precedence over an uncertain receiver shape.
-        if (!any(vapply(reply$result$items, function(item)
-            identical(item$data$type, "member"), logical(1)))) {
-            reply$result$rConsoleStaticUnavailableReason <- reason
-        }
+        reply$result$rConsoleStaticUnavailableReason <- reason
     }
 
     if ((!is.null(params$rConsoleCall) || !is.null(params$rConsoleDataObject) || isTRUE(params$rConsolePipe)) &&
-        is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L) {
+        is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L &&
+        (nzchar(params$rConsoleParseSuffix) || !is.null(params$rConsoleParseInsertion))) {
         previous_parse <- document$parse_data
         on.exit(document$update_parse_data(previous_parse), add = TRUE)
         document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix, params$rConsoleParseInsertion))
@@ -116,17 +118,22 @@ console_supplement_completion <- function(reply, self, params) {
     }
 
     call <- console_call_identity(params$rConsoleCall)
-    native_arguments <- any(vapply(reply$result$items, function(item)
-        isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")) ||
-            (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
+    member_arguments <- any(vapply(reply$result$items, function(item)
+        identical(item$data$type, "member") && !is.null(item$data$parameter), logical(1)))
+    native_arguments <- member_arguments || any(vapply(reply$result$items, function(item)
+        isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
     method_root <- if (member_call) console_call_root(params$rConsoleCall, include_calls = TRUE) else NULL
-    member_source <- if (static_analysis && member_call)
-        console_member_function(uri, workspace, document, point, method_root) else NULL
+    source_root <- if (static_analysis && member_call && !is.null(method_root))
+        console_source_function(document, point, method_root) else NULL
+    native_signature <- if (native_arguments) console_native_signature(reply$result$items, uri) else NULL
+    native_member <- static_analysis && member_call && member_arguments && !is.null(native_signature) &&
+        is.null(source_root) && !identical(method_root, "")
+    member_source <- if (static_analysis && member_call && !native_member)
+        console_member_function(uri, workspace, document, point, method_root, source_root) else NULL
     # A current source binding (including an unresolved factory or a formal)
     # must not borrow arguments from an older, same-named live object.
-    source_method_root <- static_analysis && (!is.null(member_source) ||
-        (!is.null(method_root) && !is.null(console_source_function(document, point, method_root))))
+    source_method_root <- static_analysis && (native_member || !is.null(member_source) || !is.null(source_root))
     if (source_method_root) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE
     # Static source inference is explicitly opt-in. Live sess signatures take
     # precedence in normal console mode regardless of native package inference.
@@ -156,20 +163,18 @@ console_supplement_completion <- function(reply, self, params) {
     if (source_is_static) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
         reply$result$rConsoleNativeArguments <- TRUE
-        for (item in reply$result$items) {
-            native_formals <- item$data$s3$method$formals
-            if (!is.null(native_formals)) {
-                signature <- console_source_signature(list(formals = native_formals), uri)
-                break
-            }
+        signature <- native_signature
+    }
+    # Prefix filtering, value matching and argument validation share one full
+    # lookup from the native provider within this request. Never retain a live
+    # receiver signature across requests or substitute a global for a method.
+    argument_signature <- function() {
+        if (is.null(signature) && !is.null(call) && !member_call && is.null(source)) {
+            signature <<- languageserver:::arg_completion(uri, workspace, point, "", call$token,
+                call$package, exported_only = call$accessor != ":::")
+            attr(signature, "known_signature") <<- length(signature) > 0L
         }
-        if (is.null(signature)) {
-            location <- languageserver:::member_call_location(document, point, symbols = TRUE)
-            constructor <- languageserver:::member_constructor_symbol(uri, workspace, document, location)
-            if (!is.null(constructor$value$function_expr)) {
-                signature <- console_source_signature(list(formals = constructor$value$function_expr[[2L]]), uri)
-            }
-        }
+        signature
     }
     if (member_call) {
         reply$result$rConsoleArgumentsResolved <- !is.null(signature)
@@ -203,14 +208,12 @@ console_supplement_completion <- function(reply, self, params) {
                 }), recursive = FALSE)
                 c(parameters, values)
             } else c(
-                if (!value_mode) languageserver:::arg_completion(uri, workspace, point, token, call$token,
-                    call$package, exported_only = call$accessor != ":::"),
+                if (!value_mode) Filter(function(item) languageserver:::match_with(item$label, token), argument_signature()),
                 languageserver:::arg_value_completion(uri, workspace, document, point, token,
                     call$token, call$package, exported_only = call$accessor != ":::")
             )
             if (value_mode) {
-                value_signature <- if (!is.null(source)) signature else languageserver:::arg_completion(
-                    uri, workspace, point, "", call$token, call$package, exported_only = call$accessor != ":::")
+                value_signature <- argument_signature()
                 name <- console_value_argument(vapply(value_signature, console_argument_name, character(1)),
                     params$rConsoleArgument, params$rConsoleValueTags)
                 arguments <- Filter(function(item) nzchar(name) && identical(item$detail, paste0("value for ", name)), arguments)
@@ -225,7 +228,7 @@ console_supplement_completion <- function(reply, self, params) {
     # Validate each proposed name using R's matching rules. Positional values,
     # partial tags and pipe insertion can make an otherwise unused name invalid.
     if (!isTRUE(source$unknown) && ((!native_arguments && (!member_call || !is.null(source))) || !is.null(signature))) reply$result$items <- console_valid_argument_items(reply$result$items,
-        params$rConsoleArgumentTags, call, uri, workspace, point, signature)
+        params$rConsoleArgumentTags, call, uri, workspace, point, argument_signature())
     if (isTRUE(attr(reply$result$items, "arguments_exhausted"))) {
         reply$result$rConsoleArgumentsExhausted <- TRUE
         reply$result$items <- list()
