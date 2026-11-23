@@ -439,7 +439,7 @@ test("cancelled or superseded static responses cannot publish or log inferred ca
   }
 });
 
-test("source receiver selection targets only a direct global closure, not nested calls or methods", () => {
+test("source receiver selection targets the root named call, not downstream call heads", () => {
   const sourceNames = [
     ["make_data()$", "make_data"],
     ["make_data()$al", "make_data"],
@@ -466,7 +466,7 @@ test("source receiver selection targets only a direct global closure, not nested
     ["pkg::make_data()$", undefined],
     ["(obj$make_data())$", undefined],
     ["((pkg::make_data()))$", undefined],
-    ["(make_data())()$", undefined],
+    ["(make_data())()$", "make_data"],
     ["(make_data)()$", undefined],
     ["(obj[[make_data()]])$", undefined],
     ["(other + make_data())$", undefined],
@@ -522,9 +522,13 @@ test("one receiver classification preserves source eligibility and root identity
   for (const [text, name, target] of [
     ['((make_data()))$inner$', 'make_data', 'source'],
     ['make_data()[["inner"]]$', 'make_data', 'source'],
-    ['make_data()$"inner"$', 'make_data', 'binding'],
-    ['make_data()$method()$', 'make_data', 'binding'],
-    ['(make_data())()$', 'make_data', 'binding'],
+    ['make_data()$"inner"$', 'make_data', 'source'],
+    ['make_data()$method()$', 'make_data', 'source'],
+    ['(make_data())()$', 'make_data', 'source'],
+    ['make_data()[[side_effect()]]()$', 'make_data', 'source'],
+    ['make_data()$"method"()$child$', 'make_data', 'source'],
+    ['(make_data)$method()$', 'make_data', 'binding'],
+    ['(make_data)()$', 'make_data', 'binding'],
     ['obj[[side_effect()]]$method(', 'obj', 'binding'],
     ['obj$"method"()$', 'obj', 'binding'],
     ['`odd root`[f()]$', 'odd root', 'binding'],
@@ -540,6 +544,32 @@ test("one receiver classification preserves source eligibility and root identity
     if (receiver) {
       assert.equal(receiver.start, text.indexOf(name === 'odd root' ? '`odd root`' : name), text);
     }
+  }
+});
+
+test("downstream receiver operations preserve guarded root source for the provider", async () => {
+  const body = "function() list(inner = list(alpha = 1), method = function() list(beta = 2))";
+  for (const text of [
+    'make_data()$"inner"$',
+    'make_data()$method()$',
+    '(make_data())()$',
+    'make_data()[[side_effect()]]()$',
+    'make_data()$"method"()$child$',
+  ]) {
+    const h = harness({ storedSources: { make_data: body },
+      lspItems: (_mode, definition) => ({
+        items: definition?.body === body ? [{ label: "inferred", kind: 4, data: { type: "member" } }] : [],
+      }),
+    });
+    assert.deepEqual(labels(await h.complete(text)), ["inferred"], text);
+    assert.deepEqual(h.sourceRequests, ["make_data"], text);
+    assert.deepEqual(h.requests.at(-1).sourceDefinition, { name: "make_data", body }, text);
+    assert.equal(h.requests.at(-1).mode, "static", text);
+    assert.deepEqual(h.native, [], "never inspect the computed receiver");
+    const disabled = harness({ staticAnalysis: false, storedSources: { make_data: body } });
+    assert.deepEqual(labels(await disabled.complete(text)), [], text);
+    assert.deepEqual(disabled.sourceRequests, [], text);
+    assert.deepEqual(disabled.native, [], text);
   }
 });
 

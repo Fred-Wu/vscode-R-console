@@ -66,12 +66,23 @@ console_static_unavailable_reason <- function(resolved) {
     NULL
 }
 
+# Native completion is not validated against console-specific binding,
+# argument and receiver constraints until the supplement succeeds. On failure
+# discard candidates and metadata; a later request can retry.
+console_unverified_completion <- function(reply, params, reason = "request-failed") {
+    reply$result <- list(items = list(), isIncomplete = TRUE,
+        rConsoleRuntimeOnly = !isTRUE(params$rConsoleStaticAnalysis),
+        rConsoleMemberResolved = FALSE, rConsoleArgumentsResolved = FALSE,
+        rConsoleStaticUnavailableReason = reason)
+    reply
+}
+
 console_supplement_completion <- function(reply, self, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
     workspace <- self$get_workspace(uri)
     document <- workspace$documents$get(uri)
-    if (is.null(document)) return(reply)
+    if (is.null(document)) return(console_unverified_completion(reply, params, "document-unavailable"))
     if (is.null(reply$result)) reply$result <- list(items = list(), isIncomplete = FALSE)
 
     point <- document$from_lsp_position(params$position)
@@ -279,11 +290,11 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     proxy <- as.list(self)
     proxy$deliver <- function(reply) {
         if (inherits(reply, "Response")) {
-            native_result <- reply$result
             reply <- tryCatch(console_supplement_completion(reply, self, params), error = function(error) {
-                languageserver:::logger$info("console completion supplement:", error)
-                reply$result <- native_result
-                reply
+                # Do not log exceptions containing user source. Even logging
+                # failure must not prevent delivery of the safe response.
+                try(languageserver:::logger$info("console completion supplement failed"), silent = TRUE)
+                console_unverified_completion(reply, params)
             })
         }
         self$deliver(reply)

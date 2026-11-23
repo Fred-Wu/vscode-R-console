@@ -110,6 +110,55 @@ test("console supplements reuse native members, constructor signatures and packa
   assert.deepEqual(result.parameters, ['cols', 'a b', '...']);
 });
 
+test("completion supplement failures never deliver unvalidated native candidates", () => {
+  const result = runRJson(String.raw`
+    native_result <- list(items = list(
+        list(label = "wrong_member", data = list(type = "member")),
+        list(label = "wrong_parameter", data = list(type = "s3_parameter", parameter = "wrong_parameter"))),
+        isIncomplete = FALSE, rConsoleMemberResolved = TRUE, rConsoleArgumentsResolved = TRUE,
+        rConsoleNativeArguments = TRUE)
+    server <- list(request_handlers = list("textDocument/completion" = function(self, id, params) {
+        self$deliver(structure(list(id = id, result = native_result), class = "Response"))
+    }))
+    source("resources/r/completion-provider.R")
+    delivered <- NULL
+    self <- list(get_workspace = function(uri) list(documents = list(get = function(uri) NULL)),
+        deliver = function(reply) { delivered <<- reply })
+    handler <- server$request_handlers[["textDocument/completion"]]
+    params <- list(textDocument = list(uri = "r-console://failure/console.R"),
+        position = list(line = 0L, character = 0L))
+    verify <- function(extra, reason) {
+        request <- c(params, extra)
+        handler(self, 1L, request)
+        result <- delivered$result
+        stopifnot(identical(delivered$id, 1L), !length(result$items),
+            isTRUE(result$isIncomplete), identical(result$rConsoleMemberResolved, FALSE),
+            identical(result$rConsoleArgumentsResolved, FALSE),
+            identical(result$rConsoleRuntimeOnly, !isTRUE(request$rConsoleStaticAnalysis)),
+            identical(result$rConsoleStaticUnavailableReason, reason),
+            is.null(result$rConsoleNativeArguments))
+    }
+    # Losing the document is also a failure to establish provenance.
+    verify(list(rConsoleStaticAnalysis = TRUE, rConsoleOpaqueFunction = "api"), "document-unavailable")
+    # Exercise the actual delivery proxy, not just the supplement helper.
+    console_supplement_completion <- function(...) stop("injected validation failure")
+    cases <- list(
+        list(rConsoleStaticAnalysis = TRUE, rConsoleOpaqueFunction = "api"),
+        list(rConsoleStaticAnalysis = TRUE, rConsoleCall = "api$scan", rConsoleRuntimeArgumentsRefused = TRUE),
+        list(rConsoleCall = "api$scan", rConsoleRuntimeArgumentsRefused = TRUE),
+        list(rConsoleCall = "api$scan", rConsoleRuntimeArgumentNames = list("live")),
+        list(rConsoleCall = "f", rConsoleRuntimeSignature = "function(live) NULL"),
+        list(rConsoleSubscriptClass = "data.frame"), list())
+    for (extra in cases) verify(extra, "request-failed")
+    # Successful validation still delivers its result unchanged.
+    console_supplement_completion <- function(reply, self, params) reply
+    handler(self, 2L, params)
+    stopifnot(identical(delivered$result, native_result), identical(delivered$id, 2L))
+    cat(jsonlite::toJSON(list(failures = length(cases) + 1L), auto_unbox = TRUE))
+  `);
+  assert.equal(result.failures, 8);
+});
+
 test("accepting a column completion inserts R source that selects the original field", async () => {
   const names = ["total\rUSD", "total\\rUSD", "total\nUSD", "total\tUSD", "total\u0085USD", "total'\"\x7f`USD"];
   const workspace = { globalenv: { sales: { names, type: "list" } } };

@@ -3,9 +3,9 @@ import { getCompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
 import type { CompletionContext } from "./types";
 
-// Locate the direct named call whose return value is being accessed. This is
-// syntax-only: no expression, subscript or callable is ever evaluated. Never
-// inspect methods (obj$fn()), namespaces or computed function expressions.
+// Locate the direct named call at the root of the receiver. This is syntax
+// only: never evaluate a selector, subscript, method or computed call head.
+// Only the root callable's stored syntax is eligible for retrieval.
 export function storedFunctionReceiver(
   context: CompletionContext, input: string, cursor: number
 ): string | undefined {
@@ -28,9 +28,9 @@ export function storedReceiverRoot(
   return receiver && { name: receiver.name, start: receiver.start };
 }
 
-// One delimiter scan and one backwards walk classify a receiver. Only a
-// direct named call is eligible for source retrieval; computed call heads
-// and quoted selectors retain the more conservative binding-only check.
+// One delimiter scan and one backwards walk classify the receiver's root.
+// Downstream accessors, subscripts and calls do not change that identity.
+// Leave inference of those operations to the language server.
 export function storedCompletionReceiver(
   context: CompletionContext, input: string, cursor: number
 ): { name: string; start: number; target: "source" | "binding" } | undefined {
@@ -89,10 +89,9 @@ export function storedCompletionReceiver(
   // Strip suffixes and grouping on the receiver. Each group
   // must contain that entire receiver, not a compound expression ending in
   // a call, such as (other + fn()). Keep this walk iterative as well.
-  // Source retrieval accepts direct named calls. Binding checks can also
-  // follow method calls and computed heads back to their named value root.
+  // Retrieve source only for a direct named call at the root. For a value
+  // root, check binding identity without inspecting any computed operation.
   const groups: number[] = [];
-  let sourceEligible = true;
   const result = (index: number, target: "source" | "binding") => {
     let start = index;
     for (let group = groups.length - 1; group >= 0; group--) {
@@ -111,7 +110,6 @@ export function storedCompletionReceiver(
     } else if ((token.type === TokenType.Identifier || (token.type === TokenType.String && token.closed)) &&
         tokens[index - 1]?.type === TokenType.Operator &&
         ["$", "@"].includes(tokens[index - 1].value)) {
-      if (token.type === TokenType.String) sourceEligible = false;
       index -= 2;
     } else if (token.type === TokenType.RightParen) {
       const opening = openings.get(index);
@@ -120,12 +118,11 @@ export function storedCompletionReceiver(
       const preceding = tokens[opening - 2];
       if (name?.type === TokenType.Identifier || (name?.type === TokenType.String && name.closed)) {
         if (preceding?.type === TokenType.Operator && ["$", "@"].includes(preceding.value)) {
-          sourceEligible = false;
           index = opening - 1;
           continue;
         }
         if (isNameAccessor(preceding)) return undefined;
-        return result(opening - 1, sourceEligible && name.type === TokenType.Identifier ? "source" : "binding");
+        return result(opening - 1, name.type === TokenType.Identifier ? "source" : "binding");
       }
       // Parentheses after a value are a computed call. A control condition or
       // function's formals, however, can be followed by a grouped body.
@@ -136,7 +133,6 @@ export function storedCompletionReceiver(
          (control.type === TokenType.Operator && control.value === "\\"));
       if (!afterControl && name &&
           [TokenType.RightParen, TokenType.RightBracket].includes(name.type)) {
-        sourceEligible = false;
         index = opening - 1;
         continue;
       }
