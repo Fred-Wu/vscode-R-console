@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { getCallOpenings, tokenizeForHighlighting } from "./parser";
 import { runtimeCompletionText } from "./completion/runtimeDocument";
+import { backtickRName } from "./completion/candidates";
+import type { CompletionSourceDefinition } from "./completion/types";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 
@@ -47,7 +49,8 @@ export class VirtualRDocument {
     }
   }
 
-  project(content: string, staticAnalysis = true, cursor?: vscode.Position) {
+  project(content: string, staticAnalysis = true, cursor?: vscode.Position,
+    sourceDefinition?: CompletionSourceDefinition) {
     // Picker previews must not change the selections saved with the actual input.
     const visible = new VirtualRDocument(this.id, content);
     const selections = this.getSelections(content);
@@ -64,7 +67,12 @@ export class VirtualRDocument {
     const position = visible.offsetAt(cursor ?? visible.positionAt(content.length));
     const projectedOffset = position + insertions.reduce((sum, selection) =>
       sum + (selection.start <= position ? selection.packageName.length + 2 : 0), 0);
-    const completionText = staticAnalysis ? text : runtimeCompletionText(text, projectedOffset);
+    // A guarded live closure definition is projected ahead of the editable
+    // source. The user input remains last so draft redefinitions still win.
+    // All mapping is local to this request; no session source journal exists.
+    const prelude = staticAnalysis && sourceDefinition
+      ? `${backtickRName(sourceDefinition.name)} <- ${sourceDefinition.body}\n` : "";
+    const completionText = staticAnalysis ? prelude + text : runtimeCompletionText(text, projectedOffset);
     if (!this.projectedDocument || this.projectedDocument.getText() !== completionText) {
       const version = (this.projectedDocument?.version ?? 0) + 1;
       this.projectedDocument = new VirtualRDocument(this.id, completionText);
@@ -78,10 +86,10 @@ export class VirtualRDocument {
         const added = insertions.reduce((sum, selection) =>
           sum + (selection.start <= offset ? selection.packageName.length + 2 : 0), 0
         );
-        return document.positionAt(offset + added);
+        return document.positionAt(prelude.length + offset + added);
       },
       toConsolePosition(position: vscode.Position): vscode.Position {
-        let offset = document.offsetAt(position);
+        let offset = Math.max(0, document.offsetAt(position) - prelude.length);
         for (const selection of insertions) {
           if (offset < selection.start) break;
           offset = Math.max(selection.start, offset - selection.packageName.length - 2);

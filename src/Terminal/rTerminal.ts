@@ -290,6 +290,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestRuntimeMemberCompletions: (expression, operator) =>
         this.requestStoredMemberCompletions(expression, operator),
+      requestRuntimeFunctionSource: name => this.requestStoredFunctionSource(name),
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
@@ -370,6 +371,20 @@ export class RTerminal implements vscode.Pseudoterminal {
       reportUnavailable();
       return { status: "unavailable" as const };
     });
+  }
+
+  // Only retrieve a global closure already stored in R, never evaluate a call.
+  // The backend uses the same idle/submission gate and native C error guard as
+  // member inspection. Unsupported or unsafe bindings have no source result.
+  private requestStoredFunctionSource(name: string): Promise<string | undefined> | undefined {
+    if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
+        this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) {
+      return undefined;
+    }
+    const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess,
+      { root: name, steps: [], target: "source" });
+    return response?.then(result => result.status === "source" ? result.text : undefined,
+      () => undefined);
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {

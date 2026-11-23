@@ -25,7 +25,7 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
 } from "vscode-languageclient/node";
-import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
+import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult, CompletionSourceDefinition } from "./completion";
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
@@ -287,7 +287,8 @@ export class ConsoleLspClient implements CompletionProvider {
     triggerCharacter?: string,
     contextPosition: vscode.Position = position,
     runtimeBracketKind?: "data.frame" | "data.table" | null,
-    analysisMode?: CompletionAnalysisMode
+    analysisMode?: CompletionAnalysisMode,
+    sourceDefinition?: CompletionSourceDefinition
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await this.packageRefreshPromise;
@@ -299,7 +300,8 @@ export class ConsoleLspClient implements CompletionProvider {
       try {
         const staticAnalysis = analysisMode === undefined
           ? this.options.getStaticAnalysisEnabled?.() === true : analysisMode === "static";
-        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition);
+        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition,
+          staticAnalysis ? sourceDefinition : undefined);
         await this.syncDocument(client, projection.document);
         await this.applySessionState(client);
         if (this.client !== client) {

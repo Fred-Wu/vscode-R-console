@@ -258,6 +258,9 @@ mod unix_host {
 
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
+            capabilities.push("function-source");
+        }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
@@ -2269,6 +2272,9 @@ mod windows_host {
 
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
+            capabilities.push("function-source");
+        }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {

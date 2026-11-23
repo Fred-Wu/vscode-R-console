@@ -7,6 +7,8 @@ import {
   type CompletionProvider,
   CompletionPickItem,
   type RuntimeMemberCompletionRequester,
+  type RuntimeFunctionSourceRequester,
+  storedFunctionReceiver,
   collectCompletionEntries,
   collectStaticFallbackEntries,
   getStaticFallbackContext,
@@ -41,6 +43,7 @@ type LangOptions = {
   onPackagesChanged?: () => void;
   getStaticAnalysisEnabled?: () => boolean;
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
+  requestRuntimeFunctionSource?: RuntimeFunctionSourceRequester;
 };
 
 type AutocompleteRequest = {
@@ -384,7 +387,24 @@ export class RTermLang {
         pending.isIncomplete = true;
         return pending;
       }
-      const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp);
+      // Source inference must also see functions defined in earlier submissions.
+      // Request their *current* stored closure AST from the guarded idle R host;
+      // never execute a call or persist submitted function bodies.
+      const cursorOffset = linesBefore.join("\n").length + (linesBefore.length ? 1 : 0) + position.character;
+      const receiver = storedFunctionReceiver(context, inputText, cursorOffset);
+      let sourceDefinition: { name: string; body: string } | undefined;
+      if (receiver && this.options.requestRuntimeFunctionSource) {
+        try {
+          const body = await this.options.requestRuntimeFunctionSource(receiver);
+          if (body && Buffer.byteLength(body, "utf8") <= 64 * 1024) {
+            sourceDefinition = { name: receiver, body };
+          }
+        } catch {
+          // An unavailable, active or deferred binding is not source evidence.
+        }
+      }
+      if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+      const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, sourceDefinition);
       if (this.isCurrentCompletionRequest(requestId) && logOutcome &&
           (entries.staticResolved || logUnresolved)) {
         logConsoleCompletionDecision({

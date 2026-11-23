@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::time::Instant;
 
+#[path = "function_source.rs"]
+mod function_source;
+
 type Sexp = *mut c_void;
 const LIST: c_int = 2;
 const CLOSURE: c_int = 3;
@@ -36,6 +39,8 @@ pub(crate) enum Target {
     Slot,
     Bracket,
     DoubleBracket,
+    // Inspect a stored closure's syntax without invoking it.
+    FunctionSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,7 +57,7 @@ pub(crate) enum Step {
 
 impl Target {
     fn accessor(self) -> &'static str {
-        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[" }
+        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSource => "" }
     }
 }
 
@@ -78,14 +83,15 @@ impl MemberQuery {
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 6 { return None; }
         // 0x80 requests a native UTF-8 locale check before resolving any name.
+        let depth = bytes[1] as usize;
         let target = match bytes[0] & !0x80 {
             0 => Target::Dollar,
             1 => Target::Slot,
             2 => Target::Bracket,
             3 => Target::DoubleBracket,
+            4 if depth == 0 => Target::FunctionSource,
             _ => return None,
         };
-        let depth = bytes[1] as usize;
         if depth > MAX_DEPTH { return None; }
         let mut at = 2;
         let root = read_name(bytes, &mut at)?;
@@ -182,9 +188,18 @@ pub(crate) struct InspectorApi {
     utf8_locale: Option<usize>,
     vmaxget: usize,
     vmaxset: usize,
+    formals: Option<usize>,
+    body: Option<usize>,
+    logical_elt: Option<usize>,
+    is_na: Option<usize>,
 }
 
 impl InspectorApi {
+    pub(crate) fn supports_function_source(&self) -> bool {
+        self.formals.is_some() && self.body.is_some() && self.car.is_some() &&
+            self.logical_elt.is_some() && self.integer_elt.is_some() && self.real_elt.is_some() && self.is_na.is_some()
+    }
+
     pub(crate) unsafe fn load(mut symbol: impl FnMut(&[u8]) -> Option<usize>) -> Option<Self> {
         Some(Self {
             install: symbol(b"Rf_install\0")?,
@@ -237,6 +252,11 @@ impl InspectorApi {
             // Required for bounded copies of R_alloc-backed UTF-8 translations.
             vmaxget: symbol(b"vmaxget\0")?,
             vmaxset: symbol(b"vmaxset\0")?,
+            // Stored syntax access only. R_ClosureExpr also exposes byte-compiled source.
+            formals: symbol(b"R_ClosureFormals\0").or_else(|| symbol(b"FORMALS\0")),
+            body: symbol(b"R_ClosureExpr\0"),
+            logical_elt: symbol(b"LOGICAL_ELT\0"),
+            is_na: symbol(b"R_IsNA\0"),
         })
     }
 }
@@ -244,6 +264,7 @@ impl InspectorApi {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Inspection {
     Available(Members),
+    FunctionSource(String),
     Suppressed(Suppression),
     Unavailable,
 }
@@ -315,6 +336,10 @@ const RMG_ENCLOS: c_int = 28;
 const RMG_PRVALUE: c_int = 29;
 const RMG_PREXPR: c_int = 30;
 const RMG_PRENV: c_int = 31;
+const RMG_FORMALS: c_int = 32;
+const RMG_BODY: c_int = 33;
+const RMG_LOGICAL_ELT: c_int = 34;
+const RMG_IS_NA: c_int = 35;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
@@ -428,8 +453,21 @@ unsafe extern "C" fn guard_promise_environment(a: Sexp) -> Sexp {
     guarded(RMG_PRENV, a as usize, 0, 0) as usize as Sexp
 }
 
+unsafe extern "C" fn guard_formals(a: Sexp) -> Sexp {
+    guarded(RMG_FORMALS, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_body(a: Sexp) -> Sexp {
+    guarded(RMG_BODY, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_logical_elt(a: Sexp, index: isize) -> c_int {
+    guarded(RMG_LOGICAL_ELT, a as usize, index as usize, 0) as c_int
+}
+unsafe extern "C" fn guard_is_na(value: f64) -> bool {
+    guarded(RMG_IS_NA, value.to_bits() as usize, 0, 0) != 0
+}
+
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 32] = [
+    let funcs: [usize; 36] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
@@ -438,6 +476,7 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
         api.char_ce, api.enclosing_env, api.promise_value, api.promise_expression, api.promise_environment,
+        api.formals.unwrap_or(0), api.body.unwrap_or(0), api.logical_elt.unwrap_or(0), api.is_na.unwrap_or(0),
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
         api.raw_protect, api.raw_unprotect,
@@ -494,6 +533,10 @@ struct Native {
     names: Sexp,
     class: Sexp,
     deadline: Instant,
+    formals: Option<Unary>,
+    body: Option<Unary>,
+    logical_elt: Option<unsafe extern "C" fn(Sexp, isize) -> c_int>,
+    is_na: Option<unsafe extern "C" fn(f64) -> bool>,
 }
 
 impl Native {
@@ -551,6 +594,10 @@ impl Native {
             names: *(api.names as *const Sexp),
             class: *(api.class_symbol as *const Sexp),
             deadline,
+            formals: api.formals.map(|_| guard_formals as _),
+            body: api.body.map(|_| guard_body as _),
+            logical_elt: api.logical_elt.map(|_| guard_logical_elt as _),
+            is_na: api.is_na.map(|_| guard_is_na as _),
         })
     }
 
@@ -1309,12 +1356,18 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) 
             return Inspection::Unavailable;
         }
         begin_inspection_guard(api);
-        let result = Native::new(api, deadline).map(|native| native.inspect(&query));
+        let result = Native::new(api, deadline).map(|native| {
+            if query.target == Target::FunctionSource {
+                native.inspect_function_source(&query).map(Inspection::FunctionSource)
+            } else {
+                native.inspect(&query).map(Inspection::Available)
+            }
+        });
         if rmg_end() != 0 {
             return Inspection::Unavailable;
         }
         match result {
-            Some(Ok(names)) => Inspection::Available(names),
+            Some(Ok(result)) => result,
             Some(Err(Suppression::InspectionLimit)) => Inspection::Unavailable,
             Some(Err(reason)) => Inspection::Suppressed(reason),
             None => Inspection::Unavailable,
@@ -1378,6 +1431,8 @@ mod tests {
         }));
         bytes[0] |= 0x80;
         assert!(MemberQuery::decode(&bytes).unwrap().utf8_byte_escapes);
+        bytes[0] = 4;
+        assert_eq!(MemberQuery::decode(&bytes), None, "function source cannot traverse selectors");
         bytes[0] = 0x40;
         assert_eq!(MemberQuery::decode(&bytes), None);
         bytes[0] = 3;
@@ -1388,6 +1443,10 @@ mod tests {
         name("task", &mut root);
         assert_eq!(MemberQuery::decode(&root), Some(MemberQuery {
             root: "task".to_owned(), steps: Vec::new(), target: Target::Dollar, utf8_byte_escapes: false,
+        }));
+        root[0] = 4;
+        assert_eq!(MemberQuery::decode(&root), Some(MemberQuery {
+            root: "task".to_owned(), steps: Vec::new(), target: Target::FunctionSource, utf8_byte_escapes: false,
         }));
     }
 }

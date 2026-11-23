@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, CompletionSourceDefinition, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
@@ -232,13 +232,14 @@ export async function collectStaticFallbackEntries(
   doc: vscode.TextDocument,
   position: vscode.Position,
   multilineBuffer: string[],
-  completionProvider: CompletionProvider
+  completionProvider: CompletionProvider,
+  sourceDefinition?: CompletionSourceDefinition
 ): Promise<CompletionEntries> {
   if (context.suppressAutomatic || (context.kind !== "member" && context.kind !== "bracket")) {
     return [];
   }
   const result = await getLanguageServerCompletions(
-    context, doc, position, multilineBuffer, completionProvider, undefined, "static"
+    context, doc, position, multilineBuffer, completionProvider, undefined, "static", sourceDefinition
   );
   // Only a receiver-specific member has sufficiently strong provenance.
   // Lexical scope fields and indexing parameters are not verified receiver

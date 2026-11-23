@@ -80,6 +80,9 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
 
 export type CompletionAnalysisMode = "runtime" | "static";
 
+/** A guarded snapshot of an already-stored R closure; never an expression to evaluate. */
+export type CompletionSourceDefinition = { name: string; body: string };
+
 export interface CompletionProvider {
   // A selected package function can be qualified in the LSP projection while
   // its name remains unqualified in the visible console input.
@@ -92,9 +95,13 @@ export interface CompletionProvider {
     contextPosition?: vscode.Position,
     // Safe, already-inspected receiver class; null means no supported class.
     runtimeBracketKind?: "data.frame" | "data.table" | null,
-    analysisMode?: CompletionAnalysisMode
+    analysisMode?: CompletionAnalysisMode,
+    sourceDefinition?: CompletionSourceDefinition
   ): Promise<CompletionResult | undefined>;
 }
+
+export type RuntimeFunctionSourceRequester = (name: string) =>
+  Promise<string | undefined> | undefined;
 
 export type RuntimeMemberCompletionRequester = (
   expression: string,
@@ -117,4 +124,3 @@ export type GlobalEnvItem = {
 export type WorkspaceData = {
   globalenv?: Record<string, GlobalEnvItem>;
 };
-

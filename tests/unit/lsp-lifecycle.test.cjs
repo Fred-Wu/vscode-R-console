@@ -44,7 +44,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
   }
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
     vscode: {
-      Position, Range: class Range {},
+      Position, Range: class Range { constructor(start, end) { this.start = start; this.end = end; } },
       Uri: { parse: (value) => ({ toString: () => value }), file: () => ({}) },
       window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
       workspace: { getConfiguration: () => ({ get: (key) => {
@@ -100,6 +100,35 @@ test("explicit completion mode uses the existing virtual document and controls s
   }
   assert.equal(client.syncedDocuments.size, 1,
     "fallback reuses the existing document instead of creating another");
+});
+
+
+test("guarded source overlay preserves console replacement offsets and uses one virtual document", async t => {
+  const { client, instances } = createClient(t, { staticAnalysis: true,
+    completion: (_instance, params) => ({ items: [{
+      label: "alpha", kind: 4, data: { type: "member" },
+      range: { inserting: { start: params.position, end: params.position },
+        replacing: { start: params.position, end: params.position } },
+    }] }),
+  });
+  const text = "make_data()$";
+  const cursor = new Position(0, text.length);
+  const doc = { getText: () => text };
+  const definition = { name: "make_data", body: "function() {\n  list(alpha = 1)\n}" };
+  const result = await client.provideCompletionItems(doc, cursor, undefined,
+    undefined, undefined, "static", definition);
+  const request = instances[0].requests.find(item => item.method === "completion");
+  const expectedPrelude = `\`make_data\` <- function() {\n  list(alpha = 1)\n}\n`;
+  assert.equal(request.params.text, expectedPrelude + text);
+  assert.equal(request.params.position.line, 3);
+  assert.equal(request.params.position.character, text.length);
+  assert.equal(result.items[0].range.inserting.start.line, 0,
+    "provider edit points back to original console input");
+  assert.equal(result.items[0].range.inserting.start.character, text.length);
+  await client.provideCompletionItems(doc, cursor, undefined, undefined, undefined, "static");
+  const requests = instances[0].requests.filter(item => item.method === "completion");
+  assert.equal(requests[1].params.text, text, "request-scoped overlay is not retained");
+  assert.equal(client.syncedDocuments.size, 1, "overlay never starts a second language server");
 });
 
 test("native member signatures never wait for runtime inspection", async t => {

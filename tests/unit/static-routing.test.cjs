@@ -23,8 +23,8 @@ const snapshot = (text, cursor = text.length) => {
 };
 const labels = entries => entries.filter(entry => "insertText" in entry).map(entry => entry.insertText);
 
-function harness({ staticAnalysis = true, inspected, lspItems, sessionData } = {}) {
-  const logs = [], native = [], requests = [];
+function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources } = {}) {
+  const logs = [], native = [], requests = [], sourceRequests = [];
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: { ...vscode, window: { createOutputChannel: () => ({
       appendLine: line => logs.push(line), dispose() {},
@@ -35,15 +35,19 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData } = {
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
     getStaticAnalysisEnabled: () => typeof staticAnalysis === "function" ? staticAnalysis() : staticAnalysis,
+    requestRuntimeFunctionSource: storedSources === undefined ? undefined : name => {
+      sourceRequests.push(name);
+      return Promise.resolve(typeof storedSources === "function" ? storedSources(name) : storedSources[name]);
+    },
     requestRuntimeMemberCompletions: (receiver, operator) => {
       native.push([receiver, operator]);
       return Promise.resolve(typeof inspected === "function" ? inspected(receiver, operator) :
         inspected ?? { status: "available", names: [] });
     },
   });
-  const provider = { provideCompletionItems: async (doc, position, trigger, contextPosition, bracket, mode) => {
-    requests.push({ text: doc.getText(), position, mode });
-    return typeof lspItems === "function" ? lspItems(mode) : lspItems ?? {
+  const provider = { provideCompletionItems: async (doc, position, trigger, contextPosition, bracket, mode, sourceDefinition) => {
+    requests.push({ text: doc.getText(), position, mode, sourceDefinition });
+    return typeof lspItems === "function" ? lspItems(mode, sourceDefinition) : lspItems ?? {
       rConsoleMemberResolved: true,
       items: [
         { label: "alpha", kind: 4, data: { type: "member" } },
@@ -66,7 +70,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData } = {
     await new Promise(resolve => setImmediate(resolve));
     return entries ?? [];
   };
-  return { lang, complete, logs, native, requests };
+  return { lang, complete, logs, native, requests, sourceRequests };
 }
 
 test("source-only context retains the correct prefix and replacement location for unsafe receivers", () => {
@@ -362,4 +366,82 @@ test("cancelled or superseded static responses cannot publish or log inferred ca
     assert.deepEqual(published, []);
     assert.equal(h.logs.filter(line => line.includes("[Static Completion - Inferred]")).length, 0);
   }
+});
+
+test("source receiver selection targets only a direct global closure, not nested calls or methods", () => {
+  const sourceNames = [
+    ["make_data()$", "make_data"],
+    ["make_data()$al", "make_data"],
+    ["make_data()$nested$", "make_data"],
+    ['make_data()[["inner"]]$', "make_data"],
+    ['make_data()[["al', "make_data"],
+    ["wrapper(make_data())$", "wrapper"],
+    ["obj[[side_effect()]]$", undefined],
+    ["obj$make_data()$", undefined],
+    ["pkg::make_data()$", undefined],
+    ["obj$", undefined],
+  ];
+  for (const [text, expected] of sourceNames) {
+    const context = completion.getStaticFallbackContext(text, text.length);
+    assert.equal(completion.storedFunctionReceiver(context ?? { kind: "default" }, text, text.length),
+      expected, text);
+  }
+});
+
+test("stored function source is requested on demand for earlier submissions and redefinitions", async () => {
+  const definitions = {
+    make_data: "function() list(alpha = 1)",
+    wrapper: "function(x) list(outer = 1)",
+  };
+  const h = harness({
+    storedSources: definitions,
+    lspItems: (_mode, definition) => ({
+      rConsoleMemberResolved: true,
+      items: definition?.body.includes("alpha") ? [
+        { label: "alpha", kind: 4, data: { type: "member" } },
+      ] : definition?.body.includes("beta") ? [
+        { label: "beta", kind: 4, data: { type: "member" } },
+      ] : [{ label: "outer", kind: 4, data: { type: "member" } }],
+    }),
+  });
+  assert.deepEqual(labels(await h.complete("make_data()$")), ["alpha"]);
+  assert.deepEqual(h.sourceRequests, ["make_data"]);
+  assert.deepEqual(h.requests[0].sourceDefinition, { name: "make_data", body: definitions.make_data });
+  // An unrelated submission cannot remove the stored definition.
+  assert.deepEqual(labels(await h.complete("make_data()$al")), ["alpha"]);
+  definitions.make_data = "function() list(beta = 2)";
+  assert.deepEqual(labels(await h.complete("make_data()$")), ["beta"]);
+  assert.deepEqual(h.requests.at(-1).sourceDefinition.body, definitions.make_data);
+  assert.deepEqual(labels(await h.complete("wrapper(make_data())$")), ["outer"]);
+  const before = h.sourceRequests.length;
+  assert.deepEqual(labels(await h.complete("obj[[side_effect()]]$")), ["outer"]);
+  assert.equal(h.sourceRequests.length, before, "computed indices cannot borrow their inner call's source");
+});
+
+test("unsafe or unavailable source retrieval never prevents static fallback", async () => {
+  for (const storedSources of [() => undefined, () => Promise.reject(new Error("unsafe binding"))]) {
+    const h = harness({ storedSources, lspItems: { items: [{ label: "global", kind: 5 }] } });
+    assert.deepEqual(labels(await h.complete("make_data()$")), []);
+    assert.deepEqual(h.sourceRequests, ["make_data"]);
+    assert.deepEqual(h.requests[0].sourceDefinition, undefined);
+  }
+});
+
+test("cancelled source retrieval cannot publish a late completion", async () => {
+  let release, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const pendingSource = new Promise(resolve => { release = resolve; });
+  const h = harness({ storedSources: () => { entered(); return pendingSource; } });
+  const pending = h.complete("make_data()$");
+  await waiting;
+  h.lang.cancelCompletion();
+  release("function() list(alpha = 1)");
+  assert.deepEqual(labels(await pending), []);
+  assert.deepEqual(h.requests, [], "cancel before the stale source reaches the language server");
+});
+
+test("runtime-only completion never requests a live function definition", async () => {
+  const h = harness({ staticAnalysis: false, storedSources: { make_data: "function() list(alpha = 1)" } });
+  assert.deepEqual(labels(await h.complete("make_data()$")), []);
+  assert.deepEqual(h.sourceRequests, []);
 });

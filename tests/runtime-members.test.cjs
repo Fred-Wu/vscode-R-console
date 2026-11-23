@@ -70,6 +70,19 @@ test("real embedded R completion inspects nested storage without running user co
     return result?.status === "available" ? { status: "available", names: result.names } : result;
   };
   const available = (names) => ({ status: "available", names });
+
+  // Real idle R source inspection feeds the real, separate language server.
+  // The frontend document deliberately contains only the later completion input.
+  const { client: sourceClient } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
+  const completeStored = async (text, cursor = text.length) => {
+    const context = completion.getStaticFallbackContext(text, cursor, text.slice(0, cursor), text.slice(cursor));
+    const name = completion.storedFunctionReceiver(context, text, cursor);
+    const result = await inspect(name, [], "source");
+    const definition = result?.status === "source" ? { name, body: result.text } : undefined;
+    return completion.collectStaticFallbackEntries(context, {
+      getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
+    }, { line: 0, character: cursor }, [], sourceClient, definition);
+  };
   // The wire protocol must distinguish a non-existent live root from an
   // existing root whose storage is authoritatively empty.
   assert.deepEqual(await inspect("unbound_completion_root"), { status: "missing" });
@@ -77,6 +90,54 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("empty_completion_root"), available([]));
   await submit("rm(empty_completion_root)");
   assert.deepEqual(await inspect("empty_completion_root"), { status: "missing" });
+
+  assert.equal(backend.hasCapability(session, "function-source"), true,
+    "supported R installations must provide guarded source inspection");
+  await submit("source_counter <- 0L; make_data <- function() { source_counter <<- source_counter + 1L; list(alpha = 1L) }");
+  const first = await inspect("make_data", [], "source");
+  assert.equal(first?.status, "source");
+  assert.match(first.text, /alpha/);
+  assert.match(first.text, /function/);
+  await submit("unrelated_value <- 100L");
+  assert.deepEqual(await inspect("make_data", [], "source"), first,
+    "separate unrelated submissions do not lose stored closure source");
+  assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["alpha"]);
+  const middle = (await completeStored("make_data()$alold", "make_data()$al".length))[0];
+  assert.equal(middle?.insertText, "alpha");
+  assert.equal(middle.replaceStart, "make_data()$".length);
+  await submit("stopifnot(source_counter == 0L)");
+  await submit("make_data <- function() list(beta = 2L)");
+  const replaced = await inspect("make_data", [], "source");
+  assert.equal(replaced?.status, "source");
+  assert.match(replaced.text, /beta/);
+  assert.doesNotMatch(replaced.text, /alpha/);
+  assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["beta"]);
+  await submit("make_data <- compiler::cmpfun(function(x = stop('default executed')) list(compiled = 1))");
+  assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["compiled"]);
+  await submit("make_data <- function() { local_fn <- function(x = NA_real_) list(nested = x); local_fn() }");
+  assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["nested"]);
+  await submit('`make data` <- function(`odd arg` = "\\\"\\n") list(`odd field` = 1)');
+  assert.deepEqual((await completeStored("`make data`()$")).map(item => item.label), ["odd field"]);
+  await submit('makeActiveBinding("active_source", function(...) stop("executed active binding"), .GlobalEnv)');
+  assert.deepEqual(await inspect("active_source", [], "source"),
+    { status: "suppressed", reason: "active-binding" });
+  assert.deepEqual(Array.from(await completeStored("active_source()$")), []);
+  await submit('delayedAssign("deferred_source", { stop("forced promise"); function() list(secret = 1) })');
+  assert.deepEqual(await inspect("deferred_source", [], "source"),
+    { status: "suppressed", reason: "deferred-binding" });
+  await submit("not_a_closure <- list(alpha = 1)");
+  assert.deepEqual(await inspect("not_a_closure", [], "source"), { status: "unavailable" });
+  await submit('wide_source <- function() NULL; body(wide_source) <- as.call(c(list(as.name("list")), rep(list(1L), 5000L))); deep_source <- function() NULL; deep_expr <- quote(list(alpha = 1)); for (i in 1:80) deep_expr <- as.call(list(as.name("identity"), deep_expr)); body(deep_source) <- deep_expr');
+  for (const name of ["wide_source", "deep_source"]) {
+    assert.deepEqual(await inspect(name, [], "source"), { status: "unavailable" },
+      "stored syntax traversal must remain bounded before it is serialized");
+  }
+  assert.equal((await inspect("make_data", [], "source"))?.status, "source",
+    "a bounded refusal releases native state for the next request");
+  await submit("rm(make_data)");
+  assert.deepEqual(await inspect("make_data", [], "source"), { status: "unavailable" });
+  assert.deepEqual(Array.from(await completeStored("make_data()$")), []);
+  await sourceClient.dispose();
 
   // Compile against this installation of R. CI installs Rtools on Windows;
   // missing compilers or callback support fail the safety test, never skip it.
@@ -86,6 +147,11 @@ test("real embedded R completion inspects nested storage without running user co
   execFileSync(rPath, ["CMD", "SHLIB", "-o", fixture, "member_safety.c"],
     { cwd, env, encoding: "utf8", timeout: 60000 });
   await submit(`dyn.load(${JSON.stringify(path.join(cwd, fixture).replaceAll("\\", "/"))}); native_safety <- .Call("member_safety_objects"); alt_index <- native_safety$index; native_database <- attach(native_safety$database, name = "member_safety_database", warn.conflicts = FALSE); detach("member_safety_database"); native_holder <- list(db = native_database); .Call("member_safety_reset")`);
+  await submit('alt_body <- function() NULL; body(alt_body) <- substitute(list(alpha = VALUE), list(VALUE = alt_index)); alt_default <- function(x) list(alpha = 1); formals(alt_default) <- list(x = alt_index); alt_string <- function() NULL; body(alt_string) <- substitute(list(alpha = VALUE), list(VALUE = attr(native_safety$names, "names"))); .Call("member_safety_reset")');
+  for (const name of ["alt_body", "alt_default", "alt_string"]) {
+    assert.deepEqual(await inspect(name, [], "source"), { status: "suppressed", reason: "unsafe-altrep" },
+      "source inspection rejects embedded ALTREP before length/element callbacks");
+  }
   for (const expression of ["native_safety$names", "native_safety$class$inner",
     "native_safety$list", "native_safety$list[[1]]", "native_safety[[alt_index]]"]) {
     assert.deepEqual(await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression)),
@@ -102,6 +168,9 @@ test("real embedded R completion inspects nested storage without running user co
   await until(() => output.includes("NATIVE_SAFETY_COUNTS:"), "native safety counters");
   assert.match(output, /NATIVE_SAFETY_COUNTS:\s*0,0,0,0,0/,
     "inspection must not run ALTREP length/element or database exists/get/objects callbacks");
+  await submit('invisible(deparse(alt_string)); cat("DEPARSE_CALLBACKS_LIVE:", any(.Call("member_safety_counts")[1:2] > 0L), "\\n")');
+  assert.match(output, /DEPARSE_CALLBACKS_LIVE:\s*TRUE/,
+    "the original general-deparser path would invoke callbacks in stored function syntax");
   // Positive controls prove these are live callbacks, not inert class labels.
   await submit('invisible(length(alt_index)); invisible(alt_index[[1]]); invisible(exists("inner", envir = native_database, inherits = FALSE)); invisible(get("inner", envir = native_database, inherits = FALSE)); invisible(ls(native_database)); cat("NATIVE_CALLBACKS_LIVE:", all(.Call("member_safety_counts") > 0L), "\\n")');
   await until(() => output.includes("NATIVE_CALLBACKS_LIVE:"), "native callback positive controls");

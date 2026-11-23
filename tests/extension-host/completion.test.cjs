@@ -335,11 +335,16 @@ suite("Static fallback routing in the VS Code extension host", () => {
       "vscode-languageclient/node": require("vscode-languageclient/node"),
     });
     let staticEnabled = true;
-    const native = [];
+    const native = [], sourceRequests = [];
+    let storedDefinition = "function() list(stored_alpha = 1)";
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, "../.."),
       rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
       getStaticAnalysisEnabled: () => staticEnabled,
+      requestRuntimeFunctionSource: async name => {
+        sourceRequests.push(name);
+        return name === "make_data" ? storedDefinition : undefined;
+      },
       requestRuntimeMemberCompletions: async (receiver, target) => {
         native.push([receiver, target]);
         if (receiver === "new_obj") return { status: "missing" };
@@ -369,6 +374,19 @@ suite("Static fallback routing in the VS Code extension host", () => {
       assert.ok(callable.includes("data") && callable.includes("metadata"),
         "source-defined factory members are inferred without evaluating the call");
       assert.equal(native.length, 1, "executable receivers must never reach the native inspector");
+      // Previously submitted definitions are absent from the editable buffer,
+      // but their current stored closure must still be available to the LSP.
+      const stored = await complete("make_data()$");
+      assert.ok(stored.includes("stored_alpha"),
+        "source inference must inspect a function defined before this input");
+      assert.ok(!stored.includes("data"), "earlier projection is not retained");
+      storedDefinition = "function() list(redefined_beta = 2)";
+      const redefined = await complete("make_data()$");
+      assert.ok(redefined.includes("redefined_beta") && !redefined.includes("stored_alpha"),
+        "a redefined stored function is re-inferred, not served from a source journal");
+      assert.deepEqual(sourceRequests, ["make_data", "make_data", "make_data"]);
+      assert.deepEqual(native, [["obj", "$"]], "function source lookup never executes an accessor");
+
 
       // Older released languageserver versions do not infer quoted [[ keys.
       // Route without executing receivers, and validate any member edit when

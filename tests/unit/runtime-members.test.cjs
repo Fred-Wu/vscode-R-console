@@ -92,7 +92,22 @@ test("native results distinguish silent empty from unavailable and unsafe access
   assert.match(parseBackendFrames(frame(Buffer.from([9, 0]))).error,
     /invalid member inspection status/);
   assert.match(parseBackendFrames(frame(Buffer.from([10]))).error,
-    /invalid member inspection result/);
+    /invalid function source length/);
+  const source = "function() list(alpha = 1)";
+  assert.deepEqual(parseBackendFrames(frame(Buffer.concat([
+    Buffer.from([10]), Buffer.from(source, "utf8")
+  ]))).events, [{ type: "member-names-result", requestId: 42,
+    result: { status: "source", text: source } }]);
+  for (const bytes of [Buffer.from([10, 0]), Buffer.from([10, 0xff]),
+    Buffer.concat([Buffer.from([10]), Buffer.alloc(64 * 1024 + 1, 97)])]) {
+    assert.ok(parseBackendFrames(frame(bytes)).error, "invalid function text must be rejected");
+  }
+  const sourceQuery = encodeMemberNamesRequestFrame(43,
+    { root: "make_data", steps: [], target: "source" });
+  assert.equal(sourceQuery.subarray(12)[0], 4);
+  assert.throws(() => encodeMemberNamesRequestFrame(44, {
+    root: "make_data", steps: [{ kind: "field", name: "x" }], target: "source",
+  }), /invalid member inspection request/);
   const typed = Buffer.concat([Buffer.from([1, 2, 0, 0, 0]),
     Buffer.from([6, 0, 0, 0]), Buffer.from("method"),
     Buffer.from([5, 0, 0, 0]), Buffer.from("value"), Buffer.from([1, 0])]);

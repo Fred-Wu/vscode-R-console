@@ -239,6 +239,11 @@ impl OutputSink {
         let mut payload = Vec::new();
         match result {
             Inspection::Unavailable => payload.push(0),
+            Inspection::FunctionSource(source) if !source.is_empty() && source.len() <= 64 * 1024 => {
+                payload.push(10);
+                payload.extend_from_slice(source.as_bytes());
+            }
+            Inspection::FunctionSource(_) => payload.push(0),
             Inspection::Suppressed(reason) => payload.push(match reason {
                 Suppression::ActiveBinding => 2,
                 Suppression::DeferredBinding => 3,
