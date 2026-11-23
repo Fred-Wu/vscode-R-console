@@ -112,6 +112,11 @@ console_member_function <- function(uri, workspace, document, point, root = NULL
         if (!length(binding$type) && is.null(binding$function_expr) && is.null(binding$function_key))
             return(list(unknown = TRUE))
     }
+    history <- if (!is.null(root)) resolved$index$document_bindings[[root]] else NULL
+    at <- resolved$bindings$.__member_position__
+    source_binding <- !is.null(source_root) || (!is.null(root) &&
+        (root %in% names(resolved$bindings) || (length(history) &&
+            (is.null(at) || languageserver:::member_history_position(history, at) > 0L))))
     definition <- resolved$value$function_expr
     if (is.null(definition) && !is.null(resolved$value) &&
         exists("member_symbol_info", asNamespace("languageserver"), inherits = FALSE)) {
@@ -133,15 +138,8 @@ console_member_function <- function(uri, workspace, document, point, root = NULL
         # A source-defined factory can have an unknown result while still
         # shadowing a live object. Reuse native binding history even when the
         # recovery XML contains only the unfinished call at the cursor.
-        if (!is.null(root)) {
-            history <- resolved$index$document_bindings[[root]]
-            at <- resolved$bindings$.__member_position__
-            if (root %in% names(resolved$bindings) || (length(history) &&
-                (is.null(at) || languageserver:::member_history_position(history, at) > 0L))) {
-                return(list(unknown = TRUE))
-            }
-        }
+        if (source_binding) return(list(unknown = TRUE, source_binding = TRUE))
         return(NULL)
     }
-    list(formals = definition[[2L]])
+    list(formals = definition[[2L]], source_binding = source_binding)
 }

@@ -45,7 +45,12 @@ export async function getLanguageServerCompletions(
     // its replacement start intact; never rewrite code to manufacture results.
     // Broadening a prefix cannot recover an unresolved method signature. It
     // would repeat both the native inspection and the same LSP lookup.
-    if (context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
+    const structuralFailure = (context.kind === "member" || context.kind === "bracket") &&
+      staticReason !== undefined && [
+      "receiver-unresolved", "unresolved-dispatch", "unsupported-context",
+      "analysis-limit", "inference-cycle", "no-receiver-members",
+    ].includes(staticReason);
+    if (!structuralFailure && context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];

@@ -68,10 +68,11 @@ test("installed package chain signatures also supply arguments without running t
     'CMD', 'INSTALL', '--no-byte-compile', '--no-test-load', '-l', session, source,
   ], { stdio: 'pipe' });
   let inspections = 0;
+  let inspection = { status: 'unavailable' };
   const cache = path.join(path.dirname(session), 'package-cache');
   const { client } = createConsoleLsp(t, { libraries: [session],
     env: { ...process.env, R_LANGSVR_PACKAGE_CACHE_DIR: cache },
-    requestRuntimeFunctionArguments: () => { inspections++; return { status: 'unavailable' }; } });
+    requestRuntimeFunctionArguments: () => { inspections++; return inspection; } });
   await client.syncSessionState({ attachedPackages: [pkg] });
   await waitFor(() => fs.existsSync(path.join(cache, 'package-metadata')) &&
     fs.readdirSync(path.join(cache, 'package-metadata')).some(name => name.startsWith(pkg + '-members-')),
@@ -130,6 +131,23 @@ test("installed package chain signatures also supply arguments without running t
   assert.deepEqual((await collect(pkg + '::api$scan()$collect(│)'))
     .filter(item => item.role === 'argument'), [], 'source inference stays opt-in');
   assert.equal(inspections, 0, 'an executable receiver must not reach runtime inspection');
+  await client.syncSessionState({ attachedPackages: [pkg] });
+  client.setStaticAnalysis(true);
+  inspection = { status: 'arguments', names: ['live_arg'] };
+  assert.deepEqual((await collect('api$scan(│)')).filter(item => item.role === 'argument')
+    .map(item => item.label), ['live_arg'], 'live global shadows attached package catalog');
+  for (const result of [inspection, { status: 'suppressed', reason: 'active-binding' }]) {
+    inspection = result;
+    assert.deepEqual((await collect('api <- list(scan = function(draft_arg) NULL)\napi$scan(│)'))
+      .filter(item => item.role === 'argument').map(item => item.label), ['draft_arg']);
+    assert.deepEqual((await collect('api <- unknown_factory()\napi$scan(│)'))
+      .filter(item => item.role === 'argument'), []);
+  }
+  assert.deepEqual((await collect('api$scan(│)')).filter(item => item.role === 'argument'), [],
+    'a refused live binding cannot borrow its package namesake');
+  assert.deepEqual((await collect(pkg + '::api$scan(│)')).filter(item => item.role === 'argument')
+    .map(item => item.label), ['path'], 'explicit namespace retains package identity');
+
 });
 
 test("project startup supplies package libraries without session path probes", { timeout: 120000 }, async t => {

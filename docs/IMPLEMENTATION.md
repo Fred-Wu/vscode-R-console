@@ -1395,7 +1395,10 @@ than using R's general deparser. Embedded ALTREP values and promises are
 rejected before any callback or forcing operation, and attributed or unsupported
 literal objects are unavailable. Traversal is limited to 4,096 nodes, 64 levels
 and 64 KiB of output, using the existing request deadline and C error boundary.
-Only direct global closure receivers are eligible; methods, namespace calls and
+Only direct global closure receivers whose enclosing environment is the global
+environment are eligible. Closures capturing a local or namespace environment
+return unavailable source because the projection cannot preserve that scope.
+Methods, namespace calls and
 computed call heads continue to use the existing source/package analysis route.
 Named call results can be wrapped in grouping parentheses, including grouping
 within member/index chains. The detector matches delimiters once and unwraps
@@ -1531,6 +1534,9 @@ Completion data comes from one shared flow:
   The R adapter applies its usual positional, partial-name and `...` matching to
   inert formals. With static analysis enabled, current source bindings take
   precedence, including unresolved factories that shadow older session objects.
+  Package catalog signatures yield to verified live argument snapshots and
+  explicit inspection refusals when the editable input has no binding for that
+  receiver. Explicit namespace receivers retain their package identity.
   Unavailable method arguments produce a reason-and-action completion log;
   a known zero-argument or fully supplied signature is silently complete.
 - with static analysis enabled, chained method calls retain their complete
@@ -1548,7 +1554,10 @@ Completion data comes from one shared flow:
   argument lookup; complete input reuses the existing parse. These optimizations
   do not cache runtime argument snapshots across requests. An unresolved method
   signature does not trigger a second inspection just to broaden its argument
-  prefix; known signatures still support abbreviation matching.
+  prefix; known signatures still support abbreviation matching. Static
+  receiver failures also skip prefix broadening when inference reports an
+  unresolved receiver, unsupported context, dispatch failure, cycle or analysis
+  limit. Pending metadata remains eligible for retry.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
 

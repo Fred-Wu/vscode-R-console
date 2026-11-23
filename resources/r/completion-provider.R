@@ -126,11 +126,21 @@ console_supplement_completion <- function(reply, self, params) {
     method_root <- if (member_call) console_call_root(params$rConsoleCall, include_calls = TRUE) else NULL
     source_root <- if (static_analysis && member_call && !is.null(method_root))
         console_source_function(document, point, method_root) else NULL
+    runtime_method <- if (member_call) console_runtime_arguments(params) else NULL
+    runtime_method_evidence <- member_call && (!is.null(runtime_method) ||
+        isTRUE(params$rConsoleRuntimeArgumentsRefused))
     native_signature <- if (native_arguments) console_native_signature(reply$result$items, uri) else NULL
     native_member <- static_analysis && member_call && member_arguments && !is.null(native_signature) &&
-        is.null(source_root) && !identical(method_root, "")
+        is.null(source_root) && !runtime_method_evidence && !identical(method_root, "")
     member_source <- if (static_analysis && member_call && !native_member)
         console_member_function(uri, workspace, document, point, method_root, source_root) else NULL
+    # Only an editable source binding can supersede a verified live signature
+    # or refusal. A package catalog may describe a shadowed namesake.
+    if (runtime_method_evidence && is.null(source_root) &&
+        !isTRUE(member_source$source_binding) && !isTRUE(member_source$unknown)) {
+        member_source <- NULL
+        native_arguments <- FALSE
+    }
     # A current source binding (including an unresolved factory or a formal)
     # must not borrow arguments from an older, same-named live object.
     source_method_root <- static_analysis && (native_member || !is.null(member_source) || !is.null(source_root))
@@ -144,7 +154,7 @@ console_supplement_completion <- function(reply, self, params) {
     if (source_is_static) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE
     runtime <- if (is.null(source) && !is.null(call) && is.null(call$package)) {
         if (member_call) {
-            if (!source_method_root) console_runtime_arguments(params) else NULL
+            if (!source_method_root) runtime_method else NULL
         } else {
             parsed <- console_parse_signature(params$rConsoleRuntimeSignature)
             if (!is.null(parsed)) list(formals = parsed[[2L]]) else console_runtime_arguments(params)

@@ -193,6 +193,7 @@ pub(crate) struct InspectorApi {
     vmaxset: usize,
     formals: Option<usize>,
     body: Option<usize>,
+    closure_env: Option<usize>,
     logical_elt: Option<usize>,
     is_na: Option<usize>,
 }
@@ -203,7 +204,7 @@ impl InspectorApi {
     }
 
     pub(crate) fn supports_function_source(&self) -> bool {
-        self.formals.is_some() && self.body.is_some() && self.car.is_some() &&
+        self.formals.is_some() && self.body.is_some() && self.closure_env.is_some() && self.car.is_some() &&
             self.logical_elt.is_some() && self.integer_elt.is_some() && self.real_elt.is_some() && self.is_na.is_some()
     }
 
@@ -262,6 +263,7 @@ impl InspectorApi {
             // Stored syntax access only. R_ClosureExpr also exposes byte-compiled source.
             formals: symbol(b"R_ClosureFormals\0").or_else(|| symbol(b"FORMALS\0")),
             body: symbol(b"R_ClosureExpr\0"),
+            closure_env: symbol(b"R_ClosureEnv\0").or_else(|| symbol(b"CLOENV\0")),
             logical_elt: symbol(b"LOGICAL_ELT\0"),
             is_na: symbol(b"R_IsNA\0"),
         })
@@ -348,6 +350,7 @@ const RMG_FORMALS: c_int = 32;
 const RMG_BODY: c_int = 33;
 const RMG_LOGICAL_ELT: c_int = 34;
 const RMG_IS_NA: c_int = 35;
+const RMG_CLOSURE_ENV: c_int = 36;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
@@ -464,6 +467,9 @@ unsafe extern "C" fn guard_promise_environment(a: Sexp) -> Sexp {
 unsafe extern "C" fn guard_formals(a: Sexp) -> Sexp {
     guarded(RMG_FORMALS, a as usize, 0, 0) as usize as Sexp
 }
+unsafe extern "C" fn guard_closure_env(a: Sexp) -> Sexp {
+    guarded(RMG_CLOSURE_ENV, a as usize, 0, 0) as usize as Sexp
+}
 unsafe extern "C" fn guard_body(a: Sexp) -> Sexp {
     guarded(RMG_BODY, a as usize, 0, 0) as usize as Sexp
 }
@@ -475,7 +481,7 @@ unsafe extern "C" fn guard_is_na(value: f64) -> bool {
 }
 
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 36] = [
+    let funcs: [usize; 37] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
@@ -484,7 +490,7 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
         api.char_ce, api.enclosing_env, api.promise_value, api.promise_expression, api.promise_environment,
-        api.formals.unwrap_or(0), api.body.unwrap_or(0), api.logical_elt.unwrap_or(0), api.is_na.unwrap_or(0),
+        api.formals.unwrap_or(0), api.body.unwrap_or(0), api.logical_elt.unwrap_or(0), api.is_na.unwrap_or(0), api.closure_env.unwrap_or(0),
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
         api.raw_protect, api.raw_unprotect,
@@ -543,6 +549,7 @@ struct Native {
     deadline: Instant,
     formals: Option<Unary>,
     body: Option<Unary>,
+    closure_env: Option<Unary>,
     logical_elt: Option<unsafe extern "C" fn(Sexp, isize) -> c_int>,
     is_na: Option<unsafe extern "C" fn(f64) -> bool>,
 }
@@ -604,6 +611,7 @@ impl Native {
             deadline,
             formals: api.formals.map(|_| guard_formals as _),
             body: api.body.map(|_| guard_body as _),
+            closure_env: api.closure_env.map(|_| guard_closure_env as _),
             logical_elt: api.logical_elt.map(|_| guard_logical_elt as _),
             is_na: api.is_na.map(|_| guard_is_na as _),
         })

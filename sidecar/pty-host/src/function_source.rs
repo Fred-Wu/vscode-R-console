@@ -47,6 +47,12 @@ impl Native {
         if !query.steps.is_empty() { return Err(Suppression::InspectionLimit); }
         let Some(root) = self.binding(self.global, &query.root)? else { return Err(Suppression::InspectionLimit); };
         if (self.type_of)(root) != CLOSURE { return Err(Suppression::InspectionLimit); }
+        // Projection defines the closure in global scope. Only closures whose
+        // enclosing environment is that same scope can retain their bindings.
+        // Read the environment pointer through the C guard without traversing it.
+        if self.closure_env.ok_or(Suppression::InspectionLimit)?(root) != self.global {
+            return Err(Suppression::InspectionLimit);
+        }
         let formals = self.formals.ok_or(Suppression::InspectionLimit)?;
         let body = self.body.ok_or(Suppression::InspectionLimit)?;
         (self.protect)(root);

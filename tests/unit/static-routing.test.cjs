@@ -398,7 +398,7 @@ test("static fallback distinguishes missing services, failed requests and absent
 test("static fallback retains only validated diagnostic metadata across matching retries", async () => {
   let requests = 0;
   const h = harness({ lspItems: () => ++requests === 1
-    ? { items: [], rConsoleStaticUnavailableReason: "receiver-unresolved" }
+    ? { items: [], rConsoleStaticUnavailableReason: "analysis-pending" }
     : { items: [], rConsoleMemberResolved: true } });
   await h.complete("make_data()$al");
   assert.equal(requests, 2);
@@ -640,5 +640,15 @@ test("source bracket routing counts individual nested delimiters", async () => {
     assert.deepEqual(labels(await h.complete(text, cursor)), ["alpha"], text);
     assert.deepEqual(h.sourceRequests, ["wrapper"], text);
     assert.deepEqual(h.native, [], text);
+  }
+});
+
+
+test("structural inference failures skip prefix retries while pending analysis stays retryable", async () => {
+  for (const reason of ['receiver-unresolved', 'unresolved-dispatch', 'unsupported-context',
+    'analysis-limit', 'inference-cycle', 'no-receiver-members', 'analysis-pending', undefined]) {
+    const h = harness({ lspItems: { items: [], rConsoleStaticUnavailableReason: reason } });
+    await h.complete('unknown_factory()$abc');
+    assert.equal(h.requests.length, reason === 'analysis-pending' || reason === undefined ? 2 : 1, reason);
   }
 });

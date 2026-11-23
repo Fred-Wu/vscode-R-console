@@ -136,6 +136,21 @@ test("real embedded R completion inspects nested storage without running user co
     assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["piped"], expression);
     await submit("stopifnot(source_counter == 0L)");
   }
+  // Stored source projection must preserve lexical binding identity.
+  for (const definition of [
+    'local({ x <- list(correct = 1); function() x })',
+    'local({ x <- list(correct = 1); compiler::cmpfun(function() x) })',
+    'local({ x <- list(correct = 1); function(value = x) value })',
+  ]) {
+    await submit('captured_source <- ' + definition);
+    assert.deepEqual(await inspect('captured_source', [], 'source'), { status: 'unavailable' });
+    assert.deepEqual(Array.from(await completeStored('x <- list(wrong = 2)\ncaptured_source()$')), []);
+    await submit('stopifnot(identical(names(captured_source()), "correct"))');
+  }
+  await submit('captured_source <- base::identity');
+  assert.deepEqual(await inspect('captured_source', [], 'source'), { status: 'unavailable' });
+  await submit('captured_source <- function() list(global = 1)');
+  assert.deepEqual((await completeStored('captured_source()$')).map(item => item.label), ['global']);
   await submit("make_data <- compiler::cmpfun(function(x = stop('default executed')) list(compiled = 1))");
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["compiled"]);
   await submit("make_data <- function() { local_fn <- function(x = NA_real_) list(nested = x); local_fn() }");
