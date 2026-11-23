@@ -501,3 +501,42 @@ test("multiline quoted brackets reach source inference without live evaluation",
   assert.deepEqual(h.native, []);
   assert.equal(h.requests[0].mode, "static");
 });
+
+test("literal names begun on earlier lines never expose unrepresentable edits", async () => {
+  for (const text of [
+    "make_data()$`odd\nfi", "obj$`odd\nfi", "outer(make_data()$`odd\nfi",
+    'make_data()[["odd\nfi', 'outer(make_data()[["odd\nfi', 'obj[["odd\nfi',
+  ]) {
+    const input = snapshot(text);
+    assert.equal(completion.getStaticFallbackContext(input.currentLine, input.cursorCol, text), undefined, text);
+    for (const staticAnalysis of [false, true]) {
+      const h = harness({ staticAnalysis, storedSources: { make_data: 'function() list("odd\\nfield" = 1)' },
+        inspected: { status: "available", names: ["odd\nfield"] },
+        lspItems: { items: [{ label: "odd\nfield", kind: 4, data: { type: "member" } }] } });
+      assert.deepEqual(labels(await h.complete(text)), [], text);
+      assert.deepEqual(h.native, [], text);
+      assert.deepEqual(h.requests, [], text);
+      assert.deepEqual(h.sourceRequests, [], text);
+    }
+  }
+});
+
+test("source bracket routing counts individual nested delimiters", async () => {
+  for (const text of [
+    'wrapper(make_data()[x[1]])[["al',
+    'wrapper(make_data()[[x[1]]])[["al',
+    'wrapper(make_data()[[x[1]]])[["alold"]]',
+    'wrapper(make_data()[x[1]])["al',
+  ]) {
+    const cursor = text.indexOf('"al') + 3;
+    const context = completion.getStaticFallbackContext(text, cursor);
+    assert.equal(context?.kind, "bracket", text);
+    assert.equal(context.prefix, "al", text);
+    assert.equal(context.bracketQuote, '"', text);
+    assert.equal(context.replaceStart, cursor - 2, text);
+    const h = harness({ storedSources: { wrapper: "function(x) list(alpha = 1)" } });
+    assert.deepEqual(labels(await h.complete(text, cursor)), ["alpha"], text);
+    assert.deepEqual(h.sourceRequests, ["wrapper"], text);
+    assert.deepEqual(h.native, [], text);
+  }
+});

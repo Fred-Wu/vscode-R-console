@@ -51,9 +51,18 @@ export function getCompletionContext(
   const identifierEnd = syntax.identifierEnd;
   const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - relativeOffset };
   const dataObjectName = syntax.dataObject;
+  // Completion starts are columns in the current line. A literal name begun
+  // on an earlier line cannot be represented by that edit contract; suppress
+  // it rather than letting the terminal clamp a negative column and corrupt
+  // the name. Escaped newlines within a single source line remain supported.
+  const outsideLine = (): CompletionContext => ({
+    kind: "default", suppressAutomatic: true, prefix: "", replaceStart: beforeCursor.length,
+    snapshotInput, snapshotCursor,
+  });
 
   const member = syntax.member;
   if (member) {
+    if (member.replaceStart < relativeOffset) return outsideLine();
     const { operator, prefix } = member;
     const replaceStart = member.replaceStart - (textForDataContext.length - beforeCursor.length);
     if (operator === "::" || operator === ":::") {
@@ -93,6 +102,7 @@ export function getCompletionContext(
   // unsupported member receiver as a default/global completion request.
   const memberSuffix = syntax.memberSuffix;
   if (memberSuffix) {
+    if (memberSuffix.replaceStart < relativeOffset) return outsideLine();
     return {
       kind: "member",
       prefix: memberSuffix.prefix,
@@ -244,13 +254,15 @@ export function getStaticFallbackContext(
   for (const token of tokens) {
     if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace ||
         token.type === TokenType.LeftBracket) {
-      frames.push({ value: token.value[0], start: token.position,
+      for (const value of token.value) frames.push({ value, start: token.position,
         ...(token.type === TokenType.LeftBracket
           ? { operator: token.value as "[" | "[[" } : {}) });
     } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace ||
                token.type === TokenType.RightBracket) {
-      const expected = token.value[0] === ")" ? "(" : token.value[0] === "}" ? "{" : "[";
-      if (frames.pop()?.value !== expected) return undefined;
+      for (const value of token.value) {
+        const expected = value === ")" ? "(" : value === "}" ? "{" : "[";
+        if (frames.pop()?.value !== expected) return undefined;
+      }
     }
   }
   const active = frames.at(-1);
@@ -272,6 +284,7 @@ export function getStaticFallbackContext(
     // Do not suggest members inside an index expression or after a comma.
     return undefined;
   }
+  if (replaceStart < 0) return undefined;
   // A completed quote after the cursor is part of the original source and
   // must not be replaced when inserting a member name.
   const stringToken = quote ? syntax.tokens.find(token =>

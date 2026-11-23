@@ -404,6 +404,9 @@ suite("Static fallback routing in the VS Code extension host", () => {
         assert.equal(sourceRequests.at(-1), "make_data");
       }
       assert.deepEqual(native, [["obj", "$"]], "continued and quoted receivers remain source-only");
+      storedDefinition = 'function() list("odd\\nfield" = 1)';
+      assert.deepEqual(await complete("make_data()$`odd\nfi"), [],
+        "literal names begun on another line must not expose invalid replacement columns");
 
 
       // Older released languageserver versions do not infer quoted [[ keys.

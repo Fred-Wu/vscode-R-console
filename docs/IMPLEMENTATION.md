@@ -1388,6 +1388,11 @@ completion lexer snapshot. Stored call serialization accepts both pairlist and
 language cons cells in argument spines, including R's native-pipe rewrites,
 without evaluating either representation. Character quoting enforces the UTF-8
 byte budget without allocating a temporary string for each ordinary character.
+The edit adapter requires replacement starts on the current console line, so
+literal names begun on an earlier line are suppressed instead of exposing
+negative replacement columns. Names containing escaped newlines on one source
+line remain supported. Bracket routing counts each delimiter independently,
+including adjacent closing brackets shared by nested single/double indices.
 
 #### Completion Frontends
 
