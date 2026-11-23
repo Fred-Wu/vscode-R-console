@@ -445,3 +445,59 @@ test("runtime-only completion never requests a live function definition", async 
   assert.deepEqual(labels(await h.complete("make_data()$")), []);
   assert.deepEqual(h.sourceRequests, []);
 });
+
+
+test("continued and quoted executable members keep static routing and exclude ambient names", async () => {
+  for (const [marked, prefix] of [
+    ["make_data()$\n  al│", "al"],
+    ["make_data()$ # continuation\n  al│old", "al"],
+    ["make_data()$\n# comment\nal│", "al"],
+    ["make_data()$\n  │", ""],
+    ["make_data()$`al│", "al"],
+    ["make_data()$`al│old`", "al"],
+    [String.raw`make_data()$` + '`a\\x6c│old`', "al"],
+  ]) {
+    const cursor = marked.indexOf("│"), text = marked.replace("│", "");
+    const input = snapshot(text, cursor);
+    const context = completion.getStaticFallbackContext(input.currentLine, input.cursorCol,
+      input.textBeforeCursor, text.slice(cursor));
+    assert.equal(context?.prefix, prefix, marked);
+    assert.equal(context?.kind, "member", marked);
+    const h = harness({ storedSources: { make_data: "function() list(alpha = 1)" },
+      sessionData: { globalenv: { al_unrelated: { type: "double" } } } });
+    const items = await h.complete(text, cursor);
+    assert.deepEqual(labels(items), ["alpha"], marked);
+    assert.deepEqual(h.sourceRequests, ["make_data"], marked);
+    assert.deepEqual(h.native, [], marked);
+    assert.equal(h.requests[0].mode, "static", marked);
+    const pick = items.find(item => "insertText" in item);
+    assert.equal(input.currentLine.slice(0, pick.replaceStart) + pick.insertText +
+      input.currentLine.slice(pick.replaceEnd ?? input.cursorCol),
+      input.currentLine.slice(0, context.replaceStart) + "alpha", marked);
+    const disabled = harness({ staticAnalysis: false });
+    assert.deepEqual(labels(await disabled.complete(text, cursor)), [], marked);
+    assert.deepEqual(disabled.requests, [], marked);
+    assert.deepEqual(disabled.native, [], marked);
+  }
+});
+
+test("backticked safe receivers retain live authority and decoded prefixes", async () => {
+  for (const staticAnalysis of [false, true]) {
+    const h = harness({ staticAnalysis, inspected: { status: "available", names: ["odd field"] } });
+    const text = "obj$`oddold`", cursor = "obj$`odd".length;
+    const items = await h.complete(text, cursor);
+    const pick = items.find(item => "insertText" in item);
+    assert.equal(text.slice(0, pick.replaceStart) + pick.insertText + text.slice(pick.replaceEnd ?? cursor),
+      "obj$`odd field`");
+    assert.deepEqual(h.native, [["obj", "$"]]);
+    assert.deepEqual(h.requests, []);
+  }
+});
+
+test("multiline quoted brackets reach source inference without live evaluation", async () => {
+  const text = 'make_data()[[\n  "al';
+  const h = harness();
+  assert.deepEqual(labels(await h.complete(text)), ["alpha"]);
+  assert.deepEqual(h.native, []);
+  assert.equal(h.requests[0].mode, "static");
+});

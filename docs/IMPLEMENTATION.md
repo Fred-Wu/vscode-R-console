@@ -1379,6 +1379,16 @@ and 64 KiB of output, using the existing request deadline and C error boundary.
 Only direct global closure receivers are eligible; methods, namespace calls and
 computed call heads continue to use the existing source/package analysis route.
 
+Member context recognition retains prefixes continued after an accessor across
+newlines/comments and unfinished backticked names. A quoted name's replacement
+span includes its delimiters, including an existing closing backtick after the
+cursor. These contexts retain the same live/static routing and never fall back
+to unrelated global symbols. Context checks and stored-call selection reuse the
+completion lexer snapshot. Stored call serialization accepts both pairlist and
+language cons cells in argument spines, including R's native-pipe rewrites,
+without evaluating either representation. Character quoting enforces the UTF-8
+byte budget without allocating a temporary string for each ordinary character.
+
 #### Completion Frontends
 
 Inline completion is the terminal completion frontend selected with

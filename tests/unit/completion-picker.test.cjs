@@ -8,7 +8,7 @@ const entries = (labels, incomplete = false) => Object.assign(labels.map(label =
   label, insertText: label, source: 'lsp', kind: 5,
 })), { isIncomplete: incomplete });
 
-async function openPicker(t, text, initialEntries, collect, delayedEntries) {
+async function openPicker(t, text, initialEntries, collect, delayedEntries, cursor = text.length) {
   let change, hide;
   const pick = { items: [], value: '', activeItems: [],
     onDidChangeValue(fn) { change = fn; }, onDidAccept() {}, onDidHide(fn) { hide = fn; },
@@ -16,11 +16,11 @@ async function openPicker(t, text, initialEntries, collect, delayedEntries) {
   const { pickCompletion } = loadSource('src/Terminal/rTerminal/completionPicker.ts', {
     vscode: { ...vscode, window: { createQuickPick: () => pick } },
   });
-  const context = completion.getCompletionContext(text, text.length) ?? {
+  const context = completion.getStaticFallbackContext(text, cursor) ?? completion.getCompletionContext(text, cursor) ?? {
     kind: 'default', prefix: '', replaceStart: 0, snapshotInput: text, snapshotCursor: text.length,
   };
   const showing = pickCompletion({ context, initialEntries, delayedEntries, force: true, isCurrent: () => true, collect,
-    latestInput: { text, currentLine: text, lines: [text], cursorRow: 0, cursorCol: text.length, textBeforeCursor: text },
+    latestInput: { text, currentLine: text, lines: [text], cursorRow: 0, cursorCol: cursor, textBeforeCursor: text.slice(0, cursor) },
   });
   t.after(async () => { pick.hide(); await showing; });
   return { pick, async type(value) { pick.value = value; change(value); await tick(); },
@@ -406,6 +406,31 @@ test('Quick Pick preserves namespace groups and ordering while refining and clea
       assert.deepEqual(picker.pick.items.map(item => item.insertText ?? item.label),
         query === 'seta' ? ['Functions', 'setattr', 'Variables', 'setAlpha'] :
           ['Functions', 'setattr', 'setDT', 'Variables', 'setAlpha', 'setZ'], query);
+    }
+  }
+});
+
+
+test('quoted member picker refinements preserve R spelling and rebase edits', async t => {
+  for (const receiver of ['obj', 'make_data()']) {
+    for (const query of ['od', 'odd field', 'odd`field', 'odd\\field']) {
+      const text = receiver + '$`oddold`';
+      const cursor = (receiver + '$`odd').length;
+      let requested;
+      const picker = await openPicker(t, text, entries(['odd field'], true), async (context, preview, lines, cursorCol) => {
+        requested = { context, preview, cursorCol };
+        return [{label: query, insertText: '`odd field`', source: 'lsp', kind: 4,
+          replaceStart: context.replaceStart, replaceEnd: context.replaceEnd}];
+      }, undefined, cursor);
+      await picker.type(query);
+      assert.equal(requested?.context.kind, 'member', query);
+      assert.equal(requested.context.prefix, query);
+      assert.equal(requested.context.staticFallback === true, receiver === 'make_data()');
+      assert.equal(requested.preview[requested.context.replaceStart], '`');
+      const pick = picker.pick.items.find(item => 'insertText' in item);
+      assert.ok(pick, query);
+      assert.equal(text.slice(0, pick.replaceStart) + pick.insertText + text.slice(pick.replaceEnd ?? cursor),
+        receiver + '$`odd field`');
     }
   }
 });

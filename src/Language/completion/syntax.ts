@@ -1,5 +1,5 @@
 import type { CompletionContext } from "./types";
-import { TokenType, tokenize, isMemberAccessor, isAccessorNamePrefix } from "../lexer";
+import { TokenType, isAccessorNamePrefix } from "../lexer";
 import { decodeQuotedCompletionPrefix, getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
@@ -7,33 +7,14 @@ function isPipePlaceholder(name: string): boolean {
   return name === "_" || name === ".";
 }
 
-/** A call/expression followed by $ or @ is not a global-name completion.
- * The normal member parser handles safe receivers; suppress the ambient-name
- * fallback when it cannot resolve the receiver without evaluating draft code.
- */
-function hasUnsupportedMemberReceiver(before: string): boolean {
-  if (!before.includes("$") && !before.includes("@")) return false;
-  const tokens = tokenize(before);
-  const last = tokens.at(-2); // EOF follows the final significant token.
-  if (!last) return false;
-  if (isMemberAccessor(last)) {
-    return before.slice(last.position + last.value.length).trim().length === 0;
-  }
-  if (!isAccessorNamePrefix(last) || last.closed === false ||
-      last.position + last.value.length !== before.length) return false;
-  const preceding = tokens.at(-3);
-  return preceding !== undefined && isMemberAccessor(preceding) &&
-    before.slice(preceding.position + preceding.value.length, last.position).trim().length === 0;
-}
-
 /** An unfinished subscript on an unsupported receiver must not fall back
  * to unrelated global symbols. Valid bracket contexts return earlier.
  */
-function hasUnsupportedBracketReceiver(before: string): boolean {
+function hasUnsupportedBracketReceiver(before: string, tokens: ReturnType<typeof getCompletionSyntax>["prefixTokens"]): boolean {
   if (!before.includes("[")) return false;
   const openings: { delimiter: string; position: number }[] = [];
   const matching: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
-  for (const token of tokenize(before)) {
+  for (const token of tokens) {
     if (token.type === TokenType.LeftBracket || token.type === TokenType.LeftParen ||
         token.type === TokenType.LeftBrace) {
       for (const delimiter of token.value) openings.push({ delimiter, position: token.position });
@@ -110,11 +91,16 @@ export function getCompletionContext(
 
   // Without this guard, explicit Tab after make_object()$ treats the
   // unsupported member receiver as a default/global completion request.
-  if (!inLiteral && hasUnsupportedMemberReceiver(textForDataContext)) {
+  const memberSuffix = syntax.memberSuffix;
+  if (memberSuffix) {
     return {
       kind: "member",
-      prefix: "",
-      replaceStart: beforeCursor.length,
+      prefix: memberSuffix.prefix,
+      replaceStart: memberSuffix.replaceStart - relativeOffset,
+      ...replacement,
+      operator: memberSuffix.operator,
+      autoTrigger: true,
+      triggerCharacter: memberSuffix.prefix ? undefined : memberSuffix.operator,
       rejectionReason: "executable-receiver",
       snapshotInput,
       snapshotCursor,
@@ -149,7 +135,7 @@ export function getCompletionContext(
 
   // If the bracket parser refused an executable receiver, do not reinterpret
   // its unfinished index as an unrelated global-symbol completion.
-  if (!inLiteral && hasUnsupportedBracketReceiver(textForDataContext)) {
+  if (!inLiteral && hasUnsupportedBracketReceiver(textForDataContext, syntax.prefixTokens)) {
     return {
       kind: "member",
       prefix: "",
@@ -229,43 +215,29 @@ export function getCompletionContext(
 export function getStaticFallbackContext(
   inputBuffer: string, cursorPosition: number,
   fullTextBeforeCursor?: string,
-  textAfterCursor = inputBuffer.slice(cursorPosition)
+  textAfterCursor = inputBuffer.slice(cursorPosition),
+  runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor)
 ): CompletionContext | undefined {
-  const runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor);
   // Quoted indices on executable receivers may look like ordinary string
   // literals to the strict runtime parser, which must still reject inspection.
-  const quotedIndex = runtime?.suppressAutomatic && inputBuffer.slice(0, cursorPosition).includes("[");
+  const quotedIndex = runtime?.suppressAutomatic && (fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition)).includes("[");
   if (!runtime?.rejectionReason && !quotedIndex) return undefined;
   if (runtime?.rejectionReason && runtime.kind === "member" &&
-      runtime.operator && runtime.objectName) {
+      runtime.operator) {
     return { ...runtime, rejectionReason: undefined, staticFallback: true };
   }
   const localBefore = inputBuffer.slice(0, cursorPosition);
   const before = fullTextBeforeCursor ?? localBefore;
   const shift = before.length - localBefore.length;
   const fullText = before + textAfterCursor;
-  const identifierEnd = getCompletionSyntax(fullText, before.length).identifierEnd;
+  const syntax = getCompletionSyntax(fullText, before.length);
+  const identifierEnd = syntax.identifierEnd;
   const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - shift };
-  const tokens = tokenize(before).filter(token =>
+  const tokens = syntax.prefixTokens.filter(token =>
     token.type !== TokenType.EOF && token.type !== TokenType.Comment && token.type !== TokenType.Newline);
   const end = tokens.at(-1);
   const identifier = end && isAccessorNamePrefix(end) &&
     end.position + end.value.length === before.length ? end : undefined;
-  const beforePrefix = identifier ? tokens.slice(0, -1) : tokens;
-  const accessor = beforePrefix.at(-1);
-  if (accessor?.type === TokenType.Operator && (accessor.value === "$" || accessor.value === "@") &&
-      beforePrefix.length > 1 && before.slice(accessor.position + accessor.value.length).trim() === (identifier?.value ?? "")) {
-    const prefix = identifier?.value ?? "";
-    return {
-      kind: "member", prefix, replaceStart: (identifier?.position ?? before.length) - shift,
-      autoTrigger: true, operator: accessor.value as "$" | "@",
-      triggerCharacter: prefix ? undefined : accessor.value,
-      ...replacement,
-      snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
-      staticFallback: true,
-    };
-  }
-
   // The runtime bracket parser intentionally rejects callable/computed
   // receivers. For LSP only, locate the active bracket without resolving it.
   const frames: Array<{ value: string; start: number; operator?: "[" | "[[" }> = [];
@@ -302,7 +274,7 @@ export function getStaticFallbackContext(
   }
   // A completed quote after the cursor is part of the original source and
   // must not be replaced when inserting a member name.
-  const stringToken = quote ? tokenize(fullText).find(token =>
+  const stringToken = quote ? syntax.tokens.find(token =>
     token.position === end?.position && token.type === TokenType.String) : undefined;
   const quotedEnd = stringToken?.closed ? stringToken.position + stringToken.value.length - 1 - shift : undefined;
   return {

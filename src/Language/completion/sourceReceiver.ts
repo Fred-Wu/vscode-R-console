@@ -1,4 +1,5 @@
-import { TokenType, tokenize, isAccessorNamePrefix } from "../lexer";
+import { TokenType, isAccessorNamePrefix } from "../lexer";
+import { getCompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
 import type { CompletionContext } from "./types";
 
@@ -11,7 +12,7 @@ export function storedFunctionReceiver(
   if (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket")) {
     return undefined;
   }
-  const tokens = tokenize(input.slice(0, cursor)).filter(token =>
+  const tokens = getCompletionSyntax(input, cursor).prefixTokens.filter(token =>
     token.type !== TokenType.EOF && token.type !== TokenType.Newline && token.type !== TokenType.Comment);
   const matchingOpen = (end: number, left: TokenType, right: TokenType): number | undefined => {
     let depth = 0;

@@ -75,13 +75,16 @@ test("real embedded R completion inspects nested storage without running user co
   // The frontend document deliberately contains only the later completion input.
   const { client: sourceClient } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
   const completeStored = async (text, cursor = text.length) => {
-    const context = completion.getStaticFallbackContext(text, cursor, text.slice(0, cursor), text.slice(cursor));
+    const before = text.slice(0, cursor).split("\n");
+    const lines = text.split("\n");
+    const row = before.length - 1, col = before.at(-1).length;
+    const context = completion.getStaticFallbackContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
     const name = completion.storedFunctionReceiver(context, text, cursor);
     const result = await inspect(name, [], "source");
     const definition = result?.status === "source" ? { name, body: result.text } : undefined;
     return completion.collectStaticFallbackEntries(context, {
       getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
-    }, { line: 0, character: cursor }, [], sourceClient, definition);
+    }, { line: row, character: col }, lines.slice(0, row), sourceClient, definition);
   };
   // The wire protocol must distinguish a non-existent live root from an
   // existing root whose storage is authoritatively empty.
@@ -112,12 +115,33 @@ test("real embedded R completion inspects nested storage without running user co
   assert.match(replaced.text, /beta/);
   assert.doesNotMatch(replaced.text, /alpha/);
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["beta"]);
+  for (const expression of [
+    "list(piped = 1) |> identity()",
+    "list(piped = 1) |> identity() |> identity()",
+    "list(piped = 1) |> (function(x) x)()",
+  ]) {
+    await submit(`make_data <- function(x = stop('default executed')) { source_counter <<- source_counter + 1L; ${expression} }`);
+    assert.equal((await inspect("make_data", [], "source"))?.status, "source", expression);
+    assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["piped"], expression);
+    await submit("stopifnot(source_counter == 0L)");
+  }
   await submit("make_data <- compiler::cmpfun(function(x = stop('default executed')) list(compiled = 1))");
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["compiled"]);
   await submit("make_data <- function() { local_fn <- function(x = NA_real_) list(nested = x); local_fn() }");
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["nested"]);
   await submit('`make data` <- function(`odd arg` = "\\\"\\n") list(`odd field` = 1)');
   assert.deepEqual((await completeStored("`make data`()$")).map(item => item.label), ["odd field"]);
+  for (const marked of [
+    "`make data`()$`odd│", "`make data`()$`odd│old`",
+    "`make data`()$\n  `odd│old`", "`make data`()$ # continuation\n  odd│old",
+  ]) {
+    const cursor = marked.indexOf("│"), text = marked.replace("│", "");
+    const entries = await completeStored(text, cursor);
+    assert.deepEqual(entries.map(item => item.label), ["odd field"], marked);
+    const line = text.split("\n").at(-1), col = text.slice(0, cursor).split("\n").at(-1).length;
+    assert.equal(line.slice(0, entries[0].replaceStart) + entries[0].insertText + line.slice(entries[0].replaceEnd ?? col),
+      line.slice(0, line.indexOf("odd") - Number(line.includes("`odd"))) + "`odd field`", marked);
+  }
   await submit('makeActiveBinding("active_source", function(...) stop("executed active binding"), .GlobalEnv)');
   assert.deepEqual(await inspect("active_source", [], "source"),
     { status: "suppressed", reason: "active-binding" });

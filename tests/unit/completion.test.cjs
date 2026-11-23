@@ -557,7 +557,7 @@ test("computed subscript receiver is rejected before LSP or native inspection", 
 });
 
 test("member-like text in literals and comments does not request runtime members", async () => {
-  for (const input of ['"obj$fi', 'r"(obj$fi)', "# obj$fi", "obj$ # fi", "obj$`fi"]) {
+  for (const input of ['"obj$fi', 'r"(obj$fi)', "# obj$fi", "obj$ # fi"]) {
     const context = completion.getCompletionContext(input, input.length);
     assert.notEqual(context?.kind, "member", input);
     if (!context) continue;

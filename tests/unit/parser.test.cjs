@@ -152,8 +152,8 @@ test("member context reads complete chains and balanced subscripts from tokens",
 
 test("member detection refuses literals, comments and unsupported or broken object expressions", () => {
   for (const input of [
-    '"obj$fi', '"obj$fi"', 'r"--(obj$fi)--"', "# obj$fi", "obj$ # fi", "obj$`fi",
-    "obj$`escaped\\`", "`obj$fi", "obj$fi ", "obj\n$fi", "outer({ obj\n$fi",
+    '"obj$fi', '"obj$fi"', 'r"--(obj$fi)--"', "# obj$fi", "obj$ # fi",
+    "`obj$fi", "obj$fi ", "obj\n$fi", "outer({ obj\n$fi",
     "obj[[1]$fi", "obj[[x[1]]$fi", "obj[1)$fi", "obj]$fi", "obj$$fi", "obj$@fi",
     "factory()$fi", "factory()$nested$fi", "factory()[1]$fi", "pkg::obj$fi",
     "123obj$fi", "😀obj$fi", "obj$\u0301nested$fi",

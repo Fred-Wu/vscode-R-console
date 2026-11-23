@@ -19,19 +19,25 @@ impl Source {
     }
 
     fn quote(&mut self, text: &str, quote: char) -> Result<(), Suppression> {
-        self.push(&quote.to_string())?;
+        self.push_char(quote)?;
         for ch in text.chars() {
             match ch {
                 '\\' => self.push("\\\\")?,
                 '\n' => self.push("\\n")?,
                 '\r' => self.push("\\r")?,
                 '\t' => self.push("\\t")?,
-                ch if ch == quote => self.push(&format!("\\{ch}"))?,
+                ch if ch == quote => { self.push("\\")?; self.push_char(ch)?; }
                 ch if ch < ' ' || ch == '\u{7f}' => self.push(&format!("\\{:03o}", ch as u32))?,
-                ch => self.push(&ch.to_string())?,
+                ch => self.push_char(ch)?,
             }
         }
-        self.push(&quote.to_string())
+        self.push_char(quote)
+    }
+
+    fn push_char(&mut self, ch: char) -> Result<(), Suppression> {
+        if self.text.len() + ch.len_utf8() > SOURCE_BYTES { return Err(Suppression::InspectionLimit); }
+        self.text.push(ch);
+        Ok(())
     }
 }
 
@@ -76,7 +82,12 @@ impl Native {
         let mut first = true;
         while args != self.nil {
             self.source_step(depth, source)?;
-            if args.is_null() || (self.type_of)(args) != LIST { return Err(Suppression::InspectionLimit); }
+            if args.is_null() { return Err(Suppression::InspectionLimit); }
+            // R's parser can use language cons cells in call argument spines
+            // (notably after native-pipe rewriting). They have the same stored
+            // CAR/CDR/TAG representation. Formal lists still require LISTSXP.
+            let kind = (self.type_of)(args);
+            if kind != LIST && (formals || kind != LANGUAGE) { return Err(Suppression::InspectionLimit); }
             if !first { source.push(", ")?; }
             first = false;
             let tag = (self.tag)(args);
@@ -150,5 +161,26 @@ impl Native {
             }
             _ => Err(Suppression::InspectionLimit),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_quotes_escape_names_and_enforce_utf8_byte_budget() {
+        let mut source = Source { text: String::new(), remaining: 1 };
+        source.quote("é`\\\n\u{7f}", '`').unwrap();
+        assert_eq!(source.text, "`é\\`\\\\\\n\\177`");
+
+        // The closing delimiter and every UTF-8 byte count toward the limit.
+        source.text = "x".repeat(SOURCE_BYTES - 4);
+        source.quote("é", '`').unwrap();
+        assert_eq!(source.text.len(), SOURCE_BYTES);
+        assert_eq!(source.push_char('x'), Err(Suppression::InspectionLimit));
+        source.text.truncate(SOURCE_BYTES - 1);
+        assert_eq!(source.push_char('é'), Err(Suppression::InspectionLimit));
+        assert_eq!(source.text.len(), SOURCE_BYTES - 1);
     }
 }

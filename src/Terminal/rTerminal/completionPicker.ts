@@ -5,6 +5,7 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { rebaseCompletionEnds } from "../../Language/completion/refinement";
+import { backtickRName } from "../../Language/completion/candidates";
 import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
@@ -154,8 +155,13 @@ export async function pickCompletion({
       const prefix = context.kind === "package" && !value.startsWith(context.prefix)
         ? context.prefix + value
         : value;
-      const cursorCol = context.replaceStart + prefix.length;
-      const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + prefix + latestInput.currentLine.slice(latestInput.cursorCol);
+      // The picker edits a decoded search query, while the preview is R
+      // source. Retain an opening backtick and escape the replacement prefix;
+      // existing suffixes (including a closing quote) stay after the cursor.
+      const spelling = context.kind === "member" && latestInput.currentLine[context.replaceStart] === "`"
+        ? backtickRName(prefix).slice(0, -1) : prefix;
+      const cursorCol = context.replaceStart + spelling.length;
+      const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + spelling + latestInput.currentLine.slice(latestInput.cursorCol);
       const lines = [...latestInput.lines];
       lines[latestInput.cursorRow] = currentLine;
       const fullTextBeforeCursor = [

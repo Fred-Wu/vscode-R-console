@@ -56,15 +56,18 @@ export function getCompletionSyntax(code: string, cursor = code.length) {
     return prefixTokens;
   };
   return {
+    get tokens() { return all(); },
+    get prefixTokens() { return prefix(); },
     get identifierEnd() {
       if (cursor === code.length) return undefined;
       const token = all().find(token => token.type === TokenType.Identifier &&
-        !token.value.startsWith("`") && token.position < cursor &&
+        token.position < cursor &&
         cursor < token.position + token.value.length);
       return token ? token.position + token.value.length : undefined;
     },
     get inLiteral() { return /["'`#]/.test(code) && isCompletionInLiteral(code, cursor, all()); },
     get member() { return /[$@]|::/.test(before) ? getQualifiedCompletionContext(before, prefix()) : undefined; },
+    get memberSuffix() { return /[$@]/.test(before) ? getMemberCompletionSuffix(before, prefix()) : undefined; },
     get bracket() { return code.includes("[") ? getBracketCompletionContext(code, cursor, all()) : undefined; },
     get pipe() { return before.includes("|>") || before.includes("%>%") ? getPipeCompletionContext(before, prefix()) : undefined; },
     get call() { return before.includes("(") ? getEnclosingCall(code, cursor, all()) : undefined; },
@@ -157,9 +160,9 @@ export function getCompletionParseSuffix(code: string): string | undefined {
  * same strict selector parser as guarded live completion. Keep incomplete
  * spellings usable while the user is still typing an escape.
  */
-export function decodeQuotedCompletionPrefix(quote: "\"" | "'", fragment: string): string {
+export function decodeQuotedCompletionPrefix(quote: "\"" | "'" | "`", fragment: string): string {
   return decodeRArgumentName(quote + fragment + quote) ??
-    fragment.replace(/\\([\\"'nrt])/g,
+    fragment.replace(/\\([\\"'`nrt])/g,
       (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
 }
 
@@ -293,6 +296,38 @@ export type QualifiedCompletionContext = {
   hasSubscript: boolean;
 };
 
+/** The trailing accessor/prefix is meaningful even when its receiver is an
+ * executable expression. Keep that syntax separate from guarded root parsing.
+ * Replacement starts at the opening backtick so insertion replaces the name
+ * as a whole, including an existing closing quote after the cursor.
+ */
+function accessorPrefix(code: string, tokens: Token[]) {
+  let index = tokens.length - 1;
+  const last = tokens[index];
+  let prefix = "";
+  let replaceStart = code.length;
+  if (isNameAccessor(tokens[index - 1]) && isAccessorNamePrefix(last) &&
+      last.position + last.value.length === code.length) {
+    prefix = last.value.startsWith("`")
+      ? decodeQuotedCompletionPrefix("`", last.value.slice(1, last.closed === true ? -1 : undefined))
+      : last.value;
+    replaceStart = last.position;
+    index--;
+  }
+  return { index, prefix, replaceStart };
+}
+
+function getMemberCompletionSuffix(code: string, sourceTokens: Token[]) {
+  const last = sourceTokens.at(-2);
+  if (last?.type === TokenType.Comment && last.position + last.value.length === code.length) return undefined;
+  const tokens = sourceTokens.filter(token => token.type !== TokenType.EOF &&
+    token.type !== TokenType.Newline && token.type !== TokenType.Comment);
+  const { index, prefix, replaceStart } = accessorPrefix(code, tokens);
+  const accessor = tokens[index];
+  if (index < 1 || !isMemberAccessor(accessor)) return undefined;
+  return { operator: accessor.value as "$" | "@", prefix, replaceStart };
+}
+
 /** Inspect the source before the cursor. Walk backwards over names, accessors
  * and balanced subscripts; never evaluate an expression or accept its suffix. */
 export function getQualifiedCompletionContext(code: string, sourceTokens?: Token[]): QualifiedCompletionContext | undefined {
@@ -331,21 +366,11 @@ export function getQualifiedCompletionContext(code: string, sourceTokens?: Token
       }
     }
   }
-  let index = tokens.length - 1;
-  const last = tokens[index];
-  let prefix = "";
-  let replaceStart = code.length;
+  let { index, prefix, replaceStart } = accessorPrefix(code, tokens);
   // R keywords such as "in" are valid *partial* names immediately after
   // an accessor (e.g. obj$in while typing obj$inner). Treat them as a prefix
   // here, not as completed receiver members or ordinary global tokens.
-  const keywordPrefix = isNameAccessor(tokens[index - 1]) && isAccessorNamePrefix(last);
-  if ((isCompleteIdentifier(last) || keywordPrefix) && !last.value.startsWith("`") &&
-      last.position + last.value.length === code.length) {
-    if (!continuations[index]) return undefined;
-    prefix = last.value;
-    replaceStart = last.position;
-    index--;
-  }
+  if (index < tokens.length - 1 && !continuations[index + 1]) return undefined;
   const accessor = tokens[index];
   if (!isNameAccessor(accessor) || !continuations[index]) return undefined;
   const namespace = accessor.value === "::" || accessor.value === ":::";

@@ -2172,7 +2172,7 @@ export class RTerminal implements vscode.Pseudoterminal {
     return staticEnabled && (context?.rejectionReason ||
       (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))
       ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length)) ?? context
+          input.text.slice(input.textBeforeCursor.length), context) ?? context
       : context;
   }
 

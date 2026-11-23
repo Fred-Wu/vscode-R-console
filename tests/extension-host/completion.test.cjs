@@ -387,6 +387,24 @@ suite("Static fallback routing in the VS Code extension host", () => {
       assert.deepEqual(sourceRequests, ["make_data", "make_data", "make_data"]);
       assert.deepEqual(native, [["obj", "$"]], "function source lookup never executes an accessor");
 
+      storedDefinition = "function() list(alpha = 1, `odd field` = 2)";
+      for (const [marked, expected] of [
+        ["make_data()$\n  al│old", "  alpha"],
+        ["make_data()$ # continuation\n# comment\n  al│", "  alpha"],
+        ["make_data()$`odd│", "make_data()$`odd field`"],
+        ["make_data()$`odd│old`", "make_data()$`odd field`"],
+        ["make_data()$\n  `odd│old`", "  `odd field`"],
+      ]) {
+        const cursor = marked.indexOf("│"), source = marked.replace("│", "");
+        const items = await completeItems(source, cursor);
+        assert.equal(items.length, 1, `only the receiver's matching member belongs in ${marked}`);
+        const line = source.split("\n").at(-1), col = source.slice(0, cursor).split("\n").at(-1).length;
+        assert.equal(line.slice(0, items[0].replaceStart) + items[0].insertText +
+          line.slice(items[0].replaceEnd ?? col), expected, marked);
+        assert.equal(sourceRequests.at(-1), "make_data");
+      }
+      assert.deepEqual(native, [["obj", "$"]], "continued and quoted receivers remain source-only");
+
 
       // Older released languageserver versions do not infer quoted [[ keys.
       // Route without executing receivers, and validate any member edit when

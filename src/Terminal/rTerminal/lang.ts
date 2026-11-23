@@ -134,7 +134,7 @@ export class RTermLang {
     if (staticEnabled && (context?.rejectionReason ||
         (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))) {
       context = getStaticFallbackContext(input.currentLine, input.cursorCol,
-        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length)) ?? context;
+        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context) ?? context;
     }
     context ??= (force
       ? {
@@ -461,7 +461,7 @@ export class RTermLang {
     if (this.options.getStaticAnalysisEnabled?.() === true &&
         (context?.rejectionReason || (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))) {
       context = getStaticFallbackContext(input.currentLine, input.cursorCol,
-        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length));
+        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context);
     }
     if (!context) return undefined;
     const safeEntries = refineCompletionEntries(cached, input, context);
