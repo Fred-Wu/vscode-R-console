@@ -890,7 +890,9 @@ test("real embedded R completion inspects nested storage without running user co
     }
   }
   for (const expression of ["slice_df[1]", "slice_list[1]"]) {
-    assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery(expression)), ["alpha"]);
+    const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression));
+    assert.equal(result.status, "available", expression);
+    assert.deepEqual(result.names, ["alpha"], expression);
   }
   // Safe slices retain R's receiver semantics through literal, stored and
   // repeated selectors. Check the native result and the frontend merge without
@@ -926,9 +928,12 @@ test("real embedded R completion inspects nested storage without running user co
       (expression, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
     assert.deepEqual(entries.map(entry => entry.insertText), ["inner"], input);
   }
-  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt")), ["alpha", "beta"]);
-  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt[[1]]")), []);
-  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_list[1][[1]]")), ["child"]);
+  for (const [expression, names] of [["slice_dt", ["alpha", "beta"]], ["slice_dt[[1]]", []],
+    ["slice_list[1][[1]]", ["child"]]]) {
+    const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression));
+    assert.equal(result.status, "available", expression);
+    assert.deepEqual(result.names, names, expression);
+  }
   await submit('escaped <- list(); escaped[["a\\\"b"]] <- list(inner = TRUE)');
   const escapedQuery = parseRuntimeMemberQuery('escaped[["a\\"b"]]', "$");
   assert.equal(escapedQuery.steps[0].name, 'a"b');

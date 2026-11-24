@@ -702,6 +702,47 @@ function select(document, input, start, text, packageName) {
   document.selectFunction(start, text, packageName);
 }
 
+test('virtual document positions preserve UTF-16 line boundaries after edits', () => {
+  const document = new VirtualRDocument('positions');
+  for (const input of ['', '\n', 'alpha\n', '😀\r\n\nβ\nlast', 'short']) {
+    document.update(input);
+    const lines = input.split('\n');
+    assert.equal(document.lineCount, lines.length);
+    let offset = 0;
+    for (let line = 0; line < lines.length; line++) {
+      for (let character = 0; character <= lines[line].length; character++) {
+        const position = new Position(line, character);
+        assert.equal(document.offsetAt(position), offset + character, input);
+        assert.deepEqual(document.positionAt(offset + character), position, input);
+      }
+      assert.equal(document.offsetAt(new Position(line, 10000)), offset + lines[line].length);
+      offset += lines[line].length + 1;
+    }
+    assert.deepEqual(document.positionAt(-1), new Position(0, 0));
+    assert.deepEqual(document.positionAt(input.length + 1), new Position(lines.length - 1, lines.at(-1).length));
+    assert.equal(document.offsetAt(new Position(-1, -1)), 0);
+    assert.equal(document.offsetAt(new Position(10000, 10000)), input.length);
+  }
+});
+
+test('large projections preserve positions through stored-source and package insertions', () => {
+  const input = 'x <- "😀"\n'.repeat(50000) + 'filter(x)';
+  const document = new VirtualRDocument('large-projection');
+  select(document, input, input.lastIndexOf('filter'), 'filter()', 'stats');
+  const projection = document.project(input, true, new Position(50000, 9), {
+    name: 'factory', body: 'function() {\n  list(alpha=1)\n}',
+  });
+  for (const row of [0, 1000, 25000, 49999, 50000]) {
+    for (let col = 0; col <= 9; col++) {
+      const position = new Position(row, col);
+      assert.deepEqual(projection.toConsolePosition(projection.toServerPosition(position)), position);
+    }
+  }
+  document.update('changed\n');
+  assert.deepEqual(projection.toConsolePosition(new Position(50003, 16)), new Position(50000, 9));
+  assert.equal(document.lineCount, 2);
+});
+
 test("selected packages qualify only virtual calls and map multiline UTF-16 positions", () => {
   const selections = new VirtualRDocument("test");
   const input = 'x <- "😀"; filter(\n  filter(x)\n)';

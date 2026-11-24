@@ -94,9 +94,9 @@ export function isCallableCompletionKind(kind: vscode.CompletionItemKind | undef
 }
 
 export function isArgumentCompletionEntry(entry: CompletionEntry): boolean {
+  if (entry.role !== undefined) return entry.role === "argument" || entry.role === "value";
   return (
-    entry.role === "argument" || entry.role === "value" || entry.detail === "parameter" ||
-    entry.detail?.startsWith("value for ") === true
+    entry.detail === "parameter" || entry.detail?.startsWith("value for ") === true
   );
 }
 

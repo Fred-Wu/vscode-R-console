@@ -11,6 +11,7 @@ const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 const { createGuardedBindingResolver } = loadSource("src/Language/completion/bindings.ts");
 const { runRJson } = require("./helpers/run-r-json.cjs");
+const { retryStaticCompletion } = require("./helpers/static-completion.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
@@ -1857,7 +1858,7 @@ test("receiver-only static inference uses the shared path across object systems"
   ]) {
     const text = definition + '\n' + input;
     const context = completion.getCompletionContext(input, input.length, text);
-    const entries = await completion.collectStaticFallbackEntries(context,
+    const entries = await retryStaticCompletion(() => completion.collectStaticFallbackEntries(context,
       { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: input.length },
       [definition], { provideStaticCompletion: async request => {
         const outcome = await client.provideStaticCompletion(request);
@@ -1865,8 +1866,8 @@ test("receiver-only static inference uses the shared path across object systems"
         return { ...outcome, completion: result && {
           ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })),
         } };
-      } });
-    assert.equal(entries.staticResolved, true, definition);
+      } }));
+    assert.equal(entries.staticResolved, true, `${definition}: ${entries.staticUnavailableReason ?? 'resolved'}`);
     for (const label of expected) assert.ok(entries.some(item => item.label === label), definition + ': ' + label);
     assert.ok(entries.every(item => item.role === 'member'), definition);
     assert.equal(fs.existsSync(marker), false, 'inference must not run a getter');

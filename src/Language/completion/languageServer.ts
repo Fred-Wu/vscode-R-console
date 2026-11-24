@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { createGuardedBindingResolver } from "./bindings";
 import { requestStaticCompletion } from "./staticProvider";
-import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, StaticCompletionAccess } from "./types";
+import { adaptNativeCompletionResult } from "./nativeMetadata";
+import type { CompletionAnalysisMode, CompletionCandidate, CompletionContext, CompletionEntry, CompletionProvider, StaticCompletionAccess, StaticCompletionOutcome } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
@@ -17,7 +18,7 @@ export async function getLanguageServerCompletions(
   runtimeBracketKind?: "data.frame" | "data.table" | null,
   analysisMode?: CompletionAnalysisMode,
   staticAccess?: StaticCompletionAccess
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; bindingSuppressionReason?: CompletionSuppressionReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; staticStatus?: StaticCompletionOutcome["status"]; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; bindingSuppressionReason?: CompletionSuppressionReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
   }
@@ -39,8 +40,8 @@ export async function getLanguageServerCompletions(
           position: queryPosition, contextPosition: position,
           triggerCharacter: context.triggerCharacter, requestScope,
         })
-      : completionProvider.provideCompletionItems?.(doc, queryPosition, context.triggerCharacter,
-          position, runtimeBracketKind, analysisMode, requestScope);
+      : Promise.resolve(completionProvider.provideCompletionItems?.(doc, queryPosition, context.triggerCharacter,
+          position, runtimeBracketKind, analysisMode, requestScope)).then(result => result && adaptNativeCompletionResult(result));
     let result = await query(position);
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
@@ -53,8 +54,8 @@ export async function getLanguageServerCompletions(
     let argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
 
     let items = Array.isArray(result) ? result : result?.items || [];
-    const usable = (item: vscode.CompletionItem): boolean =>
-      !(workspaceFunction && !context.argumentValue && getCompletionRole(item) === "value") &&
+    const usable = (item: CompletionCandidate): boolean =>
+      !(workspaceFunction && !context.argumentValue && item.role === "value") &&
       isLanguageServerCompletionItem(context, item, doc.uri?.toString()) &&
       (context.kind !== "static" || (result?.rConsoleStaticStatus === "resolved" && validStaticEdit(item, inputLines, position))) &&
       (analysisMode !== "static" || !item.range || validStaticEdit(item, inputLines, position, false));
@@ -100,14 +101,15 @@ export async function getLanguageServerCompletions(
         insertText: getCompletionInsertText(item, context),
         kind: item.kind,
         detail: item.detail,
-        role: getCompletionRole(item),
-        ...(isSubscriptSpecial(item) ? { bracketSpecial: true } : {}),
+        role: item.role,
+        ...(item.bracketSpecial ? { bracketSpecial: true } : {}),
         source: "lsp",
         replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
         ...getCompletionReplaceEnd(item, lineOffsets, position),
         packageName: getCompletionPackage(item),
       })),
       isIncomplete: result?.rConsoleStaticStatus === "pending" || (!Array.isArray(result) && result?.isIncomplete === true),
+      staticStatus: result?.rConsoleStaticStatus,
       rConsoleLocalFunction: localFunction,
       runtimeOnly,
       memberResolved: memberResolved || result?.rConsoleStaticStatus === "resolved-empty",
@@ -124,29 +126,11 @@ export async function getLanguageServerCompletions(
   }
 }
 
-function isSubscriptSpecial(item: vscode.CompletionItem): boolean {
-  return (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_special";
-}
-
-function getCompletionRole(item: vscode.CompletionItem): CompletionEntry["role"] {
-  const data = (item as vscode.CompletionItem & { data?: { type?: string; parameter?: string } }).data;
-  const type = data?.type;
-  if (type === "subscript_special") return "scope";
-  if (type?.endsWith("argument_value") || item.detail?.startsWith("value for ")) return "value";
-  if (data?.parameter !== undefined || type?.endsWith("parameter") || item.detail === "parameter") return "argument";
-  if (type === "member" || type === "scope") return type;
-  return undefined;
-}
-
-function getCompletionPackage(item: vscode.CompletionItem): string | undefined {
+function getCompletionPackage(item: CompletionCandidate): string | undefined {
   if (!isCallableCompletionKind(item.kind)) {
     return undefined;
   }
-  const data = (item as vscode.CompletionItem & { data?: { package?: unknown } }).data;
-  if (typeof data?.package === "string" && /^[A-Za-z][A-Za-z0-9.]*$/.test(data.package)) {
-    return data.package;
-  }
-  return /^\{([A-Za-z][A-Za-z0-9.]*)\}$/.exec(item.detail ?? "")?.[1];
+  return item.packageName && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.packageName) ? item.packageName : undefined;
 }
 
 function restrictsBracketSymbols(context: CompletionContext): boolean {
@@ -156,23 +140,21 @@ function restrictsBracketSymbols(context: CompletionContext): boolean {
 
 function isLanguageServerCompletionItem(
   context: CompletionContext,
-  item: vscode.CompletionItem,
+  item: CompletionCandidate,
   documentUri?: string
 ): boolean {
-  const role = getCompletionRole(item);
-  const subscriptParameter = context.kind === "bracket" &&
-    (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_parameter";
+  const role = item.role;
+  const subscriptParameter = context.kind === "bracket" && item.subscriptParameter === true;
   if (context.suppressAutomatic) return false;
   if (item.kind === vscode.CompletionItemKind.Text) {
     return false;
   }
 
-  if (item.detail === "[workspace]") {
-    const data = (item as vscode.CompletionItem & { data?: { package?: string; context_uri?: string; uri?: string } }).data;
+  if (item.workspaceOrigin) {
     // Only definitions from this console's virtual document are authoritative.
     // Other workspace/editor symbols must not leak into the console session.
-    if (!(isCallableCompletionKind(item.kind) && (data?.package === "_workspace_" || data?.uri === documentUri) &&
-      documentUri !== undefined && data?.context_uri === documentUri)) return false;
+    if (!(isCallableCompletionKind(item.kind) && documentUri !== undefined &&
+      item.workspaceOrigin.definitionUri === documentUri && item.workspaceOrigin.contextUri === documentUri)) return false;
   }
 
   // Generic static contexts use the provider's explicit resolution and edits.
@@ -247,16 +229,16 @@ function stripSnippetSyntax(text: string): string {
   return expand();
 }
 
-function getCompletionInsertText(item: vscode.CompletionItem, context: CompletionContext): string {
+function getCompletionInsertText(item: CompletionCandidate, context: CompletionContext): string {
   if (context.kind === "static" && typeof item.insertText === "object") return stripSnippetSyntax(item.insertText.value);
   if (context.kind === "static" && typeof item.insertText === "string") {
     return (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat === 2
       ? stripSnippetSyntax(item.insertText) : item.insertText;
   }
-  if (getCompletionRole(item) === "argument" && getCompletionLabel(item) === "...") return "...";
+  if (item.role === "argument" && getCompletionLabel(item) === "...") return "...";
   // Value labels are literal R strings, including dollar signs and braces.
   // Quote them for both named and positional insertion before snippet handling.
-  if (getCompletionRole(item) === "value" && !item.range) {
+  if (item.role === "value" && !item.range) {
     return quoteCompletionValue(getCompletionLabel(item), context.argumentValue?.quote ?? context.bracketQuote);
   }
   let text: string;
@@ -280,7 +262,7 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
   const protocolFormat = (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat;
   const result = (typeof item.insertText === "object" && "value" in item.insertText) || protocolFormat === 2
     ? stripSnippetSyntax(text) : text;
-  const role = getCompletionRole(item);
+  const role = item.role;
   // Inferred members may supply only a display label. A raw label is not
   // necessarily valid R code: quote $/@ names and escape quoted [[ keys.
   // Preserve explicitly formatted LSP insertion text.

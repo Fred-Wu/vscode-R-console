@@ -3,6 +3,7 @@ import { getCompletionContext, getStaticFallbackContext } from "./syntax";
 import { allowsSymbolCompletions } from "./policy";
 import { storedCompletionReceiver } from "./sourceReceiver";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import { adaptNativeCompletionResult } from "./nativeMetadata";
 import { staticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
 
 /** Native projection payload, confined to the installed-provider adapter. */
@@ -43,21 +44,17 @@ export async function provideNativeStaticCompletion(
     }
   }
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
-  const result = await completeNative(sourceBinding);
+  const nativeResult = await completeNative(sourceBinding);
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
-  if (!result) return { status: "pending", reason: "no-response" };
+  if (!nativeResult) return { status: "pending", reason: "no-response" };
+  const result = adaptNativeCompletionResult(nativeResult);
   if (bindingSuppression) result.rConsoleBindingSuppressionReason = bindingSuppression;
   let items = Array.isArray(result) ? result : result.items;
   // Parameter inference can fail inside a valid argument expression. Retain
   // independent symbols after the native supplement has validated the reply.
   const expressionContext = context?.kind === "argument" && allowsSymbolCompletions(context);
   if (result.rConsoleArgumentsResolved === false && expressionContext) {
-    items = items.filter(item => {
-      const data = (item as typeof item & { data?: { type?: string; parameter?: string } }).data;
-      return data?.parameter === undefined && data?.type !== "member" &&
-        !data?.type?.endsWith("parameter") && !data?.type?.endsWith("argument_value") &&
-        item.detail !== "parameter" && !item.detail?.startsWith("value for ");
-    });
+    items = items.filter(item => item.role === "symbol" || item.role === "scope");
     if (Array.isArray(result)) result.splice(0, result.length, ...items);
     else result.items = items;
   }

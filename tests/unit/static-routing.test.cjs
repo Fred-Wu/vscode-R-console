@@ -30,6 +30,16 @@ const snapshot = (text, cursor = text.length) => {
 };
 const labels = entries => entries.filter(entry => "insertText" in entry).map(entry => entry.insertText);
 
+test('the static provider contract types candidate provenance without native metadata', () => {
+  const path = require('node:path');
+  const compiler = path.join(path.dirname(require.resolve('typescript/package.json')), 'bin/tsc');
+  require('node:child_process').execFileSync(process.execPath, [compiler,
+    '--ignoreConfig', '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022', '--module', 'commonjs', '--esModuleInterop',
+    '--types', 'node',
+    'tests/fixtures/static-provider.ts',
+  ], { cwd: path.resolve(__dirname, '../..'), encoding: 'utf8' });
+});
+
 function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources, staticProvider } = {}) {
   const logs = [], native = [], requests = [], sourceRequests = [], sourceTargets = [];
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
@@ -901,7 +911,7 @@ test('static providers discover multiple dependencies without terminal receiver 
           const found = await request.bindings.resolve({ name, lookup: 'function', scope: { kind: 'search-path' } });
           assert.equal(found.status, 'source');
         }
-        return { status: 'resolved', completion: { items: [{ label: 'alpha', kind: 4, data: { type: 'member' } }] } };
+        return { status: 'resolved', completion: { items: [{ label: 'alpha', kind: 4, role: 'member' }] } };
       },
     });
     assert.deepEqual(labels(await h.complete(text)), ['alpha']);
@@ -911,6 +921,46 @@ test('static providers discover multiple dependencies without terminal receiver 
     assert.deepEqual(h.requests, [], 'general providers bypass the compatibility adapter');
     assert.deepEqual(h.native, []);
   }
+});
+
+test('typed static candidates supply members and arguments without native annotations', async () => {
+  for (const [text, role, insertText] of [
+    ['factory()$al', 'member', 'alpha'],
+    ['factory()[["al', 'member', 'alpha'],
+    ['factory()[, al', 'member', 'alpha'],
+    ['f(al', 'argument', 'alpha = '],
+    ['factory()$method(al', 'argument', 'alpha = '],
+    ['obj$method(al', 'argument', 'alpha = '],
+    ['obj$method(value = "al', 'value', 'alpha'],
+  ]) {
+    const h = harness({ staticProvider: async request => ({ status: 'resolved', completion: { items: [{
+      label: 'alpha', insertText, kind: 4, role,
+      // Display text is independent of a candidate's semantic role.
+      detail: role === 'argument' ? 'parameter' : 'provider description',
+      range: { start: new Position(0, request.cursor - 2), end: request.contextPosition },
+    }] } }) });
+    assert.deepEqual(labels(await h.complete(text)), [insertText], text);
+  }
+});
+
+test('explicit static provenance excludes ambient symbols and external workspace candidates', async () => {
+  for (const text of ['factory()$al', 'factory()[["al']) {
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
+      { label: 'alpha', insertText: 'alpha', kind: 4, role: 'member' },
+      { label: 'alpha_scope', kind: 4, role: 'scope' },
+      { label: 'alpha_symbol', kind: 4, role: 'symbol', detail: 'parameter' },
+      { label: 'alpha_argument', kind: 5, role: 'argument' },
+      { label: 'alpha_external', kind: 2, role: 'member', workspaceOrigin: {
+        definitionUri: 'file:///other.R', contextUri: 'r-console://test/console.R',
+      } },
+    ] } }) });
+    assert.deepEqual(labels(await h.complete(text)), ['alpha'], text);
+  }
+  const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
+    { label: 'alpha', insertText: 'alpha', kind: 4, role: 'symbol', detail: 'parameter' },
+  ] } }) });
+  const entries = await h.complete('f(al');
+  assert.deepEqual(entries.filter(item => !('insertText' in item)).map(item => item.label), ['Fields']);
 });
 
 test('unknown static contexts reach providers with full source and validated replacement edits', async () => {
@@ -925,12 +975,12 @@ test('unknown static contexts reach providers with full source and validated rep
       assert.deepEqual(request.contextPosition, new Position(input.cursorRow, input.cursorCol));
       const range = { start: new Position(input.cursorRow, input.cursorCol - 2), end: new Position(input.cursorRow, input.cursorCol + 4) };
       return { status: 'resolved', completion: { items: [
-        { label: 'column', insertText: 'column', kind: 4, range },
-        { label: 'no edit', kind: 4 },
-        { label: 'column_external', insertText: 'column_external()', kind: 2, detail: '[workspace]', range,
-          data: { package: '_workspace_', context_uri: 'file:///other.R' } },
-        { label: 'bad edit', insertText: 'bad', kind: 4, range: { ...range, start: new Position(input.cursorRow, -1) } },
-        { label: 'past end', insertText: 'bad', kind: 4, range: { ...range, end: new Position(input.cursorRow, 999) } },
+        { label: 'column', insertText: 'column', kind: 4, role: 'member', range },
+        { label: 'no edit', kind: 4, role: 'symbol' },
+        { label: 'column_external', insertText: 'column_external()', kind: 2, role: 'symbol', range,
+          workspaceOrigin: { definitionUri: 'file:///other.R', contextUri: 'file:///other.R' } },
+        { label: 'bad edit', insertText: 'bad', kind: 4, role: 'member', range: { ...range, start: new Position(input.cursorRow, -1) } },
+        { label: 'past end', insertText: 'bad', kind: 4, role: 'member', range: { ...range, end: new Position(input.cursorRow, 999) } },
       ] } };
     } });
     const items = (await h.complete(text, cursor)).filter(x => 'insertText' in x);
@@ -1020,8 +1070,8 @@ test('static edits are validated in recognized member, bracket and argument cont
     const start = new Position(input.cursorRow, input.cursorCol - 2);
     const end = new Position(input.cursorRow, input.cursorCol);
     const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
-      { label: 'alpha', insertText: 'alpha', kind: 4, data: { type: 'member' }, range: { start, end } },
-      { label: 'alpha_plain', kind: 4, data: { type: 'member' } },
+      { label: 'alpha', insertText: 'alpha', kind: 4, role: 'member', range: { start, end } },
+      { label: 'alpha_plain', kind: 4, role: 'member' },
       ...[
         { start: new Position(input.cursorRow, -2), end },
         { start: new Position(input.cursorRow - 1, 0), end },
@@ -1029,7 +1079,7 @@ test('static edits are validated in recognized member, bracket and argument cont
         { start, end: new Position(input.cursorRow, input.cursorCol - 1) },
         { start: new Position(input.cursorRow, input.cursorCol + 1), end },
         { start: new Position(input.cursorRow, 0.5), end },
-      ].map(range => ({ label: 'alpha_bad', insertText: 'bad', kind: 4, data: { type: 'member' }, range })),
+      ].map(range => ({ label: 'alpha_bad', insertText: 'bad', kind: 4, role: 'member', range })),
     ] } }) });
     const entries = (await h.complete(text)).filter(x => 'insertText' in x);
     assert.deepEqual(entries.map(x => x.insertText), ['alpha', 'alpha_plain'], text);
@@ -1070,7 +1120,7 @@ test('multiline static edit mapping shares document reads across candidates', as
     const entries = await getLanguageServerCompletions(context,
       { version: 1, getText: () => { reads++; return input; } }, position, [], {
         provideStaticCompletion: async () => ({ status: 'resolved', completion: {
-          items: Array.from({ length: count }, (_, i) => ({ label: `column${i}`, insertText: `column${i}`, kind: 4,
+          items: Array.from({ length: count }, (_, i) => ({ label: `column${i}`, insertText: `column${i}`, kind: 4, role: 'member',
             range: { start: new Position(0, 12), end: new Position(1, 4) } })),
         } }),
       }, undefined, 'static');

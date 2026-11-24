@@ -42,7 +42,7 @@ export type CompletionEntry = {
   source: "lsp" | "session" | "buffer";
   replaceStart?: number;
   replaceEnd?: number;
-  role?: "argument" | "value" | "member" | "scope";
+  role?: "argument" | "value" | "member" | "scope" | "symbol";
   // Explicit bracket-context symbol supplied by installed package metadata.
   bracketSpecial?: boolean;
   packageName?: string;
@@ -71,7 +71,21 @@ export type CompletionPickItem = vscode.QuickPickItem & {
 
 export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
-export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[]) & {
+/** Candidate semantics used by console filtering, independent of provider metadata. */
+export type CompletionCandidate = vscode.CompletionItem & {
+  role?: CompletionEntry["role"];
+  subscriptParameter?: boolean;
+  bracketSpecial?: boolean;
+  packageName?: string;
+  workspaceOrigin?: { definitionUri?: string; contextUri?: string };
+};
+
+/** Static providers explicitly identify receiver members, arguments and ambient symbols. */
+export type StaticCompletionCandidate = CompletionCandidate & {
+  role: NonNullable<CompletionCandidate["role"]>;
+};
+
+type CompletionMetadata = {
   rConsoleStaticStatus?: StaticCompletionOutcome["status"];
   rConsoleBindingSuppressionReason?: CompletionSuppressionReason;
   // Applies even when filtering leaves no arguments or the definition has none.
@@ -85,6 +99,9 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
   rConsoleArgumentsResolved?: boolean;
   rConsoleArgumentSuppressionReason?: CompletionSuppressionReason;
 };
+
+export type CompletionResult = (vscode.CompletionList<CompletionCandidate> | CompletionCandidate[]) & CompletionMetadata;
+export type StaticCompletionResult = (vscode.CompletionList<StaticCompletionCandidate> | StaticCompletionCandidate[]) & CompletionMetadata;
 
 export type CompletionAnalysisMode = "runtime" | "static";
 
@@ -126,8 +143,8 @@ export type StaticCompletionRequest = StaticCompletionAccess & {
 };
 
 export type StaticCompletionOutcome =
-  | { status: "resolved" | "resolved-empty"; completion: CompletionResult }
-  | { status: "unresolved" | "pending"; reason: StaticCompletionUnavailableReason; completion?: CompletionResult };
+  | { status: "resolved" | "resolved-empty"; completion: StaticCompletionResult }
+  | { status: "unresolved" | "pending"; reason: StaticCompletionUnavailableReason; completion?: StaticCompletionResult };
 
 export interface CompletionProvider {
   provideStaticCompletion?(request: StaticCompletionRequest): Promise<StaticCompletionOutcome>;

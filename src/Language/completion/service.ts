@@ -143,10 +143,12 @@ export async function collectCompletionEntries(
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
       rawLspResult.isIncomplete || retryableRuntime);
   }
-  const unavailableSignature = (runtimeOnly && memberArguments && !rawLspResult.workspaceFunction) ||
+  const unavailableSignature = rawLspResult.staticStatus !== "resolved" && (
+    (runtimeOnly && memberArguments && !rawLspResult.workspaceFunction) ||
     (!rawLspResult.rConsoleLocalFunction && !rawLspResult.workspaceFunction &&
-    (sessionArguments || (memberArguments && !rawLspResult.nativeArguments &&
-      !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter"))));
+      (sessionArguments || (memberArguments && !rawLspResult.nativeArguments &&
+        !rawLspResult.entries.some(entry => entry.role === "argument" && entry.detail !== "parameter"))))
+  );
   const rawLspItems = unavailableSignature
     ? rawLspResult.entries.filter(entry => !isArgumentCompletionEntry(entry))
     : rawLspResult.entries;

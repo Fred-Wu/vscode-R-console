@@ -752,12 +752,21 @@ snapshots. No expression evaluation operation is exposed by the resolver.
 
 Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
 `unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
-pending analysis is retried on a later request. The native adapter retains validated
+pending analysis is retried on a later request. Static candidates declare a typed
+`role`: `member`, `argument`, `value`, `scope` or `symbol`. Package identity,
+subscript parameters/specials and workspace definition/context URIs have explicit
+candidate fields. Receiver fallback accepts only `member` candidates, and workspace
+definitions must belong to the requesting console document. The native metadata
+adapter translates installed language-server annotations into these fields.
+Resolved static argument candidates retain their provider's signature evidence.
+The native adapter retains validated
 expression symbols when callable parameter inference is unavailable, while
 excluding parameter and default-value candidates that require that signature.
 Independent expression symbols retain prefix broadening when parameter inference
 is unavailable. Multiline replacement offsets share one document line-offset index
-per completion request.
+per completion request. Virtual documents cache UTF-16 line offsets for each text
+version; offset lookup uses the index and position lookup uses binary search.
+Stored-source and package projections reuse those indexes for every candidate edit.
 An authoritative empty result
 does not trigger prefix broadening. Result validation retains fixed diagnostic
 codes, source precedence and console-relative replacement ranges.
