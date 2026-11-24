@@ -25,6 +25,26 @@ test("pending inline results cannot reopen the panel after switching to Quick Pi
   assert.equal(terminal.inputState.text, "mea");
 });
 
+test("static fallback keeps its typed inline prefix through asynchronous presentation", t => {
+  for (const [source, prefix] of [
+    ["make_data()$alp", "alp"],
+    ['make_data()[["al', "al"],
+  ]) {
+    const { terminal } = createTerminal(t, 80, 24, "typing",
+      { "completion.staticAnalysis": true });
+    terminal.inputState.insertText(source);
+    terminal.lang.handleAutocomplete = ({ onInlineEntries }) => {
+      onInlineEntries([{ ...item("alpha"), replaceStart: source.length - prefix.length,
+        snapshotInput: source, snapshotCursor: source.length }]);
+    };
+    terminal.requestInlineCompletion(true);
+    assert.equal(terminal.inlineCompletion.visible, true, source);
+    assert.equal(terminal.inlineCompletion.resultQuery, prefix,
+      "presentation must use the reconstructed static context, not the rejecting runtime parser");
+    assert.equal(terminal.inlineCompletion.query, prefix, source);
+  }
+});
+
 test("inline selection follows the shared ranking including R identifier case", () => {
   const { rankCompletionEntries, toCompletionQuickPickItems } = loadSource('src/Language/completion.ts', { vscode: {
     QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Function: 2, Field: 4, Variable: 5 },

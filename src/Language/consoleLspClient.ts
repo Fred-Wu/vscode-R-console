@@ -25,7 +25,8 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
 } from "vscode-languageclient/node";
-import type { CompletionPickItem, CompletionProvider, CompletionResult } from "./completion";
+import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult, CompletionSourceBinding, RuntimeFunctionArgumentsRequester } from "./completion";
+import type { MemberInspectionResult } from "../Runtime/backendProtocol";
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
@@ -35,6 +36,9 @@ import { PackageInventory, type PackageInventoryChange } from "./packageInventor
 import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
+import { staticCompletionUnavailableReason } from "./completion/diagnostics";
+import { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
+import { storedCompletionReceiver } from "./completion/sourceReceiver";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -57,6 +61,7 @@ type ConsoleLspClientOptions = {
   onPackagesChanged?: () => void;
   getCachedWorkspaceData?: () => WorkspaceData | undefined;
   getStaticAnalysisEnabled?: () => boolean;
+  requestRuntimeFunctionArguments?: RuntimeFunctionArgumentsRequester;
 };
 
 type ConsoleLspSessionState = {
@@ -93,9 +98,15 @@ class ConsoleLanguageClient extends LanguageClient {
 }
 
 export class ConsoleLspClient implements CompletionProvider {
+  private readonly argumentInspections = new WeakMap<object, {
+    expression: string;
+    isCurrent: () => boolean;
+    result: MemberInspectionResult | undefined;
+  }>();
   private readonly outputChannel: vscode.OutputChannel;
   private readonly workingDirectory: string;
   private readonly inputDocument: VirtualRDocument;
+  private readonly packageDocument: VirtualRDocument;
 
   private client: ConsoleLanguageClient | undefined;
   private startPromise: Promise<void> | undefined;
@@ -109,6 +120,14 @@ export class ConsoleLspClient implements CompletionProvider {
   private sessionState: ConsoleLspSessionState | undefined;
   private syncedSessionStateKey: string | undefined;
   private sessionStateSyncPromise: Promise<SessionStateSyncResult> | undefined;
+  private startupPackages: string[] = [];
+  private preparedPackages: {
+    client: ConsoleLanguageClient;
+    stateKey: string;
+    staticAnalysis: boolean;
+    startupPackages: string[];
+    pending: Promise<void>;
+  } | undefined;
   private readonly packageInventory: PackageInventory;
   private runtimeLibraryPaths: string[] | undefined;
   private serverLibraryPaths: string[] | undefined;
@@ -120,6 +139,7 @@ export class ConsoleLspClient implements CompletionProvider {
 
   constructor(private readonly options: ConsoleLspClientOptions) {
     this.inputDocument = new VirtualRDocument(options.consoleId);
+    this.packageDocument = new VirtualRDocument(`${options.consoleId}-packages`);
     this.outputChannel = new SilentOutputChannel("R Console");
     // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
@@ -162,6 +182,7 @@ export class ConsoleLspClient implements CompletionProvider {
           throw new Error("Cannot stop the previous console language server process.");
         }
         this.syncedDocuments.clear();
+        this.preparedPackages = undefined;
         this.syncedSessionStateKey = undefined;
         this.sessionStateSyncPromise = undefined;
       }
@@ -217,6 +238,7 @@ export class ConsoleLspClient implements CompletionProvider {
         return false;
       }
       this.syncedDocuments.clear();
+      this.preparedPackages = undefined;
       this.syncedSessionStateKey = undefined;
       this.sessionStateSyncPromise = undefined;
       return true;
@@ -232,6 +254,7 @@ export class ConsoleLspClient implements CompletionProvider {
       }
     }
     this.syncedDocuments.clear();
+    this.preparedPackages = undefined;
     try {
       await client.stop();
     } catch {
@@ -286,7 +309,10 @@ export class ConsoleLspClient implements CompletionProvider {
     position: vscode.Position,
     triggerCharacter?: string,
     contextPosition: vscode.Position = position,
-    runtimeBracketKind?: "data.frame" | "data.table" | null
+    runtimeBracketKind?: "data.frame" | "data.table" | null,
+    analysisMode?: CompletionAnalysisMode,
+    sourceBinding?: CompletionSourceBinding,
+    requestScope: object = {}
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await this.packageRefreshPromise;
@@ -296,13 +322,15 @@ export class ConsoleLspClient implements CompletionProvider {
         return undefined;
       }
       try {
-        const staticAnalysis = this.options.getStaticAnalysisEnabled?.() === true;
-        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition);
-        await this.syncDocument(client, projection.document);
+        const staticAnalysis = analysisMode === undefined
+          ? this.options.getStaticAnalysisEnabled?.() === true : analysisMode === "static";
+        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition,
+          staticAnalysis ? sourceBinding : undefined);
         await this.applySessionState(client);
         if (this.client !== client) {
           continue;
         }
+        await this.syncDocument(client, projection.document);
         const context: vscode.CompletionContext = triggerCharacter
           ? {
               triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
@@ -315,9 +343,34 @@ export class ConsoleLspClient implements CompletionProvider {
         const serverPosition = projection.toServerPosition(position);
         const params = createCompletionParams(client, projection, serverPosition, contextPosition, context,
           staticAnalysis);
+        if (staticAnalysis && sourceBinding && sourceBinding.body === undefined) {
+          // Package selections can qualify the visible callable in projection.
+          // Only a still-bare receiver is shadowed by the live binding.
+          const text = projection.document.getText();
+          const offset = projection.document.offsetAt(projection.toServerPosition(contextPosition));
+          const before = text.slice(0, offset), line = before.split("\n").at(-1)!;
+          const fallback = getStaticFallbackContext(line, line.length, before, text.slice(offset));
+          const visibleContext = getCompletionContext(line, line.length, before, text.slice(offset));
+          const receiverContext = fallback ?? visibleContext;
+          const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, offset);
+          const root = visibleContext?.objectName && parseRuntimeMemberQuery(visibleContext.objectName)?.root;
+          if (sourceBinding.opaqueReceiver && root === sourceBinding.name) {
+            Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
+              rConsoleOpaqueFunctionPosition: projection.toServerPosition(contextPosition) });
+          }
+          if (receiver?.name === sourceBinding.name &&
+              (sourceBinding.opaqueReceiver || receiver.target !== "binding")) {
+            Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
+              rConsoleOpaqueFunctionPosition: projection.document.positionAt(receiver.start) });
+          }
+        }
         const documentVersion = projection.document.version;
         const sessionState = this.sessionState;
         const runtimeRevision = this.runtimeRevision;
+        const isCurrent = () => !this.disposed && this.client === client &&
+          revision === this.packageRevision && runtimeRevision === this.runtimeRevision &&
+          this.sessionState === sessionState &&
+          this.syncedDocuments.get(projection.document.uri.toString())?.version === documentVersion;
         // Use the already-published workspace snapshot; completion must not
         // query sess to resolve or inspect runtime objects.
         const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
@@ -337,6 +390,7 @@ export class ConsoleLspClient implements CompletionProvider {
               .rConsoleSubscriptClass = primaryClass;
           }
         }
+        let cachedSignature: string | undefined;
         if (params.rConsoleCall && globals && !params.rConsoleCall.includes("$") &&
             !params.rConsoleCall.includes("@") && !params.rConsoleCall.includes("::")) {
           const name = Object.hasOwn(globals, params.rConsoleCall)
@@ -345,15 +399,47 @@ export class ConsoleLspClient implements CompletionProvider {
           const item = name === undefined ? undefined : globals[name];
           if (item && ["closure", "builtin", "special"].includes(item.type) &&
               typeof item.str === "string" && /^\s*function\s*\(/.test(item.str)) {
-            (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = item.str;
+            cachedSignature = item.str;
+            (params as typeof params & { rConsoleRuntimeSignature?: string }).rConsoleRuntimeSignature = cachedSignature;
+          }
+        }
+        // Stored functions share one argument-name reader regardless of class.
+        // Retain ordinary cached signatures (including literal default choices),
+        // but never parse class-specific display text to recover a signature.
+        // Source bindings take precedence and native snapshots stay request-local.
+        const functionQuery = params.rConsoleCall ? parseRuntimeMemberQuery(params.rConsoleCall, "arguments") : undefined;
+        let functionInspection: MemberInspectionResult | undefined;
+        if (functionQuery && (functionQuery.steps.length || !cachedSignature) &&
+            this.options.requestRuntimeFunctionArguments) {
+          const cached = this.argumentInspections.get(requestScope);
+          if (cached) {
+            if (cached.expression !== params.rConsoleCall || !cached.isCurrent()) return undefined;
+            functionInspection = cached.result;
+          } else {
+            try {
+              // A requester can decline an inspection (busy session, missing
+              // capability or queue limit) without returning a status.
+              functionInspection = (await this.options.requestRuntimeFunctionArguments(params.rConsoleCall!)) ??
+                { status: "unavailable" };
+            } catch { functionInspection = { status: "unavailable" }; }
+            if (!isCurrent()) return undefined;
+            this.argumentInspections.set(requestScope, { expression: params.rConsoleCall!,
+              isCurrent, result: functionInspection });
+          }
+          if (functionInspection?.status === "arguments") {
+            Object.assign(params, { rConsoleRuntimeArgumentNames: functionInspection.names,
+              rConsoleRuntimeArgumentRoot: functionQuery.root });
+          } else if (functionInspection?.status === "suppressed" ||
+              functionInspection?.status === "opaque" || functionInspection?.status === "unavailable" ||
+              functionInspection?.status === "not-callable") {
+            // Preserve unknown live callable identity, including unsupported
+            // primitives and inspection limits. Only verified package/missing
+            // outcomes authorize package inference without a source override.
+            Object.assign(params, { rConsoleRuntimeArgumentsRefused: true });
           }
         }
         const result = await client.sendRequest(CompletionRequest.type, params);
         if (this.client !== client || revision !== this.packageRevision) continue;
-        const isCurrent = () => !this.disposed && this.client === client &&
-          revision === this.packageRevision && runtimeRevision === this.runtimeRevision &&
-          this.sessionState === sessionState &&
-          this.syncedDocuments.get(projection.document.uri.toString())?.version === documentVersion;
         if (!isCurrent()) return undefined;
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);
         if (!isCurrent()) return undefined;
@@ -370,6 +456,17 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         if (completions && (result as { rConsoleMemberResolved?: boolean } | null)?.rConsoleMemberResolved === true) {
           completions.rConsoleMemberResolved = true;
+        }
+        const staticReason = staticCompletionUnavailableReason(
+          (result as { rConsoleStaticUnavailableReason?: unknown } | null)?.rConsoleStaticUnavailableReason);
+        if (completions && staticReason) completions.rConsoleStaticUnavailableReason = staticReason;
+        const argumentsResolved = (result as { rConsoleArgumentsResolved?: unknown } | null)?.rConsoleArgumentsResolved;
+        if (completions && typeof argumentsResolved === "boolean") {
+          completions.rConsoleArgumentsResolved = argumentsResolved;
+        }
+        if (completions && functionInspection?.status === "suppressed" &&
+            (result as { rConsoleRuntimeArgumentsIgnored?: boolean } | null)?.rConsoleRuntimeArgumentsIgnored !== true) {
+          completions.rConsoleArgumentSuppressionReason = functionInspection.reason;
         }
         if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
           completions.rConsoleNativeArguments = true;
@@ -477,18 +574,25 @@ export class ConsoleLspClient implements CompletionProvider {
     const state = this.sessionState;
     const stateKey = this.getSessionStateKey(state);
     if (this.syncedSessionStateKey === stateKey) {
+      await this.prepareAttachedPackages(client, state);
       return;
     }
 
     let syncPromise = this.sessionStateSyncPromise;
     if (!syncPromise) {
-      syncPromise = client.sendRequest<{ libraryPaths: string[] }>("rConsole/syncSessionState", state)
+      syncPromise = (async () => {
+        // Retire documents and their pending metadata tasks before changing
+        // the search path. Completion reopens the current input afterwards.
+        await this.closeCompletionDocuments(client);
+        return client.sendRequest<{ libraryPaths: string[]; startupPackages?: string[] }>("rConsole/syncSessionState", state);
+      })()
         .then((reply) => {
           if (this.client === client && typeof reply === "object" && Array.isArray(reply?.libraryPaths)) {
             this.packageInventory.setLibraryPaths(this.runtimeLibraryPaths ?? reply.libraryPaths);
           }
           const synced = this.client === client;
           if (synced) {
+            this.startupPackages = Array.isArray(reply?.startupPackages) ? reply.startupPackages : [];
             this.syncedSessionStateKey = stateKey;
           }
           return { synced, stateKey };
@@ -513,6 +617,55 @@ export class ConsoleLspClient implements CompletionProvider {
     ) {
       await this.applySessionState(client);
     }
+    if (this.syncedSessionStateKey === currentStateKey) {
+      await this.prepareAttachedPackages(client, this.sessionState);
+    }
+  }
+
+  private async prepareAttachedPackages(client: ConsoleLanguageClient, state: ConsoleLspSessionState): Promise<void> {
+    if (this.disposed || this.client !== client || this.sessionState !== state) return;
+    const stateKey = this.getSessionStateKey(state);
+    const staticAnalysis = this.options.getStaticAnalysisEnabled?.() === true;
+    const previous = this.preparedPackages;
+    if (previous?.client === client && previous.stateKey === stateKey &&
+        previous.staticAnalysis === staticAnalysis && previous.startupPackages === this.startupPackages) {
+      await previous.pending;
+      return;
+    }
+    // Namespace references start languageserver's own asynchronous metadata
+    // tasks without attaching packages in its workers. The sentinel needs no
+    // matching export: this document requests metadata, never completions or
+    // evaluation. Keep it stable to reuse native tasks and disk caches.
+    const packages = staticAnalysis
+      ? [...new Set(state.attachedPackages)].filter(name =>
+        !this.startupPackages.includes(name) && /^[A-Za-z][A-Za-z0-9.]*$/.test(name)).reverse()
+      : [];
+    this.packageDocument.update(packages.map(name => `${name}::\`.__r_console_metadata__\``).join("\n"));
+    const prepared = { client, stateKey, staticAnalysis, startupPackages: this.startupPackages,
+      pending: Promise.resolve() };
+    this.preparedPackages = prepared;
+    prepared.pending = (packages.length
+      ? this.syncDocument(client, this.packageDocument as unknown as vscode.TextDocument)
+      : this.closeCompletionDocuments(client, this.packageDocument.uri.toString()))
+      .catch(error => {
+        if (this.preparedPackages === prepared) this.preparedPackages = undefined;
+        throw error;
+      });
+    await prepared.pending;
+  }
+
+  private closeCompletionDocuments(client: ConsoleLanguageClient, uri?: string): Promise<void> {
+    const close = this.documentSyncPromise.then(async () => {
+      for (const [key, { document }] of this.syncedDocuments) {
+        if (uri !== undefined && key !== uri) continue;
+        if (this.client !== client) return;
+        await client.sendNotification(DidCloseTextDocumentNotification.type,
+          client.code2ProtocolConverter.asCloseTextDocumentParams(document));
+        if (this.client === client) this.syncedDocuments.delete(key);
+      }
+    });
+    this.documentSyncPromise = close.catch(() => {});
+    return close;
   }
 
   private getSessionStateKey(state: ConsoleLspSessionState): string {

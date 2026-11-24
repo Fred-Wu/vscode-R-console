@@ -356,8 +356,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (!session) return undefined;
     const state = this.sessionStates.get(session);
     if (!state?.hostConnected || !state.capabilities.has("member-inspection") ||
+        (query.target === "source" && !state.capabilities.has("function-source")) ||
+        (query.target === "source-value" && (!state.capabilities.has("function-source-value") ||
+          !state.capabilities.has("member-inspection-search-path"))) ||
+        (query.target === "arguments" && !state.capabilities.has("function-arguments")) ||
+        (query.target === "binding" && !state.capabilities.has("member-inspection-search-path")) ||
         (query.utf8ByteEscapes && !state.capabilities.has("member-inspection-utf8-escapes")) ||
         state.pendingMemberRequests.size >= 16) return undefined;
+    const searchPath = state.capabilities.has("member-inspection-search-path");
     return new Promise<MemberInspectionResult>(resolve => {
       const requestId = ++state.nextRequestId;
       const timeout = setTimeout(() => {
@@ -368,14 +374,15 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       }, MEMBER_NAMES_TIMEOUT_MS);
       state.pendingMemberRequests.set(requestId, { resolve, timeout });
       try {
-        if (this.writeFrame(state, encodeMemberNamesRequestFrame(requestId, query))) return;
+        if (this.writeFrame(state, encodeMemberNamesRequestFrame(requestId, { ...query, searchPath }))) return;
       } catch {
         // Invalid paths must never reach the R backend.
       }
       state.pendingMemberRequests.delete(requestId);
       clearTimeout(timeout);
       resolve({ status: "unavailable" });
-    });
+    }).then(result => !searchPath && (result.status === "missing" || result.status === "not-callable")
+      ? { status: "unavailable" } : result);
   }
 
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined {

@@ -44,12 +44,24 @@ console_text_document_did_close <- function(self, params) {
     path <- languageserver:::path_from_uri(uri)
 
     if (length(path) == 0 || !nzchar(path)) {
+        # Virtual documents have no filesystem path. Preserve the native close
+        # handler's task and reply cancellation before removing their state.
+        for (manager in list(self$parse_task_manager, self$resolve_task_manager, self$member_task_manager)) {
+            if (!is.null(manager) && is.function(manager$cancel)) manager$cancel(uri)
+        }
         workspace <- self$get_workspace(uri)
         if (workspace$documents$has(uri)) {
             doc <- workspace$documents$get(uri)
             doc$did_close()
             workspace$documents$remove(uri)
             workspace$update_loaded_packages()
+        }
+        for (queue in self$pending_replies$get(uri, NULL)) {
+            while (queue$size()) {
+                item <- queue$pop()
+                self$deliver(languageserver:::ResponseErrorMessage$new(item$id, "RequestCancelled",
+                    "Request cancelled because the document was closed"))
+            }
         }
         self$pending_replies$remove(uri)
         return(invisible(NULL))
@@ -140,11 +152,21 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
     attached_packages <- normalize_character(params$attachedPackages)
     workspace <- self$get_workspace(self$rootUri)
 
+    # Session attachment is dynamic in the console. Retained member catalogs
+    # can otherwise resolve a bare name from a package that was detached.
+    # Retire only those in-memory catalogs; native disk metadata stays reusable.
+    for (package in setdiff(workspace$startup_packages, attached_packages)) {
+        if (is.function(workspace$member_metadata$has) && workspace$member_metadata$has(package)) {
+            workspace$member_metadata$remove(package)
+        }
+    }
+
     # languageserver resolves package conflicts from the end of this list.
     workspace$startup_packages <- rev(attached_packages)
     workspace$update_loaded_packages()
 
-    self$deliver(languageserver:::Response$new(id, result = list(libraryPaths = as.list(.libPaths()))))
+    self$deliver(languageserver:::Response$new(id, result = list(libraryPaths = as.list(.libPaths()),
+        startupPackages = as.list(languageserver:::startup_packages))))
 }
 server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params) {
     self$deliver(languageserver:::Response$new(id, result = as.list(.libPaths())))

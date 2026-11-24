@@ -50,31 +50,79 @@ console_subscript_completion <- function(params, workspace, uri, point) {
     c(parameters, specials)
 }
 
+# Diagnostic metadata only: preserve the native inference and candidate list.
+# Reasons are a bounded vocabulary, never source text or exception messages.
+console_static_unavailable_reason <- function(resolved) {
+    if (isTRUE(resolved$budget$exhausted)) return("analysis-limit")
+    if (isTRUE(resolved$budget$transient)) return("analysis-pending")
+    reason <- resolved$value$reason
+    if (isTRUE(reason %in% c("unresolved_dollar_dispatch", "unresolved_subset_dispatch")))
+        return("unresolved-dispatch")
+    if (isTRUE(reason %in% c("budget", "snapshot_budget", "snapshot_depth",
+        "s4_slot_limit", "s7_property_limit"))) return("analysis-limit")
+    if (isTRUE(reason %in% c("cycle", "alias_cycle", "recursion", "binding_cycle",
+        "binding_recursion", "inheritance_cycle", "s4_cycle", "s7_recursion"))) return("inference-cycle")
+    if (is.null(resolved$value) || !length(resolved$value$type)) return("receiver-unresolved")
+    NULL
+}
+
+# Native completion is not validated against console-specific binding,
+# argument and receiver constraints until the supplement succeeds. On failure
+# discard candidates and metadata; a later request can retry.
+console_unverified_completion <- function(reply, params, reason = "request-failed") {
+    reply$result <- list(items = list(), isIncomplete = TRUE,
+        rConsoleRuntimeOnly = !isTRUE(params$rConsoleStaticAnalysis),
+        rConsoleMemberResolved = FALSE, rConsoleArgumentsResolved = FALSE,
+        rConsoleStaticUnavailableReason = reason)
+    reply
+}
+
 console_supplement_completion <- function(reply, self, params) {
     textDocument <- params$textDocument
     uri <- languageserver:::uri_escape_unicode(textDocument$uri)
     workspace <- self$get_workspace(uri)
     document <- workspace$documents$get(uri)
-    if (is.null(document)) return(reply)
+    if (is.null(document)) return(console_unverified_completion(reply, params, "document-unavailable"))
     if (is.null(reply$result)) reply$result <- list(items = list(), isIncomplete = FALSE)
 
     point <- document$from_lsp_position(params$position)
     static_analysis <- isTRUE(params$rConsoleStaticAnalysis)
     reply$result$rConsoleRuntimeOnly <- !static_analysis
+    if (static_analysis && !is.null(params$rConsoleOpaqueFunction) &&
+        !isTRUE(tryCatch(console_source_overrides_opaque(params$rConsoleOpaqueFunction,
+            uri, workspace, document, params$rConsoleOpaqueFunctionPosition), error = function(e) FALSE))) {
+        reply$result$items <- list()
+        reply$result$isIncomplete <- TRUE
+        reply$result$rConsoleMemberResolved <- FALSE
+        reply$result$rConsoleStaticUnavailableReason <- "receiver-unresolved"
+        return(reply)
+    }
     # Ask the native resolver whether an empty member list is authoritative.
     # This uses its cached receiver and avoids probing stale live objects when
     # the current source defines an empty list or the prefix has no matches.
-    if (static_analysis && exists("member_cursor", asNamespace("languageserver"), inherits = FALSE)) {
-        cursor <- languageserver:::member_cursor(document, point)
+    has_members <- any(vapply(reply$result$items, function(item)
+        identical(item$data$type, "member") && is.null(item$data$parameter), logical(1)))
+    if (static_analysis && has_members) {
+        reply$result$rConsoleMemberResolved <- TRUE
+    } else if (static_analysis) {
+        cursor <- if (exists("member_cursor", asNamespace("languageserver"), inherits = FALSE) &&
+            exists("member_resolve_cursor", asNamespace("languageserver"), inherits = FALSE))
+            languageserver:::member_cursor(document, point) else NULL
+        reason <- "unsupported-context"
         if (!is.null(cursor)) {
             resolved <- languageserver:::member_resolve_cursor(uri, workspace, document, point, cursor)
             reply$result$rConsoleMemberResolved <- !is.null(resolved$value) &&
                 (length(resolved$value$type) > 0L || identical(resolved$value$reason, "unresolved_dollar_dispatch"))
+            reason <- console_static_unavailable_reason(resolved)
         }
+        # A known empty list or a prefix with no matches is still resolved.
+        # Inferred candidates take precedence over an uncertain receiver shape.
+        reply$result$rConsoleStaticUnavailableReason <- reason
     }
 
     if ((!is.null(params$rConsoleCall) || !is.null(params$rConsoleDataObject) || isTRUE(params$rConsolePipe)) &&
-        is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L) {
+        is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L &&
+        (nzchar(params$rConsoleParseSuffix) || !is.null(params$rConsoleParseInsertion))) {
         previous_parse <- document$parse_data
         on.exit(document$update_parse_data(previous_parse), add = TRUE)
         document$update_parse_data(console_completion_parse(uri, document, params$rConsoleParseSuffix, params$rConsoleParseInsertion))
@@ -90,20 +138,52 @@ console_supplement_completion <- function(reply, self, params) {
     }
 
     call <- console_call_identity(params$rConsoleCall)
-    native_arguments <- any(vapply(reply$result$items, function(item)
-        isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")) ||
-            (identical(item$data$type, "member") && !is.null(item$data$parameter)), logical(1)))
+    member_arguments <- any(vapply(reply$result$items, function(item)
+        identical(item$data$type, "member") && !is.null(item$data$parameter), logical(1)))
+    native_arguments <- member_arguments || any(vapply(reply$result$items, function(item)
+        isTRUE(item$data$type %in% c("s3_parameter", "s3_argument_value")), logical(1)))
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
+    method_root <- if (member_call) console_call_root(params$rConsoleCall, include_calls = TRUE) else NULL
+    source_root <- if (static_analysis && member_call && !is.null(method_root))
+        console_source_function(document, point, method_root) else NULL
+    runtime_method <- if (member_call) console_runtime_arguments(params) else NULL
+    runtime_method_evidence <- member_call && (!is.null(runtime_method) ||
+        isTRUE(params$rConsoleRuntimeArgumentsRefused))
+    native_signature <- if (native_arguments) console_native_signature(reply$result$items, uri) else NULL
+    native_member <- static_analysis && member_call && member_arguments && !is.null(native_signature) &&
+        is.null(source_root) && !runtime_method_evidence && !identical(method_root, "")
+    member_source <- if (static_analysis && member_call && !native_member)
+        console_member_function(uri, workspace, document, point, method_root, source_root) else NULL
+    # Only an editable source binding can supersede a verified live signature
+    # or refusal. A package catalog may describe a shadowed namesake.
+    if (runtime_method_evidence && is.null(source_root) &&
+        !isTRUE(member_source$source_binding) && !isTRUE(member_source$unknown)) {
+        member_source <- NULL
+        native_arguments <- FALSE
+    }
+    # A current source binding (including an unresolved factory or a formal)
+    # must not borrow arguments from an older, same-named live object.
+    source_method_root <- static_analysis && (native_member || !is.null(member_source) || !is.null(source_root))
+    if (source_method_root) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE
     # Static source inference is explicitly opt-in. Live sess signatures take
     # precedence in normal console mode regardless of native package inference.
     source <- if (is.null(call) || !is.null(call$package) || !static_analysis) NULL else if (member_call) {
-        if (native_arguments) NULL else console_member_function(uri, workspace, document, point)
+        if (native_arguments && !isTRUE(member_source$unknown)) NULL else member_source
     } else console_source_function(document, point, call$token)
     source_is_static <- !is.null(source)
-    runtime <- if (is.null(source) && !is.null(call) && is.null(call$package))
-        console_parse_signature(params$rConsoleRuntimeSignature) else NULL
+    if (source_is_static) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE
+    runtime <- if (is.null(source) && !is.null(call) && is.null(call$package)) {
+        if (member_call) {
+            if (!source_method_root) runtime_method else NULL
+        } else {
+            parsed <- console_parse_signature(params$rConsoleRuntimeSignature)
+            if (!is.null(parsed)) list(formals = parsed[[2L]]) else console_runtime_arguments(params)
+        }
+    } else NULL
+    if (is.null(source) && is.null(runtime) && !source_method_root &&
+        isTRUE(params$rConsoleRuntimeArgumentsRefused)) runtime <- list(unknown = TRUE)
     if (!is.null(runtime)) {
-        source <- list(formals = runtime[[2L]])
+        source <- runtime
         reply$result$rConsoleWorkspaceFunction <- TRUE
     }
     # Cached workspace signatures override package inference; unsubmitted source
@@ -113,20 +193,23 @@ console_supplement_completion <- function(reply, self, params) {
     if (source_is_static) reply$result$rConsoleLocalFunction <- TRUE
     if (native_arguments) {
         reply$result$rConsoleNativeArguments <- TRUE
-        for (item in reply$result$items) {
-            native_formals <- item$data$s3$method$formals
-            if (!is.null(native_formals)) {
-                signature <- console_source_signature(list(formals = native_formals), uri)
-                break
-            }
+        signature <- native_signature
+    }
+    # Prefix filtering, value matching and argument validation share one full
+    # lookup from the native provider within this request. Never retain a live
+    # receiver signature across requests or substitute a global for a method.
+    argument_signature <- function() {
+        if (is.null(signature) && !is.null(call) && !member_call && is.null(source)) {
+            signature <<- languageserver:::arg_completion(uri, workspace, point, "", call$token,
+                call$package, exported_only = call$accessor != ":::")
+            attr(signature, "known_signature") <<- length(signature) > 0L
         }
-        if (is.null(signature)) {
-            location <- languageserver:::member_call_location(document, point, symbols = TRUE)
-            constructor <- languageserver:::member_constructor_symbol(uri, workspace, document, location)
-            if (!is.null(constructor$value$function_expr)) {
-                signature <- console_source_signature(list(formals = constructor$value$function_expr[[2L]]), uri)
-            }
-        }
+        signature
+    }
+    if (member_call) {
+        reply$result$rConsoleArgumentsResolved <- !is.null(signature)
+        reply$result$rConsoleStaticUnavailableReason <- if (is.null(signature))
+            "method-arguments-unavailable" else NULL
     }
     if (is.null(call) && !is.null(params$rConsoleCall)) {
         # A name accepted by the frontend lexer may be invalid in R's locale
@@ -155,14 +238,12 @@ console_supplement_completion <- function(reply, self, params) {
                 }), recursive = FALSE)
                 c(parameters, values)
             } else c(
-                if (!value_mode) languageserver:::arg_completion(uri, workspace, point, token, call$token,
-                    call$package, exported_only = call$accessor != ":::"),
+                if (!value_mode) Filter(function(item) languageserver:::match_with(item$label, token), argument_signature()),
                 languageserver:::arg_value_completion(uri, workspace, document, point, token,
                     call$token, call$package, exported_only = call$accessor != ":::")
             )
             if (value_mode) {
-                value_signature <- if (!is.null(source)) signature else languageserver:::arg_completion(
-                    uri, workspace, point, "", call$token, call$package, exported_only = call$accessor != ":::")
+                value_signature <- argument_signature()
                 name <- console_value_argument(vapply(value_signature, console_argument_name, character(1)),
                     params$rConsoleArgument, params$rConsoleValueTags)
                 arguments <- Filter(function(item) nzchar(name) && identical(item$detail, paste0("value for ", name)), arguments)
@@ -177,7 +258,7 @@ console_supplement_completion <- function(reply, self, params) {
     # Validate each proposed name using R's matching rules. Positional values,
     # partial tags and pipe insertion can make an otherwise unused name invalid.
     if (!isTRUE(source$unknown) && ((!native_arguments && (!member_call || !is.null(source))) || !is.null(signature))) reply$result$items <- console_valid_argument_items(reply$result$items,
-        params$rConsoleArgumentTags, call, uri, workspace, point, signature)
+        params$rConsoleArgumentTags, call, uri, workspace, point, argument_signature())
     if (isTRUE(attr(reply$result$items, "arguments_exhausted"))) {
         reply$result$rConsoleArgumentsExhausted <- TRUE
         reply$result$items <- list()
@@ -209,11 +290,11 @@ server$request_handlers[["textDocument/completion"]] <- function(self, id, param
     proxy <- as.list(self)
     proxy$deliver <- function(reply) {
         if (inherits(reply, "Response")) {
-            native_result <- reply$result
             reply <- tryCatch(console_supplement_completion(reply, self, params), error = function(error) {
-                languageserver:::logger$info("console completion supplement:", error)
-                reply$result <- native_result
-                reply
+                # Do not log exceptions containing user source. Even logging
+                # failure must not prevent delivery of the safe response.
+                try(languageserver:::logger$info("console completion supplement failed"), silent = TRUE)
+                console_unverified_completion(reply, params)
             })
         }
         self$deliver(reply)

@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::time::Instant;
 
+#[path = "function_source.rs"]
+mod function_source;
+
 type Sexp = *mut c_void;
 const LIST: c_int = 2;
 const CLOSURE: c_int = 3;
@@ -36,6 +39,14 @@ pub(crate) enum Target {
     Slot,
     Bracket,
     DoubleBracket,
+    // Inspect a stored closure's syntax without invoking it.
+    FunctionSource,
+    // A grouped symbol in call position uses ordinary value lookup.
+    FunctionSourceValue,
+    // Read only the tags of a stored closure's formals, never defaults/body.
+    FunctionArguments,
+    // Check a computed receiver's root identity without traversing its value.
+    Binding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,7 +63,7 @@ pub(crate) enum Step {
 
 impl Target {
     fn accessor(self) -> &'static str {
-        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[" }
+        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSourceValue => "(", Self::FunctionSource | Self::FunctionArguments | Self::Binding => "" }
     }
 }
 
@@ -72,20 +83,25 @@ pub(crate) struct MemberQuery {
     pub steps: Vec<Step>,
     pub target: Target,
     pub utf8_byte_escapes: bool,
+    pub search_path: bool,
 }
 
 impl MemberQuery {
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 6 { return None; }
         // 0x80 requests a native UTF-8 locale check before resolving any name.
-        let target = match bytes[0] & !0x80 {
+        let depth = bytes[1] as usize;
+        let target = match bytes[0] & !0xc0 {
             0 => Target::Dollar,
             1 => Target::Slot,
             2 => Target::Bracket,
             3 => Target::DoubleBracket,
+            4 if depth == 0 => Target::FunctionSource,
+            5 => Target::FunctionArguments,
+            6 if depth == 0 && bytes[0] & 0x40 != 0 => Target::Binding,
+            7 if depth == 0 && bytes[0] & 0xc0 == 0x40 => Target::FunctionSourceValue,
             _ => return None,
         };
-        let depth = bytes[1] as usize;
         if depth > MAX_DEPTH { return None; }
         let mut at = 2;
         let root = read_name(bytes, &mut at)?;
@@ -107,7 +123,8 @@ impl MemberQuery {
             steps.push(step);
         }
         if at != bytes.len() { return None; }
-        Some(Self { root, steps, target, utf8_byte_escapes: bytes[0] & 0x80 != 0 })
+        Some(Self { root, steps, target, utf8_byte_escapes: bytes[0] & 0x80 != 0,
+            search_path: bytes[0] & 0x40 != 0 })
     }
 }
 
@@ -178,13 +195,28 @@ pub(crate) struct InspectorApi {
     promise_environment: usize,
     empty_env: usize,
     base_namespace: usize,
+    base_env: usize,
     namespace_registry: usize,
     utf8_locale: Option<usize>,
     vmaxget: usize,
     vmaxset: usize,
+    formals: Option<usize>,
+    body: Option<usize>,
+    closure_env: Option<usize>,
+    logical_elt: Option<usize>,
+    is_na: Option<usize>,
 }
 
 impl InspectorApi {
+    pub(crate) fn supports_function_arguments(&self) -> bool {
+        self.formals.is_some()
+    }
+
+    pub(crate) fn supports_function_source(&self) -> bool {
+        self.formals.is_some() && self.body.is_some() && self.closure_env.is_some() && self.car.is_some() &&
+            self.logical_elt.is_some() && self.integer_elt.is_some() && self.real_elt.is_some() && self.is_na.is_some()
+    }
+
     pub(crate) unsafe fn load(mut symbol: impl FnMut(&[u8]) -> Option<usize>) -> Option<Self> {
         Some(Self {
             install: symbol(b"Rf_install\0")?,
@@ -232,11 +264,18 @@ impl InspectorApi {
             promise_environment: symbol(b"PRENV\0")?,
             empty_env: symbol(b"R_EmptyEnv\0")?,
             base_namespace: symbol(b"R_BaseNamespace\0")?,
+            base_env: symbol(b"R_BaseEnv\0")?,
             namespace_registry: symbol(b"R_NamespaceRegistry\0")?,
             utf8_locale: symbol(b"utf8locale\0"),
             // Required for bounded copies of R_alloc-backed UTF-8 translations.
             vmaxget: symbol(b"vmaxget\0")?,
             vmaxset: symbol(b"vmaxset\0")?,
+            // Stored syntax access only. R_ClosureExpr also exposes byte-compiled source.
+            formals: symbol(b"R_ClosureFormals\0").or_else(|| symbol(b"FORMALS\0")),
+            body: symbol(b"R_ClosureExpr\0"),
+            closure_env: symbol(b"R_ClosureEnv\0").or_else(|| symbol(b"CLOENV\0")),
+            logical_elt: symbol(b"LOGICAL_ELT\0"),
+            is_na: symbol(b"R_IsNA\0"),
         })
     }
 }
@@ -244,8 +283,20 @@ impl InspectorApi {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Inspection {
     Available(Members),
+    NotCallable,
+    PackageBinding,
+    Opaque,
+    FunctionSource(String),
+    FunctionArguments(Vec<String>),
     Suppressed(Suppression),
     Unavailable,
+}
+
+enum RootBinding {
+    Missing,
+    NotCallable,
+    Stored(Sexp),
+    Package(Sexp),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -254,11 +305,17 @@ pub(crate) struct Members {
     pub(crate) kinds: Vec<u8>,
     // 0 = ordinary, 1 = data.frame, 2 = data.table; only used for [ insertion.
     pub(crate) bracket_kind: u8,
+    // The root is absent, rather than a stored object with zero members.
+    pub(crate) root_missing: bool,
 }
 
 impl Members {
     fn empty() -> Self {
-        Self { names: Vec::new(), kinds: Vec::new(), bracket_kind: 0 }
+        Self { names: Vec::new(), kinds: Vec::new(), bracket_kind: 0, root_missing: false }
+    }
+
+    fn missing() -> Self {
+        Self { root_missing: true, ..Self::empty() }
     }
 }
 
@@ -309,6 +366,11 @@ const RMG_ENCLOS: c_int = 28;
 const RMG_PRVALUE: c_int = 29;
 const RMG_PREXPR: c_int = 30;
 const RMG_PRENV: c_int = 31;
+const RMG_FORMALS: c_int = 32;
+const RMG_BODY: c_int = 33;
+const RMG_LOGICAL_ELT: c_int = 34;
+const RMG_IS_NA: c_int = 35;
+const RMG_CLOSURE_ENV: c_int = 36;
 
 unsafe extern "C" {
     fn rmg_begin(toplevel: usize, funcs: *const usize, count: usize,
@@ -422,8 +484,24 @@ unsafe extern "C" fn guard_promise_environment(a: Sexp) -> Sexp {
     guarded(RMG_PRENV, a as usize, 0, 0) as usize as Sexp
 }
 
+unsafe extern "C" fn guard_formals(a: Sexp) -> Sexp {
+    guarded(RMG_FORMALS, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_closure_env(a: Sexp) -> Sexp {
+    guarded(RMG_CLOSURE_ENV, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_body(a: Sexp) -> Sexp {
+    guarded(RMG_BODY, a as usize, 0, 0) as usize as Sexp
+}
+unsafe extern "C" fn guard_logical_elt(a: Sexp, index: isize) -> c_int {
+    guarded(RMG_LOGICAL_ELT, a as usize, index as usize, 0) as c_int
+}
+unsafe extern "C" fn guard_is_na(value: f64) -> bool {
+    guarded(RMG_IS_NA, value.to_bits() as usize, 0, 0) != 0
+}
+
 unsafe fn begin_inspection_guard(api: InspectorApi) {
-    let funcs: [usize; 32] = [
+    let funcs: [usize; 37] = [
         api.install, api.find_var, api.exists, api.active, api.typeof_,
         api.altrep, api.attrib, api.get_attrib, api.tag,
         api.car.unwrap_or(0), api.cdr, api.printname, api.vector_elt,
@@ -432,6 +510,7 @@ unsafe fn begin_inspection_guard(api: InspectorApi) {
         api.integer_elt.unwrap_or(0), api.real_elt.unwrap_or(0),
         api.envlength.unwrap_or(0), api.vmaxget, api.vmaxset,
         api.char_ce, api.enclosing_env, api.promise_value, api.promise_expression, api.promise_environment,
+        api.formals.unwrap_or(0), api.body.unwrap_or(0), api.logical_elt.unwrap_or(0), api.is_na.unwrap_or(0), api.closure_env.unwrap_or(0),
     ];
     rmg_begin(api.top_level, funcs.as_ptr(), funcs.len(),
         api.raw_protect, api.raw_unprotect,
@@ -480,6 +559,7 @@ struct Native {
     promise_environment: Unary,
     empty_env: Sexp,
     base_namespace: Sexp,
+    base_env: Sexp,
     namespace_registry: Sexp,
     global: Sexp,
     nil: Sexp,
@@ -488,6 +568,11 @@ struct Native {
     names: Sexp,
     class: Sexp,
     deadline: Instant,
+    formals: Option<Unary>,
+    body: Option<Unary>,
+    closure_env: Option<Unary>,
+    logical_elt: Option<unsafe extern "C" fn(Sexp, isize) -> c_int>,
+    is_na: Option<unsafe extern "C" fn(f64) -> bool>,
 }
 
 impl Native {
@@ -537,6 +622,7 @@ impl Native {
             promise_environment: guard_promise_environment,
             empty_env: *(api.empty_env as *const Sexp),
             base_namespace: *(api.base_namespace as *const Sexp),
+            base_env: *(api.base_env as *const Sexp),
             namespace_registry: *(api.namespace_registry as *const Sexp),
             global,
             nil,
@@ -545,6 +631,11 @@ impl Native {
             names: *(api.names as *const Sexp),
             class: *(api.class_symbol as *const Sexp),
             deadline,
+            formals: api.formals.map(|_| guard_formals as _),
+            body: api.body.map(|_| guard_body as _),
+            closure_env: api.closure_env.map(|_| guard_closure_env as _),
+            logical_elt: api.logical_elt.map(|_| guard_logical_elt as _),
+            is_na: api.is_na.map(|_| guard_is_na as _),
         })
     }
 
@@ -638,6 +729,80 @@ impl Native {
         if value.is_null() || value == self.unbound { None } else { Some(value) }
     }
 
+    // An attached package and its namespace share stored export bindings,
+    // including unforced lazy-load promises. Verify that identity before using
+    // installed metadata. An environment's display name alone proves nothing.
+    unsafe fn package_binding(&self, env: Sexp, name: &str, raw: Sexp) -> Result<bool, Suppression> {
+        let namespace = if env == self.base_env { self.base_namespace } else {
+            let label = (self.get_attrib)(env, self.symbol("name").ok_or(Suppression::InspectionLimit)?);
+            if label == self.nil || (self.type_of)(label) != STRING { return Ok(false); }
+            if (self.altrep)(label) != 0 { return Err(Suppression::UnsafeAltRep); }
+            if (self.xlength)(label) != 1 { return Ok(false); }
+            let Some(label) = self.text((self.string_elt)(label, 0)) else { return Ok(false); };
+            let Some(package) = label.strip_prefix("package:") else { return Ok(false); };
+            let Some(namespace) = self.stored_binding(self.namespace_registry, package)? else { return Ok(false); };
+            if (self.type_of)(namespace) != ENV { return Ok(false); }
+            namespace
+        };
+        let same = |candidate: Sexp| candidate == raw ||
+            self.cached_value(raw).is_some_and(|value| self.cached_value(candidate) == Some(value));
+        // Re-exported bindings may live in the namespace's imports chain.
+        let mut cursor = namespace;
+        for _ in 0..128 {
+            self.check_deadline()?;
+            if cursor == self.global || cursor == self.empty_env { break; }
+            if cursor.is_null() || (self.type_of)(cursor) != ENV { return Err(Suppression::UnsafeEnvironment); }
+            if let Some(candidate) = self.stored_binding(cursor, name)? {
+                if same(candidate) { return Ok(true); }
+                break;
+            }
+            cursor = (self.enclosing_env)(cursor);
+        }
+        // Lazy datasets are kept in the namespace's separate data environment.
+        let Some(info) = self.stored_binding(namespace, ".__NAMESPACE__.")? else { return Ok(false); };
+        if (self.type_of)(info) != ENV { return Ok(false); }
+        let Some(data) = self.stored_binding(info, "lazydata")? else { return Ok(false); };
+        if (self.type_of)(data) != ENV { return Ok(false); }
+        Ok(self.stored_binding(data, name)?.is_some_and(same))
+    }
+
+    // Resolve the actual search-path binding without evaluating it. Bare
+    // function calls skip ordinary non-callable values; member receivers use
+    // ordinary value lookup. Unknown promises and active bindings stop lookup.
+    unsafe fn root_binding(&self, query: &MemberQuery) -> Result<RootBinding, Suppression> {
+        if !query.search_path {
+            return Ok(self.binding(self.global, &query.root)?.map(RootBinding::Stored)
+                .unwrap_or(RootBinding::Missing));
+        }
+        let function_lookup = query.target == Target::FunctionSource ||
+            (query.target == Target::FunctionArguments && query.steps.is_empty());
+        let mut env = self.global;
+        let mut skipped = false;
+        for _ in 0..128 {
+            self.check_deadline()?;
+            if env == self.empty_env {
+                return Ok(if skipped { RootBinding::NotCallable } else { RootBinding::Missing });
+            }
+            if env.is_null() || (self.type_of)(env) != ENV { return Err(Suppression::UnsafeEnvironment); }
+            if let Some(raw) = self.stored_binding(env, &query.root)? {
+                let package = env != self.global && self.package_binding(env, &query.root, raw)?;
+                let value = if package { self.cached_value(raw) } else { Some(raw) };
+                if let Some(value) = value {
+                    let kind = (self.type_of)(value);
+                    if kind == PROMISE { return Err(Suppression::DeferredBinding); }
+                    if function_lookup && !matches!(kind, CLOSURE | SPECIAL | BUILTIN) {
+                        skipped = true;
+                        env = (self.enclosing_env)(env);
+                        continue;
+                    }
+                }
+                return Ok(if package { RootBinding::Package(raw) } else { RootBinding::Stored(raw) });
+            }
+            env = (self.enclosing_env)(env);
+        }
+        Err(Suppression::InspectionLimit)
+    }
+
     // R resolves the function in a call before dispatching on its receiver.
     // Reproduce only the non-evaluating part of that lookup: ordinary
     // non-functions are skipped, forced promises may supply a stored value,
@@ -668,6 +833,7 @@ impl Native {
         let mut checked = HashSet::new();
         for accessor in query.steps.iter().map(Step::accessor)
             .chain(std::iter::once(query.target.accessor())) {
+            if accessor.is_empty() { continue; }
             if !checked.insert(accessor) { continue; }
             let primitive = self.stored_binding(self.base_namespace, accessor)?
                 .and_then(|value| self.cached_value(value))
@@ -941,7 +1107,7 @@ impl Native {
             if index % 32 == 0 { self.check_deadline()?; }
             kinds.push(self.member_kind(value, target, name)?);
         }
-        Ok(Members { names, kinds, bracket_kind: 0 })
+        Ok(Members { names, kinds, bracket_kind: 0, root_missing: false })
     }
 
     unsafe fn bracket_kind(&self, value: Sexp) -> Result<u8, Suppression> {
@@ -958,8 +1124,32 @@ impl Native {
         })
     }
 
+    unsafe fn function_arguments(&self, value: Sexp) -> Result<Members, Suppression> {
+        if (self.type_of)(value) != CLOSURE { return Err(Suppression::InspectionLimit); }
+        let formals = self.formals.ok_or(Suppression::InspectionLimit)?;
+        let mut cursor = formals(value);
+        let mut members = Members::empty();
+        let mut seen = HashSet::new();
+        while cursor != self.nil {
+            self.check_deadline()?;
+            if cursor.is_null() || (self.type_of)(cursor) != LIST || members.names.len() >= 128 {
+                return Err(Suppression::InspectionLimit);
+            }
+            let tag = (self.tag)(cursor);
+            if tag.is_null() || (self.type_of)(tag) != 1 { return Err(Suppression::InspectionLimit); }
+            let name = self.text((self.printname)(tag)).ok_or(Suppression::InspectionLimit)?;
+            if name.is_empty() || !seen.insert(name.clone()) { return Err(Suppression::InspectionLimit); }
+            members.names.push(name);
+            // Do not read CAR: defaults may contain arbitrary callback-bearing
+            // objects. Only the argument names are needed for matching.
+            cursor = (self.cdr)(cursor);
+        }
+        Ok(members)
+    }
+
     unsafe fn names_for(&self, value: Sexp, target: Target) -> Result<Members, Suppression> {
         self.check_deadline()?;
+        if target == Target::FunctionArguments { return self.function_arguments(value); }
         if value == self.nil { return Ok(Members::empty()); }
         let kind = (self.type_of)(value);
         if target == Target::Slot {
@@ -982,7 +1172,7 @@ impl Native {
                     // Names remain safe storage metadata, like a custom list.
                     // A stored function need not be callable through its method.
                     let kinds = vec![0; names.len()];
-                    Ok(Members { names, kinds, bracket_kind: 0 })
+                    Ok(Members { names, kinds, bracket_kind: 0, root_missing: false })
                 } else {
                     self.classify_unindexed(value, target, names)
                 }
@@ -1239,10 +1429,24 @@ impl Native {
         Ok(self.stored_kind(stored))
     }
 
-    unsafe fn inspect(&self, query: &MemberQuery) -> Result<Members, Suppression> {
+    unsafe fn inspect(&self, query: &MemberQuery) -> Result<Inspection, Suppression> {
         self.check_deadline()?;
         self.validate_accessors(query)?;
-        let Some(root) = self.binding(self.global, &query.root)? else { return Ok(Members::empty()); };
+        let root = match self.root_binding(query)? {
+            RootBinding::Missing => return Ok(Inspection::Available(Members::missing())),
+            RootBinding::NotCallable => return Ok(Inspection::NotCallable),
+            RootBinding::Package(raw) => {
+                if query.target == Target::Binding || (query.target == Target::FunctionArguments && query.steps.is_empty()) {
+                    return Ok(Inspection::PackageBinding);
+                }
+                // Already materialized package receivers have ordinary live
+                // storage too. Read that current value when it is available.
+                let Some(value) = self.cached_value(raw) else { return Ok(Inspection::PackageBinding); };
+                value
+            }
+            RootBinding::Stored(_) if query.target == Target::Binding => return Ok(Inspection::Opaque),
+            RootBinding::Stored(value) => value,
+        };
         (self.protect)(root);
         let mut protected = 1;
         let outcome = (|| -> Result<Members, Suppression> {
@@ -1250,10 +1454,13 @@ impl Native {
                 let mut current = View::Object(root);
                 for step in &query.steps {
                     self.check_deadline()?;
-                    let Some(next) = self.step(current, step)? else { return Ok(Members::empty()); };
+                    let Some(next) = self.step(current, step)? else {
+                        return if query.target == Target::FunctionArguments { Err(Suppression::InspectionLimit) }
+                            else { Ok(Members::empty()) };
+                    };
                     if let View::Object(value) = next {
+                        if value.is_null() { return Err(Suppression::InspectionLimit); }
                         if (self.type_of)(value) == PROMISE { return Err(Suppression::DeferredBinding); }
-                        if value.is_null() { return Ok(Members::empty()); }
                         (self.protect)(value);
                         protected += 1;
                     }
@@ -1265,6 +1472,7 @@ impl Native {
                         self.names_for(value, query.target)
                     }
                     View::Slice { source, index } => {
+                        if query.target == Target::FunctionArguments { return Err(Suppression::InspectionLimit); }
                         if query.target == Target::Slot { return Ok(Members::empty()); }
                         let type_ = (self.type_of)(source);
                         if query.target == Target::Dollar && !matches!(type_, VECTOR | EXPRESSION) {
@@ -1282,13 +1490,18 @@ impl Native {
                         let bracket_kind = if query.target == Target::Bracket {
                             self.bracket_kind(source)?
                         } else { 0 };
-                        Ok(Members { names, kinds, bracket_kind })
+                        Ok(Members { names, kinds, bracket_kind, root_missing: false })
                     }
                 }
             }
         })();
         (self.unprotect)(protected);
-        outcome
+        match outcome {
+            Ok(members) if query.target == Target::FunctionArguments => Ok(Inspection::FunctionArguments(members.names)),
+            Ok(members) => Ok(Inspection::Available(members)),
+            Err(Suppression::InspectionLimit) if query.search_path && query.target == Target::FunctionArguments => Ok(Inspection::Opaque),
+            Err(reason) => Err(reason),
+        }
     }
 }
 
@@ -1303,12 +1516,18 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) 
             return Inspection::Unavailable;
         }
         begin_inspection_guard(api);
-        let result = Native::new(api, deadline).map(|native| native.inspect(&query));
+        let result = Native::new(api, deadline).map(|native| {
+            if matches!(query.target, Target::FunctionSource | Target::FunctionSourceValue) {
+                native.inspect_function_source(&query)
+            } else {
+                native.inspect(&query)
+            }
+        });
         if rmg_end() != 0 {
             return Inspection::Unavailable;
         }
         match result {
-            Some(Ok(names)) => Inspection::Available(names),
+            Some(Ok(result)) => result,
             Some(Err(Suppression::InspectionLimit)) => Inspection::Unavailable,
             Some(Err(reason)) => Inspection::Suppressed(reason),
             None => Inspection::Unavailable,
@@ -1368,11 +1587,15 @@ mod tests {
             root: "obj".to_owned(),
             steps: vec![Step::Field("inner".to_owned()),
                 Step::NamedIndex("a b".to_owned()), Step::Index(1)],
-            target: Target::DoubleBracket, utf8_byte_escapes: false,
+            target: Target::DoubleBracket, utf8_byte_escapes: false, search_path: false,
         }));
         bytes[0] |= 0x80;
         assert!(MemberQuery::decode(&bytes).unwrap().utf8_byte_escapes);
-        bytes[0] = 0x40;
+        bytes[0] = 4;
+        assert_eq!(MemberQuery::decode(&bytes), None, "function source cannot traverse selectors");
+        bytes[0] = 0xc3;
+        assert!(MemberQuery::decode(&bytes).unwrap().search_path);
+        bytes[0] = 0x20;
         assert_eq!(MemberQuery::decode(&bytes), None);
         bytes[0] = 3;
         assert_eq!(MemberQuery::decode(&bytes[..bytes.len()-1]), None);
@@ -1381,7 +1604,25 @@ mod tests {
         let mut root = vec![0, 0];
         name("task", &mut root);
         assert_eq!(MemberQuery::decode(&root), Some(MemberQuery {
-            root: "task".to_owned(), steps: Vec::new(), target: Target::Dollar, utf8_byte_escapes: false,
+            root: "task".to_owned(), steps: Vec::new(), target: Target::Dollar, utf8_byte_escapes: false, search_path: false,
         }));
+        root[0] = 4;
+        assert_eq!(MemberQuery::decode(&root), Some(MemberQuery {
+            root: "task".to_owned(), steps: Vec::new(), target: Target::FunctionSource, utf8_byte_escapes: false, search_path: false,
+        }));
+        root[0] = 6;
+        assert_eq!(MemberQuery::decode(&root), None, "binding queries require search-path semantics");
+        root[0] = 0x46;
+        assert_eq!(MemberQuery::decode(&root).unwrap().target, Target::Binding);
+        root[0] = 7;
+        assert_eq!(MemberQuery::decode(&root), None, "value source requires search-path lookup");
+        root[0] = 0xc7;
+        assert_eq!(MemberQuery::decode(&root), None, "source names cannot use byte-escape flags");
+        root[0] = 0x47;
+        assert_eq!(MemberQuery::decode(&root).unwrap().target, Target::FunctionSourceValue);
+        root[1] = 1;
+        assert_eq!(MemberQuery::decode(&root), None, "value source never traverses selectors");
+        root[0] = 0x46;
+        assert_eq!(MemberQuery::decode(&root), None, "binding queries never traverse selectors");
     }
 }

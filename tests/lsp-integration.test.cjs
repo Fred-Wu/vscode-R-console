@@ -18,6 +18,147 @@ const completion = loadSource("src/Language/completion.ts", { vscode: {
   Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
 } });
 
+test("closing a virtual completion document cancels native tasks and answers pending requests", () => {
+  assert.deepEqual(runRJson(String.raw`
+    code <- parse("resources/r/console-language-server.R")
+    definition <- Filter(function(node) is.call(node) && identical(node[[1L]], as.name("<-")) &&
+        identical(node[[2L]], quote(console_text_document_did_close)), as.list(code))[[1L]]
+    eval(definition)
+    cancelled <- delivered <- integer()
+    removed <- closed <- FALSE
+    manager <- function(index) list(cancel = function(uri) { cancelled <<- c(cancelled, index) })
+    ids <- c(101L, 102L)
+    queue <- list(size = function() length(ids), pop = function() {
+        id <- ids[[1L]]; ids <<- ids[-1L]; list(id = id)
+    })
+    document <- list(did_close = function() { closed <<- TRUE })
+    workspace <- list(documents = list(has = function(uri) TRUE, get = function(uri) document,
+        remove = function(uri) { removed <<- TRUE }), update_loaded_packages = function() NULL)
+    self <- list(parse_task_manager = manager(1L), resolve_task_manager = manager(2L), member_task_manager = manager(3L),
+        get_workspace = function(uri) workspace, deliver = function(reply) { delivered <<- c(delivered, reply$id) },
+        pending_replies = list(get = function(...) list(queue), remove = function(uri) NULL))
+    console_text_document_did_close(self, list(textDocument = list(uri = "r-console://cancel/console.R")))
+    stopifnot(closed, removed, !length(ids))
+    cat(jsonlite::toJSON(list(cancelled = cancelled, delivered = delivered)))
+  `), { cancelled: [1, 2, 3], delivered: [101, 102] });
+});
+
+test("console supplements reuse native members, constructor signatures and package argument lookups", () => {
+  const result = runRJson(String.raw`
+    server <- list(request_handlers = list("textDocument/completion" = function(...) NULL))
+    for (file in c("completion-runtime.R", "completion-arguments.R", "completion-static.R", "completion-provider.R"))
+        source(file.path("resources/r", file))
+    uri <- "r-console://reuse/console.R"
+    point <- list(row = 0L, col = 0L)
+    # A successful native member reply needs no second receiver analysis.
+    document <- list(from_lsp_position = function(position) point)
+    workspace <- list(documents = list(get = function(uri) document))
+    self <- list(get_workspace = function(uri) workspace)
+    member <- list(label = "secret", data = list(type = "member"))
+    reply <- console_supplement_completion(list(result = list(items = list(member))), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = 0L), rConsoleStaticAnalysis = TRUE))
+    stopifnot(isTRUE(reply$result$rConsoleMemberResolved), identical(reply$result$items, list(member)))
+
+    text <- "pkg::Factory$new("
+    document <- languageserver:::Document$new(uri, language = "r", version = 1L, content = text)
+    document$update_parse_data(languageserver:::parse_document(uri, text))
+    console_member_function <- function(...) stop("duplicate receiver inspection")
+    console_completion_parse <- function(...) stop("duplicate parse of complete input")
+    signature <- 'new(cols, \x60a b\x60 = stop("defaults stay inert"), ...)'
+    constructor <- list(label = "cols", kind = languageserver:::CompletionItemKind$Variable,
+        data = list(type = "member", parameter = "cols", signature = signature))
+    reply <- console_supplement_completion(list(result = list(items = list(constructor))), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = nchar(text)),
+            rConsoleStaticAnalysis = TRUE, rConsoleCall = "pkg::Factory$new", rConsoleArgumentTags = list(NULL),
+            rConsoleParseSuffix = ""))
+    stopifnot(isTRUE(reply$result$rConsoleArgumentsResolved), isTRUE(reply$result$rConsoleNativeArguments))
+    names <- vapply(console_native_signature(list(constructor), uri), console_argument_name, character(1))
+    stopifnot(identical(names, c("cols", "a b", "...")))
+
+    # S3 arguments alone do not establish the identity of a member receiver.
+    # They must never replace an explicit refusal from the runtime inspector.
+    text <- "task$levels("
+    document <- languageserver:::Document$new(uri, language = "r", version = 1L, content = text)
+    document$update_parse_data(languageserver:::parse_document(uri, text))
+    console_member_function <- function(...) NULL
+    unrelated <- list(label = "wrong", kind = languageserver:::CompletionItemKind$Variable,
+        data = list(type = "s3_parameter", parameter = "wrong", s3 = list(method = list(formals = list(wrong = NULL)))))
+    refused <- console_supplement_completion(list(result = list(items = list(unrelated))), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = nchar(text)),
+            rConsoleStaticAnalysis = TRUE, rConsoleCall = "task$levels", rConsoleArgumentTags = list(NULL),
+            rConsoleRuntimeArgumentsRefused = TRUE))
+    stopifnot(identical(refused$result$rConsoleArgumentsResolved, FALSE), !length(refused$result$items),
+        !isTRUE(refused$result$rConsoleRuntimeArgumentsIgnored))
+
+    # Recovery of a lexer-selected call must share the full package signature
+    # between prefix filtering and validation. Value lookup is a separate native API.
+    calls <- 0L
+    workspace$get_formals <- function(...) { calls <<- calls + 1L; list(cols = NULL, mode = quote(c("auto", "stream"))) }
+    workspace$get_signature <- function(...) "target(cols, mode)"
+    document <- list(from_lsp_position = function(position) point,
+        detect_call = function(point) list(token = "other", accessor = "", package = NULL),
+        detect_token = function(...) list(token = ""))
+    reply <- console_supplement_completion(list(result = list(items = list())), self,
+        list(textDocument = list(uri = uri), position = list(line = 0L, character = 0L),
+            rConsoleCall = "pkg::target", rConsoleArgumentTags = list(NULL)))
+    stopifnot(calls == 2L)
+    labels <- vapply(reply$result$items, function(item) item$label, character(1))
+    stopifnot(identical(labels, c("cols", "mode")))
+    cat(jsonlite::toJSON(list(lookups = calls, parameters = names), auto_unbox = TRUE))
+  `);
+  assert.equal(result.lookups, 2);
+  assert.deepEqual(result.parameters, ['cols', 'a b', '...']);
+});
+
+test("completion supplement failures never deliver unvalidated native candidates", () => {
+  const result = runRJson(String.raw`
+    native_result <- list(items = list(
+        list(label = "wrong_member", data = list(type = "member")),
+        list(label = "wrong_parameter", data = list(type = "s3_parameter", parameter = "wrong_parameter"))),
+        isIncomplete = FALSE, rConsoleMemberResolved = TRUE, rConsoleArgumentsResolved = TRUE,
+        rConsoleNativeArguments = TRUE)
+    server <- list(request_handlers = list("textDocument/completion" = function(self, id, params) {
+        self$deliver(structure(list(id = id, result = native_result), class = "Response"))
+    }))
+    source("resources/r/completion-provider.R")
+    delivered <- NULL
+    self <- list(get_workspace = function(uri) list(documents = list(get = function(uri) NULL)),
+        deliver = function(reply) { delivered <<- reply })
+    handler <- server$request_handlers[["textDocument/completion"]]
+    params <- list(textDocument = list(uri = "r-console://failure/console.R"),
+        position = list(line = 0L, character = 0L))
+    verify <- function(extra, reason) {
+        request <- c(params, extra)
+        handler(self, 1L, request)
+        result <- delivered$result
+        stopifnot(identical(delivered$id, 1L), !length(result$items),
+            isTRUE(result$isIncomplete), identical(result$rConsoleMemberResolved, FALSE),
+            identical(result$rConsoleArgumentsResolved, FALSE),
+            identical(result$rConsoleRuntimeOnly, !isTRUE(request$rConsoleStaticAnalysis)),
+            identical(result$rConsoleStaticUnavailableReason, reason),
+            is.null(result$rConsoleNativeArguments))
+    }
+    # Losing the document is also a failure to establish provenance.
+    verify(list(rConsoleStaticAnalysis = TRUE, rConsoleOpaqueFunction = "api"), "document-unavailable")
+    # Exercise the actual delivery proxy, not just the supplement helper.
+    console_supplement_completion <- function(...) stop("injected validation failure")
+    cases <- list(
+        list(rConsoleStaticAnalysis = TRUE, rConsoleOpaqueFunction = "api"),
+        list(rConsoleStaticAnalysis = TRUE, rConsoleCall = "api$scan", rConsoleRuntimeArgumentsRefused = TRUE),
+        list(rConsoleCall = "api$scan", rConsoleRuntimeArgumentsRefused = TRUE),
+        list(rConsoleCall = "api$scan", rConsoleRuntimeArgumentNames = list("live")),
+        list(rConsoleCall = "f", rConsoleRuntimeSignature = "function(live) NULL"),
+        list(rConsoleSubscriptClass = "data.frame"), list())
+    for (extra in cases) verify(extra, "request-failed")
+    # Successful validation still delivers its result unchanged.
+    console_supplement_completion <- function(reply, self, params) reply
+    handler(self, 2L, params)
+    stopifnot(identical(delivered$result, native_result), identical(delivered$id, 2L))
+    cat(jsonlite::toJSON(list(failures = length(cases) + 1L), auto_unbox = TRUE))
+  `);
+  assert.equal(result.failures, 8);
+});
+
 test("accepting a column completion inserts R source that selects the original field", async () => {
   const names = ["total\rUSD", "total\\rUSD", "total\nUSD", "total\tUSD", "total\u0085USD", "total'\"\x7f`USD"];
   const workspace = { globalenv: { sales: { names, type: "list" } } };
@@ -244,6 +385,60 @@ test("typing and accepting package functions opens real argument suggestions wit
   assert.equal(piped.inputState.textBeforeCursor, '"file.csv" |> read.csv(');
   await waitFor(() => pipeChoices().some(item => item.detail === "parameter"), "arguments after accepting a piped function");
   piped.dismissInlineCompletion(false);
+});
+
+test("accepting a chained method opens its inferred arguments without executing the receiver", { timeout: 90000 }, async t => {
+  const { createConsoleLsp } = require('./helpers/console-lsp.cjs');
+  const { createTerminal } = require('./helpers/inline-terminal.cjs');
+  let inspections = 0;
+  const { client } = createConsoleLsp(t, { requestRuntimeFunctionArguments: () => {
+    inspections++;
+    return { status: 'unavailable' };
+  } });
+  const provide = client.provideCompletionItems.bind(client);
+  client.provideCompletionItems = async (...args) => {
+    const response = await provide(...args);
+    return { ...response, items: response.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+  };
+  const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+    vscode: {
+      Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
+      Uri: { parse: value => ({ toString: () => value }) },
+      CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5 },
+      QuickPickItemKind: { Separator: -1 }, SnippetString: class {},
+    },
+    '../../Language/consoleLspClient': { ConsoleLspClient: class { constructor() { return client; } } },
+  });
+  const { terminal } = createTerminal(t, 100, 24, 'typing', { 'completion.staticAnalysis': true });
+  delete terminal.applyCompletion;
+  terminal.lang = new RTermLang({ extensionPath: '', rPath: '', env: {}, getStaticAnalysisEnabled: () => true });
+  t.after(() => terminal.lang.cancelCompletion());
+  const marker = path.join(os.tmpdir(), 'r-console-chain-' + randomBytes(8).toString('hex'));
+  t.after(() => fs.rmSync(marker, { force: true }));
+  const definition = `api <- list(scan = function() { file.create(${JSON.stringify(marker)}); list(collect = function(engine, optimize = TRUE) NULL) })`;
+  terminal.inputState.text = definition + '\napi$scan()$collec';
+  terminal.inputState.cursorPosition = terminal.inputState.text.length;
+  terminal.applyKeyAction({ type: 'text', text: 't' });
+  const choices = () => terminal.inlineCompletion.items.filter(item => 'insertText' in item);
+  const until = async (predicate, label) => {
+    const deadline = Date.now() + 15000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, label);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  };
+  await until(() => choices().some(item => item.insertText === 'collect()'), 'method popup');
+  const method = choices().find(item => item.insertText === 'collect()');
+  assert.match(method.detail, /engine/);
+  terminal.inlineCompletion.move(choices().indexOf(method) - terminal.inlineCompletion.selected);
+  terminal.applyKeyAction({ type: 'tab' });
+  assert.equal(terminal.inputState.textBeforeCursor, definition + '\napi$scan()$collect(');
+  await until(() => choices().some(item => item.insertText === 'engine = '), 'arguments after accepting chained method');
+  assert.deepEqual(choices().filter(item => item.detail === 'parameter').map(item => item.insertText),
+    ['engine = ', 'optimize = ']);
+  assert.equal(terminal.submitted, undefined);
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(inspections, 0);
 });
 
 test("real LSP excludes supplied argument names while retaining signature order", { timeout: 90000 }, async t => {
@@ -817,7 +1012,7 @@ test("unknown runtime member signatures do not request expressions or borrow glo
     const entries = await completion.collectCompletionEntries(completion.getCompletionContext(text, text.length),
       undefined, undefined, undefined, [], [], undefined,
       async () => assert.fail("member arguments must not evaluate expressions through sess"));
-    assert.deepEqual(entries, []);
+    assert.deepEqual(Array.from(entries), []);
   }
 });
 
@@ -1452,6 +1647,40 @@ test("native member inference owns edits, callable snippets and empty source obj
   }
 });
 
+test("static completion explains missing source and unresolved accessors using native inference evidence", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const definition = [
+    'probe <- new.env(parent = emptyenv())',
+    'probe$calls <- 0L',
+    'custom_obj <- structure(list(inner = list(secret = 123)), class = "dangerous")',
+    '`$.dangerous` <- function(x, name) { probe$calls <- probe$calls + 1L; unclass(x)[[name]] }',
+    'make_object <- function() { probe$calls <- probe$calls + 1L; list(inner = list(secret = 456)) }',
+  ].join('\n');
+  for (const [text, reason, resolved, labels] of [
+    ['custom_obj$inner$', 'receiver-unresolved', false, []],
+    [definition + '\ncustom_obj$inner$', 'unresolved-dispatch', false, []],
+    [definition + '\nmake_object()$inner$', undefined, true, ['secret']],
+    ['obj <- list()\nobj$', undefined, true, []],
+    ['obj <- list(alpha = 1)\nobj$missing', undefined, true, []],
+    ['make_object()[["se', 'unsupported-context', false, []],
+    ['again <- function() again()\nagain()$', 'analysis-limit', false, []],
+  ]) {
+    const lines = text.split('\n'), line = lines.at(-1);
+    const position = { line: lines.length - 1, character: line.length };
+    const doc = { getText: () => text, uri: client.inputDocument.uri };
+    const context = completion.getStaticFallbackContext(line, line.length, text) ??
+      completion.getCompletionContext(line, line.length, text);
+    const result = await client.provideCompletionItems(doc, position, context.triggerCharacter,
+      undefined, undefined, 'static');
+    assert.equal(result.rConsoleStaticUnavailableReason, reason, text);
+    const entries = await completion.collectStaticFallbackEntries(context, doc, position,
+      lines.slice(0, -1), { provideCompletionItems: async () => result });
+    assert.equal(entries.staticResolved, resolved, text);
+    assert.equal(entries.staticUnavailableReason, reason, text);
+    assert.deepEqual(entries.map(entry => entry.label), labels, text);
+  }
+});
+
 test("native S3 arguments retain their resolved method and presentation role", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   const text = 'df <- data.frame(alpha = 1)\nsubset(df, )';
@@ -1573,6 +1802,35 @@ test("source-defined member arguments use native inference without a live-sessio
       } }, async () => { probes++; return [{ name: 'stale' }]; });
     assert.ok(entries.some(item => item.insertText === expected), line);
     assert.equal(probes, 0);
+  }
+});
+
+test("receiver-only static inference uses the shared path across object systems", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  const marker = path.join(os.tmpdir(), 'r-console-oop-getter-' + randomBytes(8).toString('hex'));
+  t.after(() => fs.rmSync(marker, { force: true }));
+  const effect = `file.create(${JSON.stringify(marker)})`;
+  for (const [definition, input, expected] of [
+    ['obj <- list(stored = 1)', 'obj$', ['stored']],
+    [`Example <- R6::R6Class("Example", public = list(stored = 1), active = list(computed = function(value) { ${effect}; 1 })); obj <- Example$new()`,
+      'obj$', ['stored', 'computed']],
+    ['methods::setClass("Example", slots = c(stored = "numeric")); obj <- methods::new("Example", stored = 1)',
+      'obj@', ['stored']],
+    [`Example <- S7::new_class("Example", properties = list(stored = S7::class_numeric, computed = S7::new_property(S7::class_numeric, getter = function(self) { ${effect}; 1 }))); obj <- Example(stored = 1)`,
+      'obj@', ['stored', 'computed']],
+  ]) {
+    const text = definition + '\n' + input;
+    const context = completion.getCompletionContext(input, input.length, text);
+    const entries = await completion.collectStaticFallbackEntries(context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: input.length },
+      [definition], { provideCompletionItems: async (...args) => {
+        const result = await client.provideCompletionItems(...args);
+        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      } });
+    assert.equal(entries.staticResolved, true, definition);
+    for (const label of expected) assert.ok(entries.some(item => item.label === label), definition + ': ' + label);
+    assert.ok(entries.every(item => item.role === 'member'), definition);
+    assert.equal(fs.existsSync(marker), false, 'inference must not run a getter');
   }
 });
 

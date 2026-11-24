@@ -1,6 +1,7 @@
 // Shared completion API for the console, terminal picker, and inline popup.
 export * from "./completion/types";
-export { getCompletionContext } from "./completion/syntax";
+export { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
+export { storedCompletionReceiver, storedFunctionReceiver, storedReceiverRoot } from "./completion/sourceReceiver";
 export { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
-export { collectCompletionEntries } from "./completion/service";
+export { collectCompletionEntries, collectStaticFallbackEntries } from "./completion/service";
 export { rankCompletionEntries, toCompletionPick, toCompletionQuickPickItems, isCompletionPickItem } from "./completion/presentation";

@@ -62,6 +62,19 @@ static SEXP counted_string(SEXP value, R_xlen_t index) {
     return Rf_mkChar("inner");
 }
 
+/* General R deparsing can request a data pointer, bypassing Elt. Keep that
+   callback observable as well, so source-inspection safety has a live control. */
+static void *counted_string_data(SEXP value, Rboolean writable) {
+    (void)writable;
+    ++element_calls;
+    if (R_altrep_data1(value) == R_NilValue) {
+        SEXP data = PROTECT(Rf_mkString("inner"));
+        R_set_altrep_data1(value, data);
+        UNPROTECT(1);
+    }
+    return (void *)DATAPTR_RO(R_altrep_data1(value));
+}
+
 static int counted_integer(SEXP value, R_xlen_t index) {
     (void)value; (void)index;
     ++element_calls;
@@ -154,6 +167,7 @@ void R_init_member_safety(DllInfo *dll) {
     integer_class = R_make_altinteger_class("counted_integer", "member_safety", dll);
     list_class = R_make_altlist_class("counted_list", "member_safety", dll);
     R_set_altrep_Length_method(string_class, counted_length);
+    R_set_altvec_Dataptr_method(string_class, counted_string_data);
     R_set_altrep_Length_method(integer_class, counted_length);
     R_set_altrep_Length_method(list_class, counted_length);
     R_set_altstring_Elt_method(string_class, counted_string);

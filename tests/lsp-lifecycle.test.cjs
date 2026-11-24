@@ -45,6 +45,114 @@ async function waitFor(predicate, label) {
   }
 }
 
+test("installed package chain signatures also supply arguments without running the chain", { timeout: 90000 }, async t => {
+  const { session } = temporaryLibraries(t);
+  const pkg = 'rconsolechaintest';
+  const source = path.join(path.dirname(session), pkg);
+  const marker = path.join(path.dirname(session), 'chain-executed');
+  fs.mkdirSync(path.join(source, 'R'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'DESCRIPTION'), [
+    'Package: ' + pkg, 'Version: 1.0', 'Title: Chain Completion Test', 'Description: A test package.',
+    'Author: Test', 'Maintainer: Test <test@example.org>', 'License: MIT', '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(source, 'NAMESPACE'), 'export(api)\n');
+  fs.writeFileSync(path.join(source, 'R', 'api.R'), `collect_impl <- function(engine = c("auto", "streaming"), optimize = TRUE, ...) {
+    file.create(${JSON.stringify(marker)})
+    NULL
+  }
+  api <- list(scan = function(path) {
+    file.create(${JSON.stringify(marker)})
+    list(collect = collect_impl)
+  })\n`);
+  execFileSync(process.env.R_TEST_EXECUTABLE || 'R', [
+    'CMD', 'INSTALL', '--no-byte-compile', '--no-test-load', '-l', session, source,
+  ], { stdio: 'pipe' });
+  let inspections = 0;
+  let inspection = { status: 'unavailable' };
+  const cache = path.join(path.dirname(session), 'package-cache');
+  const { client } = createConsoleLsp(t, { libraries: [session],
+    env: { ...process.env, R_LANGSVR_PACKAGE_CACHE_DIR: cache },
+    requestRuntimeFunctionArguments: () => { inspections++; return inspection; } });
+  await client.syncSessionState({ attachedPackages: [pkg] });
+  await waitFor(() => fs.existsSync(path.join(cache, 'package-metadata')) &&
+    fs.readdirSync(path.join(cache, 'package-metadata')).some(name => name.startsWith(pkg + '-members-')),
+  'native member metadata must be prepared before the first completion request');
+  assert.equal(fs.existsSync(marker), false, 'background preparation must not run receiver expressions');
+  const { getCompletionContext, collectCompletionEntries } = loadSource('src/Language/completion.ts', {
+    vscode: { CompletionItemKind: { Method: 1, Function: 2, Field: 4, Variable: 5, Text: 0 }, SnippetString: class {} },
+  });
+  const collect = async marked => {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const before = text.slice(0, cursor), lines = text.split('\n'), row = before.split('\n').length - 1;
+    const col = before.split('\n').at(-1).length;
+    const result = await collectCompletionEntries(getCompletionContext(lines[row], col, before, text.slice(cursor)),
+      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, undefined, lines.slice(0, row), [], {
+        provideCompletionItems: async (...args) => {
+          const response = await client.provideCompletionItems(...args);
+          return { ...response, items: response.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+        },
+      });
+    assert.equal(fs.existsSync(marker), false, 'completion must not execute constructors or methods');
+    return result;
+  };
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const text = pkg + '::api$scan()$collect';
+    const members = await client.provideCompletionItems({ getText: () => text },
+      { line: 0, character: text.length });
+    if (members.items.some(item => item.label === 'collect' && item.detail?.includes('engine'))) break;
+    assert.ok(Date.now() < deadline, 'the method popup has a signature supplied by installed package metadata: ' + JSON.stringify(members));
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  client.setRuntimeSignatures({ collect: 'function(unrelated_global)' });
+  for (const [marked, expected] of [
+    ['api$scan()$collect(│)', ['engine', 'optimize', '...']],
+    ['api$scan()$collect(engine = "auto", op│)', ['optimize']],
+    [pkg + '::api$scan()$collect("auto", │)', ['optimize', '...']],
+    ['alias <- ' + pkg + '::api\nalias$scan()$collect(│)', ['engine', 'optimize', '...']],
+  ]) {
+    const entries = await collect(marked);
+    assert.deepEqual(entries.filter(item => item.role === 'argument').map(item => item.label), expected, marked);
+    assert.equal(entries.argumentsResolved, true, marked);
+  }
+  const values = await collect('api$scan()$collect(engine = "st│")');
+  assert.ok(values.some(item => item.role === 'value' && item.label === 'streaming'));
+  const unknown = await collect('unknown_factory()$collect(│)');
+  assert.deepEqual(unknown.filter(item => item.role === 'argument'), []);
+  assert.equal(unknown.argumentsResolved, false);
+  for (const marked of ['api <- unknown_factory()\napi$scan()$collect(│)',
+    'function(api) api$scan()$collect(│)']) {
+    assert.deepEqual((await collect(marked)).filter(item => item.role === 'argument'), [], marked);
+  }
+  await client.syncSessionState({ attachedPackages: [] });
+  assert.deepEqual((await collect('api$scan()$collect(│)')).filter(item => item.role === 'argument'), [],
+    'preparation must not retain members of a detached package');
+  client.setStaticAnalysis(false);
+  assert.deepEqual((await collect(pkg + '::api$scan()$collect(│)'))
+    .filter(item => item.role === 'argument'), [], 'source inference stays opt-in');
+  assert.equal(inspections, 0, 'an executable receiver must not reach runtime inspection');
+  await client.syncSessionState({ attachedPackages: [pkg] });
+  client.setStaticAnalysis(true);
+  inspection = { status: 'arguments', names: ['live_arg'] };
+  assert.deepEqual((await collect('api$scan(│)')).filter(item => item.role === 'argument')
+    .map(item => item.label), ['live_arg'], 'live global shadows attached package catalog');
+  for (const result of [inspection, { status: 'suppressed', reason: 'active-binding' },
+    { status: 'unavailable' }, undefined, Promise.resolve(undefined)]) {
+    inspection = result;
+    assert.deepEqual((await collect('api <- list(scan = function(draft_arg) NULL)\napi$scan(│)'))
+      .filter(item => item.role === 'argument').map(item => item.label), ['draft_arg']);
+    assert.deepEqual((await collect('api <- unknown_factory()\napi$scan(│)'))
+      .filter(item => item.role === 'argument'), []);
+    if ((await result)?.status !== 'arguments') {
+      assert.deepEqual((await collect('api$scan(│)')).filter(item => item.role === 'argument'), [],
+        'a refused or unavailable live binding cannot borrow its package namesake');
+    }
+    assert.deepEqual((await collect(pkg + '::api$scan(│)')).filter(item => item.role === 'argument')
+      .map(item => item.label), ['path'], 'explicit namespace retains package identity');
+  }
+
+});
+
 test("project startup supplies package libraries without session path probes", { timeout: 120000 }, async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-project-"));
   let projectClient;

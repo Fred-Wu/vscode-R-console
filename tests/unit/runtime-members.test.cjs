@@ -72,6 +72,106 @@ test("native request includes only parsed selectors and target operator", () => 
   assert.ok(!frame.toString("utf8").includes("eval("));
 });
 
+test("stored argument snapshots validate bounded names and preserve zero-argument functions", () => {
+  const u32 = value => { const bytes = Buffer.alloc(4); bytes.writeUInt32LE(value); return bytes; };
+  const encode = names => Buffer.concat([Buffer.from([11]), u32(names.length), ...names.flatMap(name => {
+    const bytes = Buffer.from(name); return [u32(bytes.length), bytes];
+  })]);
+  const parse = payload => {
+    const header = Buffer.alloc(12);
+    header.writeUInt32LE(payload.length); header.writeUInt16LE(26, 4);
+    return parseBackendFrames(Buffer.concat([header, payload]));
+  };
+  for (const names of [[], ['cols'], ['first', '...', 'after dots', '中文'], ['a'.repeat(128)]]) {
+    assert.deepEqual(parse(encode(names)).events[0].result, { status: 'arguments', names });
+  }
+  for (const payload of [encode(['']), encode(['x', 'x']), encode(['x\0y']), encode(['x'.repeat(4097)]),
+    encode(Array.from({ length: 129 }, (_, i) => 'arg' + i)), encode([Buffer.from([255])]),
+    Buffer.concat([encode(['cols']), Buffer.from([0])]), encode(['cols']).subarray(0, 6)]) {
+    assert.ok(parse(payload).error, 'malformed signatures must not produce suggestions');
+  }
+  const query = parseRuntimeMemberQuery('task$levels', 'arguments');
+  assert.equal(encodeMemberNamesRequestFrame(1, query)[12], 5);
+});
+
+test("stored argument requests require the negotiated capability on persistent backends", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource('src/Runtime/runtimeBackend.ts');
+  const backend = new RustSidecarRuntimeBackend('unused');
+  const session = { sessionId: 'method-arguments' };
+  const state = { hostConnected: true, capabilities: new Set(['member-inspection']),
+    pendingMemberRequests: new Map(), nextRequestId: 0 };
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const query = parseRuntimeMemberQuery('task$levels', 'arguments');
+  assert.equal(backend.inspectMemberNames(session, query), undefined);
+  assert.equal(frames.length, 0);
+  state.capabilities.add('function-arguments');
+  const pending = backend.inspectMemberNames(session, query);
+  backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: 1,
+    result: { status: 'arguments', names: ['cols'] } });
+  assert.deepEqual(await pending, { status: 'arguments', names: ['cols'] });
+});
+
+test("search-path outcomes are negotiated and older absence results remain unknown", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource('src/Runtime/runtimeBackend.ts');
+  const backend = new RustSidecarRuntimeBackend('unused');
+  const session = { sessionId: 'search-path' };
+  const state = { hostConnected: true, capabilities: new Set(['member-inspection', 'function-source']),
+    pendingMemberRequests: new Map(), nextRequestId: 0 };
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const binding = { root: 'iris', steps: [], target: 'binding' };
+  assert.equal(backend.inspectMemberNames(session, binding), undefined);
+  assert.equal(frames.length, 0, 'older backends cannot accept binding-only requests');
+  for (const status of ['missing', 'not-callable']) {
+    const request = backend.inspectMemberNames(session, { root: 'factory', steps: [], target: 'source' });
+    assert.equal(frames.at(-1)[12], 4);
+    backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: state.nextRequestId,
+      result: { status } });
+    assert.deepEqual(await request, { status: 'unavailable' }, 'older backends checked only .GlobalEnv');
+  }
+  state.capabilities.add('member-inspection-search-path');
+  const identity = backend.inspectMemberNames(session, binding);
+  assert.equal(frames.at(-1)[12], 0x46);
+  backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: state.nextRequestId,
+    result: { status: 'opaque' } });
+  assert.deepEqual(await identity, { status: 'opaque' });
+  for (const status of ['missing', 'package', 'opaque']) {
+    const request = backend.inspectMemberNames(session, { root: 'factory', steps: [], target: 'source' });
+    assert.equal(frames.at(-1)[12], 0x44);
+    backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: state.nextRequestId,
+      result: { status } });
+    assert.deepEqual(await request, { status });
+  }
+});
+
+test("value-source requests negotiate distinct guarded lookup semantics", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource('src/Runtime/runtimeBackend.ts');
+  const backend = new RustSidecarRuntimeBackend('unused');
+  const session = { sessionId: 'source-value' };
+  const state = { hostConnected: true, capabilities: new Set(['member-inspection', 'function-source', 'member-inspection-search-path']),
+    pendingMemberRequests: new Map(), nextRequestId: 0 };
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const query = { root: 'factory', steps: [], target: 'source-value' };
+  assert.equal(backend.inspectMemberNames(session, query), undefined);
+  assert.equal(frames.length, 0, 'old backends must not receive a different lookup mode');
+  assert.throws(() => encodeMemberNamesRequestFrame(1, query), /search-path/);
+  assert.throws(() => encodeMemberNamesRequestFrame(1, { ...query, searchPath: true,
+    steps: [{ kind: 'field', name: 'child' }] }), /invalid member inspection request/);
+  assert.throws(() => encodeMemberNamesRequestFrame(1, { ...query, searchPath: true,
+    utf8ByteEscapes: true }), /invalid member inspection request/);
+  state.capabilities.add('function-source-value');
+  const pending = backend.inspectMemberNames(session, query);
+  assert.equal(frames.at(-1)[12], 0x47);
+  backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: 1,
+    result: { status: 'opaque' } });
+  assert.deepEqual(await pending, { status: 'opaque' });
+});
+
 test("native results distinguish silent empty from unavailable and unsafe access", () => {
   function frame(payload) {
     const header = Buffer.alloc(12);
@@ -86,6 +186,38 @@ test("native results distinguish silent empty from unavailable and unsafe access
   assert.deepEqual(parseBackendFrames(frame(Buffer.from([1, 0, 0, 0, 0]))).events, [{
     type: "member-names-result", requestId: 42, result: { status: "available", names: [] },
   }]);
+  assert.deepEqual(parseBackendFrames(frame(Buffer.from([9]))).events, [{
+    type: "member-names-result", requestId: 42, result: { status: "missing" },
+  }], "code 9 is a proven absent root, not a stored object with no members");
+  assert.match(parseBackendFrames(frame(Buffer.from([9, 0]))).error,
+    /invalid member inspection status/);
+  assert.deepEqual(parseBackendFrames(frame(Buffer.from([12]))).events[0].result,
+    { status: "not-callable" });
+  assert.match(parseBackendFrames(frame(Buffer.from([12, 0]))).error,
+    /invalid member inspection status/);
+  for (const [code, status] of [[13, 'package'], [14, 'opaque']]) {
+    assert.deepEqual(parseBackendFrames(frame(Buffer.from([code]))).events[0].result, { status });
+    assert.match(parseBackendFrames(frame(Buffer.from([code, 0]))).error, /invalid member inspection status/);
+  }
+  assert.match(parseBackendFrames(frame(Buffer.from([15]))).error,
+    /invalid member inspection result/);
+  assert.match(parseBackendFrames(frame(Buffer.from([10]))).error,
+    /invalid function source length/);
+  const source = "function() list(alpha = 1)";
+  assert.deepEqual(parseBackendFrames(frame(Buffer.concat([
+    Buffer.from([10]), Buffer.from(source, "utf8")
+  ]))).events, [{ type: "member-names-result", requestId: 42,
+    result: { status: "source", text: source } }]);
+  for (const bytes of [Buffer.from([10, 0]), Buffer.from([10, 0xff]),
+    Buffer.concat([Buffer.from([10]), Buffer.alloc(64 * 1024 + 1, 97)])]) {
+    assert.ok(parseBackendFrames(frame(bytes)).error, "invalid function text must be rejected");
+  }
+  const sourceQuery = encodeMemberNamesRequestFrame(43,
+    { root: "make_data", steps: [], target: "source" });
+  assert.equal(sourceQuery.subarray(12)[0], 4);
+  assert.throws(() => encodeMemberNamesRequestFrame(44, {
+    root: "make_data", steps: [{ kind: "field", name: "x" }], target: "source",
+  }), /invalid member inspection request/);
   const typed = Buffer.concat([Buffer.from([1, 2, 0, 0, 0]),
     Buffer.from([6, 0, 0, 0]), Buffer.from("method"),
     Buffer.from([5, 0, 0, 0]), Buffer.from("value"), Buffer.from([1, 0])]);

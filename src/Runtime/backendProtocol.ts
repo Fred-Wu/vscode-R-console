@@ -60,7 +60,11 @@ export type BackendCapability =
   | "parse-status"
   | "set-width"
   | "member-inspection"
-  | "member-inspection-utf8-escapes";
+  | "member-inspection-utf8-escapes"
+  | "member-inspection-search-path"
+  | "function-source"
+  | "function-source-value"
+  | "function-arguments";
 
 export type BackendDialogRequest =
   | {
@@ -94,10 +98,16 @@ export type MemberInspectionStep =
   | { kind: "field" | "slot" | "named-index" | "slice-name" | "variable-index" | "variable-slice"; name: string }
   | { kind: "index" | "slice-index"; index: number };
 
-export type MemberInspectionTarget = "$" | "@" | "[" | "[[";
+export type MemberInspectionTarget = "$" | "@" | "[" | "[[" | "source" | "arguments" | "binding" | "source-value";
 
 export type MemberInspectionResult =
   | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
+  | { status: "missing" }
+  | { status: "not-callable" }
+  | { status: "package" }
+  | { status: "opaque" }
+  | { status: "source"; text: string }
+  | { status: "arguments"; names: string[] }
   | { status: "suppressed"; reason: "active-binding" | "deferred-binding" |
       "unsafe-dispatch" | "unsafe-altrep" | "unsafe-environment" }
   | { status: "unavailable" };
@@ -108,6 +118,8 @@ export type MemberInspectionQuery = {
   target: MemberInspectionTarget;
   // Non-ASCII byte escapes require R's current native locale to be UTF-8.
   utf8ByteEscapes?: boolean;
+  // Negotiates search-path lookup and its package/opaque response statuses.
+  searchPath?: boolean;
 };
 
 export type BackendControlEvent =
@@ -206,7 +218,11 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "parse-status" ||
     value === "set-width" ||
     value === "member-inspection" ||
-    value === "member-inspection-utf8-escapes"
+    value === "member-inspection-utf8-escapes" ||
+    value === "member-inspection-search-path" ||
+    value === "function-source" ||
+    value === "function-source-value" ||
+    value === "function-arguments"
   );
 }
 
@@ -262,13 +278,17 @@ function parseStringListPayload(payload: Buffer): StringListPayload {
 
 function parseStringArray(
   payload: Buffer,
-  offset: number = 0
+  offset: number = 0,
+  strictUtf8 = false
 ): { values: string[]; offset: number } {
   const count = parseU32(payload, offset);
   offset += 4;
   const values: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const result = parseString(payload, offset);
+    if (strictUtf8 && !Buffer.from(result.value, "utf8").equals(payload.subarray(offset + 4, result.offset))) {
+      throw new Error("invalid inspected argument encoding");
+    }
     values.push(result.value);
     offset = result.offset;
   }
@@ -355,11 +375,39 @@ function parseControlFrame(
     case FrameKind.OutputFlush:
       return { type: "output-flush" };
     case FrameKind.MemberNamesResult: {
-      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 8) {
+      if (payload.length > 1024 * 1024 || payload.length === 0 || payload[0] > 14) {
         throw new Error("invalid member inspection result");
+      }
+      if (payload[0] === 11) {
+        if (parseU32(payload, 1) > 128) throw new Error("too many inspected arguments");
+        const parsed = parseStringArray(payload, 1, true);
+        if (parsed.offset !== payload.length || new Set(parsed.values).size !== parsed.values.length ||
+            parsed.values.some(name => !name || name.includes("\0") || Buffer.byteLength(name, "utf8") > 4096)) {
+          throw new Error("invalid inspected arguments");
+        }
+        return { type: "member-names-result", requestId, result: { status: "arguments", names: parsed.values } };
+      }
+      if (payload[0] === 10) {
+        const bytes = payload.subarray(1);
+        if (!bytes.length || bytes.length > 64 * 1024) throw new Error("invalid function source length");
+        const text = bytes.toString("utf8");
+        if (text.includes("\0") || !Buffer.from(text, "utf8").equals(bytes)) {
+          throw new Error("invalid function source encoding");
+        }
+        return { type: "member-names-result", requestId, result: { status: "source", text } };
       }
       if (payload[0] !== 1 && payload[0] !== 7 && payload[0] !== 8) {
         if (payload.length !== 1) throw new Error("invalid member inspection status");
+        if (payload[0] === 9) {
+          return { type: "member-names-result", requestId, result: { status: "missing" } };
+        }
+        if (payload[0] === 12) {
+          return { type: "member-names-result", requestId, result: { status: "not-callable" } };
+        }
+        if (payload[0] === 13 || payload[0] === 14) {
+          return { type: "member-names-result", requestId,
+            result: { status: payload[0] === 13 ? "package" : "opaque" } };
+        }
         const reasons = {
           2: "active-binding", 3: "deferred-binding",
           4: "unsafe-dispatch", 5: "unsafe-altrep", 6: "unsafe-environment",
@@ -614,9 +662,12 @@ export function encodeShutdownFrame(): Buffer {
 }
 
 export function encodeMemberNamesRequestFrame(requestId: number, query: MemberInspectionQuery): Buffer {
-  if (query.steps.length > 12 || query.root.length === 0 ||
+  if (query.steps.length > 12 || (["source", "source-value", "binding"].includes(query.target) && (query.steps.length !== 0 || query.utf8ByteEscapes)) || query.root.length === 0 ||
       Buffer.byteLength(query.root, "utf8") > 4096) {
     throw new Error("invalid member inspection request");
+  }
+  if (query.target === "source-value" && !query.searchPath) {
+    throw new Error("value source inspection requires search-path lookup");
   }
   const encodeString = (value: string): Buffer => {
     const bytes = Buffer.from(value, "utf8");
@@ -626,13 +677,14 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
     bytes.copy(result, 4);
     return result;
   };
-  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3 };
+  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3, source: 4, arguments: 5, binding: 6, "source-value": 7 };
   const stepCodes = {
     field: 0, slot: 1, index: 2, "named-index": 3,
     "slice-index": 4, "slice-name": 5, "variable-index": 6, "variable-slice": 7,
   } as const;
-  // The high bit is negotiated separately for older persistent backends.
-  const parts: Buffer[] = [Buffer.from([targetCodes[query.target] | (query.utf8ByteEscapes ? 0x80 : 0), query.steps.length]), encodeString(query.root)];
+  // Both flags are negotiated separately for persistent backends.
+  const parts: Buffer[] = [Buffer.from([targetCodes[query.target] |
+    (query.utf8ByteEscapes ? 0x80 : 0) | (query.searchPath ? 0x40 : 0), query.steps.length]), encodeString(query.root)];
   for (const step of query.steps) {
     if ("index" in step) {
       if (!Number.isSafeInteger(step.index) || step.index < 1 || step.index > 100000) {

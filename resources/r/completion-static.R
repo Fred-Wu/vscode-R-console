@@ -91,15 +91,83 @@ console_source_function <- function(document, point, name) {
 }
 
 
+# Verify a draft binding before permitting native results for an opaque live
+# callable. Read the native source index, including unfinished lexical scopes.
+console_source_overrides_opaque <- function(name, uri, workspace, document, position) {
+    if (!is.character(name) || length(name) != 1L || is.na(name) || !nzchar(name) ||
+        !is.list(position) ||
+        !exists("member_resolve_cursor", asNamespace("languageserver"), inherits = FALSE) ||
+        !exists("member_infer", asNamespace("languageserver"), inherits = FALSE)) return(FALSE)
+    # Resolve lexical scope immediately before the callable. This also covers
+    # assignments and formals inside an unfinished block/function. The native
+    # scope resolver owns recovery, budgets and binding inference.
+    point <- document$from_lsp_position(position)
+    cursor <- list(operator = point$col + 1L, operator_row = point$row,
+        start = point$col, end = point$col, accessor = NULL,
+        before = substr(document$line0(point$row), 1L, point$col))
+    resolved <- languageserver:::member_resolve_cursor(uri, workspace, document, point, cursor)
+    fields <- resolved$value$fields
+    history <- resolved$index$document_bindings[[name]]
+    at <- resolved$bindings$.__member_position__
+    has_binding <- name %in% names(fields) || name %in% names(resolved$bindings) ||
+        (length(history) && (is.null(at) || languageserver:::member_history_position(history, at) > 0L))
+    if (!has_binding) return(FALSE)
+    bindings <- resolved$bindings
+    bindings[names(fields)] <- fields
+    binding <- languageserver:::member_infer(as.name(name), resolved$index,
+        bindings, budget = resolved$budget)
+    length(binding$type) > 0L || !is.null(binding$function_expr) || !is.null(binding$function_key)
+}
+
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
-console_member_function <- function(uri, workspace, document, point) {
+console_member_function <- function(uri, workspace, document, point, root = NULL,
+    source_root = if (!is.null(root)) console_source_function(document, point, root)) {
+    if (identical(root, "")) return(list(unknown = TRUE))
     if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
     location <- languageserver:::member_call_location(document, point)
     if (is.null(location)) return(NULL)
     resolved <- languageserver:::member_resolve_cursor(uri, workspace, document,
         location$point, location$cursor, location$cursor$token)
+    if (!is.null(source_root)) {
+        # A draft assignment or formal may shadow an attached package object.
+        # Verify that binding independently before following a catalog method;
+        # an unresolved source root is not the same as its package namesake.
+        if (!exists("member_infer", asNamespace("languageserver"), inherits = FALSE))
+            return(list(unknown = TRUE))
+        binding <- languageserver:::member_infer(as.name(root), resolved$index,
+            resolved$bindings, budget = resolved$budget)
+        if (!length(binding$type) && is.null(binding$function_expr) && is.null(binding$function_key))
+            return(list(unknown = TRUE))
+    }
+    history <- if (!is.null(root)) resolved$index$document_bindings[[root]] else NULL
+    at <- resolved$bindings$.__member_position__
+    source_binding <- !is.null(source_root) || (!is.null(root) &&
+        (root %in% names(resolved$bindings) || (length(history) &&
+            (is.null(at) || languageserver:::member_history_position(history, at) > 0L))))
     definition <- resolved$value$function_expr
-    if (is.null(definition)) return(NULL)
-    list(formals = definition[[2L]])
+    if (is.null(definition) && !is.null(resolved$value) &&
+        exists("member_symbol_info", asNamespace("languageserver"), inherits = FALSE)) {
+        # Package methods can refer to a catalog definition instead of carrying
+        # inline function syntax. Reuse the receiver-specific signature that
+        # supplies the member popup, including its package/alias resolution.
+        # A fixed display name makes the declaration parseable as function
+        # syntax; neither the receiver nor its defaults/body is evaluated.
+        label <- ".r_console_callable"
+        symbol <- languageserver:::member_symbol_info(label, resolved$value,
+            resolved$value$function_key, resolved$index)
+        signature <- symbol$signature
+        if (is.character(signature) && length(signature) == 1L && !is.na(signature) &&
+            nchar(signature, type = "bytes") <= 65536L && startsWith(signature, paste0(label, "("))) {
+            definition <- console_parse_signature(paste0("function", substring(signature, nchar(label) + 1L)))
+        }
+    }
+    if (is.null(definition)) {
+        # A source-defined factory can have an unknown result while still
+        # shadowing a live object. Reuse native binding history even when the
+        # recovery XML contains only the unfinished call at the cursor.
+        if (source_binding) return(list(unknown = TRUE, source_binding = TRUE))
+        return(NULL)
+    }
+    list(formals = definition[[2L]], source_binding = source_binding)
 }

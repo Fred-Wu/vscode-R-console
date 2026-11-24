@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext, parseRuntimeMemberQuery } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, getStaticFallbackContext, parseRuntimeMemberQuery, type RuntimeFunctionSourceTarget } from "../Language/completion";
 import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
 import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
@@ -290,6 +290,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       onPackagesChanged: () => this.dismissInlineCompletion(false),
       requestRuntimeMemberCompletions: (expression, operator) =>
         this.requestStoredMemberCompletions(expression, operator),
+      requestRuntimeFunctionSource: (name, target) => this.requestStoredFunctionSource(name, target),
+      requestRuntimeFunctionArguments: expression => this.requestStoredFunctionArguments(expression),
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
@@ -337,8 +339,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     const query = parseRuntimeMemberQuery(expression, operator);
     if (!query) {
-      logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
-        expression + operator, this.lang.completionDiagnosticsScope);
+      if (!vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false)) {
+        logConsoleCompletionDecision({ kind: "Rejected", reason: "executable-receiver" },
+          expression + operator, this.lang.completionDiagnosticsScope);
+      }
       return undefined;
     }
     const reportUnavailable = () => {
@@ -356,8 +360,10 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     return response.then(result => {
       if (result.status === "suppressed") {
-        logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
-          expression + operator, this.lang.completionDiagnosticsScope);
+        if (!vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false)) {
+          logConsoleCompletionDecision({ kind: "Suppressed", reason: result.reason },
+            expression + operator, this.lang.completionDiagnosticsScope);
+        }
       } else if (result.status === "unavailable") {
         reportUnavailable();
       }
@@ -366,6 +372,27 @@ export class RTerminal implements vscode.Pseudoterminal {
       reportUnavailable();
       return { status: "unavailable" as const };
     });
+  }
+
+  // Retrieve stored closure syntax or check a receiver's root binding identity.
+  // The backend uses the same idle/submission gate and native C error guard as
+  // member inspection. Unsupported or unsafe bindings have no source result.
+  private requestStoredFunctionSource(name: string, target: RuntimeFunctionSourceTarget = "source"): Promise<MemberInspectionResult | undefined> | undefined {
+    if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
+        this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) {
+      return undefined;
+    }
+    const response = this.runtimeBackend?.inspectMemberNames?.(this.rProcess,
+      { root: name, steps: [], target });
+    return response;
+  }
+
+  private requestStoredFunctionArguments(expression: string): Promise<MemberInspectionResult | undefined> | undefined {
+    if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
+        this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) return undefined;
+    const query = parseRuntimeMemberQuery(expression, "arguments");
+    if (!query) return undefined;
+    return this.runtimeBackend?.inspectMemberNames?.(this.rProcess, query);
   }
 
   private createWriteEmitter(): vscode.EventEmitter<string> {
@@ -2142,6 +2169,21 @@ export class RTerminal implements vscode.Pseudoterminal {
     if (wasVisible && redraw && this.mode === "ready") this.renderInput();
   }
 
+  // Resolve the same static/runtime context for scheduling, caching and
+  // presenting asynchronous inline suggestions. Re-parsing only with the
+  // strict runtime grammar would discard prefixes on executable receivers.
+  private inlineCompletionContext(input: InputSnapshot): ReturnType<typeof getCompletionContext> {
+    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
+    const staticEnabled = vscode.workspace.getConfiguration("r.console")
+      .get<boolean>("completion.staticAnalysis", false);
+    return staticEnabled && (context?.rejectionReason ||
+      (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))
+      ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+          input.text.slice(input.textBeforeCursor.length), context) ?? context
+      : context;
+  }
+
   private scheduleInlineCompletion(): void {
     if (!this.inlineCompletion) return;
     // An empty command must close the panel and cancel pending async completions.
@@ -2156,12 +2198,12 @@ export class RTerminal implements vscode.Pseudoterminal {
     const input = this.getInputSnapshot();
     noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
       this.lang.completionDiagnosticsScope);
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-      input.text.slice(input.textBeforeCursor.length));
+    const staticEnabled = settings.get<boolean>("completion.staticAnalysis", false);
+    const context = this.inlineCompletionContext(input);
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
-    if (context?.rejectionReason) {
+    if (context?.rejectionReason && !staticEnabled) {
       logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
         completionDecisionContext(input.textBeforeCursor), this.lang.completionDiagnosticsScope);
     }
@@ -2212,8 +2254,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         if (this.mode !== "ready" || this.inlineCompletionMode() !== "inline" ||
             token !== this.inlineCompletion.token) return;
         const input = this.getInputSnapshot();
-        const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length));
+        const context = this.inlineCompletionContext(input);
         if (!this.inlineCompletion.set(items, token, context?.prefix ?? "")) return;
         this.renderInput();
       },

@@ -104,9 +104,42 @@ test("call context suppresses argument names in values, literals, comments and e
     assert.equal(context?.name, "obj$fun", marked);
     assert.equal(context.argumentTags, undefined, marked);
   }
-  for (const input of ["obj[[1]]$fun(", "obj$fun()[[1]](", "x] obj$fun("]) {
+  for (const input of ["obj$fun()[[1]](", "x] obj$fun("]) {
     assert.equal(parser.getEnclosingCall(input), undefined, input);
   }
+});
+
+test("chained method arguments retain the complete receiver without evaluating it", () => {
+  for (const [marked, name, tags] of [
+    ['pl$scan_csv()$collect(│)', 'pl$scan_csv()$collect', [null]],
+    ['polars::pl$DataFrame(a = 1)$sort(descending = TRUE, nu│)',
+      'polars::pl$DataFrame(a = 1)$sort', ['descending', null]],
+    ['obj$first(x, y)$second()[[1]]$run(1, co│, later = 2)',
+      'obj$first(x, y)$second()[[1]]$run', ['', null, 'later']],
+    ['obj[[1]]$fun(│)', 'obj[[1]]$fun', [null]],
+    ['obj[x[1]]$fun(│)', 'obj[x[1]]$fun', [null]],
+    ['(obj$first())$run(│)', '(obj$first())$run', [null]],
+    ['make({ x <- 1\n y <- 2; list(x, y) })$run(│)',
+      'make({ x <- 1\n y <- 2; list(x, y) })$run', [null]],
+    ['outer(pl$scan_csv( # input\n "data.csv")\n$collect(│))',
+      'pl$scan_csv( # input\n "data.csv")$collect', [null]],
+    ['obj$first()$ # method\nrun(│)', 'obj$first()$run', [null]],
+    ['(function() list(run = function(cols) NULL))()$run(│)',
+      '(function() list(run = function(cols) NULL))()$run', [null]],
+  ]) {
+    const call = parser.getEnclosingCall(marked.replace('│', ''), marked.indexOf('│'));
+    assert.equal(call?.name, name, marked);
+    assert.equal(call.operator, '$', marked);
+    assert.deepEqual(call.argumentTags, tags, marked);
+  }
+  for (const text of ['obj$first()\n$run(', 'obj[[1]]\n$run(', 'obj$first()$run\n(',
+    'outer({ obj$first()\n$run(', 'obj$first(]$run(', 'obj$first()$$run(']) {
+    assert.equal(parser.getEnclosingCall(text), undefined, text);
+  }
+  const value = parser.getEnclosingCall('pl$scan_csv()$collect(engine = "st');
+  assert.equal(value.argumentValue.name, 'engine');
+  assert.equal(value.argumentValue.prefix, 'st');
+  assert.equal(value.argumentTags, undefined);
 });
 
 test("Unicode callables and argument tags retain complete identifiers and UTF-16 offsets", () => {
@@ -152,8 +185,8 @@ test("member context reads complete chains and balanced subscripts from tokens",
 
 test("member detection refuses literals, comments and unsupported or broken object expressions", () => {
   for (const input of [
-    '"obj$fi', '"obj$fi"', 'r"--(obj$fi)--"', "# obj$fi", "obj$ # fi", "obj$`fi",
-    "obj$`escaped\\`", "`obj$fi", "obj$fi ", "obj\n$fi", "outer({ obj\n$fi",
+    '"obj$fi', '"obj$fi"', 'r"--(obj$fi)--"', "# obj$fi", "obj$ # fi",
+    "`obj$fi", "obj$fi ", "obj\n$fi", "outer({ obj\n$fi",
     "obj[[1]$fi", "obj[[x[1]]$fi", "obj[1)$fi", "obj]$fi", "obj$$fi", "obj$@fi",
     "factory()$fi", "factory()$nested$fi", "factory()[1]$fi", "pkg::obj$fi",
     "123obj$fi", "😀obj$fi", "obj$\u0301nested$fi",

@@ -239,6 +239,20 @@ impl OutputSink {
         let mut payload = Vec::new();
         match result {
             Inspection::Unavailable => payload.push(0),
+            Inspection::NotCallable => payload.push(12),
+            Inspection::PackageBinding => payload.push(13),
+            Inspection::Opaque => payload.push(14),
+            Inspection::FunctionSource(source) if !source.is_empty() && source.len() <= 64 * 1024 => {
+                payload.push(10);
+                payload.extend_from_slice(source.as_bytes());
+            }
+            Inspection::FunctionSource(_) => payload.push(0),
+            Inspection::FunctionArguments(names) if names.len() <= 128 &&
+                names.iter().all(|name| !name.is_empty() && name.len() <= 4096) => {
+                payload.push(11);
+                encode_string_array(names, &mut payload);
+            }
+            Inspection::FunctionArguments(_) => payload.push(0),
             Inspection::Suppressed(reason) => payload.push(match reason {
                 Suppression::ActiveBinding => 2,
                 Suppression::DeferredBinding => 3,
@@ -247,6 +261,9 @@ impl OutputSink {
                 Suppression::UnsafeEnvironment => 6,
                 Suppression::InspectionLimit => 0,
             }),
+            // Code 9 proves the root is unbound; successful inspection of an
+            // existing empty object must remain code 1.
+            Inspection::Available(members) if members.root_missing => payload.push(9),
             Inspection::Available(members) if members.names.len() <= 1000 &&
                 members.kinds.len() == members.names.len() &&
                 members.names.iter().all(|name| name.len() <= 4096) &&

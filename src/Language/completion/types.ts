@@ -2,6 +2,7 @@ import type * as vscode from "vscode";
 import type { CallCompletionContext } from "./contextParser";
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 import type { WorkspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
+import type { CompletionSuppressionReason, StaticCompletionUnavailableReason } from "./diagnostics";
 export type CompletionContext = {
   kind: "member" | "package" | "bracket" | "argument" | "default";
   prefix: string;
@@ -22,6 +23,8 @@ export type CompletionContext = {
   autoTrigger?: boolean;
   suppressAutomatic?: boolean;
   rejectionReason?: "executable-receiver";
+  // Parser-rejected receiver selected for source-only LSP fallback.
+  staticFallback?: boolean;
   functionName?: string;
   functionOperator?: "$" | "@" | "::" | ":::";
   // Source tags from the lexer, available only at an argument-name position.
@@ -47,6 +50,11 @@ export type CompletionEntry = {
 
 export type CompletionEntries = CompletionEntry[] & {
   isIncomplete?: boolean;
+  // Whether static analysis resolved the requested member/column receiver.
+  staticResolved?: boolean;
+  staticUnavailableReason?: StaticCompletionUnavailableReason;
+  argumentsResolved?: boolean;
+  argumentSuppressionReason?: CompletionSuppressionReason;
   // An empty but successful sess column inspection is authoritative.
   columnsResolved?: boolean;
 };
@@ -70,9 +78,17 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
   rConsoleLocalFunction?: boolean;
   rConsoleWorkspaceFunction?: boolean;
   rConsoleMemberResolved?: boolean;
+  rConsoleStaticUnavailableReason?: StaticCompletionUnavailableReason;
   rConsoleNativeArguments?: boolean;
   rConsoleArgumentsExhausted?: boolean;
+  rConsoleArgumentsResolved?: boolean;
+  rConsoleArgumentSuppressionReason?: CompletionSuppressionReason;
 };
+
+export type CompletionAnalysisMode = "runtime" | "static";
+
+/** A guarded closure snapshot or opaque live binding. Receiver refusals also preserve root identity. */
+export type CompletionSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
 
 export interface CompletionProvider {
   // A selected package function can be qualified in the LSP projection while
@@ -85,9 +101,20 @@ export interface CompletionProvider {
     // Keep the user's cursor when position is moved to broaden matching.
     contextPosition?: vscode.Position,
     // Safe, already-inspected receiver class; null means no supported class.
-    runtimeBracketKind?: "data.frame" | "data.table" | null
+    runtimeBracketKind?: "data.frame" | "data.table" | null,
+    analysisMode?: CompletionAnalysisMode,
+    sourceBinding?: CompletionSourceBinding,
+    // Shared only by the initial query and its prefix retry.
+    requestScope?: object
   ): Promise<CompletionResult | undefined>;
 }
+
+export type RuntimeFunctionSourceTarget = "source" | "source-value" | "binding";
+export type RuntimeFunctionSourceRequester = (name: string, target?: RuntimeFunctionSourceTarget) =>
+  Promise<MemberInspectionResult | undefined> | undefined;
+
+export type RuntimeFunctionArgumentsRequester = (expression: string) =>
+  Promise<MemberInspectionResult | undefined> | undefined;
 
 export type RuntimeMemberCompletionRequester = (
   expression: string,
@@ -110,4 +137,3 @@ export type GlobalEnvItem = {
 export type WorkspaceData = {
   globalenv?: Record<string, GlobalEnvItem>;
 };
-

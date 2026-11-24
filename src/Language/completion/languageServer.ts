@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
-import type { CompletionContext, CompletionEntry, CompletionProvider } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, CompletionSourceBinding } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
+import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
 import { isCallableName } from "./contextParser";
 import { backtickRName, escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
 
@@ -11,23 +12,29 @@ export async function getLanguageServerCompletions(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider?: CompletionProvider,
-  runtimeBracketKind?: "data.frame" | "data.table" | null
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean }> {
+  runtimeBracketKind?: "data.frame" | "data.table" | null,
+  analysisMode?: CompletionAnalysisMode,
+  sourceBinding?: CompletionSourceBinding
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
   if (!completionProvider) {
-    return { entries: [], isIncomplete: false };
+    return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
   }
   try {
+    const requestScope = {};
     let result = await completionProvider.provideCompletionItems(
       doc,
       position,
-      context.triggerCharacter, undefined, runtimeBracketKind
+      context.triggerCharacter, undefined, runtimeBracketKind, analysisMode, sourceBinding, requestScope
     );
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
     let workspaceFunction = result?.rConsoleWorkspaceFunction === true;
     let memberResolved = result?.rConsoleMemberResolved === true;
+    let staticReason = staticCompletionUnavailableReason(result?.rConsoleStaticUnavailableReason);
     let nativeArguments = result?.rConsoleNativeArguments === true;
     let argumentsExhausted = result?.rConsoleArgumentsExhausted === true;
+    let argumentsResolved = result?.rConsoleArgumentsResolved;
+    let argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
 
     let items = Array.isArray(result) ? result : result?.items || [];
     const usable = (item: vscode.CompletionItem): boolean =>
@@ -37,19 +44,29 @@ export async function getLanguageServerCompletions(
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
     // its replacement start intact; never rewrite code to manufacture results.
-    if (context.prefix.length > 1 && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
+    // Broadening a prefix cannot recover an unresolved method signature. It
+    // would repeat both the native inspection and the same LSP lookup.
+    const structuralFailure = (context.kind === "member" || context.kind === "bracket") &&
+      staticReason !== undefined && [
+      "receiver-unresolved", "unresolved-dispatch", "unsupported-context",
+      "analysis-limit", "inference-cycle", "no-receiver-members",
+    ].includes(staticReason);
+    if (!structuralFailure && context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];
       result = await completionProvider.provideCompletionItems(doc,
         new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter, position, runtimeBracketKind);
+        context.triggerCharacter, position, runtimeBracketKind, analysisMode, sourceBinding, requestScope);
       runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;
       memberResolved ||= result?.rConsoleMemberResolved === true;
+      staticReason = staticCompletionUnavailableReason(result?.rConsoleStaticUnavailableReason);
       nativeArguments ||= result?.rConsoleNativeArguments === true;
       argumentsExhausted ||= result?.rConsoleArgumentsExhausted === true;
+      argumentsResolved = result?.rConsoleArgumentsResolved ?? argumentsResolved;
+      argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
       items = Array.isArray(result) ? result : result?.items || [];
     }
 
@@ -74,12 +91,15 @@ export async function getLanguageServerCompletions(
       rConsoleLocalFunction: localFunction,
       runtimeOnly,
       memberResolved,
+      staticUnavailableReason: result == null ? "no-response" : staticReason,
       workspaceFunction,
       nativeArguments,
       argumentsExhausted,
+      argumentsResolved,
+      argumentSuppressionReason,
     };
   } catch {
-    return { entries: [], isIncomplete: false };
+    return { entries: [], isIncomplete: false, staticUnavailableReason: "request-failed" };
   }
 }
 
@@ -232,6 +252,12 @@ function getCompletionInsertText(item: vscode.CompletionItem, context: Completio
   const result = (typeof item.insertText === "object" && "value" in item.insertText) || protocolFormat === 2
     ? stripSnippetSyntax(text) : text;
   const role = getCompletionRole(item);
+  // Inferred members may supply only a display label. A raw label is not
+  // necessarily valid R code: quote $/@ names and escape quoted [[ keys.
+  // Preserve explicitly formatted LSP insertion text.
+  if (role === "member" && result === label) {
+    return getFieldInsertText(label, context);
+  }
   if (role === "member" || item.kind === vscode.CompletionItemKind.Field) {
     if (result === label && escapeRControls(label) !== label) {
       return getFieldInsertText(label, context, role === "scope");
@@ -274,4 +300,3 @@ function getCompletionReplaceEnd(
   if (end.line < position.line || end.line >= lines.length) return {};
   return { replaceEnd: lines.slice(position.line, end.line).reduce((sum, line) => sum + line.length + 1, 0) + end.character };
 }
-

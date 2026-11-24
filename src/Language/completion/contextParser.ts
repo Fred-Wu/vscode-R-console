@@ -1,6 +1,6 @@
 import { TokenType, tokenize, continuesExpressionLine, isMemberAccessor, isNameAccessor, isAccessorNamePrefix, isCompleteIdentifier, type Token } from "../lexer";
 import { getDataCompletionObject } from "./dataScope";
-import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import { decodeRArgumentName, parseRuntimeMemberQuery } from "./runtimeMembers";
 
 // Retain only the latest completion input. Adjacent tokens can merge after an
 // edit (notably r + a quote + a raw-string delimiter, or an exponent's sign).
@@ -56,15 +56,18 @@ export function getCompletionSyntax(code: string, cursor = code.length) {
     return prefixTokens;
   };
   return {
+    get tokens() { return all(); },
+    get prefixTokens() { return prefix(); },
     get identifierEnd() {
       if (cursor === code.length) return undefined;
       const token = all().find(token => token.type === TokenType.Identifier &&
-        !token.value.startsWith("`") && token.position < cursor &&
+        token.position < cursor &&
         cursor < token.position + token.value.length);
       return token ? token.position + token.value.length : undefined;
     },
     get inLiteral() { return /["'`#]/.test(code) && isCompletionInLiteral(code, cursor, all()); },
     get member() { return /[$@]|::/.test(before) ? getQualifiedCompletionContext(before, prefix()) : undefined; },
+    get memberSuffix() { return /[$@]/.test(before) ? getMemberCompletionSuffix(before, prefix()) : undefined; },
     get bracket() { return code.includes("[") ? getBracketCompletionContext(code, cursor, all()) : undefined; },
     get pipe() { return before.includes("|>") || before.includes("%>%") ? getPipeCompletionContext(before, prefix()) : undefined; },
     get call() { return before.includes("(") ? getEnclosingCall(code, cursor, all()) : undefined; },
@@ -86,7 +89,8 @@ export function getCompletionParseInsertion(code: string, cursor: number): { off
 
 export type CallCompletionContext = {
   // Callable source reconstructed from tokens, without inter-token whitespace
-  // or comments. Quoted identifiers retain their spelling and escapes.
+  // or comments between selectors. Balanced receiver expressions retain their
+  // original source, including statement boundaries inside blocks.
   name: string;
   operator?: "$" | "@" | "::" | ":::";
   // R source tags; "" is positional, "..." is unknown forwarded dots, null is the cursor. Undefined
@@ -125,10 +129,10 @@ export function isCompletionInLiteral(code: string, cursor = code.length, tokens
 
 /** Finish only open delimiters for parsing local definitions during completion.
  * The suffix is never inserted into the console or evaluated. */
-export function getCompletionParseSuffix(code: string): string | undefined {
-  if (!code.includes("function") && !code.includes("\\")) return undefined;
+export function getCompletionParseSuffix(code: string, includeOrdinaryBindings = false): string | undefined {
+  if (!includeOrdinaryBindings && !code.includes("function") && !code.includes("\\")) return undefined;
   const tokens = tokenize(code);
-  if (!tokens.some(token => token.type === TokenType.Function ||
+  if (!includeOrdinaryBindings && !tokens.some(token => token.type === TokenType.Function ||
       (token.type === TokenType.Operator && token.value === "\\"))) return undefined;
   const closing: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
   const stack: string[] = [];
@@ -153,6 +157,16 @@ export function getCompletionParseSuffix(code: string): string | undefined {
   return suffix + stack.reverse().join("");
 }
 
+/** Decode typed R string keys without evaluation. Valid complete escapes use the
+ * same strict selector parser as guarded live completion. Keep incomplete
+ * spellings usable while the user is still typing an escape.
+ */
+export function decodeQuotedCompletionPrefix(quote: "\"" | "'" | "`", fragment: string): string {
+  return decodeRArgumentName(quote + fragment + quote) ??
+    fragment.replace(/\\([\\"'`nrt])/g,
+      (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
+}
+
 function completionPrefix(tokens: Token[], start: number, end: number, cursor: number, accessorPrefix = false):
   { prefix: string; replaceStart: number; replaceEnd?: number; quote?: "\"" | "'" } | undefined {
   const before = tokens.slice(start, end).filter(token => token.position < cursor);
@@ -170,8 +184,8 @@ function completionPrefix(tokens: Token[], start: number, end: number, cursor: n
       ...(end > cursor ? { replaceEnd: end } : {}) };
   }
   if (token.type === TokenType.String && (cursor < token.position + token.value.length || token.closed === false)) {
-    const prefix = token.value.slice(1, cursor - token.position).replace(/\\([\\"'nrt])/g,
-      (_match, escaped: string) => ({ n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped));
+    const prefix = decodeQuotedCompletionPrefix(token.value[0] as "\"" | "'",
+      token.value.slice(1, cursor - token.position));
     return { prefix, replaceStart: token.position + 1,
       replaceEnd: token.position + token.value.length - Number(token.closed === true),
       quote: token.value[0] as "\"" | "'" };
@@ -283,6 +297,38 @@ export type QualifiedCompletionContext = {
   hasSubscript: boolean;
 };
 
+/** The trailing accessor/prefix is meaningful even when its receiver is an
+ * executable expression. Keep that syntax separate from guarded root parsing.
+ * Replacement starts at the opening backtick so insertion replaces the name
+ * as a whole, including an existing closing quote after the cursor.
+ */
+function accessorPrefix(code: string, tokens: Token[]) {
+  let index = tokens.length - 1;
+  const last = tokens[index];
+  let prefix = "";
+  let replaceStart = code.length;
+  if (isNameAccessor(tokens[index - 1]) && isAccessorNamePrefix(last) &&
+      last.position + last.value.length === code.length) {
+    prefix = last.value.startsWith("`")
+      ? decodeQuotedCompletionPrefix("`", last.value.slice(1, last.closed === true ? -1 : undefined))
+      : last.value;
+    replaceStart = last.position;
+    index--;
+  }
+  return { index, prefix, replaceStart };
+}
+
+function getMemberCompletionSuffix(code: string, sourceTokens: Token[]) {
+  const last = sourceTokens.at(-2);
+  if (last?.type === TokenType.Comment && last.position + last.value.length === code.length) return undefined;
+  const tokens = sourceTokens.filter(token => token.type !== TokenType.EOF &&
+    token.type !== TokenType.Newline && token.type !== TokenType.Comment);
+  const { index, prefix, replaceStart } = accessorPrefix(code, tokens);
+  const accessor = tokens[index];
+  if (index < 1 || !isMemberAccessor(accessor)) return undefined;
+  return { operator: accessor.value as "$" | "@", prefix, replaceStart };
+}
+
 /** Inspect the source before the cursor. Walk backwards over names, accessors
  * and balanced subscripts; never evaluate an expression or accept its suffix. */
 export function getQualifiedCompletionContext(code: string, sourceTokens?: Token[]): QualifiedCompletionContext | undefined {
@@ -321,21 +367,11 @@ export function getQualifiedCompletionContext(code: string, sourceTokens?: Token
       }
     }
   }
-  let index = tokens.length - 1;
-  const last = tokens[index];
-  let prefix = "";
-  let replaceStart = code.length;
+  let { index, prefix, replaceStart } = accessorPrefix(code, tokens);
   // R keywords such as "in" are valid *partial* names immediately after
   // an accessor (e.g. obj$in while typing obj$inner). Treat them as a prefix
   // here, not as completed receiver members or ordinary global tokens.
-  const keywordPrefix = isNameAccessor(tokens[index - 1]) && isAccessorNamePrefix(last);
-  if ((isCompleteIdentifier(last) || keywordPrefix) && !last.value.startsWith("`") &&
-      last.position + last.value.length === code.length) {
-    if (!continuations[index]) return undefined;
-    prefix = last.value;
-    replaceStart = last.position;
-    index--;
-  }
+  if (index < tokens.length - 1 && !continuations[index + 1]) return undefined;
   const accessor = tokens[index];
   if (!isNameAccessor(accessor) || !continuations[index]) return undefined;
   const namespace = accessor.value === "::" || accessor.value === ":::";
@@ -427,38 +463,69 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
     }
   }
   const stack: { opening: string; index: number }[] = [];
+  const openings = new Map<number, number>();
+  const continuations: boolean[] = [];
   for (let index = 0; index < tokens.length && tokens[index].position < cursor; index++) {
     const token = tokens[index];
+    continuations[index] = continuesExpressionLine(lineBreaks.has(index), stack.at(-1)?.opening, tokens[index - 1]);
     if (token.type === TokenType.LeftParen || token.type === TokenType.LeftBrace || token.type === TokenType.LeftBracket) {
       for (const opening of token.value.slice(0, cursor - token.position)) {
         stack.push({ opening, index });
       }
     } else if (token.type === TokenType.RightParen || token.type === TokenType.RightBrace || token.type === TokenType.RightBracket) {
+      let opening = -1;
       for (const closing of token.value.slice(0, cursor - token.position)) {
         const expected = closing === ")" ? "(" : closing === "}" ? "{" : "[";
-        if (stack.pop()?.opening !== expected) return undefined;
+        const matched = stack.pop();
+        if (matched?.opening !== expected) return undefined;
+        opening = matched.index;
       }
+      if (stack.at(-1)?.index !== opening) openings.set(index, opening);
     }
   }
   const frame = stack.at(-1);
   if (frame?.opening !== "(") return undefined;
-  // Parentheses and subscripts allow continuation across newlines; a brace
-  // starts a statement context even when it is itself inside parentheses.
-  const parent = stack.at(-2)?.opening;
-  const continuesLine = (index: number): boolean =>
-    continuesExpressionLine(lineBreaks.has(index), parent, tokens[index - 1]);
+  const continuesLine = (index: number): boolean => continuations[index];
   let start = frame.index - 1;
   const last = tokens[start];
-  if (last?.type !== TokenType.Identifier || !continuesLine(frame.index)) return undefined;
+  if (!isCompleteIdentifier(last) || !continuesLine(frame.index)) return undefined;
   let operator: CallCompletionContext["operator"];
-  while (start >= 1) {
+  const parts: string[] = [];
+  // Find the complete receiver of a named method, including calls, grouping
+  // and subscripts. This is syntax for source inference, not authorization to
+  // evaluate a chain; the native inspector retains its separate strict grammar.
+  const canEndReceiver = (index: number): boolean => {
+    const token = tokens[index];
+    if (isCompleteIdentifier(token)) return true;
+    if (!openings.has(index)) return false;
+    const head = tokens[openings.get(index)! - 1];
+    return token.type !== TokenType.RightParen || !head ||
+      !([TokenType.If, TokenType.For, TokenType.While, TokenType.Function].includes(head.type) ||
+        (head.type === TokenType.Operator && head.value === "\\"));
+  };
+  while (start >= 0) {
+    const token = tokens[start];
+    if (isCompleteIdentifier(token)) parts.push(token.value);
+    else {
+      const opening = openings.get(start);
+      if (opening === undefined) return undefined;
+      parts.push(code.slice(tokens[opening].position, token.position + token.value.length));
+      start = opening;
+      if (token.type === TokenType.RightBracket || (token.type === TokenType.RightParen &&
+          continuesLine(start) && canEndReceiver(start - 1))) {
+        if (!continuesLine(start)) return undefined;
+        start--;
+        continue;
+      }
+    }
     const previous = tokens[start - 1];
     if (!isNameAccessor(previous)) break;
-    if (tokens[start - 2]?.type !== TokenType.Identifier ||
-        !continuesLine(start) || !continuesLine(start - 1)) return undefined;
+    if (!continuesLine(start) || !continuesLine(start - 1)) return undefined;
     operator ??= previous.value as CallCompletionContext["operator"];
+    parts.push(previous.value);
     start -= 2;
   }
+  if (start < 0) return undefined;
   // Never reinterpret the ASCII suffix of an unsupported token as a callable.
   const preceding = tokens[start - 1];
   if (preceding?.type === TokenType.Unknown &&
@@ -529,7 +596,7 @@ export function getEnclosingCall(code: string, cursor = code.length, sourceToken
   }
   if (piped && !hasPipePlaceholder) argumentTags.unshift("");
   return {
-    name: tokens.slice(start, frame.index).map(token => token.value).join(""),
+    name: parts.reverse().join(""),
     operator,
     argumentTags: namePosition && !inComment ? argumentTags : undefined,
     ...(argumentValue && !inComment ? { argumentValue: { ...argumentValue,

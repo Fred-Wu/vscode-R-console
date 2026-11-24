@@ -3,6 +3,51 @@ const path = require("node:path");
 const loadSource = require("../helpers/load-source.cjs");
 
 suite("Completion in the VS Code extension host", () => {
+  test("stored method argument names use the real converter and preserve source precedence", async () => {
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      'vscode-languageclient/node': require('vscode-languageclient/node'),
+    });
+    let staticMode = true;
+    const inspected = [];
+    const lang = new RTermLang({
+      extensionPath: path.resolve(__dirname, '../..'), rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
+      getStaticAnalysisEnabled: () => staticMode,
+      requestRuntimeFunctionArguments: async expression => {
+        inspected.push(expression);
+        return { status: 'arguments', names: ['cols'] };
+      },
+    });
+    try {
+      for (const mode of [true, false]) {
+        staticMode = mode;
+        for (const [marked, expected] of [
+          ['task$levels(│)', ['cols = ']], ['task$levels(co│)', ['cols = ']],
+          ['task$levels(NULL, │)', []],
+          ['task <- list(levels = function(source_arg) NULL)\ntask$levels(│)', mode ? ['source_arg = '] : ['cols = ']],
+          ['task <- unknown_factory()\ntask$levels(│)', mode ? [] : ['cols = ']],
+          ['{ task <- unknown_factory(); task$levels(│', mode ? [] : ['cols = ']],
+        ]) {
+          const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+          const lines = text.split('\n'), before = text.slice(0, cursor);
+          const cursorRow = before.split('\n').length - 1;
+          const input = { text, lines, cursorRow, currentLine: lines[cursorRow],
+            cursorCol: before.split('\n').at(-1).length, textBeforeCursor: before };
+          let entries;
+          await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+            getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries: value => { entries = value; } });
+          const picks = entries.filter(item => 'insertText' in item && item.detail === 'parameter');
+          assert.deepEqual(picks.map(item => item.insertText), expected, marked);
+          for (const item of picks) {
+            assert.equal(item.replaceStart, input.currentLine.lastIndexOf('(') + 1);
+            assert.equal(item.isCallable, false);
+          }
+        }
+      }
+      assert.ok(inspected.length >= 10);
+      assert.ok(inspected.every(expression => expression === 'task$levels'));
+    } finally { await lang.dispose(); }
+  });
+
   test("real language-client results preserve argument order and alphabetize namespaces", async () => {
     // Use the actual VS Code API and language-client converters, not the Node
     // integration suite's host adapter or injected completion candidates.
@@ -323,6 +368,149 @@ suite("Subscript completion in the VS Code extension host", () => {
       const value = await complete('DT[, keyby = al');
       assert.ok(value.every(item => item.detail !== 'parameter'));
       assert.equal(expressionProbes, 0, 'subscript completion must not evaluate R expressions');
+    } finally {
+      await lang.dispose();
+    }
+  });
+});
+
+suite("Static fallback routing in the VS Code extension host", () => {
+  test("guarded live inspection falls back to source inference without calling an executable receiver", async () => {
+    const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
+      "vscode-languageclient/node": require("vscode-languageclient/node"),
+    });
+    let staticEnabled = true;
+    const native = [], sourceRequests = [];
+    let storedDefinition = "function() list(stored_alpha = 1)";
+    const lang = new RTermLang({
+      extensionPath: path.resolve(__dirname, "../.."),
+      rPath: process.env.R_TEST_EXECUTABLE || "R", env: { ...process.env },
+      getStaticAnalysisEnabled: () => staticEnabled,
+      requestRuntimeFunctionSource: async name => {
+        sourceRequests.push(name);
+        if (name === "data.frame") return { status: "unavailable" };
+        return name === "make_data" ? { status: "source", text: storedDefinition } : { status: "missing" };
+      },
+      requestRuntimeMemberCompletions: async (receiver, target) => {
+        native.push([receiver, target]);
+        if (receiver === "new_obj") return { status: "missing" };
+        if (receiver === "empty_obj") return { status: "available", names: [] };
+        return { status: "suppressed", reason: "unsafe-dispatch" };
+      },
+    });
+    const completeItems = async (text, cursor = text.length) => {
+      const lines = text.split("\n");
+      const before = text.slice(0, cursor).split("\n");
+      const cursorRow = before.length - 1;
+      const input = { text, lines, cursorRow, currentLine: lines[cursorRow],
+        cursorCol: before.at(-1).length, textBeforeCursor: text.slice(0, cursor) };
+      let entries = [];
+      await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+        getWorkspaceData: () => ({ search: [], globalenv: {} }),
+        applyCompletion() {}, onInlineEntries: items => { entries = items; } });
+      return entries.filter(item => "insertText" in item);
+    };
+    const complete = async text => (await completeItems(text)).map(item => item.insertText);
+    try {
+      const suppressed = await complete("obj <- list(alpha = 1)\nobj$");
+      assert.ok(suppressed.includes("alpha"), "suppressed live inspection uses the existing R source analyzer");
+      assert.deepEqual(native, [["obj", "$"]]);
+
+      const callable = await complete("make_data <- function() list(data = 1, metadata = 2)\nmake_data()$");
+      assert.ok(callable.includes("data") && callable.includes("metadata"),
+        "source-defined factory members are inferred without evaluating the call");
+      assert.equal(native.length, 1, "executable receivers must never reach the native inspector");
+      // Previously submitted definitions are absent from the editable buffer,
+      // but their current stored closure must still be available to the LSP.
+      const stored = await complete("make_data()$");
+      assert.ok(stored.includes("stored_alpha"),
+        "source inference must inspect a function defined before this input");
+      assert.ok(!stored.includes("data"), "earlier projection is not retained");
+      storedDefinition = "function() list(redefined_beta = 2)";
+      const redefined = await complete("make_data()$");
+      assert.ok(redefined.includes("redefined_beta") && !redefined.includes("stored_alpha"),
+        "a redefined stored function is re-inferred, not served from a source journal");
+      assert.deepEqual(sourceRequests, ["make_data", "make_data", "make_data"]);
+      assert.deepEqual(native, [["obj", "$"]], "function source lookup never executes an accessor");
+
+      storedDefinition = "function() list(alpha = 1, `odd field` = 2)";
+      for (const [marked, expected] of [
+        ["(make_data())$al│old", "(make_data())$alpha"],
+        ["((make_data()))$al│", "((make_data()))$alpha"],
+        ["( # group\n  make_data()\n)$al│old", ")$alpha"],
+        ["make_data()$\n  al│old", "  alpha"],
+        ["make_data()$ # continuation\n# comment\n  al│", "  alpha"],
+        ["make_data()$`odd│", "make_data()$`odd field`"],
+        ["make_data()$`odd│old`", "make_data()$`odd field`"],
+        ["make_data()$\n  `odd│old`", "  `odd field`"],
+      ]) {
+        const cursor = marked.indexOf("│"), source = marked.replace("│", "");
+        const items = await completeItems(source, cursor);
+        assert.equal(items.length, 1, `only the receiver's matching member belongs in ${marked}`);
+        const line = source.split("\n").at(-1), col = source.slice(0, cursor).split("\n").at(-1).length;
+        assert.equal(line.slice(0, items[0].replaceStart) + items[0].insertText +
+          line.slice(items[0].replaceEnd ?? col), expected, marked);
+        assert.equal(sourceRequests.at(-1), "make_data");
+      }
+      assert.deepEqual(native, [["obj", "$"]], "continued and quoted receivers remain source-only");
+      assert.deepEqual(await complete('data.frame(fake = 1)$'), [],
+        'an opaque live callable cannot borrow the package function');
+      assert.deepEqual(await complete('{ data.frame <- function(...) list(draft = 1); data.frame(fake = 1)$'), ['draft']);
+      storedDefinition = 'function() list("odd\\nfield" = 1)';
+      assert.deepEqual(await complete("make_data()$`odd\nfi"), [],
+        "literal names begun on another line must not expose invalid replacement columns");
+
+
+      // Older released languageserver versions do not infer quoted [[ keys.
+      // Route without executing receivers, and validate any member edit when
+      // a newer server provides source-only quoted-key inference.
+      // Unquoted [[ and single [ must remain safe without invented source fields.
+      for (const [definition, marked, expected, memberSuffix] of [
+        ["make_data <- function() list(alpha = 1)",
+          String.raw`make_data()[["al│old"]]`, 'make_data()[["alpha"]]', "alpha"],
+        ["make_data <- function() list(alpha = 1)",
+          String.raw`make_data()[['al│old']]`, "make_data()[['alpha']]", "alpha"],
+        [String.raw`make_data <- function() list("line\nitem" = 1)`,
+          String.raw`make_data()[["line\n│old"]]`, String.raw`make_data()[["line\nitem"]]`, "item"],
+      ]) {
+        const caret = marked.indexOf("│");
+        const line = marked.replace("│", "");
+        const source = definition + "\n" + line;
+        const items = await completeItems(source, definition.length + 1 + caret);
+        assert.ok(items.every(item => item.insertText.includes(memberSuffix)),
+          `quoted source-only routing must not borrow unrelated candidates: ${marked}`);
+        for (const member of items) {
+          assert.equal(line.slice(0, member.replaceStart) + member.insertText +
+            line.slice(member.replaceEnd ?? caret), expected,
+            `real-provider replacement must preserve the whole quoted key: ${marked}`);
+        }
+        assert.equal(native.length, 1, "static quoted keys never inspect executable receivers");
+      }
+      for (const input of ["make_data()[[al", "make_data()[al"]) {
+        assert.deepEqual(await complete("make_data <- function() list(alpha = 1)\n" + input), [],
+          `${input} cannot borrow symbols or claim unsupported source member inference`);
+        assert.equal(native.length, 1, "unquoted executable indices must remain source-only");
+      }
+
+      const missing = await complete("new_obj <- list(alpha = 1)\nnew_obj$");
+      assert.ok(missing.includes("alpha"), "only native-confirmed absence permits unsubmitted source members");
+      assert.deepEqual(native.at(-1), ["new_obj", "$"]);
+
+      const empty = await complete("empty_obj <- list(alpha = 1)\nempty_obj$");
+      assert.deepEqual(empty, [], "empty stored members override conflicting unsubmitted source without metadata");
+      assert.deepEqual(native.at(-1), ["empty_obj", "$"]);
+
+      const suppressedBracket = await complete('obj <- list(alpha = 1)\nobj[["al');
+      assert.ok(suppressedBracket.every(item => item.includes("alpha")),
+        "a suppressed stored bracket receiver cannot borrow unrelated symbols");
+      // A released server may return no quoted [[ members. Either way it
+      // must never bypass native suppression or suggest lexical scope fields.
+      assert.deepEqual(native.at(-1), ["obj", "[["]);
+
+      staticEnabled = false;
+      assert.deepEqual(await complete("make_data()$"), [],
+        "the default runtime-only policy still rejects executable receivers");
+      assert.equal(native.length, 4);
     } finally {
       await lang.dispose();
     }

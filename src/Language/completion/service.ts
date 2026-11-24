@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, CompletionSourceBinding, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
@@ -18,7 +18,9 @@ export async function collectCompletionEntries(
   completionProvider?: CompletionProvider,
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester,
   consoleInputText?: string,
-  prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>
+  prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>,
+  analysisMode?: CompletionAnalysisMode,
+  sourceBinding?: CompletionSourceBinding
 ): Promise<CompletionEntries> {
   if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -37,7 +39,7 @@ export async function collectCompletionEntries(
   const runtimeBracketKind = context.kind === "bracket" && context.bracketOperator === "[" &&
     prefetchedResult?.status === "available" ? prefetchedResult.bracketKind ?? null :
     prefetchedResult?.status === "suppressed" ? null : undefined;
-  const rawLspItemsRequest =
+  const rawLspItemsRequest: ReturnType<typeof getLanguageServerCompletions> =
     !includeLspItems
       ? Promise.resolve({ entries: [] as CompletionEntry[], isIncomplete: false, rConsoleLocalFunction: false, runtimeOnly: false, memberResolved: false, workspaceFunction: false, nativeArguments: false, argumentsExhausted: false })
       : getLanguageServerCompletions(
@@ -46,7 +48,8 @@ export async function collectCompletionEntries(
           position,
           multilineBuffer,
           completionProvider,
-          runtimeBracketKind
+          runtimeBracketKind,
+          analysisMode, sourceBinding
         );
   const bufferItems = getConsoleBufferCompletions(
     context,
@@ -77,6 +80,9 @@ export async function collectCompletionEntries(
   // A definitive safety refusal must not be undone by cached receiver names
   // or package method suggestions. In particular, a masked accessor need not
   // accept the stored object's members or the installed method's arguments.
+  // A confirmed absent root is authoritative for runtime candidates too.
+  // Cached workspace names must not revive a binding missing from live R.
+  if (runtimeResult?.status === "missing") return asCompletionEntries([], false);
   const runtimeSuppressed = runtimeResult?.status === "suppressed";
   if (runtimeSuppressed && context.kind === "member") return [];
   // An unavailable inspection is not a complete member list: later typing
@@ -110,7 +116,11 @@ export async function collectCompletionEntries(
     entry.role === "scope" && entry.kind === vscode.CompletionItemKind.Field && !entry.bracketSpecial);
   // A package-inferred exhaustion must not override an unresolved live member.
   if (context.argumentTags && rawLspResult.argumentsExhausted &&
-      !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) return [];
+      !(runtimeOnly && memberArguments && !rawLspResult.workspaceFunction)) {
+    const empty = [] as CompletionEntries;
+    if (memberArguments) empty.argumentsResolved = true;
+    return empty;
+  }
   const dataItems = runtimeMembers !== undefined && context.kind === "bracket" ? runtimeMembers :
     !includeColumns || nativeFields ||
     (context.kind === "bracket" && rawLspResult.memberResolved) ? [] : cachedColumnItems;
@@ -187,11 +197,21 @@ export async function collectCompletionEntries(
     const columnFiltered = filterCompletionEntries(dataItems, context.prefix);
     const bufferFiltered = filterCompletionEntries(fallbackBufferItems, context.prefix);
 
-    return asCompletionEntries(dedupeCompletionEntries([
+    const entries = asCompletionEntries(dedupeCompletionEntries([
       ...(!context.argumentValue?.quote ? columnFiltered : []),
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),
     ]), rawLspResult.isIncomplete);
+    if (memberArguments) {
+      entries.argumentsResolved = rawLspResult.argumentsResolved ?? (rawLspResult.rConsoleLocalFunction === true ||
+        rawLspResult.workspaceFunction === true || rawLspItems.some(isArgumentCompletionEntry));
+      entries.argumentSuppressionReason = rawLspResult.argumentSuppressionReason;
+      if (!entries.argumentsResolved) {
+        entries.staticUnavailableReason = rawLspResult.staticUnavailableReason ?? "method-arguments-unavailable";
+        entries.isIncomplete = true;
+      }
+    }
+    return entries;
   }
 
   const defaultColumnFiltered = filterCompletionEntries(dataItems, context.prefix);
@@ -218,3 +238,38 @@ function asCompletionEntries(
   return result;
 }
 
+
+// Static fallback is an isolated source of receiver members. Do not merge
+// unverified session names, global symbols, or buffered text after a native
+// safety refusal; those could masquerade as members of an unsafe receiver.
+export async function collectStaticFallbackEntries(
+  context: CompletionContext,
+  doc: vscode.TextDocument,
+  position: vscode.Position,
+  multilineBuffer: string[],
+  completionProvider: CompletionProvider,
+  sourceBinding?: CompletionSourceBinding
+): Promise<CompletionEntries> {
+  if (context.suppressAutomatic || (context.kind !== "member" && context.kind !== "bracket")) {
+    return [];
+  }
+  const result = await getLanguageServerCompletions(
+    context, doc, position, multilineBuffer, completionProvider, undefined, "static", sourceBinding
+  );
+  // Only a receiver-specific member has sufficiently strong provenance.
+  // Lexical scope fields and indexing parameters are not verified receiver
+  // members, even when they are labeled as fields by the language server.
+  const memberItems = result.entries.filter(entry => entry.role === "member");
+  const entries = asCompletionEntries(
+    dedupeCompletionEntries(filterCompletionEntries(memberItems, context.prefix)),
+    result.isIncomplete
+  );
+  // An authoritative empty receiver is still a successful resolution. A
+  // recognized but unresolved method must not be reported as inferred.
+  entries.staticResolved = memberItems.length > 0 || !!(result.memberResolved && !result.staticUnavailableReason);
+  if (!entries.staticResolved) {
+    entries.staticUnavailableReason = result.staticUnavailableReason ?? "no-receiver-members";
+    entries.isIncomplete = true;
+  }
+  return entries;
+}

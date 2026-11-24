@@ -257,7 +257,14 @@ mod unix_host {
         let api = unsafe { RApi::load(&library_path)? };
 
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
+            capabilities.push("function-arguments");
+        }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
+            capabilities.push("function-source");
+            capabilities.push("function-source-value");
+        }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
@@ -1893,7 +1900,7 @@ mod unix_host {
             let mut state = SharedState::default();
             state.pending_commands.push_back(PendingCommand::MemberNames {
                 request_id: 42,
-                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false, search_path: false },
                 queued_at: Instant::now() - super::MEMBER_REQUEST_TTL,
             });
             let (id, query) = take_next_member_request(&mut state).expect("queued request");
@@ -1906,7 +1913,7 @@ mod unix_host {
             let mut state = SharedState::default();
             state.pending_commands.push_back(PendingCommand::MemberNames {
                 request_id: 1,
-                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false, search_path: false },
                 queued_at: Instant::now(),
             });
             assert_eq!(enqueue_parse_status(&mut state, 2, "1 + 1".into()), vec![1]);
@@ -2268,7 +2275,14 @@ mod windows_host {
         let mut api = unsafe { RApi::load(&layout)? };
 
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes"]); }
+        if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
+            capabilities.push("function-arguments");
+        }
+        if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
+            capabilities.push("function-source");
+            capabilities.push("function-source-value");
+        }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
@@ -4431,7 +4445,7 @@ mod windows_host {
             let mut state = SharedState::default();
             state.pending_commands.push_back(PendingCommand::MemberNames {
                 request_id: 42,
-                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                query: MemberQuery { root: "wide".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false, search_path: false },
                 queued_at: Instant::now() - super::MEMBER_REQUEST_TTL,
             });
             let (id, query) = take_next_member_request(&mut state).expect("queued request");
@@ -4448,7 +4462,7 @@ mod windows_host {
             let mut state = SharedState::default();
             state.pending_commands.push_back(PendingCommand::MemberNames {
                 request_id: 1,
-                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false },
+                query: MemberQuery { root: "obj".into(), steps: vec![], target: Target::Dollar, utf8_byte_escapes: false, search_path: false },
                 queued_at: Instant::now(),
             });
             assert_eq!(enqueue_parse_status(&mut state, 2, "1 + 1".into()), vec![1]);

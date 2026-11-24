@@ -1343,6 +1343,118 @@ unsubmitted input. Session-backed signature handling is implemented in
 `resources/r/completion-runtime.R`; optional source inference is in
 `resources/r/completion-static.R`.
 
+For nested completion, guarded live inspection remains authoritative for
+stored receivers, including stored receivers with no members. If the runtime
+parser rejects an executable receiver or native inspection suppresses unsafe
+access, enabling static analysis routes that request to the existing console
+language server without executing the receiver. The source-only result is
+filtered to receiver-specific inferred members, never unrelated scope fields,
+global symbols or indexing-method arguments after a safety refusal. Safe live
+bracket completion still retains the existing method-argument path. The
+existing language server infers source members for $ and @ access. Quoted [[
+keys can only be inferred if the installed languageserver version provides
+receiver-specific members (this is not yet available in released v0.3.22);
+unquoted [[ and single [ indices do not gain inferred member fields through
+this routing-only change. Unsupported source inference returns no unrelated
+suggestions. Native root lookup follows the R search path through at most 128
+environments. Value lookup selects the first binding; bare function lookup skips
+ordinary non-callable values. Active bindings, unforced user promises and custom
+database environments stop lookup. A missing result confirms absence through
+that search path. Attached objects retain their stored members, including empty
+receivers. An inherited package binding can authorize installed metadata after
+its identity is verified against the loaded namespace, imports or lazy-data
+environment. This comparison reads stored pointers without forcing package
+promises. Materialized package receivers use guarded live storage inspection.
+The `member-inspection-search-path` capability negotiates a request flag,
+root-binding inspection and package/opaque response statuses. Computed receivers
+with a named root use a binding-only request to preserve that root's identity
+without traversing selectors or evaluating calls. A live root requires an
+independently inferred draft override before package metadata can contribute.
+Absence reported by an older backend remains
+unknown to the source adapter. Source-only results carry static inference diagnostics.
+The existing virtual document continues to describe the editable input, and
+source-only fallback can also retrieve the *current stored closure definition*
+for a named callable at the root of that expression. Bare identifiers and
+quoted call names use R function lookup; a grouped symbol in call position
+uses value lookup (and cannot skip a non-callable shadowing binding). The
+`function-source-value` capability negotiates the latter without changing
+existing function-source requests. A dedicated guarded,
+idle-only native request extracts the closure's syntax without evaluating its
+body, defaults, active bindings or promises. The source is projected ahead of
+the current input for that one LSP request, with console edit positions mapped
+back to the original buffer. Each request reads the current stored definition,
+so intervening submissions preserve it and redefinitions take effect on the
+next request. Source requests retain their structured native outcome.
+Verified inherited package bindings permit installed package inference.
+Missing bindings and exhausted bare function lookup permit editable source
+inference; a non-callable value lookup remains opaque.
+Unavailable or refused callables remain opaque to source inference. The adapter
+checks the native lexical scope at the callable's position before accepting a
+draft override; otherwise it returns an unresolved result. Explicit namespace
+calls and selected package qualifications retain their package identity.
+The opaque-binding check uses request metadata and leaves the input unchanged.
+Refused member and bracket receivers carry their root binding identity through
+static fallback. Package members are eligible only when editable source proves
+a replacement binding. Stored factory definitions also accompany method argument
+and value requests, with the same receiver identity and scope checks. Retrieval
+starts alongside language-server startup and document preparation; cancellation
+and setting changes discard obsolete snapshots before they reach the provider.
+
+Static completion logs retain the language server's inference reason when one
+is available. Missing receiver information, unresolved class-specific member
+access, analysis limits and recursive definitions have distinct explanations;
+unavailable services or failed requests are distinguished from inference gaps.
+After a runtime safety refusal, an unavailable static result reuses the existing
+runtime safety reason. For example, after submitting
+`custom_obj <- structure(list(inner = list(secret = 123)), class = "dangerous")`
+and `\`$.dangerous\` <- function(x, name) unclass(x)[[name]]`, request
+`custom_obj$inner$`. The log reads: "Request completion could run a custom method.
+No completion suggestions were returned."
+Every unavailable result has one brief reason sentence followed by that same
+action sentence. Without a runtime safety refusal, the reason comes from native
+source inference when available, including unresolved custom method results.
+The log does not describe an existing R object as missing. Known empty receivers and prefixes with no
+matching members remain successful inference; unresolved custom methods do not.
+Diagnostic metadata uses fixed reason codes and plain R-facing messages, without
+logging object names, submitted code or raw errors. Candidate selection and the
+no-execution safety rule are unchanged.
+
+The native source adapter serializes bounded stored syntax directly, rather
+than using R's general deparser. Embedded ALTREP values and promises are
+rejected before any callback or forcing operation, and attributed or unsupported
+literal objects are unavailable. Traversal is limited to 4,096 nodes, 64 levels
+and 64 KiB of output, using the existing request deadline and C error boundary.
+Direct named closures found in the search path whose enclosing environment is
+the global environment are eligible. Closures capturing a local or namespace environment
+return unavailable source because the projection cannot preserve that scope.
+Methods, namespace calls and
+computed call heads continue to use the existing source/package analysis route.
+Named call results can be wrapped in grouping parentheses, including grouping
+within member/index chains. The detector matches delimiters once and unwraps
+groups iteratively, requiring each whole group to be a supported receiver;
+compound expressions such as `(other + fn())$` cannot borrow `fn`'s source.
+The serializer reuses decoded call-head names while retaining the same node,
+depth, byte and deadline limits.
+
+Member context recognition retains prefixes continued after an accessor across
+newlines/comments and unfinished backticked names. A quoted name's replacement
+span includes its delimiters, including an existing closing backtick after the
+cursor. These contexts retain the same live/static routing and never fall back
+to unrelated global symbols. Context checks and stored-call selection reuse the
+completion lexer snapshot. Stored call serialization accepts both pairlist and
+language cons cells in argument spines, including R's native-pipe rewrites,
+without evaluating either representation. Character quoting enforces the UTF-8
+byte budget without allocating a temporary string for each ordinary character.
+The edit adapter requires replacement starts on the current console line, so
+literal names begun on an earlier line are suppressed instead of exposing
+negative replacement columns. Names containing escaped newlines on one source
+line remain supported. Quick Pick escapes decoded search text when projecting
+quoted keys and argument values, and maps replacement ends back to the original
+input. Static bracket fallback accepts standalone key prefixes; operators,
+argument tags and dimension separators keep the surrounding index unsupported.
+Bracket routing counts each delimiter independently,
+including adjacent closing brackets shared by nested single/double indices.
+
 #### Completion Frontends
 
 Inline completion is the terminal completion frontend selected with
@@ -1420,16 +1532,18 @@ the console document.
 
 `RTermLang` owns the console completion flow. It detects the completion
 context, builds fast runtime suggestions from cached session data and the
-current input, then merges the full language-server result. Autocompletion does not request
-fresh session inspection data.
+current input, then merges the full language-server result. Session metadata comes
+from the cache; stored members and method arguments use guarded native inspection
+while R is idle.
 
 Completion data comes from one shared flow:
 
 - runtime/global-environment symbols come from the selected session integration's
   cached workspace data
-- `$` and `@` member completion uses native language-server inference where
-  available and cached top-level workspace metadata otherwise. It does not
-  automatically request live member values.
+- `$` and `@` member completion uses guarded native storage inspection. Published
+  top-level schemas remain available where appropriate; a safety refusal cannot
+  be replaced by cached names. Optional source inference follows the fallback
+  rules above.
 - data-aware bracket and pipe-placeholder contexts use cached workspace names.
   Nested runtime-only names are omitted instead of using sess workspace_children,
   which can invoke user-defined extraction or formatting methods. Static LSP
@@ -1437,12 +1551,68 @@ Completion data comes from one shared flow:
 - function arguments for existing top-level R functions use signatures already
   recorded in the cached workspace snapshot. The language server parses those
   signatures without evaluating function bodies or defaults, applies R argument
-  matching, and supplies literal choices. Member-function and custom subscript
-  signatures requiring runtime extraction are not inspected automatically.
-  Truncated signatures remain unavailable, and obsolete replies are discarded
-  after session changes.
+  matching, and supplies literal choices. When the snapshot has no recognizable
+  signature, the same guarded reader used for member functions retrieves formal
+  names directly. This works independently of the function's class or custom
+  display format, including S3 classed closures and S4/S7 generics. It does not
+  call `str()`, infer a signature from class-specific output, or select a method
+  by running generic dispatch. Obsolete replies are discarded after session changes.
+- stored function arguments use a guarded native request while R is idle.
+  For example, after `task <- mlr3::tsk("iris")`, `task$levels(` can offer `cols = `.
+  The inspector follows the existing safe receiver rules, then reads only the
+  closure's formal names, bounded to 128 names. It never reads the body or default
+  values. Active bindings, deferred values and custom access methods remain
+  refused. The `function-arguments` capability gates requests to persistent
+  backends; signatures are fetched per request and discarded after runtime changes.
+  The R adapter applies its usual positional, partial-name and `...` matching to
+  inert formals. With static analysis enabled, current source bindings take
+  precedence, including unresolved factories that shadow older session objects.
+  Package catalog signatures yield to verified live argument snapshots and
+  opaque or refused outcomes when the editable input has no binding for that
+  receiver. Stored primitives, missing methods and closures exceeding the formal
+  inspection limit retain an opaque receiver outcome. Transient unavailable
+  argument inspection also prevents borrowing a package signature. Explicit
+  namespace receivers retain their package identity.
+  Unavailable method arguments produce a reason-and-action completion log;
+  a known zero-argument or fully supplied signature is silently complete.
+- with static analysis enabled, chained method calls retain their complete
+  receiver syntax, including balanced calls and subscripts. Argument completion
+  uses the same receiver-specific package signature as the member popup when
+  the resolver refers to a catalog definition instead of inline function syntax.
+  For example, `api$scan()$collect(` can offer the declared `collect` arguments
+  without invoking `scan()`. An unrelated global `collect` cannot supply them.
+  The native receiver grammar remains unchanged; executable chains are never
+  sent to the stored-function inspector.
+- successful native member replies and constructor/S3 signature metadata are
+  reused by the console adapter. It resolves a member again only when it needs
+  evidence for an empty reply or a source-shadowing check. Within one request,
+  argument prefix filtering, value matching and validation share a full native
+  argument lookup; complete input reuses the existing parse. The initial
+  completion and its prefix retry share one guarded argument snapshot through
+  a request-scoped token. Runtime, session, document, package and client changes
+  invalidate that snapshot; each new completion retrieves fresh arguments.
+  An unresolved method signature does not trigger a second inspection just to
+  broaden its argument prefix; known signatures still support abbreviation matching. Static
+  receiver failures also skip prefix broadening when inference reports an
+  unresolved receiver, unsupported context, dispatch failure, cycle or analysis
+  limit. Pending metadata remains eligible for retry.
 - language-server symbols and package-name suggestions come from the
   console-owned `languageserver` process.
+
+The storage reader and completion adapters do not need a new implementation for
+each object system. They read stored names and function formals, retain published
+top-level schemas where appropriate, and use the existing language server for
+source inference. They never call `.DollarNames` or `.AtNames` to discover new
+names during completion: those hooks can execute arbitrary class-supplied code.
+An inferred member must belong to the requested receiver after a safety refusal.
+
+This does not guarantee discovery of every virtual property on a submitted
+object. For example, an S7 getter-only `computed` property has no stored value;
+it needs declared schema metadata or a source definition available to the
+language server. The console does not guess schema layouts from arbitrary
+attributes or add object-system-specific property lookups. Cached workspace
+schemas can intentionally omit internal storage, so they are not blindly unioned
+with every attribute or environment binding.
 
 #### Language Server Lifecycle
 
@@ -1453,6 +1623,31 @@ so R reads the project startup files and discovers its package libraries.
 The LSP workspace remains a separate temporary folder to avoid project indexing.
 Opening the console starts the client and issues a silent completion request
 to initialize completion caches. Runtime start and attach events reuse the client.
+With static analysis enabled, session package changes also synchronize a separate
+in-memory document containing only namespace references for attached packages. Native
+language-server background tasks prepare their metadata before a member request;
+the document contains no submitted expressions or stored function definitions.
+Its fixed sentinel names only identify namespaces; no matching export is required.
+Namespace references avoid attaching packages in the metadata worker or changing
+the completion search order. Packages already covered by native startup metadata
+are excluded, using the startup list reported by the R adapter.
+Package preparation is memoized by client, attachment state, static-analysis mode
+and startup-package metadata. Concurrent requests share preparation; failed
+document synchronization remains retryable. Detach, library replacement, server
+restart and disabling static analysis update or clear it. The console does not
+copy package snapshots, alter their construction or override package-size limits.
+
+Search-path changes close the old completion documents before synchronizing the
+new attachment order. The adapter drops detached packages' in-memory member
+catalogs so their names cannot survive as inferred members of a bare receiver.
+The current input is then reopened; native disk metadata remains available for
+reattachment and explicit namespace requests.
+
+Upstream metadata failures can still prevent inferred completions. For example,
+languageserver 0.3.22 with Polars 1.12.0 can exceed its 32 MiB member snapshot
+budget for `polars::pl$scan_csv()$`. Background preparation moves work earlier,
+but cannot make that failed snapshot usable; fixing its size requires an upstream
+change. No receiver expression is executed to work around this failure.
 
 Windows uses an authenticated loopback TCP connection. On Unix,
 `r.lsp.use_stdio` selects stdio or TCP. For TCP, the R server initializes its
@@ -1831,4 +2026,3 @@ may replay a delayed submission with its original timestamp.
 16. [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 17. [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 18. [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
-
