@@ -1,4 +1,5 @@
 import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
+import type { CompletionContext } from "./types";
 
 export type CompletionSuppressionReason = Extract<MemberInspectionResult, { status: "suppressed" }>["reason"];
 
@@ -77,7 +78,14 @@ export function formatCompletionDecision(decision: CompletionDecision): string {
   return `[Runtime Completion - ${decision.kind}]: ${descriptions[decision.reason]}. ${actions[decision.kind]}.`;
 }
 
-export function completionDecisionContext(text: string): string {
+export function completionDecisionContext(text: string, context?: CompletionContext): string {
+  // Scheduling and result delivery share the same target identity. Lexical
+  // prefixes may grow without changing the call, literal or expression slot.
+  if (context?.kind === "argument" &&
+      (context.functionOperator === "$" || context.functionOperator === "@")) return context.functionName + "(";
+  if (context && (context.kind === "static" || context.kind === "default" || context.kind === "argument")) {
+    return text.slice(0, text.length - context.snapshotCursor + context.replaceStart);
+  }
   // Keep one identity while a rejected receiver's member or subscript prefix
   // grows. Prefer the final unfinished bracket over an earlier $/@ accessor.
   const bracket = /(\[\[?)[^\[\]]*$/.exec(text);

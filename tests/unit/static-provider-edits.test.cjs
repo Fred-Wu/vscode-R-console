@@ -75,6 +75,23 @@ async function openStaticPicker(t, marked, provide, options = {}) {
   };
 }
 
+test('symbol and argument pickers retry timed-out providers when search grows', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const marked of ['co│', 'f(co│)']) {
+    let calls = 0;
+    const h = await openStaticPicker(t, marked, async () => ++calls === 1
+      ? new Promise(() => {})
+      : resolved([{ label: 'column', insertText: 'column', role: 'symbol', kind: 5 }]));
+    t.mock.timers.tick(10000);
+    await tick();
+    assert.ok(h.pick, marked);
+    await h.type('colu');
+    assert.ok(calls >= 2, 'search must retry after the provider deadline');
+    await h.accept();
+    assert.equal(h.terminal.inputState.text, marked.startsWith('f(') ? 'f(column)' : 'column');
+  }
+});
+
 test('Quick Pick composes provider edits across prefix growth, shrinking, quoting and multiline suffixes', async t => {
   for (const fixture of [
     { marked: 'factory()[, c│]', query: 'col', insertion: 'umn', expected: 'factory()[, column]' },

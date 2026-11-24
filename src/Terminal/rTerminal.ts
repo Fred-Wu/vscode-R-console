@@ -2195,16 +2195,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
     if (!this.inlineCompletion.visible && !typing) return;
     const input = this.getInputSnapshot();
-    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
-      this.lang.completionDiagnosticsScope);
     const staticEnabled = settings.get<boolean>("completion.staticAnalysis", false);
     const context = this.inlineCompletionContext(input);
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor, context),
+      this.lang.completionDiagnosticsScope);
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
     if (context?.rejectionReason && !staticEnabled) {
       logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
-        completionDecisionContext(input.textBeforeCursor), this.lang.completionDiagnosticsScope);
+        completionDecisionContext(input.textBeforeCursor, context), this.lang.completionDiagnosticsScope);
     }
     if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
         (!context || ((context.kind === "default" || context.kind === "argument") &&

@@ -151,14 +151,12 @@ export class RTermLang {
           snapshotCursor: input.cursorCol,
         }
       : undefined);
-    noteConsoleCompletionContext(context?.kind === "argument" &&
-      (context.functionOperator === "$" || context.functionOperator === "@")
-      ? context.functionName + "(" : completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor, context), this.completionDocumentId);
     if (context?.rejectionReason) {
       logConsoleCompletionDecision(staticEnabled
         ? { kind: "StaticUnavailable", reason: "unsupported-context" }
         : { kind: "Rejected", reason: context.rejectionReason },
-        completionDecisionContext(input.textBeforeCursor), this.completionDocumentId);
+        completionDecisionContext(input.textBeforeCursor, context), this.completionDocumentId);
       onInlineEntries?.([]);
       return;
     }
@@ -394,6 +392,8 @@ export class RTermLang {
     const staticEnabled = this.options.getStaticAnalysisEnabled?.() === true;
     const isCurrent = () => !signal?.aborted && this.isCurrentCompletionRequest(requestId);
     if (!isCurrent()) return undefined;
+    const diagnosticContext = () => completionDecisionContext(inputText.slice(0,
+      linesBefore.reduce((offset, line) => offset + line.length + 1, position.character)), context);
     const access: StaticCompletionAccess = { bindings: createGuardedBindingResolver(
       this.options.requestRuntimeFunctionSource, {
         signal,
@@ -408,7 +408,7 @@ export class RTermLang {
         if (logOutcome && logUnresolved) {
           logConsoleCompletionDecision({ kind: "StaticUnavailable",
             reason: !lsp ? "provider-unavailable" : "document-unavailable", runtimeReason },
-            completionDecisionContext(inputText), this.completionDocumentId);
+            diagnosticContext(), this.completionDocumentId);
         }
         // A missing language server or document is not an authoritative empty
         // result. Keep inline completion retryable after the provider recovers.
@@ -419,14 +419,15 @@ export class RTermLang {
       const staticAccess: StaticCompletionAccess = { ...access,
         ...(runtimeReason && context.objectName ? { runtimeRefusal: { expression: context.objectName, reason: runtimeReason } } : {}) };
       const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, staticAccess);
-      if (isCurrent() && logOutcome &&
+      // Generic providers can decline ordinary literals and comments. That is
+      // an expected empty typing result; service and safety failures still log.
+      const unsupported = context.kind === "static" && entries.staticUnavailableReason === "unsupported-context";
+      if (isCurrent() && logOutcome && !unsupported &&
           (entries.staticResolved || logUnresolved)) {
         logConsoleCompletionDecision(entries.staticResolved ? { kind: "StaticInferred" } : {
           kind: "StaticUnavailable", reason: entries.staticUnavailableReason,
           runtimeReason: runtimeReason ?? entries.staticSuppressionReason,
-        }, completionDecisionContext(inputText.slice(0,
-          linesBefore.join("\n").length + (linesBefore.length ? 1 : 0) + position.character)),
-        this.completionDocumentId);
+        }, diagnosticContext(), this.completionDocumentId);
       }
       return isCurrent() ? entries : undefined;
     };
@@ -466,7 +467,7 @@ export class RTermLang {
         reason: entries.staticUnavailableReason, runtimeReason: entries.argumentSuppressionReason }
         : entries.argumentSuppressionReason ? { kind: "Suppressed" as const, reason: entries.argumentSuppressionReason }
         : { kind: "ArgumentsUnavailable" as const };
-      logConsoleCompletionDecision(decision, context.functionName + "(", this.completionDocumentId);
+      logConsoleCompletionDecision(decision, diagnosticContext(), this.completionDocumentId);
     }
     return entries;
   }

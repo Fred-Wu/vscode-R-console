@@ -746,10 +746,18 @@ available to prefix retries while the request is current. Cancellation, input
 changes, session changes and setting
 changes invalidate outstanding access and prevent late results from presentation.
 Provider completion has a 10-second deadline; capabilities expire when that
-provider invocation finishes. Outstanding provider-facing binding reads immediately
+provider invocation finishes. An expired deadline returns pending analysis with
+the `analysis-limit` reason. Every collector retains transient diagnostic metadata
+and completeness so growing picker searches can request fresh results.
+Outstanding provider-facing binding reads immediately
 settle as cancelled, while the shared resolver retains snapshots for prefix retries.
 Cancellation propagates to the native LSP request
-through its cancellation token. New input and picker refinements obtain fresh
+through its cancellation token. The native adapter checks cancellation after
+startup, package refresh and session preparation, and inside queued document
+synchronization before sending source or inspecting bindings. Argument snapshots
+retain document and runtime validity independently of each invocation's cancellation
+signal, allowing prefix retries to reuse their guarded inspection.
+New input and picker refinements obtain fresh
 snapshots. Closing or accepting a picker cancels its outstanding binding reads
 and provider invocation. Clearing a refined query or entering an unsupported
 preview context also cancels that refinement. Each picker owns its cancellation
@@ -897,14 +905,19 @@ runtime safety reason. For example, after submitting
 and `\`$.dangerous\` <- function(x, name) unclass(x)[[name]]`, request
 `custom_obj$inner$`. The log reads: "Request completion could run a custom method.
 No completion suggestions were returned."
-Every unavailable result has one brief reason sentence followed by that same
+Every logged unavailable result has one brief reason sentence followed by that same
 action sentence. Without a runtime safety refusal, the reason comes from native
 source inference when available, including unresolved custom method results.
 The log does not describe an existing R object as missing. Known empty receivers and prefixes with no
 matching members remain successful inference; unresolved custom methods do not.
 Diagnostic metadata uses fixed reason codes and plain R-facing messages, without
-logging object names, submitted code or raw errors. Candidate selection and the
-no-execution safety rule are unchanged.
+logging object names, submitted code or raw errors. Scheduling and result delivery
+share a completion-target identity, including method calls and growing literal
+prefixes. Repeated decisions are deduplicated per console; a changed target or
+failure reason remains visible. Unsupported generic typing contexts, including
+ordinary strings and comments, stay quiet while remaining available to providers.
+Real-LSP fixtures retry bounded transient results on fresh requests and keep
+permanent inference failures visible to their assertions.
 
 The native source adapter serializes bounded stored syntax directly, rather
 than using R's general deparser. Embedded ALTREP values and promises are

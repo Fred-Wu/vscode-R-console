@@ -1186,3 +1186,15 @@ test('multiline static edit mapping shares document reads across candidates', as
   };
   assert.equal(await run(100), await run(1));
 });
+
+test('transient provider metadata survives collection in ordinary symbols, calls and members', async () => {
+  for (const text of ['co', 'f(co', 'obj$co', 'obj[, co']) {
+    const context = completion.getCompletionContext(text, text.length);
+    const entries = await completion.collectCompletionEntries(context,
+      { version: 1, getText: () => text }, new Position(0, text.length), undefined, [], [], {
+        provideStaticCompletion: async () => ({ status: 'pending', reason: 'analysis-limit' }),
+      }, undefined, undefined, undefined, 'static');
+    assert.equal(entries.isIncomplete, true, text);
+    assert.equal(entries.staticUnavailableReason, 'analysis-limit', text);
+  }
+});

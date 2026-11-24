@@ -83,6 +83,80 @@ function change() {
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
 
+test('cancelled startup cannot replace a newer stored-source projection', async t => {
+  let releaseStartup, releaseReply, markSent;
+  const startup = new Promise(resolve => { releaseStartup = resolve; });
+  const reply = new Promise(resolve => { releaseReply = resolve; });
+  const sent = new Promise(resolve => { markSent = resolve; });
+  t.after(() => { releaseStartup([]); releaseReply(); });
+  const { client, instances } = createClient(t, {
+    staticAnalysis: true,
+    start: instance => {
+      const send = instance.sendRequest.bind(instance);
+      instance.sendRequest = (method, ...args) => method === 'rConsole/libraryPaths' ? startup : send(method, ...args);
+    },
+    completion: async () => { markSent(); await reply; return { items: [{ label: 'beta' }] }; },
+  });
+  const controller = new AbortController();
+  let text = 'factory()$';
+  const doc = { getText: () => text };
+  const old = client.provideCompletionItems(doc, new Position(0, text.length), undefined, undefined,
+    undefined, 'static', {}, { name: 'factory', body: 'function() list(alpha=1)' }, controller.signal);
+  while (!instances[0]?.running) await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  text = 'other()$';
+  const latest = client.provideCompletionItems(doc, new Position(0, text.length), undefined, undefined,
+    undefined, 'static', {}, { name: 'other', body: 'function() list(beta=1)' });
+  await sent;
+  releaseStartup([]);
+  assert.equal(await old, undefined);
+  assert.deepEqual(instances[0].documents, ['`other` <- function() list(beta=1)\nother()$']);
+  releaseReply();
+  assert.deepEqual((await latest).items, [{ label: 'beta' }]);
+});
+
+test('cancellation during session preparation or queued synchronization prevents obsolete work', async t => {
+  for (const phase of ['session', 'document', 'refresh']) {
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const waiting = new Promise(resolve => { entered = resolve; });
+    t.after(release);
+    let inspections = 0;
+    const { client, instances } = createClient(t, { staticAnalysis: true,
+      requestRuntimeFunctionArguments: async () => { inspections++; return { status: 'arguments', names: ['arg'] }; },
+    });
+    await client.start();
+    if (phase === 'session') {
+      const prepare = client.applySessionState.bind(client);
+      let first = true;
+      client.applySessionState = async (...args) => {
+        if (first) { first = false; entered(); await gate; }
+        return prepare(...args);
+      };
+    } else if (phase === 'document') {
+      client.documentSyncPromise = gate;
+      const sync = client.syncDocument.bind(client);
+      client.syncDocument = (...args) => { entered(); return sync(...args); };
+    } else {
+      client.packageRefreshPromise = gate;
+      entered();
+    }
+    const controller = new AbortController();
+    const old = client.provideCompletionItems({ getText: () => 'old(' }, new Position(0, 4),
+      undefined, undefined, undefined, 'static', {}, undefined, controller.signal);
+    await waiting;
+    controller.abort();
+    if (phase === 'refresh') client.packageRefreshPromise = undefined;
+    const latest = client.provideCompletionItems({ getText: () => 'new(' }, new Position(0, 4),
+      undefined, undefined, undefined, 'static');
+    release();
+    assert.equal(await old, undefined, phase);
+    assert.ok(await latest, phase);
+    assert.deepEqual(instances[0].documents, ['new('], phase);
+    assert.equal(inspections, 1, phase);
+  }
+});
+
 test("explicit completion mode uses the existing virtual document and controls source inference", async t => {
   const { client, instances } = createClient(t, { staticAnalysis: true });
   const source = "object <- list(alpha = 1)\nobject$";
@@ -214,24 +288,26 @@ test("prefix retries share native argument snapshots only within the current req
   const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', {
     vscode: { Position, CompletionItemKind: { Text: 0, Field: 4 } },
   });
-  let inspections = 0;
-  const { client, instances } = createClient(t, {
-    requestRuntimeFunctionArguments: () => {
-      inspections++; return { status: 'arguments', names: ['alpha_beta'] };
-    },
-    completion: () => ({ items: [], rConsoleWorkspaceFunction: true, rConsoleArgumentsResolved: true }),
-  });
   const text = 'obj$fun(alpha_beta = "zzz';
   const doc = { getText: () => text };
   const position = new Position(0, text.length);
   const context = { kind: 'argument', prefix: 'zzz', replaceStart: text.length - 3,
     snapshotInput: text, snapshotCursor: text.length, functionName: 'obj$fun', functionOperator: '$',
     argumentValue: { quote: '"', name: 'alpha_beta', prefix: 'zzz', replaceStart: text.length - 3 } };
-  for (let request = 1; request <= 2; request++) {
-    await getLanguageServerCompletions(context, doc, position, [], client);
-    assert.equal(inspections, request, 'each new completion reads fresh live arguments');
-    assert.equal(instances[0].requests.filter(item => item.method === 'completion').length, request * 2,
-      'the prefix retry remains available but shares its native snapshot');
+  for (const mode of ['runtime', 'static']) {
+    let inspections = 0;
+    const { client, instances } = createClient(t, {
+      requestRuntimeFunctionArguments: () => {
+        inspections++; return { status: 'arguments', names: ['alpha_beta'] };
+      },
+      completion: () => ({ items: [], rConsoleWorkspaceFunction: true, rConsoleArgumentsResolved: true }),
+    });
+    for (let request = 1; request <= 2; request++) {
+      await getLanguageServerCompletions(context, doc, position, [], client, undefined, mode);
+      assert.equal(inspections, request, 'each new completion reads fresh live arguments');
+      assert.equal(instances[0].requests.filter(item => item.method === 'completion').length, request * 2,
+        'the prefix retry remains available after the preceding invocation expires');
+    }
   }
 });
 

@@ -4,7 +4,7 @@ const { createConsoleLsp } = require('./helpers/console-lsp.cjs');
 const loadSource = require('./helpers/load-source.cjs');
 const { createGuardedBindingResolver } = loadSource('src/Language/completion/bindings.ts');
 const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
-const { retryStaticCompletion } = require('./helpers/static-completion.cjs');
+const { retryStaticCompletion, staticFixtureAccess, staticFixtureProvider } = require('./helpers/static-completion.cjs');
 
 test('a cold native reply can exceed one provider deadline and resolve on a fresh request', { timeout: 60000 }, async t => {
   class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
@@ -34,6 +34,38 @@ test('a cold native reply can exceed one provider deadline and resolve on a fres
   assert.equal(results.length, 2);
   assert.equal(entries.staticResolved, true);
   assert.deepEqual(entries.map(item => item.label), ['stored']);
+});
+
+test('ordinary static collections retain transient failures and recover literal-name edits', { timeout: 60000 }, async t => {
+  class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
+  const { collectCompletionEntries } = loadSource('src/Language/completion/service.ts', {
+    vscode: { Position, CompletionItemKind: { Text: 0, Function: 2, Field: 4, Snippet: 14 } },
+  });
+  const { getCompletionContext } = loadSource('src/Language/completion/syntax.ts');
+  let delayed = false;
+  const { client } = createConsoleLsp(t, { afterResponse: async method => {
+    if (method.method === 'textDocument/completion' && !delayed) {
+      delayed = true;
+      await new Promise(resolve => setTimeout(resolve, 11000));
+    }
+  } });
+  const definition = 'sales <- list("total\\u0085USD" = 42L, "total\\u0085EUR" = function() 43L)';
+  const input = definition + '\nsales$tot';
+  const document = { version: 1, getText: () => input, uri: client.inputDocument.uri };
+  const context = getCompletionContext('sales$tot', 9, input);
+  const results = [];
+  const entries = await retryStaticCompletion(async () => {
+    const result = await collectCompletionEntries(context, document, new Position(1, 9), undefined, [definition], [],
+      staticFixtureProvider(client), undefined, undefined, undefined, 'static', staticFixtureAccess());
+    results.push(result);
+    return result;
+  });
+  assert.equal(results[0].staticUnavailableReason, 'analysis-limit');
+  assert.equal(results[0].isIncomplete, true);
+  assert.deepEqual([...results[0]], []);
+  assert.equal(results.length, 2);
+  assert.deepEqual(entries.map(item => item.label).sort(), ['total\u0085EUR', 'total\u0085USD']);
+  assert.ok(entries.every(item => !item.insertText.includes('\u0085')));
 });
 
 test('general static contract uses the real languageserver adapter and preserves binding barriers', { timeout: 60000 }, async t => {

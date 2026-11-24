@@ -141,7 +141,7 @@ export async function collectCompletionEntries(
     const entries = cachedSchema ?? (runtimeMembers !== undefined ? runtimeMembers : runtimeOnly ? sessionItems
       : nativeMembers ? rawLspResult.entries : sessionItems);
     return asCompletionEntries(dedupeCompletionEntries(filterCompletionEntries(entries, context.prefix)),
-      rawLspResult.isIncomplete || retryableRuntime);
+      rawLspResult.isIncomplete || retryableRuntime, rawLspResult.staticUnavailableReason);
   }
   const unavailableSignature = rawLspResult.staticStatus !== "resolved" && (
     (runtimeOnly && memberArguments && !rawLspResult.workspaceFunction) ||
@@ -190,7 +190,7 @@ export async function collectCompletionEntries(
       ...lspFiltered,
       ...columnFiltered,
       ...(!context.bracketQuote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete || retryableRuntime);
+    ]), rawLspResult.isIncomplete || retryableRuntime, rawLspResult.staticUnavailableReason);
   }
 
   if (context.kind === "argument") {
@@ -203,7 +203,7 @@ export async function collectCompletionEntries(
       ...(!context.argumentValue?.quote ? columnFiltered : []),
       ...lspFiltered,
       ...(!context.argumentValue?.quote ? [...sessionFiltered, ...bufferFiltered] : []),
-    ]), rawLspResult.isIncomplete);
+    ]), rawLspResult.isIncomplete, rawLspResult.staticUnavailableReason);
     if (memberArguments) {
       entries.argumentsResolved = rawLspResult.argumentsResolved ?? (rawLspResult.rConsoleLocalFunction === true ||
         rawLspResult.workspaceFunction === true || rawLspItems.some(isArgumentCompletionEntry));
@@ -226,16 +226,18 @@ export async function collectCompletionEntries(
       ...(!context.pipe ? fallbackBufferItems : []),
     ],
     context.prefix
-  )), rawLspResult.isIncomplete);
+  )), rawLspResult.isIncomplete, rawLspResult.staticUnavailableReason);
 }
 
 function asCompletionEntries(
   entries: CompletionEntry[],
-  isIncomplete: boolean
+  isIncomplete: boolean,
+  reason?: CompletionEntries["staticUnavailableReason"]
 ): CompletionEntries {
   const result = entries as CompletionEntries;
   if (isIncomplete) {
     result.isIncomplete = true;
+    if (reason) result.staticUnavailableReason = reason;
   }
   return result;
 }

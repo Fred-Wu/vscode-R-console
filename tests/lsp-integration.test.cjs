@@ -21,8 +21,9 @@ const completion = loadSource("src/Language/completion.ts", { vscode: {
 } });
 
 function collectStaticEntries(client, context, doc, position, session, lines, recent = [], requestRuntime) {
-  return completion.collectCompletionEntries(context, { version: 1, uri: client.inputDocument.uri, ...doc }, position,
-    session, lines, recent, staticFixtureProvider(client), requestRuntime, undefined, undefined, 'static', staticFixtureAccess());
+  return retryStaticCompletion(() => completion.collectCompletionEntries(context,
+    { version: 1, uri: client.inputDocument.uri, ...doc }, position,
+    session, lines, recent, staticFixtureProvider(client), requestRuntime, undefined, undefined, 'static', staticFixtureAccess()));
 }
 
 test("closing a virtual completion document cancels native tasks and answers pending requests", () => {

@@ -324,21 +324,24 @@ export class ConsoleLspClient implements CompletionProvider {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (signal?.aborted) return undefined;
       await this.packageRefreshPromise;
+      if (signal?.aborted) return undefined;
       const revision = this.packageRevision;
       const client = await this.ensureClient();
-      if (!client) {
+      if (!client || signal?.aborted) {
         return undefined;
       }
       try {
         const staticAnalysis = analysisMode === undefined
           ? this.options.getStaticAnalysisEnabled?.() === true : analysisMode === "static";
-        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition,
-          staticAnalysis ? sourceBinding : undefined);
         await this.applySessionState(client);
+        if (signal?.aborted) return undefined;
         if (this.client !== client) {
           continue;
         }
-        await this.syncDocument(client, projection.document);
+        const projection = this.inputDocument.project(doc.getText(), staticAnalysis, contextPosition,
+          staticAnalysis ? sourceBinding : undefined);
+        await this.syncDocument(client, projection.document, signal);
+        if (signal?.aborted) return undefined;
         const context: vscode.CompletionContext = triggerCharacter
           ? {
               triggerKind: vscode.CompletionTriggerKind.TriggerCharacter,
@@ -354,10 +357,11 @@ export class ConsoleLspClient implements CompletionProvider {
         const documentVersion = projection.document.version;
         const sessionState = this.sessionState;
         const runtimeRevision = this.runtimeRevision;
-        const isCurrent = () => !this.disposed && this.client === client &&
+        const snapshotCurrent = () => !this.disposed && this.client === client &&
           revision === this.packageRevision && runtimeRevision === this.runtimeRevision &&
           this.sessionState === sessionState &&
           this.syncedDocuments.get(projection.document.uri.toString())?.version === documentVersion;
+        const isCurrent = () => !signal?.aborted && snapshotCurrent();
         // Use the already-published workspace snapshot; completion must not
         // query sess to resolve or inspect runtime objects.
         const globals = this.options.getCachedWorkspaceData?.()?.globalenv;
@@ -411,7 +415,7 @@ export class ConsoleLspClient implements CompletionProvider {
             } catch { functionInspection = { status: "unavailable" }; }
             if (!isCurrent()) return undefined;
             this.argumentInspections.set(requestScope, { expression: params.rConsoleCall!,
-              isCurrent, result: functionInspection });
+              isCurrent: snapshotCurrent, result: functionInspection });
           }
           if (functionInspection?.status === "arguments") {
             Object.assign(params, { rConsoleRuntimeArgumentNames: functionInspection.names,
@@ -1031,8 +1035,9 @@ export class ConsoleLspClient implements CompletionProvider {
     ];
   }
 
-  private syncDocument(client: LanguageClient, document: vscode.TextDocument): Promise<void> {
+  private syncDocument(client: LanguageClient, document: vscode.TextDocument, signal?: AbortSignal): Promise<void> {
     const syncPromise = this.documentSyncPromise.then(async () => {
+      if (signal?.aborted) return;
       const key = document.uri.toString();
       const existing = this.syncedDocuments.get(key);
       if (!existing) {

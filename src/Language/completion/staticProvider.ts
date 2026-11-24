@@ -110,7 +110,7 @@ export async function requestStaticCompletion(
       resolve(valid ? result : pending);
     };
     const cancel = () => finish(pending);
-    const timer = setTimeout(() => finish({ status: "unresolved", reason: "analysis-limit" }), 10000);
+    const timer = setTimeout(() => finish({ status: "pending", reason: "analysis-limit" }), 10000);
     request.bindings.signal?.addEventListener("abort", cancel, { once: true });
     if (!current()) return finish(pending);
     void Promise.resolve().then(() => finished || !current() ? pending : provider.provideStaticCompletion
