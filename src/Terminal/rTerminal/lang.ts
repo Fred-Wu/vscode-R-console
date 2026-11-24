@@ -8,12 +8,11 @@ import {
   CompletionPickItem,
   type RuntimeMemberCompletionRequester,
   type RuntimeFunctionSourceRequester,
-  type CompletionSourceBinding,
+  type StaticCompletionAccess,
   type RuntimeFunctionArgumentsRequester,
-  storedCompletionReceiver,
   collectCompletionEntries,
   collectStaticFallbackEntries,
-  getStaticFallbackContext,
+  getStaticCompletionContext,
   parseRuntimeMemberQuery,
   getCompletionContext,
   rankCompletionEntries,
@@ -21,6 +20,7 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
+import { createGuardedBindingResolver } from "../../Language/completion/bindings";
 import { clearCompletionDiagnosticsScope, logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
 import { completionDecisionContext, type CompletionSuppressionReason } from "../../Language/completion/diagnostics";
 import { VirtualRDocument } from "../../Language/virtualRDocument";
@@ -79,6 +79,7 @@ export class RTermLang {
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
   private completionPickerAbort: AbortController | undefined;
+  private bindingAbort: AbortController | undefined;
 
   constructor(private readonly options: LangOptions) {}
 
@@ -126,6 +127,9 @@ export class RTermLang {
     if (this.lastStaticAnalysisEnabled !== undefined &&
         this.lastStaticAnalysisEnabled !== staticEnabled) this.cancelCompletion();
     this.lastStaticAnalysisEnabled = staticEnabled;
+    this.bindingAbort?.abort();
+    this.bindingAbort = new AbortController();
+    const bindingSignal = this.bindingAbort.signal;
     const requestId = ++this.completionRequestId;
     let context = getCompletionContext(
       input.currentLine,
@@ -133,9 +137,8 @@ export class RTermLang {
       input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length)
     );
-    if (staticEnabled && (context?.rejectionReason ||
-        (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))) {
-      context = getStaticFallbackContext(input.currentLine, input.cursorCol,
+    if (staticEnabled) {
+      context = getStaticCompletionContext(input.currentLine, input.cursorCol,
         input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context) ?? context;
     }
     context ??= (force
@@ -183,8 +186,6 @@ export class RTermLang {
       const runtimeMember = context.kind === "member" && !context.staticFallback &&
         this.options.requestRuntimeMemberCompletions !== undefined &&
         (!staticEnabled || !!(context.objectName && parseRuntimeMemberQuery(context.objectName)));
-      const sourceRequest = staticEnabled
-        ? this.prefetchFunctionSource(context, latestInput.text, latestInput.textBeforeCursor.length) : undefined;
       const prefetchedBracketMembers = this.prefetchBracketMembers(context);
       // Publish guarded bracket names as soon as they arrive. Do not hold
       // columns hostage to a slow or restarting language server; its method
@@ -220,7 +221,7 @@ export class RTermLang {
           getWorkspaceData() ?? cachedSessionData;
         return await this.collectRoutedEntries(
           context, document, position, sessionData, linesBefore, recentEntries,
-          completionProvider, latestInput.text, prefetchedBracketMembers, requestId, true, sourceRequest
+          completionProvider, latestInput.text, prefetchedBracketMembers, requestId, true, bindingSignal
         );
       })();
       // Argument candidates must await LSP parameters; early session-only
@@ -242,7 +243,7 @@ export class RTermLang {
         return;
       }
 
-      const opensBeforeFullResults = (force && context.kind !== "argument") ||
+      const opensBeforeFullResults = (force && !onInlineEntries && context.kind !== "argument") ||
         !!stagedEntries?.length || !!stagedBracketEntries;
       const entries = stagedEntries?.length
         ? stagedEntries
@@ -295,9 +296,13 @@ export class RTermLang {
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol, onStagedEntries) => {
+          if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+          this.bindingAbort?.abort();
+          this.bindingAbort = new AbortController();
+          const refinementSignal = this.bindingAbort.signal;
 
-          if (nextContext.rejectionReason && staticEnabled) {
-            nextContext = getStaticFallbackContext(lines[latestInput.cursorRow], cursorCol,
+          if (staticEnabled) {
+            nextContext = getStaticCompletionContext(lines[latestInput.cursorRow], cursorCol,
               [...lines.slice(0, latestInput.cursorRow),
                 lines[latestInput.cursorRow].slice(0, cursorCol)].join("\n"),
               nextInputText.slice([...lines.slice(0, latestInput.cursorRow),
@@ -307,8 +312,6 @@ export class RTermLang {
           const nextRuntimeMember = nextContext.kind === "member" && !nextContext.staticFallback &&
             this.options.requestRuntimeMemberCompletions !== undefined &&
             (!staticEnabled || !!(nextContext.objectName && parseRuntimeMemberQuery(nextContext.objectName)));
-          const nextSource = staticEnabled ? this.prefetchFunctionSource(nextContext, nextInputText,
-            lines.slice(0, latestInput.cursorRow).reduce((sum, line) => sum + line.length + 1, 0) + cursorCol) : undefined;
           const nextBracketMembers = this.prefetchBracketMembers(nextContext);
           // Refinements need the same early native results as the initial
           // picker. The picker guards these against newer queries and the
@@ -326,7 +329,7 @@ export class RTermLang {
             completionProvider = await this.ensureConsoleLspStarted();
           }
           const nextDocument = await nextDocumentRequest;
-          if (!this.isCurrentCompletionRequest(requestId)) {
+          if (refinementSignal.aborted || !this.isCurrentCompletionRequest(requestId)) {
             return;
           }
           const refinedSessionData =
@@ -335,7 +338,7 @@ export class RTermLang {
             nextContext, nextDocument, new vscode.Position(latestInput.cursorRow, cursorCol),
             refinedSessionData, lines.slice(0, latestInput.cursorRow),
             recentEntries, completionProvider, nextInputText, nextBracketMembers,
-            requestId, false, nextSource
+            requestId, false, refinementSignal
           );
         },
       });
@@ -361,29 +364,6 @@ export class RTermLang {
     }
   }
 
-  private prefetchFunctionSource(context: CompletionContext, input: string, cursor: number):
-    Promise<{ binding?: CompletionSourceBinding; reason?: CompletionSuppressionReason }> | undefined {
-    // Start independently of LSP startup; every completion owns a fresh snapshot.
-    // Stored methods already receive a full argument inspection in the client.
-    if (context.kind === "argument" && context.functionName &&
-        parseRuntimeMemberQuery(context.functionName, "arguments")) return undefined;
-    const receiver = storedCompletionReceiver(context, input, cursor);
-    const requester = this.options.requestRuntimeFunctionSource;
-    if (!receiver?.name || !requester) return undefined;
-    const source = receiver.target !== "binding";
-    return (async () => {
-      const binding: CompletionSourceBinding = { name: receiver.name, ...(!source ? { opaqueReceiver: true } : {}) };
-      try {
-        const result = await requester(receiver.name, receiver.target);
-        if (source && result?.status === "source" && result.text && Buffer.byteLength(result.text, "utf8") <= 64 * 1024) {
-          return { binding: { ...binding, body: result.text } };
-        }
-        if (result?.status === "missing" || result?.status === "not-callable" || result?.status === "package") return {};
-        return { binding, reason: result?.status === "suppressed" ? result.reason : undefined };
-      } catch { return { binding }; }
-    })();
-  }
-
   /**
    * Preserve native completion for stored receivers. Only a definitive safety
    * refusal is routed to static source inference, never a successful empty
@@ -401,14 +381,21 @@ export class RTermLang {
     bracketInspection: Promise<MemberInspectionResult | undefined> | undefined,
     requestId: number,
     logOutcome = true,
-    sourceRequest?: ReturnType<RTermLang["prefetchFunctionSource"]>
+    signal?: AbortSignal
   ): Promise<CompletionEntries | undefined> {
     const staticEnabled = this.options.getStaticAnalysisEnabled?.() === true;
+    const isCurrent = () => !signal?.aborted && this.isCurrentCompletionRequest(requestId);
+    if (!isCurrent()) return undefined;
+    const access: StaticCompletionAccess = { bindings: createGuardedBindingResolver(
+      this.options.requestRuntimeFunctionSource, {
+        signal,
+        isCurrent,
+      }) };
     const fallback = async (logUnresolved = true, runtimeReason?: CompletionSuppressionReason): Promise<CompletionEntries | undefined> => {
       const lsp = provider ?? await this.ensureConsoleLspStarted();
-      if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+      if (!isCurrent()) return undefined;
       const doc = document ?? await this.getOrOpenCompletionDocument(inputText);
-      if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+      if (!isCurrent()) return undefined;
       if (!doc || !lsp) {
         if (logOutcome && logUnresolved) {
           logConsoleCompletionDecision({ kind: "StaticUnavailable",
@@ -421,21 +408,19 @@ export class RTermLang {
         pending.isIncomplete = true;
         return pending;
       }
-      const source = await sourceRequest;
-      const sourceBinding = source?.binding ?? (runtimeReason && context.objectName
-        ? { name: parseRuntimeMemberQuery(context.objectName)!.root, opaqueReceiver: true } : undefined);
-      runtimeReason ??= source?.reason;
-      if (!this.isCurrentCompletionRequest(requestId)) return undefined;
-      const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, sourceBinding);
-      if (this.isCurrentCompletionRequest(requestId) && logOutcome &&
+      const staticAccess: StaticCompletionAccess = { ...access,
+        ...(runtimeReason && context.objectName ? { runtimeRefusal: { expression: context.objectName, reason: runtimeReason } } : {}) };
+      const entries = await collectStaticFallbackEntries(context, doc, position, linesBefore, lsp, staticAccess);
+      if (isCurrent() && logOutcome &&
           (entries.staticResolved || logUnresolved)) {
         logConsoleCompletionDecision(entries.staticResolved ? { kind: "StaticInferred" } : {
-          kind: "StaticUnavailable", reason: entries.staticUnavailableReason, runtimeReason,
+          kind: "StaticUnavailable", reason: entries.staticUnavailableReason,
+          runtimeReason: runtimeReason ?? entries.staticSuppressionReason,
         }, completionDecisionContext(inputText.slice(0,
           linesBefore.join("\n").length + (linesBefore.length ? 1 : 0) + position.character)),
         this.completionDocumentId);
       }
-      return this.isCurrentCompletionRequest(requestId) ? entries : undefined;
+      return isCurrent() ? entries : undefined;
     };
 
     if (context.staticFallback) return staticEnabled ? fallback() : [];
@@ -447,7 +432,7 @@ export class RTermLang {
         context.objectName && parseRuntimeMemberQuery(context.objectName)) {
       const result = await Promise.resolve(requester(context.objectName, context.operator ?? "$"))
         .catch(() => undefined);
-      if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+      if (!isCurrent()) return undefined;
       if (result?.status === "suppressed") return fallback(true, result.reason);
       if (result?.status === "missing" || result?.status === "package") return fallback(false);
       return collectCompletionEntries(context, undefined, undefined, sessionData,
@@ -455,18 +440,17 @@ export class RTermLang {
     }
     if (staticEnabled && context.kind === "bracket" && bracketInspection) {
       const result = await bracketInspection.catch(() => undefined);
-      if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+      if (!isCurrent()) return undefined;
       if (result?.status === "suppressed") return fallback(true, result.reason);
       if (result?.status === "missing" || result?.status === "package") return fallback(false);
       bracketInspection = Promise.resolve(result);
     }
-    const source = await sourceRequest;
-    if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+    if (!isCurrent()) return undefined;
     const entries = await collectCompletionEntries(context, document, document ? position : undefined,
       sessionData, linesBefore, recentEntries, provider, requester, inputText,
       bracketInspection, staticEnabled && context.kind === "bracket" && bracketInspection
-        ? "runtime" : undefined, source?.binding);
-    if (!this.isCurrentCompletionRequest(requestId)) return undefined;
+        ? "runtime" : staticEnabled ? "static" : "runtime", staticEnabled ? access : undefined);
+    if (!isCurrent()) return undefined;
     if (logOutcome && context.kind === "argument" && context.argumentTags &&
         (context.functionOperator === "$" || context.functionOperator === "@") &&
         entries.argumentsResolved === false && !entries.length) {
@@ -488,14 +472,14 @@ export class RTermLang {
       this.cancelCompletion();
       return undefined;
     }
+    this.bindingAbort?.abort();
     this.completionRequestId++;
     const cached = this.inlineCache;
     if (!cached) return undefined;
     context ??= getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length));
-    if (this.options.getStaticAnalysisEnabled?.() === true &&
-        (context?.rejectionReason || (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))) {
-      context = getStaticFallbackContext(input.currentLine, input.cursorCol,
+    if (this.options.getStaticAnalysisEnabled?.() === true) {
+      context = getStaticCompletionContext(input.currentLine, input.cursorCol,
         input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context);
     }
     if (!context) return undefined;
@@ -512,6 +496,7 @@ export class RTermLang {
   }
 
   cancelCompletion(): void {
+    this.bindingAbort?.abort();
     this.completionRequestId++;
     this.inlineCache = undefined;
     this.completionPickerAbort?.abort();
@@ -648,7 +633,7 @@ export class RTermLang {
     this.silentCompletionRequest = (async () => {
       try {
         const position = document.positionAt(document.getText().length);
-        await completionProvider.provideCompletionItems(document, position);
+        await completionProvider.provideCompletionItems?.(document, position);
       } catch {
       } finally {
         this.silentCompletionRequest = undefined;

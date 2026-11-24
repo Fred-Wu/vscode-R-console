@@ -1958,3 +1958,15 @@ test("accessor prefixes bypass top-level character threshold even without a visi
   mock.mock.timers.tick(150);
   assert.equal(requests.length, 4);
 });
+
+test('typing in previously unclassified brackets schedules static provider completion', async t => {
+  for (const source of ['factory()[, col', 'factory()[1, "co']) {
+    const { terminal } = createTerminal(t, 80, 24, 'typing', { 'completion.staticAnalysis': true });
+    terminal.inputState.insertText(source);
+    let requested;
+    terminal.lang.handleAutocomplete = ({ input }) => { requested = input.text; };
+    terminal.scheduleInlineCompletion();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(requested, source);
+  }
+});

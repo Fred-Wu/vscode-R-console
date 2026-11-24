@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, CompletionSourceBinding, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionEntries, CompletionProvider, StaticCompletionAccess, RuntimeMemberCompletionRequester, WorkspaceData } from "./types";
 import { isSessionFunctionCall, getSessionCompletions, getDataColumnCompletions } from "./runtime";
 import { getConsoleBufferCompletions } from "./buffer";
 import { getLanguageServerCompletions } from "./languageServer";
@@ -20,7 +20,7 @@ export async function collectCompletionEntries(
   consoleInputText?: string,
   prefetchedBracketMembers?: Promise<MemberInspectionResult | undefined>,
   analysisMode?: CompletionAnalysisMode,
-  sourceBinding?: CompletionSourceBinding
+  staticAccess?: StaticCompletionAccess
 ): Promise<CompletionEntries> {
   if (context.rejectionReason || context.suppressAutomatic) return [];
   const sessionItems = getSessionCompletions(context, sessionData);
@@ -49,7 +49,7 @@ export async function collectCompletionEntries(
           multilineBuffer,
           completionProvider,
           runtimeBracketKind,
-          analysisMode, sourceBinding
+          analysisMode, staticAccess
         );
   const bufferItems = getConsoleBufferCompletions(
     context,
@@ -248,18 +248,18 @@ export async function collectStaticFallbackEntries(
   position: vscode.Position,
   multilineBuffer: string[],
   completionProvider: CompletionProvider,
-  sourceBinding?: CompletionSourceBinding
+  staticAccess?: StaticCompletionAccess
 ): Promise<CompletionEntries> {
-  if (context.suppressAutomatic || (context.kind !== "member" && context.kind !== "bracket")) {
+  if (context.suppressAutomatic || (context.kind !== "member" && context.kind !== "bracket" && context.kind !== "static")) {
     return [];
   }
   const result = await getLanguageServerCompletions(
-    context, doc, position, multilineBuffer, completionProvider, undefined, "static", sourceBinding
+    context, doc, position, multilineBuffer, completionProvider, undefined, "static", staticAccess
   );
   // Only a receiver-specific member has sufficiently strong provenance.
   // Lexical scope fields and indexing parameters are not verified receiver
   // members, even when they are labeled as fields by the language server.
-  const memberItems = result.entries.filter(entry => entry.role === "member");
+  const memberItems = result.entries.filter(entry => context.kind === "static" || entry.role === "member");
   const entries = asCompletionEntries(
     dedupeCompletionEntries(filterCompletionEntries(memberItems, context.prefix)),
     result.isIncomplete
@@ -269,6 +269,7 @@ export async function collectStaticFallbackEntries(
   entries.staticResolved = memberItems.length > 0 || !!(result.memberResolved && !result.staticUnavailableReason);
   if (!entries.staticResolved) {
     entries.staticUnavailableReason = result.staticUnavailableReason ?? "no-receiver-members";
+    entries.staticSuppressionReason = result.bindingSuppressionReason;
     entries.isIncomplete = true;
   }
   return entries;

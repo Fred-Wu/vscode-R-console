@@ -39,6 +39,7 @@ import { lifecycleOutputChannel } from "./completion/outputChannel";
 import { staticCompletionUnavailableReason } from "./completion/diagnostics";
 import { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
 import { storedCompletionReceiver } from "./completion/sourceReceiver";
+import { provideNativeStaticCompletion } from "./completion/staticProvider";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -302,6 +303,10 @@ export class ConsoleLspClient implements CompletionProvider {
       this.options.getStaticAnalysisEnabled?.() === true, position);
     return getEnclosingCall(projection.document.getText(),
       projection.document.offsetAt(projection.toServerPosition(position)));
+  }
+
+  provideStaticCompletion(request: import("./completion/types").StaticCompletionRequest) {
+    return provideNativeStaticCompletion(this, request);
   }
 
   async provideCompletionItems(

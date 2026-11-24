@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import {
   type CompletionContext, type CompletionEntries, type CompletionEntry, type CompletionPickItem,
-  getCompletionContext, getStaticFallbackContext, rankCompletionEntries, isCompletionPickItem,
+  getCompletionContext, getStaticCompletionContext, rankCompletionEntries, isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { rebaseCompletionEnds } from "../../Language/completion/refinement";
@@ -159,7 +159,7 @@ export async function pickCompletion({
       // source. Retain an opening backtick and escape the replacement prefix;
       // existing suffixes (including a closing quote) stay after the cursor.
       const quote = context.bracketQuote ?? context.argumentValue?.quote;
-      const spelling = quote ? quoteCompletionValue(prefix, quote) : context.kind === "member" && latestInput.currentLine[context.replaceStart] === "`"
+      const spelling = quote ? quoteCompletionValue(prefix, quote) : (context.kind === "member" || context.kind === "static") && latestInput.currentLine[context.replaceStart] === "`"
         ? backtickRName(prefix).slice(0, -1) : prefix;
       const cursorCol = context.replaceStart + spelling.length;
       const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + spelling + latestInput.currentLine.slice(latestInput.cursorCol);
@@ -173,7 +173,7 @@ export async function pickCompletion({
       const nextContext = context.kind === "package"
         ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
         : (context.staticFallback
-          ? getStaticFallbackContext(currentLine, cursorCol, fullTextBeforeCursor,
+          ? getStaticCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
               nextInputText.slice(fullTextBeforeCursor.length))
           : undefined) ?? getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
             nextInputText.slice(fullTextBeforeCursor.length));

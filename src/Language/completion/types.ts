@@ -4,7 +4,7 @@ import type { MemberInspectionResult } from "../../Runtime/backendProtocol";
 import type { WorkspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";
 import type { CompletionSuppressionReason, StaticCompletionUnavailableReason } from "./diagnostics";
 export type CompletionContext = {
-  kind: "member" | "package" | "bracket" | "argument" | "default";
+  kind: "member" | "package" | "bracket" | "argument" | "default" | "static";
   prefix: string;
   replaceStart: number;
   // Line-relative offset, potentially past this line for a multiline string.
@@ -53,6 +53,7 @@ export type CompletionEntries = CompletionEntry[] & {
   // Whether static analysis resolved the requested member/column receiver.
   staticResolved?: boolean;
   staticUnavailableReason?: StaticCompletionUnavailableReason;
+  staticSuppressionReason?: CompletionSuppressionReason;
   argumentsResolved?: boolean;
   argumentSuppressionReason?: CompletionSuppressionReason;
   // An empty but successful sess column inspection is authoritative.
@@ -73,6 +74,8 @@ export type CompletionPickItem = vscode.QuickPickItem & {
 export type CompletionQuickPickItem = CompletionPickItem | vscode.QuickPickItem;
 
 export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[]) & {
+  rConsoleStaticStatus?: StaticCompletionOutcome["status"];
+  rConsoleBindingSuppressionReason?: CompletionSuppressionReason;
   // Applies even when filtering leaves no arguments or the definition has none.
   rConsoleRuntimeOnly?: boolean;
   rConsoleLocalFunction?: boolean;
@@ -90,11 +93,53 @@ export type CompletionAnalysisMode = "runtime" | "static";
 /** A guarded closure snapshot or opaque live binding. Receiver refusals also preserve root identity. */
 export type CompletionSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
 
+export type BindingLookup = "function" | "value" | "identity";
+export type BindingScope = { kind: "search-path" } | { kind: "closure"; bindingId: string };
+export type StaticBindingQuery = {
+  name: string;
+  lookup: BindingLookup;
+  scope: BindingScope;
+  depth?: number;
+};
+export type StaticBindingResult =
+  | { status: "source"; source: string; bindingId: string; closureScope: BindingScope }
+  | { status: "package" | "missing" | "not-callable" | "opaque" }
+  | { status: "unavailable"; reason: "unsupported-scope" | "invalid-request" | "cancelled" | "analysis-limit" | "runtime-unavailable" }
+  | { status: "suppressed"; reason: CompletionSuppressionReason };
+
+/** Request-local capability. Each lookup independently enforces runtime safety. */
+export interface GuardedBindingResolver {
+  resolve(query: StaticBindingQuery): Promise<StaticBindingResult>;
+  isCurrent(): boolean;
+  readonly signal?: AbortSignal;
+}
+
+export type StaticCompletionAccess = {
+  bindings: GuardedBindingResolver;
+  runtimeRefusal?: { expression: string; reason: CompletionSuppressionReason };
+};
+
+export type StaticCompletionRequest = StaticCompletionAccess & {
+  document: vscode.TextDocument;
+  /** Immutable input snapshot and UTF-16 offset of the user's actual cursor. */
+  input: string;
+  cursor: number;
+  position: vscode.Position;
+  contextPosition: vscode.Position;
+  triggerCharacter?: string;
+  requestScope: object;
+};
+
+export type StaticCompletionOutcome =
+  | { status: "resolved" | "resolved-empty"; completion: CompletionResult }
+  | { status: "unresolved" | "pending"; reason: StaticCompletionUnavailableReason; completion?: CompletionResult };
+
 export interface CompletionProvider {
+  provideStaticCompletion?(request: StaticCompletionRequest): Promise<StaticCompletionOutcome>;
   // A selected package function can be qualified in the LSP projection while
   // its name remains unqualified in the visible console input.
   getCallContext?(doc: vscode.TextDocument, position: vscode.Position): CallCompletionContext | undefined;
-  provideCompletionItems(
+  provideCompletionItems?(
     doc: vscode.TextDocument,
     position: vscode.Position,
     triggerCharacter?: string,

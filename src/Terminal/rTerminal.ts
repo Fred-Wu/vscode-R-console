@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext, getStaticFallbackContext, parseRuntimeMemberQuery, type RuntimeFunctionSourceTarget } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, getStaticCompletionContext, parseRuntimeMemberQuery, type RuntimeFunctionSourceTarget } from "../Language/completion";
 import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
 import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
@@ -2177,9 +2177,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       input.text.slice(input.textBeforeCursor.length));
     const staticEnabled = vscode.workspace.getConfiguration("r.console")
       .get<boolean>("completion.staticAnalysis", false);
-    return staticEnabled && (context?.rejectionReason ||
-      (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))
-      ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+    return staticEnabled
+      ? getStaticCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
           input.text.slice(input.textBeforeCursor.length), context) ?? context
       : context;
   }

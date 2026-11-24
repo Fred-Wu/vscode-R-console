@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
-import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, CompletionSourceBinding } from "./types";
+import { createGuardedBindingResolver } from "./bindings";
+import { requestStaticCompletion } from "./staticProvider";
+import type { CompletionAnalysisMode, CompletionContext, CompletionEntry, CompletionProvider, StaticCompletionAccess } from "./types";
 import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
@@ -14,18 +16,26 @@ export async function getLanguageServerCompletions(
   completionProvider?: CompletionProvider,
   runtimeBracketKind?: "data.frame" | "data.table" | null,
   analysisMode?: CompletionAnalysisMode,
-  sourceBinding?: CompletionSourceBinding
-): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
+  staticAccess?: StaticCompletionAccess
+): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; bindingSuppressionReason?: CompletionSuppressionReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
   if (!completionProvider) {
     return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
   }
   try {
     const requestScope = {};
-    let result = await completionProvider.provideCompletionItems(
-      doc,
-      position,
-      context.triggerCharacter, undefined, runtimeBracketKind, analysisMode, sourceBinding, requestScope
-    );
+    const input = doc.getText();
+    const inputLines = input.split("\n");
+    const access = staticAccess ?? { bindings: createGuardedBindingResolver() };
+    const query = (queryPosition: vscode.Position) => analysisMode === "static"
+      ? requestStaticCompletion(completionProvider, {
+          ...access, document: doc, input,
+          cursor: inputLines.slice(0, position.line).reduce((sum, line) => sum + line.length + 1, 0) + position.character,
+          position: queryPosition, contextPosition: position,
+          triggerCharacter: context.triggerCharacter, requestScope,
+        })
+      : completionProvider.provideCompletionItems?.(doc, queryPosition, context.triggerCharacter,
+          position, runtimeBracketKind, analysisMode, undefined, requestScope);
+    let result = await query(position);
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
     let workspaceFunction = result?.rConsoleWorkspaceFunction === true;
@@ -39,7 +49,8 @@ export async function getLanguageServerCompletions(
     let items = Array.isArray(result) ? result : result?.items || [];
     const usable = (item: vscode.CompletionItem): boolean =>
       !(workspaceFunction && !context.argumentValue && getCompletionRole(item) === "value") &&
-      isLanguageServerCompletionItem(context, item, doc.uri?.toString());
+      isLanguageServerCompletionItem(context, item, doc.uri?.toString()) &&
+      (context.kind !== "static" || (result?.rConsoleStaticStatus === "resolved" && validStaticEdit(item, inputLines, position)));
     // Some R language servers only return contiguous matches. If that lookup
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
@@ -51,13 +62,12 @@ export async function getLanguageServerCompletions(
       "receiver-unresolved", "unresolved-dispatch", "unsupported-context",
       "analysis-limit", "inference-cycle", "no-receiver-members",
     ].includes(staticReason);
-    if (!structuralFailure && context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
+    if (result?.rConsoleStaticStatus !== "resolved-empty" && result?.rConsoleStaticStatus !== "unresolved" &&
+        result?.rConsoleStaticStatus !== "pending" && !structuralFailure && context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];
-      result = await completionProvider.provideCompletionItems(doc,
-        new vscode.Position(position.line, context.replaceStart + firstCharacter.length),
-        context.triggerCharacter, position, runtimeBracketKind, analysisMode, sourceBinding, requestScope);
+      result = await query(new vscode.Position(position.line, context.replaceStart + firstCharacter.length));
       runtimeOnly ||= result?.rConsoleRuntimeOnly === true;
       localFunction ||= result?.rConsoleLocalFunction === true;
       workspaceFunction ||= result?.rConsoleWorkspaceFunction === true;
@@ -87,11 +97,12 @@ export async function getLanguageServerCompletions(
         ...getCompletionReplaceEnd(item, doc, position),
         packageName: getCompletionPackage(item),
       })),
-      isIncomplete: !Array.isArray(result) && result?.isIncomplete === true,
+      isIncomplete: result?.rConsoleStaticStatus === "pending" || (!Array.isArray(result) && result?.isIncomplete === true),
       rConsoleLocalFunction: localFunction,
       runtimeOnly,
-      memberResolved,
+      memberResolved: memberResolved || result?.rConsoleStaticStatus === "resolved-empty",
       staticUnavailableReason: result == null ? "no-response" : staticReason,
+      bindingSuppressionReason: result?.rConsoleBindingSuppressionReason,
       workspaceFunction,
       nativeArguments,
       argumentsExhausted,
@@ -142,6 +153,20 @@ function isLanguageServerCompletionItem(
   const subscriptParameter = context.kind === "bracket" &&
     (item as vscode.CompletionItem & { data?: { type?: string } }).data?.type === "subscript_parameter";
   if (context.suppressAutomatic) return false;
+  if (item.kind === vscode.CompletionItemKind.Text) {
+    return false;
+  }
+
+  if (item.detail === "[workspace]") {
+    const data = (item as vscode.CompletionItem & { data?: { package?: string; context_uri?: string; uri?: string } }).data;
+    // Only definitions from this console's virtual document are authoritative.
+    // Other workspace/editor symbols must not leak into the console session.
+    if (!(isCallableCompletionKind(item.kind) && (data?.package === "_workspace_" || data?.uri === documentUri) &&
+      documentUri !== undefined && data?.context_uri === documentUri)) return false;
+  }
+
+  // Generic static contexts use the provider's explicit resolution and edits.
+  if (context.kind === "static") return true;
   if (context.kind !== "member" && context.kind !== "package" && !allowsSymbolCompletions(context) &&
       role !== "argument" && role !== "value" && role !== "member" &&
       !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
@@ -160,17 +185,6 @@ function isLanguageServerCompletionItem(
   if (restrictsBracketSymbols(context) &&
       !subscriptParameter && role !== "member" &&
       !(role === "scope" && item.kind === vscode.CompletionItemKind.Field)) return false;
-  if (item.kind === vscode.CompletionItemKind.Text) {
-    return false;
-  }
-
-  if (item.detail === "[workspace]") {
-    const data = (item as vscode.CompletionItem & { data?: { package?: string; context_uri?: string; uri?: string } }).data;
-    // Only definitions from this console's virtual document are authoritative.
-    // Other workspace/editor symbols must not leak into the console session.
-    return isCallableCompletionKind(item.kind) && (data?.package === "_workspace_" || data?.uri === documentUri) &&
-      documentUri !== undefined && data?.context_uri === documentUri;
-  }
 
   if (
     (context.kind === "argument" || context.kind === "package") &&
@@ -224,6 +238,11 @@ function stripSnippetSyntax(text: string): string {
 }
 
 function getCompletionInsertText(item: vscode.CompletionItem, context: CompletionContext): string {
+  if (context.kind === "static" && typeof item.insertText === "object") return stripSnippetSyntax(item.insertText.value);
+  if (context.kind === "static" && typeof item.insertText === "string") {
+    return (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat === 2
+      ? stripSnippetSyntax(item.insertText) : item.insertText;
+  }
   if (getCompletionRole(item) === "argument" && getCompletionLabel(item) === "...") return "...";
   // Value labels are literal R strings, including dollar signs and braces.
   // Quote them for both named and positional insertion before snippet handling.
@@ -299,4 +318,18 @@ function getCompletionReplaceEnd(
   const lines = doc.getText().split("\n");
   if (end.line < position.line || end.line >= lines.length) return {};
   return { replaceEnd: lines.slice(position.line, end.line).reduce((sum, line) => sum + line.length + 1, 0) + end.character };
+}
+
+/** The terminal can apply only edits beginning on the cursor's line. */
+function validStaticEdit(item: vscode.CompletionItem, lines: string[], position: vscode.Position): boolean {
+  if (!item.range || (typeof item.insertText !== "string" &&
+      !(typeof item.insertText === "object" && typeof item.insertText?.value === "string"))) return false;
+  const range = "start" in item.range ? item.range : item.range.replacing;
+  const { start, end } = range;
+  return Number.isInteger(start.line) && Number.isInteger(start.character) &&
+    Number.isInteger(end.line) && Number.isInteger(end.character) &&
+    start.line === position.line && start.character >= 0 && start.character <= position.character &&
+    end.line >= start.line && end.line < lines.length && end.character >= 0 &&
+    end.character <= lines[end.line].length &&
+    (end.line > position.line || end.character >= position.character);
 }

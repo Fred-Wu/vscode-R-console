@@ -23,7 +23,7 @@ const snapshot = (text, cursor = text.length) => {
 };
 const labels = entries => entries.filter(entry => "insertText" in entry).map(entry => entry.insertText);
 
-function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources } = {}) {
+function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources, staticProvider } = {}) {
   const logs = [], native = [], requests = [], sourceRequests = [], sourceTargets = [];
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: { ...vscode, window: { createOutputChannel: () => ({
@@ -57,6 +57,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
       ],
     };
   } };
+  if (staticProvider) provider.provideStaticCompletion = staticProvider;
   lang.ensureConsoleLspStarted = async () => provider;
   lang.getOrOpenCompletionDocument = async text => ({
     getText: () => text,
@@ -397,11 +398,13 @@ test("static fallback distinguishes missing services, failed requests and absent
   assert.ok(failed.logs.every(line => !/private source|INJECTED/.test(line)));
 });
 
-test("static fallback retains only validated diagnostic metadata across matching retries", async () => {
+test("static fallback retains only validated diagnostic metadata across later requests", async () => {
   let requests = 0;
   const h = harness({ lspItems: () => ++requests === 1
     ? { items: [], rConsoleStaticUnavailableReason: "analysis-pending" }
     : { items: [], rConsoleMemberResolved: true } });
+  await h.complete("make_data()$al");
+  assert.equal(requests, 1, 'pending analysis does not trigger an immediate prefix retry');
   await h.complete("make_data()$al");
   assert.equal(requests, 2);
   assert.ok(h.logs.some(line => line.includes("[Static Completion - Inferred]")),
@@ -811,7 +814,11 @@ test("structural inference failures skip prefix retries while pending analysis s
     'analysis-limit', 'inference-cycle', 'no-receiver-members', 'analysis-pending', undefined]) {
     const h = harness({ lspItems: { items: [], rConsoleStaticUnavailableReason: reason } });
     await h.complete('unknown_factory()$abc');
-    assert.equal(h.requests.length, reason === 'analysis-pending' || reason === undefined ? 2 : 1, reason);
+    assert.equal(h.requests.length, reason === undefined ? 2 : 1, reason);
+    if (reason === 'analysis-pending') {
+      await h.complete('unknown_factory()$abc');
+      assert.equal(h.requests.length, 2, 'a later request retries pending analysis');
+    }
   }
 });
 
@@ -831,21 +838,22 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
   }
 });
 
-test("stored source retrieval overlaps LSP startup and cancellation discards its result", { timeout: 3000 }, async () => {
+test("cancelled LSP startup does not authorize a provider binding lookup", { timeout: 3000 }, async () => {
   for (const text of ['make_data()$', 'make_data()$method(']) {
     let release, entered;
     const started = new Promise(resolve => { entered = resolve; });
     const waiting = new Promise(resolve => { release = resolve; });
-    const h = harness({ storedSources: () => { entered(); return 'function() list(method=function(alpha) NULL)'; } });
+    const h = harness({ storedSources: { make_data: 'function() list(method=function(alpha) NULL)' } });
     const provider = h.lang.ensureConsoleLspStarted;
-    h.lang.ensureConsoleLspStarted = async () => { await waiting; return provider(); };
+    h.lang.ensureConsoleLspStarted = async () => { entered(); await waiting; return provider(); };
     const pending = h.complete(text);
     await started;
-    assert.equal(h.requests.length, 0, 'source starts while the LSP is still unavailable');
+    assert.deepEqual(h.sourceRequests, [], 'bindings are selected by the provider after startup');
     h.lang.cancelCompletion();
     release();
     await pending;
-    assert.equal(h.requests.length, 0, 'cancelled source cannot reach the provider');
+    assert.deepEqual(h.sourceRequests, []);
+    assert.deepEqual(h.requests, []);
   }
 });
 
@@ -871,4 +879,109 @@ test("refused live receivers carry their root identity into source fallback", as
     await h.complete(text);
     assert.deepEqual(h.requests.at(-1).sourceDefinition, { name: 'iris', opaqueReceiver: true });
   }
+});
+
+test('static providers discover multiple dependencies without terminal receiver selection', async () => {
+  for (const text of ['factory(helper())$', '(left + factory())$']) {
+    const requests = [];
+    const h = harness({ storedSources: name => 'function() list(' + name + '=1)',
+      staticProvider: async request => {
+        requests.push(request);
+        assert.deepEqual(h.sourceRequests, [], 'terminal performs no speculative source lookup');
+        for (const name of ['helper', 'left', 'factory']) {
+          const found = await request.bindings.resolve({ name, lookup: 'function', scope: { kind: 'search-path' } });
+          assert.equal(found.status, 'source');
+        }
+        return { status: 'resolved', completion: { items: [{ label: 'alpha', kind: 4, data: { type: 'member' } }] } };
+      },
+    });
+    assert.deepEqual(labels(await h.complete(text)), ['alpha']);
+    assert.deepEqual(h.sourceRequests, ['helper', 'left', 'factory']);
+    assert.equal(requests[0].input, text);
+    assert.equal(requests[0].cursor, text.length);
+    assert.deepEqual(h.requests, [], 'general providers bypass the compatibility adapter');
+    assert.deepEqual(h.native, []);
+  }
+});
+
+test('unknown static contexts reach providers with full source and validated replacement edits', async () => {
+  for (const marked of ['factory()[, co│lumn]', 'factory()[1, "co│lumn"]', 'x <- 1\nfactory()[, co│lumn]']) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const input = snapshot(text, cursor);
+    let calls = 0;
+    const h = harness({ staticProvider: async request => {
+      calls++;
+      assert.equal(request.input, text);
+      assert.equal(request.cursor, cursor);
+      assert.deepEqual(request.contextPosition, new Position(input.cursorRow, input.cursorCol));
+      const range = { start: new Position(input.cursorRow, input.cursorCol - 2), end: new Position(input.cursorRow, input.cursorCol + 4) };
+      return { status: 'resolved', completion: { items: [
+        { label: 'column', insertText: 'column', kind: 4, range },
+        { label: 'no edit', kind: 4 },
+        { label: 'column_external', insertText: 'column_external()', kind: 2, detail: '[workspace]', range,
+          data: { package: '_workspace_', context_uri: 'file:///other.R' } },
+        { label: 'bad edit', insertText: 'bad', kind: 4, range: { ...range, start: new Position(input.cursorRow, -1) } },
+        { label: 'past end', insertText: 'bad', kind: 4, range: { ...range, end: new Position(input.cursorRow, 999) } },
+      ] } };
+    } });
+    const items = (await h.complete(text, cursor)).filter(x => 'insertText' in x);
+    assert.equal(calls, 1);
+    assert.deepEqual(items.map(x => x.insertText), ['column']);
+    assert.equal(items[0].replaceStart, input.cursorCol - 2);
+    assert.equal(items[0].replaceEnd, input.cursorCol + 4);
+    assert.deepEqual(h.native, []);
+    const disabled = harness({ staticAnalysis: false, staticProvider: () => { throw Error('static is disabled'); } });
+    assert.deepEqual(labels(await disabled.complete(text, cursor)), []);
+  }
+});
+
+test('unresolved and pending providers cannot leak unrelated candidates or reuse cancelled capabilities', async () => {
+  for (const status of ['unresolved', 'pending']) {
+    let retained, calls = 0;
+    const h = harness({ storedSources: { helper: 'function() 1' }, staticProvider: async request => {
+      retained = request.bindings;
+      calls++;
+      return { status, reason: status === 'pending' ? 'analysis-pending' : 'receiver-unresolved',
+        completion: { items: [{ label: 'co_unrelated', kind: 4, data: { type: 'member' } }] } };
+    } });
+    assert.deepEqual(labels(await h.complete('factory()[, co')), []);
+    assert.equal(calls, 1);
+    assert.equal((await retained.resolve({ name: 'helper', lookup: 'function', scope: { kind: 'search-path' } })).reason, 'cancelled');
+    assert.deepEqual(h.sourceRequests, []);
+    await h.complete('factory()[, co');
+    assert.equal(calls, 2, 'later requests can retry');
+  }
+});
+
+test('authoritative empty live receivers bypass the general static provider', async () => {
+  let calls = 0;
+  const h = harness({ inspected: { status: 'available', names: [] }, staticProvider: async () => {
+    calls++; return { status: 'resolved-empty', completion: { items: [] } };
+  } });
+  assert.deepEqual(labels(await h.complete('obj$')), []);
+  assert.equal(calls, 0);
+});
+
+test('value lookup of a non-callable binding remains opaque in the compatibility adapter', async () => {
+  const h = harness({ storedSources: { factory: { status: 'not-callable' } } });
+  await h.complete('(factory)()$');
+  assert.deepEqual(h.requests[0].sourceDefinition, { name: 'factory' });
+  assert.deepEqual(h.sourceTargets, ['source-value']);
+});
+
+test('authoritative empty static results stay complete and source refusal keeps its diagnostic', async () => {
+  for (const text of ['factory()$al', 'factory()[, co']) {
+    let calls = 0;
+    const h = harness({ staticProvider: async () => {
+      calls++; return { status: 'resolved-empty', completion: { items: [] } };
+    } });
+    assert.deepEqual(labels(await h.complete(text)), []);
+    assert.equal(calls, 1);
+    assert.equal(h.lang.inlineCache.entries.isIncomplete, undefined);
+    assert.ok(h.logs.some(line => line.includes('[Static Completion - Inferred]')));
+  }
+  const h = harness({ storedSources: { factory: { status: 'suppressed', reason: 'active-binding' } },
+    lspItems: { items: [], rConsoleStaticUnavailableReason: 'receiver-unresolved' } });
+  await h.complete('factory()$');
+  assert.ok(h.logs.some(line => line.includes('automatically linked')));
 });

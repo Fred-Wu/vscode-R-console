@@ -1322,6 +1322,8 @@ Implementation files:
 
 - [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
 - [`src/Language/completion/service.ts`](../src/Language/completion/service.ts) combines language-server, runtime and recent-input candidates. [`contextParser.ts`](../src/Language/completion/contextParser.ts) identifies the expression at the cursor.
+- [`src/Language/completion/bindings.ts`](../src/Language/completion/bindings.ts) supplies guarded binding snapshots.
+- [`src/Language/completion/staticProvider.ts`](../src/Language/completion/staticProvider.ts) adapts the provider contract to the installed language server.
 - [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
@@ -1366,17 +1368,52 @@ inferred binding. A declaration whose indexed range contains the cursor remains
 opaque while its binding is unresolved. Argument matching and literal-choice
 formatting operate on inert metadata only.
 
-Stored-source selection currently uses the bounded console receiver selector in
-`sourceReceiver.ts`. It requests one named binding with function or value lookup,
-then projects an eligible global-environment closure ahead of editable input.
-Static routing can reach the provider even when that selector cannot identify a
-binding. Transitive stored-source dependencies remain subject to the installed
-provider's capabilities. The current provider integration has no on-demand
-binding-resolution protocol. Such a protocol requires provider-owned dependency
-requests carrying lookup identity, explicit source/package/opaque/missing/
-unavailable outcomes, request-local snapshots, and shared lookup, byte, depth,
-time and cancellation budgets. The native runtime receiver grammar and guarded
-source retrieval retain their existing safety allowlists.
+The static provider contract receives the full editable input, its UTF-16 cursor
+offset, document identity/version, query position, request scope and a guarded
+binding resolver. The terminal decides live inspection eligibility and retains
+successful live results, including empty results. Inline completion, explicit
+completion and picker refinement route remaining static requests to the provider.
+Syntax-derived presentation hints preserve known prefix and quoting behavior;
+contexts without those hints use provider-supplied replacement edits. The edit
+validator requires a start on the cursor's line, an end inside the input and a
+range containing the cursor.
+
+Providers discover dependencies and can request several bindings iteratively.
+Each request names a binding, function/value/identity lookup semantics, its lookup
+scope and dependency depth. The resolver maps these to native source,
+source-value and binding operations. Results distinguish source, verified package
+identity, missing, non-callable, opaque, safety refusal and unavailable information.
+Source snapshots carry a request-local binding identity and the verified global
+lookup scope of their closure. The native serializer accepts closures enclosed
+by the global environment; captured local/namespace closures remain unavailable.
+Requests for other closure environments return `unsupported-scope`.
+
+Binding reads are cached by name and lookup semantics only within one completion
+request and its prefix retry. Defaults permit 16 distinct reads, 64 KiB per source,
+256 KiB in total and dependency depth 8. A shared 1.5-second lookup deadline starts
+with the first read. Cancellation, input changes, session changes and setting
+changes invalidate outstanding access and prevent late results from presentation.
+Provider completion has a 10-second deadline; capabilities expire when that
+provider invocation finishes. New input and picker refinements obtain fresh
+snapshots. No expression evaluation operation is exposed by the resolver.
+
+Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
+`unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
+pending analysis is retried on a later request. An authoritative empty result
+does not trigger prefix broadening. Result validation retains fixed diagnostic
+codes, source precedence and console-relative replacement ranges.
+
+The installed `languageserver` compatibility adapter identifies the source
+information its current projection can consume, requests it through the resolver,
+and projects one eligible stored closure ahead of editable input. Its receiver
+selector is in `sourceReceiver.ts`. It preserves function-versus-value lookup and
+opaque roots after native safety refusals. Unsupported adapter contexts, including
+computed multidimensional bracket completion, return `unsupported-context`.
+Transitive dependency discovery remains limited by the installed provider;
+providers implementing the general contract can request additional bindings
+without changes to terminal routing. Document-only providers use the same
+compatibility adapter. The native runtime inspection and source-serialization
+safety allowlists apply to every lookup.
 
 As a result, static completion support follows the installed `languageserver`.
 For example, some chained assignments, callable formal defaults and unfinished
@@ -1386,7 +1423,10 @@ the provider: native inference can retain an earlier signature inside an
 unfinished recursive redefinition when its navigation outline is incomplete.
 The adapter can reject conflicting metadata when both indexes supply evidence;
 it relies on native scope inference where the outline has no current declaration.
-`tests/static-delegation.test.cjs` exercises the actual native resolver and
+`tests/static-provider.test.cjs` verifies the general contract with the real
+language-server adapter, fresh stored definitions and opaque binding barriers.
+`tests/unit/static-bindings.test.cjs` covers resolver limits, lookup identity,
+scopes and cancellation. `tests/static-delegation.test.cjs` exercises the actual native resolver and
 verifies binding provenance, parse-queue replay, callable metadata compatibility,
 and the absence of execution side effects from draft bodies, defaults and indices.
 
@@ -1402,7 +1442,7 @@ existing language server infers source members for $ and @ access. Quoted [[
 keys can only be inferred if the installed languageserver version provides
 receiver-specific members (this is not yet available in released v0.3.22);
 unquoted [[ and single [ indices do not gain inferred member fields through
-this routing-only change. Unsupported source inference returns no unrelated
+the current compatibility adapter. Unsupported source inference returns no unrelated
 suggestions. Native root lookup follows the R search path through at most 128
 environments. Value lookup selects the first binding; bare function lookup skips
 ordinary non-callable values. Active bindings, unforced user promises and custom
@@ -1444,8 +1484,8 @@ Refused member and bracket receivers carry their root binding identity through
 static fallback. Package members are eligible only when editable source proves
 a replacement binding. Stored factory definitions also accompany method argument
 and value requests, with the same receiver identity and scope checks. Retrieval
-starts alongside language-server startup and document preparation; cancellation
-and setting changes discard obsolete snapshots before they reach the provider.
+starts when the provider identifies a dependency; cancellation and setting changes
+invalidate the capability and discard obsolete snapshots before presentation.
 
 Static completion logs retain the language server's inference reason when one
 is available. Missing receiver information, unresolved class-specific member

@@ -304,3 +304,41 @@ export function getStaticFallbackContext(
     staticFallback: true,
   };
 }
+
+/** Presentation hints never decide whether a static provider can analyze input. */
+export function getStaticCompletionContext(
+  inputBuffer: string, cursorPosition: number, fullTextBeforeCursor?: string,
+  textAfterCursor = inputBuffer.slice(cursorPosition),
+  runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor)
+): CompletionContext {
+  if (runtime && !runtime.rejectionReason && !runtime.suppressAutomatic) return runtime;
+  if (!(fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition)).trim()) return {
+    kind: "default", prefix: "", replaceStart: cursorPosition,
+    snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
+  };
+  const known = getStaticFallbackContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor, runtime);
+  if (known) return known;
+  // The search UI needs a lexical prefix even when receiver semantics are
+  // unknown. These hints never authorize runtime inspection or inferred edits.
+  const before = fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition);
+  const shift = before.length - cursorPosition;
+  const token = getCompletionSyntax(before + textAfterCursor, before.length).prefixTokens
+    .filter(token => token.type !== TokenType.EOF).at(-1);
+  let prefix = "", replaceStart = cursorPosition;
+  let bracketQuote: "\"" | "'" | undefined;
+  if (token && token.position >= shift && token.position + token.value.length === before.length) {
+    if (token.type === TokenType.String && !token.closed && /^["']/.test(token.value)) {
+      bracketQuote = token.value[0] as "\"" | "'";
+      prefix = decodeQuotedCompletionPrefix(bracketQuote, token.value.slice(1));
+      replaceStart = token.position + 1 - shift;
+    } else if (isAccessorNamePrefix(token)) {
+      prefix = token.value.startsWith("`")
+        ? decodeQuotedCompletionPrefix("`", token.value.slice(1, token.closed === true ? -1 : undefined)) : token.value;
+      replaceStart = token.position - shift;
+    }
+  }
+  return {
+    kind: "static", staticFallback: true, prefix, replaceStart, bracketQuote,
+    snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
+  };
+}

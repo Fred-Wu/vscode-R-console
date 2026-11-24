@@ -78,15 +78,13 @@ test("real embedded R completion inspects nested storage without running user co
     const before = text.slice(0, cursor).split("\n");
     const lines = text.split("\n");
     const row = before.length - 1, col = before.at(-1).length;
-    const context = completion.getStaticFallbackContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
-    const receiver = useStoredSource ? completion.storedCompletionReceiver(context, text, cursor) : undefined;
-    const result = receiver ? await inspect(receiver.name, [], receiver.target) : undefined;
-    const definition = !receiver || result?.status === "missing" || result?.status === "not-callable" || result?.status === "package" ? undefined
-      : { name: receiver.name, ...(receiver.target === "binding" ? { opaqueReceiver: true } : {}),
-        ...(result?.status === "source" ? { body: result.text } : {}) };
+    const context = completion.getStaticCompletionContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
+    const bindings = completion.createGuardedBindingResolver(useStoredSource
+      ? (name, target) => inspect(name, [], target)
+      : async () => ({ status: 'missing' }));
     return completion.collectStaticFallbackEntries(context, {
       getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
-    }, { line: row, character: col }, lines.slice(0, row), sourceClient, definition);
+    }, { line: row, character: col }, lines.slice(0, row), sourceClient, { bindings });
   };
   // The wire protocol must distinguish a non-existent live root from an
   // existing root whose storage is authoritatively empty.

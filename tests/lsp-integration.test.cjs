@@ -591,7 +591,8 @@ test("unfinished multiline definitions complete immediately without executing or
   const { terminal } = require("./helpers/inline-terminal.cjs").createTerminal(t);
   delete terminal.applyCompletion;
   terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
- });
+    getStaticAnalysisEnabled: () => true,
+  });
   const input = cases[0][0].replace("│", "");
   terminal.applyKeyAction({ type: "text", text: input });
   const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
