@@ -1366,8 +1366,8 @@ stored-source selector and the native runtime receiver grammar remain safety
 allowlists; they are not expanded to emulate unsupported static syntax.
 
 As a result, static completion support follows the installed `languageserver`.
-For example, some chained assignments and callable formal defaults that the
-former console walker recognized may remain unresolved upstream. They return no
+For example, some chained assignments, callable formal defaults and unfinished
+native-pipe destinations may remain unresolved upstream. They return no
 signature instead of invoking the function, guessing a binding or adding a
 console-specific syntax exception. Improvements to those cases belong upstream.
 `tests/static-delegation.test.cjs` exercises the actual native resolver and

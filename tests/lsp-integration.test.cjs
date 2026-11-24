@@ -1503,18 +1503,18 @@ test("literal argument names and values are never interpreted as snippet placeho
   }
 });
 
-test("source-only pipe functions survive filtering and native-pipe parse recovery", { timeout: 90000 }, async t => {
+test("pipe completion preserves native recovery without synthetic source edits", { timeout: 90000 }, async t => {
   const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   for (const [marked, required] of [
     ['my_frob <- function(x) x\n1 %>% my_fr│', true],
-    ['my_frob <- function(x) x\n1 |> my_fr│', true],
+    ['my_frob <- function(x) x\n1 |> my_fr│', false],
     ['{\n my_frob <- function(x) x\n 1 |> my_fr│', false],
     ['{\n my_frob <- function(x) x\n 1 |> my_fr│ }', false],
     ['{\n my_frob <- function(x) x\n 1 |> my_f│rob }', false],
     ['my_frob <- function(x) x\n1 |> my_fr│()', true],
-    ['my_frob <- function(x) x\n"😀" |> my_fr│', true],
-    ['my_frob <- function(x) x\n\t1 |> my_fr│', true],
-    ['my_frob <- function(x) x\n1 |> │', true],
+    ['my_frob <- function(x) x\n"😀" |> my_fr│', false],
+    ['my_frob <- function(x) x\n\t1 |> my_fr│', false],
+    ['my_frob <- function(x) x\n1 |> │', false],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
     const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
@@ -1526,7 +1526,7 @@ test("source-only pipe functions survive filtering and native-pipe parse recover
         return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
       } });
     if (required) assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
-    // Incomplete native-pipe blocks may remain unresolved upstream. Never
+    // Incomplete native-pipe destinations may remain unresolved upstream. Never
     // synthesize a call/closing braces to manufacture static source bindings.
     const params = instances.at(-1).requests.filter(request => request.params?.position).at(-1).params;
     assert.equal(params.rConsoleParseSuffix, undefined);
