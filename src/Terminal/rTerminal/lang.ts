@@ -370,7 +370,7 @@ export class RTermLang {
     const receiver = storedCompletionReceiver(context, input, cursor);
     const requester = this.options.requestRuntimeFunctionSource;
     if (!receiver?.name || !requester) return undefined;
-    const source = receiver.target === "source";
+    const source = receiver.target !== "binding";
     return (async () => {
       const binding: CompletionSourceBinding = { name: receiver.name, ...(!source ? { opaqueReceiver: true } : {}) };
       try {

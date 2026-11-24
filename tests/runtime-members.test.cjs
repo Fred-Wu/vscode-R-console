@@ -74,15 +74,16 @@ test("real embedded R completion inspects nested storage without running user co
   // Real idle R source inspection feeds the real, separate language server.
   // The frontend document deliberately contains only the later completion input.
   const { client: sourceClient } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
-  const completeStored = async (text, cursor = text.length) => {
+  const completeStored = async (text, cursor = text.length, useStoredSource = true) => {
     const before = text.slice(0, cursor).split("\n");
     const lines = text.split("\n");
     const row = before.length - 1, col = before.at(-1).length;
     const context = completion.getStaticFallbackContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
-    const name = completion.storedFunctionReceiver(context, text, cursor);
-    const result = name ? await inspect(name, [], "source") : undefined;
-    const definition = !name || result?.status === "missing" || result?.status === "not-callable" || result?.status === "package" ? undefined
-      : { name, ...(result?.status === "source" ? { body: result.text } : {}) };
+    const receiver = useStoredSource ? completion.storedCompletionReceiver(context, text, cursor) : undefined;
+    const result = receiver ? await inspect(receiver.name, [], receiver.target) : undefined;
+    const definition = !receiver || result?.status === "missing" || result?.status === "not-callable" || result?.status === "package" ? undefined
+      : { name: receiver.name, ...(receiver.target === "binding" ? { opaqueReceiver: true } : {}),
+        ...(result?.status === "source" ? { body: result.text } : {}) };
     return completion.collectStaticFallbackEntries(context, {
       getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
     }, { line: row, character: col }, lines.slice(0, row), sourceClient, definition);
@@ -106,6 +107,16 @@ test("real embedded R completion inspects nested storage without running user co
   assert.deepEqual(await inspect("make_data", [], "source"), first,
     "separate unrelated submissions do not lose stored closure source");
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["alpha"]);
+  assert.equal(backend.hasCapability(session, "function-source-value"), true);
+  assert.deepEqual(await inspect("make_data", [], "source-value"), first);
+  // Provider capability can vary by languageserver version. Every named call
+  // form must see the same source as an equivalent editable definition.
+  for (const text of ['"make_data"()$', "(make_data)()$", "((make_data))()$"]) {
+    const draft = "`make_data` <- " + first.text + "\n" + text;
+    const actual = await completeStored(text);
+    const expected = await completeStored(draft, draft.length, false);
+    assert.deepEqual(actual.map(item => item.label), expected.map(item => item.label), text);
+  }
   for (const marked of [
     "(make_data())$│", "((make_data()))$al│old",
     "( # group\n  make_data()\n)$al│old",
@@ -127,6 +138,31 @@ test("real embedded R completion inspects nested storage without running user co
   assert.match(replaced.text, /beta/);
   assert.doesNotMatch(replaced.text, /alpha/);
   assert.deepEqual((await completeStored("make_data()$")).map(item => item.label), ["beta"]);
+  assert.deepEqual(await inspect("make_data", [], "source-value"), replaced);
+  // Value lookup must not skip a nearer non-callable binding. A bare call
+  // still uses the normal function search and may find an attached closure.
+  await submit('attach(list(lookup_factory=function() list(inherited=1)), name="source_value_test"); lookup_factory <- 1L');
+  assert.equal((await inspect("lookup_factory", [], "source")).status, "source");
+  assert.deepEqual(await inspect("lookup_factory", [], "source-value"), { status: "opaque" });
+  assert.deepEqual(Array.from(await completeStored("(lookup_factory)()$")), []);
+  await submit('rm(lookup_factory); detach("source_value_test")');
+  await submit('data.frame <- 1L');
+  assert.deepEqual((await completeStored('data.frame(fake=1)$')).map(item => item.label), ['fake']);
+  assert.deepEqual(await inspect('data.frame', [], 'source-value'), { status: 'opaque' });
+  assert.deepEqual(Array.from(await completeStored('(data.frame)(fake=1)$')), []);
+  await submit('rm(data.frame)');
+  await submit('assign("(", function(x) { source_counter <<- source_counter+1L; x }, .GlobalEnv)');
+  assert.deepEqual(await inspect('make_data', [], 'source-value'), { status: 'suppressed', reason: 'unsafe-dispatch' });
+  await submit('rm(list="("); stopifnot(source_counter == 0L)');
+  for (const setup of [
+    'makeActiveBinding("lookup_factory", function() { source_counter <<- source_counter+1L; function() list(wrong=1) }, .GlobalEnv)',
+    'delayedAssign("lookup_factory", { source_counter <<- source_counter+1L; function() list(wrong=1) })',
+  ]) {
+    await submit(setup);
+    assert.equal((await inspect("lookup_factory", [], "source-value")).status, "suppressed");
+    assert.deepEqual(Array.from(await completeStored("(lookup_factory)()$")), []);
+    await submit("stopifnot(source_counter == 0L); rm(lookup_factory)");
+  }
   for (const expression of [
     "list(piped = 1) |> identity()",
     "list(piped = 1) |> identity() |> identity()",

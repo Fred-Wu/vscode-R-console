@@ -63,6 +63,7 @@ export type BackendCapability =
   | "member-inspection-utf8-escapes"
   | "member-inspection-search-path"
   | "function-source"
+  | "function-source-value"
   | "function-arguments";
 
 export type BackendDialogRequest =
@@ -97,7 +98,7 @@ export type MemberInspectionStep =
   | { kind: "field" | "slot" | "named-index" | "slice-name" | "variable-index" | "variable-slice"; name: string }
   | { kind: "index" | "slice-index"; index: number };
 
-export type MemberInspectionTarget = "$" | "@" | "[" | "[[" | "source" | "arguments" | "binding";
+export type MemberInspectionTarget = "$" | "@" | "[" | "[[" | "source" | "arguments" | "binding" | "source-value";
 
 export type MemberInspectionResult =
   | { status: "available"; names: string[]; kinds?: number[]; bracketKind?: "data.frame" | "data.table" }
@@ -220,6 +221,7 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "member-inspection-utf8-escapes" ||
     value === "member-inspection-search-path" ||
     value === "function-source" ||
+    value === "function-source-value" ||
     value === "function-arguments"
   );
 }
@@ -660,9 +662,12 @@ export function encodeShutdownFrame(): Buffer {
 }
 
 export function encodeMemberNamesRequestFrame(requestId: number, query: MemberInspectionQuery): Buffer {
-  if (query.steps.length > 12 || (["source", "binding"].includes(query.target) && (query.steps.length !== 0 || query.utf8ByteEscapes)) || query.root.length === 0 ||
+  if (query.steps.length > 12 || (["source", "source-value", "binding"].includes(query.target) && (query.steps.length !== 0 || query.utf8ByteEscapes)) || query.root.length === 0 ||
       Buffer.byteLength(query.root, "utf8") > 4096) {
     throw new Error("invalid member inspection request");
+  }
+  if (query.target === "source-value" && !query.searchPath) {
+    throw new Error("value source inspection requires search-path lookup");
   }
   const encodeString = (value: string): Buffer => {
     const bytes = Buffer.from(value, "utf8");
@@ -672,7 +677,7 @@ export function encodeMemberNamesRequestFrame(requestId: number, query: MemberIn
     bytes.copy(result, 4);
     return result;
   };
-  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3, source: 4, arguments: 5, binding: 6 };
+  const targetCodes: Record<MemberInspectionTarget, number> = { "$": 0, "@": 1, "[": 2, "[[": 3, source: 4, arguments: 5, binding: 6, "source-value": 7 };
   const stepCodes = {
     field: 0, slot: 1, index: 2, "named-index": 3,
     "slice-index": 4, "slice-name": 5, "variable-index": 6, "variable-slice": 7,

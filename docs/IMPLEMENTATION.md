@@ -1374,7 +1374,11 @@ Absence reported by an older backend remains
 unknown to the source adapter. Source-only results carry static inference diagnostics.
 The existing virtual document continues to describe the editable input, and
 source-only fallback can also retrieve the *current stored closure definition*
-for a direct named function call in that expression. A dedicated guarded,
+for a named callable at the root of that expression. Bare identifiers and
+quoted call names use R function lookup; a grouped symbol in call position
+uses value lookup (and cannot skip a non-callable shadowing binding). The
+`function-source-value` capability negotiates the latter without changing
+existing function-source requests. A dedicated guarded,
 idle-only native request extracts the closure's syntax without evaluating its
 body, defaults, active bindings or promises. The source is projected ahead of
 the current input for that one LSP request, with console edit positions mapped
@@ -1382,7 +1386,8 @@ back to the original buffer. Each request reads the current stored definition,
 so intervening submissions preserve it and redefinitions take effect on the
 next request. Source requests retain their structured native outcome.
 Verified inherited package bindings permit installed package inference.
-Missing bindings and confirmed non-callable values permit editable source inference.
+Missing bindings and exhausted bare function lookup permit editable source
+inference; a non-callable value lookup remains opaque.
 Unavailable or refused callables remain opaque to source inference. The adapter
 checks the native lexical scope at the callable's position before accepting a
 draft override; otherwise it returns an unresolved result. Explicit namespace

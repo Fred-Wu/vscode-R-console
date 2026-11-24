@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext, getStaticFallbackContext, parseRuntimeMemberQuery } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, getStaticFallbackContext, parseRuntimeMemberQuery, type RuntimeFunctionSourceTarget } from "../Language/completion";
 import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
 import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
@@ -377,7 +377,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   // Retrieve stored closure syntax or check a receiver's root binding identity.
   // The backend uses the same idle/submission gate and native C error guard as
   // member inspection. Unsupported or unsafe bindings have no source result.
-  private requestStoredFunctionSource(name: string, target: "source" | "binding" = "source"): Promise<MemberInspectionResult | undefined> | undefined {
+  private requestStoredFunctionSource(name: string, target: RuntimeFunctionSourceTarget = "source"): Promise<MemberInspectionResult | undefined> | undefined {
     if (this.mode !== "ready" || !this.promptReady || this.submissionQueue.length > 0 ||
         this.activeSubmission !== null || this.submissionPending || this.awaitingExecutionStart) {
       return undefined;

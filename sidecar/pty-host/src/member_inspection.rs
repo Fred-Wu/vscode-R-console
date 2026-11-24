@@ -41,6 +41,8 @@ pub(crate) enum Target {
     DoubleBracket,
     // Inspect a stored closure's syntax without invoking it.
     FunctionSource,
+    // A grouped symbol in call position uses ordinary value lookup.
+    FunctionSourceValue,
     // Read only the tags of a stored closure's formals, never defaults/body.
     FunctionArguments,
     // Check a computed receiver's root identity without traversing its value.
@@ -61,7 +63,7 @@ pub(crate) enum Step {
 
 impl Target {
     fn accessor(self) -> &'static str {
-        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSource | Self::FunctionArguments | Self::Binding => "" }
+        match self { Self::Dollar => "$", Self::Slot => "@", Self::Bracket => "[", Self::DoubleBracket => "[[", Self::FunctionSourceValue => "(", Self::FunctionSource | Self::FunctionArguments | Self::Binding => "" }
     }
 }
 
@@ -97,6 +99,7 @@ impl MemberQuery {
             4 if depth == 0 => Target::FunctionSource,
             5 => Target::FunctionArguments,
             6 if depth == 0 && bytes[0] & 0x40 != 0 => Target::Binding,
+            7 if depth == 0 && bytes[0] & 0xc0 == 0x40 => Target::FunctionSourceValue,
             _ => return None,
         };
         if depth > MAX_DEPTH { return None; }
@@ -1514,7 +1517,7 @@ pub(crate) fn inspect(api: InspectorApi, query: MemberQuery, deadline: Instant) 
         }
         begin_inspection_guard(api);
         let result = Native::new(api, deadline).map(|native| {
-            if query.target == Target::FunctionSource {
+            if matches!(query.target, Target::FunctionSource | Target::FunctionSourceValue) {
                 native.inspect_function_source(&query)
             } else {
                 native.inspect(&query)
@@ -1611,7 +1614,15 @@ mod tests {
         assert_eq!(MemberQuery::decode(&root), None, "binding queries require search-path semantics");
         root[0] = 0x46;
         assert_eq!(MemberQuery::decode(&root).unwrap().target, Target::Binding);
+        root[0] = 7;
+        assert_eq!(MemberQuery::decode(&root), None, "value source requires search-path lookup");
+        root[0] = 0xc7;
+        assert_eq!(MemberQuery::decode(&root), None, "source names cannot use byte-escape flags");
+        root[0] = 0x47;
+        assert_eq!(MemberQuery::decode(&root).unwrap().target, Target::FunctionSourceValue);
         root[1] = 1;
+        assert_eq!(MemberQuery::decode(&root), None, "value source never traverses selectors");
+        root[0] = 0x46;
         assert_eq!(MemberQuery::decode(&root), None, "binding queries never traverse selectors");
     }
 }

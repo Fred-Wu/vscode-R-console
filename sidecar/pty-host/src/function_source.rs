@@ -45,16 +45,28 @@ impl Native {
     pub(super) unsafe fn inspect_function_source(&self, query: &MemberQuery) -> Result<Inspection, Suppression> {
         self.check_deadline()?;
         if !query.steps.is_empty() { return Err(Suppression::InspectionLimit); }
+        let value_lookup = query.target == Target::FunctionSourceValue;
+        // Grouping must still denote the ordinary primitive, not a masked call.
+        if value_lookup { self.validate_accessors(query)?; }
         let root = match self.root_binding(query)? {
             RootBinding::Missing => return Ok(Inspection::Available(Members::missing())),
             RootBinding::NotCallable => return Ok(Inspection::NotCallable),
-            RootBinding::Package(_) => return Ok(Inspection::PackageBinding),
+            RootBinding::Package(raw) => {
+                if value_lookup && !self.cached_value(raw).is_some_and(|value|
+                    matches!((self.type_of)(value), CLOSURE | SPECIAL | BUILTIN)) {
+                    return Ok(Inspection::Opaque);
+                }
+                return Ok(Inspection::PackageBinding);
+            }
             RootBinding::Stored(value) => value,
         };
         let kind = (self.type_of)(root);
-        // R's function lookup skips ordinary non-callable bindings. Callable
-        // aliases and uninspectable values still require an opaque binding.
-        if !matches!(kind, CLOSURE | SPECIAL | BUILTIN) { return Ok(Inspection::NotCallable); }
+        // Bare function lookup skips non-callable bindings. Value lookup
+        // stops at the first binding, which must never expose a namesake from
+        // a lower search-path environment or the installed package catalog.
+        if !matches!(kind, CLOSURE | SPECIAL | BUILTIN) {
+            return Ok(if value_lookup { Inspection::Opaque } else { Inspection::NotCallable });
+        }
         if kind != CLOSURE { return Err(Suppression::InspectionLimit); }
         // Projection defines the closure in global scope. Only closures whose
         // enclosing environment is that same scope can retain their bindings.

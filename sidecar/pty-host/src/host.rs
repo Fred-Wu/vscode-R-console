@@ -263,6 +263,7 @@ mod unix_host {
         }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
             capabilities.push("function-source");
+            capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();
@@ -2280,6 +2281,7 @@ mod windows_host {
         }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_source()) {
             capabilities.push("function-source");
+            capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
         let session_transport = session_transport_config().is_some();

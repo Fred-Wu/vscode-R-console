@@ -24,7 +24,7 @@ const snapshot = (text, cursor = text.length) => {
 const labels = entries => entries.filter(entry => "insertText" in entry).map(entry => entry.insertText);
 
 function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources } = {}) {
-  const logs = [], native = [], requests = [], sourceRequests = [];
+  const logs = [], native = [], requests = [], sourceRequests = [], sourceTargets = [];
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: { ...vscode, window: { createOutputChannel: () => ({
       appendLine: line => logs.push(line), dispose() {},
@@ -35,9 +35,10 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
     getStaticAnalysisEnabled: () => typeof staticAnalysis === "function" ? staticAnalysis() : staticAnalysis,
-    requestRuntimeFunctionSource: storedSources === undefined ? undefined : async name => {
+    requestRuntimeFunctionSource: storedSources === undefined ? undefined : async (name, target) => {
       sourceRequests.push(name);
-      const result = await (typeof storedSources === "function" ? storedSources(name) : storedSources[name]);
+      sourceTargets.push(target);
+      const result = await (typeof storedSources === "function" ? storedSources(name, target) : storedSources[name]);
       return typeof result === "string" ? { status: "source", text: result } : result;
     },
     requestRuntimeMemberCompletions: (receiver, operator) => {
@@ -71,7 +72,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
     await new Promise(resolve => setImmediate(resolve));
     return entries ?? [];
   };
-  return { lang, complete, logs, native, requests, sourceRequests };
+  return { lang, complete, logs, native, requests, sourceRequests, sourceTargets };
 }
 
 test("unavailable stored method arguments log the reason and remain retryable", async () => {
@@ -467,7 +468,10 @@ test("source receiver selection targets the root named call, not downstream call
     ["(obj$make_data())$", undefined],
     ["((pkg::make_data()))$", undefined],
     ["(make_data())()$", "make_data"],
-    ["(make_data)()$", undefined],
+    ["(make_data)()$", "make_data"],
+    ["((make_data))()$", "make_data"],
+    ['"make_data"()$', "make_data"],
+    ['("make_data")()$', undefined],
     ["(obj[[make_data()]])$", undefined],
     ["(other + make_data())$", undefined],
     ["((make_data() + other))$", undefined],
@@ -528,7 +532,19 @@ test("one receiver classification preserves source eligibility and root identity
     ['make_data()[[side_effect()]]()$', 'make_data', 'source'],
     ['make_data()$"method"()$child$', 'make_data', 'source'],
     ['(make_data)$method()$', 'make_data', 'binding'],
-    ['(make_data)()$', 'make_data', 'binding'],
+    ['(make_data)()$', 'make_data', 'source-value'],
+    ['((make_data))()$', 'make_data', 'source-value'],
+    ['((make_data)())()$', 'make_data', 'source-value'],
+    ['((make_data))()$method()$', 'make_data', 'source-value'],
+    ['((make_data)$method)()$', 'make_data', 'binding'],
+    ['(make_data[[1]])()$', 'make_data', 'binding'],
+    ['(other + make_data)()$', undefined, undefined],
+    ['"make_data"()$', 'make_data', 'source'],
+    ['("make_data")()$', undefined, undefined],
+    ['(NULL)()$', undefined, undefined],
+    ['(...)()$', undefined, undefined],
+    ['(..1)()$', undefined, undefined],
+    ['('.repeat(5000) + 'make_data' + ')'.repeat(5000) + '()$', 'make_data', 'source-value'],
     ['obj[[side_effect()]]$method(', 'obj', 'binding'],
     ['obj$"method"()$', 'obj', 'binding'],
     ['`odd root`[f()]$', 'odd root', 'binding'],
@@ -570,6 +586,41 @@ test("downstream receiver operations preserve guarded root source for the provid
     assert.deepEqual(labels(await disabled.complete(text)), [], text);
     assert.deepEqual(disabled.sourceRequests, [], text);
     assert.deepEqual(disabled.native, [], text);
+  }
+});
+
+test("named call heads preserve lookup semantics without evaluating receiver operations", async () => {
+  const body = "function() list(alpha = 1)";
+  for (const [text, target] of [
+    ['make_data()$', 'source'],
+    ['"make_data"()$', 'source'],
+    ['(make_data)()$', 'source-value'],
+    ['((make_data))()$al', 'source-value'],
+    ['((make_data))()$child()$', 'source-value'],
+    ['(make_data)()$method(', 'source-value'],
+    ['(make_data)[[1]]()$', 'binding'],
+    ['(make_data$method)()$', 'binding'],
+  ]) {
+    const h = harness({ storedSources: (_name, mode) => mode === 'binding' ? { status: 'opaque' } : body,
+      lspItems: (_mode, definition) => ({
+        items: definition?.body === body ? [{ label: "alpha", kind: 4, data: { type: "member" } }] : [],
+      }),
+    });
+    await h.complete(text);
+    assert.deepEqual(h.sourceRequests, ["make_data"], text);
+    assert.deepEqual(h.sourceTargets, [target], text);
+    assert.deepEqual(h.requests.at(-1).sourceDefinition, target === 'binding'
+      ? { name: "make_data", opaqueReceiver: true } : { name: "make_data", body }, text);
+    assert.deepEqual(h.native, [], text);
+    const disabled = harness({ staticAnalysis: false, storedSources: { make_data: body } });
+    await disabled.complete(text);
+    assert.deepEqual(disabled.sourceRequests, [], text);
+  }
+  for (const result of [{ status: 'opaque' }, { status: 'unavailable' },
+    { status: 'suppressed', reason: 'active-binding' }]) {
+    const h = harness({ storedSources: { make_data: result }, lspItems: { items: [] } });
+    await h.complete('(make_data)()$');
+    assert.deepEqual(h.requests.at(-1).sourceDefinition, { name: 'make_data' }, result.status);
   }
 });
 
@@ -796,6 +847,7 @@ test("factory argument source selection preserves complete receiver identity", (
   for (const [text, expected] of [
     ['make_data()$method(', 'make_data'],
     ['((make_data()))$inner[[1]]$method(', 'make_data'],
+    ['((make_data))()$method(', 'make_data'],
     ['make_data()$method(alpha = "a', 'make_data'],
     ['pkg::make_data()$method(', undefined],
     ['obj$make_data()$method(', undefined],

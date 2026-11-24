@@ -359,7 +359,7 @@ export class ConsoleLspClient implements CompletionProvider {
               rConsoleOpaqueFunctionPosition: projection.toServerPosition(contextPosition) });
           }
           if (receiver?.name === sourceBinding.name &&
-              (sourceBinding.opaqueReceiver || receiver.target === "source")) {
+              (sourceBinding.opaqueReceiver || receiver.target !== "binding")) {
             Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
               rConsoleOpaqueFunctionPosition: projection.document.positionAt(receiver.start) });
           }

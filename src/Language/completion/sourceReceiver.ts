@@ -1,11 +1,11 @@
 import { TokenType, continuesExpressionLine, isAccessorNamePrefix, isNameAccessor } from "../lexer";
 import { getCompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
-import type { CompletionContext } from "./types";
+import type { CompletionContext, RuntimeFunctionSourceTarget } from "./types";
 
-// Locate the direct named call at the root of the receiver. This is syntax
-// only: never evaluate a selector, subscript, method or computed call head.
-// Only the root callable's stored syntax is eligible for retrieval.
+// Locate the named callable at the root of the receiver. A bare function
+// name uses function lookup; a grouped symbol used as a call head uses value
+// lookup. Neither path evaluates selectors, subscripts or computed heads.
 export function storedFunctionReceiver(
   context: CompletionContext, input: string, cursor: number
 ): string | undefined {
@@ -16,7 +16,7 @@ export function storedFunctionCall(
   context: CompletionContext, input: string, cursor: number
 ): { name: string; start: number } | undefined {
   const receiver = storedCompletionReceiver(context, input, cursor);
-  return receiver?.target === "source" ? { name: receiver.name, start: receiver.start } : undefined;
+  return receiver && receiver.target !== "binding" ? { name: receiver.name, start: receiver.start } : undefined;
 }
 
 // Locate the value root of a computed receiver for binding identity checks.
@@ -33,7 +33,7 @@ export function storedReceiverRoot(
 // Leave inference of those operations to the language server.
 export function storedCompletionReceiver(
   context: CompletionContext, input: string, cursor: number
-): { name: string; start: number; target: "source" | "binding" } | undefined {
+): { name: string; start: number; target: RuntimeFunctionSourceTarget } | undefined {
   const methodArguments = context.kind === "argument" &&
     (context.functionOperator === "$" || context.functionOperator === "@");
   if (!methodArguments && (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket"))) {
@@ -89,16 +89,23 @@ export function storedCompletionReceiver(
   // Strip suffixes and grouping on the receiver. Each group
   // must contain that entire receiver, not a compound expression ending in
   // a call, such as (other + fn()). Keep this walk iterative as well.
-  // Retrieve source only for a direct named call at the root. For a value
-  // root, check binding identity without inspecting any computed operation.
+  // A call on a grouped symbol uses value lookup. Track whether the walk
+  // reaches that symbol through grouping alone; traversing a selector or
+  // subscript instead leaves only a binding-identity check.
   const groups: number[] = [];
-  const result = (index: number, target: "source" | "binding") => {
+  let valueCall = false;
+  const result = (index: number, target: RuntimeFunctionSourceTarget) => {
     let start = index;
     for (let group = groups.length - 1; group >= 0; group--) {
       if (start !== groups[group] + 1) return undefined;
       start = groups[group];
     }
+    // These are not ordinary symbol lookups. Quoted call names remain valid,
+    // but NULL literals and variadic references must not borrow stored source.
+    if (target !== "binding" && tokens[index].value === "NULL") return undefined;
     const decoded = decodeRArgumentName(tokens[index].value);
+    if (target === "source-value" && decoded &&
+        (decoded === "..." || /^\.\.[0-9]+$/.test(decoded))) return undefined;
     return decoded === undefined ? undefined : { name: decoded, start: tokens[index].position, target };
   };
   for (let index = receiverEnd; index >= 0;) {
@@ -106,10 +113,12 @@ export function storedCompletionReceiver(
     if (token.type === TokenType.RightBracket) {
       const opening = openings.get(index);
       if (opening === undefined) return undefined;
+      valueCall = false;
       index = opening - 1;
     } else if ((token.type === TokenType.Identifier || (token.type === TokenType.String && token.closed)) &&
         tokens[index - 1]?.type === TokenType.Operator &&
         ["$", "@"].includes(tokens[index - 1].value)) {
+      valueCall = false;
       index -= 2;
     } else if (token.type === TokenType.RightParen) {
       const opening = openings.get(index);
@@ -118,11 +127,13 @@ export function storedCompletionReceiver(
       const preceding = tokens[opening - 2];
       if (name?.type === TokenType.Identifier || (name?.type === TokenType.String && name.closed)) {
         if (preceding?.type === TokenType.Operator && ["$", "@"].includes(preceding.value)) {
+          valueCall = false;
           index = opening - 1;
           continue;
         }
         if (isNameAccessor(preceding)) return undefined;
-        return result(opening - 1, name.type === TokenType.Identifier ? "source" : "binding");
+        // R accepts an identifier or a string constant as a named call head.
+        return result(opening - 1, "source");
       }
       // Parentheses after a value are a computed call. A control condition or
       // function's formals, however, can be followed by a grouped body.
@@ -133,6 +144,7 @@ export function storedCompletionReceiver(
          (control.type === TokenType.Operator && control.value === "\\"));
       if (!afterControl && name &&
           [TokenType.RightParen, TokenType.RightBracket].includes(name.type)) {
+        valueCall = name.type === TokenType.RightParen;
         index = opening - 1;
         continue;
       }
@@ -144,7 +156,7 @@ export function storedCompletionReceiver(
       groups.push(opening);
       index--;
     } else if (token.type === TokenType.Identifier && !isNameAccessor(tokens[index - 1])) {
-      return result(index, "binding");
+      return result(index, valueCall ? "source-value" : "binding");
     } else return undefined;
   }
   return undefined;

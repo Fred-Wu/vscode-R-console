@@ -147,6 +147,31 @@ test("search-path outcomes are negotiated and older absence results remain unkno
   }
 });
 
+test("value-source requests negotiate distinct guarded lookup semantics", async () => {
+  const { RustSidecarRuntimeBackend } = loadSource('src/Runtime/runtimeBackend.ts');
+  const backend = new RustSidecarRuntimeBackend('unused');
+  const session = { sessionId: 'source-value' };
+  const state = { hostConnected: true, capabilities: new Set(['member-inspection', 'function-source', 'member-inspection-search-path']),
+    pendingMemberRequests: new Map(), nextRequestId: 0 };
+  backend.sessionStates.set(session, state);
+  const frames = [];
+  backend.writeFrame = (_, frame) => { frames.push(frame); return true; };
+  const query = { root: 'factory', steps: [], target: 'source-value' };
+  assert.equal(backend.inspectMemberNames(session, query), undefined);
+  assert.equal(frames.length, 0, 'old backends must not receive a different lookup mode');
+  assert.throws(() => encodeMemberNamesRequestFrame(1, query), /search-path/);
+  assert.throws(() => encodeMemberNamesRequestFrame(1, { ...query, searchPath: true,
+    steps: [{ kind: 'field', name: 'child' }] }), /invalid member inspection request/);
+  assert.throws(() => encodeMemberNamesRequestFrame(1, { ...query, searchPath: true,
+    utf8ByteEscapes: true }), /invalid member inspection request/);
+  state.capabilities.add('function-source-value');
+  const pending = backend.inspectMemberNames(session, query);
+  assert.equal(frames.at(-1)[12], 0x47);
+  backend.handleSessionControlEvent(state, { type: 'member-names-result', requestId: 1,
+    result: { status: 'opaque' } });
+  assert.deepEqual(await pending, { status: 'opaque' });
+});
+
 test("native results distinguish silent empty from unavailable and unsafe access", () => {
   function frame(payload) {
     const header = Buffer.alloc(12);
