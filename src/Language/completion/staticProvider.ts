@@ -47,7 +47,7 @@ export async function provideNativeStaticCompletion(
   const nativeResult = await completeNative(sourceBinding);
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
   if (!nativeResult) return { status: "pending", reason: "no-response" };
-  const result = adaptNativeCompletionResult(nativeResult);
+  const result = adaptNativeCompletionResult(nativeResult, context);
   if (bindingSuppression) result.rConsoleBindingSuppressionReason = bindingSuppression;
   let items = Array.isArray(result) ? result : result.items;
   // Parameter inference can fail inside a valid argument expression. Retain

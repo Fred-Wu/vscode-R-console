@@ -31,7 +31,7 @@ import type { MemberInspectionResult } from "../Runtime/backendProtocol";
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
 import { createCompletionParams } from "./completion/protocol";
-import { backtickRName } from "./completion/candidates";
+import { backtickRName } from "./completion/rText";
 import { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
 import type { WorkspaceData } from "../Runtime/VSCR/types";

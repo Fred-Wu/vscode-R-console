@@ -4,8 +4,8 @@ import {
   getCompletionContext, getStaticCompletionContext, rankCompletionEntries, isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
-import { rebaseCompletionEnds } from "../../Language/completion/refinement";
-import { backtickRName, quoteCompletionValue } from "../../Language/completion/candidates";
+import { composeCompletionPreviewEdits } from "../../Language/completion/refinement";
+import { backtickRName, quoteCompletionValue } from "../../Language/completion/rText";
 import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
@@ -171,7 +171,9 @@ export async function pickCompletion({
       ].join("\n");
       const nextInputText = lines.join("\n");
       const nextContext = context.kind === "package"
-        ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
+        ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined,
+            replaceEnd: context.replaceEnd === undefined ? undefined : context.replaceEnd + cursorCol - latestInput.cursorCol,
+            snapshotInput: currentLine, snapshotCursor: cursorCol }
         : context.staticFallback
           ? getStaticCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
               nextInputText.slice(fullTextBeforeCursor.length))
@@ -186,7 +188,11 @@ export async function pickCompletion({
       const publish = (nextEntries: CompletionEntries): boolean => {
         if (!active || !isCurrent() || currentRequest !== request) return false;
         // LSP edits target the preview, but acceptance edits the actual input.
-        sourceEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
+        sourceEntries = composeCompletionPreviewEdits(nextEntries, {
+          prefixStart: context.replaceStart, originalCursor: latestInput.cursorCol,
+          originalLength: latestInput.text.length - latestInput.textBeforeCursor.length + latestInput.cursorCol,
+          previewContext: nextContext,
+        });
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
         return true;

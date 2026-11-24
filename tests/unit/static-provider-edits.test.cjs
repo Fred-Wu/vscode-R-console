@@ -1,0 +1,190 @@
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+const loadSource = require('../helpers/load-source.cjs');
+
+class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
+const vscode = {
+  Position, EventEmitter: class {},
+  CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Value: 11, Snippet: 14 },
+  QuickPickItemKind: { Separator: -1 },
+};
+const { InputState } = loadSource('src/Terminal/inputState.ts');
+const { RTerminal } = loadSource('src/Terminal/rTerminal.ts', { vscode, './rTerminal/lang': {} });
+const { provideNativeStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const pending = () => ({ status: 'pending', reason: 'analysis-pending' });
+const resolved = items => ({ status: 'resolved', completion: { items } });
+
+// Exercise provider validation, preview composition and actual terminal insertion.
+async function openStaticPicker(t, marked, provide, options = {}) {
+  const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+  const before = text.slice(0, cursor), lines = text.split('\n');
+  const cursorRow = before.split('\n').length - 1;
+  const input = { text, lines, textBeforeCursor: before, cursorRow,
+    cursorCol: before.split('\n').at(-1).length, currentLine: lines[cursorRow] };
+  const picks = [], requests = [], showing = [];
+  const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+    vscode: { ...vscode, window: {
+      createOutputChannel: () => ({ appendLine() {}, dispose() {} }),
+      createQuickPick: () => {
+        let hidden = false;
+        const pick = { value: '', items: [], activeItems: [], selectedItems: [],
+          onDidChangeValue(fn) { this.change = fn; }, onDidAccept(fn) { this.accept = fn; },
+          onDidHide(fn) { this.onHide = fn; }, show() {}, dispose() {},
+          hide() { if (!hidden) { hidden = true; this.onHide(); } },
+        };
+        picks.push(pick);
+        return pick;
+      },
+    } },
+    '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
+    '../../Language/virtualRDocument': { VirtualRDocument: class {} },
+  });
+  const lang = new RTermLang({ extensionPath: '', rPath: 'R', env: {},
+    getStaticAnalysisEnabled: () => true, requestRuntimeFunctionSource: options.requestSource });
+  lang.getOrOpenCompletionDocument = async value => ({ version: 1, getText: () => value,
+    uri: { toString: () => 'r-console://provider-edits/console.R' } });
+  lang.ensureConsoleLspStarted = async () => ({ provideStaticCompletion: request => {
+    requests.push(request);
+    return provide(request);
+  } });
+  const terminal = Object.assign(Object.create(RTerminal.prototype), {
+    inputState: new InputState(), lang, renderInput() {}, scheduleInlineCompletion() {},
+  });
+  terminal.inputState.text = text;
+  terminal.inputState.cursorPosition = cursor;
+  const start = () => {
+    const result = lang.handleAutocomplete({ input, force: true, getCurrentInput: () => input,
+      getWorkspaceData: () => options.workspace, applyCompletion: selection => terminal.applyCompletion(selection) });
+    showing.push(result);
+    return result;
+  };
+  t.after(async () => { lang.cancelCompletion(); for (const pick of picks) pick.hide(); await Promise.all(showing); });
+  start();
+  await tick();
+  return { input, terminal, lang, requests, start,
+    get pick() { return picks.at(-1); },
+    async type(value) { this.pick.value = value; this.pick.change(value); await tick(); },
+    async accept() {
+      assert.ok(this.pick.activeItems.length, 'a candidate is available for acceptance');
+      this.pick.selectedItems = [this.pick.activeItems[0]];
+      this.pick.accept();
+      await Promise.all(showing);
+    },
+    async hide() { this.pick.hide(); await Promise.all(showing); },
+  };
+}
+
+test('Quick Pick composes provider edits across prefix growth, shrinking, quoting and multiline suffixes', async t => {
+  for (const fixture of [
+    { marked: 'factory()[, c│]', query: 'col', insertion: 'umn', expected: 'factory()[, column]' },
+    { marked: 'factory()[, colu│]', query: 'co', insertion: 'lumn', expected: 'factory()[, column]' },
+    { marked: 'factory()[, c│]', query: 'col', back: 1, insertion: 'lumn', expected: 'factory()[, column]' },
+    { marked: 'factory()[, c│olumn]', query: 'col', back: 1, forward: 5,
+      insertion: 'lumn', expected: 'factory()[, column]' },
+    { marked: 'factory()[, c│]', query: 'col', start: 0, insertion: 'other[, column', expected: 'other[, column]' },
+    { marked: 'factory()[1, "a│"]', query: 'a"b', label: 'a"btail', insertion: 'tail',
+      expected: 'factory()[1, "a\\"btail"]' },
+    { marked: 'factory()[1, "z│"]', query: 'a😀', label: 'a😀tail', insertion: 'tail',
+      expected: 'factory()[1, "a😀tail"]' },
+    { marked: 'head <- 1\nfactory()[, c│ol\numn]\ntail <- 2', query: 'col', back: 1,
+      end: new Position(2, 3), insertion: 'lumn', expected: 'head <- 1\nfactory()[, column]\ntail <- 2' },
+    { marked: 'pkg::co│lumn', query: 'column', insertion: 'column', noRange: true, expected: 'pkg::column' },
+  ]) {
+    const original = fixture.marked.replace('│', '');
+    const h = await openStaticPicker(t, fixture.marked, async request => {
+      if (request.input === original) return pending();
+      const position = request.contextPosition;
+      return resolved([{ label: fixture.label ?? 'column', insertText: fixture.insertion,
+        role: fixture.noRange ? 'symbol' : 'member', kind: 4,
+        ...(fixture.noRange ? {} : { range: {
+          start: new Position(position.line, fixture.start ?? position.character - (fixture.back ?? 0)),
+          end: fixture.end ?? new Position(position.line, position.character + (fixture.forward ?? 0)),
+        } }),
+      }]);
+    });
+    await h.type(fixture.query);
+    const selection = h.pick.activeItems[0];
+    assert.ok(selection, fixture.marked);
+    assert.ok(selection.replaceStart <= h.input.cursorCol, fixture.marked);
+    assert.ok(selection.replaceEnd >= h.input.cursorCol, fixture.marked);
+    await h.accept();
+    assert.equal(h.terminal.inputState.text, fixture.expected, fixture.marked + ' -> ' + fixture.query);
+  }
+});
+
+test('range-free static value candidates preserve explicit R expressions and snippets on acceptance', async t => {
+  for (const [insertText, expected] of [
+    ['TRUE', 'TRUE'], ['42L', '42L'], ['letters[1]', 'letters[1]'],
+    ['"$1${2:x}"', '"$1${2:x}"'], [{ value: '${1:TRUE}$0' }, 'TRUE'],
+  ]) {
+    const h = await openStaticPicker(t, 'f(flag = │)', async () => resolved([
+      { label: 'choice', role: 'value', kind: 11, insertText },
+    ]));
+    await h.accept();
+    assert.equal(h.terminal.inputState.text, `f(flag = ${expected})`);
+  }
+});
+
+test('native literal choices preserve quoting and dollar signs after adapter normalization', async t => {
+  for (const [marked, expected] of [
+    ['f(flag = │)', 'f(flag = "$1${2:x}")'],
+    ['f(flag = "│")', 'f(flag = "$1${2:x}")'],
+    ["f(flag = '│')", "f(flag = '$1${2:x}')"],
+  ]) {
+    const h = await openStaticPicker(t, marked, request => provideNativeStaticCompletion(async () => ({ items: [
+      { label: '$1${2:x}', kind: 11, detail: 'value for flag', insertText: { value: '$1${2:x}' }, insertTextFormat: 2 },
+    ] }), request));
+    await h.accept();
+    assert.equal(h.terminal.inputState.text, expected, marked);
+  }
+});
+
+test('closing Quick Pick revokes pending provider capabilities and immediately cancels binding reads', async t => {
+  for (const action of ['hide', 'accept']) {
+    for (const readBeforeClose of [false, true]) {
+      let read, reads = 0;
+      const h = await openStaticPicker(t, action === 'accept' ? 'fa│' : 'factory()$│', request => {
+        if (readBeforeClose) read = request.bindings.resolve({ name: 'factory', lookup: 'function', scope: { kind: 'search-path' } });
+        return new Promise(() => {});
+      }, {
+        workspace: { globalenv: { factory: { type: 'closure' } } },
+        requestSource: () => { reads++; return new Promise(() => {}); },
+      });
+      const bindings = h.requests[0].bindings;
+      await h[action]();
+      assert.equal(bindings.signal.aborted, true, action);
+      assert.equal(bindings.isCurrent(), false, action);
+      read ??= bindings.resolve({ name: 'factory', lookup: 'function', scope: { kind: 'search-path' } });
+      assert.deepEqual(await Promise.race([read, tick().then(() => 'still pending')]),
+        { status: 'unavailable', reason: 'cancelled' }, action);
+      assert.equal(reads, Number(readBeforeClose), 'a dismissed provider cannot start another native inspection');
+    }
+  }
+});
+
+test('dismissing a pending refinement cancels its capability', async t => {
+  const original = 'factory()$';
+  const h = await openStaticPicker(t, original + '│', async request => request.input === original
+    ? { status: 'resolved', completion: { items: [{ label: 'alpha', role: 'member', kind: 4 }], isIncomplete: true } }
+    : new Promise(() => {}));
+  await h.type('al');
+  assert.equal(h.requests.length, 2);
+  const bindings = h.requests[1].bindings;
+  assert.equal(bindings.isCurrent(), true);
+  await h.hide();
+  assert.equal(bindings.signal.aborted, true);
+  assert.equal(bindings.isCurrent(), false);
+});
+
+test('an older picker closing cannot cancel a newer provider invocation', async t => {
+  const h = await openStaticPicker(t, 'factory()$│', () => new Promise(() => {}));
+  h.start();
+  await tick();
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests[0].bindings.isCurrent(), false);
+  assert.equal(h.requests[1].bindings.isCurrent(), true);
+  assert.equal(h.requests[1].bindings.signal.aborted, false);
+  await h.hide();
+  assert.equal(h.requests[1].bindings.signal.aborted, true);
+});

@@ -1051,7 +1051,7 @@ test("real embedded R completion inspects nested storage without running user co
   // Feed the actual insertion spelling back through the parser and native
   // inspector. Test both UI insertion paths, nested roots, and R's locale at
   // request time; never infer a legacy encoding from UTF-8-looking bytes.
-  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/candidates.ts", {vscode:{}});
+  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/rText.ts");
   await submit('escaped_names <- c("line\\u2028name", "para\\u2029name", "bidi\\u202ename", "c1\\u0085name"); escaped_holder <- setNames(rep(list(list(child=1)), length(escaped_names)), escaped_names); escaped_index <- escaped_names[[1]]; assign(escaped_index, list(child=1), .GlobalEnv); assign("selector\\u2028key", escaped_index, .GlobalEnv); saved_ctype <- Sys.getlocale("LC_CTYPE"); stopifnot(l10n_info()[["UTF-8"]])');
   const escapedEntries = await completion.collectCompletionEntries(
     completion.getCompletionContext("escaped_holder$", 15), undefined, undefined, undefined, [], [], undefined,

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry, WorkspaceData, GlobalEnvItem } from "./types";
-import { backtickRName, quoteRNameIfNeeded, getFieldInsertText, bracketFieldMode } from "./candidates";
+import { getFieldInsertText, bracketFieldMode } from "./candidates";
+import { backtickRName, quoteRNameIfNeeded } from "./rText";
 import { allowsSymbolCompletions } from "./policy";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 import { workspaceStrings } from "../../Runtime/VSCR/workspaceMetadata";

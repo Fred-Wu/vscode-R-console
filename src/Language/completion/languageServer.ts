@@ -7,7 +7,8 @@ import { allowsSymbolCompletions } from "./policy";
 import { completionMatch } from "../completionMatch";
 import { staticCompletionUnavailableReason, type StaticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
 import { isCallableName } from "./contextParser";
-import { backtickRName, escapeRControls, getFieldInsertText, quoteRNameIfNeeded, quoteCompletionValue, isCallableCompletionKind } from "./candidates";
+import { getFieldInsertText, isCallableCompletionKind } from "./candidates";
+import { backtickRName, escapeRControls, quoteRNameIfNeeded } from "./rText";
 
 export async function getLanguageServerCompletions(
   context: CompletionContext,
@@ -41,7 +42,7 @@ export async function getLanguageServerCompletions(
           triggerCharacter: context.triggerCharacter, requestScope,
         })
       : Promise.resolve(completionProvider.provideCompletionItems?.(doc, queryPosition, context.triggerCharacter,
-          position, runtimeBracketKind, analysisMode, requestScope)).then(result => result && adaptNativeCompletionResult(result));
+          position, runtimeBracketKind, analysisMode, requestScope)).then(result => result && adaptNativeCompletionResult(result, context));
     let result = await query(position);
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;
@@ -230,17 +231,15 @@ function stripSnippetSyntax(text: string): string {
 }
 
 function getCompletionInsertText(item: CompletionCandidate, context: CompletionContext): string {
-  if (context.kind === "static" && typeof item.insertText === "object") return stripSnippetSyntax(item.insertText.value);
-  if (context.kind === "static" && typeof item.insertText === "string") {
-    return (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat === 2
-      ? stripSnippetSyntax(item.insertText) : item.insertText;
+  if (context.kind === "static" || item.role === "value") {
+    if (typeof item.insertText === "object") return stripSnippetSyntax(item.insertText.value);
+    if (typeof item.insertText === "string") {
+      return (item as vscode.CompletionItem & { insertTextFormat?: number }).insertTextFormat === 2
+        ? stripSnippetSyntax(item.insertText) : item.insertText;
+    }
+    return getCompletionLabel(item);
   }
   if (item.role === "argument" && getCompletionLabel(item) === "...") return "...";
-  // Value labels are literal R strings, including dollar signs and braces.
-  // Quote them for both named and positional insertion before snippet handling.
-  if (item.role === "value" && !item.range) {
-    return quoteCompletionValue(getCompletionLabel(item), context.argumentValue?.quote ?? context.bracketQuote);
-  }
   let text: string;
 
   if (typeof item.insertText === "string") {

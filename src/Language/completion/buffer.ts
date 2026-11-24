@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { CompletionContext, CompletionEntry } from "./types";
-import { R_RESERVED_WORDS } from "./candidates";
+import { R_RESERVED_WORDS } from "./rText";
 import { allowsSymbolCompletions } from "./policy";
 
 const CONSOLE_IDENTIFIER_PATTERN = /\b[a-zA-Z.][a-zA-Z0-9._]*\b/g;

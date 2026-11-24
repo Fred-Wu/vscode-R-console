@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { getCallOpenings, tokenizeForHighlighting } from "./parser";
 import { runtimeCompletionText } from "./completion/runtimeDocument";
-import { backtickRName } from "./completion/candidates";
+import { backtickRName } from "./completion/rText";
 import type { NativeSourceBinding } from "./completion/staticProvider";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";

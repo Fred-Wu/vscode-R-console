@@ -128,8 +128,9 @@ export class RTermLang {
         this.lastStaticAnalysisEnabled !== staticEnabled) this.cancelCompletion();
     this.lastStaticAnalysisEnabled = staticEnabled;
     this.bindingAbort?.abort();
-    this.bindingAbort = new AbortController();
-    const bindingSignal = this.bindingAbort.signal;
+    let requestBindings = new AbortController();
+    this.bindingAbort = requestBindings;
+    const bindingSignal = requestBindings.signal;
     const requestId = ++this.completionRequestId;
     let context = getCompletionContext(
       input.currentLine,
@@ -297,9 +298,10 @@ export class RTermLang {
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
         collect: async (nextContext, nextInputText, lines, cursorCol, onStagedEntries) => {
           if (!this.isCurrentCompletionRequest(requestId)) return undefined;
-          this.bindingAbort?.abort();
-          this.bindingAbort = new AbortController();
-          const refinementSignal = this.bindingAbort.signal;
+          requestBindings.abort();
+          requestBindings = new AbortController();
+          this.bindingAbort = requestBindings;
+          const refinementSignal = requestBindings.signal;
 
           if (staticEnabled) {
             nextContext = getStaticCompletionContext(lines[latestInput.cursorRow], cursorCol,
@@ -341,8 +343,13 @@ export class RTermLang {
             requestId, false, refinementSignal
           );
         },
+      }).finally(() => {
+        // Each picker owns its initial and refined requests. Closing an older
+        // picker must leave a newer completion's controller intact.
+        requestBindings.abort();
+        if (this.bindingAbort === requestBindings) this.bindingAbort = undefined;
+        if (this.completionPickerAbort === pickerAbort) this.completionPickerAbort = undefined;
       });
-      if (this.completionPickerAbort === pickerAbort) this.completionPickerAbort = undefined;
 
       if (!isCompletionPickItem(selection)) {
         return;

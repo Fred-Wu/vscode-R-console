@@ -725,6 +725,10 @@ validator checks explicit provider ranges in every static context. It requires a
 start on the cursor's line, an end inside the input and a range containing the
 cursor. Recognized contexts can also supply prefix-based edits for candidates
 without an explicit range.
+Quick Pick composes provider edits with its preview prefix replacement before
+applying them to the original input. Insertion and partial-token edits retain
+the relevant preview text; replacement bounds are checked against the original
+buffer, including multiline suffixes and escaped quoted prefixes.
 
 Providers discover dependencies and can request several bindings iteratively.
 Each request names a binding, function/value/identity lookup semantics, its lookup
@@ -748,7 +752,10 @@ provider invocation finishes. Outstanding provider-facing binding reads immediat
 settle as cancelled, while the shared resolver retains snapshots for prefix retries.
 Cancellation propagates to the native LSP request
 through its cancellation token. New input and picker refinements obtain fresh
-snapshots. No expression evaluation operation is exposed by the resolver.
+snapshots. Closing or accepting a picker cancels its outstanding binding reads
+and provider invocation. Each picker owns its cancellation controller so an older
+picker can finish independently of a newer request. No expression evaluation
+operation is exposed by the resolver.
 
 Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
 `unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
@@ -758,6 +765,10 @@ subscript parameters/specials and workspace definition/context URIs have explici
 candidate fields. Receiver fallback accepts only `member` candidates, and workspace
 definitions must belong to the requesting console document. The native metadata
 adapter translates installed language-server annotations into these fields.
+Value candidates retain their explicit insertion text, with snippet expansion
+when requested. The native adapter formats its literal string choices using the
+current R quoting context before passing them to presentation. Shared R name and
+literal formatting resides in `completion/rText.ts`.
 Resolved static argument candidates retain their provider's signature evidence.
 The native adapter retains validated
 expression symbols when callable parameter inference is unavailable, while
