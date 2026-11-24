@@ -1327,7 +1327,7 @@ Implementation files:
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
 - [`resources/r/completion-provider.R`](../resources/r/completion-provider.R) supplements native language-server completion with console argument handling.
 - [`resources/r/completion-runtime.R`](../resources/r/completion-runtime.R) parses cached runtime function signatures.
-- [`resources/r/completion-static.R`](../resources/r/completion-static.R) handles optional unsubmitted source inference.
+- [`resources/r/completion-static.R`](../resources/r/completion-static.R) adapts native source inference to console binding-safety rules.
 
 #### Completion Sources And Modes
 
@@ -1342,6 +1342,36 @@ source inference, including function arguments and members inferred from
 unsubmitted input. Session-backed signature handling is implemented in
 `resources/r/completion-runtime.R`; optional source inference is in
 `resources/r/completion-static.R`.
+
+Static syntax recovery, lexical scopes, assignments, aliases, return shapes and
+callable metadata belong to `languageserver`. The console adapter reads its
+recovered scope and inferred binding, and reuses `member_symbol_info` formals
+(or native definition metadata on released providers without that field).
+It does not walk XML assignments, unwrap function definitions, reconstruct
+source from tokens, or parse a displayed method signature. Static requests do
+not send parse suffixes or insert synthetic expressions into unfinished input.
+The original document and cursor go through the native asynchronous provider.
+Static requests wait on its existing parse queue for the current document
+version, including literal contexts where native completion can answer early.
+This keeps binding checks current without a separate parser or scheduling loop.
+
+The console retains authority over runtime evidence: an unresolved draft
+binding cannot borrow a live or package namesake's signature, and an opaque live
+binding requires positive native evidence of a draft override. Missing APIs,
+stale analysis, exhausted inference budgets and conflicting native callable
+metadata fail closed. Pending inference retains any known source identity.
+Argument matching
+and literal-choice formatting operate on inert metadata only. The bounded
+stored-source selector and the native runtime receiver grammar remain safety
+allowlists; they are not expanded to emulate unsupported static syntax.
+
+As a result, static completion support follows the installed `languageserver`.
+For example, some chained assignments and callable formal defaults that the
+former console walker recognized may remain unresolved upstream. They return no
+signature instead of invoking the function, guessing a binding or adding a
+console-specific syntax exception. Improvements to those cases belong upstream.
+`tests/static-delegation.test.cjs` exercises the actual native resolver and
+verifies that draft bodies, defaults and indices have no execution side effects.
 
 For nested completion, guarded live inspection remains authoritative for
 stored receivers, including stored receivers with no members. If the runtime
