@@ -339,13 +339,13 @@ suite("Subscript completion in the VS Code extension host", () => {
     const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
       'vscode-languageclient/node': require('vscode-languageclient/node'),
     });
-    let expressionProbes = 0;
+    const inspectedReceivers = [];
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, '../..'),
       rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
       // These legacy cases deliberately exercise the opt-in source analyzer.
       getStaticAnalysisEnabled: () => true,
-      requestMemberCompletions: async () => { expressionProbes++; return undefined; },
+      requestRuntimeMemberCompletions: async expression => { inspectedReceivers.push(expression); return undefined; },
     });
     const session = { search: [], loaded_namespaces: [], globalenv: {
       DT: { type: 'list', class: ['data.table', 'data.frame'], names: ['zebra', 'alpha'] },
@@ -355,9 +355,11 @@ suite("Subscript completion in the VS Code extension host", () => {
       const lines = text.split('\n'), currentLine = lines.at(-1);
       const input = { text, currentLine, lines, cursorRow: lines.length - 1,
         cursorCol: currentLine.length, textBeforeCursor: text };
-      let items;
+      let items, publish;
+      const ready = new Promise(resolve => { publish = resolve; });
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
-        getWorkspaceData: () => session, applyCompletion() {}, onInlineEntries: result => { items = result; } });
+        getWorkspaceData: () => session, applyCompletion() {}, onInlineEntries: result => { items = result; publish(); } });
+      await ready;
       assert.ok(Array.isArray(items));
       return items;
     };
@@ -382,7 +384,9 @@ suite("Subscript completion in the VS Code extension host", () => {
 
       const value = await complete('DT[, keyby = al');
       assert.ok(value.every(item => item.detail !== 'parameter'));
-      assert.equal(expressionProbes, 0, 'subscript completion must not evaluate R expressions');
+      assert.ok(inspectedReceivers.length > 0, 'exercise the wired native inspection hook');
+      assert.ok(inspectedReceivers.every(expression => expression === 'DT' || expression === 'df'),
+        'only stored receivers may reach native inspection');
     } finally {
       await lang.dispose();
     }

@@ -107,3 +107,21 @@ test('fuzzy method completion reuses its snapshot after a slow native response',
   assert.equal(reads, 1);
   assert.ok(result.entries.some(item => item.label === 'q_quux'));
 });
+
+test('real static provider broadens independent symbols with unknown callable parameters', { timeout: 60000 }, async t => {
+  class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
+  const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', {
+    vscode: { Position, CompletionItemKind: { Text: 0, Function: 2, Field: 4, Snippet: 14 } },
+  });
+  const { getCompletionContext } = loadSource('src/Language/completion/syntax.ts');
+  const { client, instances } = createConsoleLsp(t);
+  for (const input of ['g <- function(f) { f(qnrm', 'g <- function(f) { f(x = qnrm']) {
+    const result = await getLanguageServerCompletions(getCompletionContext(input, input.length),
+      { version: 1, getText: () => input }, new Position(0, input.length), [], client, undefined, 'static');
+    assert.ok(result.entries.some(item => item.label === 'qnorm'), input);
+    assert.equal(result.argumentsResolved, false);
+    assert.ok(result.entries.every(item => item.role !== 'argument' && item.role !== 'value'));
+    const queries = instances.at(-1).requests.filter(r => r.params?.position).slice(-2);
+    assert.deepEqual(queries.map(r => r.params.position.character), [input.length, input.length - 3]);
+  }
+});

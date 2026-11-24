@@ -590,7 +590,7 @@ test("cached session state reaches the LSP before its first launch", async () =>
     vscode: {}, "../../Language/completion": {},
     "../../Language/consoleLspClient": { ConsoleLspClient },
   });
-  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const data = { search: ["package:stats"], globalenv: { f: { type: "closure", str: "function(first)" } }, loaded_namespaces: [] };
   lang.updateSessionData(data);
   await lang.ensureConsoleLspStarted();

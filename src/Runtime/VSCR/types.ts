@@ -18,12 +18,6 @@ export type WorkspaceData = {
   globalenv: Record<string, GlobalEnvItem>;
 };
 
-export type SessionMemberCompletionItem = {
-  name: string;
-  type?: string;
-  str?: string;
-};
-
 export type VscodeRIntegrationOptions =
   | { kind: "disabled" }
   | { kind: "sess" }

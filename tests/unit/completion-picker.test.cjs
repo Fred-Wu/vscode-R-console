@@ -296,7 +296,7 @@ test('Quick Pick rejects acceptance after another input line changes', async () 
     '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
     '../../Language/virtualRDocument': { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({ extensionPath: '', rPath: '', env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: '', rPath: '', env: {} });
   const text = 'obj <- first\nobj$';
   const input = { text, currentLine: 'obj$', lines: text.split('\n'), cursorRow: 1, cursorCol: 4, textBeforeCursor: text };
   let current = input, applied = false;

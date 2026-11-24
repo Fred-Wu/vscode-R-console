@@ -967,8 +967,7 @@ test("completion requests do not perform package inventory checks", async (t) =>
 });
 
 
-test("language-server completion does not request a workspace refresh", async () => {
-  let workspaceRequests = 0;
+test("language-server completion starts from cached session data", async () => {
   let lspCompletionStarted = false;
   class TestPosition {
     constructor(line, character) {
@@ -1010,8 +1009,6 @@ test("language-server completion does not request a workspace refresh", async ()
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
-    requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
     provideCompletionItems: async () => {
@@ -1038,8 +1035,6 @@ test("language-server completion does not request a workspace refresh", async ()
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(lspCompletionStarted, true);
   await request;
-
-  assert.equal(workspaceRequests, 0);
 });
 
 
@@ -1080,10 +1075,6 @@ test("namespace completion does not wait for library or workspace probes", async
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: async () => {
-      throw new Error("workspace request should not run");
-    },
-    requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => {
     events.push("lookup");
@@ -1112,8 +1103,7 @@ test("namespace completion does not wait for library or workspace probes", async
 });
 
 
-test("F7 refinement does not request a workspace refresh", async () => {
-  let workspaceRequests = 0;
+test("F7 refinement starts from cached session data", async () => {
   let refinedCompletionStarted = false;
   let changeValue;
   let hide;
@@ -1172,8 +1162,6 @@ test("F7 refinement does not request a workspace refresh", async () => {
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
-    requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
     provideCompletionItems: async () => [],
@@ -1203,7 +1191,6 @@ test("F7 refinement does not request a workspace refresh", async () => {
 
   quickPick.hide();
   await request;
-  assert.equal(workspaceRequests, 0);
 });
 
 
@@ -1267,10 +1254,6 @@ test("package completion filters locally without repeated language-server reques
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: async () => {
-      throw new Error("workspace request should not run");
-    },
-    requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
     provideCompletionItems: async () => [],
@@ -1528,7 +1511,6 @@ test("namespace-only session changes do not resync the language server", () => {
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestMemberCompletions: async () => [],
   });
   const states = [];
   lang.consoleLsp = {
@@ -1655,10 +1637,6 @@ test("incomplete package completion re-queries until a complete result arrives",
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: async () => {
-      throw new Error("workspace request should not run");
-    },
-    requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({
     provideCompletionItems: async () => [],
@@ -1839,7 +1817,7 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
     return { text, lines, cursorRow, cursorCol: before.split("\n").at(-1).length,
       currentLine: lines[cursorRow], textBeforeCursor: before };
   };
-  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const input = snapshot("x <- df$a");
   await lang.handleAutocomplete({ input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
     applyCompletion() {}, onInlineEntries() {} });
@@ -1894,7 +1872,7 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
       "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
       "../../Language/virtualRDocument": { VirtualRDocument: class {} },
     });
-    const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+    const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
     const snapshot = value => ({ text: value, currentLine: value, lines: [value], cursorRow: 0,
       cursorCol: value.length, textBeforeCursor: value });
     const input = snapshot(text);
@@ -1957,8 +1935,6 @@ test("function argument completion awaits parameters before offering runtime var
   });
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
-    requestWorkspaceData: async () => ({ globalenv: { naive: {} } }),
-    requestMemberCompletions: async () => [],
   });
   lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: () => [] });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1990,7 +1966,7 @@ test("session updates synchronize attached packages without supplying library pa
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const states = [];
   lang.consoleLsp = { syncSessionState: async state => { states.push(state); } };
   const data = { search: ["package:stats"], loaded_namespaces: [], globalenv: {} };
@@ -2037,7 +2013,6 @@ test("language-server state sync failures do not reject terminal workspace updat
   });
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
-    requestMemberCompletions: async () => [],
   });
   lang.consoleLsp = { syncSessionState: async () => { throw Error("restart failed"); } };
   assert.equal(lang.updateSessionData({

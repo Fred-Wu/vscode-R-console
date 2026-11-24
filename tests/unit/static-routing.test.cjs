@@ -1036,3 +1036,50 @@ test('static edits are validated in recognized member, bracket and argument cont
     assert.equal(entries[0].replaceStart, context.replaceStart, text);
   }
 });
+
+test('unknown signatures allow fuzzy expression retries while retaining parameter barriers', async () => {
+  for (const text of ['g <- function(f) { f(qnrm', 'g <- function(f) { f(x = qnrm', 'obj$method(qnrm']) {
+    let calls = 0;
+    const h = harness({ lspItems: () => ({
+      rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: text.startsWith('obj') ? 'method-arguments-unavailable' : 'receiver-unresolved',
+      items: ++calls === 1 ? [] : [
+        { label: 'qnorm', insertText: 'qnorm()', kind: 2 },
+        { label: 'qnrm_parameter', detail: 'parameter', kind: 5 },
+        { label: 'qnrm_value', detail: 'value for method', kind: 11 },
+      ],
+    }) });
+    assert.deepEqual(labels(await h.complete(text)), ['qnorm()'], text);
+    assert.equal(calls, 2, text);
+  }
+  for (const reason of ['analysis-pending', 'analysis-limit', 'request-failed', 'document-unavailable']) {
+    const h = harness({ lspItems: { items: [], rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: reason } });
+    assert.deepEqual(labels(await h.complete('g <- function(f) { f(qnrm')), []);
+    assert.equal(h.requests.length, 1, reason);
+  }
+});
+
+test('multiline static edit mapping shares document reads across candidates', async () => {
+  const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', { vscode });
+  const input = 'factory()[, co\nlumn]';
+  const position = new Position(0, 14);
+  const context = completion.getStaticCompletionContext(input.split('\n')[0], 14, input.slice(0, 14), input.slice(14));
+  const run = async count => {
+    let reads = 0;
+    const entries = await getLanguageServerCompletions(context,
+      { version: 1, getText: () => { reads++; return input; } }, position, [], {
+        provideStaticCompletion: async () => ({ status: 'resolved', completion: {
+          items: Array.from({ length: count }, (_, i) => ({ label: `column${i}`, insertText: `column${i}`, kind: 4,
+            range: { start: new Position(0, 12), end: new Position(1, 4) } })),
+        } }),
+      }, undefined, 'static');
+    assert.equal(entries.entries.length, count);
+    for (const entry of entries.entries) {
+      assert.equal(entry.replaceStart, 12);
+      assert.equal(entry.replaceEnd, 19);
+    }
+    return reads;
+  };
+  assert.equal(await run(100), await run(1));
+});

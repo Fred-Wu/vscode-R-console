@@ -235,12 +235,6 @@ export function closeRuntimeVscodeRIntegration(host: RuntimeHost): void {
   vscodeRIntegration(host).handleRuntimeExit();
 }
 
-export async function getRuntimeWorkspaceData(
-  host: RuntimeHost
-): Promise<WorkspaceData | undefined> {
-  return await vscodeRIntegration(host).requestWorkspaceData();
-}
-
 export async function startRuntime(host: RuntimeHost): Promise<void> {
   pendingRuntimeRewrites.delete(host);
   const integration = vscodeRIntegration(host);

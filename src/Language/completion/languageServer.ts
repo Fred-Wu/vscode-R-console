@@ -25,11 +25,17 @@ export async function getLanguageServerCompletions(
     const requestScope = {};
     const input = doc.getText();
     const inputLines = input.split("\n");
+    const lineOffsets: number[] = [];
+    let offset = 0;
+    for (const line of inputLines) {
+      lineOffsets.push(offset);
+      offset += line.length + 1;
+    }
     const access = staticAccess ?? { bindings: createGuardedBindingResolver() };
     const query = (queryPosition: vscode.Position) => analysisMode === "static"
       ? requestStaticCompletion(completionProvider, {
           ...access, document: doc, input,
-          cursor: inputLines.slice(0, position.line).reduce((sum, line) => sum + line.length + 1, 0) + position.character,
+          cursor: lineOffsets[position.line] + position.character,
           position: queryPosition, contextPosition: position,
           triggerCharacter: context.triggerCharacter, requestScope,
         })
@@ -56,15 +62,18 @@ export async function getLanguageServerCompletions(
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
     // its replacement start intact; never rewrite code to manufacture results.
-    // Broadening a prefix cannot recover an unresolved method signature. It
-    // would repeat both the native inspection and the same LSP lookup.
+    // Independent expression symbols can broaden even when parameters are
+    // unavailable. The native adapter retains the parameter barrier on retries.
     const structuralFailure = (context.kind === "member" || context.kind === "bracket") &&
       staticReason !== undefined && [
       "receiver-unresolved", "unresolved-dispatch", "unsupported-context",
       "analysis-limit", "inference-cycle", "no-receiver-members",
     ].includes(staticReason);
+    const expressionSymbols = analysisMode === "static" && context.kind === "argument" && allowsSymbolCompletions(context);
     if (result?.rConsoleStaticStatus !== "resolved-empty" && result?.rConsoleStaticStatus !== "unresolved" &&
-        result?.rConsoleStaticStatus !== "pending" && !structuralFailure && context.prefix.length > 1 && argumentsResolved !== false && !memberResolved && !argumentsExhausted && !restrictsBracketSymbols(context) &&
+        result?.rConsoleStaticStatus !== "pending" && !structuralFailure && context.prefix.length > 1 &&
+        (argumentsResolved !== false || expressionSymbols) && !memberResolved &&
+        !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
           completionMatch(getCompletionLabel(item), context.prefix))) {
       const firstCharacter = [...context.prefix][0];
@@ -95,7 +104,7 @@ export async function getLanguageServerCompletions(
         ...(isSubscriptSpecial(item) ? { bracketSpecial: true } : {}),
         source: "lsp",
         replaceStart: getCompletionReplaceStart(item, context, multilineBuffer),
-        ...getCompletionReplaceEnd(item, doc, position),
+        ...getCompletionReplaceEnd(item, lineOffsets, position),
         packageName: getCompletionPackage(item),
       })),
       isIncomplete: result?.rConsoleStaticStatus === "pending" || (!Array.isArray(result) && result?.isIncomplete === true),
@@ -311,14 +320,13 @@ function getCompletionReplaceStart(
 }
 
 function getCompletionReplaceEnd(
-  item: vscode.CompletionItem, doc: vscode.TextDocument, position: vscode.Position
+  item: vscode.CompletionItem, lineOffsets: number[], position: vscode.Position
 ): { replaceEnd?: number } {
   if (!item.range) return {};
   const end = "end" in item.range ? item.range.end : item.range.replacing.end;
   if (end.line === position.line) return { replaceEnd: end.character };
-  const lines = doc.getText().split("\n");
-  if (end.line < position.line || end.line >= lines.length) return {};
-  return { replaceEnd: lines.slice(position.line, end.line).reduce((sum, line) => sum + line.length + 1, 0) + end.character };
+  if (end.line < position.line || end.line >= lineOffsets.length) return {};
+  return { replaceEnd: lineOffsets[end.line] - lineOffsets[position.line] + end.character };
 }
 
 /** The terminal can apply only edits beginning on the cursor's line. */

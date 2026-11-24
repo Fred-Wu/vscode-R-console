@@ -753,6 +753,9 @@ Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
 pending analysis is retried on a later request. The native adapter retains validated
 expression symbols when callable parameter inference is unavailable, while
 excluding parameter and default-value candidates that require that signature.
+Independent expression symbols retain prefix broadening when parameter inference
+is unavailable. Multiline replacement offsets share one document line-offset index
+per completion request.
 An authoritative empty result
 does not trigger prefix broadening. Result validation retains fixed diagnostic
 codes, source precedence and console-relative replacement ranges.

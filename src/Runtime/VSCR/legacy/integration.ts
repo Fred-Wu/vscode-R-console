@@ -85,10 +85,6 @@ export class LegacyVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return this.watcher.getWorkspaceData();
   }
 
-  override async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
-    return await this.watcher.requestWorkspaceData();
-  }
-
   override handleRuntimeExit(): void {
     this.attached = false;
   }

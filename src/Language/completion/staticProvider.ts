@@ -65,7 +65,11 @@ export async function provideNativeStaticCompletion(
   // Native member diagnostics describe the receiver query. Package symbols,
   // call parameters and literal values have their own validated evidence.
   const receiverContext = context?.kind === "member" || context?.kind === "bracket";
-  const failed = (result.rConsoleArgumentsResolved === false && !(expressionContext && items.length)) ||
+  // An empty symbol match can still be broadened independently of the
+  // unavailable signature. Scheduling and resource failures retain their status.
+  const canBroadenSymbols = expressionContext && result.rConsoleArgumentsResolved === false &&
+    (reason === "receiver-unresolved" || reason === "method-arguments-unavailable");
+  const failed = (result.rConsoleArgumentsResolved === false && !(canBroadenSymbols || (expressionContext && items.length))) ||
     reason === "request-failed" || reason === "document-unavailable" ||
     (receiverContext && !items.length);
   if (reason && failed) return {
@@ -74,7 +78,7 @@ export async function provideNativeStaticCompletion(
     completion: result,
   };
   if (!receiverContext && result.rConsoleArgumentsResolved !== false) delete result.rConsoleStaticUnavailableReason;
-  const authoritativeEmpty = !items.length && (result.rConsoleMemberResolved || result.rConsoleArgumentsExhausted);
+  const authoritativeEmpty = !canBroadenSymbols && !items.length && (result.rConsoleMemberResolved || result.rConsoleArgumentsExhausted);
   return { status: authoritativeEmpty ? "resolved-empty" : "resolved", completion: result };
 }
 
