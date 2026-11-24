@@ -994,3 +994,45 @@ test('authoritative empty static results stay complete and source refusal keeps 
   await h.complete('factory()$');
   assert.ok(h.logs.some(line => line.includes('automatically linked')));
 });
+
+test('unknown signatures preserve expression symbols without reviving parameters or defaults', async () => {
+  for (const text of ['g <- function(f) { f(me', 'g <- function(f) { f(x = me']) {
+    const h = harness({ lspItems: { rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: 'receiver-unresolved', items: [
+        { label: 'mean', insertText: 'mean()', kind: 2 },
+        { label: 'method', kind: 5, detail: 'parameter' },
+        { label: 'method_value', kind: 11, detail: 'value for method' },
+        { label: 'member_parameter', kind: 5, data: { type: 'member', parameter: 'member_parameter' } },
+      ] } });
+    assert.deepEqual(labels(await h.complete(text)), ['mean()'], text);
+  }
+  for (const reason of ['request-failed', 'document-unavailable']) {
+    const h = harness({ lspItems: { rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: reason, items: [{ label: 'mean', kind: 2 }] } });
+    assert.deepEqual(labels(await h.complete('g <- function(f) { f(me')), [], reason);
+  }
+});
+
+test('static edits are validated in recognized member, bracket and argument contexts', async () => {
+  for (const text of ['factory()$al', 'factory()[["al', 'f(al', 'x <- 1\nfactory()$al']) {
+    const input = snapshot(text);
+    const context = completion.getStaticCompletionContext(input.currentLine, input.cursorCol, text);
+    const start = new Position(input.cursorRow, input.cursorCol - 2);
+    const end = new Position(input.cursorRow, input.cursorCol);
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
+      { label: 'alpha', insertText: 'alpha', kind: 4, data: { type: 'member' }, range: { start, end } },
+      { label: 'alpha_plain', kind: 4, data: { type: 'member' } },
+      ...[
+        { start: new Position(input.cursorRow, -2), end },
+        { start: new Position(input.cursorRow - 1, 0), end },
+        { start, end: new Position(input.cursorRow, input.cursorCol + 100) },
+        { start, end: new Position(input.cursorRow, input.cursorCol - 1) },
+        { start: new Position(input.cursorRow, input.cursorCol + 1), end },
+        { start: new Position(input.cursorRow, 0.5), end },
+      ].map(range => ({ label: 'alpha_bad', insertText: 'bad', kind: 4, data: { type: 'member' }, range })),
+    ] } }) });
+    const entries = (await h.complete(text)).filter(x => 'insertText' in x);
+    assert.deepEqual(entries.map(x => x.insertText), ['alpha', 'alpha_plain'], text);
+    assert.equal(entries[0].replaceStart, context.replaceStart, text);
+  }
+});

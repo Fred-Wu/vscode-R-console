@@ -37,6 +37,14 @@ test('general static contract uses the real languageserver adapter and preserves
   assert.ok(result.items.some(item => item.label === 'draft'));
   result = await complete('f <- function(alpha) NULL; f(');
   assert.ok(result.items.some(item => item.label === 'alpha'));
+  for (const text of ['g <- function(f) { f(me', 'g <- function(f) { f(x = me',
+    'f <- unknown_factory(); f(me']) {
+    result = await complete(text);
+    assert.equal(result.rConsoleStaticStatus, 'resolved', text);
+    assert.equal(result.rConsoleArgumentsResolved, false, text);
+    assert.ok(result.items.some(item => item.label === 'mean'), text);
+    assert.ok(!result.items.some(item => item.detail === 'parameter'), text);
+  }
   result = await complete('stats::lm(');
   assert.deepEqual(result.items.filter(item => item.detail === 'parameter').slice(0, 4).map(item => item.label),
     ['formula', 'data', 'subset', 'weights']);

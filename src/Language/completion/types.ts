@@ -56,8 +56,6 @@ export type CompletionEntries = CompletionEntry[] & {
   staticSuppressionReason?: CompletionSuppressionReason;
   argumentsResolved?: boolean;
   argumentSuppressionReason?: CompletionSuppressionReason;
-  // An empty but successful sess column inspection is authoritative.
-  columnsResolved?: boolean;
 };
 
 export type CompletionPickItem = vscode.QuickPickItem & {

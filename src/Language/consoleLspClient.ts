@@ -356,8 +356,8 @@ export class ConsoleLspClient implements CompletionProvider {
           const text = projection.document.getText();
           const offset = projection.document.offsetAt(projection.toServerPosition(contextPosition));
           const before = text.slice(0, offset), line = before.split("\n").at(-1)!;
-          const fallback = getStaticFallbackContext(line, line.length, before, text.slice(offset));
           const visibleContext = getCompletionContext(line, line.length, before, text.slice(offset));
+          const fallback = getStaticFallbackContext(line, line.length, before, text.slice(offset), visibleContext);
           const receiverContext = fallback ?? visibleContext;
           const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, offset);
           const root = visibleContext?.objectName && parseRuntimeMemberQuery(visibleContext.objectName)?.root;

@@ -1375,8 +1375,10 @@ successful live results, including empty results. Inline completion, explicit
 completion and picker refinement route remaining static requests to the provider.
 Syntax-derived presentation hints preserve known prefix and quoting behavior;
 contexts without those hints use provider-supplied replacement edits. The edit
-validator requires a start on the cursor's line, an end inside the input and a
-range containing the cursor.
+validator checks explicit provider ranges in every static context. It requires a
+start on the cursor's line, an end inside the input and a range containing the
+cursor. Recognized contexts can also supply prefix-based edits for candidates
+without an explicit range.
 
 Providers discover dependencies and can request several bindings iteratively.
 Each request names a binding, function/value/identity lookup semantics, its lookup
@@ -1399,7 +1401,10 @@ snapshots. No expression evaluation operation is exposed by the resolver.
 
 Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
 `unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
-pending analysis is retried on a later request. An authoritative empty result
+pending analysis is retried on a later request. The native adapter retains validated
+expression symbols when callable parameter inference is unavailable, while
+excluding parameter and default-value candidates that require that signature.
+An authoritative empty result
 does not trigger prefix broadening. Result validation retains fixed diagnostic
 codes, source precedence and console-relative replacement ranges.
 

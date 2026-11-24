@@ -32,7 +32,6 @@ export function createCompletionParams(
       rConsoleDataObject: bracket.objectName,
       rConsoleSubscriptOperator: bracket.operator,
       rConsoleSubscriptTags: bracket.argumentTags,
-      rConsoleSubscriptPrefix: bracket.prefix,
       ...(bracket.argumentName ? { rConsoleSubscriptArgument: bracket.argumentName } : {}),
     } : {}),
     ...(parseInsertion ? { rConsoleParseInsertion: {

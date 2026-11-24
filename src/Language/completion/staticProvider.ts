@@ -1,5 +1,6 @@
 import type { CompletionProvider, CompletionResult, StaticBindingQuery, StaticCompletionOutcome, StaticCompletionRequest } from "./types";
 import { getCompletionContext, getStaticFallbackContext } from "./syntax";
+import { allowsSymbolCompletions } from "./policy";
 import { storedCompletionReceiver } from "./sourceReceiver";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 import { staticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
@@ -46,12 +47,25 @@ export async function provideNativeStaticCompletion(
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
   if (!result) return { status: "pending", reason: "no-response" };
   if (bindingSuppression) result.rConsoleBindingSuppressionReason = bindingSuppression;
-  const items = Array.isArray(result) ? result : result.items;
+  let items = Array.isArray(result) ? result : result.items;
+  // Parameter inference can fail inside a valid argument expression. Retain
+  // independent symbols after the native supplement has validated the reply.
+  const expressionContext = context?.kind === "argument" && allowsSymbolCompletions(context);
+  if (result.rConsoleArgumentsResolved === false && expressionContext) {
+    items = items.filter(item => {
+      const data = (item as typeof item & { data?: { type?: string; parameter?: string } }).data;
+      return data?.parameter === undefined && data?.type !== "member" &&
+        !data?.type?.endsWith("parameter") && !data?.type?.endsWith("argument_value") &&
+        item.detail !== "parameter" && !item.detail?.startsWith("value for ");
+    });
+    if (Array.isArray(result)) result.splice(0, result.length, ...items);
+    else result.items = items;
+  }
   const reason = staticCompletionUnavailableReason(result.rConsoleStaticUnavailableReason);
   // Native member diagnostics describe the receiver query. Package symbols,
   // call parameters and literal values have their own validated evidence.
   const receiverContext = context?.kind === "member" || context?.kind === "bracket";
-  const failed = result.rConsoleArgumentsResolved === false ||
+  const failed = (result.rConsoleArgumentsResolved === false && !(expressionContext && items.length)) ||
     reason === "request-failed" || reason === "document-unavailable" ||
     (receiverContext && !items.length);
   if (reason && failed) return {
