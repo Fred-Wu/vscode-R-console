@@ -523,43 +523,49 @@ test("computed receiver identity follows only its outer named root", () => {
 });
 
 test("one receiver classification preserves source eligibility and root identity", () => {
-  for (const [text, name, target] of [
-    ['((make_data()))$inner$', 'make_data', 'source'],
-    ['make_data()[["inner"]]$', 'make_data', 'source'],
-    ['make_data()$"inner"$', 'make_data', 'source'],
-    ['make_data()$method()$', 'make_data', 'source'],
-    ['(make_data())()$', 'make_data', 'source'],
-    ['make_data()[[side_effect()]]()$', 'make_data', 'source'],
-    ['make_data()$"method"()$child$', 'make_data', 'source'],
-    ['(make_data)$method()$', 'make_data', 'binding'],
-    ['(make_data)()$', 'make_data', 'source-value'],
-    ['((make_data))()$', 'make_data', 'source-value'],
-    ['((make_data)())()$', 'make_data', 'source-value'],
-    ['((make_data))()$method()$', 'make_data', 'source-value'],
-    ['((make_data)$method)()$', 'make_data', 'binding'],
-    ['(make_data[[1]])()$', 'make_data', 'binding'],
+  // Mark the complete source token, not the first occurrence of its decoded
+  // name (which may exclude quotes or appear earlier in the input).
+  for (const [marked, name, target] of [
+    ['((│make_data()))$inner$', 'make_data', 'source'],
+    ['│make_data()[["inner"]]$', 'make_data', 'source'],
+    ['│make_data()$"inner"$', 'make_data', 'source'],
+    ['│make_data()$method()$', 'make_data', 'source'],
+    ['(│make_data())()$', 'make_data', 'source'],
+    ['│make_data()[[side_effect()]]()$', 'make_data', 'source'],
+    ['│make_data()$"method"()$child$', 'make_data', 'source'],
+    ['(│make_data)$method()$', 'make_data', 'binding'],
+    ['(│make_data)()$', 'make_data', 'source-value'],
+    ['((│make_data))()$', 'make_data', 'source-value'],
+    ['((│make_data)())()$', 'make_data', 'source-value'],
+    ['((│make_data))()$method()$', 'make_data', 'source-value'],
+    ['((│make_data)$method)()$', 'make_data', 'binding'],
+    ['(│make_data[[1]])()$', 'make_data', 'binding'],
     ['(other + make_data)()$', undefined, undefined],
-    ['"make_data"()$', 'make_data', 'source'],
+    ['│"make_data"()$', 'make_data', 'source'],
+    ["│'make_data'()$", 'make_data', 'source'],
+    ['│"make\\x5fdata"()$', 'make_data', 'source'],
+    ['make_data <- 1; │"make_data"()$', 'make_data', 'source'],
+    ['make_data <- 1; (│make_data)()$', 'make_data', 'source-value'],
     ['("make_data")()$', undefined, undefined],
     ['(NULL)()$', undefined, undefined],
     ['(...)()$', undefined, undefined],
     ['(..1)()$', undefined, undefined],
-    ['('.repeat(5000) + 'make_data' + ')'.repeat(5000) + '()$', 'make_data', 'source-value'],
-    ['obj[[side_effect()]]$method(', 'obj', 'binding'],
-    ['obj$"method"()$', 'obj', 'binding'],
-    ['`odd root`[f()]$', 'odd root', 'binding'],
-    ['if (TRUE) (make_data())$', 'make_data', 'source'],
+    ['('.repeat(5000) + '│make_data' + ')'.repeat(5000) + '()$', 'make_data', 'source-value'],
+    ['│obj[[side_effect()]]$method(', 'obj', 'binding'],
+    ['│obj$"method"()$', 'obj', 'binding'],
+    ['│`odd root`[f()]$', 'odd root', 'binding'],
+    ['if (TRUE) (│make_data())$', 'make_data', 'source'],
     ['pkg::make_data()$', undefined, undefined],
     ['(other + make_data())$', undefined, undefined],
   ]) {
+    const expectedStart = marked.indexOf("│");
+    const text = marked.replace("│", "");
     const context = completion.getStaticFallbackContext(text, text.length) ??
       completion.getCompletionContext(text, text.length);
     const receiver = completion.storedCompletionReceiver(context, text, text.length);
     assert.equal(receiver?.name, name, text);
     assert.equal(receiver?.target, target, text);
-    if (receiver) {
-      assert.equal(receiver.start, text.indexOf(name === 'odd root' ? '`odd root`' : name), text);
-    }
+    assert.equal(receiver?.start, expectedStart === -1 ? undefined : expectedStart, text);
   }
 });
 
