@@ -27,11 +27,13 @@ export function createGuardedBindingResolver(
       if (query.scope?.kind !== "search-path") return unavailable("unsupported-scope");
       const { name, lookup } = query;
       deadline ??= Date.now() + limits.timeoutMs;
-      if ((query.depth ?? 0) > limits.depth || Date.now() >= deadline) return unavailable("analysis-limit");
+      if ((query.depth ?? 0) > limits.depth) return unavailable("analysis-limit");
       const key = JSON.stringify([lookup, name]);
       const previous = cache.get(key);
       if (previous) return previous.then(result => isCurrent() ? result : unavailable("cancelled"));
-      if (cache.size >= limits.lookups) return unavailable("analysis-limit");
+      // Settled snapshots remain valid for prefix retries in the same request.
+      // Pending reads retain their original deadline and cancellation handler.
+      if (Date.now() >= deadline || cache.size >= limits.lookups) return unavailable("analysis-limit");
       const bindingId = `binding-${cache.size}`;
       const pending = new Promise<StaticBindingResult>(resolve => {
         let settled = false;

@@ -9,6 +9,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { createGuardedBindingResolver } = loadSource("src/Language/completion/bindings.ts");
 const { runRJson } = require("./helpers/run-r-json.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
@@ -1708,7 +1709,7 @@ test("static completion explains missing source and unresolved accessors using n
     // This source-only fixture has no live bindings to mask native inference.
     const entries = await completion.collectStaticFallbackEntries(context, doc, position,
       lines.slice(0, -1), client, {
-        bindings: completion.createGuardedBindingResolver(async () => ({ status: 'missing' })),
+        bindings: createGuardedBindingResolver(async () => ({ status: 'missing' })),
       });
     assert.equal(entries.staticResolved, resolved, text);
     assert.equal(entries.staticUnavailableReason, reason, text);

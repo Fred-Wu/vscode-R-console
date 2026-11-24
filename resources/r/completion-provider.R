@@ -146,7 +146,7 @@ console_supplement_completion <- function(reply, self, params) {
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
     method_root <- if (member_call) console_call_root(params$rConsoleCall, include_calls = TRUE) else NULL
     source_root <- if (static_analysis && member_call && !is.null(method_root))
-        console_source_function(document, point, method_root, uri, workspace) else NULL
+        console_call_binding(document, point, method_root, uri, workspace) else NULL
     runtime_method <- if (member_call) console_runtime_arguments(params) else NULL
     runtime_method_evidence <- member_call && (!is.null(runtime_method) ||
         isTRUE(params$rConsoleRuntimeArgumentsRefused))

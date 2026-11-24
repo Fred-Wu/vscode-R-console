@@ -59,3 +59,51 @@ test('general static contract uses the real languageserver adapter and preserves
     assert.equal(calls.length, before, 'unsupported adapter contexts do not inspect runtime bindings');
   }
 });
+
+test('source method arguments retain call-site provenance across statement layouts and shadowing', { timeout: 60000 }, async t => {
+  const { client } = createConsoleLsp(t);
+  for (const separator of ['; ', '\n']) {
+    for (const [definition, call, expected] of [
+      ['obj <- list(fun=function(arg) NULL)', 'obj$fun(', ['arg']],
+      ['obj <- list(fun=function(arg) NULL); alias <- obj', 'alias$fun(', ['arg']],
+      ['obj <- list(fun=function(arg) NULL); obj <- unknown_factory()', 'obj$fun(', []],
+      ['obj <- list(fun=function(arg) NULL); g <- function(obj) {', 'obj$fun(', []],
+    ]) {
+      const input = definition + separator + call;
+      const lines = input.split('\n');
+      const position = { line: lines.length - 1, character: lines.at(-1).length };
+      const result = await requestStaticCompletion(client, {
+        document: { version: 1, getText: () => input }, input, cursor: input.length,
+        position, contextPosition: position, requestScope: {},
+        bindings: createGuardedBindingResolver(async () => ({ status: 'missing' })),
+      });
+      assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, input);
+    }
+  }
+});
+
+test('fuzzy method completion reuses its snapshot after a slow native response', { timeout: 60000 }, async t => {
+  class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
+  const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', {
+    vscode: { Position, CompletionItemKind: { Text: 0, Function: 2, Field: 4, Snippet: 14 } },
+  });
+  const { getCompletionContext } = loadSource('src/Language/completion/syntax.ts');
+  const { client } = createConsoleLsp(t);
+  const complete = client.provideCompletionItems.bind(client);
+  let requests = 0, reads = 0;
+  client.provideCompletionItems = async (...args) => {
+    const result = await complete(...args);
+    if (++requests === 1) await new Promise(resolve => setTimeout(resolve, 1600));
+    return result;
+  };
+  const input = 'factory()$method(qqux';
+  const result = await getLanguageServerCompletions(getCompletionContext(input, input.length),
+    { version: 1, getText: () => input }, new Position(0, input.length), [], client, undefined, 'static', {
+      bindings: createGuardedBindingResolver(async () => {
+        reads++; return { status: 'source', text: 'function() list(method=function(q_quux, zebra) NULL)' };
+      }),
+    });
+  assert.equal(requests, 2);
+  assert.equal(reads, 1);
+  assert.ok(result.entries.some(item => item.label === 'q_quux'));
+});

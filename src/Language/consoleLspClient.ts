@@ -10,6 +10,7 @@ import * as readline from "readline";
 import { URL } from "url";
 import * as vscode from "vscode";
 import {
+  CancellationTokenSource,
   CloseAction,
   DataCallback,
   CompletionRequest,
@@ -308,7 +309,7 @@ export class ConsoleLspClient implements CompletionProvider {
   provideStaticCompletion(request: import("./completion/types").StaticCompletionRequest) {
     return provideNativeStaticCompletion(binding => this.provideCompletionItems(
       request.document, request.position, request.triggerCharacter, request.contextPosition,
-      undefined, "static", request.requestScope, binding), request);
+      undefined, "static", request.requestScope, binding, request.bindings.signal), request);
   }
 
   async provideCompletionItems(
@@ -319,9 +320,11 @@ export class ConsoleLspClient implements CompletionProvider {
     runtimeBracketKind?: "data.frame" | "data.table" | null,
     analysisMode?: CompletionAnalysisMode,
     requestScope: object = {},
-    sourceBinding?: NativeSourceBinding
+    sourceBinding?: NativeSourceBinding,
+    signal?: AbortSignal
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (signal?.aborted) return undefined;
       await this.packageRefreshPromise;
       const revision = this.packageRevision;
       const client = await this.ensureClient();
@@ -445,7 +448,19 @@ export class ConsoleLspClient implements CompletionProvider {
             Object.assign(params, { rConsoleRuntimeArgumentsRefused: true });
           }
         }
-        const result = await client.sendRequest(CompletionRequest.type, params);
+        if (signal?.aborted) return undefined;
+        const cancellation = signal ? new CancellationTokenSource() : undefined;
+        const cancel = () => cancellation?.cancel();
+        signal?.addEventListener("abort", cancel, { once: true });
+        const result = await (async () => {
+          try {
+            return await client.sendRequest(CompletionRequest.type, params, cancellation?.token);
+          } finally {
+            signal?.removeEventListener("abort", cancel);
+            cancellation?.dispose();
+          }
+        })();
+        if (signal?.aborted) return undefined;
         if (this.client !== client || revision !== this.packageRevision) continue;
         if (!isCurrent()) return undefined;
         const completions: CompletionResult | undefined = await client.protocol2CodeConverter.asCompletionResult(result);

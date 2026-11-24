@@ -106,12 +106,16 @@ console_source_binding <- function(name, uri, workspace, document, point, locati
             (!length(value$type) && is.null(value$function_expr) && is.null(value$function_key)))
 }
 
-console_source_function <- function(document, point, name, uri, workspace) {
-    # Look up the callable in its own scope, including while editing a quoted
-    # argument. Native call detection owns the position and token boundaries.
+console_call_binding <- function(document, point, name, uri, workspace) {
+    # Resolve a binding in the call site's lexical scope, including quoted
+    # arguments. Native call detection owns the position and token boundaries.
     location <- if (exists("member_call_location", asNamespace("languageserver"), inherits = FALSE))
         languageserver:::member_call_location(document, point, symbols = TRUE)
-    binding <- console_source_binding(name, uri, workspace, document, point, location)
+    console_source_binding(name, uri, workspace, document, point, location)
+}
+
+console_source_function <- function(document, point, name, uri, workspace) {
+    binding <- console_call_binding(document, point, name, uri, workspace)
     if (is.null(binding) || isTRUE(binding$unknown)) return(binding)
     # The provider owns aliases, closures, return shapes and catalog signatures.
     # A non-callable draft binding still shadows an older live/package function.
@@ -130,7 +134,7 @@ console_source_overrides_opaque <- function(name, uri, workspace, document, posi
 # The native resolver already knows source-defined member functions. Reuse its
 # function syntax to expose formals without evaluating the receiver or its body.
 console_member_function <- function(uri, workspace, document, point, root = NULL,
-    source_root = if (!is.null(root)) console_source_function(document, point, root, uri, workspace)) {
+    source_root = if (!is.null(root)) console_call_binding(document, point, root, uri, workspace)) {
     if (identical(root, "")) return(list(unknown = TRUE))
     if (!exists("member_call_location", asNamespace("languageserver"), inherits = FALSE)) return(NULL)
     location <- languageserver:::member_call_location(document, point)
@@ -139,17 +143,10 @@ console_member_function <- function(uri, workspace, document, point, root = NULL
         location$point, location$cursor, location$cursor$token)
     if (is.null(resolved) || isTRUE(resolved$budget$exhausted) || isTRUE(resolved$budget$transient))
         return(list(unknown = TRUE))
-    if (!is.null(source_root)) {
-        # A draft assignment or formal may shadow an attached package object.
-        # Verify that binding independently before following a catalog method;
-        # an unresolved source root is not the same as its package namesake.
-        if (!exists("member_infer", asNamespace("languageserver"), inherits = FALSE))
-            return(list(unknown = TRUE))
-        binding <- languageserver:::member_infer(as.name(root), resolved$index,
-            resolved$bindings, budget = resolved$budget)
-        if (!length(binding$type) && is.null(binding$function_expr) && is.null(binding$function_key))
-            return(list(unknown = TRUE))
-    }
+    # Root provenance is resolved at the call site. The member result can carry
+    # a closure's earlier binding position, so reuse the independent root proof.
+    if (!is.null(source_root) && isTRUE(source_root$unknown))
+        return(list(unknown = TRUE, source_binding = isTRUE(source_root$source_binding)))
     history <- if (!is.null(root)) resolved$index$document_bindings[[root]] else NULL
     at <- resolved$bindings$.__member_position__
     source_binding <- !is.null(source_root) || (!is.null(root) &&

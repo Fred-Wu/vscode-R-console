@@ -136,3 +136,19 @@ test('runtime-only providers cannot silently supply static completion', async ()
   assert.equal(result.rConsoleStaticUnavailableReason, 'provider-unavailable');
   assert.deepEqual(result.items, []);
 });
+
+test('settled binding snapshots survive the lookup deadline while new reads and cancelled reuse remain blocked', async () => {
+  const controller = new AbortController();
+  const calls = [];
+  const resolver = createGuardedBindingResolver(async name => {
+    calls.push(name); return { status: 'source', text: 'function() list(alpha=1)' };
+  }, { signal: controller.signal, limits: { timeoutMs: 10 } });
+  const first = await resolver.resolve(query('factory'));
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(await resolver.resolve(query('factory')), first);
+  assert.equal((await resolver.resolve(query('another'))).reason, 'analysis-limit');
+  assert.equal((await resolver.resolve(query('factory', 'function', { depth: 9 }))).reason, 'analysis-limit');
+  controller.abort();
+  assert.equal((await resolver.resolve(query('factory'))).reason, 'cancelled');
+  assert.deepEqual(calls, ['factory']);
+});

@@ -71,10 +71,12 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       if (method === rpc.DidOpenTextDocumentNotification.type) this.opened.push(params.textDocument.uri);
       return this.connection.sendNotification(method, params);
     }
-    async sendRequest(method, params) {
+    async sendRequest(method, params, token) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
-      const result = await this.connection.sendRequest(method, params);
+      const result = await (token
+        ? this.connection.sendRequest(method, params, token)
+        : this.connection.sendRequest(method, params));
       await afterResponse?.(method, this);
       return result;
     }

@@ -34,14 +34,14 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
       if (method === "open" || method === "change") this.documents.push(params.text);
       if (method === "close") this.closed++;
     }
-    async sendRequest(method, params) {
+    async sendRequest(method, params, token) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
       if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
       if (method === "rConsole/libraryPaths") return libraries;
       if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
       assert.equal(method, "completion");
-      return await completion?.(this, params) ?? [{ label: "lm" }];
+      return await completion?.(this, params, token) ?? [{ label: "lm" }];
     }
   }
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
@@ -59,6 +59,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     },
     "vscode-languageclient/node": {
       LanguageClient,
+      CancellationTokenSource: require("vscode-languageserver-protocol").CancellationTokenSource,
       CompletionRequest: { type: "completion" },
       DidOpenTextDocumentNotification: { type: "open" },
       DidChangeTextDocumentNotification: { type: "change" },
@@ -689,4 +690,31 @@ test("runtime library snapshots are retained before completion client constructi
   lang.clearSessionState();
   assert.equal(calls.includes("reset"), true);
   await lang.dispose();
+});
+
+test('static provider cancellation reaches the LSP and rejects late results', async t => {
+  let started, release, token;
+  const waiting = new Promise(resolve => { started = resolve; });
+  const { client } = createClient(t, { staticAnalysis: true, completion: async (_client, _params, currentToken) => {
+    token = currentToken; started();
+    return new Promise(resolve => { release = resolve; });
+  } });
+  const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+  const { createGuardedBindingResolver } = loadSource('src/Language/completion/bindings.ts');
+  const controller = new AbortController();
+  const input = 'stats::lm(';
+  const position = new Position(0, input.length);
+  const pending = requestStaticCompletion(client, {
+    document: { version: 1, getText: () => input }, input, cursor: input.length,
+    position, contextPosition: position, requestScope: {},
+    bindings: createGuardedBindingResolver(undefined, { signal: controller.signal }),
+  });
+  await waiting;
+  assert.equal(token.isCancellationRequested, false);
+  controller.abort();
+  assert.equal(token.isCancellationRequested, true);
+  const result = await pending;
+  assert.equal(result.rConsoleStaticStatus, 'pending');
+  assert.deepEqual(result.items, []);
+  release({ items: [{ label: 'stale' }] });
 });

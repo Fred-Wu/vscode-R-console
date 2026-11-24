@@ -6,6 +6,7 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { createGuardedBindingResolver } = loadSource("src/Language/completion/bindings.ts");
 const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
 const { parseRuntimeMemberQuery } = loadSource("src/Language/completion/runtimeMembers.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
@@ -79,7 +80,7 @@ test("real embedded R completion inspects nested storage without running user co
     const lines = text.split("\n");
     const row = before.length - 1, col = before.at(-1).length;
     const context = completion.getStaticCompletionContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
-    const bindings = completion.createGuardedBindingResolver(useStoredSource
+    const bindings = createGuardedBindingResolver(useStoredSource
       ? (name, target) => inspect(name, [], target)
       : async () => ({ status: 'missing' }));
     return completion.collectStaticFallbackEntries(context, {
