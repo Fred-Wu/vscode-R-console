@@ -5,7 +5,7 @@ import type { NativeSourceBinding } from "./staticProvider";
 import type * as vscode from "vscode";
 import type { LanguageClient } from "vscode-languageclient/node";
 import type { VirtualRDocument } from "../virtualRDocument";
-import { getBracketCompletionContext, getCompletionParseInsertion, getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./contextParser";
+import { getCompletionSyntax, getCompletionParseInsertion, getCompletionParseSuffix } from "./contextParser";
 
 // Supplemental syntax belongs to the console adapter. Standard completion
 // position and document contents remain available to the native LSP handler.
@@ -17,10 +17,10 @@ export function createCompletionParams(
   const text = projection.document.getText();
   const hasContext = !!sourceBinding || text.includes("(") || text.includes("[") || text.includes("|>") || text.includes("%>%");
   const contextOffset = hasContext ? projection.document.offsetAt(projection.toServerPosition(contextPosition)) : 0;
-  const call = text.includes("(")
-    ? getEnclosingCall(text, contextOffset) : undefined;
-  const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
-  const bracket = text.includes("[") ? getBracketCompletionContext(text, contextOffset) : undefined;
+  const syntax = getCompletionSyntax(text, contextOffset);
+  const call = syntax.call;
+  const pipe = syntax.pipe;
+  const bracket = syntax.bracket;
   // Static parsing and incomplete-input recovery belong to languageserver.
   // The legacy repair is used only to match inert runtime signature metadata.
   const parseSuffix = staticAnalysis ? undefined : getCompletionParseSuffix(text);

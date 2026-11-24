@@ -6,6 +6,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
 const loadSource = require("./helpers/load-source.cjs");
+const { staticFixtureAccess, staticFixtureProvider, completeStatic } = require("./helpers/static-completion.cjs");
 
 test("real R supplies abbreviation candidates with correct replacement ranges", { timeout: 60000 }, async t => {
   class Position { constructor(line, character) { Object.assign(this, { line, character }); } }
@@ -81,24 +82,26 @@ test("installed package chain signatures also supply arguments without running t
   const { getCompletionContext, collectCompletionEntries } = loadSource('src/Language/completion.ts', {
     vscode: { CompletionItemKind: { Method: 1, Function: 2, Field: 4, Variable: 5, Text: 0 }, SnippetString: class {} },
   });
+  let staticMode = true;
   const collect = async marked => {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
     const before = text.slice(0, cursor), lines = text.split('\n'), row = before.split('\n').length - 1;
     const col = before.split('\n').at(-1).length;
     const result = await collectCompletionEntries(getCompletionContext(lines[row], col, before, text.slice(cursor)),
-      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, undefined, lines.slice(0, row), [], {
+      { version: 1, getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, undefined, lines.slice(0, row), [], {
+        ...staticFixtureProvider(client),
         provideCompletionItems: async (...args) => {
           const response = await client.provideCompletionItems(...args);
           return { ...response, items: response.items.map(item => ({ ...item, kind: item.kind - 1 })) };
         },
-      });
+      }, undefined, undefined, undefined, staticMode ? 'static' : 'runtime', staticFixtureAccess());
     assert.equal(fs.existsSync(marker), false, 'completion must not execute constructors or methods');
     return result;
   };
   const deadline = Date.now() + 20000;
   for (;;) {
     const text = pkg + '::api$scan()$collect';
-    const members = await client.provideCompletionItems({ getText: () => text },
+    const members = await completeStatic(client, { getText: () => text },
       { line: 0, character: text.length });
     if (members.items.some(item => item.label === 'collect' && item.detail?.includes('engine'))) break;
     assert.ok(Date.now() < deadline, 'the method popup has a signature supplied by installed package metadata: ' + JSON.stringify(members));
@@ -127,12 +130,14 @@ test("installed package chain signatures also supply arguments without running t
   await client.syncSessionState({ attachedPackages: [] });
   assert.deepEqual((await collect('api$scan()$collect(│)')).filter(item => item.role === 'argument'), [],
     'preparation must not retain members of a detached package');
-  client.setStaticAnalysis(false);
+  staticMode = false;
+  client.setStaticAnalysis(staticMode);
   assert.deepEqual((await collect(pkg + '::api$scan()$collect(│)'))
     .filter(item => item.role === 'argument'), [], 'source inference stays opt-in');
   assert.equal(inspections, 0, 'an executable receiver must not reach runtime inspection');
   await client.syncSessionState({ attachedPackages: [pkg] });
-  client.setStaticAnalysis(true);
+  staticMode = true;
+  client.setStaticAnalysis(staticMode);
   inspection = { status: 'arguments', names: ['live_arg'] };
   assert.deepEqual((await collect('api$scan(│)')).filter(item => item.role === 'argument')
     .map(item => item.label), ['live_arg'], 'live global shadows attached package catalog');

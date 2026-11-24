@@ -89,6 +89,8 @@ export async function pickCompletion({
     let refinedPrefix: string | undefined;
     let baselineEntries = initialEntries;
     let baselineIncomplete = initialEntries.isIncomplete === true;
+    let baselineReady = !stagedEntries && !delayedEntries;
+    let baselineGeneration = 0;
     let sourceEntries = initialEntries;
     let sourceIncomplete = baselineIncomplete;
     let baselinePhase = 0;
@@ -99,19 +101,40 @@ export async function pickCompletion({
       placeholder: completionPlaceHolder,
     });
     setQuickPickItems(pick, sourceEntries, "");
-    const updateBaseline = (phase: number, nextEntries: CompletionEntries | undefined): void => {
-      if (!active || !nextEntries || !isCurrent() || phase < baselinePhase) return;
+    const updateBaseline = (phase: number, nextEntries: CompletionEntries | undefined, generation = 0): void => {
+      if (!active || !nextEntries || !isCurrent() || generation !== baselineGeneration || phase < baselinePhase) return;
       // A slower native-only result must not replace the completed LSP merge.
       baselinePhase = phase;
       baselineEntries = nextEntries;
       baselineIncomplete = nextEntries.isIncomplete === true;
+      baselineReady = phase === 2;
       if (refinedPrefix !== undefined) return;
       sourceEntries = nextEntries;
-      sourceIncomplete = baselineIncomplete;
-      void changeValue(pick.value).catch(() => undefined);
+      sourceIncomplete = baselineIncomplete || !baselineReady;
+      if (pick.value) void changeValue(pick.value).catch(() => undefined);
+      else setQuickPickItems(pick, sourceEntries, pick.value);
     };
-    void stagedEntries?.then(entries => updateBaseline(1, entries)).catch(() => undefined);
+    void stagedEntries?.then(entries => updateBaseline(delayedEntries ? 1 : 2, entries)).catch(() => undefined);
     void delayedEntries?.then(entries => updateBaseline(2, entries)).catch(() => undefined);
+    const requestBaseline = async (currentRequest: number): Promise<void> => {
+      const generation = ++baselineGeneration;
+      baselinePhase = 0;
+      baselineReady = false;
+      let finished = false;
+      const publish = (phase: number, entries: CompletionEntries | undefined) => {
+        if (currentRequest === request) updateBaseline(phase, entries, generation);
+      };
+      try {
+        // Restore the exact source snapshot, including escaped prefixes and
+        // suffixes. A cancelled initial query may have supplied only staging.
+        const entries = await collect(context, latestInput.text, [...latestInput.lines], latestInput.cursorCol,
+          staged => { if (!finished) publish(1, staged); });
+        finished = true;
+        publish(2, entries);
+      } finally {
+        finished = true;
+      }
+    };
     const changeValue = async (value: string): Promise<void> => {
       const refinesBlankContext =
         context.prefix.length === 0 &&
@@ -119,12 +142,14 @@ export async function pickCompletion({
           context.kind === "argument" ||
           (context.kind === "bracket" && !!context.dataObjectName));
       if (value.length === 0) {
-        if (refinedPrefix !== undefined) cancelPending?.();
+        const wasRefined = refinedPrefix !== undefined;
+        if (wasRefined) cancelPending?.();
         refinedPrefix = undefined;
-        request += 1;
+        const currentRequest = ++request;
         sourceEntries = baselineEntries;
-        sourceIncomplete = baselineIncomplete;
+        sourceIncomplete = baselineIncomplete || !baselineReady;
         setQuickPickItems(pick, sourceEntries, value);
+        if (wasRefined && sourceIncomplete) await requestBaseline(currentRequest);
         return;
       }
 

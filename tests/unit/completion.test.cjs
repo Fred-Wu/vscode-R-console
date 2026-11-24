@@ -1714,7 +1714,13 @@ test("incomplete package completion re-queries until a complete result arrives",
 
   changeValue("");
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(completionCalls, 2);
+  assert.equal(completionCalls, 3, "clearing reloads the incomplete namespace baseline");
+  assert.deepEqual(quickPick.items.map(item => item.label), ["median"]);
+
+  changeValue("f");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 4, "the refreshed incomplete baseline still permits refinement");
+  assert.deepEqual(quickPick.items.map(item => item.label), ["filter"]);
 
   quickPick.hide();
   await request;

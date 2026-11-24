@@ -245,14 +245,18 @@ test('Quick Pick widening a completed query refreshes missing candidates', async
 
 test('clearing Quick Pick invalidates pending member and symbol results', async t => {
   for (const text of ['obj$', 'al']) {
-    let resolve;
+    const pending = [];
     const picker = await openPicker(t, text, entries(['alpha'], true),
-      () => new Promise(done => { resolve = done; }));
+      () => new Promise(done => { pending.push(done); }));
     await picker.type('az');
     await picker.type('');
-    resolve(entries(['azure']));
+    assert.equal(pending.length, 2, 'clearing refreshes the incomplete baseline');
+    pending[0](entries(['azure']));
     await tick();
     assert.deepEqual(picker.labels(), ['alpha'], text);
+    pending[1](entries(['alpine']));
+    await tick();
+    assert.deepEqual(picker.labels(), ['alpine'], text);
   }
 });
 

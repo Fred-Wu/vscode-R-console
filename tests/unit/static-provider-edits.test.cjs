@@ -216,3 +216,83 @@ test('an older picker closing cannot cancel a newer provider invocation', async 
   await h.hide();
   assert.equal(h.requests[1].bindings.signal.aborted, true);
 });
+
+test('clearing a refinement reloads an unfinished baseline with its exact input and edits', async t => {
+  for (const finishRefinement of [false, true]) {
+    for (const marked of ['factory()$al│', 'head <- 1\nfactory()$al│ + 2', 'factory()[["\\u0061│"]]']) {
+      const pendingRequests = [];
+      const h = await openStaticPicker(t, marked, request => new Promise(resolve => pendingRequests.push({ request, resolve })));
+      await h.type('be');
+      assert.equal(pendingRequests.length, 2);
+      assert.equal(pendingRequests[0].request.bindings.signal.aborted, true);
+      const member = label => resolved([{ label, insertText: label, role: 'member', kind: 4 }]);
+      if (finishRefinement) {
+        pendingRequests[1].resolve(member('beta'));
+        await tick();
+      }
+      await h.type('');
+      assert.equal(pendingRequests.length, 3, 'clearing starts a fresh baseline request');
+      assert.equal(pendingRequests[1].request.bindings.signal.aborted, true);
+      assert.equal(pendingRequests[2].request.input, h.input.text);
+      assert.equal(pendingRequests[2].request.cursor, h.input.textBeforeCursor.length);
+      pendingRequests[2].resolve(member('alpha'));
+      await tick();
+      pendingRequests[0].resolve(member('ancient'));
+      pendingRequests[1].resolve(member('beta'));
+      await tick();
+      assert.deepEqual(h.pick.items.filter(item => 'insertText' in item).map(item => item.insertText), ['alpha']);
+      await h.accept();
+      assert.equal(h.terminal.inputState.text, marked.replace(/(?:al|\\u0061)│/, 'alpha'), marked);
+    }
+  }
+});
+
+test('clearing preserves a complete baseline and refreshes incomplete or staged suggestions', async t => {
+  for (const baseline of ['complete', 'empty', 'incomplete', 'staged']) {
+    let initial;
+    const h = await openStaticPicker(t, 'al│', async request => {
+      if (request.input !== 'al') return pending();
+      if (baseline === 'staged') return new Promise(resolve => { initial = resolve; });
+      if (baseline === 'empty') return { status: 'resolved-empty', completion: { items: [] } };
+      return { status: 'resolved', completion: {
+        items: [{ label: 'alpha', insertText: 'alpha', role: 'symbol', kind: 5 }], isIncomplete: baseline === 'incomplete',
+      } };
+    }, baseline === 'staged' ? { workspace: { globalenv: { already: { type: 'double' } } } } : {});
+    await h.type('be');
+    const before = h.requests.length;
+    await h.type('');
+    assert.equal(h.requests.length - before, Number(baseline === 'incomplete' || baseline === 'staged'), baseline);
+    if (baseline === 'complete') {
+      assert.ok(h.pick.items.some(item => item.insertText === 'alpha'));
+    } else if (baseline === 'empty') {
+      assert.equal(h.pick.items.length, 0, 'an authoritative empty baseline needs no retry');
+    } else if (baseline === 'staged') {
+      assert.ok(h.pick.items.some(item => item.insertText === 'already'), 'staged candidates remain usable during reload');
+      initial(resolved([{ label: 'alpha', insertText: 'alpha', role: 'symbol', kind: 5 }]));
+      await tick();
+      assert.ok(h.pick.items.some(item => item.insertText === 'alpha'));
+    }
+    await h.hide();
+  }
+});
+
+test('a restored baseline cannot outlive a newer search or a dismissed picker', async t => {
+  for (const next of ['be', 'hide']) {
+    const waiting = [];
+    const h = await openStaticPicker(t, 'factory()$al│', request => new Promise(resolve => waiting.push({ request, resolve })));
+    await h.type('be');
+    await h.type('');
+    const restored = waiting[2];
+    if (next === 'hide') await h.hide();
+    else {
+      await h.type(next);
+      waiting[3].resolve(resolved([{ label: 'beta', insertText: 'beta', role: 'member', kind: 4 }]));
+      await tick();
+    }
+    assert.equal(restored.request.bindings.signal.aborted, true);
+    restored.resolve(resolved([{ label: 'alpha', insertText: 'alpha', role: 'member', kind: 4 }]));
+    await tick();
+    assert.ok(!h.pick.items.some(item => item.insertText === 'alpha'));
+    if (next !== 'hide') await h.accept();
+  }
+});

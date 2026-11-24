@@ -35,3 +35,28 @@ test('native array replies normalize member provenance before static filtering',
   result.items.pop();
   assert.equal(input.length, 2);
 });
+
+test('protocol syntax shares tokenization and preserves the actual cursor on fuzzy requests', () => {
+  const lexer = loadSource('src/Language/lexer.ts');
+  let tokenizations = 0;
+  const { createCompletionParams } = loadSource('src/Language/completion/protocol.ts', {
+    '../lexer': { ...lexer, tokenize: (...args) => { tokenizations++; return lexer.tokenize(...args); } },
+  });
+  for (const [marked, expected] of [
+    ['factory()[[1]] |> target(│)', { rConsoleCall: 'target', rConsoleArgumentTags: ['', null] }],
+    ['target(df[, col│])', { rConsoleDataObject: 'df', rConsoleSubscriptOperator: '[', rConsoleSubscriptTags: ['', null] }],
+    ['target(df[1]) |> fo│obar()', { rConsolePipe: true, rConsolePrefix: 'f' }],
+  ]) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const position = { line: 0, character: cursor }, query = { line: 0, character: cursor - 1 };
+    const document = { getText: () => text, offsetAt: p => p.character };
+    const projection = { document, toServerPosition: p => p };
+    const client = { code2ProtocolConverter: { asCompletionParams: (_doc, pos) => ({ position: pos }) } };
+    const before = tokenizations;
+    const params = createCompletionParams(client, projection, query, position, {}, true);
+    // A mid-token cursor may require one additional scan of that token fragment.
+    assert.ok(tokenizations - before <= 2, `${marked}: ${tokenizations - before} scans`);
+    assert.equal(params.position, query);
+    for (const [name, value] of Object.entries(expected)) assert.deepEqual(params[name], value, marked + ': ' + name);
+  }
+});

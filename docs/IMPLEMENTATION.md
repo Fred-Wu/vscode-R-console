@@ -754,6 +754,11 @@ snapshots. Closing or accepting a picker cancels its outstanding binding reads
 and provider invocation. Clearing a refined query or entering an unsupported
 preview context also cancels that refinement. Each picker owns its cancellation
 controller so an older picker can finish independently of a newer request.
+Clearing search reuses a completed baseline. If that baseline is incomplete or
+its original request was cancelled, the picker requests the exact original input
+again. Restored baselines retain staged results while pending and reject replies
+from earlier baseline generations. New searches and dismissal invalidate pending
+restorations.
 No expression evaluation operation is exposed by the resolver.
 
 Static providers return a completion list with explicit items and completeness.
@@ -796,7 +801,9 @@ selector is in `sourceReceiver.ts`. Method argument validation reuses root bindi
 evidence from the call site, preserving source scope across statement layouts. It preserves function-versus-value lookup and
 opaque roots after native safety refusals. The protocol adapter constructs source-related
 supplemental parameters from the projected document, including opaque-binding
-positions and package qualifications. Unsupported adapter contexts, including
+positions and package qualifications. Call, pipe and subscript parameters share
+one lexical snapshot at the original context cursor, including during fuzzy
+prefix retries. Unsupported adapter contexts, including
 computed multidimensional bracket completion, return `unsupported-context`.
 Transitive dependency discovery remains limited by the installed provider;
 providers implementing the general contract can request additional bindings
@@ -815,6 +822,9 @@ The adapter can reject conflicting metadata when both indexes supply evidence;
 it relies on native scope inference where the outline has no current declaration.
 `tests/static-provider.test.cjs` verifies the general contract with the real
 language-server adapter, fresh stored definitions and opaque binding barriers.
+Source-completion integration fixtures exercise the explicit static provider
+boundary and the production collector, with missing-binding resolvers for fixtures
+that have no embedded R session. Live-binding fixtures supply native inspection.
 `tests/unit/static-bindings.test.cjs` covers resolver limits, lookup identity,
 scopes and cancellation. `tests/static-delegation.test.cjs` exercises the actual native resolver and
 verifies binding provenance, parse-queue replay, callable metadata compatibility,
