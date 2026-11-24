@@ -753,9 +753,10 @@ settle as cancelled, while the shared resolver retains snapshots for prefix retr
 Cancellation propagates to the native LSP request
 through its cancellation token. New input and picker refinements obtain fresh
 snapshots. Closing or accepting a picker cancels its outstanding binding reads
-and provider invocation. Each picker owns its cancellation controller so an older
-picker can finish independently of a newer request. No expression evaluation
-operation is exposed by the resolver.
+and provider invocation. Clearing a refined query or entering an unsupported
+preview context also cancels that refinement. Each picker owns its cancellation
+controller so an older picker can finish independently of a newer request.
+No expression evaluation operation is exposed by the resolver.
 
 Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
 `unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
@@ -769,6 +770,10 @@ Value candidates retain their explicit insertion text, with snippet expansion
 when requested. The native adapter formats its literal string choices using the
 current R quoting context before passing them to presentation. Shared R name and
 literal formatting resides in `completion/rText.ts`.
+Deduplication preserves choices with distinct roles, insertion text, replacement
+ranges or package identities, even when their display text matches.
+Inline member refinement refreshes the provider whenever cached edits cannot be
+rebased to the new prefix, while retaining safely reusable suggestions.
 Resolved static argument candidates retain their provider's signature evidence.
 The native adapter retains validated
 expression symbols when callable parameter inference is unavailable, while

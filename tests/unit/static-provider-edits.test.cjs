@@ -177,6 +177,34 @@ test('dismissing a pending refinement cancels its capability', async t => {
   assert.equal(bindings.isCurrent(), false);
 });
 
+test('clearing or invalidating a pending picker refinement revokes its capability', async t => {
+  for (const [original, nextQuery] of [['factory()$', ''], ['obj$', '(']]) {
+    let read, reads = 0;
+    const h = await openStaticPicker(t, original + '│', async request => {
+      if (request.input === original) return { status: 'resolved', completion: {
+        items: [{ label: 'alpha', role: 'member', kind: 4 }], isIncomplete: true,
+      } };
+      read = request.bindings.resolve({ name: 'factory', lookup: 'function', scope: { kind: 'search-path' } });
+      return new Promise(() => {});
+    }, { requestSource: () => { reads++; return new Promise(() => {}); } });
+    await h.type('al');
+    const bindings = h.requests[1].bindings;
+    assert.equal(bindings.isCurrent(), true);
+    await h.type(nextQuery);
+    assert.equal(bindings.signal.aborted, true);
+    assert.equal(bindings.isCurrent(), false);
+    assert.deepEqual(await Promise.race([read, tick().then(() => 'still pending')]),
+      { status: 'unavailable', reason: 'cancelled' });
+    assert.deepEqual(await bindings.resolve({ name: 'other', lookup: 'function', scope: { kind: 'search-path' } }),
+      { status: 'unavailable', reason: 'cancelled' });
+    assert.equal(reads, 1);
+    if (nextQuery === '') {
+      await h.accept();
+      assert.equal(h.terminal.inputState.text, 'factory()$alpha');
+    } else await h.hide();
+  }
+});
+
 test('an older picker closing cannot cancel a newer provider invocation', async t => {
   const h = await openStaticPicker(t, 'factory()$│', () => new Promise(() => {}));
   h.start();

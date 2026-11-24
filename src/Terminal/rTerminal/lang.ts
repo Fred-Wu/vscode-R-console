@@ -296,6 +296,7 @@ export class RTermLang {
         stagedEntries: stagedBracketEntries,
         delayedEntries: opensBeforeFullResults ? fullEntriesPromise : undefined,
         force, isCurrent: () => this.isCurrentCompletionRequest(requestId),
+        cancelPending: () => requestBindings.abort(),
         collect: async (nextContext, nextInputText, lines, cursorCol, onStagedEntries) => {
           if (!this.isCurrentCompletionRequest(requestId)) return undefined;
           requestBindings.abort();
@@ -496,10 +497,13 @@ export class RTermLang {
   }
 
   /** True only after a successful, complete cache refinement in the same
-   * member context. A partial language-server result must still be refreshed. */
+   * member context. Partial results and edits discarded during refinement
+   * require a provider refresh. */
   hasCompleteInlineMemberCache(): boolean {
-    return this.inlineCache?.context.kind === "member" &&
-      this.inlineCache.entries.isIncomplete !== true;
+    const cache = this.inlineCache;
+    return cache?.context.kind === "member" && cache.entries.isIncomplete !== true &&
+      cache.entries.every(entry => entry.replaceStart === undefined ||
+        entry.replaceStart === cache.context.replaceStart);
   }
 
   cancelCompletion(): void {

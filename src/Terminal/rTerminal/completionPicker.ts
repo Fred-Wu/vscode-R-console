@@ -10,7 +10,7 @@ import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
 export async function pickCompletion({
-  context, latestInput, initialEntries, stagedEntries, delayedEntries, force, isCurrent, collect, signal,
+  context, latestInput, initialEntries, stagedEntries, delayedEntries, force, isCurrent, collect, signal, cancelPending,
 }: {
   context: CompletionContext;
   latestInput: InputSnapshot;
@@ -19,6 +19,7 @@ export async function pickCompletion({
   delayedEntries?: Promise<CompletionEntries | undefined>;
   force: boolean;
   signal?: AbortSignal;
+  cancelPending?: () => void;
   isCurrent: () => boolean;
   collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number,
     onStagedEntries: (entries: CompletionEntries) => void) => Promise<CompletionEntries | undefined>;
@@ -118,6 +119,7 @@ export async function pickCompletion({
           context.kind === "argument" ||
           (context.kind === "bracket" && !!context.dataObjectName));
       if (value.length === 0) {
+        if (refinedPrefix !== undefined) cancelPending?.();
         refinedPrefix = undefined;
         request += 1;
         sourceEntries = baselineEntries;
@@ -180,6 +182,7 @@ export async function pickCompletion({
           : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
             nextInputText.slice(fullTextBeforeCursor.length));
       if (!nextContext) {
+        cancelPending?.();
         return;
       }
       if (prefix.length > 0) {

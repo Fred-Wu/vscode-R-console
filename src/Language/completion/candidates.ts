@@ -101,7 +101,7 @@ export function filterShadowedWorkspaceEntries(
   }
 
   const workspaceLabels = new Set(
-    workspaceEntries.map(getCompletionIdentityKey)
+    workspaceEntries.map(getCompletionDisplayKey)
   );
   const workspaceNames = new Set(workspaceEntries.map(entry => entry.label));
 
@@ -110,7 +110,7 @@ export function filterShadowedWorkspaceEntries(
       return true;
     }
     if (entry.detail === "[workspace]" && workspaceNames.has(entry.label)) return false;
-    return !workspaceLabels.has(getCompletionIdentityKey(entry));
+    return !workspaceLabels.has(getCompletionDisplayKey(entry));
   });
 }
 
@@ -120,7 +120,11 @@ export function dedupeCompletionEntries(
   const seen = new Set<string>();
   const result: CompletionEntry[] = [];
   for (const entry of entries) {
-    const key = getCompletionIdentityKey(entry);
+    // Identical display text can offer different operations, such as inserting
+    // an argument tag or its namesake variable. Preserve those choices and
+    // edits targeting different ranges or package functions.
+    const key = JSON.stringify([getCompletionDisplayKey(entry), entry.role,
+      entry.insertText, entry.replaceStart, entry.replaceEnd, entry.packageName]);
     if (seen.has(key)) {
       continue;
     }
@@ -130,12 +134,12 @@ export function dedupeCompletionEntries(
   return result;
 }
 
-function getCompletionIdentityKey(entry: CompletionEntry): string {
-  return [
+function getCompletionDisplayKey(entry: CompletionEntry): string {
+  return JSON.stringify([
     entry.label,
     entry.detail ?? "",
     getCompletionDescription(entry),
-  ].join("\u0000");
+  ]);
 }
 
 export function getCompletionDescription(entry: CompletionEntry): string {

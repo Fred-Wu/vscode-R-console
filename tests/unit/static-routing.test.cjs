@@ -943,6 +943,59 @@ test('typed static candidates supply members and arguments without native annota
   }
 });
 
+test('static choices with the same display text retain distinct roles and insertions', async () => {
+  const choices = [
+    { label: 'alpha', insertText: 'alpha = ', kind: 5, role: 'argument' },
+    { label: 'alpha', insertText: 'alpha', kind: 5, role: 'symbol' },
+    { label: 'alpha', insertText: 'alpha[[1]]', kind: 5, role: 'symbol' },
+  ];
+  for (const items of [choices, [...choices].reverse()]) {
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: {
+      items: [...items, ...items.map(item => ({ ...item }))],
+    } }) });
+    const entries = await h.complete('f(al');
+    assert.deepEqual(labels(entries).sort(), choices.map(item => item.insertText).sort());
+    assert.ok(entries.some(item => item.label === 'Arguments'), 'argument choice remains grouped');
+    assert.ok(entries.some(item => item.label === 'Other'), 'expression choices remain grouped');
+  }
+});
+
+test('static choices preserve different edit ranges and package identities', async () => {
+  for (const fixture of [
+    { text: 'identity(co)', cursor: 11, items: [
+      { label: 'column', insertText: 'column', kind: 5, role: 'symbol',
+        range: { start: new Position(0, 9), end: new Position(0, 11) } },
+      { label: 'column', insertText: 'column', kind: 5, role: 'symbol',
+        range: { start: new Position(0, 0), end: new Position(0, 12) } },
+    ], expected: ['identity(column)', 'column'] },
+    { text: 'fi', cursor: 2, items: ['stats', 'dplyr'].map(packageName => ({
+      label: 'filter', insertText: 'filter()', kind: 2, role: 'symbol', packageName,
+    })), expected: ['stats', 'dplyr'] },
+  ]) {
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: {
+      items: [...fixture.items, ...fixture.items.map(item => ({ ...item }))],
+    } }) });
+    const entries = (await h.complete(fixture.text, fixture.cursor)).filter(item => 'insertText' in item);
+    assert.deepEqual(entries.map(item => item.packageName ??
+      fixture.text.slice(0, item.replaceStart) + item.insertText + fixture.text.slice(item.replaceEnd)),
+    fixture.expected);
+  }
+});
+
+test('inline members with edits that cannot be rebased request fresh provider results', async () => {
+  const h = harness({ staticProvider: async request => ({ status: 'resolved', completion: { items: [{
+    label: 'alpha', insertText: 'alpha'.slice(request.input.length - 'factory()$'.length), kind: 4, role: 'member',
+    range: { start: request.contextPosition, end: request.contextPosition },
+  }] } }) });
+  assert.deepEqual(labels(await h.complete('factory()$a')), ['lpha']);
+  assert.deepEqual(h.lang.refineInlineCompletion(snapshot('factory()$al')), []);
+  assert.equal(h.lang.hasCompleteInlineMemberCache(), false,
+    'dropping a cursor-dependent edit must schedule a provider refresh');
+  const entries = (await h.complete('factory()$al')).filter(item => 'insertText' in item);
+  assert.equal(entries.length, 1);
+  assert.equal('factory()$al'.slice(0, entries[0].replaceStart) + entries[0].insertText, 'factory()$alpha');
+});
+
 test('explicit static provenance excludes ambient symbols and external workspace candidates', async () => {
   for (const text of ['factory()$al', 'factory()[["al']) {
     const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
