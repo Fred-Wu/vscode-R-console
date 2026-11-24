@@ -86,7 +86,7 @@ export type StaticCompletionCandidate = CompletionCandidate & {
 };
 
 type CompletionMetadata = {
-  rConsoleStaticStatus?: StaticCompletionOutcome["status"];
+  staticStatus?: StaticCompletionOutcome["status"];
   rConsoleBindingSuppressionReason?: CompletionSuppressionReason;
   // Applies even when filtering leaves no arguments or the definition has none.
   rConsoleRuntimeOnly?: boolean;
@@ -101,22 +101,19 @@ type CompletionMetadata = {
 };
 
 export type CompletionResult = (vscode.CompletionList<CompletionCandidate> | CompletionCandidate[]) & CompletionMetadata;
-export type StaticCompletionResult = (vscode.CompletionList<StaticCompletionCandidate> | StaticCompletionCandidate[]) & CompletionMetadata;
+export type StaticCompletionResult = vscode.CompletionList<StaticCompletionCandidate> & CompletionMetadata;
 
 export type CompletionAnalysisMode = "runtime" | "static";
 
 export type BindingLookup = "function" | "value" | "identity";
-export type BindingScope = { kind: "search-path" } | { kind: "closure"; bindingId: string };
 export type StaticBindingQuery = {
   name: string;
   lookup: BindingLookup;
-  scope: BindingScope;
-  depth?: number;
 };
 export type StaticBindingResult =
-  | { status: "source"; source: string; bindingId: string; closureScope: BindingScope }
+  | { status: "source"; source: string }
   | { status: "package" | "missing" | "not-callable" | "opaque" }
-  | { status: "unavailable"; reason: "unsupported-scope" | "invalid-request" | "cancelled" | "analysis-limit" | "runtime-unavailable" }
+  | { status: "unavailable"; reason: "invalid-request" | "cancelled" | "analysis-limit" | "runtime-unavailable" }
   | { status: "suppressed"; reason: CompletionSuppressionReason };
 
 /** Request-local capability. Each lookup independently enforces runtime safety. */

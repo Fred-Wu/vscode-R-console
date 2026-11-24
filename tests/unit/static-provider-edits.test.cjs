@@ -145,7 +145,7 @@ test('closing Quick Pick revokes pending provider capabilities and immediately c
     for (const readBeforeClose of [false, true]) {
       let read, reads = 0;
       const h = await openStaticPicker(t, action === 'accept' ? 'fa│' : 'factory()$│', request => {
-        if (readBeforeClose) read = request.bindings.resolve({ name: 'factory', lookup: 'function', scope: { kind: 'search-path' } });
+        if (readBeforeClose) read = request.bindings.resolve({ name: 'factory', lookup: 'function' });
         return new Promise(() => {});
       }, {
         workspace: { globalenv: { factory: { type: 'closure' } } },
@@ -155,7 +155,7 @@ test('closing Quick Pick revokes pending provider capabilities and immediately c
       await h[action]();
       assert.equal(bindings.signal.aborted, true, action);
       assert.equal(bindings.isCurrent(), false, action);
-      read ??= bindings.resolve({ name: 'factory', lookup: 'function', scope: { kind: 'search-path' } });
+      read ??= bindings.resolve({ name: 'factory', lookup: 'function' });
       assert.deepEqual(await Promise.race([read, tick().then(() => 'still pending')]),
         { status: 'unavailable', reason: 'cancelled' }, action);
       assert.equal(reads, Number(readBeforeClose), 'a dismissed provider cannot start another native inspection');
@@ -184,7 +184,7 @@ test('clearing or invalidating a pending picker refinement revokes its capabilit
       if (request.input === original) return { status: 'resolved', completion: {
         items: [{ label: 'alpha', role: 'member', kind: 4 }], isIncomplete: true,
       } };
-      read = request.bindings.resolve({ name: 'factory', lookup: 'function', scope: { kind: 'search-path' } });
+      read = request.bindings.resolve({ name: 'factory', lookup: 'function' });
       return new Promise(() => {});
     }, { requestSource: () => { reads++; return new Promise(() => {}); } });
     await h.type('al');
@@ -195,7 +195,7 @@ test('clearing or invalidating a pending picker refinement revokes its capabilit
     assert.equal(bindings.isCurrent(), false);
     assert.deepEqual(await Promise.race([read, tick().then(() => 'still pending')]),
       { status: 'unavailable', reason: 'cancelled' });
-    assert.deepEqual(await bindings.resolve({ name: 'other', lookup: 'function', scope: { kind: 'search-path' } }),
+    assert.deepEqual(await bindings.resolve({ name: 'other', lookup: 'function' }),
       { status: 'unavailable', reason: 'cancelled' });
     assert.equal(reads, 1);
     if (nextQuery === '') {

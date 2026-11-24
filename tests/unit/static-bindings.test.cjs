@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const loadSource = require('../helpers/load-source.cjs');
 const { createGuardedBindingResolver } = loadSource('src/Language/completion/bindings.ts');
-const query = (name, lookup = 'function', extra = {}) => ({ name, lookup, scope: { kind: 'search-path' }, ...extra });
+const query = (name, lookup = 'function', extra = {}) => ({ name, lookup, ...extra });
 
 test('binding capability preserves lookup identity and caches only within one request', async () => {
   const calls = [];
@@ -24,30 +24,25 @@ test('binding capability preserves lookup identity and caches only within one re
   assert.equal((await createGuardedBindingResolver(inspect).resolve(query('factory'))).source, source);
 });
 
-test('verified global closures expose their scope and unknown captured scopes stay unavailable', async () => {
-  const calls = [];
-  const resolver = createGuardedBindingResolver(async name => {
-    calls.push(name);
-    return { status: 'source', text: 'function() helper()' };
-  });
-  const factory = await resolver.resolve(query('factory'));
-  assert.deepEqual(factory.closureScope, { kind: 'search-path' });
-  assert.equal((await resolver.resolve(query('helper', 'function', { scope: factory.closureScope }))).status, 'source');
-  const dependency = await resolver.resolve(query('helper', 'function', { scope: { kind: 'closure', bindingId: 'captured' } }));
-  assert.deepEqual(dependency, { status: 'unavailable', reason: 'unsupported-scope' });
-  assert.deepEqual(calls, ['factory', 'helper']);
+test('binding queries reject unsupported scopes and options without inspecting a namesake', async () => {
+  const resolver = createGuardedBindingResolver(async () => assert.fail('invalid query must not inspect R'));
+  const inheritedScope = Object.assign(Object.create({ scope: { kind: 'closure' } }), query('factory'));
+  assert.equal((await resolver.resolve(inheritedScope)).reason, 'invalid-request');
+  for (const extra of [{ scope: { kind: 'closure', bindingId: 'captured' } }, { depth: 1 }]) {
+    assert.deepEqual(await resolver.resolve(query('factory', 'function', extra)),
+      { status: 'unavailable', reason: 'invalid-request' });
+  }
 });
 
-test('binding limits cover concurrent source reads, lookups, depth and invalid requests', async () => {
+test('binding limits cover concurrent source reads, lookups and invalid requests', async () => {
   const calls = [];
   const resolver = createGuardedBindingResolver(async name => {
     calls.push(name); return { status: 'source', text: 'function() 1' };
-  }, { limits: { lookups: 3, sourceBytes: 16, totalBytes: 16, depth: 2 } });
+  }, { limits: { lookups: 3, sourceBytes: 16, totalBytes: 16 } });
   const results = await Promise.all(['a', 'b', 'c', 'd'].map(name => resolver.resolve(query(name))));
   assert.equal(results.filter(x => x.status === 'source').length, 1);
   assert.equal(results.filter(x => x.reason === 'analysis-limit').length, 3);
   assert.deepEqual(calls, ['a', 'b', 'c']);
-  assert.equal((await resolver.resolve(query('a', 'function', { depth: 3 }))).reason, 'analysis-limit');
   for (const q of [query(''), query('bad\0name'), query('a', 'evaluate'), query('a', 'function', { depth: -1 })]) {
     assert.equal((await resolver.resolve(q)).reason, 'invalid-request');
   }
@@ -127,7 +122,7 @@ test('provider lifetime closes pending reads and invalidates stale document resp
     document.version++;
     return { status: 'resolved', completion: { items: [{ label: 'stale' }] } };
   } }, request);
-  assert.equal(stale.rConsoleStaticStatus, 'pending');
+  assert.equal(stale.staticStatus, 'pending');
   assert.deepEqual(stale.items, []);
 });
 
@@ -149,7 +144,7 @@ test('failed and cancelled providers immediately settle their outstanding bindin
       bindings: { signal: controller.signal, isCurrent: () => !controller.signal.aborted,
         resolve: () => new Promise(() => {}) },
     });
-    assert.equal(result.rConsoleStaticStatus, end === 'failure' ? 'unresolved' : 'pending');
+    assert.equal(result.staticStatus, end === 'failure' ? 'unresolved' : 'pending');
     assert.deepEqual(await Promise.race([
       read, new Promise(resolve => setImmediate(() => resolve('still pending'))),
     ]), { status: 'unavailable', reason: 'cancelled' }, end);
@@ -167,7 +162,7 @@ test('runtime-only providers cannot silently supply static completion', async ()
     position, contextPosition: position, requestScope: {},
     bindings: createGuardedBindingResolver(async () => assert.fail('no binding lookup without static support')),
   });
-  assert.equal(result.rConsoleStaticStatus, 'unresolved');
+  assert.equal(result.staticStatus, 'unresolved');
   assert.equal(result.rConsoleStaticUnavailableReason, 'provider-unavailable');
   assert.deepEqual(result.items, []);
 });
@@ -182,8 +177,26 @@ test('settled binding snapshots survive the lookup deadline while new reads and 
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.deepEqual(await resolver.resolve(query('factory')), first);
   assert.equal((await resolver.resolve(query('another'))).reason, 'analysis-limit');
-  assert.equal((await resolver.resolve(query('factory', 'function', { depth: 9 }))).reason, 'analysis-limit');
   controller.abort();
   assert.equal((await resolver.resolve(query('factory'))).reason, 'cancelled');
   assert.deepEqual(calls, ['factory']);
+});
+
+test('provider outcomes preserve evidence without publishing refused candidates or mutating provider lists', async () => {
+  const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+  const input = 'factory()$';
+  const completion = Object.freeze({ items: Object.freeze([{ label: 'alpha', role: 'member' }]),
+    isIncomplete: true, rConsoleArgumentsResolved: false });
+  for (const status of ['resolved', 'resolved-empty', 'unresolved', 'pending']) {
+    const reply = await requestStaticCompletion({ provideStaticCompletion: async () => ({
+      status, completion, reason: 'receiver-unresolved',
+    }) }, { document: { version: 1, getText: () => input }, input,
+      bindings: createGuardedBindingResolver() });
+    assert.equal(reply.staticStatus, status);
+    assert.deepEqual(reply.items.map(item => item.label), status === 'resolved' ? ['alpha'] : []);
+    assert.equal(reply.rConsoleArgumentsResolved, false, 'signature barriers survive empty results');
+    assert.equal(reply.isIncomplete, status !== 'resolved-empty');
+    reply.items.push({ label: 'local' });
+    assert.equal(completion.items.length, 1, 'presentation cannot mutate a provider snapshot');
+  }
 });

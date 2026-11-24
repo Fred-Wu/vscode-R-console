@@ -50,7 +50,7 @@ test('general static contract uses the real languageserver adapter and preserves
     });
   };
   let result = await complete('factory()$');
-  assert.equal(result.rConsoleStaticStatus, 'resolved');
+  assert.equal(result.staticStatus, 'resolved');
   assert.ok(result.items.some(item => item.label === 'alpha'));
   assert.deepEqual(calls, [['factory', 'source']]);
   snapshot = { status: 'source', text: 'function() list(beta=1)' };
@@ -61,7 +61,7 @@ test('general static contract uses the real languageserver adapter and preserves
     snapshot = refusal;
     result = await complete('factory()$');
     assert.deepEqual(result.items, [], refusal.status);
-    assert.equal(result.rConsoleStaticStatus, 'unresolved', refusal.status);
+    assert.equal(result.staticStatus, 'unresolved', refusal.status);
   }
   snapshot = { status: 'missing' };
   result = await complete('factory <- function() list(draft=1); factory()$');
@@ -71,7 +71,7 @@ test('general static contract uses the real languageserver adapter and preserves
   for (const text of ['g <- function(f) { f(me', 'g <- function(f) { f(x = me',
     'f <- unknown_factory(); f(me']) {
     result = await complete(text);
-    assert.equal(result.rConsoleStaticStatus, 'resolved', text);
+    assert.equal(result.staticStatus, 'resolved', text);
     assert.equal(result.rConsoleArgumentsResolved, false, text);
     assert.ok(result.items.some(item => item.label === 'mean'), text);
     assert.ok(!result.items.some(item => item.detail === 'parameter'), text);
@@ -84,7 +84,7 @@ test('general static contract uses the real languageserver adapter and preserves
   for (const text of ['factory()[, co', 'factory()[1, "co']) {
     const before = calls.length;
     result = await complete(text);
-    assert.equal(result.rConsoleStaticStatus, 'unresolved');
+    assert.equal(result.staticStatus, 'unresolved');
     assert.equal(result.rConsoleStaticUnavailableReason, 'unsupported-context');
     assert.deepEqual(result.items, []);
     assert.equal(calls.length, before, 'unsupported adapter contexts do not inspect runtime bindings');

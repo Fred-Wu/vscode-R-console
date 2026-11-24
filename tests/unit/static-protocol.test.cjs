@@ -19,3 +19,19 @@ test('static requests leave unfinished syntax recovery to languageserver', () =>
     assert.equal(document.getText(), text);
   }
 });
+
+test('native array replies normalize member provenance before static filtering', () => {
+  const { adaptNativeCompletionResult } = loadSource('src/Language/completion/nativeMetadata.ts');
+  const input = Object.freeze(Object.assign([
+    Object.freeze({ label: 'alpha', data: { type: 'member' } }),
+    Object.freeze({ label: 'ambient', data: { type: 'scope' } }),
+  ], { rConsoleMemberResolved: true }));
+  const result = adaptNativeCompletionResult(input);
+  assert.equal(Array.isArray(result), false);
+  assert.equal(Object.hasOwn(result, "0"), false, "raw candidates must exist only in the validated items list");
+  assert.equal(result.isIncomplete, false);
+  assert.equal(result.rConsoleMemberResolved, true);
+  assert.deepEqual(result.items.map(item => item.role), ['member', 'scope']);
+  result.items.pop();
+  assert.equal(input.length, 2);
+});

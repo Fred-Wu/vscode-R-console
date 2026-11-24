@@ -33,5 +33,7 @@ export function adaptNativeCompletionResult(result: CompletionResult, context?: 
     };
   };
   const items = (Array.isArray(result) ? result : result.items).map(adapt);
-  return Array.isArray(result) ? Object.assign([], result, items) : { ...result, items };
+  const metadata = Array.isArray(result)
+    ? Object.fromEntries(Object.entries(result).filter(([key]) => !/^\d+$/.test(key))) : result;
+  return { ...metadata, items, isIncomplete: !Array.isArray(result) && result.isIncomplete === true };
 }

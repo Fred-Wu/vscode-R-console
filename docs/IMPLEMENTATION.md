@@ -730,19 +730,17 @@ applying them to the original input. Insertion and partial-token edits retain
 the relevant preview text; replacement bounds are checked against the original
 buffer, including multiline suffixes and escaped quoted prefixes.
 
-Providers discover dependencies and can request several bindings iteratively.
-Each request names a binding, function/value/identity lookup semantics, its lookup
-scope and dependency depth. The resolver maps these to native source,
-source-value and binding operations. Results distinguish source, verified package
-identity, missing, non-callable, opaque, safety refusal and unavailable information.
-Source snapshots carry a request-local binding identity and the verified global
-lookup scope of their closure. The native serializer accepts closures enclosed
+The console provider can request several current search-path bindings through
+`resolve({ name, lookup })`. Lookup distinguishes function, value and binding
+identity semantics and maps to native source, source-value and binding operations.
+Results distinguish source, verified package identity, missing, non-callable,
+opaque, safety refusal and unavailable information. Unknown query fields are
+rejected before native inspection. The native serializer accepts closures enclosed
 by the global environment; captured local/namespace closures remain unavailable.
-Requests for other closure environments return `unsupported-scope`.
 
 Binding reads are cached by name and lookup semantics only within one completion
 request and its prefix retry. Defaults permit 16 distinct reads, 64 KiB per source,
-256 KiB in total and dependency depth 8. A shared 1.5-second lookup deadline starts
+256 KiB in total. A shared 1.5-second lookup deadline starts
 with the first read and bounds new and pending inspection. Settled snapshots remain
 available to prefix retries while the request is current. Cancellation, input
 changes, session changes and setting
@@ -758,6 +756,10 @@ preview context also cancels that refinement. Each picker owns its cancellation
 controller so an older picker can finish independently of a newer request.
 No expression evaluation operation is exposed by the resolver.
 
+Static providers return a completion list with explicit items and completeness.
+Native array replies are normalized at the adapter boundary. The request boundary
+carries `staticStatus` through collection and suppresses candidates from unresolved
+or pending replies while retaining their diagnostic metadata.
 Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
 `unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
 pending analysis is retried on a later request. Static candidates declare a typed
@@ -792,7 +794,9 @@ information its current projection can consume, requests it through the resolver
 and projects one eligible stored closure ahead of editable input. Its receiver
 selector is in `sourceReceiver.ts`. Method argument validation reuses root binding
 evidence from the call site, preserving source scope across statement layouts. It preserves function-versus-value lookup and
-opaque roots after native safety refusals. Unsupported adapter contexts, including
+opaque roots after native safety refusals. The protocol adapter constructs source-related
+supplemental parameters from the projected document, including opaque-binding
+positions and package qualifications. Unsupported adapter contexts, including
 computed multidimensional bracket completion, return `unsupported-context`.
 Transitive dependency discovery remains limited by the installed provider;
 providers implementing the general contract can request additional bindings

@@ -714,7 +714,7 @@ test('static provider cancellation reaches the LSP and rejects late results', as
   controller.abort();
   assert.equal(token.isCancellationRequested, true);
   const result = await pending;
-  assert.equal(result.rConsoleStaticStatus, 'pending');
+  assert.equal(result.staticStatus, 'pending');
   assert.deepEqual(result.items, []);
   release({ items: [{ label: 'stale' }] });
 });

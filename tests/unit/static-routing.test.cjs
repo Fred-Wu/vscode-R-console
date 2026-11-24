@@ -908,7 +908,7 @@ test('static providers discover multiple dependencies without terminal receiver 
         requests.push(request);
         assert.deepEqual(h.sourceRequests, [], 'terminal performs no speculative source lookup');
         for (const name of ['helper', 'left', 'factory']) {
-          const found = await request.bindings.resolve({ name, lookup: 'function', scope: { kind: 'search-path' } });
+          const found = await request.bindings.resolve({ name, lookup: 'function' });
           assert.equal(found.status, 'source');
         }
         return { status: 'resolved', completion: { items: [{ label: 'alpha', kind: 4, role: 'member' }] } };
@@ -1058,7 +1058,7 @@ test('unresolved and pending providers cannot leak unrelated candidates or reuse
     } });
     assert.deepEqual(labels(await h.complete('factory()[, co')), []);
     assert.equal(calls, 1);
-    assert.equal((await retained.resolve({ name: 'helper', lookup: 'function', scope: { kind: 'search-path' } })).reason, 'cancelled');
+    assert.equal((await retained.resolve({ name: 'helper', lookup: 'function' })).reason, 'cancelled');
     assert.deepEqual(h.sourceRequests, []);
     await h.complete('factory()[, co');
     assert.equal(calls, 2, 'later requests can retry');

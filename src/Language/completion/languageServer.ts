@@ -54,11 +54,11 @@ export async function getLanguageServerCompletions(
     let argumentsResolved = result?.rConsoleArgumentsResolved;
     let argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
 
-    let items = Array.isArray(result) ? result : result?.items || [];
+    let items = result?.items ?? [];
     const usable = (item: CompletionCandidate): boolean =>
       !(workspaceFunction && !context.argumentValue && item.role === "value") &&
       isLanguageServerCompletionItem(context, item, doc.uri?.toString()) &&
-      (context.kind !== "static" || (result?.rConsoleStaticStatus === "resolved" && validStaticEdit(item, inputLines, position))) &&
+      (context.kind !== "static" || (result?.staticStatus === "resolved" && validStaticEdit(item, inputLines, position))) &&
       (analysisMode !== "static" || !item.range || validStaticEdit(item, inputLines, position, false));
     // Some R language servers only return contiguous matches. If that lookup
     // has no usable candidates, request at the first prefix character and
@@ -72,8 +72,8 @@ export async function getLanguageServerCompletions(
       "analysis-limit", "inference-cycle", "no-receiver-members",
     ].includes(staticReason);
     const expressionSymbols = analysisMode === "static" && context.kind === "argument" && allowsSymbolCompletions(context);
-    if (result?.rConsoleStaticStatus !== "resolved-empty" && result?.rConsoleStaticStatus !== "unresolved" &&
-        result?.rConsoleStaticStatus !== "pending" && !structuralFailure && context.prefix.length > 1 &&
+    if (result?.staticStatus !== "resolved-empty" && result?.staticStatus !== "unresolved" &&
+        result?.staticStatus !== "pending" && !structuralFailure && context.prefix.length > 1 &&
         (argumentsResolved !== false || expressionSymbols) && !memberResolved &&
         !argumentsExhausted && !restrictsBracketSymbols(context) &&
         !items.some(item => usable(item) &&
@@ -89,7 +89,7 @@ export async function getLanguageServerCompletions(
       argumentsExhausted ||= result?.rConsoleArgumentsExhausted === true;
       argumentsResolved = result?.rConsoleArgumentsResolved ?? argumentsResolved;
       argumentSuppressionReason = result?.rConsoleArgumentSuppressionReason;
-      items = Array.isArray(result) ? result : result?.items || [];
+      items = result?.items ?? [];
     }
 
     const filteredItems = items.filter((item) =>
@@ -109,11 +109,11 @@ export async function getLanguageServerCompletions(
         ...getCompletionReplaceEnd(item, lineOffsets, position),
         packageName: getCompletionPackage(item),
       })),
-      isIncomplete: result?.rConsoleStaticStatus === "pending" || (!Array.isArray(result) && result?.isIncomplete === true),
-      staticStatus: result?.rConsoleStaticStatus,
+      isIncomplete: result?.staticStatus === "pending" || result?.isIncomplete === true,
+      staticStatus: result?.staticStatus,
       rConsoleLocalFunction: localFunction,
       runtimeOnly,
-      memberResolved: memberResolved || result?.rConsoleStaticStatus === "resolved-empty",
+      memberResolved: memberResolved || result?.staticStatus === "resolved-empty",
       staticUnavailableReason: result == null ? "no-response" : staticReason,
       bindingSuppressionReason: result?.rConsoleBindingSuppressionReason,
       workspaceFunction,

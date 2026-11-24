@@ -1,4 +1,4 @@
-import type { CompletionProvider, CompletionResult, StaticBindingQuery, StaticBindingResult, StaticCompletionOutcome, StaticCompletionRequest } from "./types";
+import type { CompletionProvider, CompletionResult, StaticBindingQuery, StaticBindingResult, StaticCompletionOutcome, StaticCompletionRequest, StaticCompletionResult } from "./types";
 import { getCompletionContext, getStaticFallbackContext } from "./syntax";
 import { allowsSymbolCompletions } from "./policy";
 import { storedCompletionReceiver } from "./sourceReceiver";
@@ -32,7 +32,7 @@ export async function provideNativeStaticCompletion(
       parseRuntimeMemberQuery(context.functionName, "arguments"))) {
     const receiver = storedCompletionReceiver(context, input, cursor);
     if (receiver) {
-      const result = await bindings.resolve({ name: receiver.name, scope: { kind: "search-path" },
+      const result = await bindings.resolve({ name: receiver.name,
         lookup: receiver.target === "source" ? "function" : receiver.target === "source-value" ? "value" : "identity" });
       if (result.status === "suppressed") bindingSuppression = result.reason;
       if (result.status === "source" && receiver.target !== "binding") {
@@ -49,14 +49,13 @@ export async function provideNativeStaticCompletion(
   if (!nativeResult) return { status: "pending", reason: "no-response" };
   const result = adaptNativeCompletionResult(nativeResult, context);
   if (bindingSuppression) result.rConsoleBindingSuppressionReason = bindingSuppression;
-  let items = Array.isArray(result) ? result : result.items;
+  let items = result.items;
   // Parameter inference can fail inside a valid argument expression. Retain
   // independent symbols after the native supplement has validated the reply.
   const expressionContext = context?.kind === "argument" && allowsSymbolCompletions(context);
   if (result.rConsoleArgumentsResolved === false && expressionContext) {
     items = items.filter(item => item.role === "symbol" || item.role === "scope");
-    if (Array.isArray(result)) result.splice(0, result.length, ...items);
-    else result.items = items;
+    result.items = items;
   }
   const reason = staticCompletionUnavailableReason(result.rConsoleStaticUnavailableReason);
   // Native member diagnostics describe the receiver query. Package symbols,
@@ -82,7 +81,7 @@ export async function provideNativeStaticCompletion(
 /** Keep hung providers and obsolete requests out of presentation and follow-up lookups. */
 export async function requestStaticCompletion(
   provider: CompletionProvider, request: StaticCompletionRequest
-): Promise<CompletionResult> {
+): Promise<StaticCompletionResult> {
   const inputVersion = request.document.version;
   const current = () => request.bindings.isCurrent() && request.document.version === inputVersion &&
     request.document.getText() === request.input;
@@ -120,18 +119,13 @@ export async function requestStaticCompletion(
       .then(finish, () => finish({ status: "unresolved", reason: "request-failed" }));
   });
   const completion = outcome.completion;
-  const result = completion ? (Array.isArray(completion) ? Object.assign([...completion], completion)
-    : { ...completion, items: [...completion.items] }) : { items: [], isIncomplete: outcome.status === "pending" };
-  result.rConsoleStaticStatus = outcome.status;
-  if (outcome.status === "resolved-empty") {
-    if (Array.isArray(result)) result.splice(0);
-    else { result.items = []; result.isIncomplete = false; }
-  }
-  if (outcome.status === "unresolved" || outcome.status === "pending") {
-    // Metadata survives for diagnostics and live/source precedence; candidates do not.
-    if (Array.isArray(result)) result.splice(0);
-    else result.items = [];
-    result.rConsoleStaticUnavailableReason = outcome.reason;
-  }
-  return result;
+  return {
+    ...completion,
+    items: outcome.status === "resolved" ? [...outcome.completion.items] : [],
+    isIncomplete: outcome.status === "pending" || (outcome.status !== "resolved-empty" &&
+      completion?.isIncomplete === true),
+    staticStatus: outcome.status,
+    ...((outcome.status === "unresolved" || outcome.status === "pending")
+      ? { rConsoleStaticUnavailableReason: outcome.reason } : {}),
+  };
 }

@@ -38,8 +38,6 @@ import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
 import { staticCompletionUnavailableReason } from "./completion/diagnostics";
-import { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
-import { storedCompletionReceiver } from "./completion/sourceReceiver";
 import { provideNativeStaticCompletion, type NativeSourceBinding } from "./completion/staticProvider";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
@@ -352,28 +350,7 @@ export class ConsoleLspClient implements CompletionProvider {
             };
         const serverPosition = projection.toServerPosition(position);
         const params = createCompletionParams(client, projection, serverPosition, contextPosition, context,
-          staticAnalysis);
-        if (staticAnalysis && sourceBinding && sourceBinding.body === undefined) {
-          // Package selections can qualify the visible callable in projection.
-          // Only a still-bare receiver is shadowed by the live binding.
-          const text = projection.document.getText();
-          const offset = projection.document.offsetAt(projection.toServerPosition(contextPosition));
-          const before = text.slice(0, offset), line = before.split("\n").at(-1)!;
-          const visibleContext = getCompletionContext(line, line.length, before, text.slice(offset));
-          const fallback = getStaticFallbackContext(line, line.length, before, text.slice(offset), visibleContext);
-          const receiverContext = fallback ?? visibleContext;
-          const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, offset);
-          const root = visibleContext?.objectName && parseRuntimeMemberQuery(visibleContext.objectName)?.root;
-          if (sourceBinding.opaqueReceiver && root === sourceBinding.name) {
-            Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
-              rConsoleOpaqueFunctionPosition: projection.toServerPosition(contextPosition) });
-          }
-          if (receiver?.name === sourceBinding.name &&
-              (sourceBinding.opaqueReceiver || receiver.target !== "binding")) {
-            Object.assign(params, { rConsoleOpaqueFunction: sourceBinding.name,
-              rConsoleOpaqueFunctionPosition: projection.document.positionAt(receiver.start) });
-          }
-        }
+          staticAnalysis, sourceBinding);
         const documentVersion = projection.document.version;
         const sessionState = this.sessionState;
         const runtimeRevision = this.runtimeRevision;
@@ -467,17 +444,9 @@ export class ConsoleLspClient implements CompletionProvider {
         if (!isCurrent()) return undefined;
         // VS Code's converter preserves standard LSP fields only. Carry this
         // source decision separately so an empty signature stays authoritative.
-        if (completions && (result as { rConsoleRuntimeOnly?: boolean } | null)?.rConsoleRuntimeOnly === true) {
-          completions.rConsoleRuntimeOnly = true;
-        }
-        if (completions && (result as { rConsoleWorkspaceFunction?: boolean } | null)?.rConsoleWorkspaceFunction === true) {
-          completions.rConsoleWorkspaceFunction = true;
-        }
-        if (completions && (result as { rConsoleLocalFunction?: boolean } | null)?.rConsoleLocalFunction === true) {
-          completions.rConsoleLocalFunction = true;
-        }
-        if (completions && (result as { rConsoleMemberResolved?: boolean } | null)?.rConsoleMemberResolved === true) {
-          completions.rConsoleMemberResolved = true;
+        for (const key of ["rConsoleRuntimeOnly", "rConsoleWorkspaceFunction", "rConsoleLocalFunction",
+          "rConsoleMemberResolved", "rConsoleNativeArguments", "rConsoleArgumentsExhausted"] as const) {
+          if (completions && (result as CompletionResult | null)?.[key] === true) completions[key] = true;
         }
         const staticReason = staticCompletionUnavailableReason(
           (result as { rConsoleStaticUnavailableReason?: unknown } | null)?.rConsoleStaticUnavailableReason);
@@ -489,12 +458,6 @@ export class ConsoleLspClient implements CompletionProvider {
         if (completions && functionInspection?.status === "suppressed" &&
             (result as { rConsoleRuntimeArgumentsIgnored?: boolean } | null)?.rConsoleRuntimeArgumentsIgnored !== true) {
           completions.rConsoleArgumentSuppressionReason = functionInspection.reason;
-        }
-        if (completions && (result as { rConsoleNativeArguments?: boolean } | null)?.rConsoleNativeArguments === true) {
-          completions.rConsoleNativeArguments = true;
-        }
-        if (completions && (result as { rConsoleArgumentsExhausted?: boolean } | null)?.rConsoleArgumentsExhausted === true) {
-          completions.rConsoleArgumentsExhausted = true;
         }
         const mapRange = (range: vscode.Range): vscode.Range => new vscode.Range(
           projection.toConsolePosition(range.start), projection.toConsolePosition(range.end)
