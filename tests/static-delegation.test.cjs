@@ -75,6 +75,33 @@ test('opaque live bindings require positive native source evidence', () => {
   assert.deepEqual(result, { overrides: [false, false, false, true], stale: false });
 });
 
+test('native binding positions exclude later and unrelated declarations', () => {
+  const result = runRJson(setup + String.raw`
+    out <- lapply(inputs, function(code) {
+      binding <- lookup(fixture(code))
+      list(absent = is.null(binding), unknown = isTRUE(binding$unknown),
+        names = as.list(names(binding$formals)))
+    })
+    cat(jsonlite::toJSON(out, auto_unbox = TRUE))
+  `, [
+    'f <- function(alpha) NULL; f(|CURSOR|); f <- function(beta) NULL',
+    'f <- function(alpha) NULL; g <- function() { f <- function(beta) NULL }; f(|CURSOR|)',
+    'f(|CURSOR|); f <- function(beta) NULL',
+    'g <- function() { f <- function(beta) NULL }; f(|CURSOR|)',
+    // An enclosing declaration remains relevant even with another later definition.
+    'f <- function(earlier) NULL; f <- function() { f(|CURSOR|) }; f <- function(earlier) NULL',
+    '(function(recursive) { f(|CURSOR|) }) -> f',
+  ]);
+  assert.deepEqual(result, [
+    { absent: false, unknown: false, names: ['alpha'] },
+    { absent: false, unknown: false, names: ['alpha'] },
+    { absent: true, unknown: false, names: [] },
+    { absent: true, unknown: false, names: [] },
+    { absent: false, unknown: true, names: [] },
+    { absent: false, unknown: true, names: [] },
+  ]);
+});
+
 test('native definition metadata supports providers without a formals field', () => {
   const result = runRJson(setup + String.raw`
     out <- lapply(inputs, function(code) {
@@ -97,12 +124,75 @@ test('native definition metadata supports providers without a formals field', ()
   ]);
 });
 
+test('direct native formals distinguish an empty signature from unavailable metadata', () => {
+  const result = runRJson(setup + String.raw`
+    out <- lapply(list(
+      list(formals = alist(alpha = ), signature = 'f(alpha)'),
+      list(formals = NULL, signature = 'f()'),
+      list(formals = NULL, signature = NULL)
+    ), function(symbol) {
+      binding <- console_native_formals(symbol, NULL)
+      list(unknown = binding$unknown, names = as.list(names(binding$formals)))
+    })
+    cat(jsonlite::toJSON(out, auto_unbox = TRUE))
+  `);
+  assert.deepEqual(result, [
+    { unknown: false, names: ['alpha'] },
+    { unknown: false, names: [] },
+    { unknown: true, names: [] },
+  ]);
+});
+
+test('static literal requests use native parse queue cancellation and current-version replay', () => {
+  const result = runRJson(String.raw`
+    uri <- 'r-console://queue/console.R'
+    document <- languageserver:::Document$new(uri, language = 'r', version = 2L,
+      content = 'f <- function(choice = "new") NULL; f(choice = "n")')
+    document$parse_data$version <- 1L
+    queue <- collections::queue()
+    delivered <- list()
+    promoted <- 0L
+    native_calls <- 0L
+    self <- list(
+      get_workspace = function(uri) list(documents = list(get = function(...) document)),
+      pending_replies = list(get = function(uri) list('textDocument/completion' = queue)),
+      parse_task_manager = list(promote = function(uri) { promoted <<- promoted + 1L }),
+      deliver = function(reply) { delivered[[length(delivered) + 1L]] <<- reply })
+    server <- list(request_handlers = list('textDocument/completion' = function(self, id, params) {
+      native_calls <<- native_calls + 1L
+      self$deliver(structure(list(id = id, result = list(items = list())), class = 'Response'))
+    }))
+    source('resources/r/completion-provider.R')
+    console_supplement_completion <- function(reply, self, params) reply
+    handler <- server$request_handlers[['textDocument/completion']]
+    params <- list(textDocument = list(uri = uri), position = list(line = 0L, character = 47L),
+      rConsoleStaticAnalysis = TRUE)
+    handler(self, 1L, params)
+    stopifnot(queue$size() == 1L, native_calls == 0L, !length(delivered))
+    handler(self, 2L, params)
+    stopifnot(queue$size() == 1L, native_calls == 0L, delivered[[1L]]$id == 1L,
+      delivered[[1L]]$error$code == -32800L)
+    document$parse_data$version <- document$version
+    pending <- queue$pop()
+    handler(self, pending$id, pending$params)
+    stopifnot(native_calls == 1L, delivered[[2L]]$id == 2L, queue$size() == 0L)
+    # Runtime-only requests retain native scheduling, including early literals.
+    document$version <- 3L
+    params$rConsoleStaticAnalysis <- FALSE
+    handler(self, 3L, params)
+    stopifnot(native_calls == 2L, queue$size() == 0L)
+    cat(jsonlite::toJSON(list(promoted = promoted, native = native_calls), auto_unbox = TRUE))
+  `);
+  assert.deepEqual(result, { promoted: 2, native: 2 });
+});
+
 test('static inference never executes draft definitions, defaults or accessors', () => {
   const result = runRJson(setup + String.raw`
     marker <- tempfile()
-    code <- paste0('f <- function(alpha = { writeLines("default", "', marker,
-      '"); stop("default ran") }) { writeLines("body", "', marker,
-      '"); stop("body ran") }; f(|CURSOR|)')
+    marker_literal <- encodeString(marker, quote = '"')
+    code <- paste0('f <- function(alpha = { writeLines("default", ', marker_literal,
+      '); stop("default ran") }) { writeLines("body", ', marker_literal,
+      '); stop("body ran") }; f(|CURSOR|)')
     binding <- lookup(fixture(code))
     before <- options('width')
     unknown <- lookup(fixture('f <- { options(width = 999L); stop("draft ran") }; f(|CURSOR|)'))

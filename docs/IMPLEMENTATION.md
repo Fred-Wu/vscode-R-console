@@ -1347,31 +1347,48 @@ Static syntax recovery, lexical scopes, assignments, aliases, return shapes and
 callable metadata belong to `languageserver`. The console adapter reads its
 recovered scope and inferred binding, and reuses `member_symbol_info` formals
 (or native definition metadata on released providers without that field).
-It does not walk XML assignments, unwrap function definitions, reconstruct
-source from tokens, or parse a displayed method signature. Static requests do
-not send parse suffixes or insert synthetic expressions into unfinished input.
-The original document and cursor go through the native asynchronous provider.
+Static requests preserve unfinished input and pass the projected document and
+cursor to the native asynchronous provider. Projection supplies guarded stored
+source and selected package qualifications while preserving console edit mapping.
 Static requests wait on its existing parse queue for the current document
 version, including literal contexts where native completion can answer early.
-This keeps binding checks current without a separate parser or scheduling loop.
+That queue owns cancellation, supersession and replay after parsing.
 
 The console retains authority over runtime evidence: an unresolved draft
 binding cannot borrow a live or package namesake's signature, and an opaque live
 binding requires positive native evidence of a draft override. Missing APIs,
 stale analysis, exhausted inference budgets and conflicting native callable
 metadata fail closed. Pending inference retains any known source identity.
-Argument matching
-and literal-choice formatting operate on inert metadata only. The bounded
-stored-source selector and the native runtime receiver grammar remain safety
-allowlists; they are not expanded to emulate unsupported static syntax.
+Binding history is checked at the native recovery position. Navigation
+signatures supplement that evidence only for declarations enclosing the cursor;
+later declarations and declarations in other scopes cannot override a current
+inferred binding. A declaration whose indexed range contains the cursor remains
+opaque while its binding is unresolved. Argument matching and literal-choice
+formatting operate on inert metadata only.
+
+Stored-source selection currently uses the bounded console receiver selector in
+`sourceReceiver.ts`. It requests one named binding with function or value lookup,
+then projects an eligible global-environment closure ahead of editable input.
+Static routing can reach the provider even when that selector cannot identify a
+binding. Transitive stored-source dependencies remain subject to the installed
+provider's capabilities. The current provider integration has no on-demand
+binding-resolution protocol. Such a protocol requires provider-owned dependency
+requests carrying lookup identity, explicit source/package/opaque/missing/
+unavailable outcomes, request-local snapshots, and shared lookup, byte, depth,
+time and cancellation budgets. The native runtime receiver grammar and guarded
+source retrieval retain their existing safety allowlists.
 
 As a result, static completion support follows the installed `languageserver`.
 For example, some chained assignments, callable formal defaults and unfinished
-native-pipe destinations may remain unresolved upstream. They return no
-signature instead of invoking the function, guessing a binding or adding a
-console-specific syntax exception. Improvements to those cases belong upstream.
+native-pipe destinations may remain unresolved upstream. Unsupported inference
+returns no signature. Accuracy of inferred lexical bindings also belongs to
+the provider: native inference can retain an earlier signature inside an
+unfinished recursive redefinition when its navigation outline is incomplete.
+The adapter can reject conflicting metadata when both indexes supply evidence;
+it relies on native scope inference where the outline has no current declaration.
 `tests/static-delegation.test.cjs` exercises the actual native resolver and
-verifies that draft bodies, defaults and indices have no execution side effects.
+verifies binding provenance, parse-queue replay, callable metadata compatibility,
+and the absence of execution side effects from draft bodies, defaults and indices.
 
 For nested completion, guarded live inspection remains authoritative for
 stored receivers, including stored receivers with no members. If the runtime

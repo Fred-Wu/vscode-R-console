@@ -141,9 +141,21 @@ suite("Completion in the VS Code extension host", () => {
       }
       const wrapped = await complete('f <- (function(new_arg) NULL)\nf(', session);
       assert.deepEqual(wrapped.filter(item => item.detail === "parameter").map(item => item.insertText), ['new_arg = ']);
-      for (const [formal, expected] of [['f = function(inner_arg) NULL', ['inner_arg = ']], ['f', []]]) {
-        const items = await complete(`f <- function(outer_arg) NULL\ng <- function(${formal}) { f(`, session);
-        assert.deepEqual(items.filter(item => item.detail === 'parameter').map(item => item.insertText), expected);
+      for (const [body, expected, nativeMayDecline = false] of [
+        ['g <- function(f = function(inner_arg) NULL) { f(', ['inner_arg = '], true],
+        ['g <- function(f) { f(', []],
+        ['g <- function(f) { f <- function(inner_arg) NULL; f(', ['inner_arg = ']],
+      ]) {
+        const text = `f <- function(outer_arg) NULL\n${body}`;
+        const items = await complete(text, session);
+        // Callable defaults depend on native inference. Check that the real
+        // converter preserves its explicit unresolved decision and shadowing.
+        const result = nativeMayDecline ? await lang.consoleLsp.provideCompletionItems(
+          { getText: () => text }, { line: 1, character: body.length }) : undefined;
+        const unresolved = result?.rConsoleArgumentsResolved === false;
+        assert.deepEqual(items.filter(item => item.detail === 'parameter').map(item => item.insertText),
+          unresolved ? [] : expected);
+        if (unresolved) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
       }
       const exhausted = await complete('f <- function(method = c("one", "two")) NULL\nf(method = "one", ');
       assert.ok(exhausted.every(item => !item.detail?.startsWith('value for ')));
@@ -156,9 +168,12 @@ suite("Completion in the VS Code extension host", () => {
         const items = await complete('`' + name + '` <- function(x) NULL\nfoo');
         assert.ok(items.some(item => item.insertText === '`' + name + '`()'), name);
       }
-      for (const operator of ['|>', '%>%']) {
-        const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
-        assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);
+      for (const [tail, required] of [['1 %>% my_fr', true], ['1 |> my_fr()', true], ['1 |> my_fr', false]]) {
+        const text = `my_frob <- function(x) x\n${tail}`;
+        const items = await complete(text, undefined, text.endsWith('()') ? text.length - 2 : text.length);
+        if (required) assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), tail);
+        // Native recovery can decline an unfinished pipe destination.
+        assert.ok(items.every(item => item.insertText === 'my_frob()'), tail);
       }
       const shadowPrint = { search: [], globalenv: { print: {
         type: 'closure', str: 'function(x, old_arg)',

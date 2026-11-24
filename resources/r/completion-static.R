@@ -20,6 +20,18 @@ console_native_formals <- function(symbol, index) {
     list(formals = if (known) definition[[2L]], unknown = !known)
 }
 
+# Navigation describes declarations throughout the document. Its function
+# ranges provide an additional identity check while editing a definition;
+# declarations elsewhere do not describe the binding visible at this cursor.
+console_enclosing_source_function <- function(document, point, name) {
+    declarations <- languageserver:::navigation_definitions(document$parse_data,
+        point$row + 1L, point$col + 1L, name, "signature")
+    enclosing <- Filter(function(row) languageserver:::position_is_in_lsp_range(
+        document, point$row, point$col, languageserver:::navigation_range(
+            document, document$parse_data$syntax_data, row)), declarations)
+    tail(enclosing, 1L)
+}
+
 console_source_binding <- function(name, uri, workspace, document, point, location = NULL) {
     if (!is.character(name) || length(name) != 1L || is.na(name) || !nzchar(name) ||
         !exists("member_resolve_cursor", asNamespace("languageserver"), inherits = FALSE) ||
@@ -55,18 +67,23 @@ console_source_binding <- function(name, uri, workspace, document, point, locati
     at <- resolved$bindings$.__member_position__
     has_binding <- name %in% names(fields) || name %in% names(resolved$bindings) ||
         (length(history) && (is.null(at) || languageserver:::member_history_position(history, at) > 0L))
-    declaration <- languageserver:::navigation_definitions(document$parse_data,
-        point$row + 1L, point$col + 1L, name, "signature", last = TRUE)
+    declaration <- console_enclosing_source_function(document, point, name)
+    # A declaration currently being edited can be indexed before its binding
+    # takes effect. Preserve that uncertainty using the provider's ranges.
+    # Entries wholly after the cursor cannot establish a current source binding.
+    editing_binding <- any(vapply(history, function(entry)
+        languageserver:::member_before(entry$start, c(point$row, point$col)) &&
+        languageserver:::member_before(c(point$row, point$col), entry$end), logical(1)))
     # Pending inference does not erase source identity already in the index.
     # Keep blocking a stale live namesake while native metadata is loading.
     if (isTRUE(resolved$budget$exhausted) || isTRUE(resolved$budget$transient))
         return(list(unknown = TRUE,
-            source_binding = isTRUE(has_binding) || length(declaration) > 0L || length(history) > 0L))
+            source_binding = isTRUE(has_binding) || editing_binding || length(declaration) > 0L))
     if (!has_binding) {
         # Native navigation can know a source declaration that inference has
         # not resolved yet (for example while editing its body). Preserve that
         # identity without substituting an older runtime/package signature.
-        return(if (length(declaration) || length(history))
+        return(if (length(declaration) || editing_binding)
             list(unknown = TRUE, source_binding = TRUE) else NULL)
     }
     bindings <- resolved$bindings

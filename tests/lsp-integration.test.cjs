@@ -1347,6 +1347,25 @@ test("partial argument values follow R matching in source and workspace signatur
   }
 });
 
+test("declarations outside the cursor binding preserve source and live signatures", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  client.setRuntimeSignatures({ f: 'function(live_arg)' });
+  for (const [marked, expected, local] of [
+    ['f <- function(alpha) NULL; f(│); f <- function(beta) NULL', ['alpha'], true],
+    ['f <- function(alpha) NULL; g <- function() { f <- function(beta) NULL }; f(│)', ['alpha'], true],
+    ['f(│); f <- function(beta) NULL', ['live_arg'], false],
+    ['g <- function() { f <- function(hidden) NULL }; f(│)', ['live_arg'], false],
+    ['f <- function(earlier) NULL; f <- function() { f(│) }; f <- function(earlier) NULL', [], true],
+    ['(function(recursive) { f(│) }) -> f', [], true],
+  ]) {
+    const result = await client.provideCompletionItems({ getText: () => marked.replace('│', '') },
+      { line: 0, character: marked.indexOf('│') });
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, marked);
+    assert.equal(result.rConsoleLocalFunction === true, local, marked);
+    assert.equal(result.rConsoleWorkspaceFunction === true, !local, marked);
+  }
+});
+
 test("source redefinitions remain authoritative through wrappers, chains and lexical scopes", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   // Native analysis may decline syntax the old console walker guessed. A
@@ -1357,9 +1376,9 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
     sourceUnresolved = result.rConsoleArgumentsResolved === false;
     return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
   } };
-  for (const [marked, expected] of [
+  for (const [marked, expected, nativeMayDecline = false] of [
     ['f <- (function(new_arg) NULL)\nf(│)', ['new_arg']],
-    ['f <- g <- function(new_arg) NULL\nf(│)', ['new_arg']],
+    ['f <- g <- function(new_arg) NULL\nf(│)', ['new_arg'], true],
     ['(function(new_arg) NULL) -> f\nf(│)', ['new_arg']],
     ['f <- (function(new_arg = stop("default evaluated")) {\n stop("body evaluated")\n NULL\n})\nf(│)', ['new_arg']],
     ['f <- (function() NULL)\nf(│)', []],
@@ -1370,8 +1389,8 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
     ['f <- function(earlier) NULL; f <- { f(│); function(later) NULL }', ['earlier']],
     ['f <- function(earlier) NULL; f <- f(│)', ['earlier']],
     ['f <- function(earlier) NULL; f <- (g <- f(│))', ['earlier']],
-    ['f <- function(recursive_arg) { f(│) }', ['recursive_arg']],
-    ['(function(recursive_arg) { f(│) }) -> f', ['recursive_arg']],
+    ['f <- function(recursive_arg) { f(│) }', ['recursive_arg'], true],
+    ['(function(recursive_arg) { f(│) }) -> f', ['recursive_arg'], true],
     ['f <- function(earlier) NULL; f <- function() { f(│) }', []],
     ['f <- function(earlier) NULL; f <- (function() { f(│) })()', ['earlier']],
     ['f <- (function(method = c("new_value", "other")) NULL)\nf(meth = "new│")', ['new_value']],
@@ -1383,30 +1402,30 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
       { globalenv: { f: { type: 'closure' } } }, lines.slice(0, position.line), [], provider,
       async () => [{ name: 'old_arg' }]);
     assert.deepEqual(entries.filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '))
-      .map(item => item.label), sourceUnresolved ? [] : expected, marked);
+      .map(item => item.label), nativeMayDecline && sourceUnresolved ? [] : expected, marked);
   }
 });
 
 test("formal bindings shadow outer functions without evaluating their defaults", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  for (const [marked, expected] of [
-    ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) { f(│) }', ['inner_arg']],
+  for (const [marked, expected, nativeMayDecline = false] of [
+    ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) { f(│) }', ['inner_arg'], true],
     ['f <- function(outer_arg) NULL\ng <- function(f) { f(│) }', []],
     ['f <- function(outer_arg) NULL\ng <- function(f = stop("must not evaluate")) { f(│) }', []],
-    ['g <- function(f = (function(inner_arg) NULL)) { f(│) }', ['inner_arg']],
-    ['g <- \\(f = \\(inner_arg) NULL) { f(│) }', ['inner_arg']],
-    ['g <- function(`a b` = function(inner_arg) NULL) { `a b`(│) }', ['inner_arg']],
+    ['g <- function(f = (function(inner_arg) NULL)) { f(│) }', ['inner_arg'], true],
+    ['g <- \\(f = \\(inner_arg) NULL) { f(│) }', ['inner_arg'], true],
+    ['g <- function(`a b` = function(inner_arg) NULL) { `a b`(│) }', ['inner_arg'], true],
     ['g <- function(f = function(default_arg) NULL) { f <- function(assigned_arg) NULL; f(│) }', ['assigned_arg']],
-    ['g <- function(f = function(default_arg) NULL) { f(│); f <- function(later_arg) NULL }', ['default_arg']],
-    ['g <- function(f = function(local_arg) NULL) { f <<- function(parent_arg) NULL; f(│) }', ['local_arg']],
-    ['g <- function(f = function(local_arg) NULL) { function(parent_arg) NULL ->> f; f(│) }', ['local_arg']],
+    ['g <- function(f = function(default_arg) NULL) { f(│); f <- function(later_arg) NULL }', ['default_arg'], true],
+    ['g <- function(f = function(local_arg) NULL) { f <<- function(parent_arg) NULL; f(│) }', ['local_arg'], true],
+    ['g <- function(f = function(local_arg) NULL) { function(parent_arg) NULL ->> f; f(│) }', ['local_arg'], true],
     ['g <- function() { f <- function(local_arg) NULL; f <<- function(parent_arg) NULL; f(│) }', ['local_arg']],
-    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f <<- function(new_arg) NULL; f(│) } }', ['new_arg']],
-    ['g <- function(f = function(outer_arg) NULL) { h <- function(f = function(inner_arg) NULL) { f(│) } }', ['inner_arg']],
-    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f(│) } }', ['outer_arg']],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f <<- function(new_arg) NULL; f(│) } }', ['new_arg'], true],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function(f = function(inner_arg) NULL) { f(│) } }', ['inner_arg'], true],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f(│) } }', ['outer_arg'], true],
     ['g <- function(f = function(outer_arg) NULL) { h <- function(f) { f(│) } }', []],
     ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) NULL; f(│)', ['outer_arg']],
-    ['g <- function(f = function(inner_arg) NULL) {\n f(│', ['inner_arg']],
+    ['g <- function(f = function(inner_arg) NULL) {\n f(│', ['inner_arg'], true],
     ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL }) { f(│) }', ['outer_arg']],
     ['f <- function(outer_arg) NULL; g <- function(x = f <- function(lazy_arg) NULL) { f(│) }', ['outer_arg']],
     ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL; f(│) }) NULL', ['lazy_arg']],
@@ -1417,24 +1436,24 @@ test("formal bindings shadow outer functions without evaluating their defaults",
       { line: lines.length - 1, character: lines.at(-1).length });
     assert.equal(result.rConsoleLocalFunction, true, marked);
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label),
-      result.rConsoleArgumentsResolved === false ? [] : expected, marked);
+      nativeMayDecline && result.rConsoleArgumentsResolved === false ? [] : expected, marked);
     if (result.rConsoleArgumentsResolved === false) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
   }
 });
 
 test("source bindings do not escape quoted, lazy or locally evaluated arguments", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  for (const tail of [
-    'quote(f <- function(hidden_arg) NULL); f(│)',
-    'substitute({ f <- function(hidden_arg) NULL }); f(│)',
-    'expression(f <- function(hidden_arg) NULL); f(│)',
-    'alist(f <- function(hidden_arg) NULL); f(│)',
-    'local({ f <- function(hidden_arg) NULL }); f(│)',
-    'base::local({ f <- function(hidden_arg) NULL }); f(│)',
-    'ignore <- function(...) NULL; ignore(f <- function(hidden_arg) NULL); f(│)',
-    'ignore <- function(x, y) y; ignore({ f <- function(hidden_arg) NULL }, f(│))',
-    'local({ f <- function(inner_arg) NULL; f(│) })',
-    'base::local({ f <- function(inner_arg) NULL; f(│) })',
+  for (const [tail, nativeMayDecline = false] of [
+    ['quote(f <- function(hidden_arg) NULL); f(│)', true],
+    ['substitute({ f <- function(hidden_arg) NULL }); f(│)', true],
+    ['expression(f <- function(hidden_arg) NULL); f(│)', true],
+    ['alist(f <- function(hidden_arg) NULL); f(│)', true],
+    ['local({ f <- function(hidden_arg) NULL }); f(│)', true],
+    ['base::local({ f <- function(hidden_arg) NULL }); f(│)', true],
+    ['ignore <- function(...) NULL; ignore(f <- function(hidden_arg) NULL); f(│)', true],
+    ['ignore <- function(x, y) y; ignore({ f <- function(hidden_arg) NULL }, f(│))'],
+    ['local({ f <- function(inner_arg) NULL; f(│) })'],
+    ['base::local({ f <- function(inner_arg) NULL; f(│) })'],
   ]) {
     const marked = 'f <- function(outer_arg) NULL; ' + tail;
     // Execute only these controlled fixtures to derive the expected binding
@@ -1445,7 +1464,7 @@ test("source bindings do not escape quoted, lazy or locally evaluated arguments"
     const result = await client.provideCompletionItems({ getText: () => text },
       { line: 0, character: marked.indexOf('│') });
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label),
-      result.rConsoleArgumentsResolved === false ? [] : expected, tail);
+      nativeMayDecline && result.rConsoleArgumentsResolved === false ? [] : expected, tail);
     if (result.rConsoleArgumentsResolved === false) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
   }
 });
