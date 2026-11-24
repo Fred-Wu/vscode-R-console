@@ -111,14 +111,49 @@ test('provider lifetime closes pending reads and invalidates stale document resp
     return { status: 'resolved-empty', completion: { items: [] } };
   } }, request);
   assert.equal(capability.signal.aborted, true);
+  assert.deepEqual(await Promise.race([
+    pendingRead, new Promise(resolve => setImmediate(() => resolve('still pending'))),
+  ]), { status: 'unavailable', reason: 'cancelled' });
   release({ status: 'source', text: 'function() list(secret=1)' });
   assert.equal((await pendingRead).reason, 'cancelled');
+  let retryBinding;
+  await requestStaticCompletion({ provideStaticCompletion: async r => {
+    retryBinding = await r.bindings.resolve(query('factory'));
+    return { status: 'resolved-empty', completion: { items: [] } };
+  } }, request);
+  assert.equal(retryBinding.status, 'source');
+  assert.equal(retryBinding.source, 'function() list(secret=1)', 'prefix retries retain the shared snapshot');
   const stale = await requestStaticCompletion({ provideStaticCompletion: async () => {
     document.version++;
     return { status: 'resolved', completion: { items: [{ label: 'stale' }] } };
   } }, request);
   assert.equal(stale.rConsoleStaticStatus, 'pending');
   assert.deepEqual(stale.items, []);
+});
+
+test('failed and cancelled providers immediately settle their outstanding binding reads', async () => {
+  const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+  for (const end of ['failure', 'cancellation']) {
+    const controller = new AbortController();
+    const input = 'factory()$';
+    const position = { line: 0, character: input.length };
+    let read;
+    const result = await requestStaticCompletion({ provideStaticCompletion: async r => {
+      read = r.bindings.resolve(query('factory'));
+      if (end === 'failure') throw new Error('provider failed');
+      controller.abort();
+      return new Promise(() => {});
+    } }, {
+      document: { version: 1, getText: () => input }, input, cursor: input.length,
+      position, contextPosition: position, requestScope: {},
+      bindings: { signal: controller.signal, isCurrent: () => !controller.signal.aborted,
+        resolve: () => new Promise(() => {}) },
+    });
+    assert.equal(result.rConsoleStaticStatus, end === 'failure' ? 'unresolved' : 'pending');
+    assert.deepEqual(await Promise.race([
+      read, new Promise(resolve => setImmediate(() => resolve('still pending'))),
+    ]), { status: 'unavailable', reason: 'cancelled' }, end);
+  }
 });
 
 test('runtime-only providers cannot silently supply static completion', async () => {

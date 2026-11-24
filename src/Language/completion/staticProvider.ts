@@ -1,4 +1,4 @@
-import type { CompletionProvider, CompletionResult, StaticBindingQuery, StaticCompletionOutcome, StaticCompletionRequest } from "./types";
+import type { CompletionProvider, CompletionResult, StaticBindingQuery, StaticBindingResult, StaticCompletionOutcome, StaticCompletionRequest } from "./types";
 import { getCompletionContext, getStaticFallbackContext } from "./syntax";
 import { allowsSymbolCompletions } from "./policy";
 import { storedCompletionReceiver } from "./sourceReceiver";
@@ -93,9 +93,15 @@ export async function requestStaticCompletion(
   let finished = false;
   const lifetime = new AbortController();
   const cancelledBinding = () => ({ status: "unavailable" as const, reason: "cancelled" as const });
+  // Release this invocation's readers immediately while retaining the shared
+  // resolver snapshot for a subsequent prefix retry in the same request.
+  const cancelledReads = new Promise<StaticBindingResult>(resolve => {
+    lifetime.signal.addEventListener("abort", () => resolve(cancelledBinding()), { once: true });
+  });
   const bindings = { ...request.bindings, signal: lifetime.signal, isCurrent: () => !finished && current(),
     resolve: (query: StaticBindingQuery) => !finished && current()
-      ? request.bindings.resolve(query).then(result => !finished && current() ? result : cancelledBinding())
+      ? Promise.race([cancelledReads,
+          request.bindings.resolve(query).then(result => !finished && current() ? result : cancelledBinding())])
       : Promise.resolve(cancelledBinding()) };
   const outcome = await new Promise<StaticCompletionOutcome>(resolve => {
     const finish = (result: StaticCompletionOutcome) => {

@@ -744,7 +744,9 @@ available to prefix retries while the request is current. Cancellation, input
 changes, session changes and setting
 changes invalidate outstanding access and prevent late results from presentation.
 Provider completion has a 10-second deadline; capabilities expire when that
-provider invocation finishes. Cancellation propagates to the native LSP request
+provider invocation finishes. Outstanding provider-facing binding reads immediately
+settle as cancelled, while the shared resolver retains snapshots for prefix retries.
+Cancellation propagates to the native LSP request
 through its cancellation token. New input and picker refinements obtain fresh
 snapshots. No expression evaluation operation is exposed by the resolver.
 
