@@ -1159,9 +1159,10 @@ test("static routing preserves search-path identity, opaque callables and stored
     libraries: [library], requestRuntimeFunctionArguments: (e) => inspect(e, "arguments"),
   });
   const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name, target = "source") => backend.inspectMemberNames(session, { root: name, steps: [], target }) });
-  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: async (...args) => {
-    const r = await client.provideCompletionItems(...args);
-    return r && { ...r, items: r.items.map((x) => ({ ...x, kind: x.kind - 1 })) };
+  lang.ensureConsoleLspStarted = async () => ({ provideStaticCompletion: async request => {
+    const outcome = await client.provideStaticCompletion(request);
+    const r = outcome.completion;
+    return { ...outcome, completion: r && { ...r, items: r.items.map(x => ({ ...x, kind: x.kind - 1 })) } };
   } });
   lang.getOrOpenCompletionDocument = async (text) => ({ getText: () => text, uri: client.inputDocument.uri });
   const complete = async (text) => {

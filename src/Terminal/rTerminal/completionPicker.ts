@@ -172,10 +172,10 @@ export async function pickCompletion({
       const nextInputText = lines.join("\n");
       const nextContext = context.kind === "package"
         ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
-        : (context.staticFallback
+        : context.staticFallback
           ? getStaticCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
               nextInputText.slice(fullTextBeforeCursor.length))
-          : undefined) ?? getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
+          : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
             nextInputText.slice(fullTextBeforeCursor.length));
       if (!nextContext) {
         return;

@@ -2179,7 +2179,7 @@ export class RTerminal implements vscode.Pseudoterminal {
       .get<boolean>("completion.staticAnalysis", false);
     return staticEnabled
       ? getStaticCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length), context) ?? context
+          input.text.slice(input.textBeforeCursor.length), context)
       : context;
   }
 

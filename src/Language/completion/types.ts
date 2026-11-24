@@ -90,9 +90,6 @@ export type CompletionResult = (vscode.CompletionList | vscode.CompletionItem[])
 
 export type CompletionAnalysisMode = "runtime" | "static";
 
-/** A guarded closure snapshot or opaque live binding. Receiver refusals also preserve root identity. */
-export type CompletionSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
-
 export type BindingLookup = "function" | "value" | "identity";
 export type BindingScope = { kind: "search-path" } | { kind: "closure"; bindingId: string };
 export type StaticBindingQuery = {
@@ -148,7 +145,6 @@ export interface CompletionProvider {
     // Safe, already-inspected receiver class; null means no supported class.
     runtimeBracketKind?: "data.frame" | "data.table" | null,
     analysisMode?: CompletionAnalysisMode,
-    sourceBinding?: CompletionSourceBinding,
     // Shared only by the initial query and its prefix retry.
     requestScope?: object
   ): Promise<CompletionResult | undefined>;

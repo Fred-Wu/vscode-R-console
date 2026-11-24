@@ -14,6 +14,13 @@ const vscode = {
   SnippetString: class { constructor(value) { this.value = value; } },
 };
 const completion = loadSource("src/Language/completion.ts", { vscode });
+const { getStaticFallbackContext } = loadSource('src/Language/completion/syntax.ts');
+const { storedCompletionReceiver } = loadSource('src/Language/completion/sourceReceiver.ts');
+const { provideNativeStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+// Model the production native adapter explicitly; runtime-only providers have no static capability.
+const nativeProvider = provider => ({ ...provider, provideStaticCompletion: request =>
+  provideNativeStaticCompletion(binding => provider.provideCompletionItems(request.document, request.position,
+    request.triggerCharacter, request.contextPosition, undefined, 'static', request.requestScope, binding), request) });
 const snapshot = (text, cursor = text.length) => {
   const before = text.slice(0, cursor);
   const lines = text.split("\n");
@@ -47,7 +54,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
         inspected ?? { status: "available", names: [] });
     },
   });
-  const provider = { provideCompletionItems: async (doc, position, trigger, contextPosition, bracket, mode, sourceDefinition) => {
+  const provider = nativeProvider({ provideCompletionItems: async (doc, position, trigger, contextPosition, bracket, mode, requestScope, sourceDefinition) => {
     requests.push({ text: doc.getText(), position, mode, sourceDefinition });
     return typeof lspItems === "function" ? lspItems(mode, sourceDefinition) : lspItems ?? {
       rConsoleMemberResolved: true,
@@ -56,7 +63,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
         { label: "ambient", kind: 5 },
       ],
     };
-  } };
+  } });
   if (staticProvider) provider.provideStaticCompletion = staticProvider;
   lang.ensureConsoleLspStarted = async () => provider;
   lang.getOrOpenCompletionDocument = async text => ({
@@ -104,7 +111,7 @@ test("source-only context retains the correct prefix and replacement location fo
     ["obj[[side_effect()]]$", "member", "", 21],
     ["obj[[side_effect()]]$al", "member", "al", 21],
   ]) {
-    const context = completion.getStaticFallbackContext(text, text.length);
+    const context = getStaticFallbackContext(text, text.length);
     assert.equal(context?.kind, expectedKind, text);
     assert.equal(context?.prefix, prefix, text);
     assert.equal(context?.replaceStart, start, text);
@@ -112,20 +119,20 @@ test("source-only context retains the correct prefix and replacement location fo
     assert.equal(context?.rejectionReason, undefined, text);
   }
   const middle = "make_data()$alpha";
-  const memberMiddle = completion.getStaticFallbackContext(middle, 14,
+  const memberMiddle = getStaticFallbackContext(middle, 14,
     middle.slice(0, 14), middle.slice(14));
   assert.equal(memberMiddle?.replaceStart, 12);
   assert.equal(memberMiddle?.replaceEnd, middle.length);
   const quoted = 'make_data()[["alpha"]]';
   const caret = quoted.indexOf("alpha") + 2;
-  const quotedContext = completion.getStaticFallbackContext(quoted, caret,
+  const quotedContext = getStaticFallbackContext(quoted, caret,
     quoted.slice(0, caret), quoted.slice(caret));
   assert.equal(quotedContext?.kind, "bracket");
   assert.equal(quotedContext?.prefix, "al");
   assert.equal(quotedContext?.bracketQuote, '"');
   assert.equal(quotedContext?.replaceStart, quoted.indexOf("alpha"));
   assert.equal(quotedContext?.replaceEnd, quoted.indexOf("alpha") + 5);
-  assert.equal(completion.getStaticFallbackContext("obj$al", 6), undefined);
+  assert.equal(getStaticFallbackContext("obj$al", 6), undefined);
 });
 
 test("escaped quoted [[ prefixes decode without evaluation and keep mid-key edit bounds", () => {
@@ -139,7 +146,7 @@ test("escaped quoted [[ prefixes decode without evaluation and keep mid-key edit
   ]) {
     const caret = marked.indexOf("│");
     const text = marked.replace("│", "");
-    const context = completion.getStaticFallbackContext(text, caret,
+    const context = getStaticFallbackContext(text, caret,
       text.slice(0, caret), text.slice(caret));
     assert.equal(context?.kind, "bracket", marked);
     assert.equal(context?.prefix, expected, marked);
@@ -156,17 +163,17 @@ test("decoded quoted fallback prefixes select escaped source member labels", asy
   ]) {
     const caret = marked.indexOf("│");
     const input = marked.replace("│", "");
-    const context = completion.getStaticFallbackContext(input, caret,
+    const context = getStaticFallbackContext(input, caret,
       input.slice(0, caret), input.slice(caret));
     assert.equal(context?.kind, "bracket", marked);
     const entries = await completion.collectStaticFallbackEntries(context, {
       getText: () => input, uri: { toString: () => "r-console://test/console.R" },
-    }, new Position(0, caret), [], {
+    }, new Position(0, caret), [], nativeProvider({
       provideCompletionItems: async () => ({ rConsoleMemberResolved: true, items: [
         { label, kind: 4, data: { type: "member" } },
         { label: "ambient", kind: 5, data: { type: "scope" } },
       ] }),
-    });
+    }));
     assert.deepEqual(entries.map(entry => entry.label), [label], marked);
     assert.equal(entries.staticResolved, true, marked);
   }
@@ -192,14 +199,14 @@ test("source-only completion remains retryable until the language server recover
 
 test("unformatted inferred member names are escaped for R accessors and quoted indices", async () => {
   const infer = async (source, cursor, items) => {
-    const context = completion.getStaticFallbackContext(source, cursor,
+    const context = getStaticFallbackContext(source, cursor,
       source.slice(0, cursor), source.slice(cursor));
     assert.ok(context?.staticFallback, source);
     const entries = await completion.collectStaticFallbackEntries(context, {
       getText: () => source, uri: { toString: () => "r-console://test/console.R" },
-    }, new Position(0, cursor), [], {
+    }, new Position(0, cursor), [], nativeProvider({
       provideCompletionItems: async () => ({ rConsoleMemberResolved: true, items }),
-    });
+    }));
     return entries.map(entry => completion.toCompletionPick(entry, context));
   };
   const memberItems = [
@@ -235,11 +242,11 @@ test("unformatted inferred member names are escaped for R accessors and quoted i
 
 test("static fallback uses only inferred member results and the requested analysis mode", async () => {
   const input = "make_data()$al";
-  const context = completion.getStaticFallbackContext(input, input.length);
+  const context = getStaticFallbackContext(input, input.length);
   const calls = [];
   const items = await completion.collectStaticFallbackEntries(context, {
     getText: () => input, uri: { toString: () => "r-console://test/console.R" },
-  }, new Position(0, input.length), [], {
+  }, new Position(0, input.length), [], nativeProvider({
     provideCompletionItems: async (...args) => {
       calls.push(args);
       return { rConsoleMemberResolved: true, items: [
@@ -248,7 +255,7 @@ test("static fallback uses only inferred member results and the requested analys
         { label: "argument", kind: 5, detail: "parameter" },
       ] };
     },
-  });
+  }));
   assert.deepEqual(items.map(item => item.label), ["alpha"]);
   assert.equal(items[0].replaceStart, context.replaceStart);
   assert.equal(items.staticResolved, true);
@@ -484,9 +491,9 @@ test("source receiver selection targets the root named call, not downstream call
     ["obj$", undefined],
   ];
   for (const [text, expected] of sourceNames) {
-    const context = completion.getStaticFallbackContext(text, text.length);
-    assert.equal(completion.storedFunctionReceiver(context ?? { kind: "default" }, text, text.length),
-      expected, text);
+    const context = getStaticFallbackContext(text, text.length);
+    const receiver = storedCompletionReceiver(context ?? { kind: "default" }, text, text.length);
+    assert.equal(receiver?.target === "binding" ? undefined : receiver?.name, expected, text);
   }
 });
 
@@ -494,7 +501,8 @@ test("deep receiver grouping uses an iterative walk without borrowing a compound
   const context = { kind: "member", staticFallback: true };
   for (const [body, expected] of [["make_data()", "make_data"], ["other + make_data()", undefined]]) {
     const input = "(".repeat(5000) + body + ")".repeat(5000) + "$";
-    assert.equal(completion.storedFunctionReceiver(context, input, input.length), expected);
+    const receiver = storedCompletionReceiver(context, input, input.length);
+    assert.equal(receiver?.target === "binding" ? undefined : receiver?.name, expected);
   }
 });
 
@@ -517,9 +525,9 @@ test("computed receiver identity follows only its outer named root", () => {
     ['(-iris[1,,drop=FALSE])$', undefined],
   ]) {
     const line = text.split('\n').at(-1);
-    const context = completion.getStaticFallbackContext(line, line.length, text) ??
+    const context = getStaticFallbackContext(line, line.length, text) ??
       completion.getCompletionContext(line, line.length, text);
-    const root = completion.storedReceiverRoot(context, text, text.length);
+    const root = storedCompletionReceiver(context, text, text.length);
     assert.equal(root?.name, expected, text);
     if (root) assert.ok(text.slice(root.start).startsWith(expected === 'odd root' ? '`odd root`' : expected));
   }
@@ -563,9 +571,9 @@ test("one receiver classification preserves source eligibility and root identity
   ]) {
     const expectedStart = marked.indexOf("│");
     const text = marked.replace("│", "");
-    const context = completion.getStaticFallbackContext(text, text.length) ??
+    const context = getStaticFallbackContext(text, text.length) ??
       completion.getCompletionContext(text, text.length);
-    const receiver = completion.storedCompletionReceiver(context, text, text.length);
+    const receiver = storedCompletionReceiver(context, text, text.length);
     assert.equal(receiver?.name, name, text);
     assert.equal(receiver?.target, target, text);
     assert.equal(receiver?.start, expectedStart === -1 ? undefined : expectedStart, text);
@@ -726,7 +734,7 @@ test("continued and quoted executable members keep static routing and exclude am
   ]) {
     const cursor = marked.indexOf("│"), text = marked.replace("│", "");
     const input = snapshot(text, cursor);
-    const context = completion.getStaticFallbackContext(input.currentLine, input.cursorCol,
+    const context = getStaticFallbackContext(input.currentLine, input.cursorCol,
       input.textBeforeCursor, text.slice(cursor));
     assert.equal(context?.prefix, prefix, marked);
     assert.equal(context?.kind, "member", marked);
@@ -775,7 +783,7 @@ test("literal names begun on earlier lines never expose unrepresentable edits", 
     'make_data()[["odd\nfi', 'outer(make_data()[["odd\nfi', 'obj[["odd\nfi',
   ]) {
     const input = snapshot(text);
-    assert.equal(completion.getStaticFallbackContext(input.currentLine, input.cursorCol, text), undefined, text);
+    assert.equal(getStaticFallbackContext(input.currentLine, input.cursorCol, text), undefined, text);
     for (const staticAnalysis of [false, true]) {
       const h = harness({ staticAnalysis, storedSources: { make_data: 'function() list("odd\\nfield" = 1)' },
         inspected: { status: "available", names: ["odd\nfield"] },
@@ -796,7 +804,7 @@ test("source bracket routing counts individual nested delimiters", async () => {
     'wrapper(make_data()[x[1]])["al',
   ]) {
     const cursor = text.indexOf('"al') + 3;
-    const context = completion.getStaticFallbackContext(text, cursor);
+    const context = getStaticFallbackContext(text, cursor);
     assert.equal(context?.kind, "bracket", text);
     assert.equal(context.prefix, "al", text);
     assert.equal(context.bracketQuote, '"', text);
@@ -826,7 +834,7 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
   for (const text of ['make_data()[[index + "al', 'make_data()[[1, "al',
     'make_data()[[name = "al', 'make_data()[[index + al', 'make_data()[[1, al',
     'make_data()[["al" # comment']) {
-    assert.equal(completion.getStaticFallbackContext(text, text.length), undefined, text);
+    assert.equal(getStaticFallbackContext(text, text.length), undefined, text);
     const h = harness();
     await h.complete(text);
     assert.equal(h.requests.length, 0, text);
@@ -834,7 +842,7 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
   }
   for (const text of ['make_data()[["al', 'make_data()[[ # key\n "al']) {
     const line = text.split('\n').at(-1);
-    assert.equal(completion.getStaticFallbackContext(line, line.length, text)?.prefix, 'al', text);
+    assert.equal(getStaticFallbackContext(line, line.length, text)?.prefix, 'al', text);
   }
 });
 
@@ -869,7 +877,8 @@ test("factory argument source selection preserves complete receiver identity", (
     ['obj[[make_data()]]$method(', undefined],
   ]) {
     const context = completion.getCompletionContext(text, text.length);
-    assert.equal(completion.storedFunctionReceiver(context, text, text.length), expected, text);
+    const receiver = storedCompletionReceiver(context, text, text.length);
+    assert.equal(receiver?.target === "binding" ? undefined : receiver?.name, expected, text);
   }
 });
 

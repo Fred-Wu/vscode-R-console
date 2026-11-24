@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const loadSource = require('../helpers/load-source.cjs');
 const vscode = { QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Text: 0, Function: 2, Field: 4, Variable: 5 } };
 const completion = loadSource('src/Language/completion.ts', { vscode });
+const { getStaticFallbackContext } = loadSource('src/Language/completion/syntax.ts');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const entries = (labels, incomplete = false) => Object.assign(labels.map(label => ({
   label, insertText: label, source: 'lsp', kind: 5,
@@ -17,7 +18,7 @@ async function openPicker(t, text, initialEntries, collect, delayedEntries, curs
     vscode: { ...vscode, window: { createQuickPick: () => pick } },
   });
   const context = (staticAnalysis ? completion.getStaticCompletionContext(text, cursor) : undefined) ??
-    completion.getStaticFallbackContext(text, cursor) ?? completion.getCompletionContext(text, cursor) ?? {
+    getStaticFallbackContext(text, cursor) ?? completion.getCompletionContext(text, cursor) ?? {
     kind: 'default', prefix: '', replaceStart: 0, snapshotInput: text, snapshotCursor: text.length,
   };
   const showing = pickCompletion({ context, initialEntries, delayedEntries, force: true, isCurrent: () => true, collect,

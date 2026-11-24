@@ -127,12 +127,12 @@ export function isCompletionInLiteral(code: string, cursor = code.length, tokens
       (token.type === TokenType.Identifier && token.value.startsWith("`"))));
 }
 
-/** Finish only open delimiters for parsing local definitions during completion.
+/** Complete delimiters for runtime signature matching in the native adapter.
  * The suffix is never inserted into the console or evaluated. */
-export function getCompletionParseSuffix(code: string, includeOrdinaryBindings = false): string | undefined {
-  if (!includeOrdinaryBindings && !code.includes("function") && !code.includes("\\")) return undefined;
+export function getCompletionParseSuffix(code: string): string | undefined {
+  if (!code.includes("function") && !code.includes("\\")) return undefined;
   const tokens = tokenize(code);
-  if (!includeOrdinaryBindings && !tokens.some(token => token.type === TokenType.Function ||
+  if (!tokens.some(token => token.type === TokenType.Function ||
       (token.type === TokenType.Operator && token.value === "\\"))) return undefined;
   const closing: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
   const stack: string[] = [];

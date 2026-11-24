@@ -1,12 +1,16 @@
-import type { CompletionProvider, CompletionResult, CompletionSourceBinding, StaticBindingQuery, StaticCompletionOutcome, StaticCompletionRequest } from "./types";
+import type { CompletionProvider, CompletionResult, StaticBindingQuery, StaticCompletionOutcome, StaticCompletionRequest } from "./types";
 import { getCompletionContext, getStaticFallbackContext } from "./syntax";
 import { storedCompletionReceiver } from "./sourceReceiver";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 import { staticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
 
+/** Native projection payload, confined to the installed-provider adapter. */
+export type NativeSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
+
 /** Compatibility boundary for the installed languageserver's single-source projection. */
 export async function provideNativeStaticCompletion(
-  provider: CompletionProvider, request: StaticCompletionRequest
+  completeNative: (binding?: NativeSourceBinding) => Promise<CompletionResult | undefined>,
+  request: StaticCompletionRequest
 ): Promise<StaticCompletionOutcome> {
   const { input, cursor, bindings } = request;
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
@@ -16,8 +20,7 @@ export async function provideNativeStaticCompletion(
   if (context?.rejectionReason || context?.suppressAutomatic) {
     return { status: "unresolved", reason: "unsupported-context" };
   }
-  if (!provider.provideCompletionItems) return { status: "unresolved", reason: "provider-unavailable" };
-  let sourceBinding: CompletionSourceBinding | undefined;
+  let sourceBinding: NativeSourceBinding | undefined;
   let bindingSuppression: CompletionSuppressionReason | undefined;
   // Runtime refusal is evidence about this receiver. Keep it opaque even when
   // another binding lookup would return a callable source snapshot.
@@ -39,8 +42,7 @@ export async function provideNativeStaticCompletion(
     }
   }
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
-  const result = await provider.provideCompletionItems(request.document, request.position, request.triggerCharacter,
-    request.contextPosition, undefined, "static", sourceBinding, request.requestScope);
+  const result = await completeNative(sourceBinding);
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
   if (!result) return { status: "pending", reason: "no-response" };
   if (bindingSuppression) result.rConsoleBindingSuppressionReason = bindingSuppression;
@@ -93,7 +95,7 @@ export async function requestStaticCompletion(
     if (!current()) return finish(pending);
     void Promise.resolve().then(() => finished || !current() ? pending : provider.provideStaticCompletion
       ? provider.provideStaticCompletion({ ...request, bindings })
-      : provideNativeStaticCompletion(provider, { ...request, bindings }))
+      : { status: "unresolved" as const, reason: "provider-unavailable" as const })
       .then(finish, () => finish({ status: "unresolved", reason: "request-failed" }));
   });
   const completion = outcome.completion;

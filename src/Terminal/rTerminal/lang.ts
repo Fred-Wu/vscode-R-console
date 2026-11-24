@@ -139,7 +139,7 @@ export class RTermLang {
     );
     if (staticEnabled) {
       context = getStaticCompletionContext(input.currentLine, input.cursorCol,
-        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context) ?? context;
+        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context);
     }
     context ??= (force
       ? {
@@ -306,7 +306,7 @@ export class RTermLang {
               [...lines.slice(0, latestInput.cursorRow),
                 lines[latestInput.cursorRow].slice(0, cursorCol)].join("\n"),
               nextInputText.slice([...lines.slice(0, latestInput.cursorRow),
-                lines[latestInput.cursorRow].slice(0, cursorCol)].join("\n").length)) ?? nextContext;
+                lines[latestInput.cursorRow].slice(0, cursorCol)].join("\n").length));
           }
           if (nextContext.rejectionReason) return [];
           const nextRuntimeMember = nextContext.kind === "member" && !nextContext.staticFallback &&

@@ -1,6 +1,6 @@
 import type { GuardedBindingResolver, RuntimeFunctionSourceRequester, StaticBindingQuery, StaticBindingResult } from "./types";
 
-export const STATIC_BINDING_LIMITS = { lookups: 16, sourceBytes: 64 * 1024, totalBytes: 256 * 1024, depth: 8, timeoutMs: 1500 };
+const STATIC_BINDING_LIMITS = { lookups: 16, sourceBytes: 64 * 1024, totalBytes: 256 * 1024, depth: 8, timeoutMs: 1500 };
 
 /** Supplies inert native snapshots; scope discovery and dependency traversal belong to providers. */
 export function createGuardedBindingResolver(

@@ -34,7 +34,7 @@ export async function getLanguageServerCompletions(
           triggerCharacter: context.triggerCharacter, requestScope,
         })
       : completionProvider.provideCompletionItems?.(doc, queryPosition, context.triggerCharacter,
-          position, runtimeBracketKind, analysisMode, undefined, requestScope);
+          position, runtimeBracketKind, analysisMode, requestScope);
     let result = await query(position);
     let runtimeOnly = result?.rConsoleRuntimeOnly === true;
     let localFunction = result?.rConsoleLocalFunction === true;

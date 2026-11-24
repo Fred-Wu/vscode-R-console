@@ -25,7 +25,7 @@ import {
   StreamMessageReader,
   StreamMessageWriter,
 } from "vscode-languageclient/node";
-import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult, CompletionSourceBinding, RuntimeFunctionArgumentsRequester } from "./completion";
+import type { CompletionAnalysisMode, CompletionPickItem, CompletionProvider, CompletionResult, RuntimeFunctionArgumentsRequester } from "./completion";
 import type { MemberInspectionResult } from "../Runtime/backendProtocol";
 import { VirtualRDocument } from "./virtualRDocument";
 import { getEnclosingCall } from "./completion/contextParser";
@@ -39,7 +39,7 @@ import { lifecycleOutputChannel } from "./completion/outputChannel";
 import { staticCompletionUnavailableReason } from "./completion/diagnostics";
 import { getCompletionContext, getStaticFallbackContext } from "./completion/syntax";
 import { storedCompletionReceiver } from "./completion/sourceReceiver";
-import { provideNativeStaticCompletion } from "./completion/staticProvider";
+import { provideNativeStaticCompletion, type NativeSourceBinding } from "./completion/staticProvider";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 
@@ -306,7 +306,9 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   provideStaticCompletion(request: import("./completion/types").StaticCompletionRequest) {
-    return provideNativeStaticCompletion(this, request);
+    return provideNativeStaticCompletion(binding => this.provideCompletionItems(
+      request.document, request.position, request.triggerCharacter, request.contextPosition,
+      undefined, "static", request.requestScope, binding), request);
   }
 
   async provideCompletionItems(
@@ -316,8 +318,8 @@ export class ConsoleLspClient implements CompletionProvider {
     contextPosition: vscode.Position = position,
     runtimeBracketKind?: "data.frame" | "data.table" | null,
     analysisMode?: CompletionAnalysisMode,
-    sourceBinding?: CompletionSourceBinding,
-    requestScope: object = {}
+    requestScope: object = {},
+    sourceBinding?: NativeSourceBinding
   ): Promise<CompletionResult | undefined> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await this.packageRefreshPromise;

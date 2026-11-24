@@ -120,3 +120,19 @@ test('provider lifetime closes pending reads and invalidates stale document resp
   assert.equal(stale.rConsoleStaticStatus, 'pending');
   assert.deepEqual(stale.items, []);
 });
+
+test('runtime-only providers cannot silently supply static completion', async () => {
+  const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+  const input = 'factory()$';
+  const position = { line: 0, character: input.length };
+  const result = await requestStaticCompletion({
+    provideCompletionItems: async () => assert.fail('static requests require an explicit provider method'),
+  }, {
+    document: { version: 1, getText: () => input }, input, cursor: input.length,
+    position, contextPosition: position, requestScope: {},
+    bindings: createGuardedBindingResolver(async () => assert.fail('no binding lookup without static support')),
+  });
+  assert.equal(result.rConsoleStaticStatus, 'unresolved');
+  assert.equal(result.rConsoleStaticUnavailableReason, 'provider-unavailable');
+  assert.deepEqual(result.items, []);
+});

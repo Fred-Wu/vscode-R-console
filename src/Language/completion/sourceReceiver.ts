@@ -3,31 +3,6 @@ import { getCompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
 import type { CompletionContext, RuntimeFunctionSourceTarget } from "./types";
 
-// Locate the named callable at the root of the receiver. A bare function
-// name uses function lookup; a grouped symbol used as a call head uses value
-// lookup. Neither path evaluates selectors, subscripts or computed heads.
-export function storedFunctionReceiver(
-  context: CompletionContext, input: string, cursor: number
-): string | undefined {
-  return storedFunctionCall(context, input, cursor)?.name;
-}
-
-export function storedFunctionCall(
-  context: CompletionContext, input: string, cursor: number
-): { name: string; start: number } | undefined {
-  const receiver = storedCompletionReceiver(context, input, cursor);
-  return receiver && receiver.target !== "binding" ? { name: receiver.name, start: receiver.start } : undefined;
-}
-
-// Locate the value root of a computed receiver for binding identity checks.
-// Subscripts and method calls are skipped syntactically, never evaluated.
-export function storedReceiverRoot(
-  context: CompletionContext, input: string, cursor: number
-): { name: string; start: number } | undefined {
-  const receiver = storedCompletionReceiver(context, input, cursor);
-  return receiver && { name: receiver.name, start: receiver.start };
-}
-
 // One delimiter scan and one backwards walk classify the receiver's root.
 // Downstream accessors, subscripts and calls do not change that identity.
 // Leave inference of those operations to the language server.

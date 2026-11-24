@@ -119,7 +119,7 @@ test("guarded source overlay preserves console replacement offsets and uses one 
   const doc = { getText: () => text };
   const definition = { name: "make_data", body: "function() {\n  list(alpha = 1)\n}" };
   const result = await client.provideCompletionItems(doc, cursor, undefined,
-    undefined, undefined, "static", definition);
+    undefined, undefined, "static", undefined, definition);
   const request = instances[0].requests.find(item => item.method === "completion");
   const expectedPrelude = `\`make_data\` <- function() {\n  list(alpha = 1)\n}\n`;
   assert.equal(request.params.text, expectedPrelude + text);
@@ -244,7 +244,7 @@ test("a shared request never reuses arguments after runtime, document or session
     const scope = {}, text = 'obj$fun(zzz';
     const doc = { getText: () => text }, position = new Position(0, text.length);
     const complete = (document = doc) => client.provideCompletionItems(document, position,
-      undefined, position, undefined, undefined, undefined, scope);
+      undefined, position, undefined, undefined, scope);
     await complete();
     const sent = instances.reduce((n, instance) => n + instance.requests.filter(r => r.method === 'completion').length, 0);
     if (change === 'runtime') client.invalidateRuntimeCompletion();
@@ -261,13 +261,13 @@ test("opaque source bindings preserve input and respect projected package select
   const { client, instances } = createClient(t, { staticAnalysis: true });
   const text = 'data.frame(fake = 1)$';
   const doc = { getText: () => text }, position = new Position(0, text.length);
-  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', { name: 'data.frame' });
+  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', undefined, { name: 'data.frame' });
   let params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
   assert.equal(params.text, text, 'an opaque binding adds no invented R source');
   assert.equal(params.rConsoleOpaqueFunction, 'data.frame');
   client.updateInput(text);
   client.recordCompletion(text, 0, { insertText: 'data.frame()', packageName: 'base' });
-  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', { name: 'data.frame' });
+  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', undefined, { name: 'data.frame' });
   params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
   assert.equal(params.text, 'base::' + text);
   assert.equal(params.rConsoleOpaqueFunction, undefined);

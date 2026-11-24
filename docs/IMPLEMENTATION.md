@@ -1411,9 +1411,10 @@ opaque roots after native safety refusals. Unsupported adapter contexts, includi
 computed multidimensional bracket completion, return `unsupported-context`.
 Transitive dependency discovery remains limited by the installed provider;
 providers implementing the general contract can request additional bindings
-without changes to terminal routing. Document-only providers use the same
-compatibility adapter. The native runtime inspection and source-serialization
-safety allowlists apply to every lookup.
+without changes to terminal routing. Static requests require the explicit
+static-provider method; runtime-only providers report unavailable static support.
+The native runtime inspection and source-serialization safety allowlists apply
+to every lookup.
 
 As a result, static completion support follows the installed `languageserver`.
 For example, some chained assignments, callable formal defaults and unfinished

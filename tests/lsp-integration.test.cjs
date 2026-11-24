@@ -1701,13 +1701,15 @@ test("static completion explains missing source and unresolved accessors using n
     const lines = text.split('\n'), line = lines.at(-1);
     const position = { line: lines.length - 1, character: line.length };
     const doc = { getText: () => text, uri: client.inputDocument.uri };
-    const context = completion.getStaticFallbackContext(line, line.length, text) ??
-      completion.getCompletionContext(line, line.length, text);
+    const context = completion.getStaticCompletionContext(line, line.length, text);
     const result = await client.provideCompletionItems(doc, position, context.triggerCharacter,
       undefined, undefined, 'static');
     assert.equal(result.rConsoleStaticUnavailableReason, reason, text);
+    // This source-only fixture has no live bindings to mask native inference.
     const entries = await completion.collectStaticFallbackEntries(context, doc, position,
-      lines.slice(0, -1), { provideCompletionItems: async () => result });
+      lines.slice(0, -1), client, {
+        bindings: completion.createGuardedBindingResolver(async () => ({ status: 'missing' })),
+      });
     assert.equal(entries.staticResolved, resolved, text);
     assert.equal(entries.staticUnavailableReason, reason, text);
     assert.deepEqual(entries.map(entry => entry.label), labels, text);
@@ -1856,9 +1858,12 @@ test("receiver-only static inference uses the shared path across object systems"
     const context = completion.getCompletionContext(input, input.length, text);
     const entries = await completion.collectStaticFallbackEntries(context,
       { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: input.length },
-      [definition], { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
+      [definition], { provideStaticCompletion: async request => {
+        const outcome = await client.provideStaticCompletion(request);
+        const result = outcome.completion;
+        return { ...outcome, completion: result && {
+          ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })),
+        } };
       } });
     assert.equal(entries.staticResolved, true, definition);
     for (const label of expected) assert.ok(entries.some(item => item.label === label), definition + ': ' + label);

@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { getCallOpenings, tokenizeForHighlighting } from "./parser";
 import { runtimeCompletionText } from "./completion/runtimeDocument";
 import { backtickRName } from "./completion/candidates";
-import type { CompletionSourceBinding } from "./completion/types";
+import type { NativeSourceBinding } from "./completion/staticProvider";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 
@@ -50,7 +50,7 @@ export class VirtualRDocument {
   }
 
   project(content: string, staticAnalysis = true, cursor?: vscode.Position,
-    sourceBinding?: CompletionSourceBinding) {
+    sourceBinding?: NativeSourceBinding) {
     // Picker previews must not change the selections saved with the actual input.
     const visible = new VirtualRDocument(this.id, content);
     const selections = this.getSelections(content);

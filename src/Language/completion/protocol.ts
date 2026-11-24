@@ -19,7 +19,7 @@ export function createCompletionParams(
   const bracket = text.includes("[") ? getBracketCompletionContext(text, contextOffset) : undefined;
   // Static parsing and incomplete-input recovery belong to languageserver.
   // The legacy repair is used only to match inert runtime signature metadata.
-  const parseSuffix = staticAnalysis ? undefined : getCompletionParseSuffix(text, false);
+  const parseSuffix = staticAnalysis ? undefined : getCompletionParseSuffix(text);
   const parseInsertion = parseSuffix !== undefined && pipe
     ? getCompletionParseInsertion(text, contextOffset) : undefined;
   // Fuzzy requests move within a prefix. Preserve the original cursor
