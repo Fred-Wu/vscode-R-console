@@ -297,7 +297,15 @@ test("two library links to the same installation retain its completion metadata"
   fs.symlinkSync(target, path.join(second, "example"), type);
   inventory.setLibraryPaths([first, second]);
   await settle();
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
   fs.unlinkSync(path.join(first, "example"));
+  // Idle can precede delivery of the filesystem notification. Wait for the
+  // surviving link to be published, then check that metadata was retained.
+  const deadline = Date.now() + 10000;
+  while (changes.at(-1).packages.get("example")?.path !== path.join(second, "example")) {
+    assert.ok(Date.now() < deadline, "remaining package link must be published");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   await settle();
   assert.deepEqual(changes.at(-1).changed, []);
   assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
