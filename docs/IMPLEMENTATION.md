@@ -720,6 +720,8 @@ binding resolver. The terminal decides live inspection eligibility and retains
 successful live results, including empty results. Inline completion, explicit
 completion and picker refinement route remaining static requests to the provider.
 Syntax-derived presentation hints preserve known prefix and quoting behavior;
+blank ordinary expressions retain session symbol browsing.
+Receiver refusals and literals retain their isolated static routing. Static
 contexts without those hints use provider-supplied replacement edits. The edit
 validator checks explicit provider ranges in every static context. It requires a
 start on the cursor's line, an end inside the input and a range containing the

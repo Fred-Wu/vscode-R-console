@@ -80,10 +80,10 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
     getText: () => text,
     uri: { toString: () => "r-console://test/console.R" },
   });
-  const complete = async (text, cursor = text.length) => {
+  const complete = async (text, cursor = text.length, force = false) => {
     const input = snapshot(text, cursor);
     let entries;
-    await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+    await lang.handleAutocomplete({ input, force, getCurrentInput: () => input,
       getWorkspaceData: () => sessionData, applyCompletion() {},
       onInlineEntries: value => { entries = value; } });
     // A bracket request can publish staged native data asynchronously.
@@ -92,6 +92,33 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
   };
   return { lang, complete, logs, native, requests, sourceRequests, sourceTargets };
 }
+
+test('explicit inline completion retains live symbols at blank expression positions in both analysis modes', async () => {
+  for (const staticAnalysis of [false, true]) {
+    const h = harness({ staticAnalysis, sessionData: { globalenv: { my_value: { type: 'double' } } },
+      lspItems: { items: [] } });
+    for (const marked of ['result <- │', '1 + │', 'result <- (│)', 'if (TRUE) │',
+      'f <- function() { │}', 'first <- 1; │', 'first <- 1\nresult <- │']) {
+      const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+      const entries = (await h.complete(text, cursor, true)).filter(item => 'insertText' in item);
+      const item = entries.find(item => item.insertText === 'my_value');
+      assert.ok(item, `${staticAnalysis}: ${marked}`);
+      assert.equal(item.replaceStart, snapshot(text, cursor).cursorCol);
+      assert.equal(item.replaceEnd ?? item.snapshotCursor, item.snapshotCursor);
+    }
+    assert.deepEqual(h.native, [], 'ordinary expression completion does not inspect a receiver');
+  }
+});
+
+test('static receiver and literal contexts keep ambient live symbols isolated', async () => {
+  const h = harness({ sessionData: { globalenv: { my_value: { type: 'double' } } },
+    lspItems: { items: [] } });
+  for (const text of ['factory()$', 'factory()[[', 'factory()[, ', 'factory()[1, "',
+    '"', '# comment ']) {
+    assert.deepEqual(labels(await h.complete(text, text.length, true)), [], text);
+  }
+  assert.deepEqual(h.native, [], 'unclassified receivers must remain source-only');
+});
 
 test("unavailable stored method arguments log the reason and remain retryable", async () => {
   for (const staticAnalysis of [true, false]) {

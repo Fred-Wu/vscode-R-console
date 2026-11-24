@@ -312,7 +312,10 @@ export function getStaticCompletionContext(
   runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor)
 ): CompletionContext {
   if (runtime && !runtime.rejectionReason && !runtime.suppressAutomatic) return runtime;
-  if (!(fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition)).trim()) return {
+  // Positions without a specialized context retain ordinary symbol browsing,
+  // including empty expressions after assignments, operators and delimiters.
+  // Receiver refusals and literals carry explicit contexts and fall through.
+  if (!runtime) return {
     kind: "default", prefix: "", replaceStart: cursorPosition,
     snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
   };

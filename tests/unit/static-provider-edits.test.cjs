@@ -75,6 +75,21 @@ async function openStaticPicker(t, marked, provide, options = {}) {
   };
 }
 
+test('blank expression pickers retain live symbols through preview refinement and acceptance', async t => {
+  for (const marked of ['result <- │', '1 + │', 'result <- (│)', 'f <- function() { │}',
+    'first <- 1\nresult <- │']) {
+    for (const refine of [false, true]) {
+      const h = await openStaticPicker(t, marked, async () => resolved([]), {
+        workspace: { globalenv: { my_value: { type: 'double' } } },
+      });
+      assert.ok(h.pick.items.some(item => item.insertText === 'my_value'), marked);
+      if (refine) await h.type('my');
+      await h.accept();
+      assert.equal(h.terminal.inputState.text, marked.replace('│', 'my_value'), marked);
+    }
+  }
+});
+
 test('symbol and argument pickers retry timed-out providers when search grows', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   for (const marked of ['co│', 'f(co│)']) {

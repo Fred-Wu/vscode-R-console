@@ -26,6 +26,7 @@ export async function getLanguageServerCompletions(
   try {
     const requestScope = {};
     const input = doc.getText();
+    const documentUri = doc.uri?.toString();
     const inputLines = input.split("\n");
     const lineOffsets: number[] = [];
     let offset = 0;
@@ -57,9 +58,10 @@ export async function getLanguageServerCompletions(
     let items = result?.items ?? [];
     const usable = (item: CompletionCandidate): boolean =>
       !(workspaceFunction && !context.argumentValue && item.role === "value") &&
-      isLanguageServerCompletionItem(context, item, doc.uri?.toString()) &&
-      (context.kind !== "static" || (result?.staticStatus === "resolved" && validStaticEdit(item, inputLines, position))) &&
-      (analysisMode !== "static" || !item.range || validStaticEdit(item, inputLines, position, false));
+      isLanguageServerCompletionItem(context, item, documentUri) &&
+      (context.kind === "static"
+        ? result?.staticStatus === "resolved" && validStaticEdit(item, inputLines, position)
+        : analysisMode !== "static" || !item.range || validStaticEdit(item, inputLines, position, false));
     // Some R language servers only return contiguous matches. If that lookup
     // has no usable candidates, request at the first prefix character and
     // apply our matcher to the returned candidates. Keep the real document and
