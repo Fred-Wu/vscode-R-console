@@ -510,14 +510,15 @@ function lifecycleFixture(t) {
 
 test("replacement restores startup options with the new package copy before loading namespaces", { timeout: 90000 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  install(first, "originalExport"); install(second, "replacementExport");
+  const startupHook = '.onLoad <- function(...) stopifnot(identical(getOption("rconsole.lifecycle.option"), "ready"))';
+  install(first, "originalExport", startupHook); install(second, "replacementExport", startupHook);
   const marker = path.join(root, "profile-runs");
   fs.writeFileSync(path.join(root, ".Renviron"), `R_DEFAULT_PACKAGES=datasets,utils,grDevices,graphics,stats,methods,${pkg}\nR_LIBS_USER="${first.replaceAll("\\", "/")}"\n`);
   fs.writeFileSync(path.join(root, ".Rprofile"), [
     `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
+    'options(defaultPackages = character(), languageserver.max_completions = 7L, rconsole.lifecycle.option = "ready")',
     `library(${pkg})`,
     'library(utils)',
-    'options(defaultPackages = character(), languageserver.max_completions = 7L)',
     `cat(Sys.getpid(), "\\n", file=${JSON.stringify(marker)}, append=TRUE)`,
   ].join("\n"));
   const env = { ...process.env }; delete env.R_PROFILE_USER; delete env.R_ENVIRON_USER;
@@ -525,6 +526,13 @@ test("replacement restores startup options with the new package copy before load
   client.updateRuntimeLibraryPaths([first, second, ...defaults]);
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  if (process.platform !== "win32") {
+    const snapshot = path.join(client.workingDirectory, "startup.rds");
+    assert.equal(fs.statSync(client.workingDirectory).mode & 0o077, 0,
+      "the language-server working directory must be private");
+    assert.equal(fs.statSync(snapshot).mode & 0o077, 0,
+      "startup options and environment must not be readable by other users");
+  }
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   client.updateRuntimeLibraryPaths([second, first, ...defaults]);
   await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");

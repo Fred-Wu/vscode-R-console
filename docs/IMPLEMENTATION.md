@@ -1234,7 +1234,9 @@ package records. Linked package directories and their target parents are also
 polled for replacement, removal, recreation and installation locks. Package
 symlink chains are followed hop by hop with cycle detection and a traversal
 limit. Each hop's parent remains monitored, and the final target's lock location
-is resolved even while the package is absent during installation. Scans use
+is resolved even while the package is absent during installation. Named locks
+are checked against both the logical package name and its resolved directory
+name, which may differ for versioned external caches. Scans use
 bounded asynchronous file operations. Named installation locks defer their
 package; a `00LOCK` directory defers the whole library. Deferred paths remain
 tracked while a lock is held, including packages absent from the initial
@@ -1260,11 +1262,15 @@ package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
-latest snapshot. The initial server saves its effective environment, completion
-options and attached package names in its private temporary directory. A replacement
+latest snapshot. The initial server saves its effective environment, all startup
+options and attached package names in its private temporary directory. The
+snapshot can contain values set by user profiles, including credentials, so the
+temporary directory and snapshot have owner-only permissions on Unix; Windows
+uses the current user's temporary-directory access controls. Normal disposal
+removes the snapshot. A replacement
 starts with profiles, environment files and automatic default-package loading
 disabled. It restores environment values and unsets, applies the console's library
-order with site-library inclusion disabled, restores completion options and then
+order with site-library inclusion disabled, restores startup options and then
 loads the startup packages. Transport credentials and R's process-specific temporary
 directory remain fresh. The client verifies namespace installations before publishing
 the inventory. A completion interrupted by replacement reopens its document

@@ -28,10 +28,17 @@ if (nzchar(startup_state)) {
             require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
         }
     } else {
-        startup_options <- options()
-        saveRDS(list(options = startup_options[names(startup_options) == "defaultPackages" |
-            startsWith(names(startup_options), "languageserver.")], packages = .packages(),
-            environment = startup_environment()), startup_state)
+        # Profile-defined options may be required by packages before they load.
+        # The snapshot can include sensitive values, so create it owner-only.
+        local({
+            if (.Platform$OS.type == "unix") {
+                original_umask <- Sys.umask("077")
+                on.exit(Sys.umask(original_umask))
+            }
+            saveRDS(list(options = options(), packages = .packages(),
+                environment = startup_environment()), startup_state)
+            if (.Platform$OS.type == "unix") Sys.chmod(startup_state, mode = "0600")
+        })
     }
 }
 

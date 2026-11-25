@@ -6,6 +6,15 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { PackageInventory } = loadSource("src/Language/packageInventory.ts");
 
+function comparablePackagePath(file) {
+  // Windows junctions can expose extended-length paths and different casing.
+  // Compare effective parents, not the literal spelling of a missing target.
+  const resolved = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+  return process.platform === "win32"
+    ? resolved.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/i, "").toLowerCase()
+    : resolved;
+}
+
 function fixture(t, notificationDelay = 0) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-"));
   const libraries = ["first", "second"].map(name => path.join(root, name));
@@ -751,8 +760,9 @@ for (const lockName of ["00LOCK-example", "00LOCK"]) {
       }
       const current = changes.at(-1);
       assert.equal(current.packages.has("example"), !initiallyMissing);
-      assert.ok(current.libraries[0].deferred.get("example")?.includes(fs.realpathSync(cache) + path.sep + "example"),
-        "the missing final target must keep its cache lock and watch location");
+      const deferredPaths = current.libraries[0].deferred.get("example") ?? [];
+      assert.ok(deferredPaths.some(file => comparablePackagePath(file) === comparablePackagePath(target)),
+        `the missing final target must keep its cache lock and watch location: ${JSON.stringify(deferredPaths)}`);
       const count = changes.length;
       install(cache, "2.0");
       await new Promise(resolve => setTimeout(resolve, 1800));
@@ -764,6 +774,35 @@ for (const lockName of ["00LOCK-example", "00LOCK"]) {
     });
   }
 }
+
+test("a versioned cache target honors its package's named installation lock", async t => {
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const cache = path.join(root, "cache");
+  fs.mkdirSync(cache);
+  const original = install(cache);
+  const target = path.join(cache, "release-1");
+  fs.renameSync(original, target);
+  fs.symlinkSync(target, path.join(library, "example"),
+    process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const before = changes.at(-1).packages.get("example").identity;
+
+  const lock = path.join(cache, "00LOCK-example");
+  fs.mkdirSync(lock);
+  fs.rmSync(target, { recursive: true });
+  fs.renameSync(install(cache, "2.0"), target);
+  inventory.dirtyLibraries.add(library);
+  await inventory.refresh();
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").identity, before,
+    "the logical package lock must defer an updated versioned target");
+  fs.rmdirSync(lock);
+  inventory.dirtyLibraries.add(library);
+  await inventory.refresh();
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0",
+    "unlocking a named package lock must publish the replacement");
+});
 
 // Binary and non-staged installs can copy a new package directly into the
 // library while 00LOCK is still empty: it must retain its library-wide scope.

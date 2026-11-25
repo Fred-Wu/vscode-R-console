@@ -470,7 +470,10 @@ export class PackageInventory {
           const target = targets.get(name);
           if (target) {
             const targetLocks = await locksFor(path.dirname(target));
-            if (targetLocks.has("*") || targetLocks.has(path.basename(target))) return defer(name, target);
+            // R installs lock by package name even when a linked cache directory is versioned.
+            if (targetLocks.has("*") || targetLocks.has(name) || targetLocks.has(path.basename(target))) {
+              return defer(name, target);
+            }
           }
           return this.readPackage(library, name, old);
         }));

@@ -144,6 +144,9 @@ export class ConsoleLspClient implements CompletionProvider {
     this.outputChannel = new SilentOutputChannel("R Console");
     // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
+    // Startup state can contain profile-provided credentials. Restrict the
+    // directory before the language server can write its snapshot.
+    if (process.platform !== "win32") fs.chmodSync(this.workingDirectory, 0o700);
     this.packageInventory = new PackageInventory(
       change => this.refreshPackages(change),
       message => lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] ${message}`),
