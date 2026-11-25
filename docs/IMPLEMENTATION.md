@@ -1266,8 +1266,9 @@ package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
-latest snapshot. The initial server saves its effective environment, all startup
-options and attached package names in its private temporary directory. The
+latest snapshot. The initial server saves its effective environment, base and site
+library roots, all startup options and attached package names in its private
+temporary directory. The
 options are serialized into a raw payload inside the snapshot, so reading the
 environment and package names cannot deserialize namespace references. Options
 containing only atomic values and lists with reference-free attributes are also
@@ -1277,8 +1278,9 @@ temporary directory and snapshot have owner-only permissions on Unix; Windows
 uses the current user's temporary-directory access controls. Normal disposal
 removes the snapshot. A replacement
 starts with profiles, environment files and automatic default-package loading
-disabled. It restores environment values and unsets, applies the console's library
-order with site-library inclusion disabled, restores those ordinary options,
+disabled. It restores environment values and unsets, then the effective `.Library`
+and `.Library.site` values before applying the console's library order with
+site-library inclusion disabled. It restores those ordinary options,
 then deserializes and restores all startup options and loads the startup packages.
 Transport credentials and R's process-specific temporary
 directory remain fresh. The client verifies namespace installations before publishing

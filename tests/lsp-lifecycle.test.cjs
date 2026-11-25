@@ -500,11 +500,11 @@ function lifecycleFixture(t) {
   const { session: first, configured: second, createClient } = temporaryLibraries(t);
   const root = path.dirname(first), pkg = "rconsolelifecycleprobe", source = path.join(root, "source");
   fs.mkdirSync(path.join(source, "R"), { recursive: true });
-  fs.writeFileSync(path.join(source, "DESCRIPTION"), [
-    `Package: ${pkg}`, "Version: 1.0", "Title: Lifecycle Probe", "Description: A test package.",
-    "Author: Test", "Maintainer: Test <test@example.org>", "License: MIT", "",
-  ].join("\n"));
-  const install = (library, exported, startup = "") => {
+  const install = (library, exported, startup = "", packageName = pkg) => {
+    fs.writeFileSync(path.join(source, "DESCRIPTION"), [
+      `Package: ${packageName}`, "Version: 1.0", "Title: Lifecycle Probe", "Description: A test package.",
+      "Author: Test", "Maintainer: Test <test@example.org>", "License: MIT", "",
+    ].join("\n"));
     fs.writeFileSync(path.join(source, "NAMESPACE"), `export(${exported})\n`);
     fs.writeFileSync(path.join(source, "R", "f.R"), `${exported} <- function() NULL\n${startup}\n`);
     execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["CMD", "INSTALL", "--no-byte-compile",
@@ -672,6 +672,107 @@ test("replacement restores profile environment changes before package loading an
       "replacement restores state without replaying the profile");
   }
   assert.equal(instances.length, 3, "both replacements authenticate with fresh transport state");
+});
+
+test("replacement preserves profile-defined base and site library roots across repeated restarts", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  const baseRoot = path.join(root, "project-base"), siteRoot = path.join(root, "excluded-site");
+  const canonical = value => fs.realpathSync.native(value).replaceAll("\\", "/");
+  const systemBase = execFileSync("Rscript", ["--vanilla", "-e", "cat(.Library)"],
+    { encoding: "utf8" }).trim();
+  const otherLibraries = defaults.filter(library => canonical(library) !== canonical(systemBase));
+  fs.mkdirSync(baseRoot);
+  fs.mkdirSync(siteRoot);
+  // Keep the standard R packages available through a distinct root without
+  // copying or modifying the installed R distribution. On Windows use junctions.
+  // Where present, leave an optional recommended package exclusively in the
+  // original system library to detect accidental fallback to that library.
+  const excludedSystem = ["spatial", "KernSmooth", "foreign"].find(name =>
+    fs.existsSync(path.join(systemBase, name, "DESCRIPTION")) &&
+    otherLibraries.every(library => !fs.existsSync(path.join(library, name, "DESCRIPTION"))));
+  for (const name of fs.readdirSync(systemBase)) {
+    const directory = path.join(systemBase, name);
+    if (name !== excludedSystem && fs.existsSync(path.join(directory, "DESCRIPTION"))) {
+      fs.symlinkSync(directory, path.join(baseRoot, name), process.platform === "win32" ? "junction" : "dir");
+    }
+  }
+  const excludedSite = "rconsoleexcludedsiteprobe";
+  install(siteRoot, "excludedExport", "", excludedSite);
+  const originalOrder = [first, second, ...otherLibraries, baseRoot].map(canonical);
+  const replacementOrder = [originalOrder[1], originalOrder[0], ...originalOrder.slice(2)];
+  const rBase = JSON.stringify(canonical(baseRoot)), rSite = JSON.stringify(canonical(siteRoot));
+  const marker = path.join(root, "profile-runs");
+  const startup = `.onLoad <- function(...) {
+    if (any(basename(commandArgs(TRUE)) == "console-language-server.R")) {
+      stopifnot(identical(get(".Library", baseenv(), inherits = FALSE), ${rBase}),
+        identical(get(".Library.site", baseenv(), inherits = FALSE), ${rSite}),
+        identical(Sys.getenv("RCONSOLE_LIBRARY_ROOT_TEST"), "ready"),
+        identical(getOption("rconsole.lifecycle.option"), "ready"))
+    }
+  }
+  .onAttach <- function(...) {
+    if (any(basename(commandArgs(TRUE)) == "console-language-server.R")) {
+      callback <- getOption("rconsole.lifecycle.callback")
+      stopifnot(is.function(callback), isNamespace(environment(callback)),
+        identical(normalizePath(getNamespaceInfo(environment(callback), "path")),
+          normalizePath(file.path(.libPaths()[[1L]], "${pkg}"))))
+    }
+  }`;
+  install(first, "originalExport", startup);
+  install(second, "replacementExport", startup);
+  const profile = path.join(root, ".Rprofile");
+  fs.writeFileSync(profile, [
+    `local({
+      roots <- list(.Library = ${rBase}, .Library.site = ${rSite})
+      for (name in names(roots)) {
+        locked <- bindingIsLocked(name, baseenv())
+        if (locked) unlockBinding(name, baseenv())
+        assign(name, roots[[name]], envir = baseenv())
+        if (locked) lockBinding(name, baseenv())
+      }
+    })`,
+    `.libPaths(c(${originalOrder.map(value => JSON.stringify(value)).join(", ")}), include.site = FALSE)`,
+    'Sys.setenv(RCONSOLE_LIBRARY_ROOT_TEST = "ready")',
+    'options(rconsole.lifecycle.option = "ready", languageserver.max_completions = 7L)',
+    `options(rconsole.lifecycle.callback = ${pkg}::originalExport)`,
+    `library(${pkg})`,
+    recordServerEvent(marker, "profile"),
+  ].join("\n") + "\n");
+  const env = { ...process.env, R_PROFILE_USER: profile, RCONSOLE_LIBRARY_ROOT_TEST: "inherited" };
+  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
+  const inventory = client.packageInventory;
+  const assertState = async (order, exported, instanceCount) => {
+    await waitFor(() => inventory.initialized && !client.packageRefreshPromise &&
+      JSON.stringify(inventory.libraries.map(library => canonical(library.path))) === JSON.stringify(order),
+    "reconcile and publish the exact console library order");
+    assert.equal(instances.length, instanceCount);
+    const paths = await instances.at(-1).sendRequest("rConsole/libraryPaths", {});
+    assert.deepEqual(paths.map(canonical), order, "no automatic system or site root may be appended");
+    const items = await complete(pkg + "::");
+    assert.ok(items.some(item => item.label === exported));
+    assert.ok(!items.some(item => item.label === (exported === "originalExport" ? "replacementExport" : "originalExport")));
+    assert.equal((await complete("stats::")).length, 7, "startup completion options survive replacement");
+    for (const name of [excludedSite, excludedSystem].filter(Boolean)) {
+      assert.ok(!inventory.packages.has(name), "excluded package is absent from the inventory: " + name);
+      assert.ok(!(await complete(name)).some(item => item.label === name && item.data?.type === "package"),
+        "excluded package is not offered for completion: " + name);
+    }
+    assert.ok(!(await complete(excludedSite + "::")).some(item => item.label === "excludedExport"));
+    assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile", "the initial profile must run only once");
+    // Include the first retry interval, so a successful completion cannot hide
+    // a reconciliation failure waiting to restart the server again.
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(instances.length, instanceCount, "successful reconciliation must not restart again");
+    assert.equal(inventory.retryTimer, undefined, "no reconciliation retry remains scheduled");
+    assert.ok(!logs.some(line => /Recovery retry scheduled|Replacement language server retained stale packages/.test(line)));
+  };
+  client.updateRuntimeLibraryPaths(originalOrder);
+  await client.start();
+  await assertState(originalOrder, "originalExport", 1);
+  client.updateRuntimeLibraryPaths(replacementOrder);
+  await assertState(replacementOrder, "replacementExport", 2);
+  client.updateRuntimeLibraryPaths(originalOrder);
+  await assertState(originalOrder, "originalExport", 3);
 });
 
 for (const lockName of ["00LOCK-rconsolelifecycleprobe", "00LOCK"]) {

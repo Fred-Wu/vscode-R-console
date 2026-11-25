@@ -18,6 +18,19 @@ if (restore_startup) {
     # loading any packages that depend on the startup configuration.
     Sys.unsetenv(setdiff(names(startup_environment()), names(startup$environment)))
     do.call(Sys.setenv, as.list(startup$environment))
+    # .libPaths() always appends .Library, even with include.site = FALSE.
+    # Restore the effective profile-defined roots before selecting libraries or
+    # deserializing options. Preserve the base bindings' original lock state.
+    local({
+        roots <- startup$library_roots
+        for (name in c(".Library", ".Library.site")) {
+            if (!name %in% names(roots)) stop("Missing startup library root: ", name)
+            locked <- bindingIsLocked(name, baseenv())
+            if (locked) unlockBinding(name, baseenv())
+            tryCatch(assign(name, roots[[name]], envir = baseenv()),
+                finally = if (locked) lockBinding(name, baseenv()))
+        }
+    })
 }
 if (nzchar(runtime_lib_paths)) {
     .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
@@ -53,7 +66,9 @@ if (nzchar(startup_state)) {
             }
             saveRDS(list(options = serialize(startup_options, NULL),
                 plain_options = Filter(plain_option, startup_options), packages = .packages(),
-                environment = startup_environment()), startup_state)
+                environment = startup_environment(),
+                library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),
+                    inherits = FALSE)), startup_state)
             if (.Platform$OS.type == "unix") Sys.chmod(startup_state, mode = "0600")
         })
     }
