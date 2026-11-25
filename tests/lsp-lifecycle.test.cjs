@@ -30,12 +30,22 @@ test("real R supplies abbreviation candidates with correct replacement ranges", 
 
 function temporaryLibraries(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-lsp-libraries-"));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const clients = [];
+  t.after(async () => {
+    // Windows holds the server's working directory open until the process exits.
+    await Promise.all(clients.map(client => client.dispose()));
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   const session = path.join(directory, "session");
   const configured = path.join(directory, "configured");
   fs.mkdirSync(session);
   fs.mkdirSync(configured);
-  return { session, configured };
+  const createClient = options => {
+    const result = createConsoleLsp(t, options);
+    clients.push(result.client);
+    return result;
+  };
+  return { session, configured, createClient };
 }
 
 async function waitFor(predicate, label) {
@@ -47,7 +57,7 @@ async function waitFor(predicate, label) {
 }
 
 test("installed package chain signatures also supply arguments without running the chain", { timeout: 90000 }, async t => {
-  const { session } = temporaryLibraries(t);
+  const { session, createClient } = temporaryLibraries(t);
   const pkg = 'rconsolechaintest';
   const source = path.join(path.dirname(session), pkg);
   const marker = path.join(path.dirname(session), 'chain-executed');
@@ -71,7 +81,7 @@ test("installed package chain signatures also supply arguments without running t
   let inspections = 0;
   let inspection = { status: 'unavailable' };
   const cache = path.join(path.dirname(session), 'package-cache');
-  const { client } = createConsoleLsp(t, { libraries: [session],
+  const { client } = createClient({ libraries: [session],
     env: { ...process.env, R_LANGSVR_PACKAGE_CACHE_DIR: cache },
     requestRuntimeFunctionArguments: () => { inspections++; return inspection; } });
   await client.syncSessionState({ attachedPackages: [pkg] });
@@ -203,7 +213,7 @@ test("project startup supplies package libraries without session path probes", {
 });
 
 test("background package refresh preserves unaffected libraries and switches remaining copies", { timeout: 120000 }, async t => {
-  const { session, configured } = temporaryLibraries(t);
+  const { session, configured, createClient } = temporaryLibraries(t);
   const pkg = "rconsoleinstalltest";
   const source = path.join(path.dirname(session), pkg);
   fs.mkdirSync(path.join(source, "R"), { recursive: true });
@@ -218,7 +228,7 @@ test("background package refresh preserves unaffected libraries and switches rem
       "CMD", "INSTALL", "--no-byte-compile", "--no-test-load", "-l", library, source,
     ], { stdio: "pipe" });
   }
-  const { client, complete, instances, logs } = createConsoleLsp(t, { libraries: [session, configured] });
+  const { client, complete, instances, logs } = createClient({ libraries: [session, configured] });
   await client.start();
   await waitFor(() => logs.some(line => line.includes("unique package names")), "initial library inventory");
   fs.mkdirSync(path.join(session, "00LOCK-test"));
@@ -280,7 +290,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 });
 
 test("real R refreshes linked project libraries when package links are added, replaced or removed", { timeout: 120000 }, async t => {
-  const { session, configured } = temporaryLibraries(t);
+  const { session, configured, createClient } = temporaryLibraries(t);
   const root = path.dirname(session);
   const cache = path.join(root, "cache");
   fs.mkdirSync(cache);
@@ -299,7 +309,7 @@ test("real R refreshes linked project libraries when package links are added, re
   }
   install(configured, "originalExport");
   install(cache, "replacementExport");
-  const { client, complete, instances, logs } = createConsoleLsp(t, { libraries: [session] });
+  const { client, complete, instances, logs } = createClient({ libraries: [session] });
   await client.start();
   await waitFor(() => logs.some(line => line.includes("unique package names")), "initial inventory");
   const link = path.join(session, pkg);
@@ -480,26 +490,26 @@ test("real R keeps startup completion working while the first session snapshot a
 });
 
 function lifecycleFixture(t) {
-  const { session: first, configured: second } = temporaryLibraries(t);
+  const { session: first, configured: second, createClient } = temporaryLibraries(t);
   const root = path.dirname(first), pkg = "rconsolelifecycleprobe", source = path.join(root, "source");
   fs.mkdirSync(path.join(source, "R"), { recursive: true });
   fs.writeFileSync(path.join(source, "DESCRIPTION"), [
     `Package: ${pkg}`, "Version: 1.0", "Title: Lifecycle Probe", "Description: A test package.",
     "Author: Test", "Maintainer: Test <test@example.org>", "License: MIT", "",
   ].join("\n"));
-  const install = (library, exported) => {
+  const install = (library, exported, startup = "") => {
     fs.writeFileSync(path.join(source, "NAMESPACE"), `export(${exported})\n`);
-    fs.writeFileSync(path.join(source, "R", "f.R"), `${exported} <- function() NULL\n`);
+    fs.writeFileSync(path.join(source, "R", "f.R"), `${exported} <- function() NULL\n${startup}\n`);
     execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["CMD", "INSTALL", "--no-byte-compile",
       "--no-test-load", "-l", library, source], { stdio: "pipe" });
   };
   const defaults = execFileSync("Rscript", ["--vanilla", "-e", 'cat(.libPaths(), sep="\\n")'],
     { encoding: "utf8" }).trim().split(/\r?\n/);
-  return { first, second, root, pkg, install, defaults };
+  return { first, second, root, pkg, install, defaults, createClient };
 }
 
 test("replacement restores startup options with the new package copy before loading namespaces", { timeout: 90000 }, async t => {
-  const { first, second, root, pkg, install, defaults } = lifecycleFixture(t);
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "originalExport"); install(second, "replacementExport");
   const marker = path.join(root, "profile-runs");
   fs.writeFileSync(path.join(root, ".Renviron"), `R_DEFAULT_PACKAGES=datasets,utils,grDevices,graphics,stats,methods,${pkg}\nR_LIBS_USER="${first.replaceAll("\\", "/")}"\n`);
@@ -511,7 +521,7 @@ test("replacement restores startup options with the new package copy before load
     `cat(Sys.getpid(), "\\n", file=${JSON.stringify(marker)}, append=TRUE)`,
   ].join("\n"));
   const env = { ...process.env }; delete env.R_PROFILE_USER; delete env.R_ENVIRON_USER;
-  const { client, instances, complete, logs } = createConsoleLsp(t, { cwd: root, args: [], env });
+  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
   client.updateRuntimeLibraryPaths([first, second, ...defaults]);
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
@@ -528,10 +538,10 @@ test("replacement restores startup options with the new package copy before load
 });
 
 test("site libraries excluded by a live snapshot stay excluded on startup and refresh", { timeout: 90000 }, async t => {
-  const { first, pkg, install, defaults } = lifecycleFixture(t);
+  const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "siteExport");
   const env = { ...process.env, R_LIBS_SITE: first };
-  const { client, complete, instances } = createConsoleLsp(t, { env, args: [] });
+  const { client, complete, instances } = createClient({ env, args: [] });
   // A console can produce this snapshot with .libPaths(defaults, include.site=FALSE).
   client.updateRuntimeLibraryPaths(defaults);
   await client.start();
@@ -547,10 +557,81 @@ test("site libraries excluded by a live snapshot stay excluded on startup and re
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "siteExport"));
 });
 
+test("replacement restores profile environment changes before package loading and keeps fresh process state", { timeout: 90000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  const marker = path.join(root, "profile-runs");
+  const startup = `.onLoad <- function(...) {
+    stopifnot(Sys.getenv("RCONSOLE_TEST_PROFILE_VALUE") == "profile value",
+      Sys.getenv("RCONSOLE_TEST_ENVIRON_VALUE") == "environ value",
+      is.na(Sys.getenv("RCONSOLE_TEST_UNSET", unset = NA_character_)),
+      Sys.getenv("RCONSOLE_TEST_EMPTY") == "", dir.exists(tempdir()))
+    session_tmp <- Sys.getenv("R_SESSION_TMPDIR")
+    if (nzchar(session_tmp)) stopifnot(normalizePath(session_tmp) == normalizePath(tempdir()))
+  }`;
+  install(first, "originalExport", startup);
+  install(second, "replacementExport", startup);
+  const profile = path.join(root, ".Rprofile"), environ = path.join(root, ".Renviron");
+  fs.writeFileSync(environ, 'RCONSOLE_TEST_ENVIRON_VALUE="environ value"\n');
+  fs.writeFileSync(profile, [
+    'Sys.setenv(RCONSOLE_TEST_PROFILE_VALUE = "profile value", RCONSOLE_TEST_EMPTY = "")',
+    'Sys.unsetenv("RCONSOLE_TEST_UNSET")',
+    `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
+    `library(${pkg})`,
+    `cat(Sys.getpid(), "\\n", file=${JSON.stringify(marker)}, append=TRUE)`,
+  ].join("\n"));
+  const env = { ...process.env, R_PROFILE_USER: profile, R_ENVIRON_USER: environ,
+    RCONSOLE_TEST_PROFILE_VALUE: "inherited", RCONSOLE_TEST_UNSET: "inherited", RCONSOLE_TEST_EMPTY: "inherited" };
+  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
+  client.updateRuntimeLibraryPaths([first, second, ...defaults]);
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
+  const snapshotKeys = execFileSync("Rscript", ["--vanilla", "-e",
+    `cat(names(readRDS(${JSON.stringify(path.join(client.workingDirectory, "startup.rds"))})$environment), sep="\\n")`],
+    { encoding: "utf8" }).trim().split(/\r?\n/);
+  assert.ok(!snapshotKeys.some(key => key.startsWith("VSCR_") || key === "R_SESSION_TMPDIR"),
+    "the startup snapshot must exclude transport secrets and the old temporary directory");
+  for (const [libraries, exported] of [[[second, first, ...defaults], "replacementExport"],
+    [[first, second, ...defaults], "originalExport"]]) {
+    logs.length = 0;
+    client.updateRuntimeLibraryPaths(libraries);
+    await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
+    assert.ok((await complete(pkg + "::")).some(item => item.label === exported),
+      "profile-dependent packages must load in every replacement server");
+    assert.ok(!fs.readFileSync(marker, "utf8").trim().split(/\s+/).includes(String(client.spawnedServer.pid)),
+      "replacement restores state without replaying the profile");
+  }
+  assert.equal(instances.length, 3, "both replacements authenticate with fresh transport state");
+});
+
+for (const lockName of ["00LOCK-rconsolelifecycleprobe", "00LOCK"]) {
+  test(`a startup namespace removed under ${lockName} is retired when the lock clears`, { timeout: 90000 }, async t => {
+    const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
+    install(first, "startupExport");
+    const lock = path.join(first, lockName);
+    fs.mkdirSync(lock);
+    const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
+      R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+    const { client, instances, complete } = createClient({ env, libraries: [first] });
+    await client.start();
+    await waitFor(() => client.packageInventory.initialized, "initial locked inventory");
+    assert.ok((await complete(pkg + "::")).some(item => item.label === "startupExport"));
+    assert.ok(!client.packageInventory.packages.has(pkg));
+    fs.rmSync(path.join(first, pkg), { recursive: true });
+    // Observe a scan while the package is absent and the lock is still held.
+    client.packageInventory.dirtyLibraries.add(first);
+    await client.packageInventory.refresh();
+    assert.equal(instances.length, 1, "the active lock keeps the startup namespace deferred");
+    fs.rmdirSync(lock);
+    await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "unlocked namespace reconciled");
+    assert.ok(!(await complete(pkg + "::")).some(item => item.label === "startupExport"));
+  });
+}
+
 test("unrelated abandoned locks do not retain removed namespace metadata", { timeout: 90000 }, async t => {
-  const { first, pkg, install } = lifecycleFixture(t);
+  const { first, pkg, install, createClient } = lifecycleFixture(t);
   install(first, "installedExport");
-  const { client, complete } = createConsoleLsp(t, { libraries: [first] });
+  const { client, complete } = createClient({ libraries: [first] });
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "installedExport"));
@@ -561,11 +642,11 @@ test("unrelated abandoned locks do not retain removed namespace metadata", { tim
 });
 
 test("linked cache changes refresh namespace exports without touching the library link", { timeout: 90000 }, async t => {
-  const { first, second: cache, pkg, install } = lifecycleFixture(t);
+  const { first, second: cache, pkg, install, createClient } = lifecycleFixture(t);
   install(cache, "originalExport");
   const target = path.join(cache, pkg);
   fs.symlinkSync(target, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
-  const { client, complete } = createConsoleLsp(t, { libraries: [first] });
+  const { client, complete } = createClient({ libraries: [first] });
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
@@ -581,13 +662,13 @@ test("linked cache changes refresh namespace exports without touching the librar
 });
 
 test("initial locked namespaces stay usable and an excluded startup namespace is retired", { timeout: 90000 }, async t => {
-  const { first, pkg, install, defaults } = lifecycleFixture(t);
+  const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "startupExport");
-  const env = { ...process.env, R_LIBS_USER: first,
+  const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
     R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
   const lock = path.join(first, "00LOCK-" + pkg);
   fs.mkdirSync(lock);
-  const { client, instances, complete } = createConsoleLsp(t, { env, libraries: [first] });
+  const { client, instances, complete } = createClient({ env, libraries: [first] });
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial locked inventory");
   assert.equal(instances.length, 1, "a locked startup namespace must not cause a restart loop");
@@ -596,7 +677,7 @@ test("initial locked namespaces stay usable and an excluded startup namespace is
   await waitFor(() => client.packageInventory.packages.has(pkg), "unlocked installation");
   await client.dispose();
   // A fresh console snapshot can already exclude a default package loaded by R startup.
-  const next = createConsoleLsp(t, { env });
+  const next = createClient({ env });
   next.client.updateRuntimeLibraryPaths(defaults);
   await next.client.start();
   await waitFor(() => next.client.packageInventory.initialized, "excluded startup namespace reconciled");

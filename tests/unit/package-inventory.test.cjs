@@ -211,13 +211,15 @@ for (const notificationDelay of [0, 100]) {
     logs.length = 0;
     fs.mkdirSync(lock);
     await waitForLog(`[Libraries] Scan deferred: installation lock present - ${library}`);
-    assert.equal(changes.length, count);
+    assert.equal(changes.length, count + 1, "publish lock state without publishing a partial installation");
+    assert.deepEqual(changes.at(-1).changed, []);
+    assert.equal(changes.at(-1).packages.size, 0);
+    assert.deepEqual(changes.at(-1).libraries[0].deferred.get("example"), [path.join(library, "example")]);
     assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
-    assert.ok(logs.includes("[Libraries] Package inventory unchanged"));
     logs.length = 0;
     install(library);
     await waitForLog(`[Libraries] Scan deferred: installation lock present - ${library}`);
-    assert.equal(changes.length, count);
+    assert.equal(changes.length, count + 1);
     fs.rmdirSync(lock);
     await settle(() => changes.at(-1).packages.has("example"), "unlocking must publish the installed package");
     assert.deepEqual(changes.at(-1).changed, ["example"]);
@@ -734,3 +736,59 @@ test("a whole-library lock protects new installations before a backup or staging
   fs.rmdirSync(path.join(library, "00LOCK"));
   await settle(() => changes.at(-1).packages.has("example"));
 });
+
+for (const lockName of ["00LOCK-example", "00LOCK"]) {
+  test(`${lockName} retains the resolved path of an initially deferred package link while it is absent`, async t => {
+    const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+    const cache = path.join(root, "cache");
+    fs.mkdirSync(cache);
+    const target = path.join(cache, "versioned-installation");
+    fs.renameSync(install(cache), target);
+    const link = path.join(library, "example"), lock = path.join(library, lockName);
+    fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+    fs.mkdirSync(lock);
+    inventory.setLibraryPaths([library]);
+    await settle();
+    assert.equal(changes.length, 1);
+    fs.unlinkSync(link);
+    inventory.dirtyLibraries.add(library);
+    await inventory.refresh();
+    await settle();
+    assert.equal(changes.length, 1, "a missing link must retain the locked namespace's resolved path");
+    fs.rmdirSync(lock);
+    await settle(() => changes.length === 2);
+    assert.deepEqual(changes[1].changed, []);
+  });
+
+  test(`releasing ${lockName} republishes initially deferred removals and retries failed reconciliation`, async t => {
+    const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+    const directory = install(library), lock = path.join(library, lockName);
+    fs.mkdirSync(lock);
+    inventory.setLibraryPaths([library]);
+    await settle();
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0].packages.size, 0);
+    assert.ok(changes[0].libraries[0].deferred.get("example").includes(directory));
+    fs.rmSync(directory, { recursive: true });
+    inventory.dirtyLibraries.add(library);
+    await inventory.refresh();
+    await settle();
+    assert.equal(changes.length, 1, "retain the initial deferral while the lock is held");
+
+    let attempts = 0;
+    inventory.onChange = async change => {
+      attempts++;
+      if (attempts === 1) throw new Error("Temporary server failure");
+      changes.push(change);
+    };
+    fs.rmdirSync(lock);
+    // A filename-less/change event must also rescan a deferred empty inventory.
+    inventory.unconfirmedLibraries.add(library);
+    await inventory.refresh();
+    await settle(() => changes.length === 2);
+    assert.equal(attempts, 2);
+    assert.deepEqual(changes[1].changed, [], "package identities remain unchanged");
+    assert.equal(changes[1].libraries[0].deferred.size, 0, "successful reconciliation publishes the release");
+    assert.equal(changes[1].packages.size, 0);
+  });
+}

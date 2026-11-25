@@ -1,36 +1,28 @@
 # The first process discovers project configuration through normal R startup.
-# Replacements restore completion options after applying the console's library
-# order, with profiles and automatic default-package loading disabled.
+# Replacements restore the startup environment and completion options with the
+# console's library order. Profiles and automatic package loading are disabled.
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
-if (identical(Sys.getenv("VSCR_LSP_READ_ENVIRON"), "TRUE")) {
-    # Use R's environment-file reader after automatic package loading has been
-    # disabled. Preserve site/project variables and R's sub-architecture search.
-    local({
-        arch <- sub("^/", "", Sys.getenv("R_ARCH"))
-        first_file <- function(paths) {
-            found <- paths[file.exists(paths)]
-            if (length(found)) found[[1L]] else ""
-        }
-        site <- Sys.getenv("R_ENVIRON", unset = NA_character_)
-        if (is.na(site)) site <- first_file(c(
-            if (nzchar(arch)) file.path(R.home("etc"), arch, "Renviron.site"),
-            file.path(R.home("etc"), "Renviron.site")))
-        if (nzchar(site) && file.exists(site)) readRenviron(site)
-        user <- Sys.getenv("R_ENVIRON_USER", unset = NA_character_)
-        if (is.na(user)) user <- first_file(unlist(lapply(c(getwd(), path.expand("~")), function(folder) c(
-            if (nzchar(arch)) file.path(folder, paste0(".Renviron.", arch)),
-            file.path(folder, ".Renviron"))), use.names = FALSE))
-        if (nzchar(user) && file.exists(user)) readRenviron(user)
-    })
+startup_state <- Sys.getenv("VSCR_LSP_STARTUP_STATE")
+restore_startup <- nzchar(startup_state) && identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
+startup_environment <- function() {
+    values <- Sys.getenv()
+    # Transport credentials and R's temporary directory belong to this process.
+    keys <- toupper(names(values))
+    values[!startsWith(keys, "VSCR_") & keys != "R_SESSION_TMPDIR"]
+}
+if (restore_startup) {
+    startup <- readRDS(startup_state)
+    # Include profile-created values, empty values and explicit unsets before
+    # loading any packages that depend on the startup configuration.
+    Sys.unsetenv(setdiff(names(startup_environment()), names(startup$environment)))
+    do.call(Sys.setenv, as.list(startup$environment))
 }
 if (nzchar(runtime_lib_paths)) {
     .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
 }
 
-startup_state <- Sys.getenv("VSCR_LSP_STARTUP_STATE")
 if (nzchar(startup_state)) {
-    if (identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")) {
-        startup <- readRDS(startup_state)
+    if (restore_startup) {
         options(startup$options)
         for (package in rev(setdiff(startup$packages, "base"))) {
             require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
@@ -38,7 +30,8 @@ if (nzchar(startup_state)) {
     } else {
         startup_options <- options()
         saveRDS(list(options = startup_options[names(startup_options) == "defaultPackages" |
-            startsWith(names(startup_options), "languageserver.")], packages = .packages()), startup_state)
+            startsWith(names(startup_options), "languageserver.")], packages = .packages(),
+            environment = startup_environment()), startup_state)
     }
 }
 

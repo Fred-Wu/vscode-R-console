@@ -9,7 +9,12 @@ export type PackageInstallation = {
   identity: string;
 };
 
-export type LibraryInventory = { path: string; packages: Map<string, PackageInstallation>; deferred?: string[] };
+export type LibraryInventory = {
+  path: string;
+  packages: Map<string, PackageInstallation>;
+  // Keep each locked package's logical and resolved paths until its lock clears.
+  deferred?: Map<string, string[]>;
+};
 export type PackageInventoryChange = {
   libraries: LibraryInventory[];
   packages: Map<string, PackageInstallation>;
@@ -357,6 +362,7 @@ export class PackageInventory {
     try {
       const entries = await fs.promises.readdir(library, { withFileTypes: true });
       if (entries.some(entry => entry.name.startsWith("00LOCK"))) return true;
+      if (previous.deferred?.size) return true;
       const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
         /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name);
       if (names.length !== previous.packages.size) return true;
@@ -415,12 +421,14 @@ export class PackageInventory {
       if (this.disposed || revision !== this.revision) return;
       const locked = await locksFor(library, entries);
       if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
-      const deferred = new Set<string>();
+      const deferred = new Map<string, string[]>();
       const defer = (name: string, target?: string) => {
         const old = previous?.packages.get(name);
-        deferred.add(path.join(library, name));
-        if (target) deferred.add(target);
-        if (old?.target) deferred.add(old.target);
+        const paths = new Set(previous?.deferred?.get(name));
+        paths.add(path.join(library, name));
+        if (target) paths.add(target);
+        if (old?.target) paths.add(old.target);
+        deferred.set(name, [...paths].sort());
         return old;
       };
       const names = [...new Set([
@@ -428,6 +436,7 @@ export class PackageInventory {
           /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name),
         ...[...locked].filter(name => name !== "*"),
         ...(locked.has("*") ? previous?.packages.keys() ?? [] : []),
+        ...(locked.has("*") ? previous?.deferred?.keys() ?? [] : []),
       ])].sort();
       const packages = new Map<string, PackageInstallation>();
       for (let offset = 0; offset < names.length; offset += 8) {
@@ -444,7 +453,8 @@ export class PackageInventory {
         }));
         for (const item of batch) if (item) packages.set(item.name, item);
       }
-      libraries.push({ path: library, packages, deferred: [...deferred].sort() });
+      libraries.push({ path: library, packages,
+        deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) });
     }
     if (this.disposed || revision !== this.revision) return;
     if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) {
@@ -454,15 +464,13 @@ export class PackageInventory {
       return;
     }
 
-    const signature = JSON.stringify(libraries.map(library => [library.path,
-      [...library.packages.values()].map(item => [item.name, item.identity])]));
-    const previousSignature = JSON.stringify(this.libraries.map(library => [library.path,
-      [...library.packages.values()].map(item => [item.name, item.identity])]));
+    // Lock transitions also need publication: a namespace deferred during
+    // discovery may disappear without ever entering the package inventory.
+    const signatureOf = (items: LibraryInventory[]) => JSON.stringify(items.map(library => [library.path,
+      [...library.packages.values()].map(item => [item.name, item.identity]), [...(library.deferred ?? [])]]));
+    const signature = signatureOf(libraries);
+    const previousSignature = signatureOf(this.libraries);
     if (this.initialized && signature === previousSignature) {
-      // Refresh lock state without replacing healthy libraries' cached metadata.
-      this.libraries = this.libraries.map((previous, index) =>
-        JSON.stringify(previous.deferred ?? []) === JSON.stringify(libraries[index].deferred ?? [])
-          ? previous : { ...previous, deferred: libraries[index].deferred });
       this.candidate = undefined;
       // A content check without a package change is routine, not a lifecycle
       // event. Avoid flooding the output channel on normal console input.

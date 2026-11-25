@@ -714,7 +714,7 @@ export class ConsoleLspClient implements CompletionProvider {
       const params = {
         libraryPaths: change.libraries.map(library => library.path),
         installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
-        deferred: change.libraries.flatMap(library => library.deferred ?? []),
+        deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
         // A recovered server already loaded the current installations.
         changed: client === previousClient ? change.changed : [],
       };
@@ -1104,11 +1104,8 @@ export class ConsoleLspClient implements CompletionProvider {
       (this.restoreStartup ? this.serverLibraryPaths : undefined))?.join("\n") ?? "";
     env.VSCR_LSP_STARTUP_STATE = path.join(this.workingDirectory, "startup.rds");
     env.VSCR_LSP_RESTORE_STARTUP = this.restoreStartup ? "TRUE" : "FALSE";
-    // Read environment files inside the entry point so they cannot preload
-    // default packages before the current library order has been installed.
-    const userArgs = config.get<string[]>("lsp.args") ?? [];
-    env.VSCR_LSP_READ_ENVIRON = this.restoreStartup &&
-      !userArgs.includes("--vanilla") && !userArgs.includes("--no-environ") ? "TRUE" : "FALSE";
+    // The entry point restores the effective startup environment after R has
+    // started without profiles or automatic default-package loading.
     if (this.restoreStartup) env.R_DEFAULT_PACKAGES = "NULL";
     if (lang) {
       env.LANG = lang;
