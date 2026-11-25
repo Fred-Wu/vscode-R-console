@@ -1388,15 +1388,28 @@ Creating a console follows this implementation path:
 8. backend events update terminal state
 9. the extension schedules persistence of the session record
 
+#### Clipboard Paste
+
+Bracketed clipboard paste inserts normalized text at the cursor in the same
+`InputState` editor used by history recall. Multiline content and trailing newlines
+remain editable until Enter submits the input. Pasting into recalled history
+expands it for editing. Top-level and nested reply prompts share the paste handler.
+The terminal always enables bracketed clipboard paste, independently of the
+`r.bracketedPaste` setting used by vscode-R for editor sends.
+An Enter following the closing paste marker submits the input, including the Enter
+appended by vscode-R editor-send commands.
+At nested reply prompts, programmatic reply routing requires a newline in the
+incoming input event. Typing and editing keys operate on the pasted draft.
+
 #### Submission Queue
 
-Enter, accepted multiline paste, and programmatic sends reserve their submission
+Enter and programmatic sends reserve their submission
 positions synchronously. Completeness checks run in reservation order, while
 completed expressions can enter execution immediately. An incomplete tail passes
 to the next reservation before that reservation is checked, including when the
 tail is waiting behind an executing expression. With no accepted successor, the
 tail becomes editable; normal input handling includes that buffer in the next
-Enter or paste snapshot. Ownership transfers between the queue and input editor
+Enter snapshot. Ownership transfers between the queue and input editor
 at that boundary.
 Enter retains literal whitespace and applies its continuation newline at the
 saved cursor only when input is incomplete. Each complete expression is recorded

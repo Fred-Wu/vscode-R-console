@@ -130,6 +130,10 @@ export class KeyProcessor {
   private escapeBuffer = "";
   private inPaste = false;
 
+  get hasPendingEscapeSequence(): boolean {
+    return this.escapeBuffer.length > 0;
+  }
+
   parseInputChunk(chunk: string): KeyAction[] {
     const actions: KeyAction[] = [];
     let i = 0;

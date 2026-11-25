@@ -38,21 +38,9 @@ function submit(terminal, input, code) {
     return terminal.handleEnterKey();
   }
   if (input === "paste") {
-    // The key handler starts handlePasteEnd() without awaiting its promise.
-    // Return that promise so assertions wait for the submission to finish.
-    const handlePasteEnd = terminal.handlePasteEnd;
-    let pendingPaste;
-    terminal.handlePasteEnd = function () {
-      pendingPaste = handlePasteEnd.call(this);
-      return pendingPaste;
-    };
-    try {
-      terminal.handleInput(`\x1b[200~${code}\n\x1b[201~`);
-    } finally {
-      terminal.handlePasteEnd = handlePasteEnd;
-    }
-    assert.ok(pendingPaste, "paste-end must dispatch its async handler");
-    return pendingPaste;
+    terminal.handleInput(`\x1b[200~${code}\n\x1b[201~`);
+    assert.equal(terminal.submissionQueue.length, 0, "paste waits for Enter");
+    return terminal.handleEnterKey();
   }
   terminal.handleInput(code + "\n");
   return terminal.programmaticSubmissionQueue;
@@ -60,7 +48,7 @@ function submit(terminal, input, code) {
 
 for (const input of ["Enter", "editor", "paste"]) {
   for (const order of ["AB", "BA"]) {
-    test(`${input} uses its own ready R while the other console executes (connect ${order})`, async () => {
+    test(`${input === "paste" ? "paste + Enter" : input} uses its own ready R while the other console executes (connect ${order})`, async () => {
       const a = consoleSession(), b = consoleSession();
       for (const fixture of order === "AB" ? [a, b] : [b, a]) fixture.connect();
       await b.terminal.handleProgrammaticSubmission("Sys.sleep(30)\n");
@@ -146,7 +134,7 @@ test("an incomplete parse releases native inspection for the restored input", as
 });
 
 for (const input of ["editor", "paste"]) {
-  test(`${input} reserves parsing before native completion can start`, async () => {
+  test(`${input === "paste" ? "paste + Enter" : input} reserves parsing before native completion can start`, async () => {
     const a = consoleSession();
     a.connect();
     const parse = deferred();

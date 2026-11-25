@@ -24,7 +24,7 @@ for (const source of ["# comment", "# first\n# second"]) {
 for (const path of ["editor", "paste"]) {
   test(`comment-only ${path} submission leaves a visible prompt`, async t => {
     const { terminal, commands, screenLines } = createTerminalWithScreen(t);
-    terminal.handleInput(path === "editor" ? "# comment\n" : "\x1b[200~# comment\n\x1b[201~");
+    terminal.handleInput(path === "editor" ? "# comment\n" : "\x1b[200~# comment\n\x1b[201~\r");
     await terminal.programmaticSubmissionQueue;
     await settle();
     assert.deepEqual(screenLines(), ["R> "]);
@@ -282,7 +282,7 @@ test("Enter waits for the previous native check and checks only the combined con
 });
 
 for (const source of ["Enter", "paste", "editor"]) {
-  test(`${source} extends a pending editor expression without consuming newer typing`, async () => {
+  test(`${source === "paste" ? "paste + Enter" : source} extends a pending editor expression without consuming newer typing`, async () => {
     const { terminal, commands } = createTerminal();
     const gate = deferred();
     const check = terminal.inputState.isExpressionCompleteAsync.bind(terminal.inputState);
@@ -297,8 +297,9 @@ for (const source of ["Enter", "paste", "editor"]) {
       terminal.inputState.insertText("2)");
       accepted = terminal.handleEnterKey();
     } else if (source === "paste") {
-      terminal.pasteBuffer = "2)\n";
-      accepted = terminal.handlePasteEnd();
+      terminal.pasteBuffer = "2)";
+      terminal.handlePasteEnd();
+      accepted = terminal.handleEnterKey();
     } else {
       terminal.handleInput("2)\n");
       accepted = terminal.programmaticSubmissionQueue;
@@ -425,12 +426,14 @@ test("an incomplete Enter restores continuation without dropping subsequent typi
   assert.deepEqual(commands, []);
 });
 
-test("multiline paste commits its snapshot and does not erase newer keyboard input", async () => {
+test("Enter after multiline paste commits its snapshot and does not erase newer keyboard input", async () => {
   const { terminal, commands } = createTerminal();
   const parse = deferred();
   terminal.inputState.isExpressionCompleteAsync = code => code === "a <- 1" ? parse.promise : Promise.resolve(true);
   terminal.pasteBuffer = "a <- 1\nb <- 2\n";
-  const pasted = terminal.handlePasteEnd();
+  terminal.handlePasteEnd();
+  assert.deepEqual(commands, [], "paste waits for Enter");
+  const pasted = terminal.handleEnterKey();
   terminal.handleInput("z");
   assert.equal(terminal.inputState.text, "z");
   parse.resolve(true);
@@ -476,14 +479,16 @@ test("editor batch retains its position ahead of a later console Enter", async (
   assert.deepEqual(commands.map(c => c.code), ["a <- 1", "a <- 2", "b"]);
 });
 
-test("editor batch retains its position ahead of a later multiline console paste", async () => {
+test("editor batch retains its position ahead of Enter after a later multiline console paste", async () => {
   const { terminal, commands } = createTerminal();
   const first = deferred();
   terminal.inputState.isExpressionCompleteAsync = code => code === "a <- 1" ? first.promise : Promise.resolve(true);
   terminal.handleInput("a <- 1\na <- 2\n");
   await Promise.resolve();
   terminal.pasteBuffer = "b <- 1\nb <- 2\n";
-  const pasted = terminal.handlePasteEnd();
+  terminal.handlePasteEnd();
+  assert.deepEqual(commands, [], "paste waits for Enter");
+  const pasted = terminal.handleEnterKey();
   first.resolve(true);
   await terminal.programmaticSubmissionQueue;
   await pasted;
@@ -636,7 +641,7 @@ function nativeChecks(t, terminal) {
 }
 
 for (const input of ["Enter", "editor", "paste"]) {
-  test(`${input} reserves immediately and waits for readiness between native checks`, async t => {
+  test(`${input === "paste" ? "paste + Enter" : input} reserves immediately and waits for readiness between native checks`, async t => {
     const { terminal, commands } = createTerminal();
     const checked = nativeChecks(t, terminal);
     let pending;
@@ -648,6 +653,7 @@ for (const input of ["Enter", "editor", "paste"]) {
       pending = terminal.programmaticSubmissionQueue;
     } else {
       terminal.handleInput("\x1b[200~1\n2\n3\n\x1b[201~");
+      pending = terminal.handleEnterKey();
     }
     assert.equal(terminal.submissionQueue[0].kind, "parse");
     await settle();
@@ -726,7 +732,7 @@ test("cancelling a readiness wait releases its batch without an R event", async 
 
 for (const input of ["Enter", "editor", "paste"]) {
   for (const raw of [false, true]) {
-    test(`${input} delivery recovery preserves a split ${raw ? "raw" : "quoted"} literal`, async () => {
+    test(`${input === "paste" ? "paste + Enter" : input} delivery recovery preserves a split ${raw ? "raw" : "quoted"} literal`, async () => {
       const { terminal, commands } = createTerminal();
       terminal.runtimeBackend.sendSessionCommand = () => false;
       const opening = raw ? 'x <- r"(hello' : 'x <- "hello';
@@ -742,8 +748,10 @@ for (const input of ["Enter", "editor", "paste"]) {
         terminal.handleInput(closing + "\n");
         second = terminal.programmaticSubmissionQueue;
       } else {
-        terminal.handleInput("\x1b[200~1\n" + opening + "\n\x1b[201~");
-        terminal.handleInput("\x1b[200~" + closing + "\n\x1b[201~");
+        terminal.handleInput("\x1b[200~1\n" + opening + "\x1b[201~");
+        first = terminal.handleEnterKey();
+        terminal.handleInput("\x1b[200~" + closing + "\x1b[201~");
+        second = terminal.handleEnterKey();
       }
       await Promise.all([first, second]);
       await settle();
