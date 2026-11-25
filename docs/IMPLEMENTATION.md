@@ -1264,14 +1264,19 @@ Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
 latest snapshot. The initial server saves its effective environment, all startup
 options and attached package names in its private temporary directory. The
+options are serialized into a raw payload inside the snapshot, so reading the
+environment and package names cannot deserialize namespace references. Options
+containing only atomic values and lists with reference-free attributes are also
+saved as ordinary values for use by namespace load hooks. The
 snapshot can contain values set by user profiles, including credentials, so the
 temporary directory and snapshot have owner-only permissions on Unix; Windows
 uses the current user's temporary-directory access controls. Normal disposal
 removes the snapshot. A replacement
 starts with profiles, environment files and automatic default-package loading
 disabled. It restores environment values and unsets, applies the console's library
-order with site-library inclusion disabled, restores startup options and then
-loads the startup packages. Transport credentials and R's process-specific temporary
+order with site-library inclusion disabled, restores those ordinary options,
+then deserializes and restores all startup options and loads the startup packages.
+Transport credentials and R's process-specific temporary
 directory remain fresh. The client verifies namespace installations before publishing
 the inventory. A completion interrupted by replacement reopens its document
 and retries once on the replacement client. `languageserver` owns its completion

@@ -83,8 +83,11 @@ function change() {
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
 
-test('terminal static lookup overlaps startup and preserves cancellation and failure recovery', { timeout: 5000 }, async t => {
-  for (const outcome of ['success', 'cancel', 'failure']) {
+// Each outcome bundles both TypeScript adapters. Give each an independent
+// deadlock watchdog so parallel CI compilation does not consume a shared
+// five-second budget; the promise gates below assert the required ordering.
+for (const outcome of ['success', 'cancel', 'failure']) {
+  test(`terminal static lookup overlaps startup: ${outcome}`, { timeout: 30000 }, async t => {
     let releaseStartup, sourceEntered;
     const startup = new Promise(resolve => { releaseStartup = resolve; });
     const inspected = new Promise(resolve => { sourceEntered = resolve; });
@@ -143,8 +146,8 @@ test('terminal static lookup overlaps startup and preserves cancellation and fai
       assert.equal(published.some(item => item.insertText === 'alpha'), true);
     }
     await lang.dispose();
-  }
-});
+  });
+}
 
 test('cancelled startup cannot replace a newer stored-source projection', async t => {
   let releaseStartup, releaseReply, markSent;

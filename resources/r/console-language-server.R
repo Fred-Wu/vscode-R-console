@@ -11,6 +11,8 @@ startup_environment <- function() {
     values[!startsWith(keys, "VSCR_") & keys != "R_SESSION_TMPDIR"]
 }
 if (restore_startup) {
+    # Options remain serialized inside this namespace-free envelope: reading a
+    # function's namespace reference can load its package during deserialization.
     startup <- readRDS(startup_state)
     # Include profile-created values, empty values and explicit unsets before
     # loading any packages that depend on the startup configuration.
@@ -23,7 +25,10 @@ if (nzchar(runtime_lib_paths)) {
 
 if (nzchar(startup_state)) {
     if (restore_startup) {
-        options(startup$options)
+        # Namespace load hooks may need ordinary profile settings while the
+        # remaining option values are being deserialized.
+        options(startup$plain_options)
+        options(unserialize(startup$options))
         for (package in rev(setdiff(startup$packages, "base"))) {
             require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
         }
@@ -31,11 +36,23 @@ if (nzchar(startup_state)) {
         # Profile-defined options may be required by packages before they load.
         # The snapshot can include sensitive values, so create it owner-only.
         local({
+            # Only reference-free values can be read before library selection.
+            # Inspect attributes too: even an atomic option can carry a closure.
+            plain_option <- function(value) {
+                if (isS4(value)) return(FALSE)
+                type <- typeof(value)
+                if (!type %in% c("NULL", "logical", "integer", "double", "complex",
+                    "character", "raw", "list")) return(FALSE)
+                if (type == "list" && !all(vapply(unclass(value), plain_option, logical(1)))) return(FALSE)
+                all(vapply(attributes(value), plain_option, logical(1)))
+            }
+            startup_options <- options()
             if (.Platform$OS.type == "unix") {
                 original_umask <- Sys.umask("077")
                 on.exit(Sys.umask(original_umask))
             }
-            saveRDS(list(options = options(), packages = .packages(),
+            saveRDS(list(options = serialize(startup_options, NULL),
+                plain_options = Filter(plain_option, startup_options), packages = .packages(),
                 environment = startup_environment()), startup_state)
             if (.Platform$OS.type == "unix") Sys.chmod(startup_state, mode = "0600")
         })
