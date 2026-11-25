@@ -737,6 +737,62 @@ test("linked targets refresh across cache removal, replacement, locks and recrea
   assert.equal(inventory.linkedWatches.size, 0, "disposal releases all linked target subscriptions");
 });
 
+test("linked library and cache timestamp touches do not rescan package metadata", async t => {
+  const { root, libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  const cache = path.join(root, "external-cache");
+  fs.mkdirSync(cache);
+  const target = install(cache);
+  fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const published = changes.length;
+  const readPackage = t.mock.method(inventory, "readPackage");
+  logs.length = 0;
+
+  for (const directory of [library, cache]) {
+    const before = fs.statSync(directory);
+    const touch = new Date(Date.now() - 5000);
+    fs.utimesSync(directory, touch, touch);
+    const after = fs.statSync(directory);
+    // renv touches its sandbox after R tasks. Deliver the polling event as
+    // well as the filesystem event, including canonical directory aliases.
+    for (const [file, watch] of inventory.linkedWatches) {
+      if (sameExistingDirectory(file, directory)) watch.listener(after, before);
+    }
+    await settle();
+  }
+  // Include the actual poller's delayed delivery before asserting quietness.
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  await settle();
+  assert.equal(readPackage.mock.callCount(), 0, "timestamp-only events must reuse cached package records");
+  assert.equal(changes.length, published);
+  assert.ok(!logs.some(line => line.includes("Scanning folder:") || line.includes("Package inventory unchanged")),
+    "timestamp-only events must not produce package lifecycle logs");
+});
+
+test("external lock transitions remain observable when linked package identities are unchanged", async t => {
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const cache = path.join(root, "external-cache");
+  fs.mkdirSync(cache);
+  const target = path.join(cache, "release-1");
+  fs.renameSync(install(cache), target);
+  fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const identity = changes.at(-1).packages.get("example").identity;
+
+  for (const lockName of ["00LOCK", "00LOCK-example", "00LOCK-release-1"]) {
+    const lock = path.join(cache, lockName);
+    fs.mkdirSync(lock);
+    await settle(() => changes.at(-1).libraries[0].deferred?.has("example"),
+      "the cache parent poll must discover locks before the package is moved");
+    assert.equal(changes.at(-1).packages.get("example").identity, identity);
+    fs.rmdirSync(lock);
+    await settle(() => changes.at(-1).libraries[0].deferred?.size === 0,
+      "unlock must publish even when no package files changed");
+  }
+});
+
 for (const lockName of ["00LOCK-example", "00LOCK"]) {
   for (const initiallyMissing of [false, true]) {
     test(`chained links retain ${lockName} protection with an ${initiallyMissing ? "initially absent" : "existing"} target`, async t => {

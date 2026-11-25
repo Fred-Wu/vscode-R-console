@@ -245,7 +245,10 @@ export class PackageInventory {
         if (current.dev === previous.dev && current.ino === previous.ino &&
             current.mtimeMs === previous.mtimeMs && current.ctimeMs === previous.ctimeMs &&
             current.size === previous.size && current.nlink === previous.nlink) return;
-        for (const owner of libraries) this.dirtyLibraries.add(owner);
+        // Parent timestamps also change during ordinary R tasks (for example,
+        // renv sandbox maintenance). Verify package identities and lock paths
+        // before treating a polling notification as a package change.
+        for (const owner of libraries) this.unconfirmedLibraries.add(owner);
         this.schedule(250);
       };
       fs.watchFile(file, { persistent: false, interval: 1000 }, listener);
@@ -281,6 +284,23 @@ export class PackageInventory {
       }
     }
     return locked;
+  }
+
+  private packageLockPaths(target: string, name: string): string[] {
+    // A versioned cache directory can differ from the logical package name.
+    return [...new Set(["00LOCK", `00LOCK-${name}`, `00LOCK-${path.basename(target)}`])]
+      .map(lock => path.join(path.dirname(target), lock));
+  }
+
+  private async isInstallationLock(file: string): Promise<boolean> {
+    // Traversal permission is sufficient to load a linked package. Inspect
+    // known lock paths without requiring a listing of the external cache.
+    try { return (await fs.promises.lstat(file)).isDirectory(); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      throw error;
+    }
   }
 
   private clearRetry(): void {
@@ -393,6 +413,7 @@ export class PackageInventory {
       const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
         /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name);
       if (names.length !== previous.packages.size) return true;
+      const linkedNames = new Set(entries.filter(entry => entry.isSymbolicLink()).map(entry => entry.name));
       // Same-name installations may be replaced, including via symlink targets.
       // Compare the identities already used by readPackage(), without reading
       // DESCRIPTION or any package metadata on unchanged events.
@@ -404,6 +425,13 @@ export class PackageInventory {
         const stat = await fs.promises.stat(directory);
         const identity = JSON.stringify([target, stat.mtimeMs, stat.ctimeMs, stat.ino]);
         if (identity !== installed.identity) return true;
+        // An installer creates its lock before moving the package. The target
+        // identity can still match while its parent reports that lock change.
+        if (linkedNames.has(name)) {
+          for (const lock of this.packageLockPaths(target, name)) {
+            if (await this.isInstallationLock(lock)) return true;
+          }
+        }
       }
       return false;
     } catch {
@@ -419,13 +447,7 @@ export class PackageInventory {
     const isLocked = (file: string) => {
       let pending = lockRequests.get(file);
       if (!pending) {
-        // Traversal permission is sufficient to load a linked package. Check
-        // its known lock paths without listing the external cache directory.
-        pending = fs.promises.lstat(file).then(stat => stat.isDirectory()).catch(error => {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code === "ENOENT" || code === "ENOTDIR") return false;
-          throw error;
-        });
+        pending = this.isInstallationLock(file);
         lockRequests.set(file, pending);
       }
       return pending;
@@ -480,9 +502,8 @@ export class PackageInventory {
           if (locked.has("*") || locked.has(name)) return defer(name, target ?? undefined);
           if (target === null) return undefined;
           if (target) {
-            // R installs lock by package name even when a linked cache directory is versioned.
-            for (const lock of new Set(["00LOCK", `00LOCK-${name}`, `00LOCK-${path.basename(target)}`])) {
-              if (await isLocked(path.join(path.dirname(target), lock))) return defer(name, target);
+            for (const lock of this.packageLockPaths(target, name)) {
+              if (await isLocked(lock)) return defer(name, target);
             }
           }
           return this.readPackage(library, name, old);

@@ -1231,7 +1231,10 @@ cannot suppress publication of the newer order.
 events schedule a scan of the changed library after 250 ms. It reads package names,
 versions, resolved paths, and package-directory timestamps, reusing unchanged
 package records. Linked package directories and their target parents are also
-polled for replacement, removal, recreation and installation locks. Package
+polled for replacement, removal, recreation and installation locks. Polling
+notifications are verified against installed package identities and known
+lock paths before a full scan. Directory timestamp touches reuse cached package
+records and remain quiet in the lifecycle log. Package
 symlink chains are followed hop by hop with cycle detection and a traversal
 limit. Each hop's parent remains monitored, and the final target's lock location
 is resolved even while the package is absent during installation. Named locks
