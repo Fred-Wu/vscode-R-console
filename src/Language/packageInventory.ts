@@ -5,10 +5,11 @@ export type PackageInstallation = {
   name: string;
   version: string;
   path: string;
+  target: string;
   identity: string;
 };
 
-export type LibraryInventory = { path: string; packages: Map<string, PackageInstallation> };
+export type LibraryInventory = { path: string; packages: Map<string, PackageInstallation>; deferred?: string[] };
 export type PackageInventoryChange = {
   libraries: LibraryInventory[];
   packages: Map<string, PackageInstallation>;
@@ -26,6 +27,12 @@ export class PackageInventory {
   private readonly parentWatchers = new Map<string, fs.FSWatcher>();
   // fs.watch follows the directory inode (or a symlink's target), not its path.
   private readonly watchedTargets = new Map<string, string | undefined>();
+  // Poll only linked installations and their target parents. stat follows the
+  // link through deletion/recreation and works when its cache is outside the
+  // library's filesystem watcher. Parent changes include installation locks.
+  private readonly linkedWatches = new Map<string, {
+    libraries: Set<string>; listener: (current: fs.Stats, previous: fs.Stats) => void;
+  }>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -66,6 +73,13 @@ export class PackageInventory {
     }
     for (const library of this.unconfirmedLibraries) {
       if (!active.has(library)) this.unconfirmedLibraries.delete(library);
+    }
+    for (const [file, watch] of this.linkedWatches) {
+      for (const library of watch.libraries) if (!active.has(library)) watch.libraries.delete(library);
+      if (!watch.libraries.size) {
+        fs.unwatchFile(file, watch.listener);
+        this.linkedWatches.delete(file);
+      }
     }
     this.paths = [...paths];
     this.revision++;
@@ -161,6 +175,82 @@ export class PackageInventory {
     }
   }
 
+  private async watchLinkedPackages(library: string, entries: fs.Dirent[]): Promise<Map<string, string>> {
+    const targets = new Map<string, string>();
+    const files = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.isSymbolicLink() || !/^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)) continue;
+      const link = path.join(library, entry.name);
+      try {
+        // readlink retains a watchable target parent even while the target is
+        // missing. realpath also follows chains into a different cache folder.
+        const direct = path.resolve(library, await fs.promises.readlink(link));
+        const target = await fs.promises.realpath(link).catch(async () => path.join(
+          await fs.promises.realpath(path.dirname(direct)).catch(() => path.dirname(direct)), path.basename(direct)));
+        targets.set(entry.name, target);
+        files.add(link);
+        files.add(path.dirname(direct));
+        files.add(path.dirname(target));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" &&
+            (error as NodeJS.ErrnoException).code !== "EINVAL") throw error;
+      }
+    }
+    if (this.disposed || !this.paths.includes(library)) return targets;
+    for (const [file, watch] of this.linkedWatches) {
+      if (!files.has(file)) watch.libraries.delete(library);
+      if (!watch.libraries.size) {
+        fs.unwatchFile(file, watch.listener);
+        this.linkedWatches.delete(file);
+      }
+    }
+    for (const file of files) {
+      const existing = this.linkedWatches.get(file);
+      if (existing) { existing.libraries.add(library); continue; }
+      const libraries = new Set([library]);
+      const listener = (current: fs.Stats, previous: fs.Stats) => {
+        if (this.disposed || this.linkedWatches.get(file)?.listener !== listener) return;
+        if (current.dev === previous.dev && current.ino === previous.ino &&
+            current.mtimeMs === previous.mtimeMs && current.ctimeMs === previous.ctimeMs &&
+            current.size === previous.size && current.nlink === previous.nlink) return;
+        for (const owner of libraries) this.dirtyLibraries.add(owner);
+        this.schedule(250);
+      };
+      fs.watchFile(file, { persistent: false, interval: 1000 }, listener);
+      this.linkedWatches.set(file, { libraries, listener });
+    }
+    return targets;
+  }
+
+  private async installationLocks(library: string, entries?: fs.Dirent[]): Promise<Set<string>> {
+    const locked = new Set<string>();
+    const read = async (directory: string) => {
+      try { return await fs.promises.readdir(directory, { withFileTypes: true }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
+    };
+    for (const entry of entries ?? await read(library)) {
+      if (!entry.isDirectory()) continue;
+      const named = /^00LOCK-([A-Za-z][A-Za-z0-9.]*)$/.exec(entry.name);
+      if (named) locked.add(named[1]);
+      else if (entry.name === "00LOCK") {
+        // R also uses a whole-library lock for binary and multi-package
+        // installs. Its scope includes new packages with no backup yet.
+        locked.add("*");
+        for (const folder of [path.join(library, "00LOCK"), path.join(library, "00LOCK", "00new")]) {
+          for (const item of await read(folder)) {
+            if ((item.isDirectory() || item.isSymbolicLink()) && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.name)) {
+              locked.add(item.name);
+            }
+          }
+        }
+      }
+    }
+    return locked;
+  }
+
   private clearRetry(): void {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
@@ -201,6 +291,8 @@ export class PackageInventory {
     this.unconfirmedLibraries.clear();
     for (const watcher of this.parentWatchers.values()) watcher.close();
     this.parentWatchers.clear();
+    for (const [file, watch] of this.linkedWatches) fs.unwatchFile(file, watch.listener);
+    this.linkedWatches.clear();
   }
 
   refresh(): Promise<void> {
@@ -290,6 +382,15 @@ export class PackageInventory {
   private async scan(revision: number, dirty: Set<string>,
     unconfirmed: Set<string> = new Set()): Promise<void> {
     const libraries: LibraryInventory[] = [];
+    const lockRequests = new Map<string, Promise<Set<string>>>();
+    const locksFor = (library: string, entries?: fs.Dirent[]) => {
+      let pending = lockRequests.get(library);
+      if (!pending) {
+        pending = this.installationLocks(library, entries);
+        lockRequests.set(library, pending);
+      }
+      return pending;
+    };
     for (const library of this.paths) {
       if (this.disposed || revision !== this.revision) return;
       const previous = this.libraries.find(item => item.path === library);
@@ -310,23 +411,40 @@ export class PackageInventory {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         entries = [];
       }
-      // R moves the old package aside during installation. Do not publish that
-      // temporary absence or a partially written replacement.
-      if (entries.some(entry => entry.name.startsWith("00LOCK"))) {
-        this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
-        libraries.push(previous ?? { path: library, packages: new Map() });
-        continue;
-      }
-      const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
-        /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name).sort();
+      const targets = await this.watchLinkedPackages(library, entries);
+      if (this.disposed || revision !== this.revision) return;
+      const locked = await locksFor(library, entries);
+      if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
+      const deferred = new Set<string>();
+      const defer = (name: string, target?: string) => {
+        const old = previous?.packages.get(name);
+        deferred.add(path.join(library, name));
+        if (target) deferred.add(target);
+        if (old?.target) deferred.add(old.target);
+        return old;
+      };
+      const names = [...new Set([
+        ...entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+          /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name),
+        ...[...locked].filter(name => name !== "*"),
+        ...(locked.has("*") ? previous?.packages.keys() ?? [] : []),
+      ])].sort();
       const packages = new Map<string, PackageInstallation>();
       for (let offset = 0; offset < names.length; offset += 8) {
         if (this.disposed || revision !== this.revision) return;
-        const batch = await Promise.all(names.slice(offset, offset + 8).map(name =>
-          this.readPackage(library, name, previous?.packages.get(name))));
+        const batch = await Promise.all(names.slice(offset, offset + 8).map(async name => {
+          const old = previous?.packages.get(name);
+          if (locked.has("*") || locked.has(name)) return defer(name, targets.get(name));
+          const target = targets.get(name);
+          if (target) {
+            const targetLocks = await locksFor(path.dirname(target));
+            if (targetLocks.has("*") || targetLocks.has(path.basename(target))) return defer(name, target);
+          }
+          return this.readPackage(library, name, old);
+        }));
         for (const item of batch) if (item) packages.set(item.name, item);
       }
-      libraries.push({ path: library, packages });
+      libraries.push({ path: library, packages, deferred: [...deferred].sort() });
     }
     if (this.disposed || revision !== this.revision) return;
     if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) {
@@ -341,6 +459,10 @@ export class PackageInventory {
     const previousSignature = JSON.stringify(this.libraries.map(library => [library.path,
       [...library.packages.values()].map(item => [item.name, item.identity])]));
     if (this.initialized && signature === previousSignature) {
+      // Refresh lock state without replacing healthy libraries' cached metadata.
+      this.libraries = this.libraries.map((previous, index) =>
+        JSON.stringify(previous.deferred ?? []) === JSON.stringify(libraries[index].deferred ?? [])
+          ? previous : { ...previous, deferred: libraries[index].deferred });
       this.candidate = undefined;
       // A content check without a package change is routine, not a lifecycle
       // event. Avoid flooding the output channel on normal console input.
@@ -420,7 +542,7 @@ export class PackageInventory {
       const packageName = /^Package:\s*(\S+)/m.exec(description)?.[1];
       const version = /^Version:\s*(\S+)/m.exec(description)?.[1];
       if (packageName !== name || !version) return undefined;
-      return { name, version, path: directory, identity };
+      return { name, version, path: directory, target, identity };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return undefined;

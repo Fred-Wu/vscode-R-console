@@ -668,3 +668,69 @@ test("removing and readding an entire runtime library closes and restores its wa
   assert.equal(inventory.watchers.has(first), true, "readded libraries resume monitoring");
   assert.equal(changes.at(-1).packages.get("example").version, "1.0");
 });
+
+test("package locks preserve only their own installation, including on initial discovery", async t => {
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const example = install(library);
+  fs.mkdirSync(path.join(library, "00LOCK-other"));
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(changes.at(-1).packages.has("example"), "unrelated package locks must not hide installed packages");
+  fs.rmSync(example, { recursive: true });
+  await settle(() => !changes.at(-1).packages.has("example"));
+  install(library, "2.0");
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  fs.mkdirSync(path.join(library, "00LOCK"));
+  const lock = path.join(library, "00LOCK", "example");
+  fs.renameSync(example, lock);
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0", "generic lock backups retain the previous copy");
+  install(library, "3.0");
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  fs.rmSync(path.join(library, "00LOCK"), { recursive: true });
+  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+});
+
+test("linked targets refresh across cache removal, replacement, locks and recreation", async t => {
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const cache = path.join(root, "external-cache");
+  fs.mkdirSync(cache);
+  const target = install(cache);
+  fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  fs.rmSync(target, { recursive: true });
+  await settle(() => !changes.at(-1).packages.has("example"), "a dangling package link must remove stale metadata");
+  install(cache, "2.0");
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  fs.mkdirSync(path.join(cache, "00LOCK-example"));
+  fs.rmSync(target, { recursive: true });
+  install(cache, "3.0");
+  await new Promise(resolve => setTimeout(resolve, 1800));
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0", "cache installations remain protected by their own lock");
+  fs.rmdirSync(path.join(cache, "00LOCK-example"));
+  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+  inventory.setLibraryPaths([]);
+  await settle(() => changes.at(-1).libraries.length === 0);
+  assert.equal(inventory.linkedWatches.size, 0, "removed libraries release linked target subscriptions");
+  inventory.setLibraryPaths([library]);
+  await settle(() => changes.at(-1).packages.has("example"));
+  inventory.dispose();
+  assert.equal(inventory.linkedWatches.size, 0, "disposal releases all linked target subscriptions");
+});
+
+// Binary and non-staged installs can copy a new package directly into the
+// library while 00LOCK is still empty: it must retain its library-wide scope.
+test("a whole-library lock protects new installations before a backup or staging directory exists", async t => {
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  fs.mkdirSync(path.join(library, "00LOCK"));
+  install(library);
+  await new Promise(resolve => setTimeout(resolve, 800));
+  assert.ok(!changes.at(-1).packages.has("example"));
+  fs.rmdirSync(path.join(library, "00LOCK"));
+  await settle(() => changes.at(-1).packages.has("example"));
+});

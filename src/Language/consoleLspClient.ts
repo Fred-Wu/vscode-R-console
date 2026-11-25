@@ -135,6 +135,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private packageRevision = 0;
   private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
+  private restoreStartup = false;
   private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
@@ -713,6 +714,7 @@ export class ConsoleLspClient implements CompletionProvider {
       const params = {
         libraryPaths: change.libraries.map(library => library.path),
         installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
+        deferred: change.libraries.flatMap(library => library.deferred ?? []),
         // A recovered server already loaded the current installations.
         changed: client === previousClient ? change.changed : [],
       };
@@ -727,12 +729,20 @@ export class ConsoleLspClient implements CompletionProvider {
         const reason = result.restart.map(name =>
           `${name} (${change.packages.has(name) ? "installation changed" : "removed"})`).join(", ");
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restarting language server: ${reason}; clearing packages loaded in the server.`);
+        this.restoreStartup = true;
         await this.restartClient(client, reason);
         client = this.client;
-        if (!client?.isRunning() || this.disposed) return;
+        if (this.disposed) return;
+        if (!client?.isRunning()) throw new Error("Replacement language server is not running");
         await this.applySessionState(client);
         if (!change.isCurrent()) return;
-        await client.sendRequest("rConsole/refreshPackages", { ...params, changed: [] });
+        const verified = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", { ...params, changed: [] });
+        if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
+        if (!change.isCurrent()) return;
+        if (verified.restart.length) {
+          // Keep this inventory unpublished so recovery can retry the change.
+          throw new Error(`Replacement language server retained stale packages: ${verified.restart.join(", ")}`);
+        }
       } else if (change.changed.length) {
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
       }
@@ -1030,6 +1040,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const userArgs = config.get<string[]>("lsp.args") ?? [];
     return [
       ...userArgs,
+      ...(this.restoreStartup ? ["--no-environ", "--no-site-file", "--no-init-file"] : []),
       "--silent",
       "--no-echo",
       "--no-save",
@@ -1089,7 +1100,16 @@ export class ConsoleLspClient implements CompletionProvider {
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
     // On a replacement server, apply the last console snapshot before loading namespaces.
-    env.VSCR_RUNTIME_LIB_PATHS = this.runtimeLibraryPaths?.join("\n") ?? "";
+    env.VSCR_RUNTIME_LIB_PATHS = (this.runtimeLibraryPaths ??
+      (this.restoreStartup ? this.serverLibraryPaths : undefined))?.join("\n") ?? "";
+    env.VSCR_LSP_STARTUP_STATE = path.join(this.workingDirectory, "startup.rds");
+    env.VSCR_LSP_RESTORE_STARTUP = this.restoreStartup ? "TRUE" : "FALSE";
+    // Read environment files inside the entry point so they cannot preload
+    // default packages before the current library order has been installed.
+    const userArgs = config.get<string[]>("lsp.args") ?? [];
+    env.VSCR_LSP_READ_ENVIRON = this.restoreStartup &&
+      !userArgs.includes("--vanilla") && !userArgs.includes("--no-environ") ? "TRUE" : "FALSE";
+    if (this.restoreStartup) env.R_DEFAULT_PACKAGES = "NULL";
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {

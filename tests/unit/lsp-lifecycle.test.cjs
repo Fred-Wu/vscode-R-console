@@ -282,7 +282,8 @@ test("native member signatures never wait for runtime inspection", async t => {
 });
 
 test("attached packages prepare native metadata once, track detach and survive server replacement", async t => {
-  const { client, instances } = createClient(t, { staticAnalysis: true, packageChanges: () => ['stats'] });
+  const { client, instances } = createClient(t, { staticAnalysis: true,
+    packageChanges: server => server === instances[0] ? ['stats'] : [] });
   await client.syncSessionState({ attachedPackages: ['polars', 'stats', 'polars', 'bad\";stop(1)'] });
   assert.deepEqual(instances[0].documents, ['stats::`.__r_console_metadata__`\npolars::`.__r_console_metadata__`']);
   assert.equal(instances[0].requests.some(item => item.method === 'completion'), false,
@@ -856,4 +857,12 @@ test('static provider cancellation reaches the LSP and rejects late results', as
   assert.equal(result.staticStatus, 'pending');
   assert.deepEqual(result.items, []);
   release({ items: [{ label: 'stale' }] });
+});
+
+test("a replacement that still requests restart fails refresh without declaring success", async t => {
+  const { client, instances } = createClient(t, { packageChanges: () => ["stats"] });
+  await client.start();
+  await assert.rejects(client.refreshPackages(change()), /retained stale packages: stats/);
+  assert.equal(instances.length, 2, "a failed verification must not spin through replacement processes");
+  assert.ok(!instances[1].requests.some(request => request.method === "completion"));
 });

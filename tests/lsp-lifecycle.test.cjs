@@ -478,3 +478,128 @@ test("real R keeps startup completion working while the first session snapshot a
     "unchanged session state is synchronized only once");
   assert.ok(!logs.some((line) => /stopped|ECONNRESET/.test(line)), "startup must have no connection reset");
 });
+
+function lifecycleFixture(t) {
+  const { session: first, configured: second } = temporaryLibraries(t);
+  const root = path.dirname(first), pkg = "rconsolelifecycleprobe", source = path.join(root, "source");
+  fs.mkdirSync(path.join(source, "R"), { recursive: true });
+  fs.writeFileSync(path.join(source, "DESCRIPTION"), [
+    `Package: ${pkg}`, "Version: 1.0", "Title: Lifecycle Probe", "Description: A test package.",
+    "Author: Test", "Maintainer: Test <test@example.org>", "License: MIT", "",
+  ].join("\n"));
+  const install = (library, exported) => {
+    fs.writeFileSync(path.join(source, "NAMESPACE"), `export(${exported})\n`);
+    fs.writeFileSync(path.join(source, "R", "f.R"), `${exported} <- function() NULL\n`);
+    execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["CMD", "INSTALL", "--no-byte-compile",
+      "--no-test-load", "-l", library, source], { stdio: "pipe" });
+  };
+  const defaults = execFileSync("Rscript", ["--vanilla", "-e", 'cat(.libPaths(), sep="\\n")'],
+    { encoding: "utf8" }).trim().split(/\r?\n/);
+  return { first, second, root, pkg, install, defaults };
+}
+
+test("replacement restores startup options with the new package copy before loading namespaces", { timeout: 90000 }, async t => {
+  const { first, second, root, pkg, install, defaults } = lifecycleFixture(t);
+  install(first, "originalExport"); install(second, "replacementExport");
+  const marker = path.join(root, "profile-runs");
+  fs.writeFileSync(path.join(root, ".Renviron"), `R_DEFAULT_PACKAGES=datasets,utils,grDevices,graphics,stats,methods,${pkg}\nR_LIBS_USER="${first.replaceAll("\\", "/")}"\n`);
+  fs.writeFileSync(path.join(root, ".Rprofile"), [
+    `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
+    `library(${pkg})`,
+    'library(utils)',
+    'options(defaultPackages = character(), languageserver.max_completions = 7L)',
+    `cat(Sys.getpid(), "\\n", file=${JSON.stringify(marker)}, append=TRUE)`,
+  ].join("\n"));
+  const env = { ...process.env }; delete env.R_PROFILE_USER; delete env.R_ENVIRON_USER;
+  const { client, instances, complete, logs } = createConsoleLsp(t, { cwd: root, args: [], env });
+  client.updateRuntimeLibraryPaths([first, second, ...defaults]);
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
+  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
+  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
+  const items = await complete(pkg + "::");
+  assert.ok(items.some(item => item.label === "replacementExport"));
+  assert.ok(!items.some(item => item.label === "originalExport"));
+  assert.equal(instances.length, 2);
+  assert.ok(!fs.readFileSync(marker, "utf8").trim().split(/\s+/).includes(String(client.spawnedServer.pid)),
+    "replacement must not re-execute profiles that preload stale namespaces");
+  assert.equal((await complete("stats::")).length, 7, "profile completion options survive a clean restart");
+});
+
+test("site libraries excluded by a live snapshot stay excluded on startup and refresh", { timeout: 90000 }, async t => {
+  const { first, pkg, install, defaults } = lifecycleFixture(t);
+  install(first, "siteExport");
+  const env = { ...process.env, R_LIBS_SITE: first };
+  const { client, complete, instances } = createConsoleLsp(t, { env, args: [] });
+  // A console can produce this snapshot with .libPaths(defaults, include.site=FALSE).
+  client.updateRuntimeLibraryPaths(defaults);
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  const paths = await instances.at(-1).sendRequest("rConsole/libraryPaths", {});
+  assert.ok(!paths.some(value => fs.realpathSync(value) === fs.realpathSync(first)));
+  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "siteExport"));
+  client.updateRuntimeLibraryPaths([first, ...defaults]);
+  await waitFor(() => client.packageInventory.packages.has(pkg), "site library explicitly added");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "siteExport"));
+  client.updateRuntimeLibraryPaths(defaults);
+  await waitFor(() => !client.packageInventory.packages.has(pkg), "site library removed again");
+  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "siteExport"));
+});
+
+test("unrelated abandoned locks do not retain removed namespace metadata", { timeout: 90000 }, async t => {
+  const { first, pkg, install } = lifecycleFixture(t);
+  install(first, "installedExport");
+  const { client, complete } = createConsoleLsp(t, { libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "installedExport"));
+  fs.mkdirSync(path.join(first, "00LOCK-unrelated"));
+  execFileSync("Rscript", ["--vanilla", "-e", `remove.packages("${pkg}", lib=${JSON.stringify(first)})`], { stdio: "pipe" });
+  await waitFor(() => !client.packageInventory.packages.has(pkg), "removal with unrelated locks present");
+  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "installedExport"));
+});
+
+test("linked cache changes refresh namespace exports without touching the library link", { timeout: 90000 }, async t => {
+  const { first, second: cache, pkg, install } = lifecycleFixture(t);
+  install(cache, "originalExport");
+  const target = path.join(cache, pkg);
+  fs.symlinkSync(target, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
+  const { client, complete } = createConsoleLsp(t, { libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
+  const originalIdentity = client.packageInventory.packages.get(pkg).identity;
+  install(cache, "replacementExport");
+  await waitFor(() => client.packageInventory.packages.get(pkg)?.identity !== originalIdentity, "external cache replacement");
+  const items = await complete(pkg + "::");
+  assert.ok(items.some(item => item.label === "replacementExport"));
+  assert.ok(!items.some(item => item.label === "originalExport"));
+  fs.rmSync(target, { recursive: true });
+  await waitFor(() => !client.packageInventory.packages.has(pkg), "external cache removal");
+  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
+});
+
+test("initial locked namespaces stay usable and an excluded startup namespace is retired", { timeout: 90000 }, async t => {
+  const { first, pkg, install, defaults } = lifecycleFixture(t);
+  install(first, "startupExport");
+  const env = { ...process.env, R_LIBS_USER: first,
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const lock = path.join(first, "00LOCK-" + pkg);
+  fs.mkdirSync(lock);
+  const { client, instances, complete } = createConsoleLsp(t, { env, libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial locked inventory");
+  assert.equal(instances.length, 1, "a locked startup namespace must not cause a restart loop");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "startupExport"));
+  fs.rmdirSync(lock);
+  await waitFor(() => client.packageInventory.packages.has(pkg), "unlocked installation");
+  await client.dispose();
+  // A fresh console snapshot can already exclude a default package loaded by R startup.
+  const next = createConsoleLsp(t, { env });
+  next.client.updateRuntimeLibraryPaths(defaults);
+  await next.client.start();
+  await waitFor(() => next.client.packageInventory.initialized, "excluded startup namespace reconciled");
+  assert.equal(next.instances.length, 2);
+  assert.ok(!(await next.complete(pkg + "::")).some(item => item.label === "startupExport"));
+});
