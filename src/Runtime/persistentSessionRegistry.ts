@@ -314,11 +314,16 @@ export class PersistentSessionRegistry {
       try { current = fs.readFileSync(this.filePath, "utf8"); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if ((current === undefined ? undefined : digest(current)) !== this.originalDigest) throw new Error("Registry changed on disk");
-      const encoded = JSON.stringify({ format: REGISTRY_FORMAT, version: 1, sessions: [...rows, ...opaque] });
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      fs.writeFileSync(temporary, encoded, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      fs.renameSync(temporary, this.filePath);
-      this.originalDigest = digest(encoded);
+      if (rows.length === 0 && opaque.length === 0) {
+        fs.rmSync(this.filePath, { force: true });
+        this.originalDigest = undefined;
+      } else {
+        const encoded = JSON.stringify({ format: REGISTRY_FORMAT, version: 1, sessions: [...rows, ...opaque] });
+        fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+        fs.writeFileSync(temporary, encoded, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        fs.renameSync(temporary, this.filePath);
+        this.originalDigest = digest(encoded);
+      }
       if (this.migrationDigest) {
         await Promise.all(alive.map(async ({ identity }) => { const key = await this.readKey(identity!); key.fill(0); }));
         this.migrationDigest = undefined;
@@ -335,7 +340,7 @@ export class PersistentSessionRegistry {
         this.sessions = [];
         this.preserved = [];
       }
-      this.reportError("R Console could not encrypt its saved sessions. The existing saved data has been retained. Older runtimes require a new R session for encrypted persistence; no plaintext fallback was written.");
+      this.reportError("R Console could not update its saved sessions. The existing saved data has been retained. Older runtimes require a new R session for encrypted persistence; no plaintext fallback was written.");
       return false;
     } finally { try { fs.rmSync(temporary, { force: true }); } catch {} }
   }

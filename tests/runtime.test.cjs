@@ -342,5 +342,5 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   t.after(() => endedRegistry.dispose());
   assert.deepEqual(await endedRegistry.load(), [], "ended R sessions have no replay to reattach");
   assert.equal(await endedRegistry.save([]), true);
-  assert.deepEqual(JSON.parse(fs.readFileSync(registryFile, "utf8")).sessions, []);
+  assert.equal(fs.existsSync(registryFile), false, "the last ended session must remove the registry file");
 });

@@ -292,7 +292,7 @@ test("external registry changes are preserved and failed saves do not leave temp
 });
 
 test("disposing a registry cancels pending key retrieval and clears the received key", async t => {
-  const { file } = fixture(t, { sessions: [] });
+  const { file } = fixture(t, { format: "r-console-session-records", version: 1, sessions: [] });
   let release;
   const transferred = Buffer.alloc(32, 42);
   const registry = new PersistentSessionRegistry(file, () => new Promise(resolve => { release = resolve; }));
@@ -364,4 +364,101 @@ test("unknown metadata stays with its record during partial recovery", async t =
   // Remove the newly added record to inspect the recovered record's metadata.
   assert.equal(await restored.save([original]), true);
   assert.equal(keys.read(file).futureMetadata, "retain");
+});
+
+test("closing sessions removes only their records and deletes the file after the last one", async t => {
+  const first = session(), second = session();
+  const { registry, file, read } = fixture(t, { sessions: [first, second] });
+  await registry.load();
+  assert.equal(await registry.save([second]), true);
+  assert.deepEqual(read().sessions, [second]);
+  assert.equal(await registry.save([]), true);
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(await registry.save([]), true, "later empty saves must keep the registry absent");
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(await registry.save([session()]), true, "a new session must recreate the registry");
+  assert.equal(read().sessions.length, 1);
+});
+
+test("an empty window does not create a registry file or storage directory", async t => {
+  const { file, keys } = fixture(t, { sessions: [] });
+  const absentFile = path.join(path.dirname(file), "new-window", "persistent-sessions.json");
+  const registry = new PersistentSessionRegistry(absentFile, keys.readKey);
+  t.after(() => registry.dispose());
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(await registry.save([]), true);
+  assert.equal(fs.existsSync(path.dirname(absentFile)), false);
+});
+
+test("an empty save preserves a live session whose key is unavailable", async t => {
+  const entry = session();
+  const { registry, file, keys } = fixture(t, { sessions: [entry] });
+  await registry.load();
+  const before = JSON.parse(fs.readFileSync(file, "utf8"));
+  registry.dispose();
+  const reloaded = new PersistentSessionRegistry(file, async () => { throw new Error("Temporarily unavailable"); });
+  t.after(() => reloaded.dispose());
+  assert.deepEqual(await reloaded.load(), []);
+  assert.equal(await reloaded.save([]), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), before);
+});
+
+test("cleanup preserves a registry changed by another writer", async t => {
+  const { registry, file } = fixture(t, { sessions: [session()] });
+  await registry.load();
+  const external = '{"futureSchema":true}';
+  fs.writeFileSync(file, external);
+  assert.equal(await registry.save([]), false);
+  assert.equal(fs.readFileSync(file, "utf8"), external);
+});
+
+test("failed last-session deletion retains the file and can be retried", async t => {
+  const { registry, file } = fixture(t, { sessions: [session()] });
+  await registry.load();
+  const before = fs.readFileSync(file, "utf8");
+  const remove = fs.rmSync;
+  fs.rmSync = (target, options) => {
+    if (target === file) throw Object.assign(new Error("File is temporarily locked"), { code: "EBUSY" });
+    return remove(target, options);
+  };
+  try { assert.equal(await registry.save([]), false); }
+  finally { fs.rmSync = remove; }
+  assert.equal(fs.readFileSync(file, "utf8"), before);
+  assert.equal(await registry.save([]), true);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test("Ctrl+L removes old output from encrypted replay while retaining the live session and draft", async t => {
+  const { createTerminalWithScreen } = require("../helpers/submission-terminal.cjs");
+  const { terminal, history } = createTerminalWithScreen(t);
+  const record = session();
+  terminal.options = { ...terminal.options, ...record.terminal.options };
+  terminal.runtimeBackend.getReconnectInfo = () => record.terminal.runtime;
+  terminal.backendChildPid = process.pid;
+  terminal.replyPromptText = "";
+  terminal.pendingInitialPromptGap = false;
+  terminal.hasReceivedOutput = true;
+  terminal.replayStartAbsoluteRow = 0;
+  const initialReplay = terminal.terminalState = terminal.createReplayTerminal();
+  t.after(() => { initialReplay.dispose(); terminal.terminalState.dispose(); });
+  terminal.captureTerminalWrite("R> print('OLD_PRINTED_VALUE')\r\nOLD_PRINTED_VALUE\r\n");
+  terminal.inputState.text = "draft <- 42";
+  terminal.inputState.cursorToEnd();
+  terminal.rHistory.push("print('OLD_PRINTED_VALUE')");
+  const snapshot = () => ({ ...record, terminal: terminal.exportPersistentState() });
+  const { registry, file, read, keys } = fixture(t, { sessions: [] });
+  await registry.load();
+  assert.equal(await registry.save([snapshot()]), true);
+  assert.match(read().sessions[0].terminal.ui.replay.lines.join("\n"), /OLD_PRINTED_VALUE/);
+  terminal.handleInput("\x0c");
+  assert.equal(await registry.save([snapshot()]), true);
+  const saved = read().sessions[0];
+  assert.doesNotMatch(saved.terminal.ui.replay.lines.join("\n"), /OLD_PRINTED_VALUE/);
+  assert.equal(saved.terminal.ui.inputText, "draft <- 42");
+  assert.deepEqual(history, ["print('OLD_PRINTED_VALUE')"]);
+  assert.equal(fs.existsSync(file), true, "the living session still needs its reconnect record");
+  registry.dispose();
+  const restored = new PersistentSessionRegistry(file, keys.readKey);
+  t.after(() => restored.dispose());
+  assert.deepEqual(await restored.load(), [saved]);
 });

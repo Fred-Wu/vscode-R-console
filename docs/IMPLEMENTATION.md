@@ -1423,6 +1423,12 @@ save before detaching. VS Code reloads retrieve keys from the surviving runtimes
 R exit, crash or reboot ends the key lifetime and makes the associated encrypted
 replay unrecoverable. Session persistence requires a living runtime.
 
+Ctrl+L clears captured console output from the in-memory replay. The next
+successful registry save records that cleared replay, normally within the
+five-second heartbeat or during detach/deactivation. The current draft input
+and reconnect record remain available. Command history has its own storage
+and deletion command.
+
 ### 4.3 Registry Loading And Pruning
 
 On activation, `extension.ts` loads `persistent-sessions.json` through
@@ -1435,7 +1441,11 @@ Records are validated individually before reconnecting. A record can reconnect o
 - its UI replay state is structurally valid
 - its recorded backend pid is either absent or still alive
 
-Entries with dead runtime PIDs are pruned when the registry is saved. Live entries
+Entries with dead runtime PIDs are pruned when the registry is saved. Each file
+holds the sessions for its workspace or folderless window. Removing one session
+preserves the remaining records; removing the last record deletes the file.
+Activation saves the pruned registry, cleaning up records left after a crash or
+reboot. An empty window keeps its registry absent. Live entries
 whose keys are temporarily unavailable or whose authentication fails retain their
 original ciphertext for retry; other sessions remain usable. Decrypted incompatible
 records remain available for the existing upgrade notice and close flow.
