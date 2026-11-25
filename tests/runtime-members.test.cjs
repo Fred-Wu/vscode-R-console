@@ -55,7 +55,9 @@ test("real embedded R completion inspects nested storage without running user co
       await delay(20, undefined, { signal: t.signal });
     }
   };
-  await until(() => mainPrompts > 0, "initial R prompt");
+  // Attach replays buffered prompts before announcing the command channel.
+  await until(() => mainPrompts > 0 && backend.canUseSessionCommands(session),
+    "initial R prompt and authenticated command channel");
   assert.equal(backend.hasCapability(session, "member-inspection"), true,
     "supported R installations must provide native guarded binding inspection");
 
@@ -1132,19 +1134,22 @@ test("static routing preserves search-path identity, opaque callables and stored
     fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     fs.rmSync(path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`), { force: true });
   });
-  const until = async (p) => {
+  const until = async (p, label) => {
     const end = Date.now() + 15e3;
     while (!p()) {
       if (failure) throw failure;
-      if (Date.now() > end) throw Error(output);
+      assert.ok(Date.now() < end, label + ": " + output);
       await delay(20, undefined, { signal: t.signal });
     }
   };
-  await until(() => prompts);
+  // A replayed prompt can precede host-connected in a separate socket frame.
+  await until(() => prompts > 0 && backend.canUseSessionCommands(session),
+    "initial R prompt and authenticated command channel");
   const submit = async (code) => {
     const old = prompts;
-    backend.sendSessionCommand(session, { type: "submit", code });
-    await until(() => prompts > old);
+    assert.equal(backend.sendSessionCommand(session, { type: "submit", code }), true,
+      "the command channel must accept the submission");
+    await until(() => prompts > old, "main prompt after submission: " + code);
   };
   const inspect = async (expression, target) => {
     const q = completion.parseRuntimeMemberQuery(expression, target);

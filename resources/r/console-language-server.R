@@ -1,9 +1,77 @@
-# Use R's normal project .Rprofile at startup; the console snapshot overrides
-# its search order on language-server replacement, before namespaces are loaded.
-# This fixed environment value contains only library paths, never console code.
+# The first process discovers project configuration through normal R startup.
+# Replacements restore the startup environment and completion options with the
+# console's library order. Profiles and automatic package loading are disabled.
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
+startup_state <- Sys.getenv("VSCR_LSP_STARTUP_STATE")
+restore_startup <- nzchar(startup_state) && identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
+startup_environment <- function() {
+    values <- Sys.getenv()
+    # Transport credentials and R's temporary directory belong to this process.
+    keys <- toupper(names(values))
+    values[!startsWith(keys, "VSCR_") & keys != "R_SESSION_TMPDIR"]
+}
+if (restore_startup) {
+    # Options remain serialized inside this namespace-free envelope: reading a
+    # function's namespace reference can load its package during deserialization.
+    startup <- readRDS(startup_state)
+    # Include profile-created values, empty values and explicit unsets before
+    # loading any packages that depend on the startup configuration.
+    Sys.unsetenv(setdiff(names(startup_environment()), names(startup$environment)))
+    do.call(Sys.setenv, as.list(startup$environment))
+    # .libPaths() always appends .Library, even with include.site = FALSE.
+    # Restore the effective profile-defined roots before selecting libraries or
+    # deserializing options. Preserve the base bindings' original lock state.
+    local({
+        roots <- startup$library_roots
+        for (name in c(".Library", ".Library.site")) {
+            if (!name %in% names(roots)) stop("Missing startup library root: ", name)
+            locked <- bindingIsLocked(name, baseenv())
+            if (locked) unlockBinding(name, baseenv())
+            tryCatch(assign(name, roots[[name]], envir = baseenv()),
+                finally = if (locked) lockBinding(name, baseenv()))
+        }
+    })
+}
 if (nzchar(runtime_lib_paths)) {
-    .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]])
+    .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
+}
+
+if (nzchar(startup_state)) {
+    if (restore_startup) {
+        # Namespace load hooks may need ordinary profile settings while the
+        # remaining option values are being deserialized.
+        options(startup$plain_options)
+        options(unserialize(startup$options))
+        for (package in rev(setdiff(startup$packages, "base"))) {
+            require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
+        }
+    } else {
+        # Profile-defined options may be required by packages before they load.
+        # The snapshot can include sensitive values, so create it owner-only.
+        local({
+            # Only reference-free values can be read before library selection.
+            # Inspect attributes too: even an atomic option can carry a closure.
+            plain_option <- function(value) {
+                if (isS4(value)) return(FALSE)
+                type <- typeof(value)
+                if (!type %in% c("NULL", "logical", "integer", "double", "complex",
+                    "character", "raw", "list")) return(FALSE)
+                if (type == "list" && !all(vapply(unclass(value), plain_option, logical(1)))) return(FALSE)
+                all(vapply(attributes(value), plain_option, logical(1)))
+            }
+            startup_options <- options()
+            if (.Platform$OS.type == "unix") {
+                original_umask <- Sys.umask("077")
+                on.exit(Sys.umask(original_umask))
+            }
+            saveRDS(list(options = serialize(startup_options, NULL),
+                plain_options = Filter(plain_option, startup_options), packages = .packages(),
+                environment = startup_environment(),
+                library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),
+                    inherits = FALSE)), startup_state)
+            if (.Platform$OS.type == "unix") Sys.chmod(startup_state, mode = "0600")
+        })
+    }
 }
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
@@ -174,17 +242,23 @@ server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params)
 server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, params) {
     changed <- normalize_character(params$changed)
     loaded <- loadedNamespaces()
+    deferred <- normalizePath(normalize_character(params$deferred), winslash = "/", mustWork = FALSE)
     switched <- Filter(function(pkgname) {
-        selected <- normalizePath(params$installations[[pkgname]], winslash = "/", mustWork = FALSE)
         current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
+        # Initial discovery can encounter a package that was already loaded
+        # while its installation is locked. Reconcile it after the lock clears.
+        if (current %in% deferred) return(FALSE)
+        installation <- params$installations[[pkgname]]
+        if (is.null(installation)) return(TRUE)
+        selected <- normalizePath(installation, winslash = "/", mustWork = FALSE)
         !identical(selected, current)
-    }, intersect(names(params$installations), setdiff(loaded, "base")))
+    }, setdiff(loaded, "base"))
     restart <- union(intersect(changed, loaded), switched)
     if (length(restart)) {
         # Removing metadata cannot replace functions or DLLs already loaded in R.
         return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))
     }
-    .libPaths(normalize_character(params$libraryPaths))
+    .libPaths(normalize_character(params$libraryPaths), include.site = FALSE)
     for (workspace in self$workspaces$values()) {
         affected <- changed
         if (length(changed) && is.function(workspace$s3_metadata$keys)) {

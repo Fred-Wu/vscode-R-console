@@ -1230,9 +1230,24 @@ cannot suppress publication of the newer order.
 `PackageInventory` monitors library folders outside the R process. Folder
 events schedule a scan of the changed library after 250 ms. It reads package names,
 versions, resolved paths, and package-directory timestamps, reusing unchanged
-package records. There are no periodic package scans or completion-triggered library-path probes. Scans use
-bounded asynchronous file operations. Installation lock folders defer changes
-in that library, and a changed inventory must be stable across two scans.
+package records. Linked package directories and their target parents are also
+polled for replacement, removal, recreation and installation locks. Polling
+notifications are verified against installed package identities and known
+lock paths before a full scan. Directory timestamp touches reuse cached package
+records and remain quiet in the lifecycle log. Package
+symlink chains are followed hop by hop with cycle detection and a traversal
+limit. Each hop's parent remains monitored, and the final target's lock location
+is resolved even while the package is absent during installation. Named locks
+are checked against both the logical package name and its resolved directory
+name, which may differ for versioned external caches. External cache locks are
+inspected by their individual paths, requiring traversal permission on the cache
+parent. Scans use bounded asynchronous file operations. Named installation locks
+defer their package; a `00LOCK` directory defers the whole library. Deferred paths remain
+tracked while a lock is held, including packages absent from the initial
+inventory. Package identities and deferred paths must be stable across two
+scans before publication. Releasing a lock reconciles loaded namespaces even
+when the inventory contains the same package identities. Failed reconciliation
+keeps the release pending for retry.
 
 Failed library reads or language-server updates leave changes pending for retry.
 Retry delays increase from 1 second to a maximum of 30 seconds. Failed folder
@@ -1251,7 +1266,25 @@ package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
-latest snapshot. A completion interrupted by replacement reopens its document
+latest snapshot. The initial server saves its effective environment, base and site
+library roots, all startup options and attached package names in its private
+temporary directory. The
+options are serialized into a raw payload inside the snapshot, so reading the
+environment and package names cannot deserialize namespace references. Options
+containing only atomic values and lists with reference-free attributes are also
+saved as ordinary values for use by namespace load hooks. The
+snapshot can contain values set by user profiles, including credentials, so the
+temporary directory and snapshot have owner-only permissions on Unix; Windows
+uses the current user's temporary-directory access controls. Normal disposal
+removes the snapshot. A replacement
+starts with profiles, environment files and automatic default-package loading
+disabled. It restores environment values and unsets, then the effective `.Library`
+and `.Library.site` values before applying the console's library order with
+site-library inclusion disabled. It restores those ordinary options,
+then deserializes and restores all startup options and loads the startup packages.
+Transport credentials and R's process-specific temporary
+directory remain fresh. The client verifies namespace installations before publishing
+the inventory. A completion interrupted by replacement reopens its document
 and retries once on the replacement client. `languageserver` owns its completion
 metadata and rebuilds it after a restart. The console does not export or restore
 that metadata. The replacement receives a silent completion request to prepare
