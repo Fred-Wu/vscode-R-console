@@ -47,7 +47,7 @@ export async function manageLegacySessions(
   for (const entry of selected) {
     try {
       await closeLegacySession(entry);
-      if (!registry.forgetLegacySession(entry)) {
+      if (!await registry.forgetLegacySession(entry)) {
         throw new Error("The process has stopped, but its saved record could not be removed.");
       }
     } catch (error) {

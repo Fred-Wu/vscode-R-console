@@ -683,7 +683,7 @@ pub(crate) enum PromptKind {
     Cont,
 }
 
-fn secure_server_nonce() -> io::Result<[u8; AUTH_NONCE_BYTES]> {
+pub(crate) fn secure_server_nonce() -> io::Result<[u8; AUTH_NONCE_BYTES]> {
     let mut nonce = [0_u8; AUTH_NONCE_BYTES];
     #[cfg(unix)]
     {

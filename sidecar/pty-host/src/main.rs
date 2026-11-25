@@ -4,6 +4,7 @@ mod host;
 mod library_paths;
 mod member_inspection;
 mod protocol;
+mod registry_key;
 #[cfg(windows)]
 mod windows_pipe_security;
 

@@ -1399,7 +1399,29 @@ Each record contains:
 - terminal location: panel or editor column
 
 The session manager uses these records to reconnect the backend and reconstruct
-its console UI.
+its console UI. Each record is encrypted separately with AES-256-GCM, a fresh
+96-bit nonce and a 128-bit authentication tag. The registry path, format version,
+session UUID and runtime PID form authenticated associated data. The cleartext
+JSON envelope contains only the format version, UUID, PID and encryption framing.
+Root metadata is included in each encrypted record. Replay, pending input, paths,
+terminal options and reconnect credentials are encrypted together.
+
+Each persistent Rust runtime creates a random 256-bit key before R starts and
+retains it in memory for that process's lifetime. The extension obtains a copy
+through a local key broker: a user-owned Unix socket in a verified mode-0700
+`/tmp/r-console-keys-<uid>` directory, or a Windows named pipe created with a
+protected user-only DACL and remote clients denied. Socket permissions are 0600.
+Endpoint names are derived from validated UUIDs. The broker returns its PID with
+the key; requests and replies have fixed lengths and bounded deadlines. The
+Windows client acknowledges receipt before the server disconnects the pipe.
+
+The extension caches keys in memory while saving and clears its key buffers on
+disposal. Registry writes use exclusive mode-0600 temporary files followed by
+atomic replacement, check for intervening changes on disk, and serialize saves.
+Queued saves coalesce to the latest UI snapshot; deactivation awaits the final
+save before detaching. VS Code reloads retrieve keys from the surviving runtimes.
+R exit, crash or reboot ends the key lifetime and makes the associated encrypted
+replay unrecoverable. Session persistence requires a living runtime.
 
 ### 4.3 Registry Loading And Pruning
 
@@ -1413,9 +1435,20 @@ Records are validated individually before reconnecting. A record can reconnect o
 - its UI replay state is structurally valid
 - its recorded backend pid is either absent or still alive
 
-Dead authenticated records are pruned when the registry is saved. Incompatible
-records are retained alongside valid records; one invalid entry does not discard
-the whole registry. Unreadable or malformed registry files are not overwritten.
+Entries with dead runtime PIDs are pruned when the registry is saved. Live entries
+whose keys are temporarily unavailable or whose authentication fails retain their
+original ciphertext for retry; other sessions remain usable. Decrypted incompatible
+records remain available for the existing upgrade notice and close flow.
+Unreadable or malformed registry files are preserved and saving is disabled.
+
+Legacy plaintext registries migrate through the runtime key broker. The runtime
+pins the SHA-256 digest of the original plaintext during migration, allowing the
+same migration to retry after a failed write. A successful encrypted save seals
+migration; subsequent plaintext replacements are rejected by that runtime.
+Runtimes predating key support retain their existing records and can still be
+reattached or closed. Starting new R sessions enables encrypted persistence.
+Encryption failures preserve the existing file and report the failure; all new
+registry writes use the encrypted format.
 
 Records are recognized as older sessions when their protocol version is lower
 than the current version and their structure and credentials are valid. Records

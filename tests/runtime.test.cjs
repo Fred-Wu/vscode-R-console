@@ -301,11 +301,29 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   stage = "reconnect";
   const reconnect = backend.getReconnectInfo(session);
   assert.ok(reconnect);
+  const { PersistentSessionRegistry } = loadSource("src/Runtime/persistentSessionRegistry.ts");
+  const { session: savedSession } = require("./helpers/persistent-session.cjs");
+  const registryFile = path.join(dir, "persistent-sessions.json");
+  const registry = new PersistentSessionRegistry(registryFile);
+  assert.deepEqual(await registry.load(), []);
+  const saved = savedSession({ ...reconnect, cwd: dir });
+  saved.terminal.ui.replay.lines = [output];
+  saved.terminal.ui.inputText = "SENSITIVE_UNSUBMITTED_INPUT";
+  assert.equal(await registry.save([saved]), true);
+  registry.dispose();
+  const encrypted = fs.readFileSync(registryFile, "utf8");
+  for (const secret of [reconnect.authToken, "SENSITIVE_UNSUBMITTED_INPUT", "REPLY: 中文 café 🙂", dir]) {
+    assert.equal(encrypted.includes(secret), false, "session secrets must be encrypted on disk");
+  }
   backend.detach(session);
   assert.equal(alive(), true, "detach must preserve the R process");
+  const restoredRegistry = new PersistentSessionRegistry(registryFile);
+  t.after(() => restoredRegistry.dispose());
+  const restoredRecords = await restoredRegistry.load();
+  assert.deepEqual(restoredRecords, [saved], "runtime memory key must recover the complete replay after reload");
   backend = new RustSidecarRuntimeBackend(binary);
   instrument(backend);
-  session = backend.reconnect(JSON.parse(JSON.stringify(reconnect)));
+  session = backend.reconnect(restoredRecords[0].terminal.runtime);
   events.length = 0;
   backend.attach(session, handlers);
   // The snapshot follows the session-state frame and can arrive in a separate
@@ -319,4 +337,10 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   stage = "shutdown";
   backend.close(session);
   await waitFor(() => !alive(), "shutdown must terminate R");
+  restoredRegistry.dispose();
+  const endedRegistry = new PersistentSessionRegistry(registryFile);
+  t.after(() => endedRegistry.dispose());
+  assert.deepEqual(await endedRegistry.load(), [], "ended R sessions have no replay to reattach");
+  assert.equal(await endedRegistry.save([]), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryFile, "utf8")).sessions, []);
 });

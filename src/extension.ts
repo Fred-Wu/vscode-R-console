@@ -95,7 +95,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
   extensionBaseUri = context.extensionUri;
-  persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context));
+  persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context), undefined,
+    message => { void vscode.window.showErrorMessage(message); });
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
   context.subscriptions.push(
@@ -153,9 +154,7 @@ async function initializePersistentSessionRegistry(): Promise<void> {
   for (const entry of records) {
     persistentSessionRecords.set(entry.terminal.runtime.sessionId, entry);
   }
-  if (records.length > 0) {
-    persistPersistentSessions();
-  }
+  await persistPersistentSessions();
 }
 
 async function loadPersistentSessionsFromDisk(): Promise<PersistedConsoleRecord[]> {
@@ -405,7 +404,7 @@ async function refreshManagedPersistentSessions(): Promise<ManagedPersistentSess
   }
   prunePersistentSessionRegistry();
   const sessions = collectManagedPersistentSessions();
-  persistPersistentSessions();
+  void persistPersistentSessions();
   return sessions;
 }
 
@@ -620,7 +619,7 @@ function detachPersistentSessions(sessions: readonly ManagedPersistentSession[])
       detachConsoleRecord(session.attachedRecord);
     }
   }
-  persistPersistentSessions();
+  void persistPersistentSessions();
 }
 
 function detachConsoleRecord(record: ConsoleRecord): void {
@@ -685,7 +684,7 @@ async function closePersistentSessions(
     }
   }
 
-  persistPersistentSessions();
+  void persistPersistentSessions();
 }
 
 function closeDetachedPersistentSessions(
@@ -1168,7 +1167,11 @@ function findEditorTabByPid(pid: number): vscode.Tab | undefined {
 
 export async function deactivate(): Promise<void> {
   extensionHostDeactivating = true;
-  flushPersistPersistentSessions();
+  if (persistHeartbeatTimer) {
+    clearInterval(persistHeartbeatTimer);
+    persistHeartbeatTimer = undefined;
+  }
+  await flushPersistPersistentSessions();
   for (const record of new Set(rTerminalToRecord.values())) {
     record.pidSubscription.dispose();
     trackTerminalCleanup(record.rTerminal.dispose());
@@ -1179,13 +1182,15 @@ export async function deactivate(): Promise<void> {
   editorTabToRecord.clear();
   await Promise.allSettled([...pendingTerminalCleanups]);
   await disposeHistoryWorker();
+  persistentRegistry?.dispose();
+  persistentRegistry = undefined;
   disposeConsoleLspOutputChannel();
 }
 
 function startPersistentSessionRegistry(context: vscode.ExtensionContext): void {
   persistHeartbeatTimer = setInterval(() => {
-    if (rTerminalToRecord.size > 0 || persistentSessionRecords.size > 0) {
-      persistPersistentSessions();
+    if (!extensionHostDeactivating && (rTerminalToRecord.size > 0 || persistentSessionRecords.size > 0)) {
+      void persistPersistentSessions();
     }
   }, PERSIST_HEARTBEAT_MS);
   context.subscriptions.push(
@@ -1203,24 +1208,24 @@ function startPersistentSessionRegistry(context: vscode.ExtensionContext): void 
 }
 
 function schedulePersistPersistentSessions(): void {
-  if (!persistentRegistry || persistDebounceTimer) {
+  if (extensionHostDeactivating || !persistentRegistry || persistDebounceTimer) {
     return;
   }
   persistDebounceTimer = setTimeout(() => {
     persistDebounceTimer = undefined;
-    persistPersistentSessions();
+    void persistPersistentSessions();
   }, PERSIST_DEBOUNCE_MS);
 }
 
-function flushPersistPersistentSessions(): void {
+async function flushPersistPersistentSessions(): Promise<void> {
   if (persistDebounceTimer) {
     clearTimeout(persistDebounceTimer);
     persistDebounceTimer = undefined;
   }
-  persistPersistentSessions();
+  await persistPersistentSessions();
 }
 
-function persistPersistentSessions(): void {
+async function persistPersistentSessions(): Promise<void> {
   if (!persistentRegistry) {
     return;
   }
@@ -1249,5 +1254,5 @@ function persistPersistentSessions(): void {
     persistentSessionRecords.set(entry.terminal.runtime.sessionId, entry);
   }
 
-  persistentRegistry.save(persisted);
+  await persistentRegistry.save(persisted);
 }

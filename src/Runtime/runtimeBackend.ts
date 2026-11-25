@@ -154,6 +154,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       env: {
         ...options.env,
         VSC_R_BACKEND_SESSION_FILE: sessionFilePath,
+        VSC_R_BACKEND_SESSION_ID: sessionId,
         VSC_R_BACKEND_AUTH_TOKEN: authToken,
         VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS: String(INITIAL_CONNECT_GRACE_MS),
         VSC_R_BACKEND_RECONNECT_GRACE_MS: String(PERSISTENT_RECONNECT_GRACE_MS),

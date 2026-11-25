@@ -257,6 +257,9 @@ mod unix_host {
         let api = unsafe { RApi::load(&library_path)? };
 
         let session_transport = session_transport_config().is_some();
+        let _registry_key = if session_transport {
+            Some(crate::registry_key::start(&std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
+        } else { None };
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
         if session_transport { capabilities.push("lsp-startup-state-v1"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
@@ -2286,6 +2289,9 @@ mod windows_host {
         let mut api = unsafe { RApi::load(&layout)? };
 
         let session_transport = session_transport_config().is_some();
+        let _registry_key = if session_transport {
+            Some(crate::registry_key::start(&std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
+        } else { None };
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
         if session_transport { capabilities.push("lsp-startup-state-v1"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
