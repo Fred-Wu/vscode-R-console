@@ -10,17 +10,50 @@ import { staticCompletionUnavailableReason, type CompletionSuppressionReason } f
 /** Native projection payload, confined to the installed-provider adapter. */
 export type NativeSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
 
+type InputAnalysis = {
+  input: string;
+  cursor: number;
+  context: ReturnType<typeof getCompletionContext>;
+  getReceiver(): ReturnType<typeof storedCompletionReceiver>;
+};
+const inputAnalyses = new WeakMap<object, InputAnalysis>();
+
+/** Fuzzy retries move the query position within the same input and actual cursor. */
+function analyzeInput({ input, cursor, requestScope }: StaticCompletionRequest): InputAnalysis {
+  const cached = requestScope && inputAnalyses.get(requestScope);
+  if (cached?.input === input && cached.cursor === cursor) return cached;
+  const before = input.slice(0, cursor), line = before.split("\n").at(-1)!;
+  const syntax = getCompletionSyntax(input, cursor);
+  const runtime = getCompletionContext(line, line.length, before, input.slice(cursor), syntax);
+  const context = getStaticFallbackContext(line, line.length, before, input.slice(cursor), runtime, syntax) ?? runtime;
+  let receiver: ReturnType<typeof storedCompletionReceiver>;
+  let receiverReady = false;
+  const analysis: InputAnalysis = {
+    input, cursor, context,
+    getReceiver() {
+      if (!receiverReady) {
+        receiverReady = true;
+        if (context && !(context.kind === "argument" && context.functionName &&
+            parseRuntimeMemberQuery(context.functionName, "arguments"))) {
+          receiver = storedCompletionReceiver(context, input, cursor, syntax);
+        }
+      }
+      return receiver;
+    },
+  };
+  if (requestScope) inputAnalyses.set(requestScope, analysis);
+  return analysis;
+}
+
 /** Compatibility boundary for the installed languageserver's single-source projection. */
 export async function provideNativeStaticCompletion(
   completeNative: (binding?: NativeSourceBinding) => Promise<CompletionResult | undefined>,
   request: StaticCompletionRequest
 ): Promise<StaticCompletionOutcome> {
-  const { input, cursor, bindings } = request;
+  const { bindings } = request;
   if (!bindings.isCurrent()) return { status: "pending", reason: "analysis-pending" };
-  const before = input.slice(0, cursor), line = before.split("\n").at(-1)!;
-  const syntax = getCompletionSyntax(input, cursor);
-  const runtime = getCompletionContext(line, line.length, before, input.slice(cursor), syntax);
-  const context = getStaticFallbackContext(line, line.length, before, input.slice(cursor), runtime, syntax) ?? runtime;
+  const analysis = analyzeInput(request);
+  const { context } = analysis;
   if (context?.rejectionReason || context?.suppressAutomatic) {
     return { status: "unresolved", reason: "unsupported-context" };
   }
@@ -30,9 +63,8 @@ export async function provideNativeStaticCompletion(
   // another binding lookup would return a callable source snapshot.
   const refusedRoot = request.runtimeRefusal && parseRuntimeMemberQuery(request.runtimeRefusal.expression)?.root;
   if (refusedRoot) sourceBinding = { name: refusedRoot, opaqueReceiver: true };
-  else if (context && !(context.kind === "argument" && context.functionName &&
-      parseRuntimeMemberQuery(context.functionName, "arguments"))) {
-    const receiver = storedCompletionReceiver(context, input, cursor, syntax);
+  else {
+    const receiver = analysis.getReceiver();
     if (receiver) {
       const result = await bindings.resolve({ name: receiver.name,
         lookup: receiver.target === "source" ? "function" : receiver.target === "source-value" ? "value" : "identity" });

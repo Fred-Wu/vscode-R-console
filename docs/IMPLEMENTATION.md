@@ -814,8 +814,12 @@ excluding parameter and default-value candidates that require that signature.
 Independent expression symbols retain prefix broadening when parameter inference
 is unavailable. Native context classification, fallback and stored-receiver
 discovery share one request-local syntax snapshot, including cursor-specific token
-slices. Derived contexts and absent results are computed lazily once per snapshot;
-input changes and cursor moves receive independent snapshots. Terminal context
+slices. The native adapter retains context and lazy receiver analysis in a weak
+cache keyed by request scope, input and actual cursor, so fuzzy prefix retries
+reuse the same analysis. Binding resolution, cancellation and runtime refusal
+checks run for each invocation. Derived contexts and absent results are computed
+lazily once per snapshot; input changes and cursor moves receive independent
+snapshots. Terminal context
 classification, static fallback classification and generic prefix extraction share
 one syntax snapshot for the same input and cursor. Snapshots are
 released with their consumers; the separate lexer cache retains only the latest
