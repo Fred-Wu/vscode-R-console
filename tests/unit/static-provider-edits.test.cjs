@@ -44,7 +44,8 @@ async function openStaticPicker(t, marked, provide, options = {}) {
     getStaticAnalysisEnabled: () => true, requestRuntimeFunctionSource: options.requestSource });
   lang.getOrOpenCompletionDocument = async value => ({ version: 1, getText: () => value,
     uri: { toString: () => 'r-console://provider-edits/console.R' } });
-  lang.ensureConsoleLspStarted = async () => ({ provideStaticCompletion: request => {
+  let acquisitions = 0;
+  lang.getCompletionProvider = async () => options.unavailableFirst && ++acquisitions === 1 ? undefined : ({ provideStaticCompletion: request => {
     requests.push(request);
     return provide(request);
   } });
@@ -104,6 +105,27 @@ test('symbol and argument pickers retry timed-out providers when search grows', 
     assert.ok(calls >= 2, 'search must retry after the provider deadline');
     await h.accept();
     assert.equal(h.terminal.inputState.text, marked.startsWith('f(') ? 'f(column)' : 'column');
+  }
+});
+
+test('growing picker searches recover from provider exceptions and unavailable startup', async t => {
+  for (const marked of ['co│', 'f(co│)']) {
+    for (const failure of ['throw', 'reject', 'unavailable', 'request-failed', 'document-unavailable']) {
+      let calls = 0;
+      const h = await openStaticPicker(t, marked, () => {
+        if (++calls === 1 && failure !== 'unavailable') {
+          if (failure === 'throw') throw new Error('temporary provider failure');
+          if (failure === 'reject') return Promise.reject(new Error('temporary provider failure'));
+          return { status: 'unresolved', reason: failure };
+        }
+        return resolved([{ label: 'column', insertText: 'column', role: 'symbol', kind: 5 }]);
+      }, { unavailableFirst: failure === 'unavailable' });
+      assert.deepEqual(h.pick.items, [], failure);
+      await h.type('col');
+      assert.equal(calls, failure === 'unavailable' ? 1 : 2, failure);
+      await h.accept();
+      assert.equal(h.terminal.inputState.text, marked.startsWith('f(') ? 'f(column)' : 'column', failure);
+    }
   }
 });
 

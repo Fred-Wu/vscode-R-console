@@ -36,7 +36,7 @@ function harness(t) {
       return { items: [], rConsoleArgumentsResolved: false, rConsoleStaticUnavailableReason: 'method-arguments-unavailable' };
     }, request);
   } };
-  lang.ensureConsoleLspStarted = async () => provider;
+  lang.getCompletionProvider = async () => provider;
   lang.getOrOpenCompletionDocument = async text => ({ version: 1, getText: () => text });
   let input, pending;
   const handle = lang.handleAutocomplete.bind(lang);

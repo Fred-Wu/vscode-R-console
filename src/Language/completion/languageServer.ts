@@ -21,7 +21,7 @@ export async function getLanguageServerCompletions(
   staticAccess?: StaticCompletionAccess
 ): Promise<{ entries: CompletionEntry[]; isIncomplete: boolean; staticStatus?: StaticCompletionOutcome["status"]; rConsoleLocalFunction?: boolean; runtimeOnly?: boolean; memberResolved?: boolean; staticUnavailableReason?: StaticCompletionUnavailableReason; bindingSuppressionReason?: CompletionSuppressionReason; workspaceFunction?: boolean; nativeArguments?: boolean; argumentsExhausted?: boolean; argumentsResolved?: boolean; argumentSuppressionReason?: CompletionSuppressionReason }> {
   if (!completionProvider) {
-    return { entries: [], isIncomplete: false, staticUnavailableReason: "provider-unavailable" };
+    return { entries: [], isIncomplete: true, staticUnavailableReason: "provider-unavailable" };
   }
   try {
     const requestScope = {};
@@ -125,7 +125,7 @@ export async function getLanguageServerCompletions(
       argumentSuppressionReason,
     };
   } catch {
-    return { entries: [], isIncomplete: false, staticUnavailableReason: "request-failed" };
+    return { entries: [], isIncomplete: true, staticUnavailableReason: "request-failed" };
   }
 }
 

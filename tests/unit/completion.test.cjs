@@ -131,7 +131,7 @@ test("native nested completion reaches Rust without awaiting the language server
         return outcome;
       },
     });
-    lang.ensureConsoleLspStarted = () => { throw Error("runtime completion must not start LSP"); };
+    lang.getCompletionProvider = () => { throw Error("runtime completion must not start LSP"); };
     lang.getOrOpenCompletionDocument = () => { throw Error("runtime completion must not open a virtual document"); };
     const text = "a$lazy$";
     const input = { text, currentLine: text, cursorCol: text.length,
@@ -167,7 +167,7 @@ test("unavailable nested inspection retries after typing instead of caching empt
         ? { status: "unavailable" } : { status: "available", names: ["alpha"] };
     },
   });
-  lang.ensureConsoleLspStarted = () => { throw Error("no LSP dependency for runtime members"); };
+  lang.getCompletionProvider = () => { throw Error("no LSP dependency for runtime members"); };
   const snapshot = text => ({ text, currentLine: text, cursorCol: text.length,
     cursorRow: 0, lines: [text], textBeforeCursor: text });
   let input = snapshot("obj$inner$");
@@ -216,7 +216,7 @@ test("bracket names publish before LSP startup and then merge its parameters", a
       return { status: "available", names: ["keyboard"], bracketKind: "data.table" };
     },
   });
-  lang.ensureConsoleLspStarted = () => startup;
+  lang.getCompletionProvider = () => startup;
   lang.getOrOpenCompletionDocument = async text => ({
     getText: () => text, uri: { toString: () => "r-console:/completion" },
   });
@@ -262,7 +262,7 @@ test("default bracket completion preserves method parameters alongside prefetche
       return { status: "available", names: ["keyboard"], bracketKind: "data.table" };
     },
   });
-  lang.ensureConsoleLspStarted = async () => {
+  lang.getCompletionProvider = async () => {
     assert.equal(nativeRequests, 1, "guarded inspection must start before LSP startup");
     return { provideCompletionItems: async () => {
       lspRequests++;
@@ -1051,7 +1051,7 @@ test("language-server completion starts from cached session data", async () => {
     rPath: "R",
     env: {},
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => {
       lspCompletionStarted = true;
       return [];
@@ -1117,7 +1117,7 @@ test("namespace completion does not wait for library or workspace probes", async
     rPath: "R",
     env: {},
   });
-  lang.ensureConsoleLspStarted = async () => {
+  lang.getCompletionProvider = async () => {
     events.push("lookup");
     return { provideCompletionItems: async () => [] };
   };
@@ -1204,7 +1204,7 @@ test("F7 refinement starts from cached session data", async () => {
     rPath: "R",
     env: {},
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => [],
   });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1296,7 +1296,7 @@ test("package completion filters locally without repeated language-server reques
     rPath: "R",
     env: {},
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => [],
   });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1679,7 +1679,7 @@ test("incomplete package completion re-queries until a complete result arrives",
     rPath: "R",
     env: {},
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => [],
   });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1983,7 +1983,7 @@ test("function argument completion awaits parameters before offering runtime var
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
   });
-  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: () => [] });
+  lang.getCompletionProvider = async () => ({ provideCompletionItems: () => [] });
   lang.getOrOpenCompletionDocument = async () => ({});
   const input = {
     text: "mean(na", currentLine: "mean(na", cursorCol: 7,

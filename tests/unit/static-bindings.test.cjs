@@ -165,7 +165,8 @@ test('failed and cancelled providers immediately settle their outstanding bindin
       bindings: { signal: controller.signal, isCurrent: () => !controller.signal.aborted,
         resolve: () => new Promise(() => {}) },
     });
-    assert.equal(result.staticStatus, end === 'failure' ? 'unresolved' : 'pending');
+    assert.equal(result.staticStatus, 'pending');
+    assert.equal(result.isIncomplete, true);
     assert.deepEqual(await Promise.race([
       read, new Promise(resolve => setImmediate(() => resolve('still pending'))),
     ]), { status: 'unavailable', reason: 'cancelled' }, end);
@@ -183,7 +184,8 @@ test('runtime-only providers cannot silently supply static completion', async ()
     position, contextPosition: position, requestScope: {},
     bindings: createGuardedBindingResolver(async () => assert.fail('no binding lookup without static support')),
   });
-  assert.equal(result.staticStatus, 'unresolved');
+  assert.equal(result.staticStatus, 'pending');
+  assert.equal(result.isIncomplete, true);
   assert.equal(result.rConsoleStaticUnavailableReason, 'provider-unavailable');
   assert.deepEqual(result.items, []);
 });

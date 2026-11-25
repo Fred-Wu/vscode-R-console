@@ -594,7 +594,7 @@ test("typing publishes an empty list when matches or the completion context disa
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
   const lang = new RTermLang({ extensionPath: "", rPath: "", env: {} });
-  lang.ensureConsoleLspStarted = async () => undefined;
+  lang.getCompletionProvider = async () => undefined;
   lang.getOrOpenCompletionDocument = async () => undefined;
   const panel = new InlineCompletion(unicode);
   for (const text of ["df$a", "df$az", "df$a", "# comment"]) {

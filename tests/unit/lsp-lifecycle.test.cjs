@@ -83,6 +83,69 @@ function change() {
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
 
+test('terminal static lookup overlaps startup and preserves cancellation and failure recovery', { timeout: 5000 }, async t => {
+  for (const outcome of ['success', 'cancel', 'failure']) {
+    let releaseStartup, sourceEntered;
+    const startup = new Promise(resolve => { releaseStartup = resolve; });
+    const inspected = new Promise(resolve => { sourceEntered = resolve; });
+    t.after(releaseStartup);
+    let starts = 0, reads = 0;
+    const { client, instances } = createClient(t, { staticAnalysis: true,
+      start: async () => {
+        starts++;
+        await startup;
+        if (outcome === 'failure' && starts === 1) throw new Error('temporary startup failure');
+      },
+      completion: () => ({ rConsoleMemberResolved: true,
+        items: [{ label: 'alpha', kind: 4, data: { type: 'member' } }] }),
+    });
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      vscode: { Position, CompletionItemKind: { Text: 0, Function: 2, Field: 4 },
+        QuickPickItemKind: { Separator: -1 } },
+      '../../Language/consoleLspClient': { ConsoleLspClient: class { constructor() { return client; } } },
+    });
+    const lang = new RTermLang({ extensionPath: '', rPath: 'R', env: {},
+      getStaticAnalysisEnabled: () => true,
+      requestRuntimeFunctionSource: async (name, target) => {
+        reads++;
+        assert.equal(name, 'factory');
+        assert.equal(target, 'source');
+        sourceEntered();
+        return { status: 'source', text: 'function() list(alpha=1)' };
+      },
+    });
+    lang.updateSessionData({ search: ['package:base'], globalenv: {} });
+    const text = 'factory()$';
+    const input = { text, textBeforeCursor: text, lines: [text], currentLine: text, cursorRow: 0, cursorCol: text.length };
+    lang.getOrOpenCompletionDocument = async () => ({ version: 1, getText: () => text });
+    let published = [];
+    const complete = () => lang.handleAutocomplete({ input, force: true, getCurrentInput: () => input,
+      getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries: items => { published = items; } });
+    const result = complete();
+    await inspected;
+    assert.equal(starts, 1, 'concurrent readiness calls share one native startup');
+    assert.deepEqual(instances[0].documents, [], 'binding reads precede document synchronization');
+    if (outcome === 'cancel') {
+      lang.cancelCompletion();
+      await result; // Cancellation settles the request while startup is blocked.
+    }
+    releaseStartup();
+    await result;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(instances[0].requests.filter(r => r.method === 'completion').length, outcome === 'success' ? 1 : 0);
+    assert.equal(published.some(item => item.insertText === 'alpha'), outcome === 'success');
+    assert.equal(instances[0].documents.some(text => text.includes('factory')), outcome === 'success');
+    if (outcome === 'failure') {
+      assert.equal(lang.inlineCache.entries.isIncomplete, true);
+      await complete();
+      assert.equal(starts, 2);
+      assert.equal(reads, 2, 'recovery obtains a fresh binding snapshot');
+      assert.equal(published.some(item => item.insertText === 'alpha'), true);
+    }
+    await lang.dispose();
+  }
+});
+
 test('cancelled startup cannot replace a newer stored-source projection', async t => {
   let releaseStartup, releaseReply, markSent;
   const startup = new Promise(resolve => { releaseStartup = resolve; });
@@ -669,7 +732,7 @@ test("cached session state reaches the LSP before its first launch", async () =>
   const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const data = { search: ["package:stats"], globalenv: { f: { type: "closure", str: "function(first)" } }, loaded_namespaces: [] };
   lang.updateSessionData(data);
-  await lang.ensureConsoleLspStarted();
+  await lang.getCompletionProvider();
   assert.deepEqual(calls, [{ attachedPackages: ["stats"] }],
     "workspace function signatures are no longer sent to the separate language server");
   assert.equal(lang.updateSessionData(data), false, "unchanged metadata is not resent");
@@ -759,7 +822,7 @@ test("runtime library snapshots are retained before completion client constructi
   });
   const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   lang.updateLibraryPaths(["/active", "/base"]);
-  await lang.ensureConsoleLspStarted();
+  await lang.getCompletionProvider();
   assert.deepEqual(paths, [["/active", "/base"]]);
   lang.updateLibraryPaths(["/base"]);
   assert.deepEqual(paths.at(-1), ["/base"]);

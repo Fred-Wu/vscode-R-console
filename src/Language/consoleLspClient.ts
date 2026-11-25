@@ -305,9 +305,15 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   provideStaticCompletion(request: import("./completion/types").StaticCompletionRequest) {
-    return provideNativeStaticCompletion(binding => this.provideCompletionItems(
-      request.document, request.position, request.triggerCharacter, request.contextPosition,
-      undefined, "static", request.requestScope, binding, request.bindings.signal), request);
+    if (!request.bindings.isCurrent()) return Promise.resolve({ status: "pending" as const, reason: "analysis-pending" as const });
+    // Start readiness and provider-owned dependency discovery together. Observe
+    // startup rejection immediately, even while a binding read is still pending.
+    const ready = this.start().then(() => true, () => false);
+    return provideNativeStaticCompletion(async binding => {
+      if (!await ready || !request.bindings.isCurrent()) return undefined;
+      return this.provideCompletionItems(request.document, request.position, request.triggerCharacter,
+        request.contextPosition, undefined, "static", request.requestScope, binding, request.bindings.signal);
+    }, request);
   }
 
   async provideCompletionItems(

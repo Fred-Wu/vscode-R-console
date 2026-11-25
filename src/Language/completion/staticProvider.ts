@@ -4,7 +4,7 @@ import { allowsSymbolCompletions } from "./policy";
 import { storedCompletionReceiver } from "./sourceReceiver";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 import { adaptNativeCompletionResult } from "./nativeMetadata";
-import { staticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
+import { isTransientCompletionFailure, staticCompletionUnavailableReason, type CompletionSuppressionReason } from "./diagnostics";
 
 /** Native projection payload, confined to the installed-provider adapter. */
 export type NativeSourceBinding = { name: string; body?: string; opaqueReceiver?: boolean };
@@ -107,7 +107,8 @@ export async function requestStaticCompletion(
       clearTimeout(timer);
       request.bindings.signal?.removeEventListener("abort", cancel);
       lifetime.abort();
-      resolve(valid ? result : pending);
+      resolve(!valid ? pending : result.status === "unresolved" && isTransientCompletionFailure(result.reason)
+        ? { ...result, status: "pending" } : result);
     };
     const cancel = () => finish(pending);
     const timer = setTimeout(() => finish({ status: "pending", reason: "analysis-limit" }), 10000);

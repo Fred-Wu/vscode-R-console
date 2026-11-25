@@ -75,7 +75,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
     };
   } });
   if (staticProvider) provider.provideStaticCompletion = staticProvider;
-  lang.ensureConsoleLspStarted = async () => provider;
+  lang.getCompletionProvider = async () => provider;
   lang.getOrOpenCompletionDocument = async text => ({
     getText: () => text,
     uri: { toString: () => "r-console://test/console.R" },
@@ -220,14 +220,14 @@ test("decoded quoted fallback prefixes select escaped source member labels", asy
 test("source-only completion remains retryable until the language server recovers", async () => {
   for (const missing of ["server", "document"]) {
     const h = harness();
-    const server = await h.lang.ensureConsoleLspStarted();
+    const server = await h.lang.getCompletionProvider();
     const getDocument = h.lang.getOrOpenCompletionDocument.bind(h.lang);
-    if (missing === "server") h.lang.ensureConsoleLspStarted = async () => undefined;
+    if (missing === "server") h.lang.getCompletionProvider = async () => undefined;
     else h.lang.getOrOpenCompletionDocument = async () => undefined;
     assert.deepEqual(labels(await h.complete("make_data()$")), []);
     assert.equal(h.lang.inlineCache?.entries.isIncomplete, true, missing);
     assert.equal(h.lang.hasCompleteInlineMemberCache(), false, missing);
-    h.lang.ensureConsoleLspStarted = async () => server;
+    h.lang.getCompletionProvider = async () => server;
     h.lang.getOrOpenCompletionDocument = getDocument;
     assert.deepEqual(labels(await h.complete("make_data()$al")), ["alpha"]);
     assert.deepEqual(h.requests.map(request => request.mode), ["static"]);
@@ -427,7 +427,7 @@ test("static fallback explains unresolved methods without calling an empty resul
 
 test("static fallback distinguishes missing services, failed requests and absent inference evidence", async () => {
   for (const [setup, expected] of [
-    [h => { h.lang.ensureConsoleLspStarted = async () => undefined; }, /language server is not available/],
+    [h => { h.lang.getCompletionProvider = async () => undefined; }, /language server is not available/],
     [h => { h.lang.getOrOpenCompletionDocument = async () => undefined; }, /console input is not available/],
     [() => {}, /returned no completion result/],
   ]) {
@@ -883,17 +883,17 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
   }
 });
 
-test("cancelled LSP startup does not authorize a provider binding lookup", { timeout: 3000 }, async () => {
+test("cancelled provider acquisition does not authorize a binding lookup", { timeout: 3000 }, async () => {
   for (const text of ['make_data()$', 'make_data()$method(']) {
     let release, entered;
     const started = new Promise(resolve => { entered = resolve; });
     const waiting = new Promise(resolve => { release = resolve; });
     const h = harness({ storedSources: { make_data: 'function() list(method=function(alpha) NULL)' } });
-    const provider = h.lang.ensureConsoleLspStarted;
-    h.lang.ensureConsoleLspStarted = async () => { entered(); await waiting; return provider(); };
+    const provider = h.lang.getCompletionProvider;
+    h.lang.getCompletionProvider = async () => { entered(); await waiting; return provider(); };
     const pending = h.complete(text);
     await started;
-    assert.deepEqual(h.sourceRequests, [], 'bindings are selected by the provider after startup');
+    assert.deepEqual(h.sourceRequests, [], 'binding selection requires an acquired provider');
     h.lang.cancelCompletion();
     release();
     await pending;

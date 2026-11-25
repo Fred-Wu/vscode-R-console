@@ -11,6 +11,7 @@ const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 const { createGuardedBindingResolver } = loadSource("src/Language/completion/bindings.ts");
 const { runRJson } = require("./helpers/run-r-json.cjs");
+const { nativeStaticEvidence } = require("./helpers/native-static-evidence.cjs");
 const { retryStaticCompletion, staticFixtureAccess, staticFixtureProvider, completeStatic } = require("./helpers/static-completion.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
@@ -1329,15 +1330,8 @@ test("declarations outside the cursor binding preserve source and live signature
 
 test("source redefinitions remain authoritative through wrappers, chains and lexical scopes", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  // Native analysis may decline syntax the old console walker guessed. A
-  // declined binding must expose no signature and cannot borrow a live one.
-  let sourceUnresolved = false;
-  const provide = client.provideStaticCompletion.bind(client);
-  client.provideStaticCompletion = async request => {
-    const outcome = await provide(request);
-    sourceUnresolved = outcome.completion?.rConsoleArgumentsResolved === false;
-    return outcome;
-  };
+  // Known native limitations use independently observed native evidence.
+  // Adapter failures cannot downgrade a callable that native inference resolves.
   for (const [marked, expected, nativeMayDecline = false] of [
     ['f <- (function(new_arg) NULL)\nf(│)', ['new_arg']],
     ['f <- g <- function(new_arg) NULL\nf(│)', ['new_arg'], true],
@@ -1364,7 +1358,7 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
       { globalenv: { f: { type: 'closure' } } }, lines.slice(0, position.line), [],
       async () => [{ name: 'old_arg' }]);
     assert.deepEqual(entries.filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '))
-      .map(item => item.label), nativeMayDecline && sourceUnresolved ? [] : expected, marked);
+      .map(item => item.label), nativeMayDecline && nativeStaticEvidence(marked).signature === null ? [] : expected, marked);
   }
 });
 
@@ -1398,7 +1392,7 @@ test("formal bindings shadow outer functions without evaluating their defaults",
       { line: lines.length - 1, character: lines.at(-1).length });
     assert.equal(result.rConsoleLocalFunction, true, marked);
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label),
-      nativeMayDecline && result.rConsoleArgumentsResolved === false ? [] : expected, marked);
+      nativeMayDecline && nativeStaticEvidence(marked).signature === null ? [] : expected, marked);
     if (result.rConsoleArgumentsResolved === false) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
   }
 });
@@ -1426,7 +1420,7 @@ test("source bindings do not escape quoted, lazy or locally evaluated arguments"
     const result = await completeStatic(client, { getText: () => text },
       { line: 0, character: marked.indexOf('│') });
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label),
-      nativeMayDecline && result.rConsoleArgumentsResolved === false ? [] : expected, tail);
+      nativeMayDecline && nativeStaticEvidence(marked).signature === null ? [] : expected, tail);
     if (result.rConsoleArgumentsResolved === false) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
   }
 });

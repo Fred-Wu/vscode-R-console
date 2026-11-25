@@ -102,7 +102,7 @@ export class RTermLang {
   }
 
   async start(): Promise<void> {
-    const completionProvider = await this.ensureConsoleLspStarted();
+    const completionProvider = await this.getCompletionProvider();
     if (!completionProvider) {
       return;
     }
@@ -202,7 +202,7 @@ export class RTermLang {
       const documentRequest = runtimeMember
         ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(latestInput.text);
       const fullEntriesPromise = (async () => {
-        completionProvider = runtimeMember ? undefined : await this.ensureConsoleLspStarted();
+        completionProvider = runtimeMember ? undefined : await this.getCompletionProvider(!staticEnabled);
         if (!this.isCurrentCompletionRequest(requestId)) {
           return undefined;
         }
@@ -327,7 +327,7 @@ export class RTermLang {
           const nextDocumentRequest = nextRuntimeMember
             ? Promise.resolve(undefined) : this.getOrOpenCompletionDocument(nextInputText);
           if (!completionProvider && !nextRuntimeMember) {
-            completionProvider = await this.ensureConsoleLspStarted();
+            completionProvider = await this.getCompletionProvider(!staticEnabled);
           }
           const nextDocument = await nextDocumentRequest;
           if (refinementSignal.aborted || !this.isCurrentCompletionRequest(requestId)) {
@@ -400,7 +400,7 @@ export class RTermLang {
         isCurrent,
       }) };
     const fallback = async (logUnresolved = true, runtimeReason?: CompletionSuppressionReason): Promise<CompletionEntries | undefined> => {
-      const lsp = provider ?? await this.ensureConsoleLspStarted();
+      const lsp = provider ?? await this.getCompletionProvider(false);
       if (!isCurrent()) return undefined;
       const doc = document ?? await this.getOrOpenCompletionDocument(inputText);
       if (!isCurrent()) return undefined;
@@ -414,6 +414,7 @@ export class RTermLang {
         // result. Keep inline completion retryable after the provider recovers.
         const pending = [] as CompletionEntries;
         pending.isIncomplete = true;
+        pending.staticUnavailableReason = !lsp ? "provider-unavailable" : "document-unavailable";
         return pending;
       }
       const staticAccess: StaticCompletionAccess = { ...access,
@@ -653,7 +654,7 @@ export class RTermLang {
     })();
   }
 
-  private async ensureConsoleLspStarted(): Promise<ConsoleLspClient | undefined> {
+  private async getCompletionProvider(waitForReady = true): Promise<ConsoleLspClient | undefined> {
     if (this.disposed) {
       return undefined;
     }
@@ -678,23 +679,28 @@ export class RTermLang {
       if (this.runtimeLibraryPaths) lsp.updateRuntimeLibraryPaths(this.runtimeLibraryPaths);
     }
 
-    try {
-      const initialState = this.sessionState;
-      if (initialState) {
-        await lsp.syncSessionState(initialState);
-      } else {
-        await lsp.start();
-      }
-      if (this.disposed || this.consoleLsp !== lsp) {
+    // Static providers can identify dependencies while startup and session
+    // preparation run. The native client awaits readiness before sending input.
+    const ready = (async () => {
+      try {
+        const initialState = this.sessionState;
+        if (initialState) {
+          await lsp.syncSessionState(initialState);
+        } else {
+          await lsp.start();
+        }
+        if (this.disposed || this.consoleLsp !== lsp) {
+          return undefined;
+        }
+        if (this.sessionState && this.sessionState !== initialState) {
+          await lsp.syncSessionState(this.sessionState);
+        }
+        return this.disposed || this.consoleLsp !== lsp ? undefined : lsp;
+      } catch {
         return undefined;
       }
-      if (this.sessionState && this.sessionState !== initialState) {
-        await lsp.syncSessionState(this.sessionState);
-      }
-      return this.disposed || this.consoleLsp !== lsp ? undefined : lsp;
-    } catch {
-      return undefined;
-    }
+    })();
+    return waitForReady ? ready : lsp;
   }
 
   private toSessionState(data: WorkspaceData): ConsoleSessionState {

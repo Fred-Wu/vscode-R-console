@@ -20,6 +20,12 @@ const staticDescriptions = {
 
 export type StaticCompletionUnavailableReason = keyof typeof staticDescriptions;
 
+/** Service failures can recover on a later user request without changing context. */
+export function isTransientCompletionFailure(reason: StaticCompletionUnavailableReason | undefined): boolean {
+  return reason !== undefined && ["provider-unavailable", "document-unavailable", "no-response",
+    "request-failed", "analysis-pending"].includes(reason);
+}
+
 // Never log arbitrary provider text, source code, names or error messages.
 export function staticCompletionUnavailableReason(value: unknown): StaticCompletionUnavailableReason | undefined {
   return typeof value === "string" && Object.hasOwn(staticDescriptions, value)

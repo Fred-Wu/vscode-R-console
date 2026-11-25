@@ -702,9 +702,10 @@ Static requests wait on its existing parse queue for the current document
 version, including literal contexts where native completion can answer early.
 That queue owns cancellation, supersession and replay after parsing.
 
-The console retains authority over runtime evidence: an unresolved draft
-binding cannot borrow a live or package namesake's signature, and an opaque live
-binding requires positive native evidence of a draft override. Missing APIs,
+The console retains authority over runtime evidence. When native metadata
+identifies an unresolved draft binding, the adapter suppresses signatures from
+live or package namesakes. An opaque live binding requires positive native
+evidence of a draft override. Missing APIs,
 stale analysis, exhausted inference budgets and conflicting native callable
 metadata fail closed. Pending inference retains any known source identity.
 Binding history is checked at the native recovery position. Navigation
@@ -747,16 +748,25 @@ with the first read and bounds new and pending inspection. Settled snapshots rem
 available to prefix retries while the request is current. Cancellation, input
 changes, session changes and setting
 changes invalidate outstanding access and prevent late results from presentation.
-Provider completion has a 10-second deadline; capabilities expire when that
-provider invocation finishes. An expired deadline returns pending analysis with
-the `analysis-limit` reason. Every collector retains transient diagnostic metadata
-and completeness so growing picker searches can request fresh results.
+Provider completion has a 10-second deadline covering startup, dependency reads
+and the native completion response; capabilities expire when that invocation
+finishes. An expired deadline returns pending analysis with the `analysis-limit`
+reason. The request boundary also classifies provider exceptions, unavailable
+providers/documents, missing responses and loading metadata as pending outcomes.
+Collectors preserve their reason and incomplete status so growing picker searches
+request fresh results after recovery. Structural inference failures retain their
+unresolved status, and authoritative empty results remain complete.
 Outstanding provider-facing binding reads immediately
 settle as cancelled, while the shared resolver retains snapshots for prefix retries.
 Cancellation propagates to the native LSP request
-through its cancellation token. The native adapter checks cancellation after
+through its cancellation token. The terminal exposes the static provider while
+shared language-server startup and session preparation are in progress. The
+native adapter starts readiness and guarded dependency discovery concurrently,
+then waits for readiness before projecting source or sending a completion request.
+The adapter observes startup failure immediately and checks cancellation after
 startup, package refresh and session preparation, and inside queued document
-synchronization before sending source or inspecting bindings. Argument snapshots
+synchronization. Cancelling one provider invocation settles its readers immediately;
+shared startup can serve a later request. Argument snapshots
 retain document and runtime validity independently of each invocation's cancellation
 signal, allowing prefix retries to reuse their guarded inspection.
 New input and picker refinements obtain fresh
@@ -822,19 +832,35 @@ static-provider method; runtime-only providers report unavailable static support
 The native runtime inspection and source-serialization safety allowlists apply
 to every lookup.
 
-As a result, static completion support follows the installed `languageserver`.
-For example, some chained assignments, callable formal defaults and unfinished
-native-pipe destinations may remain unresolved upstream. Unsupported inference
-returns no signature. Accuracy of inferred lexical bindings also belongs to
-the provider: native inference can retain an earlier signature inside an
-unfinished recursive redefinition when its navigation outline is incomplete.
-The adapter can reject conflicting metadata when both indexes supply evidence;
-it relies on native scope inference where the outline has no current declaration.
+Static completion support follows the installed `languageserver`. The native
+adapter supplies the syntax recovery and lexical inference available in that
+version. The following examples describe limitations observed with version
+0.3.22; each input is unsubmitted, with the cursor at its end.
+
+| Input | Native result and console behavior |
+| --- | --- |
+| `f <- g <- function(alpha) NULL; f(` | Native inference supplies no signature; the console returns no parameters. |
+| `g <- function(f = function(alpha) NULL) { f(` | Native inference supplies no signature for the callable formal default; the console returns no parameters. |
+| `my_frob <- function(x) x; 1 \|> my_fr` | The unfinished pipe destination can omit the source-defined function from completion. |
+| `f <- function(earlier) NULL; f <- function() { f(` | Native inference retains `f(earlier)` while the navigation outline omits the unfinished redefinition; the console can suggest the stale `earlier` parameter. |
+
+These cases belong to `languageserver`. Native `Document`, `parse_document`,
+`member_call_location` and `member_symbol` reproduce the callable limitations
+without loading console adapters. The adapter rejects conflicting metadata when
+both inference and navigation supply evidence. Where the outline omits the
+current declaration, completion depends on native scope inference and can inherit
+its inaccuracies. Provider-declined contexts return no signature. The provider
+contract also supports alternative implementations with additional dependency
+discovery and inference capabilities.
 `tests/static-provider.test.cjs` verifies the general contract with the real
 language-server adapter, fresh stored definitions and opaque binding barriers.
 Source-completion integration fixtures exercise the explicit static provider
 boundary and the production collector, with missing-binding resolvers for fixtures
 that have no embedded R session. Live-binding fixtures supply native inspection.
+Known callable-limitation fixtures derive signature availability independently
+through the native APIs in `tests/helpers/native-static-evidence.cjs`. A missing
+console signature is accepted only when the native probe also lacks that
+signature; provider or adapter failures cannot relax a supported-case assertion.
 `tests/unit/static-bindings.test.cjs` covers resolver limits, lookup identity,
 scopes and cancellation. `tests/static-delegation.test.cjs` exercises the actual native resolver and
 verifies binding provenance, parse-queue replay, callable metadata compatibility,
@@ -894,8 +920,9 @@ Refused member and bracket receivers carry their root binding identity through
 static fallback. Package members are eligible only when editable source proves
 a replacement binding. Stored factory definitions also accompany method argument
 and value requests, with the same receiver identity and scope checks. Retrieval
-starts when the provider identifies a dependency; cancellation and setting changes
-invalidate the capability and discard obsolete snapshots before presentation.
+starts when the provider identifies a dependency and overlaps language-server
+startup and session preparation. Cancellation and setting changes invalidate the
+capability and discard obsolete snapshots before presentation.
 
 Static completion logs retain the language server's inference reason when one
 is available. Missing receiver information, unresolved class-specific member

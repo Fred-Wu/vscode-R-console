@@ -399,7 +399,7 @@ test("real embedded R completion inspects nested storage without running user co
           requests.push(request);
           return request;
         } });
-      lang.ensureConsoleLspStarted = async () => undefined;
+      lang.getCompletionProvider = async () => undefined;
       lang.getOrOpenCompletionDocument = async () => undefined;
       const input = { text, currentLine: text, cursorCol: text.length,
         cursorRow: 0, lines: [text], textBeforeCursor: text };
@@ -1165,7 +1165,7 @@ test("static routing preserves search-path identity, opaque callables and stored
     libraries: [library], requestRuntimeFunctionArguments: (e) => inspect(e, "arguments"),
   });
   const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name, target = "source") => backend.inspectMemberNames(session, { root: name, steps: [], target }) });
-  lang.ensureConsoleLspStarted = async () => ({ provideStaticCompletion: async request => {
+  lang.getCompletionProvider = async () => ({ provideStaticCompletion: async request => {
     const outcome = await client.provideStaticCompletion(request);
     const r = outcome.completion;
     return { ...outcome, completion: r && { ...r, items: r.items.map(x => ({ ...x, kind: x.kind - 1 })) } };

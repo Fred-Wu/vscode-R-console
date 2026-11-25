@@ -161,7 +161,7 @@ test('typing in a pending bracket picker publishes native columns before LSP sta
     getStaticAnalysisEnabled: () => false,
     requestRuntimeMemberCompletions: () => new Promise(resolve => nativeRequests.push(resolve)),
   });
-  lang.ensureConsoleLspStarted = () => startup;
+  lang.getCompletionProvider = () => startup;
   lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
   const text = 'DT[,';
   const input = { text, currentLine: text, lines: [text], cursorRow: 0,
@@ -331,7 +331,7 @@ test('Tab and F7 open bracket Quick Pick while native and LSP results are pendin
     const lang = new RTermLang({ extensionPath: '', rPath: '', env: {},
       getStaticAnalysisEnabled: () => false,
       requestRuntimeMemberCompletions: () => native });
-    lang.ensureConsoleLspStarted = () => server;
+    lang.getCompletionProvider = () => server;
     lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
     const text = 'DT[, key';
     const input = { text, currentLine: text, lines: [text], cursorRow: 0,
