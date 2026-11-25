@@ -17,7 +17,7 @@ const uri = (value) => ({ toString: () => value });
 // Existing static-inference integration fixtures request it explicitly via
 // this helper's default. The extension setting and production default are off.
 function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env,
-  staticAnalysis = true, requestRuntimeFunctionArguments } = {}) {
+  staticAnalysis = true, requestRuntimeFunctionArguments, useStdio = false } = {}) {
   const instances = [];
   const logs = [];
   const runtimeSignatures = new Map();
@@ -108,6 +108,7 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       },
       workspace: { getConfiguration: () => ({ get: (key) => {
         if (key === "lsp.args") return args;
+        if (key === "lsp.use_stdio") return useStdio;
         if (key === "libPaths" || key === "useRenvLibPath") {
           throw new Error("R Console must not read vscode-R library settings");
         }

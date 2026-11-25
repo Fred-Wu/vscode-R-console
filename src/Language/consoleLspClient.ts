@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as net from "net";
 import { randomBytes } from "crypto";
 import { authenticateLspSocket } from "./lspSocketAuth";
+import { decodeStartupState, readStartupAcknowledgement, writeStartupState } from "./lspStartupState";
 import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 import * as os from "os";
 import * as path from "path";
@@ -135,7 +136,7 @@ export class ConsoleLspClient implements CompletionProvider {
   private packageRevision = 0;
   private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
-  private restoreStartup = false;
+  private startupState: Buffer | undefined;
   private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
@@ -144,8 +145,7 @@ export class ConsoleLspClient implements CompletionProvider {
     this.outputChannel = new SilentOutputChannel("R Console");
     // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
-    // Startup state can contain profile-provided credentials. Restrict the
-    // directory before the language server can write its snapshot.
+    // Restrict the isolated workspace to this user.
     if (process.platform !== "win32") fs.chmodSync(this.workingDirectory, 0o700);
     this.packageInventory = new PackageInventory(
       change => this.refreshPackages(change),
@@ -282,6 +282,8 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.disposed = true;
+    this.startupState?.fill(0);
+    this.startupState = undefined;
     this.packageInventory.dispose();
     this.disposePromise = (async () => {
       while (!(await this.stop())) {
@@ -732,7 +734,6 @@ export class ConsoleLspClient implements CompletionProvider {
         const reason = result.restart.map(name =>
           `${name} (${change.packages.has(name) ? "installation changed" : "removed"})`).join(", ");
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restarting language server: ${reason}; clearing packages loaded in the server.`);
-        this.restoreStartup = true;
         await this.restartClient(client, reason);
         client = this.client;
         if (this.disposed) return;
@@ -849,6 +850,14 @@ export class ConsoleLspClient implements CompletionProvider {
     this.syncedSessionStateKey = undefined;
     this.sessionStateSyncPromise = undefined;
     await client.start();
+    if (!this.startupState) {
+      const state = decodeStartupState(await client.sendRequest<unknown>("rConsole/takeStartupState", {}));
+      if (this.disposed || this.client !== client) {
+        state.fill(0);
+        throw new Error("Language server changed during startup state transfer");
+      }
+      this.startupState = state;
+    }
     await this.disableConsoleDiagnostics(client);
     const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});
     if (this.client === client && !this.disposed) {
@@ -885,6 +894,25 @@ export class ConsoleLspClient implements CompletionProvider {
         if (!child.stdout || !child.stdin) {
           settled = true;
           reject(new Error("Console language server started without stdio streams."));
+          return;
+        }
+        if (this.startupState) {
+          const ready = readStartupAcknowledgement(child.stdout);
+          void ready.then(() => {
+            if (settled) return;
+            settled = true;
+            resolve({ reader: child.stdout!, writer: child.stdin! });
+          }, error => {
+            if (!settled) { settled = true; reject(error); }
+          });
+          try {
+            writeStartupState(child, this.startupState, error => {
+              if (!settled) { settled = true; reject(error); }
+            });
+          } catch (error) {
+            settled = true;
+            reject(error);
+          }
           return;
         }
         settled = true;
@@ -1001,7 +1029,7 @@ export class ConsoleLspClient implements CompletionProvider {
           child = spawn(this.options.rPath, args, {
             cwd: this.options.cwd ?? this.workingDirectory,
             env,
-            stdio: ["ignore", "ignore", "pipe"],
+            stdio: [this.startupState ? "pipe" : "ignore", "ignore", "pipe"],
             shell: false,
           });
         } catch (error) {
@@ -1012,6 +1040,14 @@ export class ConsoleLspClient implements CompletionProvider {
         this.forwardServerStderr(child);
         child.once("spawn", () => {
           this.logServerStarted();
+          if (this.startupState) {
+            try {
+              writeStartupState(child, this.startupState, rejectOnce);
+              child.stdin!.end();
+            } catch (error) {
+              rejectOnce(error instanceof Error ? error : new Error("Startup state transfer failed"));
+            }
+          }
         });
         child.once("error", (error) => {
           if (settled) {
@@ -1043,7 +1079,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const userArgs = config.get<string[]>("lsp.args") ?? [];
     return [
       ...userArgs,
-      ...(this.restoreStartup ? ["--no-environ", "--no-site-file", "--no-init-file"] : []),
+      ...(this.startupState ? ["--no-environ", "--no-site-file", "--no-init-file"] : []),
       "--silent",
       "--no-echo",
       "--no-save",
@@ -1098,18 +1134,22 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
+    // Each child gets fresh transport settings. Inherited settings must never
+    // redirect a stdio child to another process's socket or state transport.
+    for (const key of Object.keys(env)) {
+      if (key.toUpperCase().startsWith("VSCR_LSP_")) delete env[key];
+    }
     const lang = config.get<string>("lsp.lang") ?? "";
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
     // On a replacement server, apply the last console snapshot before loading namespaces.
     env.VSCR_RUNTIME_LIB_PATHS = (this.runtimeLibraryPaths ??
-      (this.restoreStartup ? this.serverLibraryPaths : undefined))?.join("\n") ?? "";
-    env.VSCR_LSP_STARTUP_STATE = path.join(this.workingDirectory, "startup.rds");
-    env.VSCR_LSP_RESTORE_STARTUP = this.restoreStartup ? "TRUE" : "FALSE";
+      (this.startupState ? this.serverLibraryPaths : undefined))?.join("\n") ?? "";
+    env.VSCR_LSP_RESTORE_STARTUP = this.startupState ? "TRUE" : "FALSE";
     // The entry point restores the effective startup environment after R has
     // started without profiles or automatic default-package loading.
-    if (this.restoreStartup) env.R_DEFAULT_PACKAGES = "NULL";
+    if (this.startupState) env.R_DEFAULT_PACKAGES = "NULL";
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {

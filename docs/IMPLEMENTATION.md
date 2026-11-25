@@ -1266,17 +1266,31 @@ package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
-latest snapshot. The initial server saves its effective environment, base and site
-library roots, all startup options and attached package names in its private
-temporary directory. The
-options are serialized into a raw payload inside the snapshot, so reading the
+latest snapshot. The initial server captures its effective environment, base and
+site library roots, all startup options and attached package names in an opaque
+serialized envelope in memory. `rConsole/takeStartupState` transfers that envelope
+once over the mutually authenticated loopback LSP connection, or the inherited
+private stdio transport when configured. The R process releases its envelope after
+transfer; the console client retains a bounded buffer for its lifetime. The
+launcher clears inherited LSP transport settings and assigns fresh connection
+credentials to each socket child. The 16 MiB limit is checked before sending and
+accepting a snapshot. Invalid or
+oversized transfers fail startup with a payload-free error.
+
+The client supplies replacement state through the spawned child's inherited stdin
+pipe, prefixed by a four-byte big-endian byte length. Pipe endpoints are assigned
+by the OS at process creation. R reads the bounded frame before loading package
+dependencies. For stdio, R acknowledges the consumed frame with `RCS1` before
+the client begins LSP writes, preserving the boundary across buffered readers;
+TCP mode closes the bootstrap pipe after sending the frame. No startup state is
+written to the filesystem or lifecycle logs. Disposal clears the retained buffer.
+The isolated temporary LSP workspace remains available for native workspace
+initialization. R and languageserver continue to own their package metadata caches.
+
+Options are serialized into a raw payload inside the envelope, so reading the
 environment and package names cannot deserialize namespace references. Options
 containing only atomic values and lists with reference-free attributes are also
-saved as ordinary values for use by namespace load hooks. The
-snapshot can contain values set by user profiles, including credentials, so the
-temporary directory and snapshot have owner-only permissions on Unix; Windows
-uses the current user's temporary-directory access controls. Normal disposal
-removes the snapshot. A replacement
+included as ordinary values for use by namespace load hooks. A replacement
 starts with profiles, environment files and automatic default-package loading
 disabled. It restores environment values and unsets, then the effective `.Library`
 and `.Library.site` values before applying the console's library order with

@@ -37,6 +37,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     async sendRequest(method, params, token) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
+      if (method === "rConsole/takeStartupState") return Buffer.from("opaque R state").toString("base64");
       if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
       if (method === "rConsole/libraryPaths") return libraries;
       if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
@@ -807,7 +808,40 @@ test("a late session-sync reply cannot replace newer R Console paths", async t =
   assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS,
     "/new\n/startup");
   client.resetRuntimeLibraryPaths();
-  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS, "");
+  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS, "/startup",
+    "replacement falls back to the captured server libraries after a runtime reset");
+});
+
+test("startup state is retained across replacement and cleared on disposal", async t => {
+  const { client, instances } = createClient(t);
+  await client.start();
+  const state = client.startupState;
+  assert.ok(Buffer.isBuffer(state));
+  await client.restartClient(instances[0], "test restart");
+  assert.equal(client.startupState, state);
+  assert.equal(instances.flatMap(item => item.requests)
+    .filter(item => item.method === "rConsole/takeStartupState").length, 1);
+  await client.dispose();
+  assert.equal(client.startupState, undefined);
+  assert.ok(state.every(byte => byte === 0), "release the retained sensitive buffer");
+});
+
+test("launch discards inherited LSP transport settings while preserving user configuration", t => {
+  const { client } = createClient(t);
+  const inherited = {
+    VSCR_LSP_HOST: "127.0.0.2", VSCR_LSP_PORT: "1234", VSCR_LSP_AUTH_TOKEN: "old-token",
+    vscr_lsp_client_nonce: "old-nonce", VSCR_LSP_RESTORE_STARTUP: "TRUE",
+    R_LIBS_USER: "/user/library", USER_SETTING: "preserved",
+  };
+  client.options.env = inherited;
+  const env = client.buildServerEnv({ get: () => undefined });
+  for (const name of ["VSCR_LSP_HOST", "VSCR_LSP_PORT", "VSCR_LSP_AUTH_TOKEN", "vscr_lsp_client_nonce"]) {
+    assert.ok(!Object.hasOwn(env, name));
+  }
+  assert.equal(env.VSCR_LSP_RESTORE_STARTUP, "FALSE");
+  assert.equal(env.R_LIBS_USER, inherited.R_LIBS_USER);
+  assert.equal(env.USER_SETTING, "preserved");
+  assert.equal(inherited.VSCR_LSP_AUTH_TOKEN, "old-token", "launch must not mutate the caller's environment");
 });
 
 test("runtime library snapshots are retained before completion client construction", async () => {

@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const { once } = require("node:events");
 const fs = require("node:fs");
@@ -10,6 +10,85 @@ const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
+const entryPoint = path.resolve(__dirname, "../resources/r/console-language-server.R");
+
+test("an extension-host crash leaves no startup snapshot on disk", { timeout: 30000 }, async t => {
+  const secret = "synthetic-startup-crash-secret";
+  const worker = spawn(process.execPath, ["-e", `
+    const { createConsoleLsp } = require('./tests/helpers/console-lsp.cjs');
+    const { client } = createConsoleLsp({ after() {} });
+    client.start().then(() => process.send({ workspace: client.workingDirectory,
+      rPid: client.spawnedServer.pid,
+      captured: client.startupState.includes(Buffer.from(process.env.RCONSOLE_TEST_CREDENTIAL))
+    })).catch(() => process.exit(1));
+  `], {
+    cwd: path.resolve(__dirname, ".."), env: { ...process.env, RCONSOLE_TEST_CREDENTIAL: secret },
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+  });
+  let workspace, rPid;
+  t.after(() => {
+    worker.kill("SIGKILL");
+    if (rPid) { try { process.kill(rPid, "SIGKILL"); } catch {} }
+    if (workspace) fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const [message] = await Promise.race([
+    once(worker, "message"),
+    once(worker, "exit").then(() => { throw new Error("Startup fixture exited before transferring state"); }),
+  ]);
+  ({ workspace, rPid } = message);
+  assert.equal(message.captured, true, "the snapshot contains a synthetic credential in memory");
+  const exited = once(worker, "exit");
+  worker.kill("SIGKILL");
+  await exited;
+  assert.deepEqual(fs.readdirSync(workspace), [], "a hard crash must leave no startup data to recover");
+});
+
+test("R rejects incomplete and oversized private startup frames before restoring state", () => {
+  for (const [size, body] of [[0, Buffer.alloc(0)], [16 * 1024 * 1024 + 1, Buffer.alloc(0)],
+    [100, Buffer.from("synthetic-private-payload")]]) {
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(size);
+    const result = spawnSync("Rscript", ["--vanilla", entryPoint], {
+      env: { ...process.env, VSCR_LSP_RESTORE_STARTUP: "TRUE", R_DEFAULT_PACKAGES: "NULL" },
+      input: Buffer.concat([header, body]), encoding: "utf8", timeout: 15000,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /(?:Invalid|Incomplete) language server startup state/);
+    assert.ok(!result.stderr.includes("synthetic-private-payload"));
+  }
+});
+
+test("R sends no startup payload to a socket peer with an invalid server proof", { timeout: 30000 }, async t => {
+  const received = [];
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.on("data", chunk => {
+      received.push(chunk);
+      if (Buffer.concat(received).length === 32) socket.write(Buffer.alloc(64));
+    });
+  });
+  t.after(() => { for (const socket of sockets) socket.destroy(); server.close(); });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const nonce = randomBytes(32).toString("hex");
+  const child = spawn("Rscript", ["--vanilla", entryPoint], {
+    env: { ...process.env, VSCR_LSP_HOST: "127.0.0.1", VSCR_LSP_PORT: String(server.address().port),
+      VSCR_LSP_AUTH_TOKEN: randomBytes(32).toString("hex"), VSCR_LSP_CLIENT_NONCE: nonce,
+      VSCR_LSP_AUTH_TIMEOUT_SECONDS: "3", VSCR_LSP_RESTORE_STARTUP: "FALSE",
+      RCONSOLE_TEST_CREDENTIAL: "synthetic-private-payload" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  t.after(() => child.kill());
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 1);
+  assert.match(stderr, /Invalid language server authentication proof/);
+  assert.deepEqual(Buffer.concat(received), Buffer.from(nonce, "hex"), "only the public nonce reaches the peer");
+  assert.ok(!stderr.includes("synthetic-private-payload"));
+});
 
 test("R authenticates after initialization exceeding the handshake deadline", { timeout: 30000 }, async (t) => {
   const source = fs.readFileSync(path.join(__dirname, "../resources/r/console-language-server.R"), "utf8");

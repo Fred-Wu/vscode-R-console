@@ -536,12 +536,11 @@ test("replacement restores startup options with the new package copy before load
   assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
     "the initial server must execute the complete profile");
   if (process.platform !== "win32") {
-    const snapshot = path.join(client.workingDirectory, "startup.rds");
     assert.equal(fs.statSync(client.workingDirectory).mode & 0o077, 0,
       "the language-server working directory must be private");
-    assert.equal(fs.statSync(snapshot).mode & 0o077, 0,
-      "startup options and environment must not be readable by other users");
   }
+  assert.ok(Buffer.isBuffer(client.startupState), "startup state stays in the client memory");
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "startup must not persist a snapshot");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   client.updateRuntimeLibraryPaths([second, first, ...defaults]);
   await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
@@ -625,7 +624,10 @@ test("site libraries excluded by a live snapshot stay excluded on startup and re
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "siteExport"));
 });
 
-test("replacement restores profile environment changes before package loading and keeps fresh process state", { timeout: 90000 }, async t => {
+for (const useStdio of [false, true]) {
+test(`replacement restores in-memory profile state over ${useStdio ? "stdio" : "authenticated TCP"}`, {
+  timeout: 90000, skip: useStdio && process.platform === "win32",
+}, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
   const marker = path.join(root, "profile-runs");
   const startup = `.onLoad <- function(...) {
@@ -633,6 +635,8 @@ test("replacement restores profile environment changes before package loading an
       Sys.getenv("RCONSOLE_TEST_ENVIRON_VALUE") == "environ value",
       is.na(Sys.getenv("RCONSOLE_TEST_UNSET", unset = NA_character_)),
       Sys.getenv("RCONSOLE_TEST_EMPTY") == "", dir.exists(tempdir()))
+    stopifnot(identical(getOption("rconsole.test.raw"), as.raw(rep(0:255, 1024L))),
+      identical(getOption("rconsole.test.credential"), Sys.getenv("RCONSOLE_TEST_CREDENTIAL")))
     session_tmp <- Sys.getenv("R_SESSION_TMPDIR")
     if (nzchar(session_tmp)) stopifnot(normalizePath(session_tmp) == normalizePath(tempdir()))
   }`;
@@ -643,22 +647,31 @@ test("replacement restores profile environment changes before package loading an
   fs.writeFileSync(profile, [
     'Sys.setenv(RCONSOLE_TEST_PROFILE_VALUE = "profile value", RCONSOLE_TEST_EMPTY = "")',
     'Sys.unsetenv("RCONSOLE_TEST_UNSET")',
+    'options(rconsole.test.credential = Sys.getenv("RCONSOLE_TEST_CREDENTIAL"))',
+    'options(rconsole.test.raw = as.raw(rep(0:255, 1024L)))',
     `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
     `library(${pkg})`,
     recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
   const env = { ...process.env, R_PROFILE_USER: profile, R_ENVIRON_USER: environ,
+    VSCR_LSP_HOST: "127.0.0.1", VSCR_LSP_PORT: "1", VSCR_LSP_AUTH_TOKEN: "stale-token",
+    RCONSOLE_TEST_CREDENTIAL: "synthetic-startup-secret-do-not-persist",
     RCONSOLE_TEST_PROFILE_VALUE: "inherited", RCONSOLE_TEST_UNSET: "inherited", RCONSOLE_TEST_EMPTY: "inherited" };
-  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
+  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env, useStdio });
   client.updateRuntimeLibraryPaths([first, second, ...defaults]);
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
     "the initial server must execute the complete profile");
+  const state = client.startupState;
+  assert.ok(state.includes(Buffer.from(env.RCONSOLE_TEST_CREDENTIAL)), "fixture contains sensitive startup data");
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "startup data must stay out of the workspace");
+  assert.equal(await client.client.sendRequest("rConsole/takeStartupState", {}), null,
+    "the R process releases the startup envelope after the first transfer");
   const snapshotKeys = execFileSync("Rscript", ["--vanilla", "-e",
-    `cat(names(readRDS(${JSON.stringify(path.join(client.workingDirectory, "startup.rds"))})$environment), sep="\\n")`],
-    { encoding: "utf8" }).trim().split(/\r?\n/);
+    `cat(names(unserialize(readBin(file("stdin", "rb"), "raw", n=${client.startupState.length}))$environment), sep="\\n")`],
+    { input: client.startupState, encoding: "utf8" }).trim().split(/\r?\n/);
   assert.ok(!snapshotKeys.some(key => key.startsWith("VSCR_") || key === "R_SESSION_TMPDIR"),
     "the startup snapshot must exclude transport secrets and the old temporary directory");
   for (const [libraries, exported] of [[[second, first, ...defaults], "replacementExport"],
@@ -672,7 +685,14 @@ test("replacement restores profile environment changes before package loading an
       "replacement restores state without replaying the profile");
   }
   assert.equal(instances.length, 3, "both replacements authenticate with fresh transport state");
+  assert.ok(client.startupState === state, "replacements reuse the original in-memory configuration");
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "restarts must not create state files");
+  assert.ok(!logs.join("\n").includes(env.RCONSOLE_TEST_CREDENTIAL), "the state transfer must not log its payload");
+  await client.dispose();
+  assert.equal(client.startupState, undefined);
+  assert.ok(state.every(byte => byte === 0));
 });
+}
 
 test("replacement preserves profile-defined base and site library roots across repeated restarts", { timeout: 120000 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);

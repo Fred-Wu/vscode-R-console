@@ -2,8 +2,11 @@
 # Replacements restore the startup environment and completion options with the
 # console's library order. Profiles and automatic package loading are disabled.
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
-startup_state <- Sys.getenv("VSCR_LSP_STARTUP_STATE")
-restore_startup <- nzchar(startup_state) && identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
+restore_startup <- identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
+# Keep this limit in sync with lspStartupState.ts. The envelope travels only
+# through the authenticated LSP transport and the spawned child's private stdin.
+startup_state_limit <- 16L * 1024L * 1024L
+startup_payload <- NULL
 startup_environment <- function() {
     values <- Sys.getenv()
     # Transport credentials and R's temporary directory belong to this process.
@@ -13,7 +16,34 @@ startup_environment <- function() {
 if (restore_startup) {
     # Options remain serialized inside this namespace-free envelope: reading a
     # function's namespace reference can load its package during deserialization.
-    startup <- readRDS(startup_state)
+    startup <- local({
+        input <- file("stdin", open = "rb")
+        on.exit(close(input))
+        read_exact <- function(size) {
+            value <- raw(size)
+            offset <- 0L
+            while (offset < size) {
+                part <- readBin(input, "raw", n = min(65536L, size - offset))
+                if (!length(part)) stop("Incomplete language server startup state")
+                value[seq.int(offset + 1L, offset + length(part))] <- part
+                offset <- offset + length(part)
+            }
+            value
+        }
+        size <- readBin(read_exact(4L), "integer", n = 1L, size = 4L, endian = "big")
+        if (is.na(size) || size <= 0L || size > startup_state_limit) {
+            stop("Invalid language server startup state size")
+        }
+        # The parent supplies this pipe at process creation; no pathname or
+        # network peer can substitute the serialized configuration.
+        unserialize(read_exact(size))
+    })
+    if (!nzchar(Sys.getenv("VSCR_LSP_PORT"))) {
+        # Let the parent send stdio LSP bytes only after closing the bootstrap
+        # reader, whose C buffer could otherwise read ahead into those messages.
+        cat("RCS1")
+        flush(stdout())
+    }
     # Include profile-created values, empty values and explicit unsets before
     # loading any packages that depend on the startup configuration.
     Sys.unsetenv(setdiff(names(startup_environment()), names(startup$environment)))
@@ -36,42 +66,38 @@ if (nzchar(runtime_lib_paths)) {
     .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
 }
 
-if (nzchar(startup_state)) {
-    if (restore_startup) {
-        # Namespace load hooks may need ordinary profile settings while the
-        # remaining option values are being deserialized.
-        options(startup$plain_options)
-        options(unserialize(startup$options))
-        for (package in rev(setdiff(startup$packages, "base"))) {
-            require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
-        }
-    } else {
-        # Profile-defined options may be required by packages before they load.
-        # The snapshot can include sensitive values, so create it owner-only.
-        local({
-            # Only reference-free values can be read before library selection.
-            # Inspect attributes too: even an atomic option can carry a closure.
-            plain_option <- function(value) {
-                if (isS4(value)) return(FALSE)
-                type <- typeof(value)
-                if (!type %in% c("NULL", "logical", "integer", "double", "complex",
-                    "character", "raw", "list")) return(FALSE)
-                if (type == "list" && !all(vapply(unclass(value), plain_option, logical(1)))) return(FALSE)
-                all(vapply(attributes(value), plain_option, logical(1)))
-            }
-            startup_options <- options()
-            if (.Platform$OS.type == "unix") {
-                original_umask <- Sys.umask("077")
-                on.exit(Sys.umask(original_umask))
-            }
-            saveRDS(list(options = serialize(startup_options, NULL),
-                plain_options = Filter(plain_option, startup_options), packages = .packages(),
-                environment = startup_environment(),
-                library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),
-                    inherits = FALSE)), startup_state)
-            if (.Platform$OS.type == "unix") Sys.chmod(startup_state, mode = "0600")
-        })
+if (restore_startup) {
+    # Namespace load hooks may need ordinary profile settings while the
+    # remaining option values are being deserialized.
+    options(startup$plain_options)
+    options(unserialize(startup$options))
+    for (package in rev(setdiff(startup$packages, "base"))) {
+        require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
     }
+    rm(startup)
+} else {
+    # Profile-defined options may be required by packages before they load.
+    # Capture before loading the language server and keep the bytes in memory.
+    startup_payload <- local({
+        # Only reference-free values can be read before library selection.
+        # Inspect attributes too: even an atomic option can carry a closure.
+        plain_option <- function(value) {
+            if (isS4(value)) return(FALSE)
+            type <- typeof(value)
+            if (!type %in% c("NULL", "logical", "integer", "double", "complex",
+                "character", "raw", "list")) return(FALSE)
+            if (type == "list" && !all(vapply(unclass(value), plain_option, logical(1)))) return(FALSE)
+            all(vapply(attributes(value), plain_option, logical(1)))
+        }
+        startup_options <- options()
+        payload <- serialize(list(options = serialize(startup_options, NULL),
+            plain_options = Filter(plain_option, startup_options), packages = .packages(),
+            environment = startup_environment(),
+            library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),
+                inherits = FALSE)), NULL)
+        if (length(payload) > startup_state_limit) stop("Language server startup state exceeds 16 MiB")
+        payload
+    })
 }
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
@@ -216,6 +242,14 @@ for (resource in c("completion-runtime.R", "completion-static.R", "completion-ar
     source(file.path(console_resource_dir, resource), local = TRUE)
 }
 
+# The client takes ownership once, after mutual socket authentication (or over
+# inherited stdio). Never include this payload in lifecycle or completion logs.
+server$request_handlers[["rConsole/takeStartupState"]] <- function(self, id, params) {
+    payload <- startup_payload
+    startup_payload <<- NULL
+    self$deliver(languageserver:::Response$new(id, result =
+        if (is.null(payload)) NULL else gsub("\n", "", jsonlite::base64_enc(payload), fixed = TRUE)))
+}
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
     workspace <- self$get_workspace(self$rootUri)
