@@ -37,6 +37,19 @@ function completionTokens(code: string): Token[] {
 
 export type CompletionSyntax = ReturnType<typeof getCompletionSyntax>;
 
+// Cache absent results too; unfinished input often has no applicable context.
+function lazy<T>(compute: () => T): () => T {
+  let ready = false;
+  let value: T;
+  return () => {
+    if (!ready) {
+      value = compute();
+      ready = true;
+    }
+    return value;
+  };
+}
+
 /** Share one lexical snapshot between completion's independent context checks. */
 export function getCompletionSyntax(code: string, cursor = code.length) {
   let tokens: Token[] | undefined;
@@ -57,23 +70,30 @@ export function getCompletionSyntax(code: string, cursor = code.length) {
     }
     return prefixTokens;
   };
+  const identifierEnd = lazy(() => {
+    if (cursor === code.length) return undefined;
+    const token = all().find(token => token.type === TokenType.Identifier &&
+      token.position < cursor && cursor < token.position + token.value.length);
+    return token ? token.position + token.value.length : undefined;
+  });
+  const inLiteral = lazy(() => /["'`#]/.test(code) && isCompletionInLiteral(code, cursor, all()));
+  const member = lazy(() => /[$@]|::/.test(before) ? getQualifiedCompletionContext(before, prefix()) : undefined);
+  const memberSuffix = lazy(() => /[$@]/.test(before) ? getMemberCompletionSuffix(before, prefix()) : undefined);
+  const bracket = lazy(() => code.includes("[") ? getBracketCompletionContext(code, cursor, all()) : undefined);
+  const pipe = lazy(() => before.includes("|>") || before.includes("%>%") ? getPipeCompletionContext(before, prefix()) : undefined);
+  const call = lazy(() => before.includes("(") ? getEnclosingCall(code, cursor, all()) : undefined);
+  const dataObject = lazy(() => /[([|%]/.test(before) ? getDataCompletionObject(before, prefix(), getQualifiedCompletionContext) : undefined);
   return {
     get tokens() { return all(); },
     get prefixTokens() { return prefix(); },
-    get identifierEnd() {
-      if (cursor === code.length) return undefined;
-      const token = all().find(token => token.type === TokenType.Identifier &&
-        token.position < cursor &&
-        cursor < token.position + token.value.length);
-      return token ? token.position + token.value.length : undefined;
-    },
-    get inLiteral() { return /["'`#]/.test(code) && isCompletionInLiteral(code, cursor, all()); },
-    get member() { return /[$@]|::/.test(before) ? getQualifiedCompletionContext(before, prefix()) : undefined; },
-    get memberSuffix() { return /[$@]/.test(before) ? getMemberCompletionSuffix(before, prefix()) : undefined; },
-    get bracket() { return code.includes("[") ? getBracketCompletionContext(code, cursor, all()) : undefined; },
-    get pipe() { return before.includes("|>") || before.includes("%>%") ? getPipeCompletionContext(before, prefix()) : undefined; },
-    get call() { return before.includes("(") ? getEnclosingCall(code, cursor, all()) : undefined; },
-    get dataObject() { return /[([|%]/.test(before) ? getDataCompletionObject(before, prefix(), getQualifiedCompletionContext) : undefined; },
+    get identifierEnd() { return identifierEnd(); },
+    get inLiteral() { return inLiteral(); },
+    get member() { return member(); },
+    get memberSuffix() { return memberSuffix(); },
+    get bracket() { return bracket(); },
+    get pipe() { return pipe(); },
+    get call() { return call(); },
+    get dataObject() { return dataObject(); },
   };
 }
 

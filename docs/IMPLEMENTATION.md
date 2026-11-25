@@ -795,8 +795,13 @@ candidate fields. Receiver fallback accepts only `member` candidates, and worksp
 definitions must belong to the requesting console document. The native metadata
 adapter translates installed language-server annotations into these fields.
 Value candidates retain their explicit insertion text, with snippet expansion
-when requested. The native adapter formats its literal string choices using the
-current R quoting context before passing them to presentation. Shared R name and
+when requested through `SnippetString`. The static candidate type exposes the
+label, kind, detail, insertion text, replacement range and console provenance
+fields. Each candidate describes one terminal insertion or replacement. Providers
+must supply the complete edit in that candidate; auxiliary text edits, editor
+commands and deferred completion-item resolution are unsupported. The native
+adapter formats its literal string choices using the current R quoting context
+before passing them to presentation. Shared R name and
 literal formatting resides in `completion/rText.ts`.
 Deduplication preserves choices with distinct roles, insertion text, replacement
 ranges or package identities, even when their display text matches.
@@ -809,7 +814,10 @@ excluding parameter and default-value candidates that require that signature.
 Independent expression symbols retain prefix broadening when parameter inference
 is unavailable. Native context classification, fallback and stored-receiver
 discovery share one request-local syntax snapshot, including cursor-specific token
-slices. Projected source uses its own snapshot when building native request
+slices. Derived contexts and absent results are computed lazily once per snapshot;
+input changes and cursor moves receive independent snapshots. Snapshots are
+released with their consumers; the separate lexer cache retains only the latest
+input. Projected source uses its own snapshot when building native request
 parameters. Multiline replacement offsets share one document line-offset index
 per completion request. Virtual documents cache UTF-16 line offsets for each text
 version; offset lookup uses the index and position lookup uses binary search.

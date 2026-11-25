@@ -8,14 +8,6 @@ export interface CompletionInput {
   cursorRow: number;
 }
 
-export function rebaseCompletionEnds(entries: CompletionEntry[], delta: number): CompletionEntries {
-  const rebased = entries.map(entry => entry.replaceEnd === undefined ? entry : {
-    ...entry, replaceEnd: entry.replaceEnd + delta,
-  }) as CompletionEntries;
-  if ((entries as CompletionEntries).isIncomplete) rebased.isIncomplete = true;
-  return rebased;
-}
-
 /** Compose a provider edit with the prefix replacement used to build its preview. */
 export function composeCompletionPreviewEdits(
   entries: CompletionEntry[],
@@ -47,7 +39,7 @@ export function composeCompletionPreviewEdits(
 export function refineCompletionEntries(
   cached: { input: CompletionInput; context: CompletionContext; entries: CompletionEntries },
   input: CompletionInput, context: CompletionContext
-): CompletionEntries | undefined {
+): CompletionEntry[] | undefined {
   const old = cached.context;
   if (allowsSymbolCompletions(context) !== allowsSymbolCompletions(old) ||
       context.kind !== old.kind || context.replaceStart !== old.replaceStart ||
@@ -60,5 +52,8 @@ export function refineCompletionEntries(
     return undefined;
   }
   const safe = cached.entries.filter(entry => entry.replaceStart === undefined || entry.replaceStart === old.replaceStart);
-  return rebaseCompletionEnds(safe, context.prefix.length - old.prefix.length);
+  const delta = context.prefix.length - old.prefix.length;
+  return safe.map(entry => entry.replaceEnd === undefined ? entry : {
+    ...entry, replaceEnd: entry.replaceEnd + delta,
+  });
 }

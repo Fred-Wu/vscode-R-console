@@ -261,6 +261,26 @@ test("completion lexical snapshots remain correct after arbitrary edits and curs
   }
 });
 
+test("syntax snapshots retain lazy contexts across interleaved documents and cursor moves", () => {
+  const properties = ['identifierEnd', 'inLiteral', 'member', 'memberSuffix', 'bracket', 'pipe', 'call', 'dataObject'];
+  const read = syntax => Object.fromEntries(properties.map(key => [key, syntax[key]]));
+  const markedInputs = ['df$al│pha', 'f(value = "al│pha")', 'df[, al│pha]',
+    'df |> sub│set()', 'factory()$al│pha', 'first <- 1\nf(al│pha)', '# comment│'];
+  const snapshots = markedInputs.map(marked => {
+    const cursor = marked.indexOf('│'), input = marked.replace('│', '');
+    return { input, cursor, syntax: parser.getCompletionSyntax(input, cursor) };
+  });
+  // Read snapshots after other documents have replaced the shared lexer cache.
+  // Later cursor movement must not change either positive or absent contexts.
+  for (const { input, cursor, syntax } of snapshots) {
+    const expected = structuredClone(read(parser.getCompletionSyntax(input, cursor)));
+    assert.deepEqual(read(syntax), expected);
+    read(parser.getCompletionSyntax(input, input.length));
+    read(parser.getCompletionSyntax('other[["column"]]$member'));
+    assert.deepEqual(read(syntax), expected);
+  }
+});
+
 test("incremental lexing handles token boundaries that change while typing", () => {
   for (const code of ['r"(foo)"', 'r"---(foo)---"', 'r"(say "hello)"; lib',
     'r"---(say "stats::lm()---"; fun(', "R'--[say 'df[[x]] ]--'; fun(",

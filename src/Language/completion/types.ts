@@ -80,8 +80,12 @@ export type CompletionCandidate = vscode.CompletionItem & {
   workspaceOrigin?: { definitionUri?: string; contextUri?: string };
 };
 
-/** Static providers explicitly identify receiver members, arguments and ambient symbols. */
-export type StaticCompletionCandidate = CompletionCandidate & {
+/** One terminal insertion/replacement, with explicit candidate provenance.
+ * Auxiliary text edits, commands and completion-item resolution are unsupported. */
+export type StaticCompletionCandidate = Pick<CompletionCandidate,
+  "label" | "kind" | "detail" | "insertText" | "range" | "subscriptParameter" |
+  "bracketSpecial" | "packageName" | "workspaceOrigin"
+> & {
   role: NonNullable<CompletionCandidate["role"]>;
 };
 

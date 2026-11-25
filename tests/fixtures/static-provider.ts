@@ -23,3 +23,15 @@ export const workspace: StaticCompletionCandidate = {
     definitionUri: "r-console://test/console.R", contextUri: "r-console://test/console.R",
   },
 };
+
+export const auxiliaryEdit: StaticCompletionCandidate = {
+  label: "alpha", insertText: "alpha", role: "symbol",
+  // @ts-expect-error The terminal applies one candidate edit.
+  additionalTextEdits: [],
+};
+
+export const editorCommand: StaticCompletionCandidate = {
+  label: "alpha", insertText: "alpha", role: "symbol",
+  // @ts-expect-error Acceptance does not execute editor commands.
+  command: { title: "Import", command: "provider.import" },
+};

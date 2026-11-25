@@ -2095,7 +2095,7 @@ test("native member snippets preserve escaped dollars, braces and backslashes", 
 });
 
 test("cached native replacement ends move with the typed prefix", () => {
-  const { refineCompletionEntries, rebaseCompletionEnds } = loadSource('src/Language/completion/refinement.ts');
+  const { refineCompletionEntries } = loadSource('src/Language/completion/refinement.ts');
   const before = 'obj$alpha';
   const after = 'obj$allpha';
   const context = completion.getCompletionContext(before, 5);
@@ -2106,8 +2106,6 @@ test("cached native replacement ends move with the typed prefix", () => {
     { text: after, textBeforeCursor: after.slice(0, 6), cursorRow: 0 }, refinedContext);
   const pick = completion.toCompletionPick(refined[0], refinedContext);
   assert.equal(after.slice(0, pick.replaceStart) + pick.insertText + after.slice(pick.replaceEnd), 'obj$alpha');
-  const preview = rebaseCompletionEnds(refined, -1);
-  assert.equal(preview[0].replaceEnd, 9, 'picker preview edits must map back to the actual input');
   assert.equal(entries[0].replaceEnd, 9, 'cache entries stay immutable');
 });
 
