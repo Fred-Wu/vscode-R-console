@@ -132,6 +132,8 @@ test("frontend continuations execute in order with real R parsing and evaluation
       await terminal.programmaticSubmissionQueue;
     } else {
       terminal.handleInput(`\x1b[200~${code}\n\x1b[201~`);
+      assert.equal(terminal.mode, "ready", "paste waits for Enter");
+      await terminal.handleEnterKey();
     }
     await waitFor(() => idle() && output.includes(marker), marker);
   }
@@ -368,6 +370,10 @@ test("two real R consoles parse and execute independently across busy, reply, de
       void terminal.handleEnterKey();
     } else {
       terminal.handleInput(input === "editor" ? `${number}\n` : `\x1b[200~${number}\n\x1b[201~`);
+      if (input === "paste") {
+        assert.equal(terminal.mode, "ready", "paste waits for Enter");
+        void terminal.handleEnterKey();
+      }
     }
     await waitFor(() => idle(f) && f.output.join("").includes(`[1] ${number}`), `${f.name} ${input}`);
     assert.ok(checked.some(c => c.code === String(number) && c.session === f.session && c.status === 1));

@@ -226,7 +226,6 @@ export class RTerminal implements vscode.Pseudoterminal {
 
   private programmaticSubmissionQueue: Promise<void> = Promise.resolve();
   private submissionGeneration = 0;
-  private suppressNextEnterAfterPasteEnd = false;
 
   private submissionQueue: Submission[] = [];
   private activeSubmission: Submission | null = null;
@@ -754,9 +753,8 @@ export class RTerminal implements vscode.Pseudoterminal {
       this.syncReplayTerminalSize();
     }
 
-    if (this.options.bracketedPaste) {
-      this.writeEmitter.fire("\x1b[?2004h");
-    }
+    // Clipboard paste must stay distinguishable from Enter and editor sends.
+    this.writeEmitter.fire("\x1b[?2004h");
 
     const runtimeWasRunning = this.isRunning();
     if (!runtimeWasRunning) {
@@ -882,12 +880,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     }
     const actions = this.keyProcessor.parseInputChunk(data);
     for (const action of actions) {
-      if (this.suppressNextEnterAfterPasteEnd) {
-        this.suppressNextEnterAfterPasteEnd = false;
-        if (action.type === "enter") {
-          continue;
-        }
-      }
       this.applyKeyAction(action);
     }
   }
@@ -934,7 +926,8 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   private shouldHandleAsNestedProgrammaticReply(data: string): boolean {
-    if (this.inBracketPaste || this.mode !== "reply" || !this.inputState.isAtEnd) {
+    if (this.inBracketPaste || this.keyProcessor.hasPendingEscapeSequence ||
+      this.mode !== "reply" || !this.inputState.isAtEnd) {
       return false;
     }
 
@@ -959,6 +952,7 @@ export class RTerminal implements vscode.Pseudoterminal {
   private canAcceptProgrammaticSubmission(): boolean {
     return (
       !this.inBracketPaste &&
+      !this.keyProcessor.hasPendingEscapeSequence &&
       this.mode !== "closed" &&
       this.mode !== "reply" &&
       this.inputState.text.length === 0 &&
@@ -1034,13 +1028,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.applyKeyAction({ type: "text", text: data });
   }
 
-  private shouldSuppressEnterAfterPasteEnd(content: string): boolean {
-    const normalized = stripBracketedPasteMarkers(content)
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n");
-    return normalized.includes("\n");
-  }
-
   private queueProgrammaticSubmission(data: string): void {
     // Continuation cursors must use the same normalized source as parsing.
     const submission = this.normalizeProgrammaticInput(stripBracketedPasteMarkers(data));
@@ -1072,18 +1059,6 @@ export class RTerminal implements vscode.Pseudoterminal {
     this.escPendingClear = false;
     this.rHistory.resetIndex();
     await this.enqueueRSubmission(submission, false, slot);
-  }
-
-  private handleNestedReplyPaste(content: string): boolean {
-    const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    if (!normalized.includes("\n") || !this.inputState.isAtEnd) {
-      this.inputState.insertText(normalized);
-      this.renderInput();
-      return false;
-    }
-
-    this.sendNestedReplyInput(`${this.inputState.text}${normalized}`);
-    return true;
   }
 
   private sendNestedReplyInput(text: string): void {
@@ -1321,10 +1296,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       case "paste-end":
         this.inBracketPaste = false;
-        this.suppressNextEnterAfterPasteEnd = this.shouldSuppressEnterAfterPasteEnd(
-          this.pasteBuffer
-        );
-        void this.handlePasteEnd();
+        this.handlePasteEnd();
         return;
       case "text":
         if (this.inBracketPaste) {
@@ -1655,32 +1627,14 @@ export class RTerminal implements vscode.Pseudoterminal {
     return false;
   }
 
-  private async handlePasteEnd(): Promise<void> {
+  private handlePasteEnd(): void {
     if (!this.pasteBuffer) return;
-    const content = stripBracketedPasteMarkers(this.pasteBuffer);
+    const content = stripBracketedPasteMarkers(this.pasteBuffer).replace(/\r\n?/g, "\n");
     this.pasteBuffer = "";
-    const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    if (!normalized.includes("\n")) {
-      this.inputState.insertText(normalized);
-      this.renderInput();
-      return;
-    }
-    const trimmed = normalized.replace(/\n+$/, "");
-    if (!this.inputState.isAtEnd) {
-      this.inputState.insertText(trimmed);
-      this.renderInput();
-      return;
-    }
-
-    const submitted = this.inputState.text + trimmed;
-    const slot = reserveRuntimeSubmission(this.runtimeHost(), submitted);
-    this.inputState.reset();
-    this.lang.updateInput("");
-    if (this.promptVisible) {
-      this.clearInputRender();
-      this.promptVisible = false;
-    }
-    await this.enqueueRSubmission(submitted, false, slot);
+    // Like history recall, paste only changes the editable input. Enter submits it.
+    this.expandForEdit();
+    this.inputState.insertText(content);
+    this.renderInput();
   }
 
   private handleReplyInputAction(action: KeyAction): void {
@@ -1694,17 +1648,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       case "paste-end":
         this.inBracketPaste = false;
-        if (this.pasteBuffer.length > 0) {
-          const content = stripBracketedPasteMarkers(this.pasteBuffer);
-          if (this.shouldSuppressEnterAfterPasteEnd(content)) {
-            this.suppressNextEnterAfterPasteEnd = this.handleNestedReplyPaste(content);
-            this.pasteBuffer = "";
-            return;
-          }
-          this.inputState.insertText(content);
-          this.pasteBuffer = "";
-          this.renderInput();
-        }
+        this.handlePasteEnd();
         return;
       case "text":
         if (this.inBracketPaste) {
@@ -1746,7 +1690,7 @@ export class RTerminal implements vscode.Pseudoterminal {
         return;
       case "enter": {
         const reply = this.inputState.text;
-        this.sendReadlineReply(reply);
+        this.sendNestedReplyInput(`${reply}\n`);
         return;
       }
       default:

@@ -1291,7 +1291,7 @@ export async function enqueueRuntimeSubmission(
           continueSubmission(next, pending, slot.initialPromptKind, editCursor);
         } else {
           // With no accepted successor, the editable buffer owns continuation.
-          // Subsequent Enter/paste snapshots already include that buffer.
+          // Subsequent Enter snapshots already include that buffer.
           publish(pending, "edit", editCursor);
         }
       }
