@@ -209,19 +209,23 @@ export class PackageInventory {
     throw Object.assign(new Error(`Too many symbolic links resolving ${link}`), { code: "ELOOP" });
   }
 
-  private async watchLinkedPackages(library: string, entries: fs.Dirent[]): Promise<Map<string, string>> {
-    const targets = new Map<string, string>();
+  private async watchLinkedPackages(library: string, entries: fs.Dirent[]): Promise<Map<string, string | null>> {
+    const targets = new Map<string, string | null>();
     const files = new Set<string>();
     for (const entry of entries) {
       if (!entry.isSymbolicLink() || !/^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)) continue;
       const link = path.join(library, entry.name);
+      files.add(link);
       try {
         const target = await this.resolvePackageLink(link, files);
         targets.set(entry.name, target);
-        files.add(link);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT" &&
-            (error as NodeJS.ErrnoException).code !== "EINVAL") throw error;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ELOOP" || code === "ENOTDIR") {
+          // An invalid installation is not a library-wide failure. Keep the
+          // link and visited parents watched so repair can be discovered.
+          targets.set(entry.name, null);
+        } else if (code !== "ENOENT" && code !== "EINVAL") throw error;
       }
     }
     if (this.disposed || !this.paths.includes(library)) return targets;
@@ -466,8 +470,9 @@ export class PackageInventory {
         if (this.disposed || revision !== this.revision) return;
         const batch = await Promise.all(names.slice(offset, offset + 8).map(async name => {
           const old = previous?.packages.get(name);
-          if (locked.has("*") || locked.has(name)) return defer(name, targets.get(name));
           const target = targets.get(name);
+          if (locked.has("*") || locked.has(name)) return defer(name, target ?? undefined);
+          if (target === null) return undefined;
           if (target) {
             const targetLocks = await locksFor(path.dirname(target));
             // R installs lock by package name even when a linked cache directory is versioned.
@@ -578,9 +583,10 @@ export class PackageInventory {
       if (packageName !== name || !version) return undefined;
       return { name, version, path: directory, target, identity };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return undefined;
-      }
+      const code = (error as NodeJS.ErrnoException).code;
+      // A package can become invalid between link resolution and metadata
+      // inspection. Do not let a missing or malformed path abort the scan.
+      if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return undefined;
       throw error;
     }
   }

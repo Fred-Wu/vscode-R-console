@@ -39,10 +39,10 @@ function fixture(t, notificationDelay = 0) {
     for (const timer of notifications) clearTimeout(timer);
     fs.rmSync(root, { recursive: true, force: true });
   });
-  const install = (library, version = "1.0") => {
-    const directory = path.join(library, "example");
+  const install = (library, version = "1.0", name = "example") => {
+    const directory = path.join(library, name);
     fs.mkdirSync(path.join(directory, "Meta"), { recursive: true });
-    fs.writeFileSync(path.join(directory, "DESCRIPTION"), `Package: example\nVersion: ${version}\n`);
+    fs.writeFileSync(path.join(directory, "DESCRIPTION"), `Package: ${name}\nVersion: ${version}\n`);
     fs.writeFileSync(path.join(directory, "Meta", "package.rds"), version);
     return directory;
   };
@@ -844,20 +844,68 @@ test("relative package links resolve parent traversal through directory aliases"
     path.join(fs.realpathSync(cache), "example")));
 });
 
-test("cyclic package links fail resolution promptly and recover when repaired", { timeout: 10000 }, async t => {
-  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+test("cyclic package links do not block healthy packages and recover when repaired", { timeout: 45000 }, async t => {
+  const { root, libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
   const alias = path.join(root, "alias"), cache = path.join(root, "cache");
   fs.mkdirSync(alias); fs.mkdirSync(cache);
-  const link = path.join(library, "example"), intermediate = path.join(alias, "example");
+  const link = path.join(first, "example"), intermediate = path.join(alias, "example");
   const kind = process.platform === "win32" ? "junction" : "dir";
+  const healthy = install(first, "1.0", "healthy");
+  const fallback = install(second);
   fs.symlinkSync(intermediate, link, kind);
   fs.symlinkSync(link, intermediate, kind);
   await assert.rejects(inventory.resolvePackageLink(link, new Set()), { code: "ELOOP" });
+  inventory.setLibraryPaths([first, second]);
+  await settle(() => changes.at(-1)?.packages.get("example")?.path === fallback,
+    "initial discovery must skip the cyclic copy and select the healthy fallback");
+  assert.ok(changes.at(-1).packages.has("healthy"), "healthy packages in the same library must be published");
+  assert.ok(!changes.at(-1).libraries[0].packages.has("example"));
+  fs.rmSync(healthy, { recursive: true });
+  await settle(() => !changes.at(-1).packages.has("healthy"), "same-library changes must publish despite the cycle");
+  fs.rmSync(fallback, { recursive: true });
+  await settle(() => !changes.at(-1).packages.has("example"), "other library changes must publish despite the cycle");
+  install(second, "2.0");
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+
+  // Repair only the external hop, without touching or explicitly rescanning the library.
   fs.unlinkSync(intermediate);
-  fs.symlinkSync(install(cache), intermediate, kind);
-  inventory.setLibraryPaths([library]);
-  await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  fs.symlinkSync(install(cache, "3.0"), intermediate, kind);
+  await settle(() => changes.at(-1).packages.get("example")?.path === link,
+    "the retained link watches must discover a repaired higher-priority copy");
+  assert.equal(changes.at(-1).packages.get("example").version, "3.0");
+
+  // A malformed link must not override an active installation lock.
+  const lock = path.join(first, "00LOCK-example");
+  fs.mkdirSync(lock);
+  fs.unlinkSync(intermediate);
+  fs.symlinkSync(link, intermediate, kind);
+  await settle(() => changes.at(-1).libraries[0].deferred?.has("example"));
+  assert.equal(changes.at(-1).packages.get("example").path, link);
+  fs.rmdirSync(lock);
+  await settle(() => changes.at(-1).packages.get("example")?.path === fallback,
+    "after unlock, the cyclic copy must be retired in favor of the healthy one");
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  assert.ok(!logs.some(line => line.includes("Could not refresh package inventory")),
+    "malformed package links must not trigger global recovery retries");
+});
+
+test("package links through non-directory parents do not prevent inventory updates", {
+  skip: process.platform === "win32" && "junction creation requires directory targets",
+  timeout: 30000,
+}, async t => {
+  const { root, libraries: [first, second], inventory, changes, install, settle } = fixture(t);
+  const parent = path.join(root, "not-a-directory"), link = path.join(first, "example");
+  fs.writeFileSync(parent, "not a directory");
+  fs.symlinkSync(path.join(parent, "example"), link, "dir");
+  const fallback = install(second);
+  inventory.setLibraryPaths([first, second]);
+  await settle(() => changes.at(-1)?.packages.get("example")?.path === fallback);
+  fs.unlinkSync(parent);
+  fs.mkdirSync(parent);
+  install(parent, "2.0");
+  await settle(() => changes.at(-1).packages.get("example")?.path === link,
+    "repair of the malformed target parent must be discovered automatically");
+  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
 });
 
 for (const lockName of ["00LOCK-example", "00LOCK"]) {
