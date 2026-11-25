@@ -6,13 +6,18 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { PackageInventory } = loadSource("src/Language/packageInventory.ts");
 
-function comparablePackagePath(file) {
-  // Windows junctions can expose extended-length paths and different casing.
-  // Compare effective parents, not the literal spelling of a missing target.
-  const resolved = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
-  return process.platform === "win32"
-    ? resolved.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/i, "").toLowerCase()
-    : resolved;
+function sameExistingDirectory(left, right) {
+  // Windows can refer to a directory by both its 8.3 short alias and long
+  // spelling. Compare the underlying directory, not its textual path.
+  try {
+    const actual = fs.statSync(left), expected = fs.statSync(right);
+    return actual.isDirectory() && expected.isDirectory() &&
+      actual.dev === expected.dev && actual.ino === expected.ino &&
+      actual.birthtimeMs === expected.birthtimeMs;
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+    throw error;
+  }
 }
 
 function fixture(t, notificationDelay = 0) {
@@ -761,7 +766,9 @@ for (const lockName of ["00LOCK-example", "00LOCK"]) {
       const current = changes.at(-1);
       assert.equal(current.packages.has("example"), !initiallyMissing);
       const deferredPaths = current.libraries[0].deferred.get("example") ?? [];
-      assert.ok(deferredPaths.some(file => comparablePackagePath(file) === comparablePackagePath(target)),
+      assert.ok(deferredPaths.some(file =>
+        path.basename(file) === path.basename(target) &&
+        sameExistingDirectory(path.join(path.dirname(file), lockName), lock)),
         `the missing final target must keep its cache lock and watch location: ${JSON.stringify(deferredPaths)}`);
       const count = changes.length;
       install(cache, "2.0");
