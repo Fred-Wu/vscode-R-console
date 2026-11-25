@@ -1,5 +1,5 @@
 import { TokenType, continuesExpressionLine, isAccessorNamePrefix, isNameAccessor } from "../lexer";
-import { getCompletionSyntax } from "./contextParser";
+import { getCompletionSyntax, type CompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
 import type { CompletionContext, RuntimeFunctionSourceTarget } from "./types";
 
@@ -7,14 +7,15 @@ import type { CompletionContext, RuntimeFunctionSourceTarget } from "./types";
 // Downstream accessors, subscripts and calls do not change that identity.
 // Leave inference of those operations to the language server.
 export function storedCompletionReceiver(
-  context: CompletionContext, input: string, cursor: number
+  context: CompletionContext, input: string, cursor: number,
+  syntax: CompletionSyntax = getCompletionSyntax(input, cursor)
 ): { name: string; start: number; target: RuntimeFunctionSourceTarget } | undefined {
   const methodArguments = context.kind === "argument" &&
     (context.functionOperator === "$" || context.functionOperator === "@");
   if (!methodArguments && (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket"))) {
     return undefined;
   }
-  const tokens = getCompletionSyntax(input, cursor).prefixTokens.filter(token =>
+  const tokens = syntax.prefixTokens.filter(token =>
     token.type !== TokenType.EOF && token.type !== TokenType.Newline && token.type !== TokenType.Comment);
   // Match delimiters once. Grouping can be arbitrarily nested, and a closing
   // bracket token can finish more than one nested single/double subscript.

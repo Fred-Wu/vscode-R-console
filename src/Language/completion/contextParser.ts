@@ -35,6 +35,8 @@ function completionTokens(code: string): Token[] {
   return tokens;
 }
 
+export type CompletionSyntax = ReturnType<typeof getCompletionSyntax>;
+
 /** Share one lexical snapshot between completion's independent context checks. */
 export function getCompletionSyntax(code: string, cursor = code.length) {
   let tokens: Token[] | undefined;

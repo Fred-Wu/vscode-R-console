@@ -60,3 +60,62 @@ test('protocol syntax shares tokenization and preserves the actual cursor on fuz
     for (const [name, value] of Object.entries(expected)) assert.deepEqual(params[name], value, marked + ': ' + name);
   }
 });
+
+test('native dependency discovery shares cursor tokens across contexts and keeps requests independent', async () => {
+  const lexer = loadSource('src/Language/lexer.ts');
+  const scans = [];
+  const { provideNativeStaticCompletion } = loadSource('src/Language/completion/nativeStaticProvider.ts', {
+    '../lexer': { ...lexer, tokenize: code => { scans.push(code); return lexer.tokenize(code); } },
+  });
+  for (const [marked, fragment, lookup] of [
+    ['factory()$al│pha', 'al', 'function'],
+    ['factory()$alp│ha', 'alp', 'function'],
+    ['factory()[["al│pha"]]', '"al', 'function'],
+    ['factory()$method(al│pha)', 'al', 'function'],
+    ['(factory)()$al│pha', 'al', 'value'],
+  ]) {
+    const before = 'heading <- "😀"\n';
+    const input = before + marked.replace('│', '') + '\ntrailing <- TRUE';
+    const cursor = before.length + marked.indexOf('│');
+    const queries = [];
+    scans.length = 0;
+    const result = await provideNativeStaticCompletion(async binding => {
+      assert.deepEqual(binding, { name: 'factory', body: 'function() list(alpha=1)' });
+      return { items: [{ label: 'alpha', data: { type: 'member' } }], rConsoleMemberResolved: true };
+    }, { input, cursor, bindings: {
+      isCurrent: () => true,
+      resolve: async query => { queries.push(query); return { status: 'source', source: 'function() list(alpha=1)' }; },
+    } });
+    assert.deepEqual(queries, [{ name: 'factory', lookup }], marked);
+    assert.equal(result.status, 'resolved', marked);
+    assert.deepEqual(result.completion.items.map(item => item.role), ['member']);
+    assert.equal(scans.filter(code => code === fragment).length, 1,
+      `${marked}: classification, fallback and dependency discovery share the cursor fragment`);
+  }
+});
+
+test('opaque projected receivers share cursor tokens and retain their projected positions', () => {
+  const lexer = loadSource('src/Language/lexer.ts');
+  const scans = [];
+  const { createCompletionParams } = loadSource('src/Language/completion/protocol.ts', {
+    '../lexer': { ...lexer, tokenize: code => { scans.push(code); return lexer.tokenize(code); } },
+  });
+  for (const [marked, fragment] of [['factory()$al│pha', 'al'], ['factory()[["al│pha"]]', '"al']]) {
+    // A preceding selected package function adds a qualifier to this projection.
+    const qualifier = 'stats::', visiblePrefix = 'lm(); ', prefix = qualifier + visiblePrefix;
+    const text = prefix + marked.replace('│', '');
+    const contextPosition = { line: 0, character: visiblePrefix.length + marked.indexOf('│') };
+    const query = { line: 0, character: contextPosition.character + qualifier.length - 1 };
+    const document = { getText: () => text, offsetAt: p => p.character,
+      positionAt: character => ({ line: 0, character }) };
+    const projection = { document,
+      toServerPosition: p => ({ line: p.line, character: p.character + qualifier.length }) };
+    const client = { code2ProtocolConverter: { asCompletionParams: (_doc, position) => ({ position }) } };
+    scans.length = 0;
+    const params = createCompletionParams(client, projection, query, contextPosition, {}, true, { name: 'factory' });
+    assert.equal(params.position, query);
+    assert.equal(params.rConsoleOpaqueFunction, 'factory');
+    assert.deepEqual(params.rConsoleOpaqueFunctionPosition, { line: 0, character: prefix.length });
+    assert.equal(scans.filter(code => code === fragment).length, 1, marked);
+  }
+});

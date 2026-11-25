@@ -10,7 +10,7 @@ const vscode = {
 };
 const { InputState } = loadSource('src/Terminal/inputState.ts');
 const { RTerminal } = loadSource('src/Terminal/rTerminal.ts', { vscode, './rTerminal/lang': {} });
-const { provideNativeStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+const { provideNativeStaticCompletion } = loadSource('src/Language/completion/nativeStaticProvider.ts');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const pending = () => ({ status: 'pending', reason: 'analysis-pending' });
 const resolved = items => ({ status: 'resolved', completion: { items } });

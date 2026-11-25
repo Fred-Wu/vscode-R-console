@@ -1,6 +1,6 @@
 import type { CompletionContext } from "./types";
 import { TokenType, isAccessorNamePrefix } from "../lexer";
-import { decodeQuotedCompletionPrefix, getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
+import { decodeQuotedCompletionPrefix, getCompletionSyntax, getQualifiedCompletionContext, type CompletionSyntax } from "./contextParser";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
@@ -37,16 +37,16 @@ export function getCompletionContext(
   inputBuffer: string,
   cursorPosition: number,
   fullTextBeforeCursor?: string,
-  textAfterCursor = inputBuffer.slice(cursorPosition)
+  textAfterCursor = inputBuffer.slice(cursorPosition),
+  syntax?: CompletionSyntax
 ): CompletionContext | undefined {
   const snapshotInput = inputBuffer;
   const snapshotCursor = cursorPosition;
   const beforeCursor = snapshotInput.slice(0, snapshotCursor);
 
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
-  const fullText = textForDataContext + textAfterCursor;
   const relativeOffset = textForDataContext.length - beforeCursor.length;
-  const syntax = getCompletionSyntax(fullText, textForDataContext.length);
+  syntax ??= getCompletionSyntax(textForDataContext + textAfterCursor, textForDataContext.length);
   const inLiteral = syntax.inLiteral;
   const identifierEnd = syntax.identifierEnd;
   const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - relativeOffset };
@@ -226,7 +226,8 @@ export function getStaticFallbackContext(
   inputBuffer: string, cursorPosition: number,
   fullTextBeforeCursor?: string,
   textAfterCursor = inputBuffer.slice(cursorPosition),
-  runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor)
+  runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor),
+  syntax?: CompletionSyntax
 ): CompletionContext | undefined {
   // Quoted indices on executable receivers may look like ordinary string
   // literals to the strict runtime parser, which must still reject inspection.
@@ -239,8 +240,7 @@ export function getStaticFallbackContext(
   const localBefore = inputBuffer.slice(0, cursorPosition);
   const before = fullTextBeforeCursor ?? localBefore;
   const shift = before.length - localBefore.length;
-  const fullText = before + textAfterCursor;
-  const syntax = getCompletionSyntax(fullText, before.length);
+  syntax ??= getCompletionSyntax(before + textAfterCursor, before.length);
   const identifierEnd = syntax.identifierEnd;
   const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - shift };
   const tokens = syntax.prefixTokens.filter(token =>

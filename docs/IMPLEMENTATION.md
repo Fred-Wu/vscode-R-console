@@ -669,7 +669,8 @@ Implementation files:
 - [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
 - [`src/Language/completion/service.ts`](../src/Language/completion/service.ts) combines language-server, runtime and recent-input candidates. [`contextParser.ts`](../src/Language/completion/contextParser.ts) identifies the expression at the cursor.
 - [`src/Language/completion/bindings.ts`](../src/Language/completion/bindings.ts) supplies guarded binding snapshots.
-- [`src/Language/completion/staticProvider.ts`](../src/Language/completion/staticProvider.ts) adapts the provider contract to the installed language server.
+- [`src/Language/completion/staticProvider.ts`](../src/Language/completion/staticProvider.ts) bounds provider invocations and manages their capability lifetime.
+- [`src/Language/completion/nativeStaticProvider.ts`](../src/Language/completion/nativeStaticProvider.ts) adapts the provider contract to the installed language server.
 - [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
@@ -806,7 +807,10 @@ The native adapter retains validated
 expression symbols when callable parameter inference is unavailable, while
 excluding parameter and default-value candidates that require that signature.
 Independent expression symbols retain prefix broadening when parameter inference
-is unavailable. Multiline replacement offsets share one document line-offset index
+is unavailable. Native context classification, fallback and stored-receiver
+discovery share one request-local syntax snapshot, including cursor-specific token
+slices. Projected source uses its own snapshot when building native request
+parameters. Multiline replacement offsets share one document line-offset index
 per completion request. Virtual documents cache UTF-16 line offsets for each text
 version; offset lookup uses the index and position lookup uses binary search.
 Stored-source and package projections reuse those indexes for every candidate edit.

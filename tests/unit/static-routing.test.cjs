@@ -16,7 +16,7 @@ const vscode = {
 const completion = loadSource("src/Language/completion.ts", { vscode });
 const { getStaticFallbackContext } = loadSource('src/Language/completion/syntax.ts');
 const { storedCompletionReceiver } = loadSource('src/Language/completion/sourceReceiver.ts');
-const { provideNativeStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+const { provideNativeStaticCompletion } = loadSource('src/Language/completion/nativeStaticProvider.ts');
 // Model the production native adapter explicitly; runtime-only providers have no static capability.
 const nativeProvider = provider => ({ ...provider, provideStaticCompletion: request =>
   provideNativeStaticCompletion(binding => provider.provideCompletionItems(request.document, request.position,

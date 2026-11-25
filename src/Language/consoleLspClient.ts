@@ -38,7 +38,7 @@ import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
 import { staticCompletionUnavailableReason } from "./completion/diagnostics";
-import { provideNativeStaticCompletion, type NativeSourceBinding } from "./completion/staticProvider";
+import { provideNativeStaticCompletion, type NativeSourceBinding } from "./completion/nativeStaticProvider";
 
 const CONSOLE_LSP_HOST = "127.0.0.1";
 

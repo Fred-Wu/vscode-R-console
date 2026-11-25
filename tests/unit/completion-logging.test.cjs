@@ -26,7 +26,7 @@ function harness(t) {
     vscode, './rTerminal/lang': {}, './rTerminal/runtime': { getCachedRuntimeWorkspaceData: () => undefined },
     '../Language/completion/outputChannel': diagnostics,
   });
-  const { provideNativeStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+  const { provideNativeStaticCompletion } = loadSource('src/Language/completion/nativeStaticProvider.ts');
   const lang = new RTermLang({ extensionPath: '', rPath: 'R', env: {}, getStaticAnalysisEnabled: () => true });
   let nativeCalls = 0, requests = 0;
   const provider = { provideStaticCompletion: request => {

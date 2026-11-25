@@ -1,7 +1,7 @@
 import { getCompletionContext, getStaticFallbackContext } from "./syntax";
 import { storedCompletionReceiver } from "./sourceReceiver";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
-import type { NativeSourceBinding } from "./staticProvider";
+import type { NativeSourceBinding } from "./nativeStaticProvider";
 import type * as vscode from "vscode";
 import type { LanguageClient } from "vscode-languageclient/node";
 import type { VirtualRDocument } from "../virtualRDocument";
@@ -31,9 +31,9 @@ export function createCompletionParams(
   let opaquePosition: vscode.Position | undefined;
   if (staticAnalysis && sourceBinding && sourceBinding.body === undefined) {
     const before = text.slice(0, contextOffset), line = before.split("\n").at(-1)!;
-    const visible = getCompletionContext(line, line.length, before, text.slice(contextOffset));
-    const receiverContext = getStaticFallbackContext(line, line.length, before, text.slice(contextOffset), visible) ?? visible;
-    const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, contextOffset);
+    const visible = getCompletionContext(line, line.length, before, text.slice(contextOffset), syntax);
+    const receiverContext = getStaticFallbackContext(line, line.length, before, text.slice(contextOffset), visible, syntax) ?? visible;
+    const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, contextOffset, syntax);
     const root = visible?.objectName && parseRuntimeMemberQuery(visible.objectName)?.root;
     if (sourceBinding.opaqueReceiver && root === sourceBinding.name) {
       opaquePosition = projection.toServerPosition(contextPosition);
