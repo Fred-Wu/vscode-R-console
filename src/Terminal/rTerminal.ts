@@ -934,6 +934,8 @@ export class RTerminal implements vscode.Pseudoterminal {
     const normalized = this.normalizeProgrammaticInput(data);
     const fullReplyText = this.stripFinalInputNewline(`${this.inputState.text}${normalized}`);
     return (
+      // Submission requires a newline in this event; the draft may contain pasted newlines.
+      normalized.includes("\n") &&
       fullReplyText.includes("\n") &&
       !normalized.includes("\x1b") &&
       !normalized.includes("\x03")

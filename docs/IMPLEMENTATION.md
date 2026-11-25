@@ -1398,6 +1398,8 @@ The terminal always enables bracketed clipboard paste, independently of the
 `r.bracketedPaste` setting used by vscode-R for editor sends.
 An Enter following the closing paste marker submits the input, including the Enter
 appended by vscode-R editor-send commands.
+At nested reply prompts, programmatic reply routing requires a newline in the
+incoming input event. Typing and editing keys operate on the pasted draft.
 
 #### Submission Queue
 

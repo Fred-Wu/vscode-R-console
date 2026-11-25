@@ -145,6 +145,25 @@ test("frontend continuations execute in order with real R parsing and evaluation
   await replyBatch;
   await waitFor(() => idle() && output.includes("REPLY_ANSWER_OK"), "native check after nested reply");
 
+  terminal.handleInput('readline("EDIT_REPLY>")\n');
+  await terminal.programmaticSubmissionQueue;
+  await waitFor(() => terminal.mode === "reply", "reply before editable paste");
+  const beforeReplyEdit = sent.length;
+  terminal.handleInput("\x1b[200~answer\n1\x1b[201~");
+  terminal.handleInput("2");
+  terminal.handleInput("\x7f");
+  terminal.handleInput("3");
+  assert.equal(terminal.mode, "reply");
+  assert.equal(terminal.inputState.text, "answer\n13");
+  assert.deepEqual(terminal.pendingConsoleInputLines, []);
+  assert.equal(sent.length, beforeReplyEdit, "editing sends no reply or code to R");
+  terminal.handleInput("\r");
+  await waitFor(() => idle() && output.includes("[1] 13"), "explicit Enter submits edited reply and code");
+  assert.deepEqual(sent.slice(beforeReplyEdit), [
+    { type: "reply-input", text: "answer" },
+    { type: "submit", code: "13" },
+  ]);
+
   for (const timing of ["overlap", "parsed", "restored"]) {
     const start = sent.length;
     terminal.handleInput("Sys.sleep(0.2)\nx <- (\n");

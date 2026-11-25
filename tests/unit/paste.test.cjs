@@ -87,6 +87,43 @@ test("nested reply paste waits for Enter before sending or queuing replies", () 
   assert.deepEqual(terminal.pendingConsoleInputLines, ["second"]);
 });
 
+for (const text of ["answer\n1", "answer\n1\n"]) {
+  for (const [name, key, edited, cursor] of [
+    ["typing", "2", text + "2", text.length + 1],
+    ["Backspace", "\x7f", text.slice(0, -1), text.length - 1],
+    ["Ctrl+A", "\x01", text, text.lastIndexOf("\n") + 1],
+    ["Ctrl+E", "\x05", text, text.length],
+  ]) {
+    test(`${name} after a nested reply paste only edits until Enter (${JSON.stringify(text)})`, () => {
+      const { terminal, commands } = createTerminal();
+      terminal.mode = "reply";
+      terminal.promptVisible = true;
+      terminal.handleInput(paste(text));
+      terminal.handleInput(key);
+      assert.equal(terminal.mode, "reply");
+      assert.equal(terminal.inputState.text, edited);
+      assert.equal(terminal.inputState.cursorPosition, cursor);
+      assert.deepEqual(commands, []);
+      assert.deepEqual(terminal.pendingConsoleInputLines, []);
+
+      terminal.handleInput("\r");
+      assert.deepEqual(commands, [{ type: "reply-input", text: "answer" }]);
+      assert.deepEqual(terminal.pendingConsoleInputLines, edited.split("\n").slice(1));
+    });
+  }
+}
+
+for (const input of ["first\nsecond\r", "first\r\nsecond\r\n", paste("first\nsecond") + "\r"]) {
+  test(`editor sends still submit multiple nested replies (${JSON.stringify(input)})`, () => {
+    const { terminal, commands } = createTerminal();
+    terminal.mode = "reply";
+    terminal.promptVisible = true;
+    terminal.handleInput(input);
+    assert.deepEqual(commands, [{ type: "reply-input", text: "first" }]);
+    assert.deepEqual(terminal.pendingConsoleInputLines, ["second"]);
+  });
+}
+
 for (const atEnd of [false, true]) {
   test(`Enter submits pasted reply lines including trailing blank lines (cursor at end=${atEnd})`, () => {
     const { terminal } = createTerminal();
