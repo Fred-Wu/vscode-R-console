@@ -1,39 +1,59 @@
+import { getCompletionContext, getStaticFallbackContext } from "./syntax";
+import { storedCompletionReceiver } from "./sourceReceiver";
+import { parseRuntimeMemberQuery } from "./runtimeMembers";
+import type { NativeSourceBinding } from "./nativeStaticProvider";
 import type * as vscode from "vscode";
 import type { LanguageClient } from "vscode-languageclient/node";
 import type { VirtualRDocument } from "../virtualRDocument";
-import { getBracketCompletionContext, getCompletionParseInsertion, getCompletionParseSuffix, getEnclosingCall, getPipeCompletionContext } from "./contextParser";
+import { getCompletionSyntax, getCompletionParseInsertion, getCompletionParseSuffix } from "./contextParser";
 
 // Supplemental syntax belongs to the console adapter. Standard completion
 // position and document contents remain available to the native LSP handler.
 export function createCompletionParams(
   client: LanguageClient, projection: ReturnType<VirtualRDocument["project"]>,
   serverPosition: vscode.Position, contextPosition: vscode.Position, context: vscode.CompletionContext,
-  staticAnalysis = false
+  staticAnalysis = false, sourceBinding?: NativeSourceBinding
 ) {
   const text = projection.document.getText();
-  const hasContext = text.includes("(") || text.includes("[") || text.includes("|>") || text.includes("%>%");
+  const hasContext = !!sourceBinding || text.includes("(") || text.includes("[") || text.includes("|>") || text.includes("%>%");
   const contextOffset = hasContext ? projection.document.offsetAt(projection.toServerPosition(contextPosition)) : 0;
-  const call = text.includes("(")
-    ? getEnclosingCall(text, contextOffset) : undefined;
-  const pipe = hasContext ? getPipeCompletionContext(text.slice(0, contextOffset)) : undefined;
-  const bracket = text.includes("[") ? getBracketCompletionContext(text, contextOffset) : undefined;
-  // Stored signatures must respect source bindings even without a function
-  // literal, such as an unfinished block that assigns a factory result.
-  const parseSuffix = getCompletionParseSuffix(text,
-    staticAnalysis && call !== undefined);
+  const syntax = getCompletionSyntax(text, contextOffset);
+  const call = syntax.call;
+  const pipe = syntax.pipe;
+  const bracket = syntax.bracket;
+  // Static parsing and incomplete-input recovery belong to languageserver.
+  // The legacy repair is used only to match inert runtime signature metadata.
+  const parseSuffix = staticAnalysis ? undefined : getCompletionParseSuffix(text);
   const parseInsertion = parseSuffix !== undefined && pipe
     ? getCompletionParseInsertion(text, contextOffset) : undefined;
+  // Projected package qualifications decide whether a live binding still
+  // shadows this callable. All supplemental parameters use the same document.
+  let opaquePosition: vscode.Position | undefined;
+  if (staticAnalysis && sourceBinding && sourceBinding.body === undefined) {
+    const before = text.slice(0, contextOffset), line = before.split("\n").at(-1)!;
+    const visible = getCompletionContext(line, line.length, before, text.slice(contextOffset), syntax);
+    const receiverContext = getStaticFallbackContext(line, line.length, before, text.slice(contextOffset), visible, syntax) ?? visible;
+    const receiver = receiverContext && storedCompletionReceiver(receiverContext, text, contextOffset, syntax);
+    const root = visible?.objectName && parseRuntimeMemberQuery(visible.objectName)?.root;
+    if (sourceBinding.opaqueReceiver && root === sourceBinding.name) {
+      opaquePosition = projection.toServerPosition(contextPosition);
+    }
+    if (receiver?.name === sourceBinding.name && (sourceBinding.opaqueReceiver || receiver.target !== "binding")) {
+      opaquePosition = projection.document.positionAt(receiver.start);
+    }
+  }
   // Fuzzy requests move within a prefix. Preserve the original cursor
   // context for argument matching, literal values and unfinished-input repair.
   return {
     ...client.code2ProtocolConverter.asCompletionParams(projection.document, serverPosition, context),
     ...(staticAnalysis ? { rConsoleStaticAnalysis: true } : {}),
+    ...(opaquePosition ? { rConsoleOpaqueFunction: sourceBinding!.name,
+      rConsoleOpaqueFunctionPosition: opaquePosition } : {}),
     ...(parseSuffix !== undefined ? { rConsoleParseSuffix: parseSuffix } : {}),
     ...(bracket ? {
       rConsoleDataObject: bracket.objectName,
       rConsoleSubscriptOperator: bracket.operator,
       rConsoleSubscriptTags: bracket.argumentTags,
-      rConsoleSubscriptPrefix: bracket.prefix,
       ...(bracket.argumentName ? { rConsoleSubscriptArgument: bracket.argumentName } : {}),
     } : {}),
     ...(parseInsertion ? { rConsoleParseInsertion: {

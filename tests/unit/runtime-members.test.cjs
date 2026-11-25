@@ -251,7 +251,7 @@ test("native results distinguish silent empty from unavailable and unsafe access
 
 
 test("emitted UTF-8 byte escapes round-trip without aliasing malformed names", () => {
-  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/candidates.ts", { vscode: {} });
+  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/rText.ts");
   for (const name of ["line\u2028name", "para\u2029name", "bidi\u202ename", "c1\u0085name", "\ufeff", "🙂", "`\\'\"\n"]) {
     for (const [spelling, steps] of [
       [backtickRName(name), []],

@@ -6,6 +6,7 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { createGuardedBindingResolver } = loadSource("src/Language/completion/bindings.ts");
 const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
 const { parseRuntimeMemberQuery } = loadSource("src/Language/completion/runtimeMembers.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
@@ -78,15 +79,13 @@ test("real embedded R completion inspects nested storage without running user co
     const before = text.slice(0, cursor).split("\n");
     const lines = text.split("\n");
     const row = before.length - 1, col = before.at(-1).length;
-    const context = completion.getStaticFallbackContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
-    const receiver = useStoredSource ? completion.storedCompletionReceiver(context, text, cursor) : undefined;
-    const result = receiver ? await inspect(receiver.name, [], receiver.target) : undefined;
-    const definition = !receiver || result?.status === "missing" || result?.status === "not-callable" || result?.status === "package" ? undefined
-      : { name: receiver.name, ...(receiver.target === "binding" ? { opaqueReceiver: true } : {}),
-        ...(result?.status === "source" ? { body: result.text } : {}) };
+    const context = completion.getStaticCompletionContext(lines[row], col, text.slice(0, cursor), text.slice(cursor));
+    const bindings = createGuardedBindingResolver(useStoredSource
+      ? (name, target) => inspect(name, [], target)
+      : async () => ({ status: 'missing' }));
     return completion.collectStaticFallbackEntries(context, {
       getText: () => text, uri: { toString: () => "r-console://real-lifecycle-test/console.R" },
-    }, { line: row, character: col }, lines.slice(0, row), sourceClient, definition);
+    }, { line: row, character: col }, lines.slice(0, row), sourceClient, { bindings });
   };
   // The wire protocol must distinguish a non-existent live root from an
   // existing root whose storage is authoritatively empty.
@@ -400,7 +399,7 @@ test("real embedded R completion inspects nested storage without running user co
           requests.push(request);
           return request;
         } });
-      lang.ensureConsoleLspStarted = async () => undefined;
+      lang.getCompletionProvider = async () => undefined;
       lang.getOrOpenCompletionDocument = async () => undefined;
       const input = { text, currentLine: text, cursorCol: text.length,
         cursorRow: 0, lines: [text], textBeforeCursor: text };
@@ -891,7 +890,9 @@ test("real embedded R completion inspects nested storage without running user co
     }
   }
   for (const expression of ["slice_df[1]", "slice_list[1]"]) {
-    assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery(expression)), ["alpha"]);
+    const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression));
+    assert.equal(result.status, "available", expression);
+    assert.deepEqual(result.names, ["alpha"], expression);
   }
   // Safe slices retain R's receiver semantics through literal, stored and
   // repeated selectors. Check the native result and the frontend merge without
@@ -927,9 +928,12 @@ test("real embedded R completion inspects nested storage without running user co
       (expression, target) => backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression, target)));
     assert.deepEqual(entries.map(entry => entry.insertText), ["inner"], input);
   }
-  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt")), ["alpha", "beta"]);
-  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_dt[[1]]")), []);
-  assert.deepEqual(await backend.requestMemberNames(session, parseRuntimeMemberQuery("slice_list[1][[1]]")), ["child"]);
+  for (const [expression, names] of [["slice_dt", ["alpha", "beta"]], ["slice_dt[[1]]", []],
+    ["slice_list[1][[1]]", ["child"]]]) {
+    const result = await backend.inspectMemberNames(session, parseRuntimeMemberQuery(expression));
+    assert.equal(result.status, "available", expression);
+    assert.deepEqual(result.names, names, expression);
+  }
   await submit('escaped <- list(); escaped[["a\\\"b"]] <- list(inner = TRUE)');
   const escapedQuery = parseRuntimeMemberQuery('escaped[["a\\"b"]]', "$");
   assert.equal(escapedQuery.steps[0].name, 'a"b');
@@ -1047,7 +1051,7 @@ test("real embedded R completion inspects nested storage without running user co
   // Feed the actual insertion spelling back through the parser and native
   // inspector. Test both UI insertion paths, nested roots, and R's locale at
   // request time; never infer a legacy encoding from UTF-8-looking bytes.
-  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/candidates.ts", {vscode:{}});
+  const { backtickRName, quoteCompletionValue } = loadSource("src/Language/completion/rText.ts");
   await submit('escaped_names <- c("line\\u2028name", "para\\u2029name", "bidi\\u202ename", "c1\\u0085name"); escaped_holder <- setNames(rep(list(list(child=1)), length(escaped_names)), escaped_names); escaped_index <- escaped_names[[1]]; assign(escaped_index, list(child=1), .GlobalEnv); assign("selector\\u2028key", escaped_index, .GlobalEnv); saved_ctype <- Sys.getlocale("LC_CTYPE"); stopifnot(l10n_info()[["UTF-8"]])');
   const escapedEntries = await completion.collectCompletionEntries(
     completion.getCompletionContext("escaped_holder$", 15), undefined, undefined, undefined, [], [], undefined,
@@ -1161,9 +1165,10 @@ test("static routing preserves search-path identity, opaque callables and stored
     libraries: [library], requestRuntimeFunctionArguments: (e) => inspect(e, "arguments"),
   });
   const lang = new RTermLang({ extensionPath: root, rPath: "R", env: {}, getStaticAnalysisEnabled: () => true, requestRuntimeMemberCompletions: inspect, requestRuntimeFunctionSource: (name, target = "source") => backend.inspectMemberNames(session, { root: name, steps: [], target }) });
-  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: async (...args) => {
-    const r = await client.provideCompletionItems(...args);
-    return r && { ...r, items: r.items.map((x) => ({ ...x, kind: x.kind - 1 })) };
+  lang.getCompletionProvider = async () => ({ provideStaticCompletion: async request => {
+    const outcome = await client.provideStaticCompletion(request);
+    const r = outcome.completion;
+    return { ...outcome, completion: r && { ...r, items: r.items.map(x => ({ ...x, kind: x.kind - 1 })) } };
   } });
   lang.getOrOpenCompletionDocument = async (text) => ({ getText: () => text, uri: client.inputDocument.uri });
   const complete = async (text) => {

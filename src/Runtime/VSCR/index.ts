@@ -43,7 +43,6 @@ export function disposeVscodeRIntegrationForRuntimeSession(sessionId: string): v
 
 export type { VscodeRSessionIntegration } from "./integration";
 export type {
-  SessionMemberCompletionItem,
   VscodeRIntegrationOptions,
   WorkspaceData,
 } from "./types";

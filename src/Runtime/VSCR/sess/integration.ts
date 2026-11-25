@@ -363,10 +363,6 @@ export class SessVscodeRIntegration extends BaseVscodeRSessionIntegration {
     return this.proxy?.getWorkspaceData();
   }
 
-  override async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
-    return await this.proxy?.requestWorkspace();
-  }
-
   override filterRuntimeOutput(text: string): string {
     let filtered = text.replace(SESS_ASYNC_PROMPT_PATTERN, "$1\r\n");
     if (this.reconnectPending || this.reconnectNoiseUntil > Date.now()) {

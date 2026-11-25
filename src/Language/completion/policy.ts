@@ -6,7 +6,7 @@ import type { CompletionContext } from "./types";
  */
 export function allowsSymbolCompletions(context: CompletionContext): boolean {
   if (context.suppressAutomatic || context.bracketQuote || context.argumentValue?.quote ||
-      context.kind === "member" || context.kind === "package") return false;
+      context.kind === "member" || context.kind === "package" || context.kind === "static") return false;
   return context.prefix.length > 0 || !!context.pipe ||
     (context.kind === "default" && !context.dataObjectName);
 }

@@ -1,16 +1,16 @@
 import * as vscode from "vscode";
 import {
   type CompletionContext, type CompletionEntries, type CompletionEntry, type CompletionPickItem,
-  getCompletionContext, getStaticFallbackContext, rankCompletionEntries, isCompletionPickItem,
+  getCompletionContext, getStaticCompletionContext, rankCompletionEntries, isCompletionPickItem,
   toCompletionQuickPickItems,
 } from "../../Language/completion";
-import { rebaseCompletionEnds } from "../../Language/completion/refinement";
-import { backtickRName, quoteCompletionValue } from "../../Language/completion/candidates";
+import { composeCompletionPreviewEdits } from "../../Language/completion/refinement";
+import { backtickRName, quoteCompletionValue } from "../../Language/completion/rText";
 import type { InputSnapshot } from "./lang";
 
 /** Quick Pick presentation and preview lifecycle, independent of LSP processes. */
 export async function pickCompletion({
-  context, latestInput, initialEntries, stagedEntries, delayedEntries, force, isCurrent, collect, signal,
+  context, latestInput, initialEntries, stagedEntries, delayedEntries, force, isCurrent, collect, signal, cancelPending,
 }: {
   context: CompletionContext;
   latestInput: InputSnapshot;
@@ -19,6 +19,7 @@ export async function pickCompletion({
   delayedEntries?: Promise<CompletionEntries | undefined>;
   force: boolean;
   signal?: AbortSignal;
+  cancelPending?: () => void;
   isCurrent: () => boolean;
   collect: (context: CompletionContext, text: string, lines: string[], cursorCol: number,
     onStagedEntries: (entries: CompletionEntries) => void) => Promise<CompletionEntries | undefined>;
@@ -88,6 +89,8 @@ export async function pickCompletion({
     let refinedPrefix: string | undefined;
     let baselineEntries = initialEntries;
     let baselineIncomplete = initialEntries.isIncomplete === true;
+    let baselineReady = !stagedEntries && !delayedEntries;
+    let baselineGeneration = 0;
     let sourceEntries = initialEntries;
     let sourceIncomplete = baselineIncomplete;
     let baselinePhase = 0;
@@ -98,19 +101,40 @@ export async function pickCompletion({
       placeholder: completionPlaceHolder,
     });
     setQuickPickItems(pick, sourceEntries, "");
-    const updateBaseline = (phase: number, nextEntries: CompletionEntries | undefined): void => {
-      if (!active || !nextEntries || !isCurrent() || phase < baselinePhase) return;
+    const updateBaseline = (phase: number, nextEntries: CompletionEntries | undefined, generation = 0): void => {
+      if (!active || !nextEntries || !isCurrent() || generation !== baselineGeneration || phase < baselinePhase) return;
       // A slower native-only result must not replace the completed LSP merge.
       baselinePhase = phase;
       baselineEntries = nextEntries;
       baselineIncomplete = nextEntries.isIncomplete === true;
+      baselineReady = phase === 2;
       if (refinedPrefix !== undefined) return;
       sourceEntries = nextEntries;
-      sourceIncomplete = baselineIncomplete;
-      void changeValue(pick.value).catch(() => undefined);
+      sourceIncomplete = baselineIncomplete || !baselineReady;
+      if (pick.value) void changeValue(pick.value).catch(() => undefined);
+      else setQuickPickItems(pick, sourceEntries, pick.value);
     };
-    void stagedEntries?.then(entries => updateBaseline(1, entries)).catch(() => undefined);
+    void stagedEntries?.then(entries => updateBaseline(delayedEntries ? 1 : 2, entries)).catch(() => undefined);
     void delayedEntries?.then(entries => updateBaseline(2, entries)).catch(() => undefined);
+    const requestBaseline = async (currentRequest: number): Promise<void> => {
+      const generation = ++baselineGeneration;
+      baselinePhase = 0;
+      baselineReady = false;
+      let finished = false;
+      const publish = (phase: number, entries: CompletionEntries | undefined) => {
+        if (currentRequest === request) updateBaseline(phase, entries, generation);
+      };
+      try {
+        // Restore the exact source snapshot, including escaped prefixes and
+        // suffixes. A cancelled initial query may have supplied only staging.
+        const entries = await collect(context, latestInput.text, [...latestInput.lines], latestInput.cursorCol,
+          staged => { if (!finished) publish(1, staged); });
+        finished = true;
+        publish(2, entries);
+      } finally {
+        finished = true;
+      }
+    };
     const changeValue = async (value: string): Promise<void> => {
       const refinesBlankContext =
         context.prefix.length === 0 &&
@@ -118,11 +142,14 @@ export async function pickCompletion({
           context.kind === "argument" ||
           (context.kind === "bracket" && !!context.dataObjectName));
       if (value.length === 0) {
+        const wasRefined = refinedPrefix !== undefined;
+        if (wasRefined) cancelPending?.();
         refinedPrefix = undefined;
-        request += 1;
+        const currentRequest = ++request;
         sourceEntries = baselineEntries;
-        sourceIncomplete = baselineIncomplete;
+        sourceIncomplete = baselineIncomplete || !baselineReady;
         setQuickPickItems(pick, sourceEntries, value);
+        if (wasRefined && sourceIncomplete) await requestBaseline(currentRequest);
         return;
       }
 
@@ -159,7 +186,7 @@ export async function pickCompletion({
       // source. Retain an opening backtick and escape the replacement prefix;
       // existing suffixes (including a closing quote) stay after the cursor.
       const quote = context.bracketQuote ?? context.argumentValue?.quote;
-      const spelling = quote ? quoteCompletionValue(prefix, quote) : context.kind === "member" && latestInput.currentLine[context.replaceStart] === "`"
+      const spelling = quote ? quoteCompletionValue(prefix, quote) : (context.kind === "member" || context.kind === "static") && latestInput.currentLine[context.replaceStart] === "`"
         ? backtickRName(prefix).slice(0, -1) : prefix;
       const cursorCol = context.replaceStart + spelling.length;
       const currentLine = latestInput.currentLine.slice(0, context.replaceStart) + spelling + latestInput.currentLine.slice(latestInput.cursorCol);
@@ -171,13 +198,16 @@ export async function pickCompletion({
       ].join("\n");
       const nextInputText = lines.join("\n");
       const nextContext = context.kind === "package"
-        ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined, snapshotInput: currentLine, snapshotCursor: cursorCol }
-        : (context.staticFallback
-          ? getStaticFallbackContext(currentLine, cursorCol, fullTextBeforeCursor,
+        ? { ...context, prefix, triggerCharacter: prefix.length === 0 ? context.triggerCharacter : undefined,
+            replaceEnd: context.replaceEnd === undefined ? undefined : context.replaceEnd + cursorCol - latestInput.cursorCol,
+            snapshotInput: currentLine, snapshotCursor: cursorCol }
+        : context.staticFallback
+          ? getStaticCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
               nextInputText.slice(fullTextBeforeCursor.length))
-          : undefined) ?? getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
+          : getCompletionContext(currentLine, cursorCol, fullTextBeforeCursor,
             nextInputText.slice(fullTextBeforeCursor.length));
       if (!nextContext) {
+        cancelPending?.();
         return;
       }
       if (prefix.length > 0) {
@@ -186,7 +216,11 @@ export async function pickCompletion({
       const publish = (nextEntries: CompletionEntries): boolean => {
         if (!active || !isCurrent() || currentRequest !== request) return false;
         // LSP edits target the preview, but acceptance edits the actual input.
-        sourceEntries = rebaseCompletionEnds(nextEntries, latestInput.cursorCol - cursorCol);
+        sourceEntries = composeCompletionPreviewEdits(nextEntries, {
+          prefixStart: context.replaceStart, originalCursor: latestInput.cursorCol,
+          originalLength: latestInput.text.length - latestInput.textBeforeCursor.length + latestInput.cursorCol,
+          previewContext: nextContext,
+        });
         sourceIncomplete = nextEntries.isIncomplete === true;
         setQuickPickItems(pick, sourceEntries, pick.value);
         return true;

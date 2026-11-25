@@ -14,6 +14,13 @@ const vscode = {
   SnippetString: class { constructor(value) { this.value = value; } },
 };
 const completion = loadSource("src/Language/completion.ts", { vscode });
+const { getStaticFallbackContext } = loadSource('src/Language/completion/syntax.ts');
+const { storedCompletionReceiver } = loadSource('src/Language/completion/sourceReceiver.ts');
+const { provideNativeStaticCompletion } = loadSource('src/Language/completion/nativeStaticProvider.ts');
+// Model the production native adapter explicitly; runtime-only providers have no static capability.
+const nativeProvider = provider => ({ ...provider, provideStaticCompletion: request =>
+  provideNativeStaticCompletion(binding => provider.provideCompletionItems(request.document, request.position,
+    request.triggerCharacter, request.contextPosition, undefined, 'static', request.requestScope, binding), request) });
 const snapshot = (text, cursor = text.length) => {
   const before = text.slice(0, cursor);
   const lines = text.split("\n");
@@ -23,7 +30,17 @@ const snapshot = (text, cursor = text.length) => {
 };
 const labels = entries => entries.filter(entry => "insertText" in entry).map(entry => entry.insertText);
 
-function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources } = {}) {
+test('the static provider contract types candidate provenance without native metadata', () => {
+  const path = require('node:path');
+  const compiler = path.join(path.dirname(require.resolve('typescript/package.json')), 'bin/tsc');
+  require('node:child_process').execFileSync(process.execPath, [compiler,
+    '--ignoreConfig', '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022', '--module', 'commonjs', '--esModuleInterop',
+    '--types', 'node',
+    'tests/fixtures/static-provider.ts',
+  ], { cwd: path.resolve(__dirname, '../..'), encoding: 'utf8' });
+});
+
+function harness({ staticAnalysis = true, inspected, lspItems, sessionData, storedSources, staticProvider } = {}) {
   const logs = [], native = [], requests = [], sourceRequests = [], sourceTargets = [];
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: { ...vscode, window: { createOutputChannel: () => ({
@@ -47,7 +64,7 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
         inspected ?? { status: "available", names: [] });
     },
   });
-  const provider = { provideCompletionItems: async (doc, position, trigger, contextPosition, bracket, mode, sourceDefinition) => {
+  const provider = nativeProvider({ provideCompletionItems: async (doc, position, trigger, contextPosition, bracket, mode, requestScope, sourceDefinition) => {
     requests.push({ text: doc.getText(), position, mode, sourceDefinition });
     return typeof lspItems === "function" ? lspItems(mode, sourceDefinition) : lspItems ?? {
       rConsoleMemberResolved: true,
@@ -56,16 +73,17 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
         { label: "ambient", kind: 5 },
       ],
     };
-  } };
-  lang.ensureConsoleLspStarted = async () => provider;
+  } });
+  if (staticProvider) provider.provideStaticCompletion = staticProvider;
+  lang.getCompletionProvider = async () => provider;
   lang.getOrOpenCompletionDocument = async text => ({
     getText: () => text,
     uri: { toString: () => "r-console://test/console.R" },
   });
-  const complete = async (text, cursor = text.length) => {
+  const complete = async (text, cursor = text.length, force = false) => {
     const input = snapshot(text, cursor);
     let entries;
-    await lang.handleAutocomplete({ input, getCurrentInput: () => input,
+    await lang.handleAutocomplete({ input, force, getCurrentInput: () => input,
       getWorkspaceData: () => sessionData, applyCompletion() {},
       onInlineEntries: value => { entries = value; } });
     // A bracket request can publish staged native data asynchronously.
@@ -74,6 +92,33 @@ function harness({ staticAnalysis = true, inspected, lspItems, sessionData, stor
   };
   return { lang, complete, logs, native, requests, sourceRequests, sourceTargets };
 }
+
+test('explicit inline completion retains live symbols at blank expression positions in both analysis modes', async () => {
+  for (const staticAnalysis of [false, true]) {
+    const h = harness({ staticAnalysis, sessionData: { globalenv: { my_value: { type: 'double' } } },
+      lspItems: { items: [] } });
+    for (const marked of ['result <- │', '1 + │', 'result <- (│)', 'if (TRUE) │',
+      'f <- function() { │}', 'first <- 1; │', 'first <- 1\nresult <- │']) {
+      const text = marked.replace('│', ''), cursor = marked.indexOf('│');
+      const entries = (await h.complete(text, cursor, true)).filter(item => 'insertText' in item);
+      const item = entries.find(item => item.insertText === 'my_value');
+      assert.ok(item, `${staticAnalysis}: ${marked}`);
+      assert.equal(item.replaceStart, snapshot(text, cursor).cursorCol);
+      assert.equal(item.replaceEnd ?? item.snapshotCursor, item.snapshotCursor);
+    }
+    assert.deepEqual(h.native, [], 'ordinary expression completion does not inspect a receiver');
+  }
+});
+
+test('static receiver and literal contexts keep ambient live symbols isolated', async () => {
+  const h = harness({ sessionData: { globalenv: { my_value: { type: 'double' } } },
+    lspItems: { items: [] } });
+  for (const text of ['factory()$', 'factory()[[', 'factory()[, ', 'factory()[1, "',
+    '"', '# comment ']) {
+    assert.deepEqual(labels(await h.complete(text, text.length, true)), [], text);
+  }
+  assert.deepEqual(h.native, [], 'unclassified receivers must remain source-only');
+});
 
 test("unavailable stored method arguments log the reason and remain retryable", async () => {
   for (const staticAnalysis of [true, false]) {
@@ -103,7 +148,7 @@ test("source-only context retains the correct prefix and replacement location fo
     ["obj[[side_effect()]]$", "member", "", 21],
     ["obj[[side_effect()]]$al", "member", "al", 21],
   ]) {
-    const context = completion.getStaticFallbackContext(text, text.length);
+    const context = getStaticFallbackContext(text, text.length);
     assert.equal(context?.kind, expectedKind, text);
     assert.equal(context?.prefix, prefix, text);
     assert.equal(context?.replaceStart, start, text);
@@ -111,20 +156,20 @@ test("source-only context retains the correct prefix and replacement location fo
     assert.equal(context?.rejectionReason, undefined, text);
   }
   const middle = "make_data()$alpha";
-  const memberMiddle = completion.getStaticFallbackContext(middle, 14,
+  const memberMiddle = getStaticFallbackContext(middle, 14,
     middle.slice(0, 14), middle.slice(14));
   assert.equal(memberMiddle?.replaceStart, 12);
   assert.equal(memberMiddle?.replaceEnd, middle.length);
   const quoted = 'make_data()[["alpha"]]';
   const caret = quoted.indexOf("alpha") + 2;
-  const quotedContext = completion.getStaticFallbackContext(quoted, caret,
+  const quotedContext = getStaticFallbackContext(quoted, caret,
     quoted.slice(0, caret), quoted.slice(caret));
   assert.equal(quotedContext?.kind, "bracket");
   assert.equal(quotedContext?.prefix, "al");
   assert.equal(quotedContext?.bracketQuote, '"');
   assert.equal(quotedContext?.replaceStart, quoted.indexOf("alpha"));
   assert.equal(quotedContext?.replaceEnd, quoted.indexOf("alpha") + 5);
-  assert.equal(completion.getStaticFallbackContext("obj$al", 6), undefined);
+  assert.equal(getStaticFallbackContext("obj$al", 6), undefined);
 });
 
 test("escaped quoted [[ prefixes decode without evaluation and keep mid-key edit bounds", () => {
@@ -138,7 +183,7 @@ test("escaped quoted [[ prefixes decode without evaluation and keep mid-key edit
   ]) {
     const caret = marked.indexOf("│");
     const text = marked.replace("│", "");
-    const context = completion.getStaticFallbackContext(text, caret,
+    const context = getStaticFallbackContext(text, caret,
       text.slice(0, caret), text.slice(caret));
     assert.equal(context?.kind, "bracket", marked);
     assert.equal(context?.prefix, expected, marked);
@@ -155,17 +200,17 @@ test("decoded quoted fallback prefixes select escaped source member labels", asy
   ]) {
     const caret = marked.indexOf("│");
     const input = marked.replace("│", "");
-    const context = completion.getStaticFallbackContext(input, caret,
+    const context = getStaticFallbackContext(input, caret,
       input.slice(0, caret), input.slice(caret));
     assert.equal(context?.kind, "bracket", marked);
     const entries = await completion.collectStaticFallbackEntries(context, {
       getText: () => input, uri: { toString: () => "r-console://test/console.R" },
-    }, new Position(0, caret), [], {
+    }, new Position(0, caret), [], nativeProvider({
       provideCompletionItems: async () => ({ rConsoleMemberResolved: true, items: [
         { label, kind: 4, data: { type: "member" } },
         { label: "ambient", kind: 5, data: { type: "scope" } },
       ] }),
-    });
+    }));
     assert.deepEqual(entries.map(entry => entry.label), [label], marked);
     assert.equal(entries.staticResolved, true, marked);
   }
@@ -175,14 +220,14 @@ test("decoded quoted fallback prefixes select escaped source member labels", asy
 test("source-only completion remains retryable until the language server recovers", async () => {
   for (const missing of ["server", "document"]) {
     const h = harness();
-    const server = await h.lang.ensureConsoleLspStarted();
+    const server = await h.lang.getCompletionProvider();
     const getDocument = h.lang.getOrOpenCompletionDocument.bind(h.lang);
-    if (missing === "server") h.lang.ensureConsoleLspStarted = async () => undefined;
+    if (missing === "server") h.lang.getCompletionProvider = async () => undefined;
     else h.lang.getOrOpenCompletionDocument = async () => undefined;
     assert.deepEqual(labels(await h.complete("make_data()$")), []);
     assert.equal(h.lang.inlineCache?.entries.isIncomplete, true, missing);
     assert.equal(h.lang.hasCompleteInlineMemberCache(), false, missing);
-    h.lang.ensureConsoleLspStarted = async () => server;
+    h.lang.getCompletionProvider = async () => server;
     h.lang.getOrOpenCompletionDocument = getDocument;
     assert.deepEqual(labels(await h.complete("make_data()$al")), ["alpha"]);
     assert.deepEqual(h.requests.map(request => request.mode), ["static"]);
@@ -191,14 +236,14 @@ test("source-only completion remains retryable until the language server recover
 
 test("unformatted inferred member names are escaped for R accessors and quoted indices", async () => {
   const infer = async (source, cursor, items) => {
-    const context = completion.getStaticFallbackContext(source, cursor,
+    const context = getStaticFallbackContext(source, cursor,
       source.slice(0, cursor), source.slice(cursor));
     assert.ok(context?.staticFallback, source);
     const entries = await completion.collectStaticFallbackEntries(context, {
       getText: () => source, uri: { toString: () => "r-console://test/console.R" },
-    }, new Position(0, cursor), [], {
+    }, new Position(0, cursor), [], nativeProvider({
       provideCompletionItems: async () => ({ rConsoleMemberResolved: true, items }),
-    });
+    }));
     return entries.map(entry => completion.toCompletionPick(entry, context));
   };
   const memberItems = [
@@ -234,11 +279,11 @@ test("unformatted inferred member names are escaped for R accessors and quoted i
 
 test("static fallback uses only inferred member results and the requested analysis mode", async () => {
   const input = "make_data()$al";
-  const context = completion.getStaticFallbackContext(input, input.length);
+  const context = getStaticFallbackContext(input, input.length);
   const calls = [];
   const items = await completion.collectStaticFallbackEntries(context, {
     getText: () => input, uri: { toString: () => "r-console://test/console.R" },
-  }, new Position(0, input.length), [], {
+  }, new Position(0, input.length), [], nativeProvider({
     provideCompletionItems: async (...args) => {
       calls.push(args);
       return { rConsoleMemberResolved: true, items: [
@@ -247,7 +292,7 @@ test("static fallback uses only inferred member results and the requested analys
         { label: "argument", kind: 5, detail: "parameter" },
       ] };
     },
-  });
+  }));
   assert.deepEqual(items.map(item => item.label), ["alpha"]);
   assert.equal(items[0].replaceStart, context.replaceStart);
   assert.equal(items.staticResolved, true);
@@ -382,7 +427,7 @@ test("static fallback explains unresolved methods without calling an empty resul
 
 test("static fallback distinguishes missing services, failed requests and absent inference evidence", async () => {
   for (const [setup, expected] of [
-    [h => { h.lang.ensureConsoleLspStarted = async () => undefined; }, /language server is not available/],
+    [h => { h.lang.getCompletionProvider = async () => undefined; }, /language server is not available/],
     [h => { h.lang.getOrOpenCompletionDocument = async () => undefined; }, /console input is not available/],
     [() => {}, /returned no completion result/],
   ]) {
@@ -397,11 +442,13 @@ test("static fallback distinguishes missing services, failed requests and absent
   assert.ok(failed.logs.every(line => !/private source|INJECTED/.test(line)));
 });
 
-test("static fallback retains only validated diagnostic metadata across matching retries", async () => {
+test("static fallback retains only validated diagnostic metadata across later requests", async () => {
   let requests = 0;
   const h = harness({ lspItems: () => ++requests === 1
     ? { items: [], rConsoleStaticUnavailableReason: "analysis-pending" }
     : { items: [], rConsoleMemberResolved: true } });
+  await h.complete("make_data()$al");
+  assert.equal(requests, 1, 'pending analysis does not trigger an immediate prefix retry');
   await h.complete("make_data()$al");
   assert.equal(requests, 2);
   assert.ok(h.logs.some(line => line.includes("[Static Completion - Inferred]")),
@@ -481,9 +528,9 @@ test("source receiver selection targets the root named call, not downstream call
     ["obj$", undefined],
   ];
   for (const [text, expected] of sourceNames) {
-    const context = completion.getStaticFallbackContext(text, text.length);
-    assert.equal(completion.storedFunctionReceiver(context ?? { kind: "default" }, text, text.length),
-      expected, text);
+    const context = getStaticFallbackContext(text, text.length);
+    const receiver = storedCompletionReceiver(context ?? { kind: "default" }, text, text.length);
+    assert.equal(receiver?.target === "binding" ? undefined : receiver?.name, expected, text);
   }
 });
 
@@ -491,7 +538,8 @@ test("deep receiver grouping uses an iterative walk without borrowing a compound
   const context = { kind: "member", staticFallback: true };
   for (const [body, expected] of [["make_data()", "make_data"], ["other + make_data()", undefined]]) {
     const input = "(".repeat(5000) + body + ")".repeat(5000) + "$";
-    assert.equal(completion.storedFunctionReceiver(context, input, input.length), expected);
+    const receiver = storedCompletionReceiver(context, input, input.length);
+    assert.equal(receiver?.target === "binding" ? undefined : receiver?.name, expected);
   }
 });
 
@@ -514,9 +562,9 @@ test("computed receiver identity follows only its outer named root", () => {
     ['(-iris[1,,drop=FALSE])$', undefined],
   ]) {
     const line = text.split('\n').at(-1);
-    const context = completion.getStaticFallbackContext(line, line.length, text) ??
+    const context = getStaticFallbackContext(line, line.length, text) ??
       completion.getCompletionContext(line, line.length, text);
-    const root = completion.storedReceiverRoot(context, text, text.length);
+    const root = storedCompletionReceiver(context, text, text.length);
     assert.equal(root?.name, expected, text);
     if (root) assert.ok(text.slice(root.start).startsWith(expected === 'odd root' ? '`odd root`' : expected));
   }
@@ -560,9 +608,9 @@ test("one receiver classification preserves source eligibility and root identity
   ]) {
     const expectedStart = marked.indexOf("│");
     const text = marked.replace("│", "");
-    const context = completion.getStaticFallbackContext(text, text.length) ??
+    const context = getStaticFallbackContext(text, text.length) ??
       completion.getCompletionContext(text, text.length);
-    const receiver = completion.storedCompletionReceiver(context, text, text.length);
+    const receiver = storedCompletionReceiver(context, text, text.length);
     assert.equal(receiver?.name, name, text);
     assert.equal(receiver?.target, target, text);
     assert.equal(receiver?.start, expectedStart === -1 ? undefined : expectedStart, text);
@@ -723,7 +771,7 @@ test("continued and quoted executable members keep static routing and exclude am
   ]) {
     const cursor = marked.indexOf("│"), text = marked.replace("│", "");
     const input = snapshot(text, cursor);
-    const context = completion.getStaticFallbackContext(input.currentLine, input.cursorCol,
+    const context = getStaticFallbackContext(input.currentLine, input.cursorCol,
       input.textBeforeCursor, text.slice(cursor));
     assert.equal(context?.prefix, prefix, marked);
     assert.equal(context?.kind, "member", marked);
@@ -772,7 +820,7 @@ test("literal names begun on earlier lines never expose unrepresentable edits", 
     'make_data()[["odd\nfi', 'outer(make_data()[["odd\nfi', 'obj[["odd\nfi',
   ]) {
     const input = snapshot(text);
-    assert.equal(completion.getStaticFallbackContext(input.currentLine, input.cursorCol, text), undefined, text);
+    assert.equal(getStaticFallbackContext(input.currentLine, input.cursorCol, text), undefined, text);
     for (const staticAnalysis of [false, true]) {
       const h = harness({ staticAnalysis, storedSources: { make_data: 'function() list("odd\\nfield" = 1)' },
         inspected: { status: "available", names: ["odd\nfield"] },
@@ -793,7 +841,7 @@ test("source bracket routing counts individual nested delimiters", async () => {
     'wrapper(make_data()[x[1]])["al',
   ]) {
     const cursor = text.indexOf('"al') + 3;
-    const context = completion.getStaticFallbackContext(text, cursor);
+    const context = getStaticFallbackContext(text, cursor);
     assert.equal(context?.kind, "bracket", text);
     assert.equal(context.prefix, "al", text);
     assert.equal(context.bracketQuote, '"', text);
@@ -811,7 +859,11 @@ test("structural inference failures skip prefix retries while pending analysis s
     'analysis-limit', 'inference-cycle', 'no-receiver-members', 'analysis-pending', undefined]) {
     const h = harness({ lspItems: { items: [], rConsoleStaticUnavailableReason: reason } });
     await h.complete('unknown_factory()$abc');
-    assert.equal(h.requests.length, reason === 'analysis-pending' || reason === undefined ? 2 : 1, reason);
+    assert.equal(h.requests.length, reason === undefined ? 2 : 1, reason);
+    if (reason === 'analysis-pending') {
+      await h.complete('unknown_factory()$abc');
+      assert.equal(h.requests.length, 2, 'a later request retries pending analysis');
+    }
   }
 });
 
@@ -819,7 +871,7 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
   for (const text of ['make_data()[[index + "al', 'make_data()[[1, "al',
     'make_data()[[name = "al', 'make_data()[[index + al', 'make_data()[[1, al',
     'make_data()[["al" # comment']) {
-    assert.equal(completion.getStaticFallbackContext(text, text.length), undefined, text);
+    assert.equal(getStaticFallbackContext(text, text.length), undefined, text);
     const h = harness();
     await h.complete(text);
     assert.equal(h.requests.length, 0, text);
@@ -827,25 +879,26 @@ test('static bracket fallback accepts only a standalone key prefix', async () =>
   }
   for (const text of ['make_data()[["al', 'make_data()[[ # key\n "al']) {
     const line = text.split('\n').at(-1);
-    assert.equal(completion.getStaticFallbackContext(line, line.length, text)?.prefix, 'al', text);
+    assert.equal(getStaticFallbackContext(line, line.length, text)?.prefix, 'al', text);
   }
 });
 
-test("stored source retrieval overlaps LSP startup and cancellation discards its result", { timeout: 3000 }, async () => {
+test("cancelled provider acquisition does not authorize a binding lookup", { timeout: 3000 }, async () => {
   for (const text of ['make_data()$', 'make_data()$method(']) {
     let release, entered;
     const started = new Promise(resolve => { entered = resolve; });
     const waiting = new Promise(resolve => { release = resolve; });
-    const h = harness({ storedSources: () => { entered(); return 'function() list(method=function(alpha) NULL)'; } });
-    const provider = h.lang.ensureConsoleLspStarted;
-    h.lang.ensureConsoleLspStarted = async () => { await waiting; return provider(); };
+    const h = harness({ storedSources: { make_data: 'function() list(method=function(alpha) NULL)' } });
+    const provider = h.lang.getCompletionProvider;
+    h.lang.getCompletionProvider = async () => { entered(); await waiting; return provider(); };
     const pending = h.complete(text);
     await started;
-    assert.equal(h.requests.length, 0, 'source starts while the LSP is still unavailable');
+    assert.deepEqual(h.sourceRequests, [], 'binding selection requires an acquired provider');
     h.lang.cancelCompletion();
     release();
     await pending;
-    assert.equal(h.requests.length, 0, 'cancelled source cannot reach the provider');
+    assert.deepEqual(h.sourceRequests, []);
+    assert.deepEqual(h.requests, []);
   }
 });
 
@@ -861,7 +914,8 @@ test("factory argument source selection preserves complete receiver identity", (
     ['obj[[make_data()]]$method(', undefined],
   ]) {
     const context = completion.getCompletionContext(text, text.length);
-    assert.equal(completion.storedFunctionReceiver(context, text, text.length), expected, text);
+    const receiver = storedCompletionReceiver(context, text, text.length);
+    assert.equal(receiver?.target === "binding" ? undefined : receiver?.name, expected, text);
   }
 });
 
@@ -870,5 +924,304 @@ test("refused live receivers carry their root identity into source fallback", as
     const h = harness({ inspected: { status: 'suppressed', reason: 'active-binding' } });
     await h.complete(text);
     assert.deepEqual(h.requests.at(-1).sourceDefinition, { name: 'iris', opaqueReceiver: true });
+  }
+});
+
+test('static providers discover multiple dependencies without terminal receiver selection', async () => {
+  for (const text of ['factory(helper())$', '(left + factory())$']) {
+    const requests = [];
+    const h = harness({ storedSources: name => 'function() list(' + name + '=1)',
+      staticProvider: async request => {
+        requests.push(request);
+        assert.deepEqual(h.sourceRequests, [], 'terminal performs no speculative source lookup');
+        for (const name of ['helper', 'left', 'factory']) {
+          const found = await request.bindings.resolve({ name, lookup: 'function' });
+          assert.equal(found.status, 'source');
+        }
+        return { status: 'resolved', completion: { items: [{ label: 'alpha', kind: 4, role: 'member' }] } };
+      },
+    });
+    assert.deepEqual(labels(await h.complete(text)), ['alpha']);
+    assert.deepEqual(h.sourceRequests, ['helper', 'left', 'factory']);
+    assert.equal(requests[0].input, text);
+    assert.equal(requests[0].cursor, text.length);
+    assert.deepEqual(h.requests, [], 'general providers bypass the compatibility adapter');
+    assert.deepEqual(h.native, []);
+  }
+});
+
+test('typed static candidates supply members and arguments without native annotations', async () => {
+  for (const [text, role, insertText] of [
+    ['factory()$al', 'member', 'alpha'],
+    ['factory()[["al', 'member', 'alpha'],
+    ['factory()[, al', 'member', 'alpha'],
+    ['f(al', 'argument', 'alpha = '],
+    ['factory()$method(al', 'argument', 'alpha = '],
+    ['obj$method(al', 'argument', 'alpha = '],
+    ['obj$method(value = "al', 'value', 'alpha'],
+  ]) {
+    const h = harness({ staticProvider: async request => ({ status: 'resolved', completion: { items: [{
+      label: 'alpha', insertText, kind: 4, role,
+      // Display text is independent of a candidate's semantic role.
+      detail: role === 'argument' ? 'parameter' : 'provider description',
+      range: { start: new Position(0, request.cursor - 2), end: request.contextPosition },
+    }] } }) });
+    assert.deepEqual(labels(await h.complete(text)), [insertText], text);
+  }
+});
+
+test('static choices with the same display text retain distinct roles and insertions', async () => {
+  const choices = [
+    { label: 'alpha', insertText: 'alpha = ', kind: 5, role: 'argument' },
+    { label: 'alpha', insertText: 'alpha', kind: 5, role: 'symbol' },
+    { label: 'alpha', insertText: 'alpha[[1]]', kind: 5, role: 'symbol' },
+  ];
+  for (const items of [choices, [...choices].reverse()]) {
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: {
+      items: [...items, ...items.map(item => ({ ...item }))],
+    } }) });
+    const entries = await h.complete('f(al');
+    assert.deepEqual(labels(entries).sort(), choices.map(item => item.insertText).sort());
+    assert.ok(entries.some(item => item.label === 'Arguments'), 'argument choice remains grouped');
+    assert.ok(entries.some(item => item.label === 'Other'), 'expression choices remain grouped');
+  }
+});
+
+test('static choices preserve different edit ranges and package identities', async () => {
+  for (const fixture of [
+    { text: 'identity(co)', cursor: 11, items: [
+      { label: 'column', insertText: 'column', kind: 5, role: 'symbol',
+        range: { start: new Position(0, 9), end: new Position(0, 11) } },
+      { label: 'column', insertText: 'column', kind: 5, role: 'symbol',
+        range: { start: new Position(0, 0), end: new Position(0, 12) } },
+    ], expected: ['identity(column)', 'column'] },
+    { text: 'fi', cursor: 2, items: ['stats', 'dplyr'].map(packageName => ({
+      label: 'filter', insertText: 'filter()', kind: 2, role: 'symbol', packageName,
+    })), expected: ['stats', 'dplyr'] },
+  ]) {
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: {
+      items: [...fixture.items, ...fixture.items.map(item => ({ ...item }))],
+    } }) });
+    const entries = (await h.complete(fixture.text, fixture.cursor)).filter(item => 'insertText' in item);
+    assert.deepEqual(entries.map(item => item.packageName ??
+      fixture.text.slice(0, item.replaceStart) + item.insertText + fixture.text.slice(item.replaceEnd)),
+    fixture.expected);
+  }
+});
+
+test('inline members with edits that cannot be rebased request fresh provider results', async () => {
+  const h = harness({ staticProvider: async request => ({ status: 'resolved', completion: { items: [{
+    label: 'alpha', insertText: 'alpha'.slice(request.input.length - 'factory()$'.length), kind: 4, role: 'member',
+    range: { start: request.contextPosition, end: request.contextPosition },
+  }] } }) });
+  assert.deepEqual(labels(await h.complete('factory()$a')), ['lpha']);
+  assert.deepEqual(h.lang.refineInlineCompletion(snapshot('factory()$al')), []);
+  assert.equal(h.lang.hasCompleteInlineMemberCache(), false,
+    'dropping a cursor-dependent edit must schedule a provider refresh');
+  const entries = (await h.complete('factory()$al')).filter(item => 'insertText' in item);
+  assert.equal(entries.length, 1);
+  assert.equal('factory()$al'.slice(0, entries[0].replaceStart) + entries[0].insertText, 'factory()$alpha');
+});
+
+test('explicit static provenance excludes ambient symbols and external workspace candidates', async () => {
+  for (const text of ['factory()$al', 'factory()[["al']) {
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
+      { label: 'alpha', insertText: 'alpha', kind: 4, role: 'member' },
+      { label: 'alpha_scope', kind: 4, role: 'scope' },
+      { label: 'alpha_symbol', kind: 4, role: 'symbol', detail: 'parameter' },
+      { label: 'alpha_argument', kind: 5, role: 'argument' },
+      { label: 'alpha_external', kind: 2, role: 'member', workspaceOrigin: {
+        definitionUri: 'file:///other.R', contextUri: 'r-console://test/console.R',
+      } },
+    ] } }) });
+    assert.deepEqual(labels(await h.complete(text)), ['alpha'], text);
+  }
+  const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
+    { label: 'alpha', insertText: 'alpha', kind: 4, role: 'symbol', detail: 'parameter' },
+  ] } }) });
+  const entries = await h.complete('f(al');
+  assert.deepEqual(entries.filter(item => !('insertText' in item)).map(item => item.label), ['Fields']);
+});
+
+test('unknown static contexts reach providers with full source and validated replacement edits', async () => {
+  for (const marked of ['factory()[, co│lumn]', 'factory()[1, "co│lumn"]', 'x <- 1\nfactory()[, co│lumn]']) {
+    const cursor = marked.indexOf('│'), text = marked.replace('│', '');
+    const input = snapshot(text, cursor);
+    let calls = 0;
+    const h = harness({ staticProvider: async request => {
+      calls++;
+      assert.equal(request.input, text);
+      assert.equal(request.cursor, cursor);
+      assert.deepEqual(request.contextPosition, new Position(input.cursorRow, input.cursorCol));
+      const range = { start: new Position(input.cursorRow, input.cursorCol - 2), end: new Position(input.cursorRow, input.cursorCol + 4) };
+      return { status: 'resolved', completion: { items: [
+        { label: 'column', insertText: 'column', kind: 4, role: 'member', range },
+        { label: 'no edit', kind: 4, role: 'symbol' },
+        { label: 'column_external', insertText: 'column_external()', kind: 2, role: 'symbol', range,
+          workspaceOrigin: { definitionUri: 'file:///other.R', contextUri: 'file:///other.R' } },
+        { label: 'bad edit', insertText: 'bad', kind: 4, role: 'member', range: { ...range, start: new Position(input.cursorRow, -1) } },
+        { label: 'past end', insertText: 'bad', kind: 4, role: 'member', range: { ...range, end: new Position(input.cursorRow, 999) } },
+      ] } };
+    } });
+    const items = (await h.complete(text, cursor)).filter(x => 'insertText' in x);
+    assert.equal(calls, 1);
+    assert.deepEqual(items.map(x => x.insertText), ['column']);
+    assert.equal(items[0].replaceStart, input.cursorCol - 2);
+    assert.equal(items[0].replaceEnd, input.cursorCol + 4);
+    assert.deepEqual(h.native, []);
+    const disabled = harness({ staticAnalysis: false, staticProvider: () => { throw Error('static is disabled'); } });
+    assert.deepEqual(labels(await disabled.complete(text, cursor)), []);
+  }
+});
+
+test('unresolved and pending providers cannot leak unrelated candidates or reuse cancelled capabilities', async () => {
+  for (const status of ['unresolved', 'pending']) {
+    let retained, calls = 0;
+    const h = harness({ storedSources: { helper: 'function() 1' }, staticProvider: async request => {
+      retained = request.bindings;
+      calls++;
+      return { status, reason: status === 'pending' ? 'analysis-pending' : 'receiver-unresolved',
+        completion: { items: [{ label: 'co_unrelated', kind: 4, data: { type: 'member' } }] } };
+    } });
+    assert.deepEqual(labels(await h.complete('factory()[, co')), []);
+    assert.equal(calls, 1);
+    assert.equal((await retained.resolve({ name: 'helper', lookup: 'function' })).reason, 'cancelled');
+    assert.deepEqual(h.sourceRequests, []);
+    await h.complete('factory()[, co');
+    assert.equal(calls, 2, 'later requests can retry');
+  }
+});
+
+test('authoritative empty live receivers bypass the general static provider', async () => {
+  let calls = 0;
+  const h = harness({ inspected: { status: 'available', names: [] }, staticProvider: async () => {
+    calls++; return { status: 'resolved-empty', completion: { items: [] } };
+  } });
+  assert.deepEqual(labels(await h.complete('obj$')), []);
+  assert.equal(calls, 0);
+});
+
+test('value lookup of a non-callable binding remains opaque in the compatibility adapter', async () => {
+  const h = harness({ storedSources: { factory: { status: 'not-callable' } } });
+  await h.complete('(factory)()$');
+  assert.deepEqual(h.requests[0].sourceDefinition, { name: 'factory' });
+  assert.deepEqual(h.sourceTargets, ['source-value']);
+});
+
+test('authoritative empty static results stay complete and source refusal keeps its diagnostic', async () => {
+  for (const text of ['factory()$al', 'factory()[, co']) {
+    let calls = 0;
+    const h = harness({ staticProvider: async () => {
+      calls++; return { status: 'resolved-empty', completion: { items: [] } };
+    } });
+    assert.deepEqual(labels(await h.complete(text)), []);
+    assert.equal(calls, 1);
+    assert.equal(h.lang.inlineCache.entries.isIncomplete, undefined);
+    assert.ok(h.logs.some(line => line.includes('[Static Completion - Inferred]')));
+  }
+  const h = harness({ storedSources: { factory: { status: 'suppressed', reason: 'active-binding' } },
+    lspItems: { items: [], rConsoleStaticUnavailableReason: 'receiver-unresolved' } });
+  await h.complete('factory()$');
+  assert.ok(h.logs.some(line => line.includes('automatically linked')));
+});
+
+test('unknown signatures preserve expression symbols without reviving parameters or defaults', async () => {
+  for (const text of ['g <- function(f) { f(me', 'g <- function(f) { f(x = me']) {
+    const h = harness({ lspItems: { rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: 'receiver-unresolved', items: [
+        { label: 'mean', insertText: 'mean()', kind: 2 },
+        { label: 'method', kind: 5, detail: 'parameter' },
+        { label: 'method_value', kind: 11, detail: 'value for method' },
+        { label: 'member_parameter', kind: 5, data: { type: 'member', parameter: 'member_parameter' } },
+      ] } });
+    assert.deepEqual(labels(await h.complete(text)), ['mean()'], text);
+  }
+  for (const reason of ['request-failed', 'document-unavailable']) {
+    const h = harness({ lspItems: { rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: reason, items: [{ label: 'mean', kind: 2 }] } });
+    assert.deepEqual(labels(await h.complete('g <- function(f) { f(me')), [], reason);
+  }
+});
+
+test('static edits are validated in recognized member, bracket and argument contexts', async () => {
+  for (const text of ['factory()$al', 'factory()[["al', 'f(al', 'x <- 1\nfactory()$al']) {
+    const input = snapshot(text);
+    const context = completion.getStaticCompletionContext(input.currentLine, input.cursorCol, text);
+    const start = new Position(input.cursorRow, input.cursorCol - 2);
+    const end = new Position(input.cursorRow, input.cursorCol);
+    const h = harness({ staticProvider: async () => ({ status: 'resolved', completion: { items: [
+      { label: 'alpha', insertText: 'alpha', kind: 4, role: 'member', range: { start, end } },
+      { label: 'alpha_plain', kind: 4, role: 'member' },
+      ...[
+        { start: new Position(input.cursorRow, -2), end },
+        { start: new Position(input.cursorRow - 1, 0), end },
+        { start, end: new Position(input.cursorRow, input.cursorCol + 100) },
+        { start, end: new Position(input.cursorRow, input.cursorCol - 1) },
+        { start: new Position(input.cursorRow, input.cursorCol + 1), end },
+        { start: new Position(input.cursorRow, 0.5), end },
+      ].map(range => ({ label: 'alpha_bad', insertText: 'bad', kind: 4, role: 'member', range })),
+    ] } }) });
+    const entries = (await h.complete(text)).filter(x => 'insertText' in x);
+    assert.deepEqual(entries.map(x => x.insertText), ['alpha', 'alpha_plain'], text);
+    assert.equal(entries[0].replaceStart, context.replaceStart, text);
+  }
+});
+
+test('unknown signatures allow fuzzy expression retries while retaining parameter barriers', async () => {
+  for (const text of ['g <- function(f) { f(qnrm', 'g <- function(f) { f(x = qnrm', 'obj$method(qnrm']) {
+    let calls = 0;
+    const h = harness({ lspItems: () => ({
+      rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: text.startsWith('obj') ? 'method-arguments-unavailable' : 'receiver-unresolved',
+      items: ++calls === 1 ? [] : [
+        { label: 'qnorm', insertText: 'qnorm()', kind: 2 },
+        { label: 'qnrm_parameter', detail: 'parameter', kind: 5 },
+        { label: 'qnrm_value', detail: 'value for method', kind: 11 },
+      ],
+    }) });
+    assert.deepEqual(labels(await h.complete(text)), ['qnorm()'], text);
+    assert.equal(calls, 2, text);
+  }
+  for (const reason of ['analysis-pending', 'analysis-limit', 'request-failed', 'document-unavailable']) {
+    const h = harness({ lspItems: { items: [], rConsoleArgumentsResolved: false,
+      rConsoleStaticUnavailableReason: reason } });
+    assert.deepEqual(labels(await h.complete('g <- function(f) { f(qnrm')), []);
+    assert.equal(h.requests.length, 1, reason);
+  }
+});
+
+test('multiline static edit mapping shares document reads across candidates', async () => {
+  const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', { vscode });
+  const input = 'factory()[, co\nlumn]';
+  const position = new Position(0, 14);
+  const context = completion.getStaticCompletionContext(input.split('\n')[0], 14, input.slice(0, 14), input.slice(14));
+  const run = async count => {
+    let reads = 0;
+    const entries = await getLanguageServerCompletions(context,
+      { version: 1, getText: () => { reads++; return input; } }, position, [], {
+        provideStaticCompletion: async () => ({ status: 'resolved', completion: {
+          items: Array.from({ length: count }, (_, i) => ({ label: `column${i}`, insertText: `column${i}`, kind: 4, role: 'member',
+            range: { start: new Position(0, 12), end: new Position(1, 4) } })),
+        } }),
+      }, undefined, 'static');
+    assert.equal(entries.entries.length, count);
+    for (const entry of entries.entries) {
+      assert.equal(entry.replaceStart, 12);
+      assert.equal(entry.replaceEnd, 19);
+    }
+    return reads;
+  };
+  assert.equal(await run(100), await run(1));
+});
+
+test('transient provider metadata survives collection in ordinary symbols, calls and members', async () => {
+  for (const text of ['co', 'f(co', 'obj$co', 'obj[, co']) {
+    const context = completion.getCompletionContext(text, text.length);
+    const entries = await completion.collectCompletionEntries(context,
+      { version: 1, getText: () => text }, new Position(0, text.length), undefined, [], [], {
+        provideStaticCompletion: async () => ({ status: 'pending', reason: 'analysis-limit' }),
+      }, undefined, undefined, undefined, 'static');
+    assert.equal(entries.isIncomplete, true, text);
+    assert.equal(entries.staticUnavailableReason, 'analysis-limit', text);
   }
 });

@@ -120,7 +120,7 @@ console_supplement_completion <- function(reply, self, params) {
         reply$result$rConsoleStaticUnavailableReason <- reason
     }
 
-    if ((!is.null(params$rConsoleCall) || !is.null(params$rConsoleDataObject) || isTRUE(params$rConsolePipe)) &&
+    if (!static_analysis && (!is.null(params$rConsoleCall) || !is.null(params$rConsoleDataObject) || isTRUE(params$rConsolePipe)) &&
         is.character(params$rConsoleParseSuffix) && length(params$rConsoleParseSuffix) == 1L &&
         (nzchar(params$rConsoleParseSuffix) || !is.null(params$rConsoleParseInsertion))) {
         previous_parse <- document$parse_data
@@ -132,7 +132,8 @@ console_supplement_completion <- function(reply, self, params) {
         root <- tryCatch(str2lang(params$rConsoleDataObject), error = function(e) NULL)
         while (is.call(root) && is.symbol(root[[1L]]) && as.character(root[[1L]]) %in% c("$", "@", "[[")) root <- root[[2L]]
         # An unexecuted source binding is not the same object as a live namesake.
-        if (is.symbol(root) && !is.null(console_source_function(document, point, as.character(root)))) {
+        if (is.symbol(root) && isTRUE(console_source_binding(as.character(root), uri, workspace,
+            document, point)$source_binding)) {
             reply$result$rConsoleMemberResolved <- TRUE
         }
     }
@@ -145,7 +146,7 @@ console_supplement_completion <- function(reply, self, params) {
     member_call <- !is.null(call) && call$accessor %in% c("$", "@")
     method_root <- if (member_call) console_call_root(params$rConsoleCall, include_calls = TRUE) else NULL
     source_root <- if (static_analysis && member_call && !is.null(method_root))
-        console_source_function(document, point, method_root) else NULL
+        console_call_binding(document, point, method_root, uri, workspace) else NULL
     runtime_method <- if (member_call) console_runtime_arguments(params) else NULL
     runtime_method_evidence <- member_call && (!is.null(runtime_method) ||
         isTRUE(params$rConsoleRuntimeArgumentsRefused))
@@ -169,7 +170,7 @@ console_supplement_completion <- function(reply, self, params) {
     # precedence in normal console mode regardless of native package inference.
     source <- if (is.null(call) || !is.null(call$package) || !static_analysis) NULL else if (member_call) {
         if (native_arguments && !isTRUE(member_source$unknown)) NULL else member_source
-    } else console_source_function(document, point, call$token)
+    } else console_source_function(document, point, call$token, uri, workspace)
     source_is_static <- !is.null(source)
     if (source_is_static) reply$result$rConsoleRuntimeArgumentsIgnored <- TRUE
     runtime <- if (is.null(source) && !is.null(call) && is.null(call$package)) {
@@ -206,10 +207,10 @@ console_supplement_completion <- function(reply, self, params) {
         }
         signature
     }
-    if (member_call) {
+    if (member_call || source_is_static) {
         reply$result$rConsoleArgumentsResolved <- !is.null(signature)
         reply$result$rConsoleStaticUnavailableReason <- if (is.null(signature))
-            "method-arguments-unavailable" else NULL
+            if (member_call) "method-arguments-unavailable" else "receiver-unresolved" else NULL
     }
     if (is.null(call) && !is.null(params$rConsoleCall)) {
         # A name accepted by the frontend lexer may be invalid in R's locale
@@ -287,6 +288,19 @@ console_supplement_completion <- function(reply, self, params) {
 # re-enter this handler; the proxy changes only delivery of the final response.
 console_native_completion <- server$request_handlers[["textDocument/completion"]]
 server$request_handlers[["textDocument/completion"]] <- function(self, id, params) {
+    if (isTRUE(params$rConsoleStaticAnalysis)) {
+        uri <- languageserver:::uri_escape_unicode(params$textDocument$uri)
+        document <- self$get_workspace(uri)$documents$get(uri)
+        if (!is.null(document) && !identical(document$version, document$parse_data$version)) {
+            # Native completion can answer literal contexts before parsing.
+            # Our binding-safety check needs current source even for an empty
+            # response. Share the native parse queue, cancellation and replay;
+            # never repair or synchronously parse the draft in this adapter.
+            languageserver:::enqueue_latest_reply(self, uri, "textDocument/completion",
+                list(id = id, version = document$version, params = params))
+            return(invisible(NULL))
+        }
+    }
     proxy <- as.list(self)
     proxy$deliver <- function(reply) {
         if (inherits(reply, "Response")) {

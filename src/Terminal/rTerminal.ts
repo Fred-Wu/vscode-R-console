@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Terminal as HeadlessTerminal, type IBufferCell, type IBufferLine } from "@xterm/headless";
 import { spawnSync } from "child_process";
-import { CompletionPickItem, getCompletionContext, getStaticFallbackContext, parseRuntimeMemberQuery, type RuntimeFunctionSourceTarget } from "../Language/completion";
+import { CompletionPickItem, getCompletionContext, getStaticCompletionContext, parseRuntimeMemberQuery, type RuntimeFunctionSourceTarget } from "../Language/completion";
 import { logConsoleCompletionDecision, noteConsoleCompletionContext } from "../Language/completion/outputChannel";
 import { completionDecisionContext } from "../Language/completion/diagnostics";
 import { getCallOpenings, isCallableName } from "../Language/parser";
@@ -2173,15 +2173,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   // presenting asynchronous inline suggestions. Re-parsing only with the
   // strict runtime grammar would discard prefixes on executable receivers.
   private inlineCompletionContext(input: InputSnapshot): ReturnType<typeof getCompletionContext> {
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-      input.text.slice(input.textBeforeCursor.length));
     const staticEnabled = vscode.workspace.getConfiguration("r.console")
       .get<boolean>("completion.staticAnalysis", false);
-    return staticEnabled && (context?.rejectionReason ||
-      (context?.suppressAutomatic && input.textBeforeCursor.includes("[")))
-      ? getStaticFallbackContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length), context) ?? context
-      : context;
+    return (staticEnabled ? getStaticCompletionContext : getCompletionContext)(
+      input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
   }
 
   private scheduleInlineCompletion(): void {
@@ -2196,16 +2192,16 @@ export class RTerminal implements vscode.Pseudoterminal {
     const typing = settings.get<string>("inlineCompletion.trigger", "tab") === "typing";
     if (!this.inlineCompletion.visible && !typing) return;
     const input = this.getInputSnapshot();
-    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor),
-      this.lang.completionDiagnosticsScope);
     const staticEnabled = settings.get<boolean>("completion.staticAnalysis", false);
     const context = this.inlineCompletionContext(input);
+    noteConsoleCompletionContext(completionDecisionContext(input.textBeforeCursor, context),
+      this.lang.completionDiagnosticsScope);
     this.inlineCompletion.setQuery(context?.prefix ?? "");
     const configuredMinimum = settings.get<number>("inlineCompletion.minCharacters", 3);
     const minimum = Number.isInteger(configuredMinimum) && configuredMinimum >= 1 ? configuredMinimum : 3;
     if (context?.rejectionReason && !staticEnabled) {
       logConsoleCompletionDecision({ kind: "Rejected", reason: context.rejectionReason },
-        completionDecisionContext(input.textBeforeCursor), this.lang.completionDiagnosticsScope);
+        completionDecisionContext(input.textBeforeCursor, context), this.lang.completionDiagnosticsScope);
     }
     if (context?.rejectionReason || context?.suppressAutomatic || (typing && !this.inlineCompletionExplicit &&
         (!context || ((context.kind === "default" || context.kind === "argument") &&

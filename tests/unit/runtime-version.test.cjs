@@ -15,7 +15,7 @@ test("the implementation guide documents the active backend protocol", () => {
   const source = fs.readFileSync(path.join(root, "docs/IMPLEMENTATION.md"), "utf8");
   const { BACKEND_PROTOCOL_VERSION } = require("../helpers/load-source.cjs")("src/Runtime/backendProtocol.ts");
   const examples = [...source.matchAll(/"protocolVersion":(\d+)/g)].map(match => Number(match[1]));
-  assert.ok(examples.length >= 2, "documentation must include session bootstrap examples");
+  assert.ok(examples.length >= 1, "documentation must include a session bootstrap example");
   assert.ok(examples.every(version => version === BACKEND_PROTOCOL_VERSION),
     "all active bootstrap examples must match the current IPC protocol");
   assert.match(source, new RegExp(`requires protocol version ${BACKEND_PROTOCOL_VERSION}`));

@@ -3,12 +3,13 @@ const { test } = require('node:test');
 const loadSource = require('../helpers/load-source.cjs');
 const vscode = { QuickPickItemKind: { Separator: -1 }, CompletionItemKind: { Text: 0, Function: 2, Field: 4, Variable: 5 } };
 const completion = loadSource('src/Language/completion.ts', { vscode });
+const { getStaticFallbackContext } = loadSource('src/Language/completion/syntax.ts');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const entries = (labels, incomplete = false) => Object.assign(labels.map(label => ({
   label, insertText: label, source: 'lsp', kind: 5,
 })), { isIncomplete: incomplete });
 
-async function openPicker(t, text, initialEntries, collect, delayedEntries, cursor = text.length) {
+async function openPicker(t, text, initialEntries, collect, delayedEntries, cursor = text.length, staticAnalysis = false) {
   let change, hide;
   const pick = { items: [], value: '', activeItems: [],
     onDidChangeValue(fn) { change = fn; }, onDidAccept() {}, onDidHide(fn) { hide = fn; },
@@ -16,7 +17,8 @@ async function openPicker(t, text, initialEntries, collect, delayedEntries, curs
   const { pickCompletion } = loadSource('src/Terminal/rTerminal/completionPicker.ts', {
     vscode: { ...vscode, window: { createQuickPick: () => pick } },
   });
-  const context = completion.getStaticFallbackContext(text, cursor) ?? completion.getCompletionContext(text, cursor) ?? {
+  const context = (staticAnalysis ? completion.getStaticCompletionContext(text, cursor) : undefined) ??
+    getStaticFallbackContext(text, cursor) ?? completion.getCompletionContext(text, cursor) ?? {
     kind: 'default', prefix: '', replaceStart: 0, snapshotInput: text, snapshotCursor: text.length,
   };
   const showing = pickCompletion({ context, initialEntries, delayedEntries, force: true, isCurrent: () => true, collect,
@@ -159,7 +161,7 @@ test('typing in a pending bracket picker publishes native columns before LSP sta
     getStaticAnalysisEnabled: () => false,
     requestRuntimeMemberCompletions: () => new Promise(resolve => nativeRequests.push(resolve)),
   });
-  lang.ensureConsoleLspStarted = () => startup;
+  lang.getCompletionProvider = () => startup;
   lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
   const text = 'DT[,';
   const input = { text, currentLine: text, lines: [text], cursorRow: 0,
@@ -243,14 +245,18 @@ test('Quick Pick widening a completed query refreshes missing candidates', async
 
 test('clearing Quick Pick invalidates pending member and symbol results', async t => {
   for (const text of ['obj$', 'al']) {
-    let resolve;
+    const pending = [];
     const picker = await openPicker(t, text, entries(['alpha'], true),
-      () => new Promise(done => { resolve = done; }));
+      () => new Promise(done => { pending.push(done); }));
     await picker.type('az');
     await picker.type('');
-    resolve(entries(['azure']));
+    assert.equal(pending.length, 2, 'clearing refreshes the incomplete baseline');
+    pending[0](entries(['azure']));
     await tick();
     assert.deepEqual(picker.labels(), ['alpha'], text);
+    pending[1](entries(['alpine']));
+    await tick();
+    assert.deepEqual(picker.labels(), ['alpine'], text);
   }
 });
 
@@ -294,7 +300,7 @@ test('Quick Pick rejects acceptance after another input line changes', async () 
     '../../Language/consoleLspClient': { ConsoleLspClient: class {} },
     '../../Language/virtualRDocument': { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({ extensionPath: '', rPath: '', env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: '', rPath: '', env: {} });
   const text = 'obj <- first\nobj$';
   const input = { text, currentLine: 'obj$', lines: text.split('\n'), cursorRow: 1, cursorCol: 4, textBeforeCursor: text };
   let current = input, applied = false;
@@ -325,7 +331,7 @@ test('Tab and F7 open bracket Quick Pick while native and LSP results are pendin
     const lang = new RTermLang({ extensionPath: '', rPath: '', env: {},
       getStaticAnalysisEnabled: () => false,
       requestRuntimeMemberCompletions: () => native });
-    lang.ensureConsoleLspStarted = () => server;
+    lang.getCompletionProvider = () => server;
     lang.getOrOpenCompletionDocument = async text => ({ getText: () => text });
     const text = 'DT[, key';
     const input = { text, currentLine: text, lines: [text], cursorRow: 0,
@@ -454,6 +460,26 @@ test('quoted picker refinements preserve literal search text and original edit b
         assert.equal(picker.pick.items.find(item => 'insertText' in item).replaceEnd,
           text.indexOf('old') + 3, 'replacement end maps back to the original suffix');
       }
+    }
+  }
+});
+
+
+test('Quick Pick refinements preserve full input for generic static contexts', async t => {
+  for (const text of ['factory()[, co', 'factory()[1, "co']) {
+    const requests = [];
+    const picker = await openPicker(t, text, entries([], true), async (context, input) => {
+      requests.push({ context, input });
+      return entries(['column'], true);
+    }, undefined, text.length, true);
+    await picker.type('column');
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].context.kind, 'static');
+    assert.equal(requests[0].input, text.slice(0, -2) + 'column');
+    assert.ok(picker.labels().includes('column'));
+    if (text.includes('"')) {
+      await picker.type('co"lumn');
+      assert.equal(requests.at(-1).input, text.slice(0, -2) + 'co\\"lumn');
     }
   }
 });

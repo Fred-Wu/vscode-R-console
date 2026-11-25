@@ -34,14 +34,14 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
       if (method === "open" || method === "change") this.documents.push(params.text);
       if (method === "close") this.closed++;
     }
-    async sendRequest(method, params) {
+    async sendRequest(method, params, token) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
       if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
       if (method === "rConsole/libraryPaths") return libraries;
       if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
       assert.equal(method, "completion");
-      return await completion?.(this, params) ?? [{ label: "lm" }];
+      return await completion?.(this, params, token) ?? [{ label: "lm" }];
     }
   }
   const { ConsoleLspClient } = loadSource("src/Language/consoleLspClient.ts", {
@@ -59,6 +59,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
     },
     "vscode-languageclient/node": {
       LanguageClient,
+      CancellationTokenSource: require("vscode-languageserver-protocol").CancellationTokenSource,
       CompletionRequest: { type: "completion" },
       DidOpenTextDocumentNotification: { type: "open" },
       DidChangeTextDocumentNotification: { type: "change" },
@@ -81,6 +82,143 @@ function change() {
   return { libraries: [{ path: "/base/library", packages: new Map() }],
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
+
+test('terminal static lookup overlaps startup and preserves cancellation and failure recovery', { timeout: 5000 }, async t => {
+  for (const outcome of ['success', 'cancel', 'failure']) {
+    let releaseStartup, sourceEntered;
+    const startup = new Promise(resolve => { releaseStartup = resolve; });
+    const inspected = new Promise(resolve => { sourceEntered = resolve; });
+    t.after(releaseStartup);
+    let starts = 0, reads = 0;
+    const { client, instances } = createClient(t, { staticAnalysis: true,
+      start: async () => {
+        starts++;
+        await startup;
+        if (outcome === 'failure' && starts === 1) throw new Error('temporary startup failure');
+      },
+      completion: () => ({ rConsoleMemberResolved: true,
+        items: [{ label: 'alpha', kind: 4, data: { type: 'member' } }] }),
+    });
+    const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
+      vscode: { Position, CompletionItemKind: { Text: 0, Function: 2, Field: 4 },
+        QuickPickItemKind: { Separator: -1 } },
+      '../../Language/consoleLspClient': { ConsoleLspClient: class { constructor() { return client; } } },
+    });
+    const lang = new RTermLang({ extensionPath: '', rPath: 'R', env: {},
+      getStaticAnalysisEnabled: () => true,
+      requestRuntimeFunctionSource: async (name, target) => {
+        reads++;
+        assert.equal(name, 'factory');
+        assert.equal(target, 'source');
+        sourceEntered();
+        return { status: 'source', text: 'function() list(alpha=1)' };
+      },
+    });
+    lang.updateSessionData({ search: ['package:base'], globalenv: {} });
+    const text = 'factory()$';
+    const input = { text, textBeforeCursor: text, lines: [text], currentLine: text, cursorRow: 0, cursorCol: text.length };
+    lang.getOrOpenCompletionDocument = async () => ({ version: 1, getText: () => text });
+    let published = [];
+    const complete = () => lang.handleAutocomplete({ input, force: true, getCurrentInput: () => input,
+      getWorkspaceData: () => undefined, applyCompletion() {}, onInlineEntries: items => { published = items; } });
+    const result = complete();
+    await inspected;
+    assert.equal(starts, 1, 'concurrent readiness calls share one native startup');
+    assert.deepEqual(instances[0].documents, [], 'binding reads precede document synchronization');
+    if (outcome === 'cancel') {
+      lang.cancelCompletion();
+      await result; // Cancellation settles the request while startup is blocked.
+    }
+    releaseStartup();
+    await result;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(instances[0].requests.filter(r => r.method === 'completion').length, outcome === 'success' ? 1 : 0);
+    assert.equal(published.some(item => item.insertText === 'alpha'), outcome === 'success');
+    assert.equal(instances[0].documents.some(text => text.includes('factory')), outcome === 'success');
+    if (outcome === 'failure') {
+      assert.equal(lang.inlineCache.entries.isIncomplete, true);
+      await complete();
+      assert.equal(starts, 2);
+      assert.equal(reads, 2, 'recovery obtains a fresh binding snapshot');
+      assert.equal(published.some(item => item.insertText === 'alpha'), true);
+    }
+    await lang.dispose();
+  }
+});
+
+test('cancelled startup cannot replace a newer stored-source projection', async t => {
+  let releaseStartup, releaseReply, markSent;
+  const startup = new Promise(resolve => { releaseStartup = resolve; });
+  const reply = new Promise(resolve => { releaseReply = resolve; });
+  const sent = new Promise(resolve => { markSent = resolve; });
+  t.after(() => { releaseStartup([]); releaseReply(); });
+  const { client, instances } = createClient(t, {
+    staticAnalysis: true,
+    start: instance => {
+      const send = instance.sendRequest.bind(instance);
+      instance.sendRequest = (method, ...args) => method === 'rConsole/libraryPaths' ? startup : send(method, ...args);
+    },
+    completion: async () => { markSent(); await reply; return { items: [{ label: 'beta' }] }; },
+  });
+  const controller = new AbortController();
+  let text = 'factory()$';
+  const doc = { getText: () => text };
+  const old = client.provideCompletionItems(doc, new Position(0, text.length), undefined, undefined,
+    undefined, 'static', {}, { name: 'factory', body: 'function() list(alpha=1)' }, controller.signal);
+  while (!instances[0]?.running) await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  text = 'other()$';
+  const latest = client.provideCompletionItems(doc, new Position(0, text.length), undefined, undefined,
+    undefined, 'static', {}, { name: 'other', body: 'function() list(beta=1)' });
+  await sent;
+  releaseStartup([]);
+  assert.equal(await old, undefined);
+  assert.deepEqual(instances[0].documents, ['`other` <- function() list(beta=1)\nother()$']);
+  releaseReply();
+  assert.deepEqual((await latest).items, [{ label: 'beta' }]);
+});
+
+test('cancellation during session preparation or queued synchronization prevents obsolete work', async t => {
+  for (const phase of ['session', 'document', 'refresh']) {
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const waiting = new Promise(resolve => { entered = resolve; });
+    t.after(release);
+    let inspections = 0;
+    const { client, instances } = createClient(t, { staticAnalysis: true,
+      requestRuntimeFunctionArguments: async () => { inspections++; return { status: 'arguments', names: ['arg'] }; },
+    });
+    await client.start();
+    if (phase === 'session') {
+      const prepare = client.applySessionState.bind(client);
+      let first = true;
+      client.applySessionState = async (...args) => {
+        if (first) { first = false; entered(); await gate; }
+        return prepare(...args);
+      };
+    } else if (phase === 'document') {
+      client.documentSyncPromise = gate;
+      const sync = client.syncDocument.bind(client);
+      client.syncDocument = (...args) => { entered(); return sync(...args); };
+    } else {
+      client.packageRefreshPromise = gate;
+      entered();
+    }
+    const controller = new AbortController();
+    const old = client.provideCompletionItems({ getText: () => 'old(' }, new Position(0, 4),
+      undefined, undefined, undefined, 'static', {}, undefined, controller.signal);
+    await waiting;
+    controller.abort();
+    if (phase === 'refresh') client.packageRefreshPromise = undefined;
+    const latest = client.provideCompletionItems({ getText: () => 'new(' }, new Position(0, 4),
+      undefined, undefined, undefined, 'static');
+    release();
+    assert.equal(await old, undefined, phase);
+    assert.ok(await latest, phase);
+    assert.deepEqual(instances[0].documents, ['new('], phase);
+    assert.equal(inspections, 1, phase);
+  }
+});
 
 test("explicit completion mode uses the existing virtual document and controls source inference", async t => {
   const { client, instances } = createClient(t, { staticAnalysis: true });
@@ -119,7 +257,7 @@ test("guarded source overlay preserves console replacement offsets and uses one 
   const doc = { getText: () => text };
   const definition = { name: "make_data", body: "function() {\n  list(alpha = 1)\n}" };
   const result = await client.provideCompletionItems(doc, cursor, undefined,
-    undefined, undefined, "static", definition);
+    undefined, undefined, "static", undefined, definition);
   const request = instances[0].requests.find(item => item.method === "completion");
   const expectedPrelude = `\`make_data\` <- function() {\n  list(alpha = 1)\n}\n`;
   assert.equal(request.params.text, expectedPrelude + text);
@@ -213,24 +351,26 @@ test("prefix retries share native argument snapshots only within the current req
   const { getLanguageServerCompletions } = loadSource('src/Language/completion/languageServer.ts', {
     vscode: { Position, CompletionItemKind: { Text: 0, Field: 4 } },
   });
-  let inspections = 0;
-  const { client, instances } = createClient(t, {
-    requestRuntimeFunctionArguments: () => {
-      inspections++; return { status: 'arguments', names: ['alpha_beta'] };
-    },
-    completion: () => ({ items: [], rConsoleWorkspaceFunction: true, rConsoleArgumentsResolved: true }),
-  });
   const text = 'obj$fun(alpha_beta = "zzz';
   const doc = { getText: () => text };
   const position = new Position(0, text.length);
   const context = { kind: 'argument', prefix: 'zzz', replaceStart: text.length - 3,
     snapshotInput: text, snapshotCursor: text.length, functionName: 'obj$fun', functionOperator: '$',
     argumentValue: { quote: '"', name: 'alpha_beta', prefix: 'zzz', replaceStart: text.length - 3 } };
-  for (let request = 1; request <= 2; request++) {
-    await getLanguageServerCompletions(context, doc, position, [], client);
-    assert.equal(inspections, request, 'each new completion reads fresh live arguments');
-    assert.equal(instances[0].requests.filter(item => item.method === 'completion').length, request * 2,
-      'the prefix retry remains available but shares its native snapshot');
+  for (const mode of ['runtime', 'static']) {
+    let inspections = 0;
+    const { client, instances } = createClient(t, {
+      requestRuntimeFunctionArguments: () => {
+        inspections++; return { status: 'arguments', names: ['alpha_beta'] };
+      },
+      completion: () => ({ items: [], rConsoleWorkspaceFunction: true, rConsoleArgumentsResolved: true }),
+    });
+    for (let request = 1; request <= 2; request++) {
+      await getLanguageServerCompletions(context, doc, position, [], client, undefined, mode);
+      assert.equal(inspections, request, 'each new completion reads fresh live arguments');
+      assert.equal(instances[0].requests.filter(item => item.method === 'completion').length, request * 2,
+        'the prefix retry remains available after the preceding invocation expires');
+    }
   }
 });
 
@@ -244,7 +384,7 @@ test("a shared request never reuses arguments after runtime, document or session
     const scope = {}, text = 'obj$fun(zzz';
     const doc = { getText: () => text }, position = new Position(0, text.length);
     const complete = (document = doc) => client.provideCompletionItems(document, position,
-      undefined, position, undefined, undefined, undefined, scope);
+      undefined, position, undefined, undefined, scope);
     await complete();
     const sent = instances.reduce((n, instance) => n + instance.requests.filter(r => r.method === 'completion').length, 0);
     if (change === 'runtime') client.invalidateRuntimeCompletion();
@@ -261,13 +401,13 @@ test("opaque source bindings preserve input and respect projected package select
   const { client, instances } = createClient(t, { staticAnalysis: true });
   const text = 'data.frame(fake = 1)$';
   const doc = { getText: () => text }, position = new Position(0, text.length);
-  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', { name: 'data.frame' });
+  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', undefined, { name: 'data.frame' });
   let params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
   assert.equal(params.text, text, 'an opaque binding adds no invented R source');
   assert.equal(params.rConsoleOpaqueFunction, 'data.frame');
   client.updateInput(text);
   client.recordCompletion(text, 0, { insertText: 'data.frame()', packageName: 'base' });
-  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', { name: 'data.frame' });
+  await client.provideCompletionItems(doc, position, undefined, undefined, undefined, 'static', undefined, { name: 'data.frame' });
   params = instances[0].requests.filter(item => item.method === 'completion').at(-1).params;
   assert.equal(params.text, 'base::' + text);
   assert.equal(params.rConsoleOpaqueFunction, undefined);
@@ -589,10 +729,10 @@ test("cached session state reaches the LSP before its first launch", async () =>
     vscode: {}, "../../Language/completion": {},
     "../../Language/consoleLspClient": { ConsoleLspClient },
   });
-  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const data = { search: ["package:stats"], globalenv: { f: { type: "closure", str: "function(first)" } }, loaded_namespaces: [] };
   lang.updateSessionData(data);
-  await lang.ensureConsoleLspStarted();
+  await lang.getCompletionProvider();
   assert.deepEqual(calls, [{ attachedPackages: ["stats"] }],
     "workspace function signatures are no longer sent to the separate language server");
   assert.equal(lang.updateSessionData(data), false, "unchanged metadata is not resent");
@@ -682,11 +822,38 @@ test("runtime library snapshots are retained before completion client constructi
   });
   const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   lang.updateLibraryPaths(["/active", "/base"]);
-  await lang.ensureConsoleLspStarted();
+  await lang.getCompletionProvider();
   assert.deepEqual(paths, [["/active", "/base"]]);
   lang.updateLibraryPaths(["/base"]);
   assert.deepEqual(paths.at(-1), ["/base"]);
   lang.clearSessionState();
   assert.equal(calls.includes("reset"), true);
   await lang.dispose();
+});
+
+test('static provider cancellation reaches the LSP and rejects late results', async t => {
+  let started, release, token;
+  const waiting = new Promise(resolve => { started = resolve; });
+  const { client } = createClient(t, { staticAnalysis: true, completion: async (_client, _params, currentToken) => {
+    token = currentToken; started();
+    return new Promise(resolve => { release = resolve; });
+  } });
+  const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+  const { createGuardedBindingResolver } = loadSource('src/Language/completion/bindings.ts');
+  const controller = new AbortController();
+  const input = 'stats::lm(';
+  const position = new Position(0, input.length);
+  const pending = requestStaticCompletion(client, {
+    document: { version: 1, getText: () => input }, input, cursor: input.length,
+    position, contextPosition: position, requestScope: {},
+    bindings: createGuardedBindingResolver(undefined, { signal: controller.signal }),
+  });
+  await waiting;
+  assert.equal(token.isCancellationRequested, false);
+  controller.abort();
+  assert.equal(token.isCancellationRequested, true);
+  const result = await pending;
+  assert.equal(result.staticStatus, 'pending');
+  assert.deepEqual(result.items, []);
+  release({ items: [{ label: 'stale' }] });
 });

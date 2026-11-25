@@ -19,7 +19,6 @@ export interface VscodeRSessionIntegration {
 
   getDisplayPid(): number | undefined;
   getCachedWorkspaceData(): WorkspaceData | undefined;
-  requestWorkspaceData(): Promise<WorkspaceData | undefined>;
   filterRuntimeOutput(text: string): string;
   disposeUi(): void;
 }
@@ -46,10 +45,6 @@ export abstract class BaseVscodeRSessionIntegration
   }
 
   getCachedWorkspaceData(): WorkspaceData | undefined {
-    return undefined;
-  }
-
-  async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
     return undefined;
   }
 

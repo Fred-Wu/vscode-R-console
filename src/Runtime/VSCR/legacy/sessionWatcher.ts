@@ -2,7 +2,6 @@ import * as fs from "fs";
 import * as http from "http";
 import * as path from "path";
 import type {
-  SessionMemberCompletionItem,
   WorkspaceData,
 } from "../types";
 
@@ -100,48 +99,6 @@ export class SessionWatcher {
 
   getAttachedPid(): number | undefined {
     return this.attachedPid;
-  }
-
-  async requestWorkspaceData(): Promise<WorkspaceData | undefined> {
-    this.updateFromRequest();
-    await this.updateWorkspace();
-    return this.workspaceData;
-  }
-
-  async requestMemberCompletions(
-    expression: string,
-    operator: "$" | "@"
-  ): Promise<SessionMemberCompletionItem[] | undefined> {
-    const expr = expression.trim();
-    if (!expr) {
-      return undefined;
-    }
-
-    const response = await this.postToSessionServer({
-      type: "complete",
-      expr,
-      trigger: operator,
-    });
-    if (!Array.isArray(response)) {
-      return undefined;
-    }
-
-    const items: SessionMemberCompletionItem[] = [];
-    for (const value of response) {
-      if (!value || typeof value !== "object") {
-        continue;
-      }
-      const item = value as Record<string, unknown>;
-      if (typeof item.name !== "string" || !item.name) {
-        continue;
-      }
-      items.push({
-        name: item.name,
-        type: typeof item.type === "string" ? item.type : undefined,
-        str: typeof item.str === "string" ? item.str : undefined,
-      });
-    }
-    return items;
   }
 
   refresh(): void {

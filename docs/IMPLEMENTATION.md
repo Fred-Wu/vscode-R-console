@@ -652,661 +652,7 @@ In `legacy` mode, the console consumes watcher metadata for:
 - display pid selection
 - search-path aware completion
 - global-environment completion
-- `# Design and Implementation
-
-`vscode-R-console` runs an embedded R session through a Rust backend and presents
-it in a VS Code pseudoterminal. The extension manages console input, output,
-completion, command history, and persistent sessions.
-
-The architecture has four main parts:
-
-1. the embedded R backend
-2. the transport model between the backend and the VS Code UI
-3. the `vscode-R` integration layer
-4. the self-managed console session layer
-
-## Implementation References
-
-The following projects inform the extension's design. The table identifies
-runtime dependencies and the local components associated with each reference.
-
-| Project | What is referenced or used | Where it appears here |
-| --- | --- | --- |
-| [`vscode-R`](https://github.com/REditorSupport/vscode-R) | Used for R executable settings, the vscode-R 3.x `sess` JSON-RPC 2.0 protocol, and deprecated pre-3.0 session-watcher compatibility. | `src/Terminal/options.ts`, `src/Runtime/VSCR/`, `resources/r/VSCR/` |
-| [`arf`](https://github.com/eitsupi/arf) | Reference for Rust embedded-R host structure, dynamic R loading, platform-specific R initialization, callback wiring, generic event/input-handler pumping, and interrupt state handling. | `sidecar/pty-host/src/host.rs` |
-| [Ark](https://github.com/posit-dev/ark) | Reference for native R frontend concepts, `ReadConsole` recovery after interrupts/nested input, nested-input separation, and generic R event/finalizer pumping while waiting for input. | `sidecar/pty-host/src/host.rs` |
-| [`rchitect`](https://github.com/randy3k/rchitect) | Reference for embedding R from a non-R host process, R home/shared-library discovery, and callback/FFI boundary patterns. | `sidecar/pty-host/src/host.rs`, `src/Terminal/options.ts` |
-| [`radian`](https://github.com/randy3k/radian) | Reference for terminal-first console interaction, prompt-centric editing, multiline editing, history, reverse search, and bracketed paste expectations. | `src/Terminal/rTerminal.ts` and supporting terminal modules |
-| [`languageserver`](https://github.com/REditorSupport/languageserver) | R package dependency for console completion. | `src/Language/consoleLspClient.ts`, `resources/r/console-language-server.R` |
-
-The embedded backend, protocol, and terminal frontend are implemented in this
-repository, drawing on the host and terminal interaction patterns above.
-
-## 1. Embedded Backend
-
-The embedded backend is the Rust sidecar binary:
-
-- Unix: `bundled/bin/R_CONSOLE_HOST`
-- Windows: `bundled/bin/R_CONSOLE_HOST.exe`
-
-Source files:
-
-- [`sidecar/pty-host/src/main.rs`](../sidecar/pty-host/src/main.rs)
-- [`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs)
-- [`sidecar/pty-host/src/protocol.rs`](../sidecar/pty-host/src/protocol.rs)
-
-`R_CONSOLE_HOST` loads the R runtime into its own process and connects R's
-callbacks to the extension's input and output protocol.
-
-On Windows, `main.rs` uses a launcher mode. The first process starts a detached
-real host process using the same `R_CONSOLE_HOST.exe` binary. The detached
-process is the process that loads R, owns the TCP control server, and owns the
-console session.
-
-### 1.1 Shared Backend State
-
-Both Unix and Windows host modules maintain a shared state object for:
-
-- queued top-level submissions
-- queued nested replies
-- parse-status requests
-- dialog results
-- pending width changes
-- prompt/wait state
-- busy state
-- interrupt state
-- shutdown state
-- top-level recovery state
-
-The backend command reader pushes protocol commands into this state. The R
-callbacks read from the same state when R asks for console input, writes output,
-requests dialogs, or reports busy state.
-
-### 1.2 Unix R Loading
-
-The Unix backend lives in the Unix module inside
-[`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs).
-
-It resolves `R_HOME`, then dynamically loads:
-
-- Linux: `libR.so`
-- macOS: `libR.dylib`
-
-The backend loads R symbols with `libloading`. Important symbols include:
-
-- `Rf_initialize_R`
-- `setup_Rmainloop`
-- `run_Rmainloop`
-- `R_ParseVector`
-- `R_tryEval`
-- `R_interrupts_pending`
-- `R_CheckUserInterrupt`
-- `R_ExpandFileName`
-- optional event APIs such as `R_ProcessEvents`, `R_PolledEvents`, and
-  `R_RunPendingFinalizers`
-
-### 1.3 Unix Callback Wiring
-
-Unix uses the normal embedded R callback globals:
-
-- `ptr_R_ReadConsole`
-- `ptr_R_WriteConsoleEx`
-- `ptr_R_ShowMessage`
-- `ptr_R_Busy`
-- `ptr_R_Suicide`
-- `ptr_R_ChooseFile`
-- `ptr_R_EditFile`
-- `ptr_R_EditFiles`
-- `ptr_R_ProcessEvents`
-- `R_PolledEvents`
-
-It also sets:
-
-- `R_Outputfile = NULL`
-- `R_Consolefile = NULL`
-
-These settings route embedded R console IO through the registered callbacks.
-
-Unix initialization calls:
-
-1. `Rf_initialize_R`
-2. `setup_Rmainloop`
-3. `run_Rmainloop`
-
-The backend adds `--interactive` when needed so embedded R is initialized as an
-interactive console.
-
-### 1.4 Windows R DLL Loading
-
-The Windows backend lives in the Windows module inside
-[`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs).
-
-It derives or uses `R_HOME`, then locates `R.dll` in this order:
-
-1. `R_HOME/bin/<R_ARCH>` when `R_ARCH` is set
-2. the configured R executable directory
-3. `R_HOME/bin/x64`
-4. `R_HOME/bin/arm64`
-5. `R_HOME/bin`
-
-Before loading `R.dll`, the backend preloads support DLLs from the selected R
-DLL directory:
-
-1. `Rgraphapp.dll`
-2. `Rblas.dll`
-3. `Riconv.dll`
-4. `Rlapack.dll`
-5. `R.dll`
-
-The preload order resolves R and its support DLLs from the selected installation.
-
-### 1.5 Windows Symbol Loading And Initialization
-
-The Windows backend loads Windows-specific R symbols when present:
-
-- `R_DefParams`
-- `R_DefParamsEx`
-- `R_SetParams`
-- `cmdlineoptions`
-- `R_common_command_line`
-- `readconsolecfg`
-- `getRUser`
-- `GA_initapp`
-- `GA_peekevent`
-- `R_ProcessEvents`
-- `R_RunPendingFinalizers`
-- `CharacterMode`
-- `UserBreak`
-- fallback `R_interrupts_pending`
-
-Windows initialization configures the runtime through `Rstart`:
-
-1. create an `Rstart` struct
-2. initialize defaults through `R_DefParamsEx(..., 0)` or `R_DefParams`
-3. apply command-line options through `cmdlineoptions` and
-   `R_common_command_line` when available
-4. set interactive mode and callback pointers on `Rstart`
-5. set `rhome` and `home`
-6. call `R_SetParams`
-7. wire file/dialog callbacks
-8. call `GA_initapp`
-9. call `readconsolecfg`
-10. switch `CharacterMode` to `LinkDLL`
-11. call `setup_Rmainloop`
-
-### 1.6 Windows Callback Wiring
-
-Windows registers callbacks through the `Rstart` structure:
-
-- `ReadConsole`
-- `WriteConsoleEx`
-- `ShowMessage`
-- `YesNoCancel`
-- `Busy`
-- `CallBack`
-- `Suicide`
-- `ChooseFile`
-- `EditFile`
-- `EditFiles`
-
-Those callbacks bridge embedded R to the same shared backend state used by the
-Unix implementation.
-
-### 1.7 R Event Loop And Input Handler Pumping
-
-The backend pumps R's event handlers and the platform event queue while waiting
-for input. R packages participate through the handlers registered with R.
-
-Unix event pumping uses available symbols such as:
-
-- `R_ProcessEvents`
-- `R_checkActivity`
-- `R_runHandlers`
-- `R_InputHandlers`
-- `R_PolledEvents`
-- `R_RunPendingFinalizers`
-
-Windows event pumping uses:
-
-- the Windows message queue through `PeekMessageW` / `DispatchMessageW`
-- `GA_peekevent`
-- `R_ProcessEvents`
-- `R_checkActivity`
-- `R_runHandlers`
-- `R_InputHandlers`
-- `R_RunPendingFinalizers`
-
-The backend runs these pumps while R is waiting in `ReadConsole` and from the
-registered callback path. Input-handler draining is bounded per pump turn. If
-an interrupt is requested during event processing, the backend preserves the R
-interrupt flag and returns control to R.
-
-### 1.8 ReadConsole State Machine
-
-`ReadConsole` is the main bridge between R and the VS Code UI.
-
-The backend distinguishes:
-
-- top-level console prompts: the locked `> ` and `+ ` prompts
-- nested prompts: every other prompt, including `readline()` and browser-style
-  prompts
-
-Top-level input is supplied from queued `submit` commands. Nested input is
-supplied from queued `reply-input` commands.
-
-While `ReadConsole` is waiting, the backend also handles:
-
-- parse-status requests
-- width changes
-- interrupts
-- shutdown requests
-- dialog results
-- event pumping
-
-After busy evaluation or nested input returns, the backend can insert one
-top-level recovery input before the next user command is consumed. The recovery
-step is implemented in the shared backend state.
-
-### 1.9 Interrupt Implementation
-
-Unix interrupt implementation uses:
-
-- `R_interrupts_pending`
-- `SIGINT` sent to the current process
-- `R_CheckUserInterrupt` where needed
-
-Windows interrupt implementation uses:
-
-- `UserBreak` when exported
-- otherwise `R_interrupts_pending`
-- `R_CheckUserInterrupt` where needed
-
-Both platforms install a base R interrupt calling handler on the first real
-top-level console read. That handler uses R's `abort` restart so R can unwind
-through normal cleanup paths.
-
-## 2. Transport Model Between Backend And UI
-
-TypeScript transport implementation:
-
-- [`src/Runtime/runtimeBackend.ts`](../src/Runtime/runtimeBackend.ts)
-- [`src/Runtime/backendProtocol.ts`](../src/Runtime/backendProtocol.ts)
-
-Rust transport implementation:
-
-- [`sidecar/pty-host/src/protocol.rs`](../sidecar/pty-host/src/protocol.rs)
-- the session command reader in [`sidecar/pty-host/src/host.rs`](../sidecar/pty-host/src/host.rs)
-
-### 2.1 Session Startup Transport
-
-When a console starts, `RustSidecarRuntimeBackend.start(...)`:
-
-1. creates a UUID session id
-2. creates a per-session bootstrap file path
-3. spawns `R_CONSOLE_HOST`
-4. passes `VSC_R_BACKEND_SESSION_FILE` to the backend
-5. generates a session secret and passes it through `VSC_R_BACKEND_AUTH_TOKEN`
-6. passes initial connect and reconnect grace values
-7. detaches/unrefs the process from the VS Code extension host
-
-The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
-`127.0.0.1:0`, then writes JSON to the bootstrap file:
-
-```json
-{"port":12345,"pid":67890,"protocolVersion":3}
-```
-
-The TypeScript side polls that file, requires protocol version 3, reads the port and pid, then connects to
-the loopback server. Before exchanging session traffic, both peers prove
-possession of the session secret using HMAC-SHA256 and fresh nonces. The
-authentication implementation is in
-[`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
-
-The current backend uses protocol version 3, including library-path notifications.
-Protocol 2 introduced authentication; v0.5.4 used version 1 without
-authentication. The extension also checks the live `backend-ready` version.
-This version is independent of vscode-R's `sess` integration protocol.
-
-### 2.2 Reconnect Transport
-
-Reconnect uses `RuntimeSessionReconnectInfo`:
-
-- `sessionId`
-- `port`
-- `authToken`
-- `pid`
-
-`RustSidecarRuntimeBackend.reconnect(...)` creates a new
-`RuntimeSessionHandle` around that information and authenticates a connection
-to the existing backend's loopback TCP server.
-
-The runtime checks process liveness before reconnecting:
-
-- if the recorded backend pid is dead, the reconnect info is discarded
-- if the Windows launcher process has exited but the detached real host pid is
-  alive, reconnect continues
-
-### 2.3 Active Client Model
-
-The Rust backend accepts one active control client at a time.
-
-Implementation details:
-
-- each active connection has a client id
-- `current_client` stores the currently active id
-- a successfully authenticated connection replaces the previous active socket
-- command-reader threads exit when their client id is no longer current
-- output is attached to the active client writer
-- when the active client disconnects, output is detached and the reconnect
-  grace timer is applied
-
-This connection model supports detaching a console tab and attaching another UI
-instance to the same embedded R backend.
-
-### 2.4 Framed Protocol
-
-The protocol frame header is 12 bytes:
-
-- payload length
-- frame kind
-- flags
-- request id
-
-Backend events sent to TypeScript include:
-
-- `backend-ready`
-- `host-connected`
-- `session-state`
-- `prompt`
-- `busy`
-- `input-request`
-- `input-end`
-- `dialog-request`
-- `output-flush`
-- `parse-status-result`
-- `host-error`
-
-Commands sent to Rust include:
-
-- `submit`
-- `reply-input`
-- `interrupt`
-- `set-width`
-- `dialog-result`
-- `shutdown`
-
-Host capabilities are advertised through `backend-ready`:
-
-- `control-channel`
-- `shutdown`
-- `session-control`
-- `top-level-submit`
-- `nested-input`
-- `parse-status`
-- `set-width`
-
-### 2.5 Output Channel
-
-Rust emits console output and control events through the active protocol writer.
-Console output is streamed in 8 KiB chunks, including output received directly
-from R callbacks. The frontend accepts frames up to 16 MiB. Each output stream
-has its own UTF-8 decoder in the frontend, so characters split between frames
-are preserved.
-If no client is attached, `protocol.rs` queues frames in an output backlog.
-
-The backlog is bounded by:
-
-- maximum buffered frames
-- maximum buffered bytes
-
-When a client attaches, the backend:
-
-1. attaches the socket writer
-2. flushes the backlog
-3. emits `backend-ready`
-4. emits `host-connected`
-5. emits `session-state`
-6. emits `output-flush`
-
-### 2.6 Shutdown Transport
-
-Attached sessions close by writing a `shutdown` frame over the active socket.
-
-Detached sessions close by:
-
-1. constructing a temporary runtime backend in the extension host
-2. reconnecting to the stored `sessionId` / `port` / `pid`
-3. writing the same `shutdown` frame
-
-The Rust command reader maps `shutdown` to the backend shared shutdown state.
-
-### 2.7 Transport Bounds And Deadlines
-
-Transport limits bound message sizes, connection admission, and request waits.
-Authentication deadlines apply during the handshake; the native parse deadline
-begins after a request is sent to a ready R session.
-
-| Boundary | Bound or timing | Purpose and behavior |
-| --- | --- | --- |
-| Backend and console language-server authentication | 3 seconds; fixed-size challenge/proof messages; bounded pending clients | Bounds incomplete authentication. Backend read/write deadlines are cleared after authentication. |
-| Backend frames | 16 MiB per payload | Rejects excessive allocation before reading a payload. Oversized submitted commands are rejected before sending; output is streamed across frames. |
-| Detached backend output | 1,000,000 bytes or 4,096 frames | Retains a rolling backlog until a frontend connects. |
-| Session proxy admission | 8 pending clients; 3 seconds to send attach | Bounds incomplete attachments. Active sessions are replaced only after an attach message, independently of these resource guards. |
-| Session proxy messages | 16 MiB per JSON line | Bounds a complete message. Forwarding follows writable stream backpressure. |
-| Optional session data requests | 1.2 seconds waiting for an R socket; 2 seconds for a response | Resolves unavailable workspace/completion data when the request expires. |
-| Legacy HTTP session data | 1.2 seconds of inactivity; 16 MiB response | Progressing responses may take longer. Response abort/error/close events settle the request directly. |
-| Native parse query | 150 milliseconds after sending | Falls back to the local parser; submission readiness is checked before sending. |
-| Backend startup and reconnect | 5 seconds for the bootstrap file; 60-second initial connection grace; unlimited persistent reconnect grace | The 40/100 ms poll/retry intervals schedule connection checks. Detached shutdown uses a 2-second socket inactivity timeout. |
-| Manual session recovery | 1.5 seconds after R returns to its main prompt | Waits for attachment confirmation after the recovery command finishes. |
-
-Terminal rendering and completion use debounces to schedule UI work. Native
-event polling drives R callbacks. Persistence heartbeats, history refreshes,
-lock retries, and close waits coordinate storage and shutdown.
-
-## 3. `vscode-R` Integration
-
-R Console uses vscode-R's public session APIs to attach its embedded R session,
-obtain workspace metadata. vscode-R manages
-the shared session services, including plots, data viewers, help, and addins.
-
-Implementation files:
-
-- [`src/Terminal/options.ts`](../src/Terminal/options.ts)
-- [`src/Terminal/rTerminal/runtime.ts`](../src/Terminal/rTerminal/runtime.ts)
-- [`src/Runtime/VSCR/index.ts`](../src/Runtime/VSCR/index.ts)
-- [`src/Runtime/VSCR/integration.ts`](../src/Runtime/VSCR/integration.ts)
-- [`src/Runtime/VSCR/types.ts`](../src/Runtime/VSCR/types.ts)
-- [`src/Runtime/VSCR/legacy/integration.ts`](../src/Runtime/VSCR/legacy/integration.ts)
-- [`src/Runtime/VSCR/legacy/sessionWatcher.ts`](../src/Runtime/VSCR/legacy/sessionWatcher.ts)
-- [`src/Runtime/VSCR/sess/integration.ts`](../src/Runtime/VSCR/sess/integration.ts)
-- [`src/Runtime/VSCR/sess/sessProxy.ts`](../src/Runtime/VSCR/sess/sessProxy.ts)
-- [`resources/r/console-profile.R`](../resources/r/console-profile.R)
-- [`resources/r/VSCR/legacy.R`](../resources/r/VSCR/legacy.R)
-
-The terminal and shared runtime depend only on `VscodeRSessionIntegration`.
-`src/Runtime/VSCR/index.ts` is the factory boundary that selects the disabled,
-legacy, or `sess` implementation. Transport-specific state, startup, completion,
-activation, reconnect, output filtering, and disposal stay inside the selected
-implementation directory.
-
-The deprecated pre-3.0 integration is contained in the legacy directories, its
-configuration variant, and the factory selection branch. Terminal, language,
-and persistence components access session services through the shared interface.
-
-### 3.1 Startup Settings From `vscode-R`
-
-R Console resolves the R executable in this order:
-
-1. `r.executablePath`
-2. deprecated `r.rpath.windows`, `r.rpath.mac`, or `r.rpath.linux`
-3. `R` on `PATH`
-4. the Windows R registry entry on Windows
-
-R Console derives `R_HOME` from the selected executable, anchoring the embedded
-runtime to that R installation.
-
-The selected executable is used to derive:
-
-- `R_HOME`
-- `R_SHARE_DIR`
-- `R_INCLUDE_DIR`
-- `R_DOC_DIR`
-- platform loader paths
-
-The same selected R executable is used for:
-
-- the embedded backend
-- the console-owned `languageserver` process
-
-### 3.2 Startup Bootstrap
-
-When `r.sessionWatcher` is enabled, startup chooses one vscode-R session
-integration:
-
-- `sess`: vscode-R 3.x architecture exposed by vscode-R's public session API.
-  `src/Runtime/VSCR/sess/integration.ts` obtains the IPC endpoint through
-  `session.getConnectionInfo()`, starts a console-owned `SessProxy`, then calls
-  `session.prepareAttachment()` with the proxy endpoint. The resulting managed
-  bootstrap script is sourced by the embedded R launch; vscode-R owns `sess`
-  installation, plot-backend configuration, and attachment preparation.
-- `legacy`: deprecated pre-3.0 file-based watcher architecture. `R Console`
-  sources vscode-R's `R/session/init.R` and uses `VSCODE_WATCHER_DIR`.
-
-In `sess` mode, vscode-R owns the IPC server and package installation/update
-policy. R Console selects the integration through vscode-R's public session API.
-The transport is a Unix socket on macOS/Linux or a Windows named pipe. Messages
-are JSON-RPC 2.0 objects framed as newline-delimited JSON.
-
-The `SessProxy` is a transparent IPC proxy. The embedded R session connects to
-the console-owned proxy endpoint, and the proxy connects to vscode-R's endpoint.
-Raw newline-delimited JSON-RPC messages are forwarded in both directions. R
-Console observes workspace responses and injects its own `workspace` and
-`completion` requests when the console needs session data. It uses vscode-R's
-public API for connection discovery, attachment preparation, terminal
-registration, connection references, and session activation.
-
-Before replacing an active R connection, the proxy waits for a newline-delimited
-`attach` message with a nonempty session id. Upstream connections and session
-requests begin after that message arrives. The proxy admits at most eight
-pending connections, each with a three-second deadline and a 16 MiB line limit.
-vscode-R validates the forwarded attachment handshake.
-
-On Windows, the bundled host's `--secure-session-pipe` command applies a protected
-DACL that grants access only to the current user and denies network logons. All
-instances of the named pipe share that descriptor. The proxy publishes its
-endpoint only after permission setup succeeds; setup failure closes the server.
-Connections accepted during setup are closed before the endpoint is returned.
-On Unix the socket resides in a private directory with owner-only permissions.
-
-Forwarding follows Node's [stream backpressure contract](https://nodejs.org/api/stream.html#event-drain):
-after a write returns false, the proxy pauses the source and retains the
-unprocessed remainder of the current batch. On drain, it forwards that remainder
-before resuming reads. Optional local workspace/completion requests resolve as
-unavailable while the destination is blocked. Each JSON line is limited to
-16 MiB, and stream drain events govern forwarding to slow receivers.
-
-The proxy is scoped to the embedded backend runtime session and is indexed by
-the backend session id while connected. The managed bootstrap connects `sess`
-through the proxy endpoint and forwards the versioned attach handshake to
-vscode-R. R Console validates attachment and connection references before
-binding the corresponding pseudoterminal. Background consoles are registered
-with their session references; terminal focus selects the matching session
-through vscode-R's public `session.activate()` API.
-
-The console passes its proxy endpoint to `prepareAttachment()`. The
-`SESS_PLOT_BACKEND` and `SESS_RSTUDIOAPI` environment variables expose vscode-R's
-resolved plot-backend preference and `r.session.emulateRStudioAPI` setting,
-respectively; vscode-R's managed bootstrap configures the corresponding sess options.
-Reconnection refreshes both variables from the current configuration before
-sourcing the newly prepared managed bootstrap.
-Inherited `SESS_DISCOVERY_FILE` values are cleared during environment preparation.
-After a window reload, the console obtains a new endpoint and reconnects when
-the restored console reaches an empty main prompt.
-Detached consoles in the same window reuse their existing proxy connection.
-
-The backend launch environment includes:
-
-- `R_PROFILE_USER_OLD`
-- `VSC_R_EXECUTABLE`
-
-Depending on the selected session integration, it also includes:
-
-- `R_CONSOLE_SESSION_BOOTSTRAP`
-- `SESS_PLOT_BACKEND` (managed sess mode)
-- `SESS_RSTUDIOAPI` (managed sess mode)
-- `VSCODE_WATCHER_DIR`
-- `VSCODE_INIT_R`
-
-At launch time, `rTerminal/runtime.ts` also sets:
-
-- `R_PROFILE_USER` to this extension's `console-profile.R`
-- `VSC_R_COLS`
-- `VSC_R_ROWS`
-- `VSC_R_SESSION_CWD`
-- `VSC_R_EXT`
-
-`console-profile.R` then:
-
-1. restores and sources the user's original profile through
-   `R_PROFILE_USER_OLD`
-2. sources the selected `R_CONSOLE_SESSION_BOOTSTRAP`, when present
-3. installs the console pager
-4. locks the prompt options used by the embedded console contract
-
-vscode-R prepares the `sess` bootstrap. The legacy implementation sources
-`resources/r/VSCR/legacy.R`, which runs vscode-R's legacy `init.R`.
-
-### 3.3 Session Metadata
-
-In `legacy` mode, `SessionWatcher` reads the file-based `request.log`,
-`workspace.lock`, and `workspace.json` files.
-Its loopback HTTP requests use a 1.2-second inactivity timeout and a 16 MiB
-response limit. Responses can take longer while data continues to arrive.
-Truncated, aborted, failed, or oversized responses close the request and resolve
-as unavailable data.
-
-In `sess` mode, session metadata flows through the proxy between R and vscode-R.
-The R side sends JSON-RPC notifications such as `attach` and
-`workspace_updated`; vscode-R sends JSON-RPC requests such as `workspace` and
-`completion`. R Console may also inject `workspace` and `completion` requests
-to the R-side socket and consumes the matching responses itself.
-
-Notifications consumed from R:
-
-- `attach`
-- `detach`
-- `workspace_updated`
-
-Requests sent to R:
-
-- `workspace`
-- `completion`
-
-The `workspace` response provides:
-
-- search path
-- loaded namespaces
-- global environment summary
-
-The `completion` response provides runtime `$` and `@` members for names and
-chains such as `obj$data`. It does not accept arbitrary R expressions.
-Data-frame bracket completion uses column names from workspace data.
-That data does not include row names or subscript-method arguments, so those
-suggestions depend on what the language server can infer from source.
-The separate language-server process obtains its own library paths.
-
-In `sess` mode, a restored console obtains the current endpoint through vscode-R's
-public session API and reconnects at an empty main prompt. A console detached
-within the same window reuses its existing proxy connection.
-
-### 3.4 Metadata Consumers
-
-In `legacy` mode, the console consumes watcher metadata for:
-
-- display pid selection
-- search-path aware completion
-- global-environment completion
- and `@` member completion from cached workspace metadata
+- `$` and `@` member completion from cached workspace metadata
 - attached-package synchronization with the console-owned language server
 
 In `sess` mode, R Console caches workspace metadata passing through its proxy.
@@ -1322,12 +668,15 @@ Implementation files:
 
 - [`src/Terminal/rTerminal/lang.ts`](../src/Terminal/rTerminal/lang.ts)
 - [`src/Language/completion/service.ts`](../src/Language/completion/service.ts) combines language-server, runtime and recent-input candidates. [`contextParser.ts`](../src/Language/completion/contextParser.ts) identifies the expression at the cursor.
+- [`src/Language/completion/bindings.ts`](../src/Language/completion/bindings.ts) supplies guarded binding snapshots.
+- [`src/Language/completion/staticProvider.ts`](../src/Language/completion/staticProvider.ts) bounds provider invocations and manages their capability lifetime.
+- [`src/Language/completion/nativeStaticProvider.ts`](../src/Language/completion/nativeStaticProvider.ts) adapts the provider contract to the installed language server.
 - [`src/Language/consoleLspClient.ts`](../src/Language/consoleLspClient.ts)
 - [`src/Language/virtualRDocument.ts`](../src/Language/virtualRDocument.ts)
 - [`resources/r/console-language-server.R`](../resources/r/console-language-server.R)
 - [`resources/r/completion-provider.R`](../resources/r/completion-provider.R) supplements native language-server completion with console argument handling.
 - [`resources/r/completion-runtime.R`](../resources/r/completion-runtime.R) parses cached runtime function signatures.
-- [`resources/r/completion-static.R`](../resources/r/completion-static.R) handles optional unsubmitted source inference.
+- [`resources/r/completion-static.R`](../resources/r/completion-static.R) adapts native source inference to console binding-safety rules.
 
 #### Completion Sources And Modes
 
@@ -1343,6 +692,200 @@ unsubmitted input. Session-backed signature handling is implemented in
 `resources/r/completion-runtime.R`; optional source inference is in
 `resources/r/completion-static.R`.
 
+Static syntax recovery, lexical scopes, assignments, aliases, return shapes and
+callable metadata belong to `languageserver`. The console adapter reads its
+recovered scope and inferred binding, and reuses `member_symbol_info` formals
+(or native definition metadata on released providers without that field).
+Static requests preserve unfinished input and pass the projected document and
+cursor to the native asynchronous provider. Projection supplies guarded stored
+source and selected package qualifications while preserving console edit mapping.
+Static requests wait on its existing parse queue for the current document
+version, including literal contexts where native completion can answer early.
+That queue owns cancellation, supersession and replay after parsing.
+
+The console retains authority over runtime evidence. When native metadata
+identifies an unresolved draft binding, the adapter suppresses signatures from
+live or package namesakes. An opaque live binding requires positive native
+evidence of a draft override. Missing APIs,
+stale analysis, exhausted inference budgets and conflicting native callable
+metadata fail closed. Pending inference retains any known source identity.
+Binding history is checked at the native recovery position. Navigation
+signatures supplement that evidence only for declarations enclosing the cursor;
+later declarations and declarations in other scopes cannot override a current
+inferred binding. A declaration whose indexed range contains the cursor remains
+opaque while its binding is unresolved. Argument matching and literal-choice
+formatting operate on inert metadata only.
+
+The static provider contract receives the full editable input, its UTF-16 cursor
+offset, document identity/version, query position, request scope and a guarded
+binding resolver. The terminal decides live inspection eligibility and retains
+successful live results, including empty results. Inline completion, explicit
+completion and picker refinement route remaining static requests to the provider.
+Syntax-derived presentation hints preserve known prefix and quoting behavior;
+blank ordinary expressions retain session symbol browsing.
+Receiver refusals and literals retain their isolated static routing. Static
+contexts without those hints use provider-supplied replacement edits. The edit
+validator checks explicit provider ranges in every static context. It requires a
+start on the cursor's line, an end inside the input and a range containing the
+cursor. Recognized contexts can also supply prefix-based edits for candidates
+without an explicit range.
+Quick Pick composes provider edits with its preview prefix replacement before
+applying them to the original input. Insertion and partial-token edits retain
+the relevant preview text; replacement bounds are checked against the original
+buffer, including multiline suffixes and escaped quoted prefixes.
+
+The console provider can request several current search-path bindings through
+`resolve({ name, lookup })`. Lookup distinguishes function, value and binding
+identity semantics and maps to native source, source-value and binding operations.
+Results distinguish source, verified package identity, missing, non-callable,
+opaque, safety refusal and unavailable information. Unknown query fields are
+rejected before native inspection. The native serializer accepts closures enclosed
+by the global environment; captured local/namespace closures remain unavailable.
+
+Binding reads are cached by name and lookup semantics only within one completion
+request and its prefix retry. Defaults permit 16 distinct reads, 64 KiB per source,
+256 KiB in total. A shared 1.5-second lookup deadline starts
+with the first read and bounds new and pending inspection. Settled snapshots remain
+available to prefix retries while the request is current. Cancellation, input
+changes, session changes and setting
+changes invalidate outstanding access and prevent late results from presentation.
+Provider completion has a 10-second deadline covering startup, dependency reads
+and the native completion response; capabilities expire when that invocation
+finishes. An expired deadline returns pending analysis with the `analysis-limit`
+reason. The request boundary also classifies provider exceptions, unavailable
+providers/documents, missing responses and loading metadata as pending outcomes.
+Collectors preserve their reason and incomplete status so growing picker searches
+request fresh results after recovery. Structural inference failures retain their
+unresolved status, and authoritative empty results remain complete.
+Outstanding provider-facing binding reads immediately
+settle as cancelled, while the shared resolver retains snapshots for prefix retries.
+Cancellation propagates to the native LSP request
+through its cancellation token. The terminal exposes the static provider while
+shared language-server startup and session preparation are in progress. The
+native adapter starts readiness and guarded dependency discovery concurrently,
+then waits for readiness before projecting source or sending a completion request.
+The adapter observes startup failure immediately and checks cancellation after
+startup, package refresh and session preparation, and inside queued document
+synchronization. Cancelling one provider invocation settles its readers immediately;
+shared startup can serve a later request. Argument snapshots
+retain document and runtime validity independently of each invocation's cancellation
+signal, allowing prefix retries to reuse their guarded inspection.
+New input and picker refinements obtain fresh
+snapshots. Closing or accepting a picker cancels its outstanding binding reads
+and provider invocation. Clearing a refined query or entering an unsupported
+preview context also cancels that refinement. Each picker owns its cancellation
+controller so an older picker can finish independently of a newer request.
+Clearing search reuses a completed baseline. If that baseline is incomplete or
+its original request was cancelled, the picker requests the exact original input
+again. Restored baselines retain staged results while pending and reject replies
+from earlier baseline generations. New searches and dismissal invalidate pending
+restorations.
+No expression evaluation operation is exposed by the resolver.
+
+Static providers return a completion list with explicit items and completeness.
+Native array replies are normalized at the adapter boundary. The request boundary
+carries `staticStatus` through collection and suppresses candidates from unresolved
+or pending replies while retaining their diagnostic metadata.
+Provider outcomes distinguish `resolved`, authoritative `resolved-empty`,
+`unresolved` and `pending`. Unresolved and pending outcomes supply no candidates;
+pending analysis is retried on a later request. Static candidates declare a typed
+`role`: `member`, `argument`, `value`, `scope` or `symbol`. Package identity,
+subscript parameters/specials and workspace definition/context URIs have explicit
+candidate fields. Receiver fallback accepts only `member` candidates, and workspace
+definitions must belong to the requesting console document. The native metadata
+adapter translates installed language-server annotations into these fields.
+Value candidates retain their explicit insertion text, with snippet expansion
+when requested through `SnippetString`. The static candidate type exposes the
+label, kind, detail, insertion text, replacement range and console provenance
+fields. Each candidate describes one terminal insertion or replacement. Providers
+must supply the complete edit in that candidate; auxiliary text edits, editor
+commands and deferred completion-item resolution are unsupported. The native
+adapter formats its literal string choices using the current R quoting context
+before passing them to presentation. Shared R name and
+literal formatting resides in `completion/rText.ts`.
+Deduplication preserves choices with distinct roles, insertion text, replacement
+ranges or package identities, even when their display text matches.
+Inline member refinement refreshes the provider whenever cached edits cannot be
+rebased to the new prefix, while retaining safely reusable suggestions.
+Resolved static argument candidates retain their provider's signature evidence.
+The native adapter retains validated
+expression symbols when callable parameter inference is unavailable, while
+excluding parameter and default-value candidates that require that signature.
+Independent expression symbols retain prefix broadening when parameter inference
+is unavailable. Native context classification, fallback and stored-receiver
+discovery share one request-local syntax snapshot, including cursor-specific token
+slices. The native adapter retains context and lazy receiver analysis in a weak
+cache keyed by request scope, input and actual cursor, so fuzzy prefix retries
+reuse the same analysis. Binding resolution, cancellation and runtime refusal
+checks run for each invocation. Derived contexts and absent results are computed
+lazily once per snapshot; input changes and cursor moves receive independent
+snapshots. Terminal context
+classification, static fallback classification and generic prefix extraction share
+one syntax snapshot for the same input and cursor. Snapshots are
+released with their consumers; the separate lexer cache retains only the latest
+input. Projected source uses its own snapshot when building native request
+parameters. Multiline replacement offsets share one document line-offset index
+per completion request. Virtual documents cache UTF-16 line offsets for each text
+version; offset lookup uses the index and position lookup uses binary search.
+Stored-source and package projections reuse those indexes for every candidate edit.
+An authoritative empty result
+does not trigger prefix broadening. Result validation retains fixed diagnostic
+codes, source precedence and console-relative replacement ranges.
+
+The installed `languageserver` compatibility adapter identifies the source
+information its current projection can consume, requests it through the resolver,
+and projects one eligible stored closure ahead of editable input. Its receiver
+selector is in `sourceReceiver.ts`. Method argument validation reuses root binding
+evidence from the call site, preserving source scope across statement layouts. It preserves function-versus-value lookup and
+opaque roots after native safety refusals. The protocol adapter constructs source-related
+supplemental parameters from the projected document, including opaque-binding
+positions and package qualifications. Call, pipe and subscript parameters share
+one lexical snapshot at the original context cursor, including during fuzzy
+prefix retries. Unsupported adapter contexts, including
+computed multidimensional bracket completion, return `unsupported-context`.
+Transitive dependency discovery remains limited by the installed provider;
+providers implementing the general contract can request additional bindings
+without changes to terminal routing. Static requests require the explicit
+static-provider method; runtime-only providers report unavailable static support.
+The native runtime inspection and source-serialization safety allowlists apply
+to every lookup.
+
+Static completion support follows the installed `languageserver`. The native
+adapter supplies the syntax recovery and lexical inference available in that
+version. The following examples describe limitations observed with version
+0.3.22; each input is unsubmitted, with the cursor at its end.
+
+| Input | Native result and console behavior |
+| --- | --- |
+| `f <- g <- function(alpha) NULL; f(` | Native inference supplies no signature; the console returns no parameters. |
+| `g <- function(f = function(alpha) NULL) { f(` | Native inference supplies no signature for the callable formal default; the console returns no parameters. |
+| `my_frob <- function(x) x; 1 \|> my_fr` | The unfinished pipe destination can omit the source-defined function from completion. |
+| `f <- function(earlier) NULL; f <- function() { f(` | Native inference retains `f(earlier)` while the navigation outline omits the unfinished redefinition; the console can suggest the stale `earlier` parameter. |
+
+These cases belong to `languageserver`. Native `Document`, `parse_document`,
+`member_call_location` and `member_symbol` reproduce the callable limitations
+without loading console adapters. The adapter rejects conflicting metadata when
+both inference and navigation supply evidence. Where the outline omits the
+current declaration, completion depends on native scope inference and can inherit
+its inaccuracies. Provider-declined contexts return no signature. The provider
+contract also supports alternative implementations with additional dependency
+discovery and inference capabilities.
+`tests/static-provider.test.cjs` verifies the general contract with the real
+language-server adapter, fresh stored definitions and opaque binding barriers.
+Source-completion integration fixtures exercise the explicit static provider
+boundary and the production collector, with missing-binding resolvers for fixtures
+that have no embedded R session. Live-binding fixtures supply native inspection.
+Known callable-limitation fixtures derive signature availability independently
+through the native APIs in `tests/helpers/native-static-evidence.cjs`. A missing
+console signature is accepted only when the native probe also lacks that
+signature; provider or adapter failures cannot relax a supported-case assertion.
+Pipe destination fixtures compare candidates with native scope and workspace
+completion in both the LSP and extension-host suites.
+`tests/unit/static-bindings.test.cjs` covers resolver limits, lookup identity,
+scopes and cancellation. `tests/static-delegation.test.cjs` exercises the actual native resolver and
+verifies binding provenance, parse-queue replay, callable metadata compatibility,
+and the absence of execution side effects from draft bodies, defaults and indices.
+
 For nested completion, guarded live inspection remains authoritative for
 stored receivers, including stored receivers with no members. If the runtime
 parser rejects an executable receiver or native inspection suppresses unsafe
@@ -1355,7 +898,7 @@ existing language server infers source members for $ and @ access. Quoted [[
 keys can only be inferred if the installed languageserver version provides
 receiver-specific members (this is not yet available in released v0.3.22);
 unquoted [[ and single [ indices do not gain inferred member fields through
-this routing-only change. Unsupported source inference returns no unrelated
+the current compatibility adapter. Unsupported source inference returns no unrelated
 suggestions. Native root lookup follows the R search path through at most 128
 environments. Value lookup selects the first binding; bare function lookup skips
 ordinary non-callable values. Active bindings, unforced user promises and custom
@@ -1397,8 +940,9 @@ Refused member and bracket receivers carry their root binding identity through
 static fallback. Package members are eligible only when editable source proves
 a replacement binding. Stored factory definitions also accompany method argument
 and value requests, with the same receiver identity and scope checks. Retrieval
-starts alongside language-server startup and document preparation; cancellation
-and setting changes discard obsolete snapshots before they reach the provider.
+starts when the provider identifies a dependency and overlaps language-server
+startup and session preparation. Cancellation and setting changes invalidate the
+capability and discard obsolete snapshots before presentation.
 
 Static completion logs retain the language server's inference reason when one
 is available. Missing receiver information, unresolved class-specific member
@@ -1410,14 +954,19 @@ runtime safety reason. For example, after submitting
 and `\`$.dangerous\` <- function(x, name) unclass(x)[[name]]`, request
 `custom_obj$inner$`. The log reads: "Request completion could run a custom method.
 No completion suggestions were returned."
-Every unavailable result has one brief reason sentence followed by that same
+Every logged unavailable result has one brief reason sentence followed by that same
 action sentence. Without a runtime safety refusal, the reason comes from native
 source inference when available, including unresolved custom method results.
 The log does not describe an existing R object as missing. Known empty receivers and prefixes with no
 matching members remain successful inference; unresolved custom methods do not.
 Diagnostic metadata uses fixed reason codes and plain R-facing messages, without
-logging object names, submitted code or raw errors. Candidate selection and the
-no-execution safety rule are unchanged.
+logging object names, submitted code or raw errors. Scheduling and result delivery
+share a completion-target identity, including method calls and growing literal
+prefixes. Repeated decisions are deduplicated per console; a changed target or
+failure reason remains visible. Unsupported generic typing contexts, including
+ordinary strings and comments, stay quiet while remaining available to providers.
+Real-LSP fixtures retry bounded transient results on fresh requests and keep
+permanent inference failures visible to their assertions.
 
 The native source adapter serializes bounded stored syntax directly, rather
 than using R's general deparser. Embedded ALTREP values and promises are

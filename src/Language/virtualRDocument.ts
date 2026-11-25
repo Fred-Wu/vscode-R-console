@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
 import { getCallOpenings, tokenizeForHighlighting } from "./parser";
 import { runtimeCompletionText } from "./completion/runtimeDocument";
-import { backtickRName } from "./completion/candidates";
-import type { CompletionSourceBinding } from "./completion/types";
+import { backtickRName } from "./completion/rText";
+import type { NativeSourceBinding } from "./completion/nativeStaticProvider";
 
 const VIRTUAL_DOCUMENT_SCHEME = "r-console";
 
@@ -15,6 +15,7 @@ export class VirtualRDocument {
   readonly languageId = "r";
   version = 1;
   private text: string;
+  private lineOffsets: number[] | undefined;
   private selections: { start: number; name: string; packageName: string }[] = [];
   private projectedDocument: VirtualRDocument | undefined;
 
@@ -26,7 +27,7 @@ export class VirtualRDocument {
   }
 
   get lineCount(): number {
-    return this.text.length === 0 ? 1 : this.text.split("\n").length;
+    return this.getLineOffsets().length;
   }
 
   update(nextText: string): void {
@@ -35,6 +36,7 @@ export class VirtualRDocument {
     }
     this.selections = this.getSelections(nextText);
     this.text = nextText;
+    this.lineOffsets = undefined;
     this.version += 1;
   }
 
@@ -50,7 +52,7 @@ export class VirtualRDocument {
   }
 
   project(content: string, staticAnalysis = true, cursor?: vscode.Position,
-    sourceBinding?: CompletionSourceBinding) {
+    sourceBinding?: NativeSourceBinding) {
     // Picker previews must not change the selections saved with the actual input.
     const visible = new VirtualRDocument(this.id, content);
     const selections = this.getSelections(content);
@@ -134,27 +136,31 @@ export class VirtualRDocument {
 
   positionAt(offset: number): vscode.Position {
     const clamped = Math.max(0, Math.min(offset, this.text.length));
-    const lines = this.text.split("\n");
-    let remaining = clamped;
-    for (let line = 0; line < lines.length; line += 1) {
-      const lineLen = lines[line].length;
-      if (remaining <= lineLen) {
-        return new vscode.Position(line, remaining);
-      }
-      remaining -= lineLen + 1;
+    const offsets = this.getLineOffsets();
+    let low = 0, high = offsets.length;
+    while (low + 1 < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (offsets[middle] <= clamped) low = middle;
+      else high = middle;
     }
-    const last = lines.length - 1;
-    return new vscode.Position(last, lines[last].length);
+    return new vscode.Position(low, clamped - offsets[low]);
   }
 
   offsetAt(position: vscode.Position): number {
-    const lines = this.text.split("\n");
-    const line = Math.max(0, Math.min(position.line, lines.length - 1));
-    const char = Math.max(0, Math.min(position.character, lines[line].length));
-    let offset = 0;
-    for (let i = 0; i < line; i += 1) {
-      offset += lines[i].length + 1;
+    const offsets = this.getLineOffsets();
+    const line = Math.max(0, Math.min(position.line, offsets.length - 1));
+    const end = line + 1 < offsets.length ? offsets[line + 1] - 1 : this.text.length;
+    return offsets[line] + Math.max(0, Math.min(position.character, end - offsets[line]));
+  }
+
+  private getLineOffsets(): number[] {
+    if (!this.lineOffsets) {
+      const offsets = [0];
+      for (let next = this.text.indexOf("\n"); next >= 0; next = this.text.indexOf("\n", next + 1)) {
+        offsets.push(next + 1);
+      }
+      this.lineOffsets = offsets;
     }
-    return offset + char;
+    return this.lineOffsets;
   }
 }

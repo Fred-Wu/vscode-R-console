@@ -6,14 +6,23 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { PackageInventory } = loadSource("src/Language/packageInventory.ts");
 
-function fixture(t) {
+function fixture(t, notificationDelay = 0) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-"));
   const libraries = ["first", "second"].map(name => path.join(root, name));
   libraries.forEach(library => fs.mkdirSync(library));
   const changes = [], logs = [];
-  const inventory = new PackageInventory(async change => changes.push(change), line => logs.push(line));
+  const notifications = new Set();
+  const Inventory = notificationDelay ? loadSource("src/Language/packageInventory.ts", { fs: {
+    ...fs,
+    watch: (file, options, callback) => fs.watch(file, options, (...args) => {
+      const timer = setTimeout(() => { notifications.delete(timer); callback(...args); }, notificationDelay);
+      notifications.add(timer);
+    }),
+  } }).PackageInventory : PackageInventory;
+  const inventory = new Inventory(async change => changes.push(change), line => logs.push(line));
   t.after(() => {
     inventory.dispose();
+    for (const timer of notifications) clearTimeout(timer);
     fs.rmSync(root, { recursive: true, force: true });
   });
   const install = (library, version = "1.0") => {
@@ -23,27 +32,23 @@ function fixture(t) {
     fs.writeFileSync(path.join(directory, "Meta", "package.rds"), version);
     return directory;
   };
-  const settle = async () => {
+  const settle = async (observed = () => true, description = "inventory settles after pending filesystem events") => {
     const deadline = Date.now() + 10000;
     do {
       await new Promise(resolve => setTimeout(resolve, 20));
-      if (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size)) return;
-      assert.ok(Date.now() < deadline, "inventory settles after pending filesystem events");
+      if (observed() && (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size))) return;
+      assert.ok(Date.now() < deadline, description);
     } while (true);
   };
-  return { root, libraries, inventory, changes, logs, install, settle };
+  // OS notifications can arrive after an idle check. Observe the effect of
+  // each mutation before checking that its resulting work has settled.
+  const waitForLog = message => settle(() => logs.some(line => line.includes(message)),
+    `inventory must report: ${message}`);
+  return { root, libraries, inventory, changes, logs, install, settle, waitForLog };
 }
 
 test("inventory preserves effective copies across duplicate additions, removals and library order changes", async t => {
-  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
-  const waitForLog = async (message) => {
-    const deadline = Date.now() + 10000;
-    while (!logs.some(line => line.includes(message))) {
-      assert.ok(Date.now() < deadline, `inventory must report: ${message}`);
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    await settle();
-  };
+  const { libraries: [first, second], inventory, changes, logs, install, settle, waitForLog } = fixture(t);
   install(first, "2.0");
   install(second);
   inventory.setLibraryPaths([first, second]);
@@ -195,24 +200,29 @@ for (const queue of ["dirty", "unconfirmed"]) {
   });
 }
 
-test("inventory ignores lock-only changes and defers packages while installation is locked", async t => {
-  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
-  inventory.setLibraryPaths([library]);
-  await settle();
-  const count = changes.length;
-  const lock = path.join(library, "00LOCK-example");
-  fs.mkdirSync(lock);
-  await settle();
-  assert.equal(changes.length, count);
-  assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
-  assert.ok(logs.includes("[Libraries] Package inventory unchanged"));
-  install(library);
-  await settle();
-  assert.equal(changes.length, count);
-  fs.rmdirSync(lock);
-  await settle();
-  assert.deepEqual(changes.at(-1).changed, ["example"]);
-});
+for (const notificationDelay of [0, 100]) {
+  test(`inventory defers locked installations with ${notificationDelay}ms watcher delivery delay`, async t => {
+    // Delayed delivery leaves the inventory idle across several settle polls.
+    const { libraries: [library], inventory, changes, logs, install, settle, waitForLog } = fixture(t, notificationDelay);
+    inventory.setLibraryPaths([library]);
+    await settle();
+    const count = changes.length;
+    const lock = path.join(library, "00LOCK-example");
+    logs.length = 0;
+    fs.mkdirSync(lock);
+    await waitForLog(`[Libraries] Scan deferred: installation lock present - ${library}`);
+    assert.equal(changes.length, count);
+    assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
+    assert.ok(logs.includes("[Libraries] Package inventory unchanged"));
+    logs.length = 0;
+    install(library);
+    await waitForLog(`[Libraries] Scan deferred: installation lock present - ${library}`);
+    assert.equal(changes.length, count);
+    fs.rmdirSync(lock);
+    await settle(() => changes.at(-1).packages.has("example"), "unlocking must publish the installed package");
+    assert.deepEqual(changes.at(-1).changed, ["example"]);
+  });
+}
 
 test("inventory detects same-version package replacement from folder events", async t => {
   const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);

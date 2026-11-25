@@ -119,7 +119,6 @@ export interface RuntimeBackend {
   canUseSessionCommands(session: RuntimeSessionHandle | null): boolean;
   sendSessionCommand(session: RuntimeSessionHandle | null, command: RuntimeSessionCommand): boolean;
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined;
-  requestMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<string[] | undefined> | undefined;
   inspectMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<MemberInspectionResult> | undefined;
   close(session: RuntimeSessionHandle): void;
   isAlive(session: RuntimeSessionHandle | null): boolean;
@@ -341,13 +340,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       state.handlers?.onStderr?.(`${error.message}\n`);
       return false;
     }
-  }
-
-  requestMemberNames(
-    session: RuntimeSessionHandle | null, query: MemberInspectionQuery
-  ): Promise<string[] | undefined> | undefined {
-    return this.inspectMemberNames(session, query)?.then(result =>
-      result.status === "available" ? result.names : undefined);
   }
 
   inspectMemberNames(

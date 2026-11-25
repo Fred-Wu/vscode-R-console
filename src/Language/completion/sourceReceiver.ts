@@ -1,45 +1,21 @@
 import { TokenType, continuesExpressionLine, isAccessorNamePrefix, isNameAccessor } from "../lexer";
-import { getCompletionSyntax } from "./contextParser";
+import { getCompletionSyntax, type CompletionSyntax } from "./contextParser";
 import { decodeRArgumentName } from "./runtimeMembers";
 import type { CompletionContext, RuntimeFunctionSourceTarget } from "./types";
-
-// Locate the named callable at the root of the receiver. A bare function
-// name uses function lookup; a grouped symbol used as a call head uses value
-// lookup. Neither path evaluates selectors, subscripts or computed heads.
-export function storedFunctionReceiver(
-  context: CompletionContext, input: string, cursor: number
-): string | undefined {
-  return storedFunctionCall(context, input, cursor)?.name;
-}
-
-export function storedFunctionCall(
-  context: CompletionContext, input: string, cursor: number
-): { name: string; start: number } | undefined {
-  const receiver = storedCompletionReceiver(context, input, cursor);
-  return receiver && receiver.target !== "binding" ? { name: receiver.name, start: receiver.start } : undefined;
-}
-
-// Locate the value root of a computed receiver for binding identity checks.
-// Subscripts and method calls are skipped syntactically, never evaluated.
-export function storedReceiverRoot(
-  context: CompletionContext, input: string, cursor: number
-): { name: string; start: number } | undefined {
-  const receiver = storedCompletionReceiver(context, input, cursor);
-  return receiver && { name: receiver.name, start: receiver.start };
-}
 
 // One delimiter scan and one backwards walk classify the receiver's root.
 // Downstream accessors, subscripts and calls do not change that identity.
 // Leave inference of those operations to the language server.
 export function storedCompletionReceiver(
-  context: CompletionContext, input: string, cursor: number
+  context: CompletionContext, input: string, cursor: number,
+  syntax: CompletionSyntax = getCompletionSyntax(input, cursor)
 ): { name: string; start: number; target: RuntimeFunctionSourceTarget } | undefined {
   const methodArguments = context.kind === "argument" &&
     (context.functionOperator === "$" || context.functionOperator === "@");
   if (!methodArguments && (!context.staticFallback || (context.kind !== "member" && context.kind !== "bracket"))) {
     return undefined;
   }
-  const tokens = getCompletionSyntax(input, cursor).prefixTokens.filter(token =>
+  const tokens = syntax.prefixTokens.filter(token =>
     token.type !== TokenType.EOF && token.type !== TokenType.Newline && token.type !== TokenType.Comment);
   // Match delimiters once. Grouping can be arbitrarily nested, and a closing
   // bracket token can finish more than one nested single/double subscript.

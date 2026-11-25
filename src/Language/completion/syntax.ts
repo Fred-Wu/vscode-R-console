@@ -1,6 +1,6 @@
 import type { CompletionContext } from "./types";
 import { TokenType, isAccessorNamePrefix } from "../lexer";
-import { decodeQuotedCompletionPrefix, getCompletionSyntax, getQualifiedCompletionContext } from "./contextParser";
+import { decodeQuotedCompletionPrefix, getCompletionSyntax, getQualifiedCompletionContext, type CompletionSyntax } from "./contextParser";
 import { parseRuntimeMemberQuery } from "./runtimeMembers";
 
 function isPipePlaceholder(name: string): boolean {
@@ -37,16 +37,16 @@ export function getCompletionContext(
   inputBuffer: string,
   cursorPosition: number,
   fullTextBeforeCursor?: string,
-  textAfterCursor = inputBuffer.slice(cursorPosition)
+  textAfterCursor = inputBuffer.slice(cursorPosition),
+  syntax?: CompletionSyntax
 ): CompletionContext | undefined {
   const snapshotInput = inputBuffer;
   const snapshotCursor = cursorPosition;
   const beforeCursor = snapshotInput.slice(0, snapshotCursor);
 
   const textForDataContext = fullTextBeforeCursor ?? beforeCursor;
-  const fullText = textForDataContext + textAfterCursor;
   const relativeOffset = textForDataContext.length - beforeCursor.length;
-  const syntax = getCompletionSyntax(fullText, textForDataContext.length);
+  syntax ??= getCompletionSyntax(textForDataContext + textAfterCursor, textForDataContext.length);
   const inLiteral = syntax.inLiteral;
   const identifierEnd = syntax.identifierEnd;
   const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - relativeOffset };
@@ -226,21 +226,22 @@ export function getStaticFallbackContext(
   inputBuffer: string, cursorPosition: number,
   fullTextBeforeCursor?: string,
   textAfterCursor = inputBuffer.slice(cursorPosition),
-  runtime = getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor)
+  runtime?: CompletionContext,
+  syntax?: CompletionSyntax
 ): CompletionContext | undefined {
+  const before = fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition);
+  syntax ??= getCompletionSyntax(before + textAfterCursor, before.length);
+  runtime ??= getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor, syntax);
   // Quoted indices on executable receivers may look like ordinary string
   // literals to the strict runtime parser, which must still reject inspection.
-  const quotedIndex = runtime?.suppressAutomatic && (fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition)).includes("[");
+  const quotedIndex = runtime?.suppressAutomatic && before.includes("[");
   if (!runtime?.rejectionReason && !quotedIndex) return undefined;
   if (runtime?.rejectionReason && runtime.kind === "member" &&
       runtime.operator) {
     return { ...runtime, rejectionReason: undefined, staticFallback: true };
   }
   const localBefore = inputBuffer.slice(0, cursorPosition);
-  const before = fullTextBeforeCursor ?? localBefore;
   const shift = before.length - localBefore.length;
-  const fullText = before + textAfterCursor;
-  const syntax = getCompletionSyntax(fullText, before.length);
   const identifierEnd = syntax.identifierEnd;
   const replacement = identifierEnd === undefined ? {} : { replaceEnd: identifierEnd - shift };
   const tokens = syntax.prefixTokens.filter(token =>
@@ -302,5 +303,49 @@ export function getStaticFallbackContext(
     triggerCharacter: prefix ? undefined : "[",
     snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
     staticFallback: true,
+  };
+}
+
+/** Presentation hints never decide whether a static provider can analyze input. */
+export function getStaticCompletionContext(
+  inputBuffer: string, cursorPosition: number, fullTextBeforeCursor?: string,
+  textAfterCursor = inputBuffer.slice(cursorPosition),
+  runtime?: CompletionContext,
+  syntax?: CompletionSyntax
+): CompletionContext {
+  const before = fullTextBeforeCursor ?? inputBuffer.slice(0, cursorPosition);
+  syntax ??= getCompletionSyntax(before + textAfterCursor, before.length);
+  runtime ??= getCompletionContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor, syntax);
+  if (runtime && !runtime.rejectionReason && !runtime.suppressAutomatic) return runtime;
+  // Positions without a specialized context retain ordinary symbol browsing,
+  // including empty expressions after assignments, operators and delimiters.
+  // Receiver refusals and literals carry explicit contexts and fall through.
+  if (!runtime) return {
+    kind: "default", prefix: "", replaceStart: cursorPosition,
+    snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
+  };
+  const known = getStaticFallbackContext(inputBuffer, cursorPosition, fullTextBeforeCursor, textAfterCursor, runtime, syntax);
+  if (known) return known;
+  // The search UI needs a lexical prefix even when receiver semantics are
+  // unknown. These hints never authorize runtime inspection or inferred edits.
+  const shift = before.length - cursorPosition;
+  const token = syntax.prefixTokens
+    .filter(token => token.type !== TokenType.EOF).at(-1);
+  let prefix = "", replaceStart = cursorPosition;
+  let bracketQuote: "\"" | "'" | undefined;
+  if (token && token.position >= shift && token.position + token.value.length === before.length) {
+    if (token.type === TokenType.String && !token.closed && /^["']/.test(token.value)) {
+      bracketQuote = token.value[0] as "\"" | "'";
+      prefix = decodeQuotedCompletionPrefix(bracketQuote, token.value.slice(1));
+      replaceStart = token.position + 1 - shift;
+    } else if (isAccessorNamePrefix(token)) {
+      prefix = token.value.startsWith("`")
+        ? decodeQuotedCompletionPrefix("`", token.value.slice(1, token.closed === true ? -1 : undefined)) : token.value;
+      replaceStart = token.position - shift;
+    }
+  }
+  return {
+    kind: "static", staticFallback: true, prefix, replaceStart, bracketQuote,
+    snapshotInput: inputBuffer, snapshotCursor: cursorPosition,
   };
 }

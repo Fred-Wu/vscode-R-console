@@ -131,7 +131,7 @@ test("native nested completion reaches Rust without awaiting the language server
         return outcome;
       },
     });
-    lang.ensureConsoleLspStarted = () => { throw Error("runtime completion must not start LSP"); };
+    lang.getCompletionProvider = () => { throw Error("runtime completion must not start LSP"); };
     lang.getOrOpenCompletionDocument = () => { throw Error("runtime completion must not open a virtual document"); };
     const text = "a$lazy$";
     const input = { text, currentLine: text, cursorCol: text.length,
@@ -167,7 +167,7 @@ test("unavailable nested inspection retries after typing instead of caching empt
         ? { status: "unavailable" } : { status: "available", names: ["alpha"] };
     },
   });
-  lang.ensureConsoleLspStarted = () => { throw Error("no LSP dependency for runtime members"); };
+  lang.getCompletionProvider = () => { throw Error("no LSP dependency for runtime members"); };
   const snapshot = text => ({ text, currentLine: text, cursorCol: text.length,
     cursorRow: 0, lines: [text], textBeforeCursor: text });
   let input = snapshot("obj$inner$");
@@ -216,7 +216,7 @@ test("bracket names publish before LSP startup and then merge its parameters", a
       return { status: "available", names: ["keyboard"], bracketKind: "data.table" };
     },
   });
-  lang.ensureConsoleLspStarted = () => startup;
+  lang.getCompletionProvider = () => startup;
   lang.getOrOpenCompletionDocument = async text => ({
     getText: () => text, uri: { toString: () => "r-console:/completion" },
   });
@@ -262,7 +262,7 @@ test("default bracket completion preserves method parameters alongside prefetche
       return { status: "available", names: ["keyboard"], bracketKind: "data.table" };
     },
   });
-  lang.ensureConsoleLspStarted = async () => {
+  lang.getCompletionProvider = async () => {
     assert.equal(nativeRequests, 1, "guarded inspection must start before LSP startup");
     return { provideCompletionItems: async () => {
       lspRequests++;
@@ -702,6 +702,47 @@ function select(document, input, start, text, packageName) {
   document.selectFunction(start, text, packageName);
 }
 
+test('virtual document positions preserve UTF-16 line boundaries after edits', () => {
+  const document = new VirtualRDocument('positions');
+  for (const input of ['', '\n', 'alpha\n', '😀\r\n\nβ\nlast', 'short']) {
+    document.update(input);
+    const lines = input.split('\n');
+    assert.equal(document.lineCount, lines.length);
+    let offset = 0;
+    for (let line = 0; line < lines.length; line++) {
+      for (let character = 0; character <= lines[line].length; character++) {
+        const position = new Position(line, character);
+        assert.equal(document.offsetAt(position), offset + character, input);
+        assert.deepEqual(document.positionAt(offset + character), position, input);
+      }
+      assert.equal(document.offsetAt(new Position(line, 10000)), offset + lines[line].length);
+      offset += lines[line].length + 1;
+    }
+    assert.deepEqual(document.positionAt(-1), new Position(0, 0));
+    assert.deepEqual(document.positionAt(input.length + 1), new Position(lines.length - 1, lines.at(-1).length));
+    assert.equal(document.offsetAt(new Position(-1, -1)), 0);
+    assert.equal(document.offsetAt(new Position(10000, 10000)), input.length);
+  }
+});
+
+test('large projections preserve positions through stored-source and package insertions', () => {
+  const input = 'x <- "😀"\n'.repeat(50000) + 'filter(x)';
+  const document = new VirtualRDocument('large-projection');
+  select(document, input, input.lastIndexOf('filter'), 'filter()', 'stats');
+  const projection = document.project(input, true, new Position(50000, 9), {
+    name: 'factory', body: 'function() {\n  list(alpha=1)\n}',
+  });
+  for (const row of [0, 1000, 25000, 49999, 50000]) {
+    for (let col = 0; col <= 9; col++) {
+      const position = new Position(row, col);
+      assert.deepEqual(projection.toConsolePosition(projection.toServerPosition(position)), position);
+    }
+  }
+  document.update('changed\n');
+  assert.deepEqual(projection.toConsolePosition(new Position(50003, 16)), new Position(50000, 9));
+  assert.equal(document.lineCount, 2);
+});
+
 test("selected packages qualify only virtual calls and map multiline UTF-16 positions", () => {
   const selections = new VirtualRDocument("test");
   const input = 'x <- "😀"; filter(\n  filter(x)\n)';
@@ -967,8 +1008,7 @@ test("completion requests do not perform package inventory checks", async (t) =>
 });
 
 
-test("language-server completion does not request a workspace refresh", async () => {
-  let workspaceRequests = 0;
+test("language-server completion starts from cached session data", async () => {
   let lspCompletionStarted = false;
   class TestPosition {
     constructor(line, character) {
@@ -1010,10 +1050,8 @@ test("language-server completion does not request a workspace refresh", async ()
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
-    requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => {
       lspCompletionStarted = true;
       return [];
@@ -1038,8 +1076,6 @@ test("language-server completion does not request a workspace refresh", async ()
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(lspCompletionStarted, true);
   await request;
-
-  assert.equal(workspaceRequests, 0);
 });
 
 
@@ -1080,12 +1116,8 @@ test("namespace completion does not wait for library or workspace probes", async
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: async () => {
-      throw new Error("workspace request should not run");
-    },
-    requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => {
+  lang.getCompletionProvider = async () => {
     events.push("lookup");
     return { provideCompletionItems: async () => [] };
   };
@@ -1112,8 +1144,7 @@ test("namespace completion does not wait for library or workspace probes", async
 });
 
 
-test("F7 refinement does not request a workspace refresh", async () => {
-  let workspaceRequests = 0;
+test("F7 refinement starts from cached session data", async () => {
   let refinedCompletionStarted = false;
   let changeValue;
   let hide;
@@ -1172,10 +1203,8 @@ test("F7 refinement does not request a workspace refresh", async () => {
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: () => { workspaceRequests++; throw Error("no live completion probe"); },
-    requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => [],
   });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1203,7 +1232,6 @@ test("F7 refinement does not request a workspace refresh", async () => {
 
   quickPick.hide();
   await request;
-  assert.equal(workspaceRequests, 0);
 });
 
 
@@ -1267,12 +1295,8 @@ test("package completion filters locally without repeated language-server reques
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: async () => {
-      throw new Error("workspace request should not run");
-    },
-    requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => [],
   });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1528,7 +1552,6 @@ test("namespace-only session changes do not resync the language server", () => {
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestMemberCompletions: async () => [],
   });
   const states = [];
   lang.consoleLsp = {
@@ -1655,12 +1678,8 @@ test("incomplete package completion re-queries until a complete result arrives",
     extensionPath: "",
     rPath: "R",
     env: {},
-    requestWorkspaceData: async () => {
-      throw new Error("workspace request should not run");
-    },
-    requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({
+  lang.getCompletionProvider = async () => ({
     provideCompletionItems: async () => [],
   });
   lang.getOrOpenCompletionDocument = async () => ({});
@@ -1695,7 +1714,13 @@ test("incomplete package completion re-queries until a complete result arrives",
 
   changeValue("");
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(completionCalls, 2);
+  assert.equal(completionCalls, 3, "clearing reloads the incomplete namespace baseline");
+  assert.deepEqual(quickPick.items.map(item => item.label), ["median"]);
+
+  changeValue("f");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completionCalls, 4, "the refreshed incomplete baseline still permits refinement");
+  assert.deepEqual(quickPick.items.map(item => item.label), ["filter"]);
 
   quickPick.hide();
   await request;
@@ -1839,12 +1864,12 @@ test("inline cache rebases safe prefix refinements and refuses changed replaceme
     return { text, lines, cursorRow, cursorCol: before.split("\n").at(-1).length,
       currentLine: lines[cursorRow], textBeforeCursor: before };
   };
-  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const input = snapshot("x <- df$a");
   await lang.handleAutocomplete({ input, getCurrentInput: () => input, getWorkspaceData: () => undefined,
     applyCompletion() {}, onInlineEntries() {} });
   const refined = lang.refineInlineCompletion(snapshot("x <- df$al"));
-  assert.equal(lang.hasCompleteInlineMemberCache(), true, "complete member suggestions can be filtered locally");
+  assert.equal(lang.hasCompleteInlineMemberCache(), false, "discarded edits require a provider refresh");
   const choices = refined.filter(entry => "insertText" in entry);
   assert.deepEqual(choices.map(entry => entry.insertText), ["alpha"]);
   assert.equal(choices[0].snapshotInput, "x <- df$al");
@@ -1894,7 +1919,7 @@ test("inline refresh, cached filtering and Quick Pick preserve semantic order", 
       "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
       "../../Language/virtualRDocument": { VirtualRDocument: class {} },
     });
-    const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+    const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
     const snapshot = value => ({ text: value, currentLine: value, lines: [value], cursorRow: 0,
       cursorCol: value.length, textBeforeCursor: value });
     const input = snapshot(text);
@@ -1957,10 +1982,8 @@ test("function argument completion awaits parameters before offering runtime var
   });
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
-    requestWorkspaceData: async () => ({ globalenv: { naive: {} } }),
-    requestMemberCompletions: async () => [],
   });
-  lang.ensureConsoleLspStarted = async () => ({ provideCompletionItems: () => [] });
+  lang.getCompletionProvider = async () => ({ provideCompletionItems: () => [] });
   lang.getOrOpenCompletionDocument = async () => ({});
   const input = {
     text: "mean(na", currentLine: "mean(na", cursorCol: 7,
@@ -1990,7 +2013,7 @@ test("session updates synchronize attached packages without supplying library pa
     "../../Language/consoleLspClient": { ConsoleLspClient: class {} },
     "../../Language/virtualRDocument": { VirtualRDocument: class {} },
   });
-  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {}, requestMemberCompletions: async () => [] });
+  const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
   const states = [];
   lang.consoleLsp = { syncSessionState: async state => { states.push(state); } };
   const data = { search: ["package:stats"], loaded_namespaces: [], globalenv: {} };
@@ -2037,7 +2060,6 @@ test("language-server state sync failures do not reject terminal workspace updat
   });
   const lang = new RTermLang({
     extensionPath: "", rPath: "R", env: {},
-    requestMemberCompletions: async () => [],
   });
   lang.consoleLsp = { syncSessionState: async () => { throw Error("restart failed"); } };
   assert.equal(lang.updateSessionData({
@@ -2073,7 +2095,7 @@ test("native member snippets preserve escaped dollars, braces and backslashes", 
 });
 
 test("cached native replacement ends move with the typed prefix", () => {
-  const { refineCompletionEntries, rebaseCompletionEnds } = loadSource('src/Language/completion/refinement.ts');
+  const { refineCompletionEntries } = loadSource('src/Language/completion/refinement.ts');
   const before = 'obj$alpha';
   const after = 'obj$allpha';
   const context = completion.getCompletionContext(before, 5);
@@ -2084,8 +2106,6 @@ test("cached native replacement ends move with the typed prefix", () => {
     { text: after, textBeforeCursor: after.slice(0, 6), cursorRow: 0 }, refinedContext);
   const pick = completion.toCompletionPick(refined[0], refinedContext);
   assert.equal(after.slice(0, pick.replaceStart) + pick.insertText + after.slice(pick.replaceEnd), 'obj$alpha');
-  const preview = rebaseCompletionEnds(refined, -1);
-  assert.equal(preview[0].replaceEnd, 9, 'picker preview edits must map back to the actual input');
   assert.equal(entries[0].replaceEnd, 9, 'cache entries stay immutable');
 });
 

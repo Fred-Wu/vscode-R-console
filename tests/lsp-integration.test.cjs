@@ -9,7 +9,10 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { createGuardedBindingResolver } = loadSource("src/Language/completion/bindings.ts");
 const { runRJson } = require("./helpers/run-r-json.cjs");
+const { nativeStaticEvidence } = require("./helpers/native-static-evidence.cjs");
+const { retryStaticCompletion, staticFixtureAccess, staticFixtureProvider, completeStatic } = require("./helpers/static-completion.cjs");
 const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 const completion = loadSource("src/Language/completion.ts", { vscode: {
@@ -17,6 +20,12 @@ const completion = loadSource("src/Language/completion.ts", { vscode: {
   SnippetString: class {},
   Position: class { constructor(line, character) { Object.assign(this, { line, character }); } },
 } });
+
+function collectStaticEntries(client, context, doc, position, session, lines, recent = [], requestRuntime) {
+  return retryStaticCompletion(() => completion.collectCompletionEntries(context,
+    { version: 1, uri: client.inputDocument.uri, ...doc }, position,
+    session, lines, recent, staticFixtureProvider(client), requestRuntime, undefined, undefined, 'static', staticFixtureAccess()));
+}
 
 test("closing a virtual completion document cancels native tasks and answers pending requests", () => {
   assert.deepEqual(runRJson(String.raw`
@@ -190,13 +199,8 @@ test("real language-server field and method edits preserve control characters in
   const input = "sales$tot";
   const source = definition + "\n" + input;
   const context = completion.getCompletionContext(input, input.length, source);
-  const entries = await completion.collectCompletionEntries(context, { getText: () => source },
-    { line: 1, character: input.length }, undefined, [definition], [], {
-      provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      },
-    });
+  const entries = await collectStaticEntries(client, context, { getText: () => source },
+    { line: 1, character: input.length }, undefined, [definition], []);
   const expressions = ["total\u0085USD", "total\u0085EUR"].map(label => {
     const entry = entries.find(item => item.label === label && item.source === "lsp");
     assert.ok(entry, label);
@@ -463,7 +467,7 @@ test("real LSP excludes supplied argument names while retaining signature order"
     const cursor = marked.indexOf("│");
     const text = marked.replace("│", "");
     const before = text.slice(0, cursor).split("\n");
-    const result = await client.provideCompletionItems({ getText: () => text },
+    const result = await completeStatic(client, { getText: () => text },
       { line: before.length - 1, character: before.at(-1).length });
     const parameters = (Array.isArray(result) ? result : result?.items ?? [])
       .filter(item => item.detail === "parameter").map(item => item.label);
@@ -492,7 +496,7 @@ test("real LSP validates positional, partial, quoted and piped argument candidat
   ]) {
     const cursor = marked.indexOf("│");
     const text = marked.replace("│", "");
-    const result = await client.provideCompletionItems({ getText: () => text }, { line: 0, character: cursor });
+    const result = await completeStatic(client, { getText: () => text }, { line: 0, character: cursor });
     const parameters = (Array.isArray(result) ? result : result?.items ?? [])
       .filter(item => item.detail === "parameter").map(item => item.label);
     assert.deepEqual(parameters, expected, marked);
@@ -504,7 +508,7 @@ test("argument validation uses the local signature without evaluating defaults o
   const definition = 'atan2 <- function(first, second = stop("default evaluated")) stop("body evaluated")\n';
   const parameters = async marked => {
     const text = definition + marked.replace("│", "");
-    const result = await client.provideCompletionItems({ getText: () => text },
+    const result = await completeStatic(client, { getText: () => text },
       { line: 1, character: marked.indexOf("│") });
     return (Array.isArray(result) ? result : result?.items ?? [])
       .filter(item => item.detail === "parameter").map(item => item.label);
@@ -530,7 +534,7 @@ test("local quoted formals retain unused arguments and reject supplied names", {
   const definition = 'f <- function(`a b`, `a\\`b`, normal = stop("default evaluated")) stop("body evaluated")\n';
   const parameters = async marked => {
     const text = definition + marked.replace("│", "");
-    const result = await client.provideCompletionItems({ getText: () => text },
+    const result = await completeStatic(client, { getText: () => text },
       { line: 1, character: marked.indexOf("│") });
     return (result.items ?? result).filter(item => item.detail === "parameter").map(item => item.insertText);
   };
@@ -566,7 +570,7 @@ test("unfinished multiline definitions complete immediately without executing or
     const before = marked.slice(0, marked.indexOf("│"));
     const position = { line: before.split("\n").length - 1, character: before.split("\n").at(-1).length };
     // One request per edit: polling would conceal a stale asynchronous parse.
-    const result = await client.provideCompletionItems({ getText: () => text }, position);
+    const result = await completeStatic(client, { getText: () => text }, position);
     assert.deepEqual((result.items ?? result).filter(item => item.detail === "parameter").map(item => item.label), expected, marked);
     const request = instances.at(-1).requests.filter(request => request.params?.position).at(-1);
     assert.deepEqual({ ...request.params.position }, position);
@@ -591,7 +595,8 @@ test("unfinished multiline definitions complete immediately without executing or
   const { terminal } = require("./helpers/inline-terminal.cjs").createTerminal(t);
   delete terminal.applyCompletion;
   terminal.lang = new RTermLang({ extensionPath: "", rPath: "", env: {},
- });
+    getStaticAnalysisEnabled: () => true,
+  });
   const input = cases[0][0].replace("│", "");
   terminal.applyKeyAction({ type: "text", text: input });
   const choices = () => terminal.inlineCompletion.items.filter(item => "insertText" in item);
@@ -610,14 +615,6 @@ test("unfinished multiline definitions complete immediately without executing or
 
 test("current source signatures supersede older session definitions, including empty results", { timeout: 90000 }, async t => {
   const { client } = require("./helpers/console-lsp.cjs").createConsoleLsp(t);
-  const provider = {
-    getCallContext: client.getCallContext.bind(client),
-    provideCompletionItems: async (...args) => {
-      const result = await client.provideCompletionItems(...args);
-      return { ...result, items: (result.items ?? result).map(item => ({ ...item,
-        kind: item.kind === undefined ? undefined : item.kind - 1 })) };
-    },
-  };
   const session = { globalenv: { f: { type: "closure" } } };
   client.setRuntimeSignatures({ f: 'function(old_arg = "old_value")' });
   const request = async () => assert.fail("workspace arguments must not query sess");
@@ -641,8 +638,8 @@ test("current source signatures supersede older session definitions, including e
     const position = { line: before.split("\n").length - 1, character: before.split("\n").at(-1).length };
     const context = completion.getCompletionContext(lines[position.line], position.character, before,
       text.slice(before.length));
-    const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
-      session, lines.slice(0, position.line), [], provider, request);
+    const entries = await collectStaticEntries(client, context, { getText: () => text }, position, session,
+      lines.slice(0, position.line), [], request);
     assert.deepEqual(entries.filter(item => item.detail === "parameter").map(item => item.label), expected, marked);
     if (!expected.includes("old_arg")) assert.ok(!entries.some(item => item.label === "old_value"), marked);
   }
@@ -658,7 +655,7 @@ test("runtime mode ignores unsubmitted definitions; opt-in static mode can infer
     const cursor = marked.indexOf("│");
     const text = marked.replace("│", "");
     const before = marked.slice(0, cursor).split("\n");
-    const result = await client.provideCompletionItems({ getText: () => text },
+    const result = await (client === runtime ? client.provideCompletionItems.bind(client) : completeStatic.bind(null, client))({ getText: () => text },
       { line: before.length - 1, character: before.at(-1).length });
     assert.ok(result, marked);
     return { result, parameters: (result.items ?? result).filter(item => item.detail === "parameter")
@@ -798,17 +795,13 @@ test("cached workspace signatures replace and remove native definitions and surv
 
 test("qualified namespace arguments use the real LSP despite a same-name local function", { timeout: 90000 }, async t => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
-  const { complete } = createConsoleLsp(t);
+  const { client } = createConsoleLsp(t);
   for (const operator of ["::", ":::"]) {
     const input = `lm <- function(wrong_argument) {}; stats${operator}lm(`;
     const context = completion.getCompletionContext(input, input.length);
     let runtimeRequests = 0;
-    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-      { line: 0, character: input.length }, undefined, [], [], {
-        provideCompletionItems: async doc => (await complete(doc.getText())).map(item => ({
-          ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
-        })),
-      }, async () => { runtimeRequests++; return []; });
+    const entries = await collectStaticEntries(client, context, { getText: () => input },
+      { line: 0, character: input.length }, undefined, [], [], async () => { runtimeRequests++; return []; });
     assert.equal(runtimeRequests, 0, "namespace calls must not request session formals");
     const parameters = entries.filter(entry => entry.detail === "parameter").map(entry => entry.label);
     assert.ok(parameters.includes("formula"));
@@ -822,15 +815,9 @@ test("an explicitly selected package function retains its signature over a sessi
   const input = "lm()";
   client.updateInput(input);
   client.recordCompletion(input, 0, { insertText: "lm()", source: "lsp", packageName: "stats" });
-  const entries = await completion.collectCompletionEntries(completion.getCompletionContext(input, 3),
-    { getText: () => input }, { line: 0, character: 3 },
-    { globalenv: { lm: { type: "closure" } } }, [], [], {
-      getCallContext: client.getCallContext.bind(client),
-      provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return (result.items ?? result).map(item => ({ ...item, kind: item.kind - 1 }));
-      },
-    }, async () => { assert.fail("selected package must not query the session namesake"); });
+  const entries = await collectStaticEntries(client, completion.getCompletionContext(input, 3),
+    { getText: () => input }, { line: 0, character: 3 }, { globalenv: { lm: { type: "closure" } } }, [], [],
+    async () => { assert.fail("selected package must not query the session namesake"); });
   assert.deepEqual(entries.filter(item => item.detail === "parameter").slice(0, 4).map(item => item.label),
     ["formula", "data", "subset", "weights"]);
 });
@@ -861,15 +848,8 @@ test("multiline arguments use parsed call identities and selected packages in th
     let parameters = [];
     const deadline = Date.now() + 10000;
     do {
-      const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-        { line: row, character: column }, undefined, linesBefore.slice(0, -1), [], {
-          provideCompletionItems: async (doc, position, trigger) => {
-            const result = await client.provideCompletionItems(doc, position, trigger);
-            return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
-              ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
-            }));
-          },
-        });
+      const entries = await collectStaticEntries(client, context, { getText: () => input },
+        { line: row, character: column }, undefined, linesBefore.slice(0, -1), []);
       parameters = entries.filter(entry => entry.detail === "parameter").map(entry => entry.label);
       if (parameters.includes(parameter)) break;
       // Local definitions become available when languageserver's asynchronous
@@ -902,15 +882,8 @@ test("multiline fuzzy arguments retain call identity and the original replacemen
     let entry;
     const deadline = Date.now() + 10000;
     do {
-      const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-        { line: 1, character: column }, undefined, [input.split("\n")[0]], [], {
-          provideCompletionItems: async (...args) => {
-            const result = await client.provideCompletionItems(...args);
-            return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
-              ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
-            }));
-          },
-        });
+      const entries = await collectStaticEntries(client, context, { getText: () => input },
+        { line: 1, character: column }, undefined, [input.split("\n")[0]], []);
       entry = entries.find(item => item.label === parameter && item.detail === "parameter");
       if (entry) break;
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -946,7 +919,7 @@ test("Unicode call identity never substitutes a same-suffix global function", { 
     let parameters;
     const deadline = Date.now() + 10000;
     do {
-      const result = await client.provideCompletionItems({ getText: () => input }, position);
+      const result = await completeStatic(client, { getText: () => input }, position);
       parameters = (Array.isArray(result) ? result : result?.items ?? [])
         .filter(item => item.detail === "parameter").map(item => item.label);
       if (validNames[index] ? parameters.includes("correct_argument") : parameters.length === 0) break;
@@ -979,15 +952,8 @@ test("fuzzy fallback preserves value, comment and member-call identities", { tim
     const column = before.split("\n").at(-1).length;
     const context = completion.getCompletionContext(input.split("\n")[1], column, before, input.slice(cursor));
     const previousRequests = instances.at(-1)?.requests.length ?? 0;
-    const entries = await completion.collectCompletionEntries(context, { getText: () => input },
-      { line: 1, character: column }, undefined, [input.split("\n")[0]], [], {
-        provideCompletionItems: async (...args) => {
-          const result = await client.provideCompletionItems(...args);
-          return (Array.isArray(result) ? result : result?.items ?? []).map(item => ({
-            ...item, kind: item.kind === undefined ? undefined : item.kind - 1,
-          }));
-        },
-      });
+    const entries = await collectStaticEntries(client, context, { getText: () => input },
+      { line: 1, character: column }, undefined, [input.split("\n")[0]], []);
     if (context.suppressAutomatic) {
       assert.deepEqual(entries, [], input);
       assert.equal(instances.at(-1)?.requests.length ?? 0, previousRequests, 'literal/comment context must not query code completions');
@@ -1315,10 +1281,6 @@ test("subscript options and adjacent nested closers preserve native R indexing",
 
 test("partial argument values follow R matching in source and workspace signatures", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  const provide = async (...args) => {
-    const result = await client.provideCompletionItems(...args);
-    return { ...result, items: (result.items ?? result).map(item => ({ ...item, kind: item.kind - 1 })) };
-  };
   const definitions = 'f <- function(method = c("spearman", "pearson"), metric = "other") stop("body evaluated")\n';
   for (const runtime of [false, true]) {
     client.setRuntimeSignatures(runtime ? { f: 'function(method = c("spearman", "pearson"), metric = "other")' } : {});
@@ -1331,31 +1293,48 @@ test("partial argument values follow R matching in source and workspace signatur
       const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
       const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
       const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
-      const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
+      const entries = await collectStaticEntries(client, context, { getText: () => text }, position,
         runtime ? { globalenv: { f: { type: 'closure' } } } : undefined, lines.slice(0, position.line), [],
-        { provideCompletionItems: provide }, async () => assert.fail("workspace arguments must not query sess"));
+        async () => assert.fail("workspace arguments must not query sess"));
       assert.deepEqual(entries.filter(item => item.detail?.startsWith('value for ')).map(item => item.label), expected,
         `${runtime ? 'runtime' : 'source'}: ${marked}`);
     }
   }
-  const result = await client.provideCompletionItems({ getText: () => 'stats::cor(met = sp)' }, { line: 0, character: 'stats::cor(met = sp'.length });
+  const result = await completeStatic(client, { getText: () => 'stats::cor(met = sp)' }, { line: 0, character: 'stats::cor(met = sp'.length });
   assert.ok(result.items.some(item => item.label === 'spearman'));
   for (const tag of ['met', 'method']) {
     const text = `f <- function(..., method = "spearman") NULL\nf(${tag} = "sp")`;
-    const result = await client.provideCompletionItems({ getText: () => text }, { line: 1, character: `f(${tag} = "sp`.length });
+    const result = await completeStatic(client, { getText: () => text }, { line: 1, character: `f(${tag} = "sp`.length });
     assert.equal(result.items.some(item => item.label === 'spearman'), tag === 'method', 'partial matching stops at dots');
+  }
+});
+
+test("declarations outside the cursor binding preserve source and live signatures", { timeout: 90000 }, async t => {
+  const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
+  client.setRuntimeSignatures({ f: 'function(live_arg)' });
+  for (const [marked, expected, local] of [
+    ['f <- function(alpha) NULL; f(│); f <- function(beta) NULL', ['alpha'], true],
+    ['f <- function(alpha) NULL; g <- function() { f <- function(beta) NULL }; f(│)', ['alpha'], true],
+    ['f(│); f <- function(beta) NULL', ['live_arg'], false],
+    ['g <- function() { f <- function(hidden) NULL }; f(│)', ['live_arg'], false],
+    ['f <- function(earlier) NULL; f <- function() { f(│) }; f <- function(earlier) NULL', [], true],
+    ['(function(recursive) { f(│) }) -> f', [], true],
+  ]) {
+    const result = await completeStatic(client, { getText: () => marked.replace('│', '') },
+      { line: 0, character: marked.indexOf('│') });
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, marked);
+    assert.equal(result.rConsoleLocalFunction === true, local, marked);
+    assert.equal(result.rConsoleWorkspaceFunction === true, !local, marked);
   }
 });
 
 test("source redefinitions remain authoritative through wrappers, chains and lexical scopes", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  const provider = { provideCompletionItems: async (...args) => {
-    const result = await client.provideCompletionItems(...args);
-    return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-  } };
-  for (const [marked, expected] of [
+  // Known native limitations use independently observed native evidence.
+  // Adapter failures cannot downgrade a callable that native inference resolves.
+  for (const [marked, expected, nativeMayDecline = false] of [
     ['f <- (function(new_arg) NULL)\nf(│)', ['new_arg']],
-    ['f <- g <- function(new_arg) NULL\nf(│)', ['new_arg']],
+    ['f <- g <- function(new_arg) NULL\nf(│)', ['new_arg'], true],
     ['(function(new_arg) NULL) -> f\nf(│)', ['new_arg']],
     ['f <- (function(new_arg = stop("default evaluated")) {\n stop("body evaluated")\n NULL\n})\nf(│)', ['new_arg']],
     ['f <- (function() NULL)\nf(│)', []],
@@ -1366,8 +1345,8 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
     ['f <- function(earlier) NULL; f <- { f(│); function(later) NULL }', ['earlier']],
     ['f <- function(earlier) NULL; f <- f(│)', ['earlier']],
     ['f <- function(earlier) NULL; f <- (g <- f(│))', ['earlier']],
-    ['f <- function(recursive_arg) { f(│) }', ['recursive_arg']],
-    ['(function(recursive_arg) { f(│) }) -> f', ['recursive_arg']],
+    ['f <- function(recursive_arg) { f(│) }', ['recursive_arg'], true],
+    ['(function(recursive_arg) { f(│) }) -> f', ['recursive_arg'], true],
     ['f <- function(earlier) NULL; f <- function() { f(│) }', []],
     ['f <- function(earlier) NULL; f <- (function() { f(│) })()', ['earlier']],
     ['f <- (function(method = c("new_value", "other")) NULL)\nf(meth = "new│")', ['new_value']],
@@ -1375,60 +1354,62 @@ test("source redefinitions remain authoritative through wrappers, chains and lex
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
     const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
     const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
-    const entries = await completion.collectCompletionEntries(context, { getText: () => text }, position,
-      { globalenv: { f: { type: 'closure' } } }, lines.slice(0, position.line), [], provider,
+    const entries = await collectStaticEntries(client, context, { getText: () => text }, position,
+      { globalenv: { f: { type: 'closure' } } }, lines.slice(0, position.line), [],
       async () => [{ name: 'old_arg' }]);
     assert.deepEqual(entries.filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '))
-      .map(item => item.label), expected, marked);
+      .map(item => item.label), nativeMayDecline && nativeStaticEvidence(marked).signature === null ? [] : expected, marked);
   }
 });
 
 test("formal bindings shadow outer functions without evaluating their defaults", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  for (const [marked, expected] of [
-    ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) { f(│) }', ['inner_arg']],
+  for (const [marked, expected, nativeMayDecline = false] of [
+    ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) { f(│) }', ['inner_arg'], true],
     ['f <- function(outer_arg) NULL\ng <- function(f) { f(│) }', []],
     ['f <- function(outer_arg) NULL\ng <- function(f = stop("must not evaluate")) { f(│) }', []],
-    ['g <- function(f = (function(inner_arg) NULL)) { f(│) }', ['inner_arg']],
-    ['g <- \\(f = \\(inner_arg) NULL) { f(│) }', ['inner_arg']],
-    ['g <- function(`a b` = function(inner_arg) NULL) { `a b`(│) }', ['inner_arg']],
+    ['g <- function(f = (function(inner_arg) NULL)) { f(│) }', ['inner_arg'], true],
+    ['g <- \\(f = \\(inner_arg) NULL) { f(│) }', ['inner_arg'], true],
+    ['g <- function(`a b` = function(inner_arg) NULL) { `a b`(│) }', ['inner_arg'], true],
     ['g <- function(f = function(default_arg) NULL) { f <- function(assigned_arg) NULL; f(│) }', ['assigned_arg']],
-    ['g <- function(f = function(default_arg) NULL) { f(│); f <- function(later_arg) NULL }', ['default_arg']],
-    ['g <- function(f = function(local_arg) NULL) { f <<- function(parent_arg) NULL; f(│) }', ['local_arg']],
-    ['g <- function(f = function(local_arg) NULL) { function(parent_arg) NULL ->> f; f(│) }', ['local_arg']],
+    ['g <- function(f = function(default_arg) NULL) { f(│); f <- function(later_arg) NULL }', ['default_arg'], true],
+    ['g <- function(f = function(local_arg) NULL) { f <<- function(parent_arg) NULL; f(│) }', ['local_arg'], true],
+    ['g <- function(f = function(local_arg) NULL) { function(parent_arg) NULL ->> f; f(│) }', ['local_arg'], true],
     ['g <- function() { f <- function(local_arg) NULL; f <<- function(parent_arg) NULL; f(│) }', ['local_arg']],
-    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f <<- function(new_arg) NULL; f(│) } }', ['new_arg']],
-    ['g <- function(f = function(outer_arg) NULL) { h <- function(f = function(inner_arg) NULL) { f(│) } }', ['inner_arg']],
-    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f(│) } }', ['outer_arg']],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f <<- function(new_arg) NULL; f(│) } }', ['new_arg'], true],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function(f = function(inner_arg) NULL) { f(│) } }', ['inner_arg'], true],
+    ['g <- function(f = function(outer_arg) NULL) { h <- function() { f(│) } }', ['outer_arg'], true],
     ['g <- function(f = function(outer_arg) NULL) { h <- function(f) { f(│) } }', []],
     ['f <- function(outer_arg) NULL\ng <- function(f = function(inner_arg) NULL) NULL; f(│)', ['outer_arg']],
-    ['g <- function(f = function(inner_arg) NULL) {\n f(│', ['inner_arg']],
+    ['g <- function(f = function(inner_arg) NULL) {\n f(│', ['inner_arg'], true],
     ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL }) { f(│) }', ['outer_arg']],
     ['f <- function(outer_arg) NULL; g <- function(x = f <- function(lazy_arg) NULL) { f(│) }', ['outer_arg']],
     ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL; f(│) }) NULL', ['lazy_arg']],
     ['f <- function(outer_arg) NULL; g <- function(x = { f <- function(lazy_arg) NULL }, y = f(│)) NULL', ['outer_arg']],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = before.split('\n');
-    const result = await client.provideCompletionItems({ getText: () => text },
+    const result = await completeStatic(client, { getText: () => text },
       { line: lines.length - 1, character: lines.at(-1).length });
     assert.equal(result.rConsoleLocalFunction, true, marked);
-    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, marked);
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label),
+      nativeMayDecline && nativeStaticEvidence(marked).signature === null ? [] : expected, marked);
+    if (result.rConsoleArgumentsResolved === false) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
   }
 });
 
 test("source bindings do not escape quoted, lazy or locally evaluated arguments", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  for (const tail of [
-    'quote(f <- function(hidden_arg) NULL); f(│)',
-    'substitute({ f <- function(hidden_arg) NULL }); f(│)',
-    'expression(f <- function(hidden_arg) NULL); f(│)',
-    'alist(f <- function(hidden_arg) NULL); f(│)',
-    'local({ f <- function(hidden_arg) NULL }); f(│)',
-    'base::local({ f <- function(hidden_arg) NULL }); f(│)',
-    'ignore <- function(...) NULL; ignore(f <- function(hidden_arg) NULL); f(│)',
-    'ignore <- function(x, y) y; ignore({ f <- function(hidden_arg) NULL }, f(│))',
-    'local({ f <- function(inner_arg) NULL; f(│) })',
-    'base::local({ f <- function(inner_arg) NULL; f(│) })',
+  for (const [tail, nativeMayDecline = false] of [
+    ['quote(f <- function(hidden_arg) NULL); f(│)', true],
+    ['substitute({ f <- function(hidden_arg) NULL }); f(│)', true],
+    ['expression(f <- function(hidden_arg) NULL); f(│)', true],
+    ['alist(f <- function(hidden_arg) NULL); f(│)', true],
+    ['local({ f <- function(hidden_arg) NULL }); f(│)', true],
+    ['base::local({ f <- function(hidden_arg) NULL }); f(│)', true],
+    ['ignore <- function(...) NULL; ignore(f <- function(hidden_arg) NULL); f(│)', true],
+    ['ignore <- function(x, y) y; ignore({ f <- function(hidden_arg) NULL }, f(│))'],
+    ['local({ f <- function(inner_arg) NULL; f(│) })'],
+    ['base::local({ f <- function(inner_arg) NULL; f(│) })'],
   ]) {
     const marked = 'f <- function(outer_arg) NULL; ' + tail;
     // Execute only these controlled fixtures to derive the expected binding
@@ -1436,9 +1417,11 @@ test("source bindings do not escape quoted, lazy or locally evaluated arguments"
     const expected = runRJson('cat(jsonlite::toJSON(eval(parse(text=inputs)), auto_unbox=FALSE))',
       marked.replace('f(│)', 'names(formals(f))'));
     const text = marked.replace('│', '');
-    const result = await client.provideCompletionItems({ getText: () => text },
+    const result = await completeStatic(client, { getText: () => text },
       { line: 0, character: marked.indexOf('│') });
-    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), expected, tail);
+    assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label),
+      nativeMayDecline && nativeStaticEvidence(marked).signature === null ? [] : expected, tail);
+    if (result.rConsoleArgumentsResolved === false) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
   }
 });
 
@@ -1459,21 +1442,17 @@ test("positional value suggestions match only the receiving argument", { timeout
     ['function(method = "still_available") NULL', 'f(method = "still│")', ['still_available']],
   ]) {
     const text = `f <- ${definition}\n${call.replace('│', '')}`;
-    const result = await client.provideCompletionItems({ getText: () => text }, { line: 1, character: call.indexOf('│') });
+    const result = await completeStatic(client, { getText: () => text }, { line: 1, character: call.indexOf('│') });
     assert.deepEqual(result.items.filter(item => item.detail?.startsWith('value for ')).map(item => item.label), expected, call);
   }
   // Package signatures use the same positional matching as source definitions.
   const text = 'stats::cor(x = 1, y = 2, use = "everything", method = "pearson", )';
-  const result = await client.provideCompletionItems({ getText: () => text }, { line: 0, character: text.length - 1 });
+  const result = await completeStatic(client, { getText: () => text }, { line: 0, character: text.length - 1 });
   assert.deepEqual(result.items.filter(item => item.detail?.startsWith('value for ')), []);
 });
 
 test("literal argument names and values are never interpreted as snippet placeholders", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  const provider = { provideCompletionItems: async (...args) => {
-    const result = await client.provideCompletionItems(...args);
-    return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-  } };
   for (const [marked, expected] of [
     ['f <- function(pattern = c("$1", "${2:text}")) NULL\nf(│)', ['pattern = ', '"$1"', '"${2:text}"']],
     ['f <- function(pattern = c("$1", "${2:text}")) NULL\nf(pattern = "│")', ['$1', '${2:text}']],
@@ -1484,8 +1463,8 @@ test("literal argument names and values are never interpreted as snippet placeho
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
     const position = { line: 1, character: before.split('\n').at(-1).length };
     const context = completion.getCompletionContext(lines[1], position.character, before, text.slice(before.length));
-    const entries = (await completion.collectCompletionEntries(context, { getText: () => text }, position,
-      undefined, lines.slice(0, 1), [], provider)).filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '));
+    const entries = (await collectStaticEntries(client, context, { getText: () => text }, position, undefined,
+      lines.slice(0, 1), [])).filter(item => item.detail === 'parameter' || item.detail?.startsWith('value for '));
     assert.deepEqual(entries.map(item => item.insertText), expected, marked);
     assert.ok(entries.every(item => item.label.includes('$') || item.label === 'pattern'), marked);
     for (const entry of entries) {
@@ -1495,29 +1474,33 @@ test("literal argument names and values are never interpreted as snippet placeho
   }
 });
 
-test("source-only pipe functions survive filtering and native-pipe parse recovery", { timeout: 90000 }, async t => {
+test("pipe completion preserves native recovery without synthetic source edits", { timeout: 90000 }, async t => {
   const { client, instances } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
-  for (const marked of [
-    'my_frob <- function(x) x\n1 %>% my_fr│',
-    'my_frob <- function(x) x\n1 |> my_fr│',
-    '{\n my_frob <- function(x) x\n 1 |> my_fr│',
-    '{\n my_frob <- function(x) x\n 1 |> my_fr│ }',
-    '{\n my_frob <- function(x) x\n 1 |> my_f│rob }',
-    'my_frob <- function(x) x\n1 |> my_fr│()',
-    'my_frob <- function(x) x\n"😀" |> my_fr│',
-    'my_frob <- function(x) x\n\t1 |> my_fr│',
-    'my_frob <- function(x) x\n1 |> │',
+  for (const [marked, required] of [
+    ['my_frob <- function(x) x\n1 %>% my_fr│', true],
+    ['my_frob <- function(x) x\n1 |> my_fr│', false],
+    ['{\n my_frob <- function(x) x\n 1 |> my_fr│', false],
+    ['{\n my_frob <- function(x) x\n 1 |> my_fr│ }', false],
+    ['{\n my_frob <- function(x) x\n 1 |> my_f│rob }', false],
+    ['my_frob <- function(x) x\n1 |> my_fr│()', true],
+    ['my_frob <- function(x) x\n"😀" |> my_fr│', false],
+    ['my_frob <- function(x) x\n\t1 |> my_fr│', false],
+    ['my_frob <- function(x) x\n1 |> │', false],
   ]) {
     const text = marked.replace('│', ''), before = marked.split('│')[0], lines = text.split('\n');
     const position = { line: before.split('\n').length - 1, character: before.split('\n').at(-1).length };
     const doc = { getText: () => text, uri: client.inputDocument.uri };
     const context = completion.getCompletionContext(lines[position.line], position.character, before, text.slice(before.length));
-    const entries = await completion.collectCompletionEntries(context, doc, position, undefined,
-      lines.slice(0, position.line), [], { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } });
-    assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
+    const entries = await collectStaticEntries(client, context, doc, position, undefined,
+      lines.slice(0, position.line), []);
+    if (required) assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
+    const native = nativeStaticEvidence(marked, context.prefix);
+    assert.equal(entries.some(item => item.insertText === 'my_frob()'), native.functions.includes('my_frob'), marked);
+    // Incomplete native-pipe destinations may remain unresolved upstream. Never
+    // synthesize a call/closing braces to manufacture static source bindings.
+    const params = instances.at(-1).requests.filter(request => request.params?.position).at(-1).params;
+    assert.equal(params.rConsoleParseSuffix, undefined);
+    assert.equal(params.rConsoleParseInsertion, undefined);
     assert.equal([...client.syncedDocuments.values()].at(-1).document.getText(), text, 'repair stays out of the visible/LSP document');
     assert.ok(instances.at(-1).requests.filter(request => request.params?.position).at(-1).params.position.character <= lines[position.line].length);
   }
@@ -1528,12 +1511,9 @@ test("source callable names preserve literal dollar signs and quoting", { timeou
   for (const name of ['foo$1', 'foo${2:text}', 'foo bar']) {
     const text = '`' + name + '` <- function(x) NULL\nfoo';
     const context = completion.getCompletionContext('foo', 3, text);
-    const entries = await completion.collectCompletionEntries(context,
+    const entries = await collectStaticEntries(client, context,
       { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: 3 }, undefined,
-      [text.split('\n')[0]], [], { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } });
+      [text.split('\n')[0]], []);
     assert.ok(entries.some(item => item.insertText === '`' + name + '`()'), name);
   }
 });
@@ -1551,15 +1531,15 @@ test("complex defaults cannot suppress source argument completions", { timeout: 
     'c((function() stop("never evaluate"))())', 'c("known", base::stop("never evaluate"))',
     'c(I("known"), , base::stop("never evaluate"))']) {
     const text = `f <- function(x = ${expression}, good) NULL\nf()`;
-    const result = await client.provideCompletionItems({ getText: () => text }, { line: 1, character: 2 });
+    const result = await completeStatic(client, { getText: () => text }, { line: 1, character: 2 });
     assert.ok(result, expression);
     assert.deepEqual(result.items.filter(item => item.detail === 'parameter').map(item => item.label), ['x', 'good'], expression);
     assert.deepEqual(result.items.filter(item => item.detail === 'value for x').map(item => item.label),
       expression.includes('"known"') ? ['known'] : [], expression);
-    const symbols = await client.provideCompletionItems({ getText: () => text.replace('f()', 'f(lib)') },
+    const symbols = await completeStatic(client, { getText: () => text.replace('f()', 'f(lib)') },
       { line: 1, character: 5 });
     assert.ok(symbols?.items.some(item => item.label === 'library'), 'ordinary symbol completion is preserved');
-    const values = await client.provideCompletionItems({ getText: () => text.replace('f()', 'f(x = "")') },
+    const values = await completeStatic(client, { getText: () => text.replace('f()', 'f(x = "")') },
       { line: 1, character: 7 });
     assert.deepEqual(values?.items.filter(item => item.detail === 'value for x').map(item => item.label),
       expression.includes('"known"') ? ['known'] : [], 'quoted values use the same safe extraction');
@@ -1618,13 +1598,10 @@ test("native member inference owns edits, callable snippets and empty source obj
     const line = text.split('\n')[position.line];
     const context = completion.getCompletionContext(line, position.character, text.slice(0, cursor), text.slice(cursor));
     let probes = 0;
-    const entries = await completion.collectCompletionEntries(context,
+    const entries = await collectStaticEntries(client, context,
       { getText: () => text, uri: client.inputDocument.uri }, position,
       { globalenv: { obj: { names: ['stale'] } } }, text.split('\n').slice(0, position.line), [],
-      { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } }, async () => { probes++; return [{ name: 'stale' }]; });
+      async () => { probes++; return [{ name: 'stale' }]; });
     assert.deepEqual(entries.map(item => item.insertText), expected, marked);
     assert.equal(probes, 0, 'native source inference must not probe the active R session');
     if (expected[0] === 'alpha') {
@@ -1668,13 +1645,14 @@ test("static completion explains missing source and unresolved accessors using n
     const lines = text.split('\n'), line = lines.at(-1);
     const position = { line: lines.length - 1, character: line.length };
     const doc = { getText: () => text, uri: client.inputDocument.uri };
-    const context = completion.getStaticFallbackContext(line, line.length, text) ??
-      completion.getCompletionContext(line, line.length, text);
-    const result = await client.provideCompletionItems(doc, position, context.triggerCharacter,
-      undefined, undefined, 'static');
+    const context = completion.getStaticCompletionContext(line, line.length, text);
+    const result = await completeStatic(client, doc, position, context.triggerCharacter);
     assert.equal(result.rConsoleStaticUnavailableReason, reason, text);
+    // This source-only fixture has no live bindings to mask native inference.
     const entries = await completion.collectStaticFallbackEntries(context, doc, position,
-      lines.slice(0, -1), { provideCompletionItems: async () => result });
+      lines.slice(0, -1), client, {
+        bindings: createGuardedBindingResolver(async () => ({ status: 'missing' })),
+      });
     assert.equal(entries.staticResolved, resolved, text);
     assert.equal(entries.staticUnavailableReason, reason, text);
     assert.deepEqual(entries.map(entry => entry.label), labels, text);
@@ -1686,12 +1664,8 @@ test("native S3 arguments retain their resolved method and presentation role", {
   const text = 'df <- data.frame(alpha = 1)\nsubset(df, )';
   const position = { line: 1, character: 11 };
   const context = completion.getCompletionContext('subset(df, )', 11, text.slice(0, text.length - 1), ')');
-  const entries = await completion.collectCompletionEntries(context,
-    { getText: () => text, uri: client.inputDocument.uri }, position, undefined, [text.split('\n')[0]], [],
-    { provideCompletionItems: async (...args) => {
-      const result = await client.provideCompletionItems(...args);
-      return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-    } });
+  const entries = await collectStaticEntries(client, context,
+    { getText: () => text, uri: client.inputDocument.uri }, position, undefined, [text.split('\n')[0]], []);
   assert.deepEqual(entries.filter(item => item.role === 'argument').map(item => item.label), ['subset', 'select', 'drop']);
   assert.ok(entries.find(item => item.label === 'drop').detail.includes('drop = FALSE'));
 });
@@ -1700,6 +1674,7 @@ test("live function arguments survive native S3 inference while source and packa
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   const setup = 'print <- function(x, custom_arg) NULL\n';
   const provider = {
+    ...staticFixtureProvider(client),
     getCallContext: client.getCallContext.bind(client),
     provideCompletionItems: async (...args) => {
       const result = await client.provideCompletionItems(...args);
@@ -1732,7 +1707,8 @@ test("live function arguments survive native S3 inference while source and packa
     }
     client.updateInput('');
     client.setRuntimeSignatures(shadow ? { print: 'function(x, custom_arg)' } : {});
-    client.setStaticAnalysis(!shadow || marked.includes('print <- function'));
+    const staticMode = !shadow || marked.includes('print <- function');
+    client.setStaticAnalysis(staticMode);
     if (selected) {
       client.updateInput(text);
       client.recordCompletion(text, 0, { insertText: 'print()', source: 'lsp', packageName: 'base' });
@@ -1740,9 +1716,10 @@ test("live function arguments survive native S3 inference while source and packa
     let probes = 0;
     const entries = await completion.collectCompletionEntries(
       completion.getCompletionContext(lines[row], col, before, text.slice(cursor)),
-      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col },
+      { version: 1, getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col },
       shadow ? { globalenv: { print: { type: 'closure' } } } : undefined,
-      lines.slice(0, row), [], provider, async () => { probes++; });
+      lines.slice(0, row), [], provider, async () => { probes++; },
+      undefined, undefined, staticMode ? 'static' : 'runtime', staticFixtureAccess());
     assert.equal(probes, 0, marked);
     if (expected) assert.ok(entries.some(entry => entry.insertText === expected), marked);
     else assert.deepEqual(entries, [], marked);
@@ -1753,6 +1730,7 @@ test("live function arguments survive native S3 inference while source and packa
 test("source bindings inside blocks override inferred S3 signatures and live functions", { timeout: 90000 }, async t => {
   const { client } = require('./helpers/console-lsp.cjs').createConsoleLsp(t);
   const provider = {
+    ...staticFixtureProvider(client),
     getCallContext: client.getCallContext.bind(client),
     provideCompletionItems: async (...args) => {
       const result = await client.provideCompletionItems(...args);
@@ -1773,12 +1751,14 @@ test("source bindings inside blocks override inferred S3 signatures and live fun
     ['{ print <- function(x, mode=c("auto", "manual")) NULL; print(data.frame(a=1), mode="aut│") }', ['auto']],
   ]) {
     const cursor = marked.indexOf('│'), text = marked.replace('│', '');
-    client.setStaticAnalysis(marked.includes('<-'));
+    const staticMode = marked.includes('<-');
+    client.setStaticAnalysis(staticMode);
     let probes = 0;
     const entries = await completion.collectCompletionEntries(
       completion.getCompletionContext(text, cursor),
-      { getText: () => text, uri: client.inputDocument.uri }, { line: 0, character: cursor },
-      { globalenv: { print: { type: 'closure' } } }, [], [], provider, async () => { probes++; });
+      { version: 1, getText: () => text, uri: client.inputDocument.uri }, { line: 0, character: cursor },
+      { globalenv: { print: { type: 'closure' } } }, [], [], provider, async () => { probes++; },
+      undefined, undefined, staticMode ? 'static' : 'runtime', staticFixtureAccess());
     const argumentsAndValues = entries.filter(item => item.role === 'argument' || item.role === 'value' ||
       item.detail === 'parameter' || item.detail?.startsWith('value for '));
     assert.deepEqual(argumentsAndValues.map(item => item.insertText), expected, marked);
@@ -1794,12 +1774,9 @@ test("source-defined member arguments use native inference without a live-sessio
     const text = first + '\n' + line;
     const context = completion.getCompletionContext(line, line.length, text);
     let probes = 0;
-    const entries = await completion.collectCompletionEntries(context,
-      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: line.length }, undefined, [first], [],
-      { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } }, async () => { probes++; return [{ name: 'stale' }]; });
+    const entries = await collectStaticEntries(client, context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: line.length }, undefined,
+      [first], [], async () => { probes++; return [{ name: 'stale' }]; });
     assert.ok(entries.some(item => item.insertText === expected), line);
     assert.equal(probes, 0);
   }
@@ -1821,13 +1798,16 @@ test("receiver-only static inference uses the shared path across object systems"
   ]) {
     const text = definition + '\n' + input;
     const context = completion.getCompletionContext(input, input.length, text);
-    const entries = await completion.collectStaticFallbackEntries(context,
+    const entries = await retryStaticCompletion(() => completion.collectStaticFallbackEntries(context,
       { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: input.length },
-      [definition], { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } });
-    assert.equal(entries.staticResolved, true, definition);
+      [definition], { provideStaticCompletion: async request => {
+        const outcome = await client.provideStaticCompletion(request);
+        const result = outcome.completion;
+        return { ...outcome, completion: result && {
+          ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })),
+        } };
+      } }));
+    assert.equal(entries.staticResolved, true, `${definition}: ${entries.staticUnavailableReason ?? 'resolved'}`);
     for (const label of expected) assert.ok(entries.some(item => item.label === label), definition + ': ' + label);
     assert.ok(entries.every(item => item.role === 'member'), definition);
     assert.equal(fs.existsSync(marker), false, 'inference must not run a getter');
@@ -1845,12 +1825,9 @@ test("native constructor signatures exclude supplied arguments without runtime f
     const text = first + '\n' + line;
     const context = completion.getCompletionContext(line, line.length, text);
     let probes = 0;
-    const entries = await completion.collectCompletionEntries(context,
-      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: line.length }, undefined, [first], [],
-      { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } }, async () => { probes++; return [{ name: 'stale' }]; });
+    const entries = await collectStaticEntries(client, context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: 1, character: line.length }, undefined,
+      [first], [], async () => { probes++; return [{ name: 'stale' }]; });
     assert.deepEqual(entries.filter(item => item.role === 'argument').map(item => item.label), expected, line);
     assert.equal(probes, 0);
   }
@@ -1879,12 +1856,9 @@ test("exhausted fixed-arity calls suppress all completion sources", { timeout: 9
     const before = text.slice(0, cursor), lines = text.split('\n');
     const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
     const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
-    const entries = await completion.collectCompletionEntries(context,
+    const entries = await collectStaticEntries(client, context,
       { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, session,
-      lines.slice(0, row), ['recent_symbol'], { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } });
+      lines.slice(0, row), ['recent_symbol']);
     if (exhausted) assert.equal(entries.length, 0, marked);
     else assert.ok(entries.some(item => item.label === 'runtime_function'), marked);
   }
@@ -1896,13 +1870,9 @@ test("unquoted list indices prioritize matching index variables", { timeout: 900
   const line = text.split('\n').at(-1), col = line.indexOf(']]');
   const context = completion.getCompletionContext(line, col, text.slice(0, -2), ']]');
   const session = { globalenv: { lst: { names: ['alpha', 'beta'] }, index: { type: 'character' } } };
-  const entries = await completion.collectCompletionEntries(context, { getText: () => text, uri: client.inputDocument.uri },
-    { line: 2, character: col }, session, text.split('\n').slice(0, 2), [], {
-      provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      },
-    });
+  const entries = await collectStaticEntries(client, context,
+    { getText: () => text, uri: client.inputDocument.uri }, { line: 2, character: col }, session,
+    text.split('\n').slice(0, 2), []);
   assert.deepEqual(entries.map(item => item.label), ['index']);
   assert.equal(entries[0].insertText, 'index');
 });
@@ -1944,12 +1914,8 @@ test("completion sources stay inside every R cursor context", { timeout: 90000 }
     const before = text.slice(0, cursor), lines = text.split('\n');
     const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
     const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
-    return completion.collectCompletionEntries(context,
-      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, session,
-      lines.slice(0, row), ['global_history'], { provideCompletionItems: async (...args) => {
-        const result = await client.provideCompletionItems(...args);
-        return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-      } });
+    return collectStaticEntries(client, context, { getText: () => text, uri: client.inputDocument.uri },
+      { line: row, character: col }, session, lines.slice(0, row), ['global_history']);
   };
   const labels = entries => entries.map(item => item.label);
   for (const [marked, expected] of [
@@ -2024,13 +1990,9 @@ test("variadic completion retains dots after supplied arguments without leaking 
     const cursor = marked.indexOf('│'), text = marked.replace('│', ''), before = text.slice(0, cursor);
     const lines = text.split('\n'), row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
     const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
-    const entries = await completion.collectCompletionEntries(context, { getText: () => text, uri: client.inputDocument.uri },
-      { line: row, character: col }, undefined, lines.slice(0, row), [], {
-        provideCompletionItems: async (...args) => {
-          const result = await client.provideCompletionItems(...args);
-          return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-        },
-      });
+    const entries = await collectStaticEntries(client, context,
+      { getText: () => text, uri: client.inputDocument.uri }, { line: row, character: col }, undefined,
+      lines.slice(0, row), []);
     const dots = entries.find(entry => entry.label === '...');
     assert.equal(!!dots, expected, marked);
     if (dots) { assert.equal(dots.insertText, '...'); assert.equal(dots.role, 'argument'); }
@@ -2185,13 +2147,9 @@ test("subscript symbols and fields come from the real language server", { timeou
     const before = text.slice(0, cursor), lines = text.split('\n');
     const row = before.split('\n').length - 1, col = before.split('\n').at(-1).length;
     const context = completion.getCompletionContext(lines[row], col, before, text.slice(cursor));
-    return completion.collectCompletionEntries(context, { getText: () => text, uri: client.inputDocument.uri },
-      { line: row, character: col }, undefined, lines.slice(0, row), [], {
-        provideCompletionItems: async (...args) => {
-          const result = await client.provideCompletionItems(...args);
-          return { ...result, items: result.items.map(item => ({ ...item, kind: item.kind - 1 })) };
-        },
-      }, async () => assert.fail("source inference must not query sess"));
+    return collectStaticEntries(client, context, { getText: () => text, uri: client.inputDocument.uri },
+      { line: row, character: col }, undefined, lines.slice(0, row), [],
+      async () => assert.fail("source inference must not query sess"));
   };
   for (const [marked, insertion] of [['DT[, fca│]', 'fcase()'], ['df[, mea│]', 'mean()']]) {
     assert.ok((await collect(marked)).some(e => e.kind === 2 && e.insertText === insertion), marked);

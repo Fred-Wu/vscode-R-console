@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const loadSource = require("../helpers/load-source.cjs");
+const { nativeStaticEvidence } = require("../helpers/native-static-evidence.cjs");
 
 suite("Completion in the VS Code extension host", () => {
   test("stored method argument names use the real converter and preserve source precedence", async () => {
@@ -141,9 +142,17 @@ suite("Completion in the VS Code extension host", () => {
       }
       const wrapped = await complete('f <- (function(new_arg) NULL)\nf(', session);
       assert.deepEqual(wrapped.filter(item => item.detail === "parameter").map(item => item.insertText), ['new_arg = ']);
-      for (const [formal, expected] of [['f = function(inner_arg) NULL', ['inner_arg = ']], ['f', []]]) {
-        const items = await complete(`f <- function(outer_arg) NULL\ng <- function(${formal}) { f(`, session);
-        assert.deepEqual(items.filter(item => item.detail === 'parameter').map(item => item.insertText), expected);
+      for (const [body, expected, nativeMayDecline = false] of [
+        ['g <- function(f = function(inner_arg) NULL) { f(', ['inner_arg = '], true],
+        ['g <- function(f) { f(', []],
+        ['g <- function(f) { f <- function(inner_arg) NULL; f(', ['inner_arg = ']],
+      ]) {
+        const text = `f <- function(outer_arg) NULL\n${body}`;
+        const items = await complete(text, session);
+        // Only independent native evidence can justify an unavailable signature.
+        const unresolved = nativeMayDecline && nativeStaticEvidence(text + '│').signature === null;
+        assert.deepEqual(items.filter(item => item.detail === 'parameter').map(item => item.insertText),
+          unresolved ? [] : expected);
       }
       const exhausted = await complete('f <- function(method = c("one", "two")) NULL\nf(method = "one", ');
       assert.ok(exhausted.every(item => !item.detail?.startsWith('value for ')));
@@ -156,9 +165,13 @@ suite("Completion in the VS Code extension host", () => {
         const items = await complete('`' + name + '` <- function(x) NULL\nfoo');
         assert.ok(items.some(item => item.insertText === '`' + name + '`()'), name);
       }
-      for (const operator of ['|>', '%>%']) {
-        const items = await complete(`my_frob <- function(x) x\n1 ${operator} my_fr`);
-        assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), operator);
+      for (const [tail, required] of [['1 %>% my_fr', true], ['1 |> my_fr()', true], ['1 |> my_fr', false]]) {
+        const text = `my_frob <- function(x) x\n${tail}`;
+        const cursor = text.endsWith('()') ? text.length - 2 : text.length;
+        const items = await complete(text, undefined, cursor);
+        if (required) assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), tail);
+        const native = nativeStaticEvidence(text.slice(0, cursor) + '│' + text.slice(cursor), 'my_fr');
+        assert.deepEqual(items.map(item => item.insertText), native.functions.map(name => name + '()'), tail);
       }
       const shadowPrint = { search: [], globalenv: { print: {
         type: 'closure', str: 'function(x, old_arg)',
@@ -324,13 +337,13 @@ suite("Subscript completion in the VS Code extension host", () => {
     const { RTermLang } = loadSource('src/Terminal/rTerminal/lang.ts', {
       'vscode-languageclient/node': require('vscode-languageclient/node'),
     });
-    let expressionProbes = 0;
+    const inspectedReceivers = [];
     const lang = new RTermLang({
       extensionPath: path.resolve(__dirname, '../..'),
       rPath: process.env.R_TEST_EXECUTABLE || 'R', env: { ...process.env },
       // These legacy cases deliberately exercise the opt-in source analyzer.
       getStaticAnalysisEnabled: () => true,
-      requestMemberCompletions: async () => { expressionProbes++; return undefined; },
+      requestRuntimeMemberCompletions: async expression => { inspectedReceivers.push(expression); return undefined; },
     });
     const session = { search: [], loaded_namespaces: [], globalenv: {
       DT: { type: 'list', class: ['data.table', 'data.frame'], names: ['zebra', 'alpha'] },
@@ -340,9 +353,11 @@ suite("Subscript completion in the VS Code extension host", () => {
       const lines = text.split('\n'), currentLine = lines.at(-1);
       const input = { text, currentLine, lines, cursorRow: lines.length - 1,
         cursorCol: currentLine.length, textBeforeCursor: text };
-      let items;
+      let items, publish;
+      const ready = new Promise(resolve => { publish = resolve; });
       await lang.handleAutocomplete({ input, getCurrentInput: () => input,
-        getWorkspaceData: () => session, applyCompletion() {}, onInlineEntries: result => { items = result; } });
+        getWorkspaceData: () => session, applyCompletion() {}, onInlineEntries: result => { items = result; publish(); } });
+      await ready;
       assert.ok(Array.isArray(items));
       return items;
     };
@@ -367,7 +382,9 @@ suite("Subscript completion in the VS Code extension host", () => {
 
       const value = await complete('DT[, keyby = al');
       assert.ok(value.every(item => item.detail !== 'parameter'));
-      assert.equal(expressionProbes, 0, 'subscript completion must not evaluate R expressions');
+      assert.ok(inspectedReceivers.length > 0, 'exercise the wired native inspection hook');
+      assert.ok(inspectedReceivers.every(expression => expression === 'DT' || expression === 'df'),
+        'only stored receivers may reach native inspection');
     } finally {
       await lang.dispose();
     }

@@ -38,11 +38,22 @@ https://github.com/user-attachments/assets/d4877829-07e9-42c2-a66b-652695a5ebf4
 
 ## Using R Console
 
+### Requirements
+
+| Component | Minimum version | Required for |
+| --- | --- | --- |
+| [VS Code](https://code.visualstudio.com/) | 1.101.0 | Running the extension |
+| [R](https://cloud.r-project.org/) | 4.0.0 | Running the console; use a 64-bit installation matching the bundled runtime's architecture |
+| [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) | 3.2.0 | R configuration and session integration |
+| R package [`languageserver`](https://cran.r-project.org/package=languageserver) | 0.3.22 | Language-server completion, including opt-in static analysis; optional for running the console |
+
+The default pipe operator, `|>`, requires R 4.1.0 or later. With R 4.0.x, configure `r.console.pipeOperator` as `%>%` and load a package that provides it, such as `magrittr`.
+
+For vscode-R 3.0.1 or earlier, use R Console 0.5.2.
+
 ### Setup
 
-Requires VS Code 1.101.0 or later.
-
-1. Install a compatible version of [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (see [Dependency Model](#dependency-model)).
+1. Install R and vscode-R according to the [requirements](#requirements).
 2. Configure `r.executablePath`. The deprecated `r.rpath.<platform>` setting is still supported for compatibility. If neither setting is set, R Console looks for R on `PATH` and, on Windows, falls back to the R installation recorded in the Windows registry.
 3. Enable bracketed paste mode:
 
@@ -61,7 +72,11 @@ Requires VS Code 1.101.0 or later.
    ```
 
    This setting is enabled by default unless explicitly set to `false`.
-6. Optional: install the R package `languageserver` for language-server completion.
+6. Optional: install or update the R package `languageserver` in the R installation used by the console for language-server completion:
+
+   ```r
+   install.packages("languageserver")
+   ```
 
 `R Console` resolves `r.executablePath`, then deprecated `r.rpath.*`, then `PATH`, with the Windows registry as the final Windows fallback. Ambient `R_HOME` is not used to select the executable; it is derived from the selected R executable instead.
 
@@ -125,12 +140,7 @@ R Console also contributes its own settings:
 
 ## Dependency Model
 
-Updated vscode-R compatibility requirements: R Console v0.5.3 requires vscode-R v3.2.0 or later. For vscode-R v3.0.1 or earlier, use R Console v0.5.2.
-
-| R Console version | vscode-R version |
-| --- | --- |
-| v0.5.3 and later | v3.2.0 and later |
-| v0.5.2 | v3.0.1 and earlier |
+Minimum versions are listed together under [Requirements](#requirements).
 
 - [vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is a hard dependency. R Console uses the same configured R binary and the supported `sess` JSON-RPC 2.0 protocol for vscode-R 3.x, while retaining deprecated compatibility with the pre-3.0 session watcher.
 - R's `languageserver` package is optional at runtime but required for language-server completion.

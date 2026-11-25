@@ -19,6 +19,7 @@ const COMPLETION_GROUP_ORDER = {
   default: DEFAULT_COMPLETION_GROUP_ORDER,
   member: ["Fields", "Runtime Variables", "Runtime Functions", "Recent Input", "Other"],
   package: ["Functions", "Variables", "Fields", "Packages", "Other"],
+  static: ["Fields", "Arguments", "Functions", "Variables", "Other"],
 } as const satisfies Record<CompletionContext["kind"], readonly string[]>;
 
 const DATA_CONTEXT_GROUP_ORDER = [
