@@ -731,6 +731,34 @@ test("linked cache changes refresh namespace exports without touching the librar
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
 });
 
+test("a traversable unlistable cache retires removed namespace completions", {
+  skip: process.platform === "win32" || process.getuid?.() === 0,
+  timeout: 90000,
+}, async t => {
+  const { first, second: cache, pkg, install, createClient } = lifecycleFixture(t);
+  install(cache, "originalExport");
+  const target = path.join(cache, pkg);
+  fs.symlinkSync(target, path.join(first, pkg), "dir");
+  fs.chmodSync(cache, 0o311);
+  let client;
+  try {
+    await assert.rejects(fs.promises.readdir(cache), { code: "EACCES" });
+    execFileSync("Rscript", ["--vanilla", "-e", `library(${pkg}, lib.loc=${JSON.stringify(first)})`], { stdio: "pipe" });
+    const result = createClient({ libraries: [first] });
+    client = result.client;
+    await client.start();
+    await waitFor(() => client.packageInventory.initialized, "inventory of a traversable unlistable cache");
+    assert.ok((await result.complete(pkg + "::")).some(item => item.label === "originalExport"));
+    fs.rmSync(target, { recursive: true });
+    await waitFor(() => !client.packageInventory.packages.has(pkg), "unlistable cache removal published");
+    assert.ok(!(await result.complete(pkg + "::")).some(item => item.label === "originalExport"));
+    assert.ok(!result.logs.some(line => line.includes("Could not refresh package inventory")));
+  } finally {
+    fs.chmodSync(cache, 0o700);
+    await client?.dispose();
+  }
+});
+
 test("a chained package link retains its startup namespace until the cache installation unlocks", { timeout: 90000 }, async t => {
   const { first, second: cache, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
   const alias = path.join(root, "alias"), replacement = path.join(root, "replacement");

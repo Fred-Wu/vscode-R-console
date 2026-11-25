@@ -254,7 +254,7 @@ export class PackageInventory {
     return targets;
   }
 
-  private async installationLocks(library: string, entries?: fs.Dirent[]): Promise<Set<string>> {
+  private async installationLocks(library: string, entries: fs.Dirent[]): Promise<Set<string>> {
     const locked = new Set<string>();
     const read = async (directory: string) => {
       try { return await fs.promises.readdir(directory, { withFileTypes: true }); }
@@ -263,7 +263,7 @@ export class PackageInventory {
         throw error;
       }
     };
-    for (const entry of entries ?? await read(library)) {
+    for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const named = /^00LOCK-([A-Za-z][A-Za-z0-9.]*)$/.exec(entry.name);
       if (named) locked.add(named[1]);
@@ -415,12 +415,18 @@ export class PackageInventory {
   private async scan(revision: number, dirty: Set<string>,
     unconfirmed: Set<string> = new Set()): Promise<void> {
     const libraries: LibraryInventory[] = [];
-    const lockRequests = new Map<string, Promise<Set<string>>>();
-    const locksFor = (library: string, entries?: fs.Dirent[]) => {
-      let pending = lockRequests.get(library);
+    const lockRequests = new Map<string, Promise<boolean>>();
+    const isLocked = (file: string) => {
+      let pending = lockRequests.get(file);
       if (!pending) {
-        pending = this.installationLocks(library, entries);
-        lockRequests.set(library, pending);
+        // Traversal permission is sufficient to load a linked package. Check
+        // its known lock paths without listing the external cache directory.
+        pending = fs.promises.lstat(file).then(stat => stat.isDirectory()).catch(error => {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR") return false;
+          throw error;
+        });
+        lockRequests.set(file, pending);
       }
       return pending;
     };
@@ -446,7 +452,7 @@ export class PackageInventory {
       }
       const targets = await this.watchLinkedPackages(library, entries);
       if (this.disposed || revision !== this.revision) return;
-      const locked = await locksFor(library, entries);
+      const locked = await this.installationLocks(library, entries);
       if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
       const deferred = new Map<string, string[]>();
       const defer = (name: string, target?: string) => {
@@ -474,10 +480,9 @@ export class PackageInventory {
           if (locked.has("*") || locked.has(name)) return defer(name, target ?? undefined);
           if (target === null) return undefined;
           if (target) {
-            const targetLocks = await locksFor(path.dirname(target));
             // R installs lock by package name even when a linked cache directory is versioned.
-            if (targetLocks.has("*") || targetLocks.has(name) || targetLocks.has(path.basename(target))) {
-              return defer(name, target);
+            for (const lock of new Set(["00LOCK", `00LOCK-${name}`, `00LOCK-${path.basename(target)}`])) {
+              if (await isLocked(path.join(path.dirname(target), lock))) return defer(name, target);
             }
           }
           return this.readPackage(library, name, old);

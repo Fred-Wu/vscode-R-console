@@ -782,6 +782,45 @@ for (const lockName of ["00LOCK-example", "00LOCK"]) {
   }
 }
 
+for (const lockName of ["00LOCK-example", "00LOCK-release-1", "00LOCK"]) {
+  test(`unlistable external caches refresh packages and preserve ${lockName}`, async t => {
+    const { root, libraries: [library, other], inventory, changes, logs, install, settle } = fixture(t);
+    const cache = path.join(root, "cache");
+    fs.mkdirSync(cache);
+    const target = path.join(cache, "release-1");
+    fs.renameSync(install(cache), target);
+    fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
+    const readdir = fs.promises.readdir;
+    t.mock.method(fs.promises, "readdir", async function(directory, ...args) {
+      if (sameExistingDirectory(directory, cache)) {
+        throw Object.assign(new Error("Cache allows traversal but not listing"), { code: "EACCES" });
+      }
+      return readdir.call(this, directory, ...args);
+    });
+    inventory.setLibraryPaths([library, other]);
+    await settle(() => changes.at(-1)?.packages.get("example")?.version === "1.0");
+
+    const lock = path.join(cache, lockName);
+    fs.mkdirSync(lock);
+    fs.rmSync(target, { recursive: true });
+    fs.renameSync(install(cache, "2.0"), target);
+    await settle(() => changes.at(-1).libraries[0].deferred?.has("example"));
+    assert.equal(changes.at(-1).packages.get("example").version, "1.0", "the locked replacement stays deferred");
+    const healthy = install(other, "1.0", "healthy");
+    await settle(() => changes.at(-1).packages.has("healthy"), "other libraries continue publishing while the cache is locked");
+    fs.rmSync(healthy, { recursive: true });
+    await settle(() => !changes.at(-1).packages.has("healthy"));
+
+    fs.rmdirSync(lock);
+    await settle(() => changes.at(-1).packages.get("example")?.version === "2.0", "polling discovers unlock without listing the cache");
+    fs.rmSync(target, { recursive: true });
+    await settle(() => !changes.at(-1).packages.has("example"));
+    fs.renameSync(install(cache, "3.0"), target);
+    await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+    assert.ok(!logs.some(line => line.includes("Could not refresh package inventory")));
+  });
+}
+
 test("a versioned cache target honors its package's named installation lock", async t => {
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
   const cache = path.join(root, "cache");

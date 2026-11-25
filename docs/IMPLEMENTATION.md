@@ -1236,9 +1236,10 @@ symlink chains are followed hop by hop with cycle detection and a traversal
 limit. Each hop's parent remains monitored, and the final target's lock location
 is resolved even while the package is absent during installation. Named locks
 are checked against both the logical package name and its resolved directory
-name, which may differ for versioned external caches. Scans use
-bounded asynchronous file operations. Named installation locks defer their
-package; a `00LOCK` directory defers the whole library. Deferred paths remain
+name, which may differ for versioned external caches. External cache locks are
+inspected by their individual paths, requiring traversal permission on the cache
+parent. Scans use bounded asynchronous file operations. Named installation locks
+defer their package; a `00LOCK` directory defers the whole library. Deferred paths remain
 tracked while a lock is held, including packages absent from the initial
 inventory. Package identities and deferred paths must be stable across two
 scans before publication. Releasing a lock reconciles loaded namespaces even
