@@ -21,6 +21,7 @@ import {
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
   encodeMemberNamesRequestFrame,
+  encodeLspStartupStateFrame,
   encodeReplyInputFrame,
   encodeSetWidthFrame,
   encodeShutdownFrame,
@@ -76,6 +77,12 @@ type BackendSessionState = {
   hostConnected: boolean;
   nextRequestId: number;
   pendingMemberRequests: Map<number, { resolve: (result: MemberInspectionResult) => void; timeout: NodeJS.Timeout }>;
+  pendingStartupRequests: Map<number, {
+    store: boolean;
+    resolve: (state: Buffer | undefined) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }>;
   pendingParseRequests: Map<
     number,
     {
@@ -120,6 +127,8 @@ export interface RuntimeBackend {
   sendSessionCommand(session: RuntimeSessionHandle | null, command: RuntimeSessionCommand): boolean;
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined;
   inspectMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<MemberInspectionResult> | undefined;
+  loadLspStartupState(session: RuntimeSessionHandle): Promise<Buffer | undefined>;
+  saveLspStartupState(session: RuntimeSessionHandle, state: Buffer): Promise<void>;
   close(session: RuntimeSessionHandle): void;
   isAlive(session: RuntimeSessionHandle | null): boolean;
   getPid(session: RuntimeSessionHandle | null): number | undefined;
@@ -166,6 +175,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       nextRequestId: 0,
       pendingParseRequests: new Map(),
       pendingMemberRequests: new Map(),
+      pendingStartupRequests: new Map(),
       child,
       childListenersAttached: false,
       sessionFilePath,
@@ -192,6 +202,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       nextRequestId: 0,
       pendingParseRequests: new Map(),
       pendingMemberRequests: new Map(),
+      pendingStartupRequests: new Map(),
       childListenersAttached: false,
       sessionFilePath: getSessionBootstrapFilePath(info.sessionId),
       authToken: info.authToken,
@@ -210,6 +221,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     state.handlers = handlers;
     state.attachGeneration += 1;
     const generation = state.attachGeneration;
+    this.rejectPendingStartupRequests(state);
 
     if (state.socket && !state.socket.destroyed) {
       state.socket.destroy();
@@ -240,6 +252,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
+        this.rejectPendingStartupRequests(state);
         this.cleanupSessionBootstrapFile(state);
         state.handlers?.onExit?.(code ?? 0);
       });
@@ -252,6 +265,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
+        this.rejectPendingStartupRequests(state);
         this.cleanupSessionBootstrapFile(state);
         state.handlers?.onError?.(error instanceof Error ? error : new Error(String(error)));
       });
@@ -272,6 +286,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     state.socketCarry = Buffer.alloc(0);
     this.resolvePendingParseRequests(state, 1);
     this.resolvePendingMemberRequests(state);
+    this.rejectPendingStartupRequests(state);
     state.socket?.destroy();
     state.socket = undefined;
   }
@@ -377,6 +392,47 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       ? { status: "unavailable" } : result);
   }
 
+  loadLspStartupState(session: RuntimeSessionHandle): Promise<Buffer | undefined> {
+    return this.requestLspStartupState(session);
+  }
+
+  async saveLspStartupState(session: RuntimeSessionHandle, snapshot: Buffer): Promise<void> {
+    await this.requestLspStartupState(session, snapshot);
+  }
+
+  private async requestLspStartupState(session: RuntimeSessionHandle, snapshot?: Buffer): Promise<Buffer | undefined> {
+    const state = this.sessionStates.get(session);
+    if (!state) throw new Error("Persistent R session is unavailable");
+    const generation = state.attachGeneration;
+    const deadline = Date.now() + 10_000;
+    // Retrieval can join initial attachment. A save must use the connection
+    // already established by retrieval, before its caller can release the bytes.
+    while (snapshot === undefined && !state.hostConnected && !state.explicitClose && state.attachGeneration === generation && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    if (!state.hostConnected || state.explicitClose || state.attachGeneration !== generation) {
+      throw new Error("Persistent R session disconnected during startup state transfer");
+    }
+    if (!state.capabilities.has("lsp-startup-state-v1")) {
+      throw new Error("This R runtime cannot retain language-server startup state. Close the old R session and start a new console.");
+    }
+    if (state.pendingStartupRequests.size >= 4) throw new Error("Too many startup state transfers");
+    const requestId = ++state.nextRequestId;
+    const frame = encodeLspStartupStateFrame(requestId, snapshot);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        state.pendingStartupRequests.delete(requestId);
+        reject(new Error("Persistent startup state transfer timed out"));
+      }, 10_000);
+      state.pendingStartupRequests.set(requestId, { store: snapshot !== undefined, resolve, reject, timeout });
+      if (!this.writeFrame(state, frame)) {
+        clearTimeout(timeout);
+        state.pendingStartupRequests.delete(requestId);
+        reject(new Error("Persistent startup state transfer failed"));
+      }
+    });
+  }
+
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined {
     if (!session) {
       return undefined;
@@ -443,6 +499,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return;
     }
     state.explicitClose = true;
+    this.rejectPendingStartupRequests(state);
     const shutdownSent = this.writeFrame(state, encodeShutdownFrame(), true);
     if (shutdownSent) {
       return;
@@ -562,6 +619,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.socketCarry = parsed.carry;
 
         if (parsed.error) {
+          this.rejectPendingStartupRequests(state);
+          socket.destroy();
           state.handlers?.onError?.(new Error(parsed.error));
           return;
         }
@@ -575,6 +634,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           socket.destroy();
           this.resolvePendingParseRequests(state, 1);
           this.resolvePendingMemberRequests(state);
+          this.rejectPendingStartupRequests(state);
           state.handlers?.onError?.(error as Error);
           return;
         }
@@ -595,7 +655,10 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
         for (const event of parsed.events) {
           this.handleSessionControlEvent(state, event);
-          state.handlers?.onControl?.(event);
+          // Opaque configuration must never reach terminal UI or replay handlers.
+          if (event.type !== "lsp-startup-state" && event.type !== "lsp-startup-stored") {
+            state.handlers?.onControl?.(event);
+          }
         }
       });
 
@@ -605,6 +668,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         }
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
+        this.rejectPendingStartupRequests(state);
         if (state.hostConnected && isSocketDisconnectError(error)) {
           return;
         }
@@ -624,6 +688,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
+        this.rejectPendingStartupRequests(state);
         if (!state.explicitClose && wasHostConnected) {
           state.handlers?.onExit?.(0);
         }
@@ -769,6 +834,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       nextRequestId: 0,
       pendingParseRequests: new Map(),
       pendingMemberRequests: new Map(),
+      pendingStartupRequests: new Map(),
       childListenersAttached: false,
       reconnectInfo: { sessionId: session.sessionId },
       socketCarry: Buffer.alloc(0),
@@ -784,6 +850,25 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     event: BackendControlEvent
   ): void {
     switch (event.type) {
+      case "lsp-startup-state":
+      case "lsp-startup-stored": {
+        const pending = state.pendingStartupRequests.get(event.requestId);
+        if (!pending) {
+          if (event.type === "lsp-startup-state") event.state?.fill(0);
+          return;
+        }
+        state.pendingStartupRequests.delete(event.requestId);
+        clearTimeout(pending.timeout);
+        if (pending.store !== (event.type === "lsp-startup-stored")) {
+          if (event.type === "lsp-startup-state") event.state?.fill(0);
+          pending.reject(new Error("Unexpected startup state response"));
+        } else if (event.type === "lsp-startup-stored" && !event.accepted) {
+          pending.reject(new Error("Persistent session already has a different startup snapshot"));
+        } else {
+          pending.resolve(event.type === "lsp-startup-state" ? event.state : undefined);
+        }
+        return;
+      }
       case "backend-ready":
         state.capabilities = new Set<BackendCapability>(event.capabilities);
         return;
@@ -827,6 +912,14 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       pending.resolve({ status: "unavailable" });
     }
     state.pendingMemberRequests.clear();
+  }
+
+  private rejectPendingStartupRequests(state: BackendSessionState): void {
+    for (const pending of state.pendingStartupRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("Persistent R session disconnected during startup state transfer"));
+    }
+    state.pendingStartupRequests.clear();
   }
 
   private resolvePendingParseRequests(state: BackendSessionState, status: number): void {

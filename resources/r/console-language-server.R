@@ -38,6 +38,10 @@ if (restore_startup) {
         # network peer can substitute the serialized configuration.
         unserialize(read_exact(size))
     })
+    if (!identical(startup$format_version, 1L) ||
+        !identical(startup$r_version, as.character(getRversion()))) {
+        stop("Incompatible language server startup state; start a new R console")
+    }
     if (!nzchar(Sys.getenv("VSCR_LSP_PORT"))) {
         # Let the parent send stdio LSP bytes only after closing the bootstrap
         # reader, whose C buffer could otherwise read ahead into those messages.
@@ -64,6 +68,8 @@ if (restore_startup) {
 }
 if (nzchar(runtime_lib_paths)) {
     .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
+} else if (restore_startup) {
+    .libPaths(startup$library_paths, include.site = FALSE)
 }
 
 if (restore_startup) {
@@ -90,7 +96,8 @@ if (restore_startup) {
             all(vapply(attributes(value), plain_option, logical(1)))
         }
         startup_options <- options()
-        payload <- serialize(list(options = serialize(startup_options, NULL),
+        payload <- serialize(list(format_version = 1L, r_version = as.character(getRversion()),
+            library_paths = .libPaths(), options = serialize(startup_options, NULL),
             plain_options = Filter(plain_option, startup_options), packages = .packages(),
             environment = startup_environment(),
             library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),

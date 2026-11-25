@@ -58,6 +58,10 @@ const FRAME_SESSION_STATE: u16 = 20;
 const FRAME_LIBRARY_PATHS: u16 = 21;
 const FRAME_MEMBER_NAMES_REQUEST: u16 = 25;
 const FRAME_MEMBER_NAMES_RESULT: u16 = 26;
+const FRAME_LSP_STARTUP_GET: u16 = 27;
+const FRAME_LSP_STARTUP_PUT: u16 = 28;
+const FRAME_LSP_STARTUP_STATE: u16 = 29;
+const FRAME_LSP_STARTUP_STORED: u16 = 30;
 const MAX_BUFFERED_FRAMES: usize = 4096;
 const MAX_BUFFERED_BYTES: usize = 1_000_000;
 // Use the same streaming granularity for R callbacks and captured native IO.
@@ -85,9 +89,30 @@ pub(crate) enum IncomingCommand {
     DialogResult(DialogResult),
     ParseStatus { request_id: u32, code: String },
     MemberNames { request_id: u32, query: crate::member_inspection::MemberQuery },
+    LspStartupGet { request_id: u32 },
+    LspStartupPut { request_id: u32, state: StartupState },
     Interrupt,
     SetWidth { columns: u16 },
     Shutdown,
+}
+
+// Opaque R serialization. Only the owning language server interprets these bytes.
+pub(crate) struct StartupState(Vec<u8>);
+
+impl std::fmt::Debug for StartupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StartupState({} bytes)", self.0.len())
+    }
+}
+
+impl Drop for StartupState {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            // Retained configuration can contain credentials.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +129,8 @@ pub(crate) struct OutputSink {
 
 struct OutputChannelState {
     writer: Option<Box<dyn Write + Send>>,
+    client_id: usize,
+    startup_state: Option<StartupState>,
     backlog: VecDeque<Vec<u8>>,
     backlog_bytes: usize,
 }
@@ -118,6 +145,8 @@ impl OutputSink {
     pub(crate) fn new_with_capabilities(host_name: &str, capabilities: &[&str]) -> Self {
         Self {
             output_state: Arc::new(Mutex::new(OutputChannelState {
+                client_id: 0,
+                startup_state: None,
                 writer: if session_transport_enabled() {
                     None
                 } else {
@@ -314,10 +343,42 @@ impl OutputSink {
         self.emit_frame(FRAME_SESSION_STATE, 0, &payload)
     }
 
-    pub(crate) fn attach_client<W: Write + Send + 'static>(&self, writer: W) {
+    pub(crate) fn attach_client<W: Write + Send + 'static>(&self, writer: W, client_id: usize) {
         if let Ok(mut output_state) = self.output_state.lock() {
             output_state.writer = Some(Box::new(writer));
+            output_state.client_id = client_id;
         }
+    }
+
+    pub(crate) fn clear_startup_state(&self) {
+        if let Ok(mut state) = self.output_state.lock() { state.startup_state = None; }
+    }
+
+    /// Replies stay on the requesting authenticated attachment and never enter
+    /// the output backlog. Both admission and writing share the attachment lock.
+    pub(crate) fn handle_startup_state(&self, client_id: usize, command: IncomingCommand) -> io::Result<()> {
+        let mut state = self.output_state.lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "startup state lock poisoned"))?;
+        if state.client_id != client_id || state.writer.is_none() { return Ok(()); }
+        let OutputChannelState { writer, startup_state, .. } = &mut *state;
+        let writer = writer.as_mut().expect("attached writer");
+        let result = match command {
+            IncomingCommand::LspStartupGet { request_id } => {
+                write_private_frame(writer, FRAME_LSP_STARTUP_STATE, request_id,
+                    startup_state.as_ref().map_or(&[], |value| value.0.as_slice()))
+            }
+            IncomingCommand::LspStartupPut { request_id, state: incoming } => {
+                let accepted = match startup_state {
+                    Some(existing) => existing.0 == incoming.0,
+                    None => { *startup_state = Some(incoming); true }
+                };
+                write_private_frame(writer, FRAME_LSP_STARTUP_STORED, request_id,
+                    &[if accepted { 0 } else { 1 }])
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid startup state operation")),
+        };
+        if result.is_err() { state.writer = None; }
+        result
     }
 
     pub(crate) fn detach_client(&self) {
@@ -381,6 +442,16 @@ impl OutputSink {
         queue_backlog_frame(&mut output_state, frame);
         Ok(())
     }
+}
+
+fn write_private_frame(writer: &mut dyn Write, kind: u16, request_id: u32, payload: &[u8]) -> io::Result<()> {
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    header[4..6].copy_from_slice(&kind.to_le_bytes());
+    header[8..12].copy_from_slice(&request_id.to_le_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(payload)?;
+    writer.flush()
 }
 
 fn queue_backlog_frame(output_state: &mut OutputChannelState, frame: Vec<u8>) {
@@ -786,6 +857,10 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
     }
 
     let command = match kind {
+        FRAME_LSP_STARTUP_GET if payload == 1_u32.to_le_bytes() =>
+            IncomingCommand::LspStartupGet { request_id },
+        FRAME_LSP_STARTUP_PUT if !payload.is_empty() =>
+            IncomingCommand::LspStartupPut { request_id, state: StartupState(payload) },
         FRAME_SUBMIT => IncomingCommand::Submit(String::from_utf8_lossy(&payload).into_owned()),
         FRAME_REPLY_INPUT => {
             IncomingCommand::ReplyInput(String::from_utf8_lossy(&payload).into_owned())
@@ -938,11 +1013,86 @@ mod tests {
     }
 
     #[test]
+    fn startup_snapshot_is_write_once_private_and_retained_across_attachments() {
+        let sink = OutputSink::new_with_capabilities("test", &[]);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        sink.attach_client(CapturedOutput(Arc::clone(&captured)), 1);
+        sink.handle_startup_state(1, IncomingCommand::LspStartupGet { request_id: 1 }).unwrap();
+        assert_eq!(captured.lock().unwrap().len(), FRAME_HEADER_LEN);
+        let secret = b"synthetic-sensitive-state";
+        for value in [secret.as_slice(), secret.as_slice(), b"conflicting-state"] {
+            captured.lock().unwrap().clear();
+            sink.handle_startup_state(1, IncomingCommand::LspStartupPut {
+                request_id: 2, state: StartupState(value.to_vec()),
+            }).unwrap();
+            assert_eq!(captured.lock().unwrap()[FRAME_HEADER_LEN], if value == secret { 0 } else { 1 });
+        }
+        sink.detach_client();
+        captured.lock().unwrap().clear();
+        sink.handle_startup_state(1, IncomingCommand::LspStartupGet { request_id: 3 }).unwrap();
+        assert!(sink.output_state.lock().unwrap().backlog.is_empty());
+        sink.attach_client(CapturedOutput(Arc::clone(&captured)), 2);
+        sink.handle_startup_state(1, IncomingCommand::LspStartupPut {
+            request_id: 4, state: StartupState(b"stale attachment".to_vec()),
+        }).unwrap();
+        assert!(captured.lock().unwrap().is_empty());
+        sink.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 5 }).unwrap();
+        assert_eq!(&captured.lock().unwrap()[FRAME_HEADER_LEN..], secret);
+        // A second runtime has its own store even with the same attachment ID.
+        let other = OutputSink::new_with_capabilities("test", &[]);
+        let other_output = Arc::new(Mutex::new(Vec::new()));
+        other.attach_client(CapturedOutput(Arc::clone(&other_output)), 2);
+        other.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 5 }).unwrap();
+        assert_eq!(other_output.lock().unwrap().len(), FRAME_HEADER_LEN);
+        sink.clear_startup_state();
+        captured.lock().unwrap().clear();
+        sink.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 6 }).unwrap();
+        assert_eq!(captured.lock().unwrap().len(), FRAME_HEADER_LEN);
+    }
+
+    #[test]
+    fn failed_snapshot_ack_is_retryable_and_never_enters_terminal_replay() {
+        struct Disconnected;
+        impl Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let sink = OutputSink::new_with_capabilities("test", &[]);
+        sink.attach_client(Disconnected, 1);
+        assert!(sink.handle_startup_state(1, IncomingCommand::LspStartupPut {
+            request_id: 1, state: StartupState(vec![42; MAX_INPUT_FRAME_BYTES]),
+        }).is_err());
+        assert!(sink.output_state.lock().unwrap().backlog.is_empty());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        sink.attach_client(CapturedOutput(Arc::clone(&captured)), 2);
+        sink.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 2 }).unwrap();
+        assert_eq!(captured.lock().unwrap().len(), FRAME_HEADER_LEN + MAX_INPUT_FRAME_BYTES);
+        assert!(captured.lock().unwrap()[FRAME_HEADER_LEN..].iter().all(|byte| *byte == 42));
+    }
+
+    #[test]
+    fn startup_protocol_checks_format_empty_state_and_frame_limits() {
+        let mut frame = Vec::new();
+        write_private_frame(&mut frame, FRAME_LSP_STARTUP_GET, 7, &1_u32.to_le_bytes()).unwrap();
+        assert!(matches!(read_next_command(&mut frame.as_slice()).unwrap(),
+            Some(IncomingCommand::LspStartupGet { request_id: 7 })));
+        for (kind, payload) in [(FRAME_LSP_STARTUP_GET, vec![2, 0, 0, 0]), (FRAME_LSP_STARTUP_PUT, vec![])] {
+            frame.clear();
+            write_private_frame(&mut frame, kind, 1, &payload).unwrap();
+            assert!(read_next_command(&mut frame.as_slice()).is_err());
+        }
+        frame[0..4].copy_from_slice(&((MAX_INPUT_FRAME_BYTES + 1) as u32).to_le_bytes());
+        assert!(read_next_command(&mut frame.as_slice()).is_err());
+        assert!(!format!("{:?}", StartupState(b"secret".to_vec())).contains("secret"));
+    }
+
+    #[test]
     fn large_output_is_framed_without_losing_bytes_or_exceeding_the_reader_limit() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let sink = OutputSink {
             output_state: Arc::new(Mutex::new(OutputChannelState {
                 writer: Some(Box::new(CapturedOutput(Arc::clone(&captured)))),
+                client_id: 0, startup_state: None,
                 backlog: VecDeque::new(), backlog_bytes: 0,
             })),
             host_name: Arc::new(String::new()), capabilities: Arc::new(Vec::new()),

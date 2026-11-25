@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as net from "net";
 import { randomBytes } from "crypto";
 import { authenticateLspSocket } from "./lspSocketAuth";
-import { decodeStartupState, readStartupAcknowledgement, writeStartupState } from "./lspStartupState";
+import { decodeStartupState, readStartupAcknowledgement, writeStartupState, type LspStartupStateStore } from "./lspStartupState";
 import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 import * as os from "os";
 import * as path from "path";
@@ -63,6 +63,7 @@ type ConsoleLspClientOptions = {
   getCachedWorkspaceData?: () => WorkspaceData | undefined;
   getStaticAnalysisEnabled?: () => boolean;
   requestRuntimeFunctionArguments?: RuntimeFunctionArgumentsRequester;
+  getStartupStateStore?: () => Promise<LspStartupStateStore>;
 };
 
 type ConsoleLspSessionState = {
@@ -137,6 +138,9 @@ export class ConsoleLspClient implements CompletionProvider {
   private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
   private startupState: Buffer | undefined;
+  private startupStore: LspStartupStateStore | undefined;
+  private startupStateLoaded = false;
+  private startupStateSaved = false;
   private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
@@ -165,11 +169,11 @@ export class ConsoleLspClient implements CompletionProvider {
     if (this.disposed) {
       throw new Error("Cannot start a disposed console language server.");
     }
-    if (this.client?.isRunning()) {
-      return;
-    }
     if (this.startPromise) {
       await this.startPromise;
+      return;
+    }
+    if (this.client?.isRunning()) {
       return;
     }
     this.startPromise = (async () => {
@@ -785,7 +789,10 @@ export class ConsoleLspClient implements CompletionProvider {
     if (this.disposed) {
       return undefined;
     }
-    if (this.client?.isRunning()) {
+    // Session metadata may arrive while the initial library query is in flight.
+    // It can use the running client once the snapshot's storage is acknowledged.
+    const snapshotReady = this.startupState && (!this.startupStore || this.startupStateSaved);
+    if (this.client?.isRunning() && (!this.startPromise || snapshotReady)) {
       return this.client;
     }
     try {
@@ -800,6 +807,17 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private async startInternal(): Promise<void> {
+    if (this.options.getStartupStateStore && !this.startupStateLoaded) {
+      this.startupStore ??= await this.options.getStartupStateStore();
+      const state = await this.startupStore.load();
+      if (this.disposed) {
+        state?.fill(0);
+        throw new Error("Console disposed during startup state retrieval");
+      }
+      this.startupState = state;
+      this.startupStateSaved = state !== undefined;
+      this.startupStateLoaded = true;
+    }
     const config = vscode.workspace.getConfiguration("r");
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
@@ -857,6 +875,11 @@ export class ConsoleLspClient implements CompletionProvider {
         throw new Error("Language server changed during startup state transfer");
       }
       this.startupState = state;
+    }
+    if (this.startupStore && !this.startupStateSaved) {
+      await this.startupStore.save(this.startupState);
+      if (this.disposed || this.client !== client) throw new Error("Console changed during startup state storage");
+      this.startupStateSaved = true;
     }
     await this.disableConsoleDiagnostics(client);
     const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});

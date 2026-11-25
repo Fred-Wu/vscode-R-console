@@ -58,6 +58,27 @@ test("R rejects incomplete and oversized private startup frames before restoring
   }
 });
 
+test("R rejects incompatible startup snapshot formats and R versions before applying state", () => {
+  for (const fields of ['format_version=2L, r_version=as.character(getRversion())',
+    'format_version=1L, r_version="0.0.0"']) {
+    const encoded = spawnSync("Rscript", ["--vanilla", "-e",
+      `cat(jsonlite::base64_enc(serialize(list(${fields}, environment=c(TEST="synthetic-private-payload")), NULL)))`],
+    { timeout: 15000 });
+    assert.equal(encoded.status, 0, encoded.stderr.toString());
+    const snapshot = Buffer.from(encoded.stdout.toString(), "base64");
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(snapshot.length);
+    const result = spawnSync("Rscript", ["--vanilla", entryPoint], {
+      env: { ...process.env, VSCR_LSP_RESTORE_STARTUP: "TRUE", R_DEFAULT_PACKAGES: "NULL" },
+      input: Buffer.concat([header, snapshot]), encoding: "utf8", timeout: 15000,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Incompatible language server startup state/);
+    assert.ok(!result.stderr.includes("synthetic-private-payload"));
+    assert.ok(!result.stdout.includes("RCS1"));
+  }
+});
+
 test("R sends no startup payload to a socket peer with an invalid server proof", { timeout: 30000 }, async t => {
   const received = [];
   const sockets = new Set();

@@ -4,6 +4,11 @@ import type { Readable } from "stream";
 // Matches the R entry point. Startup options can contain large user values.
 export const MAX_STARTUP_STATE_BYTES = 16 * 1024 * 1024;
 
+export interface LspStartupStateStore {
+  load(): Promise<Buffer | undefined>;
+  save(state: Buffer): Promise<void>;
+}
+
 /** Consume the private pipe acknowledgement before any stdio LSP writes. */
 export function readStartupAcknowledgement(output: Readable, timeoutMs = 10_000): Promise<void> {
   return new Promise((resolve, reject) => {

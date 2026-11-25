@@ -49,6 +49,10 @@ const FrameKind = {
   LibraryPaths: 21,
   MemberNamesRequest: 25,
   MemberNamesResult: 26,
+  LspStartupGet: 27,
+  LspStartupPut: 28,
+  LspStartupState: 29,
+  LspStartupStored: 30,
 } as const;
 
 export type BackendCapability =
@@ -64,7 +68,8 @@ export type BackendCapability =
   | "member-inspection-search-path"
   | "function-source"
   | "function-source-value"
-  | "function-arguments";
+  | "function-arguments"
+  | "lsp-startup-state-v1";
 
 export type BackendDialogRequest =
   | {
@@ -123,6 +128,8 @@ export type MemberInspectionQuery = {
 };
 
 export type BackendControlEvent =
+  | { type: "lsp-startup-state"; requestId: number; state?: Buffer }
+  | { type: "lsp-startup-stored"; requestId: number; accepted: boolean }
   | {
       type: "backend-ready";
       protocolVersion: number;
@@ -222,7 +229,8 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "member-inspection-search-path" ||
     value === "function-source" ||
     value === "function-source-value" ||
-    value === "function-arguments"
+    value === "function-arguments" ||
+    value === "lsp-startup-state-v1"
   );
 }
 
@@ -326,6 +334,11 @@ function parseControlFrame(
   payload: Buffer
 ): BackendControlEvent | undefined {
   switch (kind) {
+    case FrameKind.LspStartupState:
+      return { type: "lsp-startup-state", requestId, state: payload.length ? Buffer.from(payload) : undefined };
+    case FrameKind.LspStartupStored:
+      if (payload.length !== 1 || payload[0] > 1) throw new Error("invalid startup state acknowledgement");
+      return { type: "lsp-startup-stored", requestId, accepted: payload[0] === 0 };
     case FrameKind.BackendReady: {
       const protocolVersion = parseU32(payload, 0);
       const info = parseStringListPayload(payload.subarray(4));
@@ -604,6 +617,16 @@ export function parseBackendFrames(
 
 export function encodeSubmitFrame(code: string): Buffer {
   return createFrame(FrameKind.Submit, 0, Buffer.from(code, "utf8"));
+}
+
+export function encodeLspStartupStateFrame(requestId: number, state?: Buffer): Buffer {
+  if (state) {
+    if (!state.length) throw new Error("Empty language server startup state");
+    return createFrame(FrameKind.LspStartupPut, requestId, state);
+  }
+  const version = Buffer.alloc(4);
+  version.writeUInt32LE(1);
+  return createFrame(FrameKind.LspStartupGet, requestId, version);
 }
 
 export function encodeReplyInputFrame(text: string): Buffer {

@@ -256,7 +256,9 @@ mod unix_host {
         let library_path = resolve_r_library_path(&r_executable)?;
         let api = unsafe { RApi::load(&library_path)? };
 
+        let session_transport = session_transport_config().is_some();
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        if session_transport { capabilities.push("lsp-startup-state-v1"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -266,7 +268,6 @@ mod unix_host {
             capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
-        let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
             let _ =
                 output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
@@ -454,7 +455,7 @@ mod unix_host {
                             break;
                         }
                         if let Some(runtime) = host_runtime() {
-                            runtime.output.attach_client(writer);
+                            runtime.output.attach_client(writer, client_id);
                             emit_attached_client_state(runtime);
                         }
 
@@ -468,7 +469,14 @@ mod unix_host {
                                         {
                                             break;
                                         }
-                                        handle_command(command);
+                                        match command {
+                                            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {
+                                                if let Some(runtime) = host_runtime() {
+                                                    if runtime.output.handle_startup_state(client_id, command).is_err() { break; }
+                                                }
+                                            }
+                                            other => handle_command(other),
+                                        }
                                         if is_shutdown_requested() {
                                             break;
                                         }
@@ -626,6 +634,8 @@ mod unix_host {
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
+            // Session state is available only on the authenticated persistent transport.
+            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {},
         }
     }
 
@@ -783,6 +793,7 @@ mod unix_host {
     fn request_shutdown() {
         let mut should_interrupt = false;
         if let Some(runtime) = host_runtime() {
+            runtime.output.clear_startup_state();
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.shutdown_requested = true;
             should_interrupt = state.busy;
@@ -2274,7 +2285,9 @@ mod windows_host {
         let layout = resolve_r_layout(&r_executable)?;
         let mut api = unsafe { RApi::load(&layout)? };
 
+        let session_transport = session_transport_config().is_some();
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        if session_transport { capabilities.push("lsp-startup-state-v1"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -2284,7 +2297,6 @@ mod windows_host {
             capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
-        let session_transport = session_transport_config().is_some();
         if let Err(error) = output.capture_process_stdout() {
             let _ =
                 output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
@@ -2472,7 +2484,7 @@ mod windows_host {
                             break;
                         }
                         if let Some(runtime) = host_runtime() {
-                            runtime.output.attach_client(writer);
+                            runtime.output.attach_client(writer, client_id);
                             emit_attached_client_state(runtime);
                         }
 
@@ -2486,7 +2498,14 @@ mod windows_host {
                                         {
                                             break;
                                         }
-                                        handle_command(command);
+                                        match command {
+                                            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {
+                                                if let Some(runtime) = host_runtime() {
+                                                    if runtime.output.handle_startup_state(client_id, command).is_err() { break; }
+                                                }
+                                            }
+                                            other => handle_command(other),
+                                        }
                                         if is_shutdown_requested() {
                                             break;
                                         }
@@ -2644,6 +2663,8 @@ mod windows_host {
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
+            // Session state is available only on the authenticated persistent transport.
+            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {},
         }
     }
 
@@ -2798,6 +2819,7 @@ mod windows_host {
     fn request_shutdown() {
         let mut should_interrupt = false;
         if let Some(runtime) = host_runtime() {
+            runtime.output.clear_startup_state();
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.shutdown_requested = true;
             should_interrupt = state.busy;
