@@ -1231,7 +1231,10 @@ cannot suppress publication of the newer order.
 events schedule a scan of the changed library after 250 ms. It reads package names,
 versions, resolved paths, and package-directory timestamps, reusing unchanged
 package records. Linked package directories and their target parents are also
-polled for replacement, removal, recreation and installation locks. Scans use
+polled for replacement, removal, recreation and installation locks. Package
+symlink chains are followed hop by hop with cycle detection and a traversal
+limit. Each hop's parent remains monitored, and the final target's lock location
+is resolved even while the package is absent during installation. Scans use
 bounded asynchronous file operations. Named installation locks defer their
 package; a `00LOCK` directory defers the whole library. Deferred paths remain
 tracked while a lock is held, including packages absent from the initial

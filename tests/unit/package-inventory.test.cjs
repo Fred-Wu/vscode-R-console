@@ -723,6 +723,48 @@ test("linked targets refresh across cache removal, replacement, locks and recrea
   assert.equal(inventory.linkedWatches.size, 0, "disposal releases all linked target subscriptions");
 });
 
+for (const lockName of ["00LOCK-example", "00LOCK"]) {
+  for (const initiallyMissing of [false, true]) {
+    test(`chained links retain ${lockName} protection with an ${initiallyMissing ? "initially absent" : "existing"} target`, async t => {
+      const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+      const alias = path.join(root, "alias"), cache = path.join(root, "cache");
+      fs.mkdirSync(alias); fs.mkdirSync(cache);
+      const target = install(cache), intermediate = path.join(alias, "example");
+      const link = (destination, file) => fs.symlinkSync(process.platform === "win32"
+        ? destination : path.relative(path.dirname(file), destination), file,
+      process.platform === "win32" ? "junction" : "dir");
+      link(target, intermediate);
+      link(intermediate, path.join(library, "example"));
+      const lock = path.join(cache, lockName);
+      const holdInstallation = () => {
+        fs.mkdirSync(lock);
+        fs.renameSync(target, path.join(lock, "example"));
+      };
+      if (initiallyMissing) holdInstallation();
+      inventory.setLibraryPaths([library]);
+      await settle();
+      if (!initiallyMissing) {
+        holdInstallation();
+        inventory.dirtyLibraries.add(library);
+        await inventory.refresh();
+        await settle();
+      }
+      const current = changes.at(-1);
+      assert.equal(current.packages.has("example"), !initiallyMissing);
+      assert.ok(current.libraries[0].deferred.get("example")?.includes(fs.realpathSync(cache) + path.sep + "example"),
+        "the missing final target must keep its cache lock and watch location");
+      const count = changes.length;
+      install(cache, "2.0");
+      await new Promise(resolve => setTimeout(resolve, 1800));
+      assert.equal(changes.length, count, "a replacement remains deferred while the external lock is held");
+      fs.rmSync(lock, { recursive: true });
+      await settle(() => changes.at(-1).packages.get("example")?.version === "2.0",
+        "the cache parent watch must detect unlock without touching either link");
+      assert.equal(changes.at(-1).libraries[0].deferred.size, 0);
+    });
+  }
+}
+
 // Binary and non-staged installs can copy a new package directly into the
 // library while 00LOCK is still empty: it must retain its library-wide scope.
 test("a whole-library lock protects new installations before a backup or staging directory exists", async t => {
@@ -735,6 +777,41 @@ test("a whole-library lock protects new installations before a backup or staging
   assert.ok(!changes.at(-1).packages.has("example"));
   fs.rmdirSync(path.join(library, "00LOCK"));
   await settle(() => changes.at(-1).packages.has("example"));
+});
+
+test("relative package links resolve parent traversal through directory aliases", {
+  skip: process.platform === "win32" && "junction creation normalizes its destination",
+}, async t => {
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const cache = path.join(root, "cache");
+  fs.mkdirSync(path.join(cache, "nested"), { recursive: true });
+  fs.symlinkSync(path.join(cache, "nested"), path.join(library, "alias"), "dir");
+  // The operating system resolves alias before applying '..'.
+  const target = install(cache);
+  fs.symlinkSync("alias/../example", path.join(library, "example"), "dir");
+  const lock = path.join(cache, "00LOCK-example");
+  fs.mkdirSync(lock);
+  fs.renameSync(target, path.join(lock, "example"));
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(changes.at(-1).libraries[0].deferred.get("example")?.includes(
+    path.join(fs.realpathSync(cache), "example")));
+});
+
+test("cyclic package links fail resolution promptly and recover when repaired", { timeout: 10000 }, async t => {
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const alias = path.join(root, "alias"), cache = path.join(root, "cache");
+  fs.mkdirSync(alias); fs.mkdirSync(cache);
+  const link = path.join(library, "example"), intermediate = path.join(alias, "example");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(intermediate, link, kind);
+  fs.symlinkSync(link, intermediate, kind);
+  await assert.rejects(inventory.resolvePackageLink(link, new Set()), { code: "ELOOP" });
+  fs.unlinkSync(intermediate);
+  fs.symlinkSync(install(cache), intermediate, kind);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
 });
 
 for (const lockName of ["00LOCK-example", "00LOCK"]) {

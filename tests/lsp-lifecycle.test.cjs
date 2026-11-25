@@ -661,6 +661,41 @@ test("linked cache changes refresh namespace exports without touching the librar
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
 });
 
+test("a chained package link retains its startup namespace until the cache installation unlocks", { timeout: 90000 }, async t => {
+  const { first, second: cache, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  const alias = path.join(root, "alias"), replacement = path.join(root, "replacement");
+  fs.mkdirSync(alias); fs.mkdirSync(replacement);
+  install(cache, "originalExport");
+  install(replacement, "replacementExport");
+  const target = path.join(cache, pkg), intermediate = path.join(alias, pkg);
+  fs.symlinkSync(target, intermediate, process.platform === "win32" ? "junction" : "dir");
+  fs.symlinkSync(intermediate, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
+  const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete, logs } = createClient({ env, libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
+  const originalIdentity = client.packageInventory.packages.get(pkg).identity;
+  const lock = path.join(cache, "00LOCK-" + pkg);
+  fs.mkdirSync(lock);
+  fs.renameSync(target, path.join(lock, pkg));
+  await waitFor(() => client.packageInventory.libraries.some(library => library.deferred?.has(pkg)),
+    "the cache lock defers the missing final target");
+  assert.equal(client.packageInventory.packages.get(pkg)?.identity, originalIdentity);
+  assert.equal(instances.length, 1, "the locked backup must not restart the language server");
+  fs.renameSync(path.join(replacement, pkg), target);
+  await new Promise(resolve => setTimeout(resolve, 1800));
+  assert.equal(client.packageInventory.packages.get(pkg)?.identity, originalIdentity);
+  assert.equal(instances.length, 1, "the new copy remains deferred until unlock");
+  fs.rmSync(lock, { recursive: true });
+  await waitFor(() => logs.some(line => line.includes("Updated: " + pkg)), "unlocked replacement published");
+  const items = await complete(pkg + "::");
+  assert.ok(items.some(item => item.label === "replacementExport"));
+  assert.ok(!items.some(item => item.label === "originalExport"));
+  assert.equal(instances.length, 2, "unlock replaces the loaded namespace once");
+});
+
 test("initial locked namespaces stay usable and an excluded startup namespace is retired", { timeout: 90000 }, async t => {
   const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "startupExport");

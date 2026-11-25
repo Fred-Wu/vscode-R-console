@@ -180,6 +180,35 @@ export class PackageInventory {
     }
   }
 
+  private async resolvePackageLink(link: string, files: Set<string>): Promise<string> {
+    let target = link;
+    const visited = new Set<string>();
+    for (let hops = 0; hops < 40; hops++) {
+      // Resolve parent aliases independently of the package's existence. Walk
+      // each package link so a missing final target retains its lock location.
+      const parent = await fs.promises.realpath(path.dirname(target)).catch(error => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return path.dirname(target);
+      });
+      target = path.join(parent, path.basename(target));
+      files.add(parent);
+      if (visited.has(target)) break;
+      visited.add(target);
+      let destination: string;
+      try {
+        destination = await fs.promises.readlink(target);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "EINVAL") return target;
+        throw error;
+      }
+      // Preserve '..' until realpath resolves any preceding directory aliases.
+      target = path.isAbsolute(destination) ? destination : parent + path.sep + destination;
+      files.add(path.dirname(target));
+    }
+    throw Object.assign(new Error(`Too many symbolic links resolving ${link}`), { code: "ELOOP" });
+  }
+
   private async watchLinkedPackages(library: string, entries: fs.Dirent[]): Promise<Map<string, string>> {
     const targets = new Map<string, string>();
     const files = new Set<string>();
@@ -187,15 +216,9 @@ export class PackageInventory {
       if (!entry.isSymbolicLink() || !/^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)) continue;
       const link = path.join(library, entry.name);
       try {
-        // readlink retains a watchable target parent even while the target is
-        // missing. realpath also follows chains into a different cache folder.
-        const direct = path.resolve(library, await fs.promises.readlink(link));
-        const target = await fs.promises.realpath(link).catch(async () => path.join(
-          await fs.promises.realpath(path.dirname(direct)).catch(() => path.dirname(direct)), path.basename(direct)));
+        const target = await this.resolvePackageLink(link, files);
         targets.set(entry.name, target);
         files.add(link);
-        files.add(path.dirname(direct));
-        files.add(path.dirname(target));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT" &&
             (error as NodeJS.ErrnoException).code !== "EINVAL") throw error;
