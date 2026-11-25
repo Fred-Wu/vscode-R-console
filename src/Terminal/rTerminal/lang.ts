@@ -132,16 +132,12 @@ export class RTermLang {
     this.bindingAbort = requestBindings;
     const bindingSignal = requestBindings.signal;
     const requestId = ++this.completionRequestId;
-    let context = getCompletionContext(
+    let context = (staticEnabled ? getStaticCompletionContext : getCompletionContext)(
       input.currentLine,
       input.cursorCol,
       input.textBeforeCursor,
       input.text.slice(input.textBeforeCursor.length)
     );
-    if (staticEnabled) {
-      context = getStaticCompletionContext(input.currentLine, input.cursorCol,
-        input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context);
-    }
     context ??= (force
       ? {
           kind: "default" as const,
@@ -486,11 +482,12 @@ export class RTermLang {
     this.completionRequestId++;
     const cached = this.inlineCache;
     if (!cached) return undefined;
-    context ??= getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-      input.text.slice(input.textBeforeCursor.length));
     if (this.options.getStaticAnalysisEnabled?.() === true) {
       context = getStaticCompletionContext(input.currentLine, input.cursorCol,
         input.textBeforeCursor, input.text.slice(input.textBeforeCursor.length), context);
+    } else {
+      context ??= getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
+        input.text.slice(input.textBeforeCursor.length));
     }
     if (!context) return undefined;
     const safeEntries = refineCompletionEntries(cached, input, context);

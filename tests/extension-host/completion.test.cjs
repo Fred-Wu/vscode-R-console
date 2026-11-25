@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const loadSource = require("../helpers/load-source.cjs");
+const { nativeStaticEvidence } = require("../helpers/native-static-evidence.cjs");
 
 suite("Completion in the VS Code extension host", () => {
   test("stored method argument names use the real converter and preserve source precedence", async () => {
@@ -148,14 +149,10 @@ suite("Completion in the VS Code extension host", () => {
       ]) {
         const text = `f <- function(outer_arg) NULL\n${body}`;
         const items = await complete(text, session);
-        // Callable defaults depend on native inference. Check that the real
-        // converter preserves its explicit unresolved decision and shadowing.
-        const result = nativeMayDecline ? await lang.consoleLsp.provideCompletionItems(
-          { getText: () => text }, { line: 1, character: body.length }) : undefined;
-        const unresolved = result?.rConsoleArgumentsResolved === false;
+        // Only independent native evidence can justify an unavailable signature.
+        const unresolved = nativeMayDecline && nativeStaticEvidence(text + '│').signature === null;
         assert.deepEqual(items.filter(item => item.detail === 'parameter').map(item => item.insertText),
           unresolved ? [] : expected);
-        if (unresolved) assert.equal(result.rConsoleStaticUnavailableReason, 'receiver-unresolved');
       }
       const exhausted = await complete('f <- function(method = c("one", "two")) NULL\nf(method = "one", ');
       assert.ok(exhausted.every(item => !item.detail?.startsWith('value for ')));
@@ -170,10 +167,11 @@ suite("Completion in the VS Code extension host", () => {
       }
       for (const [tail, required] of [['1 %>% my_fr', true], ['1 |> my_fr()', true], ['1 |> my_fr', false]]) {
         const text = `my_frob <- function(x) x\n${tail}`;
-        const items = await complete(text, undefined, text.endsWith('()') ? text.length - 2 : text.length);
+        const cursor = text.endsWith('()') ? text.length - 2 : text.length;
+        const items = await complete(text, undefined, cursor);
         if (required) assert.ok(items.some(item => item.insertText === 'my_frob()' && item.isCallable === true), tail);
-        // Native recovery can decline an unfinished pipe destination.
-        assert.ok(items.every(item => item.insertText === 'my_frob()'), tail);
+        const native = nativeStaticEvidence(text.slice(0, cursor) + '│' + text.slice(cursor), 'my_fr');
+        assert.deepEqual(items.map(item => item.insertText), native.functions.map(name => name + '()'), tail);
       }
       const shadowPrint = { search: [], globalenv: { print: {
         type: 'closure', str: 'function(x, old_arg)',

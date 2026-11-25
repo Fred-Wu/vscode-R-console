@@ -815,7 +815,9 @@ Independent expression symbols retain prefix broadening when parameter inference
 is unavailable. Native context classification, fallback and stored-receiver
 discovery share one request-local syntax snapshot, including cursor-specific token
 slices. Derived contexts and absent results are computed lazily once per snapshot;
-input changes and cursor moves receive independent snapshots. Snapshots are
+input changes and cursor moves receive independent snapshots. Terminal context
+classification, static fallback classification and generic prefix extraction share
+one syntax snapshot for the same input and cursor. Snapshots are
 released with their consumers; the separate lexer cache retains only the latest
 input. Projected source uses its own snapshot when building native request
 parameters. Multiline replacement offsets share one document line-offset index
@@ -873,6 +875,8 @@ Known callable-limitation fixtures derive signature availability independently
 through the native APIs in `tests/helpers/native-static-evidence.cjs`. A missing
 console signature is accepted only when the native probe also lacks that
 signature; provider or adapter failures cannot relax a supported-case assertion.
+Pipe destination fixtures compare candidates with native scope and workspace
+completion in both the LSP and extension-host suites.
 `tests/unit/static-bindings.test.cjs` covers resolver limits, lookup identity,
 scopes and cancellation. `tests/static-delegation.test.cjs` exercises the actual native resolver and
 verifies binding provenance, parse-queue replay, callable metadata compatibility,

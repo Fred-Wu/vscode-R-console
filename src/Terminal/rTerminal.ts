@@ -2173,14 +2173,11 @@ export class RTerminal implements vscode.Pseudoterminal {
   // presenting asynchronous inline suggestions. Re-parsing only with the
   // strict runtime grammar would discard prefixes on executable receivers.
   private inlineCompletionContext(input: InputSnapshot): ReturnType<typeof getCompletionContext> {
-    const context = getCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-      input.text.slice(input.textBeforeCursor.length));
     const staticEnabled = vscode.workspace.getConfiguration("r.console")
       .get<boolean>("completion.staticAnalysis", false);
-    return staticEnabled
-      ? getStaticCompletionContext(input.currentLine, input.cursorCol, input.textBeforeCursor,
-          input.text.slice(input.textBeforeCursor.length), context)
-      : context;
+    return (staticEnabled ? getStaticCompletionContext : getCompletionContext)(
+      input.currentLine, input.cursorCol, input.textBeforeCursor,
+      input.text.slice(input.textBeforeCursor.length));
   }
 
   private scheduleInlineCompletion(): void {

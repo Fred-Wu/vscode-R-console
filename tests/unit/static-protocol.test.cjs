@@ -36,6 +36,43 @@ test('native array replies normalize member provenance before static filtering',
   assert.equal(input.length, 2);
 });
 
+test('terminal static contexts share one syntax snapshot across classification and prefix extraction', () => {
+  const parser = loadSource('src/Language/completion/contextParser.ts');
+  const snapshots = [];
+  const { getStaticCompletionContext, getStaticFallbackContext } = loadSource('src/Language/completion/syntax.ts', {
+    './contextParser': { ...parser, getCompletionSyntax: (...args) => {
+      snapshots.push(args);
+      return parser.getCompletionSyntax(...args);
+    } },
+  });
+  for (const [marked, expected] of [
+    ['factory()$al│pha', { kind: 'member', prefix: 'al', replaceStart: 10, replaceEnd: 15 }],
+    ['factory()[["al│pha"]]', { kind: 'bracket', prefix: 'al', replaceStart: 12, replaceEnd: 17 }],
+    ['factory()[, co│l]', { kind: 'static', prefix: 'co', replaceStart: 12 }],
+    ['head <- 1\nfactory()[1, "a😀│tail"]', { kind: 'static', prefix: 'a😀', replaceStart: 14, bracketQuote: '"' }],
+    ['# comm│ent', { kind: 'static', prefix: '', replaceStart: 6 }],
+    ['value <- │', { kind: 'default', prefix: '', replaceStart: 9 }],
+  ]) {
+    const cursor = marked.indexOf('│'), input = marked.replace('│', '');
+    const before = input.slice(0, cursor), lines = before.split('\n');
+    const line = input.split('\n')[lines.length - 1], column = lines.at(-1).length;
+    const args = [line, column, before, input.slice(cursor)];
+    snapshots.length = 0;
+    const context = getStaticCompletionContext(...args);
+    assert.deepEqual(snapshots, [[input, cursor]], marked);
+    for (const [key, value] of Object.entries(expected)) assert.equal(context[key], value, marked + ': ' + key);
+    assert.equal(context.snapshotInput, line);
+    assert.equal(context.snapshotCursor, column);
+    // Native callers can supply their existing snapshot, including when the
+    // runtime classifier has no context at this cursor.
+    snapshots.length = 0;
+    const syntax = parser.getCompletionSyntax(input, cursor);
+    assert.deepEqual(getStaticCompletionContext(...args, undefined, syntax), context);
+    getStaticFallbackContext(...args, undefined, syntax);
+    assert.deepEqual(snapshots, [], marked);
+  }
+});
+
 test('protocol syntax shares tokenization and preserves the actual cursor on fuzzy requests', () => {
   const lexer = loadSource('src/Language/lexer.ts');
   let tokenizations = 0;

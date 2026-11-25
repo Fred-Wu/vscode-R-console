@@ -1494,6 +1494,8 @@ test("pipe completion preserves native recovery without synthetic source edits",
     const entries = await collectStaticEntries(client, context, doc, position, undefined,
       lines.slice(0, position.line), []);
     if (required) assert.ok(entries.some(item => item.insertText === 'my_frob()'), marked);
+    const native = nativeStaticEvidence(marked, context.prefix);
+    assert.equal(entries.some(item => item.insertText === 'my_frob()'), native.functions.includes('my_frob'), marked);
     // Incomplete native-pipe destinations may remain unresolved upstream. Never
     // synthesize a call/closing braces to manufacture static source bindings.
     const params = instances.at(-1).requests.filter(request => request.params?.position).at(-1).params;
