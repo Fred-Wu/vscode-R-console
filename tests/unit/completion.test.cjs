@@ -938,7 +938,8 @@ test("background package replacement shares startup and preserves the newer libr
   assert.deepEqual(requests.slice(1).map(request => request.method),
     ["rConsole/refreshPackages"],
     "apply only the latest library inventory to the new server");
-  assert.deepEqual(requests[1].params.libraryPaths, ["/latest"]);
+  assert.equal(requests[1].params.libraryPaths, undefined,
+    "inventory refreshes cannot overwrite the directly synchronized library order");
 });
 
 test("completion requests do not perform package inventory checks", async (t) => {

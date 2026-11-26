@@ -19,6 +19,9 @@ export type PackageInventoryChange = {
   libraries: LibraryInventory[];
   packages: Map<string, PackageInstallation>;
   changed: string[];
+  // Selection changes can reuse an installation already observed unchanged.
+  // Only content changes require reloading a namespace at the same path.
+  changedInstallations?: string[];
   isCurrent: () => boolean;
 };
 
@@ -548,7 +551,15 @@ export class PackageInventory {
     }
     const changed = [...new Set([...this.packages.keys(), ...packages.keys()])].filter(name =>
       this.packages.get(name)?.identity !== packages.get(name)?.identity);
+    const changedInstallations = changed.filter(name => {
+      const selected = packages.get(name);
+      if (!selected) return true;
+      const previous = this.libraries.map(library => library.packages.get(name))
+        .find(item => item?.path === selected.path);
+      return previous?.identity !== selected.identity;
+    });
     await this.onChange({ libraries, packages, changed: this.initialized ? changed : [],
+      changedInstallations: this.initialized ? changedInstallations : [],
       isCurrent: () => !this.disposed && revision === this.revision });
     if (this.disposed || revision !== this.revision) return;
 

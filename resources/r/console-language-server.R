@@ -280,6 +280,17 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
 server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params) {
     self$deliver(languageserver:::Response$new(id, result = as.list(.libPaths())))
 }
+library_paths_changed <- FALSE
+server$request_handlers[["rConsole/syncLibraryPaths"]] <- function(self, id, params) {
+    previous <- .libPaths()
+    .libPaths(normalize_character(params$libraryPaths), include.site = FALSE)
+    # The client replaces this process when the effective order changes. Its
+    # retained startup state and latest paths initialize fresh namespace caches.
+    # Keep the replacement requirement across retries if a reply is lost.
+    library_paths_changed <<- library_paths_changed || !identical(previous, .libPaths())
+    self$deliver(languageserver:::Response$new(id,
+        result = list(changed = library_paths_changed)))
+}
 server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, params) {
     changed <- normalize_character(params$changed)
     loaded <- loadedNamespaces()
@@ -294,12 +305,11 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
         selected <- normalizePath(installation, winslash = "/", mustWork = FALSE)
         !identical(selected, current)
     }, setdiff(loaded, "base"))
-    restart <- union(intersect(changed, loaded), switched)
+    restart <- union(intersect(normalize_character(params$changedInstallations), loaded), switched)
     if (length(restart)) {
         # Removing metadata cannot replace functions or DLLs already loaded in R.
         return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))
     }
-    .libPaths(normalize_character(params$libraryPaths), include.site = FALSE)
     for (workspace in self$workspaces$values()) {
         affected <- changed
         if (length(changed) && is.function(workspace$s3_metadata$keys)) {

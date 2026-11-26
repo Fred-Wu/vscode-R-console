@@ -1218,10 +1218,26 @@ r.useRenvLibPath settings. The embedded R host reads the fixed base `.libPaths()
 call at a completed main prompt, publishing a bounded,
 ordered snapshot only when the effective search order changes. The console's
 completion client gives that snapshot priority over the LSP's own startup paths
-and updates the package inventory and language-server library paths. A reconnect
-receives the last completed prompt snapshot without evaluating R on the socket
+and sends the ordered directory list over the authenticated LSP connection using
+`rConsole/syncLibraryPaths`. The server applies R's `.libPaths()` rules with
+`include.site = FALSE` and reports whether the effective order changed. A change
+refreshes the separate language-server process from its retained in-memory startup
+state, initializing namespace and completion caches with the latest library order.
+The interactive R session retains its loaded packages. Profiles run during the
+initial language-server launch; replacements restore the captured startup state.
+Concurrent changes share a synchronization queue that drains to the latest snapshot
+before completion proceeds. Failed synchronization retries with delays increasing
+from 1 second to 30 seconds, stopping on success or disposal. Synchronization also
+runs after startup, and unchanged snapshots reuse the existing server.
+
+A reconnect receives the last completed prompt snapshot without evaluating R on the socket
 thread. No library-path requests go through sess or the legacy session integration.
-Library removal, reordering, and restoration use the same package-inventory lifecycle.
+Directory additions, removal and reordering reach the language server independently
+of filesystem inventory publication. Package installation, removal or update inside
+an unchanged directory remains an inventory event. Applying `.libPaths()` and loading
+packages still use R's ordinary filesystem access, including configured network paths.
+
+The package inventory receives the same ordered snapshot for its own monitoring.
 Unchanged libraries retain their filesystem and parent watchers and cached
 package inventories. Reordering avoids directory rescans; added paths are scanned
 and removed paths are unwatched. An in-flight scan from the previous search order
@@ -1256,9 +1272,14 @@ while monitoring was unavailable. Recovery stops once successful or when the
 console closes. Healthy libraries continue to use the existing inventory.
 
 The first library containing a package selects its effective installation.
-Adding or removing a lower-priority copy updates the inventory and counts but
-preserves completion data. A new effective package updates the package-name
-list without restarting. A changed effective copy invalidates that package's
+Inventory publication distinguishes a selection change from a change to the
+selected installation's recorded identity. Reusing an unchanged copy after a
+library-order refresh preserves the new server; replacing files in that copy
+still invalidates loaded namespaces. Inventory requests update package metadata;
+the dedicated library synchronization request owns the search order.
+With an unchanged library order, adding or removing a lower-priority copy updates
+the inventory and counts while preserving completion data. A newly installed
+package updates the package-name list without restarting. A changed effective copy invalidates that package's
 completion metadata and affected requests. `rConsole/refreshPackages` requests
 a restart only when a changed package is already loaded in the LSP process,
 or the loaded namespace comes from a different installation. Console-side

@@ -7,7 +7,7 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, getStartupStateStore } = {}) {
+function createClient(t, { reply, completion, packageChanges, librarySync, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, getStartupStateStore } = {}) {
   const instances = [];
   const logs = [];
   class LanguageClient {
@@ -40,6 +40,7 @@ function createClient(t, { reply, completion, packageChanges, start, stop, libra
       if (method === "rConsole/takeStartupState") return Buffer.from("opaque R state").toString("base64");
       if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
       if (method === "rConsole/libraryPaths") return libraries;
+      if (method === "rConsole/syncLibraryPaths") return await librarySync?.(this, params) ?? { changed: false };
       if (method === "rConsole/refreshPackages") return { restart: await packageChanges?.(this) ?? [] };
       assert.equal(method, "completion");
       return await completion?.(this, params, token) ?? [{ label: "lm" }];
@@ -890,6 +891,124 @@ test("a late session-sync reply cannot replace newer R Console paths", async t =
   client.resetRuntimeLibraryPaths();
   assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS, "/startup",
     "replacement falls back to the captured server libraries after a runtime reset");
+});
+
+test("library directory additions, reordering and removals synchronize without inventory publication", async t => {
+  const { client, instances } = createClient(t, { libraries: ["/base"] });
+  // The fixture disables inventory monitoring. No refreshPackages callback is delivered.
+  await client.start();
+  for (const paths of [["/first", "/base"], ["/base", "/first"], ["/base"]]) {
+    client.updateRuntimeLibraryPaths(paths);
+    await client.libraryPathsSyncPromise;
+    assert.deepEqual(instances[0].requests.at(-1), {
+      method: "rConsole/syncLibraryPaths", params: { libraryPaths: paths },
+    });
+  }
+  const count = instances[0].requests.length;
+  client.updateRuntimeLibraryPaths(["/base"]);
+  await client.syncLibraryPaths();
+  assert.equal(instances[0].requests.length, count);
+  assert.ok(!instances[0].requests.some(request => request.method === "rConsole/refreshPackages"));
+});
+
+test("library synchronization serializes snapshots and gates completion on the latest order", async t => {
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release({ changed: false }));
+  const { client, instances } = createClient(t, { libraries: ["/base"],
+    librarySync: async (_instance, params) => {
+      if (params.libraryPaths[0] === "/first") { entered(); return gate; }
+    },
+  });
+  await client.start();
+  client.updateRuntimeLibraryPaths(["/first", "/base"]);
+  await started;
+  client.updateRuntimeLibraryPaths(["/second", "/base"]);
+  const completing = client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8));
+  assert.ok(!instances[0].requests.some(request => request.method === "completion"));
+  release({ changed: false });
+  await completing;
+  const requests = instances[0].requests;
+  assert.deepEqual(requests.filter(request => request.method === "rConsole/syncLibraryPaths")
+    .map(request => request.params.libraryPaths), [["/first", "/base"], ["/second", "/base"]]);
+  assert.equal(requests.at(-1).method, "completion");
+});
+
+test("a path snapshot arriving during completion preparation cannot publish old candidates", async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release({ changed: false }));
+  const { client } = createClient(t, { libraries: ["/base"], librarySync: () => gate,
+    completion: () => [{ label: "oldCandidate" }],
+  });
+  await client.start();
+  const prepare = client.applySessionState.bind(client);
+  client.applySessionState = async (...args) => {
+    await prepare(...args);
+    client.updateRuntimeLibraryPaths(["/new", "/base"]);
+  };
+  assert.equal(await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8)),
+    undefined);
+});
+
+test("a library change refreshes cached namespaces independently of package discovery", async t => {
+  let changed = true;
+  const { client, instances } = createClient(t, { libraries: ["/base"],
+    librarySync: () => { const reply = { changed }; changed = false; return reply; },
+  });
+  await client.start();
+  await client.syncSessionState({ attachedPackages: ["stats"] });
+  const startupState = client.startupState;
+  client.updateRuntimeLibraryPaths(["/new", "/base"]);
+  await client.libraryPathsSyncPromise;
+  assert.equal(instances.length, 2);
+  assert.equal(client.startupState, startupState);
+  await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8));
+  assert.ok(instances[1].requests.some(request => request.method === "rConsole/syncSessionState"));
+  assert.ok(!instances.flatMap(instance => instance.requests)
+    .some(request => request.method === "rConsole/refreshPackages"));
+});
+
+test("snapshots arriving during startup and replacement settle on the latest order", async t => {
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const waiting = new Promise(resolve => { entered = resolve; });
+  t.after(release);
+  let starts = 0;
+  const { client, instances } = createClient(t, { libraries: ["/base"],
+    start: async () => { if (++starts === 2) { entered(); await gate; } },
+    librarySync: instance => ({ changed: instance === instances[0] }),
+  });
+  const starting = client.start();
+  client.updateRuntimeLibraryPaths(["/first", "/base"]);
+  await waiting;
+  client.updateRuntimeLibraryPaths(["/second", "/base"]);
+  release();
+  await starting;
+  assert.equal(instances.length, 2);
+  assert.equal(client.syncedLibraryPaths.key, JSON.stringify(["/second", "/base"]));
+  assert.deepEqual(instances[1].requests.at(-1).params.libraryPaths, ["/second", "/base"]);
+});
+
+test("failed library synchronization retries automatically and disposal cancels retry", async t => {
+  let attempts = 0;
+  const { client } = createClient(t, { libraries: ["/base"],
+    librarySync: () => { if (++attempts === 1) throw new Error("temporary transport failure"); },
+  });
+  await client.start();
+  client.libraryPathsRetryDelay = 5;
+  client.updateRuntimeLibraryPaths(["/new", "/base"]);
+  await assert.rejects(client.libraryPathsSyncPromise, /temporary transport failure/);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(attempts, 2);
+  assert.equal(client.syncedLibraryPaths.key, JSON.stringify(["/new", "/base"]));
+  attempts = 0;
+  client.updateRuntimeLibraryPaths(["/another", "/base"]);
+  await assert.rejects(client.libraryPathsSyncPromise);
+  assert.ok(client.libraryPathsRetry);
+  await client.dispose();
+  assert.equal(client.libraryPathsRetry._destroyed, true);
 });
 
 test("startup state is retained across replacement and cleared on disposal", async t => {

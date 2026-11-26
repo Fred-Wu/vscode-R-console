@@ -334,7 +334,7 @@ test("real R refreshes linked project libraries when package links are added, re
 });
 
 
-test("real console library-path IPC updates package completion, precedence and removal", { timeout: 120000 }, async t => {
+test("real console library-path IPC updates completion without filesystem monitoring", { timeout: 120000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-live-libpaths-"));
   const first = path.join(root, "first");
   const second = path.join(root, "second");
@@ -360,7 +360,17 @@ test("real console library-path IPC updates package completion, precedence and r
 
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } =
     loadSource("src/Runtime/runtimeBackend.ts");
-  const { client, complete, logs } = createConsoleLsp(t, { cwd: root });
+  let loseSyncReply = true;
+  const { client, instances, complete, logs } = createConsoleLsp(t, { cwd: root,
+    afterResponse: method => {
+      if (method === "rConsole/syncLibraryPaths" && loseSyncReply) {
+        loseSyncReply = false;
+        throw new Error("Simulated lost library synchronization reply");
+      }
+    },
+  });
+  client.packageInventory.dispose();
+  client.packageInventory.setLibraryPaths = () => {};
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {},
     "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
@@ -400,10 +410,7 @@ test("real console library-path IPC updates package completion, precedence and r
       await new Promise(resolve => setTimeout(resolve, 50));
     }
   };
-  const samePath = (a, b) => fs.realpathSync.native(a).replaceAll("\\", "/").toLowerCase() ===
-    fs.realpathSync.native(b).replaceAll("\\", "/").toLowerCase();
   await client.start();
-  await check(() => client.packageInventory.initialized, "initial language-server inventory");
   session = backend.start([rPath, "--vanilla", "--quiet"], {
     cwd: root, env: { ...process.env, R_HOME: rHome },
   });
@@ -442,28 +449,31 @@ test("real console library-path IPC updates package completion, precedence and r
     assert.ok(backend.canUseSessionCommands(session), "library changes must not disconnect R");
   };
   await submitPaths([first], "FIRST_LIBRARY_ACTIVE");
-  await check(() => logs.some(line => line.includes("Added: " + packageName)),
-    "first package addition observed");
   await check(async () => (await complete(packageName + "::"))?.some(item => item.label === "fromFirstLibrary"),
     "first library completion");
   await submitPaths([first, second], "SECOND_LIBRARY_ACTIVE");
-  await check(() => client.packageInventory.libraries.some(lib => samePath(lib.path, second)),
-    "second library inventory");
+  await client.libraryPathsSyncPromise;
+  assert.deepEqual(await instances.at(-1).sendRequest("rConsole/libraryPaths", {}), snapshots.at(-1));
   await submitPaths([second, first], "REORDERED_LIBRARIES");
   await check(async () => {
     const items = await complete(packageName + "::");
     return items?.some(item => item.label === "fromSecondLibrary") &&
       !items.some(item => item.label === "fromFirstLibrary");
   }, "reordered library completion precedence");
+  client.setStaticAnalysis(false);
+  assert.ok((await complete(packageName + "::"))?.some(item => item.label === "fromSecondLibrary"),
+    "live-mode namespace completion also uses the synchronized library order");
   await submitPaths([], "REMOVED_LIBRARIES");
-  await check(() => logs.some(line => line.includes("Removed: " + packageName)),
-    "removed package inventory");
   await check(async () => {
     const items = await complete(packageName + "::");
     return !items?.some(item => item.label === "fromFirstLibrary" || item.label === "fromSecondLibrary");
   }, "removed library must not complete");
   assert.deepEqual(snapshots.at(-1), basePaths,
     "removing both libraries restores exactly the original console search order");
+  assert.ok(!instances.flatMap(instance => instance.requests)
+    .some(request => request.method === "rConsole/refreshPackages"),
+    "path synchronization must not depend on an inventory refresh");
+  assert.equal(loseSyncReply, false, "exercise retry after R applies paths but the reply is lost");
 });
 
 test("real R keeps startup completion working while the first session snapshot arrives", { timeout: 90000 }, async (t) => {

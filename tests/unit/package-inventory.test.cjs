@@ -84,6 +84,8 @@ test("inventory preserves effective copies across duplicate additions, removals 
   inventory.setLibraryPaths([second, first]);
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.deepEqual(changes.at(-1).changedInstallations, [],
+    "selecting an already observed copy does not replace that installation");
   assert.equal(changes.at(-1).packages.get("example").version, "1.0");
   logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
@@ -258,6 +260,8 @@ test("inventory detects same-version package replacement from folder events", as
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.notEqual(changes.at(-1).packages.get("example").identity, identity);
+  assert.deepEqual(changes.at(-1).changedInstallations, ["example"],
+    "replacing files at the selected path must still invalidate a loaded namespace");
   assert.ok(logs.some(line => line.includes("Updated: example 1.0 -> 1.0")));
 });
 
