@@ -7,11 +7,12 @@ const net = require("node:net");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { BACKEND_PROTOCOL_VERSION } = loadSource("src/Runtime/backendProtocol.ts");
 
-test("a future protocol upgrade closes a real authenticated protocol 4 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
+test(`a future protocol upgrade closes a real authenticated protocol ${BACKEND_PROTOCOL_VERSION} session`, { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {
-    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 5 },
+    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: BACKEND_PROTOCOL_VERSION + 1 },
   });
   const { closeLegacySession } = loadSource("src/Runtime/legacySession.ts", { "./persistentSessionRegistry": registry });
   const { session: savedSession } = require("./helpers/persistent-session.cjs");
@@ -45,7 +46,7 @@ test("a future protocol upgrade closes a real authenticated protocol 4 session",
     await delay(20, undefined, { signal: t.signal });
   }
   const runtime = backend.getReconnectInfo(handle);
-  assert.equal(runtime.protocolVersion, 4);
+  assert.equal(runtime.protocolVersion, BACKEND_PROTOCOL_VERSION);
   pid = runtime.pid;
   const entry = savedSession({ ...runtime, cwd: directory });
   assert.equal(registry.isLegacyConsoleRecord(entry), true);
@@ -161,9 +162,9 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   const bootstrap = path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`);
   const sessionData = JSON.parse(fs.readFileSync(bootstrap, "utf8"));
   assert.equal(sessionData.authToken, undefined, "bootstrap must never disclose backend credentials");
-  assert.equal(sessionData.protocolVersion, 3);
-  assert.equal(backend.getReconnectInfo(session).protocolVersion, 3);
-  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, 3);
+  assert.equal(sessionData.protocolVersion, BACKEND_PROTOCOL_VERSION);
+  assert.equal(backend.getReconnectInfo(session).protocolVersion, BACKEND_PROTOCOL_VERSION);
+  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, BACKEND_PROTOCOL_VERSION);
   assert.match(backend.getReconnectInfo(session).authToken, /^[0-9a-f]{64}$/);
   if (process.platform !== "win32") assert.equal(fs.statSync(bootstrap).mode & 0o777, 0o600);
   // Wrong and missing credentials must not replace the authenticated console.
