@@ -6,7 +6,8 @@ import { isTransientCompletionFailure } from "./diagnostics";
 // as the completion request; aborted requests still settle immediately.
 export const STATIC_COMPLETION_REQUEST_TIMEOUT_MS = 20_000;
 export async function requestStaticCompletion(
-  provider: CompletionProvider, request: StaticCompletionRequest
+  provider: CompletionProvider, request: StaticCompletionRequest,
+  timeoutMs = STATIC_COMPLETION_REQUEST_TIMEOUT_MS
 ): Promise<StaticCompletionResult> {
   const inputVersion = request.document.version;
   const current = () => request.bindings.isCurrent() && request.document.version === inputVersion &&
@@ -37,7 +38,7 @@ export async function requestStaticCompletion(
         ? { ...result, status: "pending" } : result);
     };
     const cancel = () => finish(pending);
-    const timer = setTimeout(() => finish({ status: "pending", reason: "analysis-limit" }), STATIC_COMPLETION_REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => finish({ status: "pending", reason: "analysis-limit" }), timeoutMs);
     request.bindings.signal?.addEventListener("abort", cancel, { once: true });
     if (!current()) return finish(pending);
     void Promise.resolve().then(() => finished || !current() ? pending : provider.provideStaticCompletion
