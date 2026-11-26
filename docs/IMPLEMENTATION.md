@@ -1275,8 +1275,23 @@ only after the new watcher is successfully registered. No intermediate
 "verifying" entries or per-package symlink locations are logged. R's original
 `.libPaths()` search order remains authoritative and unchanged by pinning.
 Ordinary package-directory events do not rebuild the package watcher set.
-No periodic filesystem polling is used; failed operations retain bounded
-recovery backoff.
+Healthy monitoring uses filesystem notifications only. If an ancestor-entry
+watcher fails, package-directory and other healthy watchers remain active.
+The console checks the pinned physical root and its ancestors with `lstat`
+on initial registration, on relevant watcher events, when a watcher fails,
+before each recovery attempt, and before and after asynchronous inventory scans.
+A linked pinned root or ancestor suspends monitoring without following the link.
+A failed parent watcher has five automatic registration attempts at 1, 2, 4,
+8 and 16 seconds; one shared timer schedules only pending failures. Each
+successful recovery compares directory-entry identities to detect changes
+missed during the outage. After five failures, the timer stops. Subsequent
+relevant library or ancestor events can retry registration no more often than
+once every 10 seconds. Unrelated notifications do not retry, and no periodic
+package scanning or idle polling is introduced. A missing library's recovery
+relies only on a watcher covering the first missing path entry or an active
+recovery attempt for that watcher, not an unrelated ancestor subscription.
+Failures and restorations are logged once per transition, not per attempt.
+R's search order and legitimate configured library symlinks remain unchanged.
 
 Scans inspect ordinary package directories directly inside each library. They read
 package names, versions, canonical library locations and package-directory timestamps,

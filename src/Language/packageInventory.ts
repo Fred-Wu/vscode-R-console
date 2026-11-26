@@ -73,7 +73,15 @@ export class PackageInventory {
     private readonly log: (message: string) => void,
   ) {
     this.entryMonitor = new LibraryPathEntryMonitor(
-      change => this.onLibraryPathEntryChange(change), message => this.log(message));
+      change => this.onLibraryPathEntryChange(change), message => this.log(message), fs,
+      library => {
+        // Check the pinned physical path on parent watcher failure and before
+        // every recovery attempt. A missing ordinary directory is recoverable;
+        // a symlinked pinned root suspends monitoring instead.
+        if (this.disposed || !this.paths.includes(library) || this.suspended.has(library)) return false;
+        try { return this.libraryTarget(library) !== undefined; }
+        catch { return !this.suspended.has(library); }
+      });
   }
 
   private onLibraryPathEntryChange(change: LibraryPathEntryChange): void {
@@ -246,6 +254,9 @@ export class PackageInventory {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         let current: string | undefined;
         try { current = this.libraryTarget(library); } catch { /* Recover a removed root below. */ }
+        if (this.suspended.has(library)) return;
+        this.entryMonitor.onLibraryEvent(library);
+        if (this.disposed || this.watchers.get(library) !== watcher) return;
         if (current !== this.watchedTargets.get(library)) {
           watcher.close();
           this.watchers.delete(library);
@@ -283,7 +294,9 @@ export class PackageInventory {
     } catch (error) {
       this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
       const code = (error as NodeJS.ErrnoException).code;
-      if ((code === "ENOENT" || code === "ENOTDIR") && this.entryMonitor.hasPhysicalEntryWatch(library)) {
+      if ((code === "ENOENT" || code === "ENOTDIR") &&
+          (this.entryMonitor.hasPhysicalEntryWatch(library) ||
+           this.entryMonitor.hasPhysicalEntryRecovery(library))) {
         this.log(`[Libraries] Waiting for pinned library recreation event: ${this.rootFor(library)}`);
       } else {
         this.scheduleRetry();
@@ -564,7 +577,8 @@ export class PackageInventory {
         libraries.push(retained("unavailable"));
         const code = (error as NodeJS.ErrnoException).code;
         if ((code !== "ENOENT" && code !== "ENOTDIR") ||
-            !this.entryMonitor.hasPhysicalEntryWatch(library)) this.scheduleRetry();
+            !(this.entryMonitor.hasPhysicalEntryWatch(library) ||
+              this.entryMonitor.hasPhysicalEntryRecovery(library))) this.scheduleRetry();
       }
     }
     if (this.disposed || revision !== this.revision) return;
