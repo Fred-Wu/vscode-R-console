@@ -509,6 +509,77 @@ test("directory timestamp touches do not rescan unchanged installed packages", a
   assert.equal(changes.at(-1).packages.get("example")?.version, "2.0");
 });
 
+test("ordinary physical libraries log one canonical path, with no alias arrow", async t => {
+  const { libraries: [library], inventory, changes, logs, settle } = fixture(t);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(logs.includes(`[Libraries] Pinned library: ${library}`));
+  assert.ok(!logs.some(line => line.startsWith("[Libraries] Library alias:")));
+  assert.ok(!logs.some(line => line.startsWith("[Libraries] Pinned library:") && line.includes(" -> ")));
+  assert.deepEqual(changes.at(-1).libraries.map(item => item.path), [library],
+    "pinning for monitoring must not change the R search order");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(logs.filter(line => line.startsWith("[Libraries] Pinned library:")).length, 1,
+    "unchanged libraries must not log their initial pin repeatedly");
+});
+
+test("canonical spelling differences without a symlink are not logged as aliases", async t => {
+  let configured;
+  const physical = [];
+  const realpathSync = Object.assign((...args) => fs.realpathSync(...args), {
+    native: (file, ...args) => file === configured ? physical[0] : fs.realpathSync.native(file, ...args),
+  });
+  const { root, inventory, changes, logs, settle } = fixture(t, 0, { realpathSync });
+  configured = path.join(root, "displayed-library");
+  physical[0] = path.join(root, "canonical-library");
+  fs.mkdirSync(configured);
+  fs.mkdirSync(physical[0]);
+  inventory.setLibraryPaths([configured]);
+  await settle();
+  assert.ok(logs.includes(`[Libraries] Pinned library: ${physical[0]}`));
+  assert.ok(!logs.some(line => line.startsWith("[Libraries] Library alias:")),
+    "different canonical strings are not proof that a symlink exists");
+  inventory.onLibraryPathEntryChange({
+    library: configured, entry: configured, pinnedRoot: physical[0], kind: "alias", state: "directory",
+  });
+  assert.ok(!logs.some(line => line.includes("Configured library alias changed:")),
+    "canonical spelling differences cannot produce alias-retarget logs");
+  assert.deepEqual(changes.at(-1).libraries.map(item => item.path), [configured]);
+});
+
+test("an alias replaced by an ordinary directory reports alias removal without retargeting", async t => {
+  const { root, inventory, logs, settle, install, entryWatches, changes } = fixture(t);
+  const first = path.join(root, "pinned-destination"), alias = path.join(root, "configured-alias");
+  install(first);
+  fs.symlinkSync(first, alias, process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([alias]);
+  await settle();
+  fs.unlinkSync(alias);
+  fs.mkdirSync(alias);
+  const entryWatch = entryWatches.find(watch => watch.file === root);
+  assert.ok(entryWatch);
+  entryWatch.trigger("rename", path.basename(alias));
+  await settle();
+  assert.ok(logs.includes(`[Libraries] Configured library alias changed: ${alias}; monitoring remains pinned to ${first}`));
+  assert.equal(inventory.configuredAliases.has(alias), false);
+  assert.equal(changes.at(-1).packages.get("example").target, path.join(first, "example"),
+    "removing an alias cannot change the pinned package destination");
+});
+
+test("a symlinked ancestor is identified as a library alias", async t => {
+  const { root, inventory, logs, install, settle } = fixture(t);
+  const realParent = path.join(root, "real-parent");
+  const aliasParent = path.join(root, "alias-parent");
+  const physicalLibrary = install(path.join(realParent, "library"));
+  fs.symlinkSync(realParent, aliasParent, process.platform === "win32" ? "junction" : "dir");
+  const configured = path.join(aliasParent, "library");
+  inventory.setLibraryPaths([configured]);
+  await settle();
+  assert.ok(logs.includes(`[Libraries] Library alias: ${configured} -> ${path.dirname(physicalLibrary)}`),
+    "a link in the configured library ancestry must be classified as an alias");
+});
+
 test("configured library aliases remain pinned when their links are retargeted", async t => {
   const { root, inventory, changes, install, settle, watches, entryWatches, logs } = fixture(t);
   const first = path.join(root, "original-target"), second = path.join(root, "replacement-target");
@@ -520,7 +591,7 @@ test("configured library aliases remain pinned when their links are retargeted",
   inventory.setLibraryPaths([library]);
   await settle();
   assert.equal(changes.at(-1).packages.get("example").version, "1.0");
-  assert.ok(logs.some(line => line.includes("Pinned configured library alias:") && line.includes(library)));
+  assert.ok(logs.includes(`[Libraries] Library alias: ${library} -> ${first}`));
   const watcher = inventory.watchers.get(library), count = changes.length;
   assert.deepEqual(watches.map(watch => watch.file).sort(), [first, path.join(first, "example")].sort());
   assert.ok(watches.every(watch => watch.options.recursive === false));
@@ -568,8 +639,12 @@ for (const replaceAncestor of [false, true]) {
     assert.ok(parentWatch, "pinned root parent entries must be monitored");
     parentWatch.trigger("rename", path.basename(replaced));
     await settle(() => changes.at(-1).unmonitoredRoots.includes(library));
-    assert.ok(logs.some(line => line.includes("Pinned library path entry changed:")),
-      "root/ancestor replacement should be visible in lifecycle logs");
+    const expected = replaceAncestor
+      ? `[Libraries] Monitoring suspended: ${library} - pinned library ancestor replaced by a symlink: ${parent}`
+      : `[Libraries] Monitoring suspended: ${library} - pinned library replaced by a symlink`;
+    assert.ok(logs.includes(expected), "symlink replacement should report suspension, not intermediate validation");
+    assert.equal(logs.filter(line => line === expected).length, 1);
+    assert.ok(!logs.some(line => line.includes("; verifying ")));
     assert.equal(changes.at(-1).packages.size, 1, "suspension retains verified metadata");
     assert.deepEqual(changes.at(-1).changed, []);
     assert.equal(changes.at(-1).unmonitored.length, 0);
@@ -580,7 +655,7 @@ for (const replaceAncestor of [false, true]) {
 }
 
 test("replacing an existing library directory re-arms its watcher without an error event", async t => {
-  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const { libraries: [library], inventory, changes, install, settle, logs } = fixture(t);
   install(library);
   inventory.setLibraryPaths([library]);
   await settle();
@@ -600,6 +675,11 @@ test("replacing an existing library directory re-arms its watcher without an err
   }
   await settle();
   assert.notEqual(inventory.watchers.get(library), previous);
+  assert.ok(logs.includes(`[Libraries] Pinned library replaced: ${library} - monitoring restored`));
+  assert.equal(logs.filter(line => line.includes("Pinned library replaced:")).length, 1,
+    "ordinary replacement must be reported once, even with multiple filesystem events");
+  assert.ok(!logs.some(line => line.includes("; verifying ")));
+  assert.deepEqual(changes.at(-1).libraries.map(item => item.path), [library]);
   assert.deepEqual(changes.at(-1).changed, ["example"]);
 
   // The newly created watcher must keep observing subsequent installations.
@@ -611,6 +691,30 @@ test("replacing an existing library directory re-arms its watcher without an err
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   await settle();
+});
+
+test("recreation after a missing-root notification reports the new physical library once", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle, entryWatches } = fixture(t);
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const previous = inventory.watchers.get(library);
+  releaseWindowsWatcherHandles(previous);
+  releaseWindowsEntryWatcherHandles(inventory);
+  const parentWatch = entryWatches.find(watch => watch.file === path.dirname(library));
+  assert.ok(parentWatch);
+  fs.renameSync(library, library + "-old");
+  parentWatch.trigger("rename", path.basename(library));
+  await settle();
+  assert.equal(inventory.watchers.has(library), false);
+  fs.mkdirSync(library);
+  install(library, "2.0");
+  parentWatch.trigger("rename", path.basename(library));
+  await settle(() => inventory.watchers.has(library) &&
+    changes.at(-1).packages.get("example")?.version === "2.0");
+  assert.equal(logs.filter(line =>
+    line === `[Libraries] Pinned library replaced: ${library} - monitoring restored`).length, 1);
+  assert.equal(inventory.retryTimer, undefined, "recreation must be driven by the parent-entry event");
 });
 
 test("healthy library events refresh during a different library's recovery backoff", async t => {

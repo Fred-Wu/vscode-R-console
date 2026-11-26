@@ -1264,11 +1264,19 @@ new destination receives no automatic subscription or scan. Shared non-recursive
 parent-entry watchers monitor canonical ancestors of the pinned library and
 ordinary ancestors of its configured alias. They detect directory replacement and
 alias retargeting through filesystem notifications without following the new target.
-The initial pinned physical root and configured library alias, along with
-subsequent alias and root/ancestor changes, are logged to the console lifecycle
-output. Package-entry symlinks remain monitored without per-package location
-logs. Ordinary package-directory events do not rebuild the package watcher set. No periodic
-filesystem polling is used; failed operations retain bounded recovery backoff.
+Console lifecycle output reports a physical library once as
+`[Libraries] Pinned library: <physical-root>`. An actual symlink or junction
+in the configured library path is reported as
+`[Libraries] Library alias: <configured-path> -> <pinned-root>`. Merely different
+canonical spellings are not classified as links. Root/ancestor replacement by a
+symlink logs a monitoring-suspended outcome; a replacement with an ordinary
+directory logs `[Libraries] Pinned library replaced: <pinned-root> - monitoring restored`
+only after the new watcher is successfully registered. No intermediate
+"verifying" entries or per-package symlink locations are logged. R's original
+`.libPaths()` search order remains authoritative and unchanged by pinning.
+Ordinary package-directory events do not rebuild the package watcher set.
+No periodic filesystem polling is used; failed operations retain bounded
+recovery backoff.
 
 Scans inspect ordinary package directories directly inside each library. They read
 package names, versions, canonical library locations and package-directory timestamps,

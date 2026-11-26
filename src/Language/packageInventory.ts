@@ -52,6 +52,10 @@ export class PackageInventory {
   private readonly suspended = new Set<string>();
   private readonly unavailable = new Set<string>();
   private readonly watchedTargets = new Map<string, string>();
+  // Preserve the last successfully watched physical identity across a brief
+  // removal, so a subsequent ordinary replacement is logged as a replacement.
+  private readonly lastWatchedTargets = new Map<string, string>();
+  private readonly configuredAliases = new Set<string>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -76,10 +80,17 @@ export class PackageInventory {
     const library = change.library;
     if (this.disposed || !this.paths.includes(library)) return;
     if (change.kind === "alias") {
-      this.log(`[Libraries] Configured library alias changed: ${change.entry}; monitoring remains pinned to ${change.pinnedRoot}`);
+      const wasAlias = this.configuredAliases.has(library);
+      const isAlias = this.configuredPathHasLink(library);
+      if (isAlias) this.configuredAliases.add(library);
+      else this.configuredAliases.delete(library);
+      // An alias's removal is still an alias change. Canonical path spelling
+      // differences alone must not generate misleading alias messages.
+      if (wasAlias || isAlias) {
+        this.log(`[Libraries] Configured library alias changed: ${library}; monitoring remains pinned to ${change.pinnedRoot}`);
+      }
       return;
     }
-    this.log(`[Libraries] Pinned library path entry changed: ${change.entry} (${change.state}); verifying ${change.pinnedRoot}`);
     let current: string | undefined;
     try { current = this.libraryTarget(library); }
     catch { /* A missing ordinary root will be revisited on its parent entry's next event. */ }
@@ -114,6 +125,8 @@ export class PackageInventory {
       if (!active.has(library)) {
         this.entryMonitor.remove(library);
         this.roots.delete(library);
+        this.lastWatchedTargets.delete(library);
+        this.configuredAliases.delete(library);
         this.suspended.delete(library);
         this.unavailable.delete(library);
       }
@@ -133,6 +146,24 @@ export class PackageInventory {
       if (!this.watchers.has(library)) this.watchLibrary(library);
     }
     this.schedule(0);
+  }
+
+  /** Only report a configured alias when an actual path component is linked.
+   * Windows spelling, casing and 8.3-name canonicalization alone are not links. */
+  private configuredPathHasLink(library: string): boolean {
+    const configured = path.resolve(library);
+    let current = path.parse(configured).root;
+    for (const part of configured.slice(current.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      try {
+        if (fs.lstatSync(current).isSymbolicLink()) return true;
+      } catch {
+        // Classification is for logging only; root validation still decides
+        // whether monitoring is safe.
+        return false;
+      }
+    }
+    return false;
   }
 
   private rootFor(library: string): string {
@@ -165,8 +196,12 @@ export class PackageInventory {
     }
     this.roots.set(library, resolved);
     if (!this.suspended.has(library)) {
-      const kind = path.resolve(library) === resolved ? "physical library" : "configured library alias";
-      this.log(`[Libraries] Pinned ${kind}: ${library} -> ${resolved}`);
+      if (this.configuredPathHasLink(library)) {
+        this.configuredAliases.add(library);
+        this.log(`[Libraries] Library alias: ${library} -> ${resolved}`);
+      } else {
+        this.log(`[Libraries] Pinned library: ${resolved}`);
+      }
     }
     return resolved;
   }
@@ -190,7 +225,9 @@ export class PackageInventory {
         this.watchedTargets.delete(library);
         this.dirtyLibraries.add(library);
         this.schedule(250);
-        this.log(`[Libraries] Monitoring suspended: ${library} - a link appeared in the pinned library path; reconfigure the library to resume`);
+        this.log(current === root
+          ? `[Libraries] Monitoring suspended: ${root} - pinned library replaced by a symlink`
+          : `[Libraries] Monitoring suspended: ${root} - pinned library ancestor replaced by a symlink: ${current}`);
         return undefined;
       }
     }
@@ -238,7 +275,11 @@ export class PackageInventory {
       this.watchers.set(library, watcher);
       this.watchedTargets.set(library, target);
       this.dirtyLibraries.add(library);
-      this.log(`[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
+      const previouslyWatched = this.lastWatchedTargets.get(library);
+      this.lastWatchedTargets.set(library, target);
+      this.log(previouslyWatched && previouslyWatched !== target
+        ? `[Libraries] Pinned library replaced: ${root} - monitoring restored`
+        : `[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
     } catch (error) {
       this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
       const code = (error as NodeJS.ErrnoException).code;
@@ -318,6 +359,8 @@ export class PackageInventory {
     this.unconfirmedLibraries.clear();
     this.entryMonitor.dispose();
     this.roots.clear();
+    this.lastWatchedTargets.clear();
+    this.configuredAliases.clear();
     this.suspended.clear();
     this.unavailable.clear();
   }
