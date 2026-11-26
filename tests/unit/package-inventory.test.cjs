@@ -14,12 +14,14 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
   libraries.forEach(library => fs.mkdirSync(library));
   const changes = [], logs = [];
   const notifications = new Set();
-  const watches = [];
+  const watches = [], entryWatches = [];
   const Inventory = loadSource("src/Language/packageInventory.ts", { fs: {
     ...fs,
     ...overrides,
     watch: (file, options, callback) => {
-      watches.push({ file, options });
+      const record = { file, options, trigger: (event, filename) => callback(event, filename) };
+      if (options.encoding === "utf8") entryWatches.push(record);
+      else watches.push(record);
       return fs.watch(file, options, (...args) => {
         const timer = setTimeout(() => { notifications.delete(timer); callback(...args); }, notificationDelay);
         notifications.add(timer);
@@ -51,7 +53,7 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
   // each mutation before checking that its resulting work has settled.
   const waitForLog = message => settle(() => logs.some(line => line.includes(message)),
     `inventory must report: ${message}`);
-  return { root, libraries, inventory, changes, logs, install, settle, waitForLog, watches };
+  return { root, libraries, inventory, changes, logs, install, settle, waitForLog, watches, entryWatches };
 }
 
 /** Windows cannot rename a directory while fs.watch holds its handle.
@@ -60,6 +62,10 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
 function releaseWindowsWatcherHandles(watcher) {
   if (process.platform !== "win32") return;
   for (const { watcher: nativeWatcher } of watcher.directories.values()) nativeWatcher.close();
+}
+function releaseWindowsEntryWatcherHandles(inventory) {
+  if (process.platform !== "win32") return;
+  for (const { watcher } of inventory.entryMonitor.watches.values()) watcher.close();
 }
 
 test("inventory preserves effective copies across duplicate additions, removals and library order changes", async t => {
@@ -260,7 +266,7 @@ test("inventory detects same-version package replacement from folder events", as
 });
 
 test("an ordinary package replaced by an renv-style link is tracked without watching the target", async t => {
-  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
+  const { root, libraries: [library], inventory, changes, install, settle, logs } = fixture(t);
   const directory = install(library);
   const target = install(path.join(root, "cache"), "2.0");
   inventory.setLibraryPaths([library]);
@@ -269,6 +275,7 @@ test("an ordinary package replaced by an renv-style link is tracked without watc
   fs.symlinkSync(target, directory, process.platform === "win32" ? "junction" : "dir");
   await settle(() => changes.at(-1).packages.get("example")?.linked === true);
   assert.equal(changes.at(-1).packages.get("example").target, directory);
+  assert.ok(logs.some(line => line.includes("Linked installation observed: example") && line.includes(directory)));
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.deepEqual(changes.at(-1).unmonitored, []);
   fs.unlinkSync(directory);
@@ -413,16 +420,19 @@ test("a library scan failure keeps its changes pending for retry", async t => {
   assert.equal(inventory.retryTimer, undefined);
 });
 
-test("a watcher that could not be created recovers when its library becomes available", async t => {
-  const { libraries: [library], inventory, changes, install, settle } = fixture(t);
+test("a missing library is restored by a parent-entry event without retry polling", async t => {
+  const { libraries: [library], inventory, changes, install, settle, entryWatches, logs } = fixture(t);
   fs.rmdirSync(library);
   inventory.setLibraryPaths([library]);
   assert.equal(inventory.watchers.size, 0);
-  assert.ok(inventory.retryTimer);
-  install(library);
   await settle();
-  assert.ok(inventory.watchers.has(library));
-  assert.ok(changes.at(-1).packages.has("example"));
+  assert.equal(inventory.retryTimer, undefined, "a watched missing root waits for an event");
+  assert.ok(logs.some(line => line.includes("Waiting for pinned library recreation event:")));
+  install(library);
+  const entryWatch = entryWatches.find(watch => watch.file === path.dirname(library));
+  assert.ok(entryWatch);
+  entryWatch.trigger("rename", path.basename(library));
+  await settle(() => inventory.watchers.has(library) && changes.at(-1).packages.has("example"));
   assert.equal(inventory.retryTimer, undefined);
 });
 
@@ -497,7 +507,7 @@ test("directory timestamp touches do not rescan unchanged installed packages", a
 });
 
 test("configured library aliases remain pinned when their links are retargeted", async t => {
-  const { root, inventory, changes, install, settle, watches } = fixture(t);
+  const { root, inventory, changes, install, settle, watches, entryWatches, logs } = fixture(t);
   const first = path.join(root, "original-target"), second = path.join(root, "replacement-target");
   const library = path.join(root, "active-library");
   install(first);
@@ -507,11 +517,16 @@ test("configured library aliases remain pinned when their links are retargeted",
   inventory.setLibraryPaths([library]);
   await settle();
   assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.ok(logs.some(line => line.includes("Pinned configured library alias:") && line.includes(library)));
   const watcher = inventory.watchers.get(library), count = changes.length;
   assert.deepEqual(watches.map(watch => watch.file).sort(), [first, path.join(first, "example")].sort());
   assert.ok(watches.every(watch => watch.options.recursive === false));
   fs.unlinkSync(library);
   fs.symlinkSync(second, library, kind);
+  const aliasWatch = entryWatches.find(watch => watch.file === root);
+  assert.ok(aliasWatch, "configured alias parent is watched for retargeting");
+  aliasWatch.trigger("rename", path.basename(library));
+  assert.ok(logs.some(line => line.includes("Configured library alias changed:") && line.includes(library)));
   fs.rmSync(path.join(second, "example"), { recursive: true });
   install(second, "3.0");
   await new Promise(resolve => setTimeout(resolve, 600));
@@ -532,7 +547,7 @@ test("configured library aliases remain pinned when their links are retargeted",
 
 for (const replaceAncestor of [false, true]) {
   test(`a pinned library ${replaceAncestor ? "ancestor" : "root"} replaced by a link suspends monitoring`, async t => {
-    const { root, inventory, changes, install, settle, watches } = fixture(t);
+    const { root, inventory, changes, install, settle, watches, entryWatches, logs } = fixture(t);
     const parent = path.join(root, "configured"), library = path.join(parent, "library");
     const external = path.join(root, "external");
     install(library);
@@ -542,11 +557,16 @@ for (const replaceAncestor of [false, true]) {
     const watcher = inventory.watchers.get(library);
     const replaced = replaceAncestor ? parent : library;
     releaseWindowsWatcherHandles(watcher);
+    releaseWindowsEntryWatcherHandles(inventory);
     fs.renameSync(replaced, replaced + "-original");
     fs.symlinkSync(external, replaced, process.platform === "win32" ? "junction" : "dir");
-    // Platforms may report a rename differently; deliver the root event too.
-    watcher.emit("change", "rename", path.basename(library));
+    // Deliver the ancestor-entry event independently of the root watcher.
+    const parentWatch = entryWatches.find(watch => watch.file === path.dirname(replaced));
+    assert.ok(parentWatch, "pinned root parent entries must be monitored");
+    parentWatch.trigger("rename", path.basename(replaced));
     await settle(() => changes.at(-1).unmonitoredRoots.includes(library));
+    assert.ok(logs.some(line => line.includes("Pinned library path entry changed:")),
+      "root/ancestor replacement should be visible in lifecycle logs");
     assert.equal(changes.at(-1).packages.size, 1, "suspension retains verified metadata");
     assert.deepEqual(changes.at(-1).changed, []);
     assert.equal(changes.at(-1).unmonitored.length, 0);

@@ -1260,9 +1260,14 @@ library list. Watches, scans and published installation locations use that pinne
 root. Retargeting the configured alias leaves the pinned location unchanged. Removing
 and readding the configured path selects its current destination. A pinned root or
 ancestor subsequently replaced by a link suspends that library's monitoring; the
-new destination receives no automatic subscription or scan. Parent directories have
-no watch subscriptions. Root replacement recovery depends on notifications from the
-existing directory watch, with retries for unavailable ordinary roots.
+new destination receives no automatic subscription or scan. Shared non-recursive
+parent-entry watchers monitor canonical ancestors of the pinned library and
+ordinary ancestors of its configured alias. They detect directory replacement and
+alias retargeting through filesystem notifications without following the new target.
+The initial pinned physical root, configured alias, physical root/ancestor changes,
+and linked package entries are logged to the console lifecycle output. Ordinary
+package-directory events do not rebuild the package watcher set. No periodic
+filesystem polling is used; failed operations retain bounded recovery backoff.
 
 Scans inspect ordinary package directories directly inside each library. They read
 package names, versions, canonical library locations and package-directory timestamps,

@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { EventEmitter } from "events";
+import { LibraryPathEntryMonitor, type LibraryPathEntryChange } from "./libraryPathEntryMonitor";
 
 // A library may be on a slow network drive; bound watcher fanout per root.
 const MAX_PACKAGE_WATCHES_PER_LIBRARY = 128;
@@ -44,6 +45,7 @@ export class PackageInventory {
   private libraries: LibraryInventory[] = [];
   private packages = new Map<string, PackageInstallation>();
   private readonly watchers = new Map<string, PackageDirectoryWatcher>();
+  private readonly entryMonitor: LibraryPathEntryMonitor;
   // Resolve explicitly configured aliases once. Watch and scan that root for
   // the lifetime of this configuration; retargeting an alias grants no new root.
   private readonly roots = new Map<string, string>();
@@ -65,7 +67,36 @@ export class PackageInventory {
   constructor(
     private readonly onChange: (change: PackageInventoryChange) => Promise<void>,
     private readonly log: (message: string) => void,
-  ) {}
+  ) {
+    this.entryMonitor = new LibraryPathEntryMonitor(
+      change => this.onLibraryPathEntryChange(change), message => this.log(message));
+  }
+
+  private onLibraryPathEntryChange(change: LibraryPathEntryChange): void {
+    const library = change.library;
+    if (this.disposed || !this.paths.includes(library)) return;
+    if (change.kind === "alias") {
+      this.log(`[Libraries] Configured library alias changed: ${change.entry}; monitoring remains pinned to ${change.pinnedRoot}`);
+      return;
+    }
+    this.log(`[Libraries] Pinned library path entry changed: ${change.entry} (${change.state}); verifying ${change.pinnedRoot}`);
+    let current: string | undefined;
+    try { current = this.libraryTarget(library); }
+    catch { /* A missing ordinary root will be revisited on its parent entry's next event. */ }
+    if (this.suspended.has(library)) {
+      this.entryMonitor.remove(library);
+      this.dirtyLibraries.add(library);
+      this.schedule(250);
+      return;
+    }
+    if (current === this.watchedTargets.get(library)) return;
+    this.watchers.get(library)?.close();
+    this.watchers.delete(library);
+    this.watchedTargets.delete(library);
+    if (current !== undefined) this.watchLibrary(library, true);
+    this.dirtyLibraries.add(library);
+    this.schedule(250);
+  }
 
   setLibraryPaths(paths: string[]): void {
     if (this.disposed || JSON.stringify(paths) === JSON.stringify(this.paths)) return;
@@ -81,6 +112,7 @@ export class PackageInventory {
     }
     for (const library of this.roots.keys()) {
       if (!active.has(library)) {
+        this.entryMonitor.remove(library);
         this.roots.delete(library);
         this.suspended.delete(library);
         this.unavailable.delete(library);
@@ -96,6 +128,8 @@ export class PackageInventory {
     this.revision++;
     this.candidate = undefined;
     for (const library of paths) {
+      const root = this.rootFor(library);
+      if (!this.suspended.has(library)) this.entryMonitor.add(library, root);
       if (!this.watchers.has(library)) this.watchLibrary(library);
     }
     this.schedule(0);
@@ -130,6 +164,10 @@ export class PackageInventory {
       this.log(`[Libraries] Monitoring suspended: ${library} - unable to pin the configured root: ${String(error)}; reconfigure to resume`);
     }
     this.roots.set(library, resolved);
+    if (!this.suspended.has(library)) {
+      const kind = path.resolve(library) === resolved ? "physical library" : "configured library alias";
+      this.log(`[Libraries] Pinned ${kind}: ${library} -> ${resolved}`);
+    }
     return resolved;
   }
 
@@ -146,6 +184,7 @@ export class PackageInventory {
       stats = fs.lstatSync(current);
       if (stats.isSymbolicLink()) {
         this.suspended.add(library);
+        this.entryMonitor.remove(library);
         this.watchers.get(library)?.close();
         this.watchers.delete(library);
         this.watchedTargets.delete(library);
@@ -202,7 +241,12 @@ export class PackageInventory {
       this.log(`[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
     } catch (error) {
       this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
-      this.scheduleRetry();
+      const code = (error as NodeJS.ErrnoException).code;
+      if ((code === "ENOENT" || code === "ENOTDIR") && this.entryMonitor.hasPhysicalEntryWatch(library)) {
+        this.log(`[Libraries] Waiting for pinned library recreation event: ${this.rootFor(library)}`);
+      } else {
+        this.scheduleRetry();
+      }
     }
   }
 
@@ -272,6 +316,7 @@ export class PackageInventory {
     this.watchers.clear();
     this.watchedTargets.clear();
     this.unconfirmedLibraries.clear();
+    this.entryMonitor.dispose();
     this.roots.clear();
     this.suspended.clear();
     this.unavailable.clear();
@@ -474,7 +519,9 @@ export class PackageInventory {
         }
         this.unavailable.add(library);
         libraries.push(retained("unavailable"));
-        this.scheduleRetry();
+        const code = (error as NodeJS.ErrnoException).code;
+        if ((code !== "ENOENT" && code !== "ENOTDIR") ||
+            !this.entryMonitor.hasPhysicalEntryWatch(library)) this.scheduleRetry();
       }
     }
     if (this.disposed || revision !== this.revision) return;
@@ -567,6 +614,12 @@ export class PackageInventory {
         }
       }
       if (!changed.length) this.log("[Completion] Active package copies unchanged; language server retained");
+    }
+    for (const [name, item] of packages) {
+      const old = this.packages.get(name);
+      if (item.linked && (!old?.linked || old.identity !== item.identity)) {
+        this.log(`[Packages] Linked installation observed: ${name} - ${item.path} (external target not watched)`);
+      }
     }
     this.log("[Libraries] Search order:");
     libraries.forEach((library, index) => this.log(
@@ -693,7 +746,9 @@ class PackageDirectoryWatcher extends EventEmitter {
           if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) return;
           if (relative.split(path.sep).length > 2) return;
           this.emit("change", event, relative);
-          if (this.closed || this.timer) return;
+          // Package-directory events cannot change the set of immediate
+          // package watches. Only root directory events re-enumerate entries.
+          if (directory !== this.root || this.closed || this.timer) return;
           // Reconcile package directory watches after bursts of install events.
           // This timer is scheduled only by a filesystem notification.
           this.timer = setTimeout(() => {
