@@ -1062,7 +1062,7 @@ test("an unpinnable configured root fails closed until explicitly reconfigured",
   inventory.setLibraryPaths([]);
   await settle(() => changes.at(-1).libraries.length === 0);
   inventory.setLibraryPaths([library]);
-  await settle(() => changes.at(-1).libraries[0].suspended);
+  await settle(() => changes.at(-1)?.libraries.some(row => row.path === library && row.suspended) === true);
   assert.equal(resolutions, 2, "only explicit reconfiguration permits a new pin attempt");
 });
 
