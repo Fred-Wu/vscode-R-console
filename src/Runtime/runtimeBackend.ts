@@ -672,10 +672,9 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
         for (const event of parsed.events) {
           this.handleSessionControlEvent(state, event);
-          // Opaque configuration must never reach terminal UI or replay handlers.
-          if (event.type !== "lsp-startup-state" && event.type !== "lsp-startup-stored") {
-            state.handlers?.onControl?.(event);
-          }
+          // Private startup state is now confined to the OS-protected IPC
+          // endpoint. The backend parser rejects the retired TCP frame kinds.
+          state.handlers?.onControl?.(event);
         }
       });
 
