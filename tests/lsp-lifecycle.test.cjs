@@ -798,7 +798,7 @@ test("unrelated abandoned locks do not retain removed namespace metadata", { tim
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "installedExport"));
 });
 
-test("linked startup packages stay usable without monitoring their external cache", { timeout: 90000 }, async t => {
+test("linked startup packages remain tracked and usable without monitoring their external cache", { timeout: 90000 }, async t => {
   const { first, second: cache, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(cache, "originalExport");
   const target = path.join(cache, pkg);
@@ -808,11 +808,15 @@ test("linked startup packages stay usable without monitoring their external cach
   const { client, instances, complete, logs } = createClient({ env, libraries: [first] });
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
-  assert.ok(!client.packageInventory.packages.has(pkg));
+  assert.equal(client.packageInventory.packages.get(pkg)?.linked, true,
+    "linked package entries remain visible to lifecycle reconciliation");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 1, "excluding a loaded linked package must not restart the server");
+  assert.equal(instances.length, 1, "an unchanged loaded linked package must not restart the server");
   const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
-  assert.ok(request.params.unmonitored.includes(pkg));
+  assert.equal(request.params.installations[pkg], path.join(fs.realpathSync.native(first), pkg),
+    "the linked entry is anchored to the configured library's pinned real path");
+  assert.ok(!request.params.unmonitored.includes(pkg),
+    "a trusted project-library link entry is monitored without watching its target");
 
   logs.length = 0;
   install(cache, "replacementExport");

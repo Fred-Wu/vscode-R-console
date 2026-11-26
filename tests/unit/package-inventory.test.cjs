@@ -259,7 +259,7 @@ test("inventory detects same-version package replacement from folder events", as
   assert.ok(logs.some(line => line.includes("Updated: example 1.0 -> 1.0")));
 });
 
-test("a normal installation replaced by a link is excluded until a directory returns", async t => {
+test("an ordinary package replaced by an renv-style link is tracked without watching the target", async t => {
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
   const directory = install(library);
   const target = install(path.join(root, "cache"), "2.0");
@@ -267,9 +267,10 @@ test("a normal installation replaced by a link is excluded until a directory ret
   await settle();
   fs.rmSync(directory, { recursive: true });
   fs.symlinkSync(target, directory, process.platform === "win32" ? "junction" : "dir");
-  await settle(() => changes.at(-1).unmonitored.includes("example"));
-  assert.equal(changes.at(-1).packages.size, 0);
-  assert.deepEqual(changes.at(-1).changed, [], "a skipped link is not a reported package removal");
+  await settle(() => changes.at(-1).packages.get("example")?.linked === true);
+  assert.equal(changes.at(-1).packages.get("example").target, directory);
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
   fs.unlinkSync(directory);
   install(library, "3.0");
   await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
@@ -308,15 +309,16 @@ test("inventory stops scanning after events settle and coalesces concurrent scan
   assert.equal(changes.length, count + 1);
 });
 
-test("an excluded higher-priority link does not select a lower-priority installation", async t => {
+test("a tracked higher-priority link selects its own entry rather than a lower-priority package", async t => {
   const { root, libraries: [first, second], inventory, changes, install, settle } = fixture(t);
   const target = install(path.join(root, "cache"));
   const fallback = install(second, "2.0");
   fs.symlinkSync(target, path.join(first, "example"), process.platform === "win32" ? "junction" : "dir");
   inventory.setLibraryPaths([first, second]);
   await settle();
-  assert.equal(changes.at(-1).packages.size, 0);
-  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  assert.equal(changes.at(-1).packages.get("example").linked, true);
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
+  assert.deepEqual(changes.at(-1).unmonitored, []);
   assert.equal(changes.at(-1).libraries[1].packages.get("example").path, fallback);
   inventory.setLibraryPaths([second, first]);
   await settle(() => changes.at(-1).packages.get("example")?.path === fallback);
@@ -401,7 +403,8 @@ test("a library scan failure keeps its changes pending for retry", async t => {
   inventory.dirtyLibraries.add(library);
   await inventory.refresh();
   assert.ok(failed, "the first scan must exercise the injected read failure");
-  assert.ok(logs.some(line => line.includes("Could not refresh package inventory: Error: Temporary read failure")));
+  assert.ok(logs.some(line => line.includes("Monitoring temporarily unavailable:") &&
+    line.includes("Temporary read failure")), "read errors retain the last verified inventory");
   assert.ok(logs.includes("[Libraries] Recovery retry scheduled in 1s"),
     "a failed scan must schedule recovery without losing the changed library");
   await settle();
@@ -544,9 +547,9 @@ for (const replaceAncestor of [false, true]) {
     // Platforms may report a rename differently; deliver the root event too.
     watcher.emit("change", "rename", path.basename(library));
     await settle(() => changes.at(-1).unmonitoredRoots.includes(library));
-    assert.equal(changes.at(-1).packages.size, 0);
+    assert.equal(changes.at(-1).packages.size, 1, "suspension retains verified metadata");
     assert.deepEqual(changes.at(-1).changed, []);
-    assert.ok(changes.at(-1).unmonitored.includes("example"));
+    assert.equal(changes.at(-1).unmonitored.length, 0);
     assert.equal(inventory.watchers.size, 0);
     assert.equal(inventory.retryTimer, undefined, "a changed link is not retried automatically");
     assert.equal(watches.length, 2, "no watch is opened on the replacement target");
@@ -676,7 +679,7 @@ test("package locks preserve only their own installation, including on initial d
   await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
 });
 
-test("linked packages are neither resolved, read, watched nor polled", async t => {
+test("linked package entries are tracked without resolving, reading, watching or polling targets", async t => {
   const accesses = [];
   let library;
   const promises = { ...fs.promises };
@@ -700,8 +703,10 @@ test("linked packages are neither resolved, read, watched nor polled", async t =
   fs.symlinkSync(path.join(library, "cycle"), path.join(library, "cycle"), kind);
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.size, 0);
-  assert.deepEqual([...changes.at(-1).unmonitored].sort(), ["cycle", "example", "missing"]);
+  assert.deepEqual([...changes.at(-1).packages.keys()].sort(), ["cycle", "example", "missing"]);
+  assert.ok([...changes.at(-1).packages.values()].every(item => item.linked),
+    "even dangling or cyclic symlinks are only identified as directory entries");
+  assert.deepEqual(changes.at(-1).unmonitored, []);
   const count = changes.length;
   fs.rmSync(target, { recursive: true });
   install(cache, "2.0");
@@ -750,7 +755,7 @@ for (const component of ["Meta", "Meta/package.rds", "DESCRIPTION"]) {
   });
 }
 
-test("a package changed to a link after directory enumeration is skipped", async t => {
+test("a package changed to a link after enumeration is recorded without following it", async t => {
   let link, target, swapped = false;
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
     promises: { ...fs.promises, readdir: async (file, ...args) => {
@@ -767,8 +772,9 @@ test("a package changed to a link after directory enumeration is skipped", async
   target = install(path.join(root, "cache"), "2.0");
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.size, 0);
-  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  assert.equal(changes.at(-1).packages.get("example").linked, true);
+  assert.equal(changes.at(-1).packages.get("example").target, link);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
 });
 
 test("linked installation locks do not defer ordinary package updates", async t => {
@@ -937,4 +943,147 @@ test("an interrupted scan cannot resolve a removed configured alias again", asyn
   release();
   await settle(() => changes.at(-1)?.libraries.length === 0);
   assert.deepEqual(resolutions, [alias], "the stale scan cannot follow the retargeted alias");
+});
+
+test("renv-style link creation, retargeting and removal update only the pinned library", async t => {
+  const { root, libraries: [library], inventory, changes, install, settle, watches } = fixture(t);
+  const cache1 = install(path.join(root, "cache-one"));
+  const cache2 = install(path.join(root, "cache-two"), "2.0");
+  const link = path.join(library, "example");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  inventory.setLibraryPaths([library]);
+  await settle();
+  fs.symlinkSync(cache1, link, kind);
+  // Exercise the same root notification path on every OS without relying on
+  // the scheduler delivering a native fs.watch event during this assertion.
+  inventory.watchers.get(library).emit("change", "rename", "example");
+  await settle(() => changes.at(-1).packages.get("example")?.linked === true);
+  const first = changes.at(-1).packages.get("example");
+  assert.equal(first.path, link);
+  assert.equal(first.target, link, "linked entries record their path, not the cache target");
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.deepEqual(watches.map(item => item.file), [library], "do not create package-target watchers");
+
+  fs.unlinkSync(link);
+  fs.symlinkSync(cache2, link, kind);
+  // Exercise the same root notification path on every OS without relying on
+  // the scheduler delivering a native fs.watch event during this assertion.
+  inventory.watchers.get(library).emit("change", "rename", "example");
+  await settle(() => changes.at(-1).packages.get("example")?.identity !== first.identity);
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  const count = changes.length;
+  fs.writeFileSync(path.join(cache2, "DESCRIPTION"), "Package: example\nVersion: 3.0\n");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(changes.length, count, "external cache content changes do not expand monitoring");
+
+  fs.unlinkSync(link);
+  // Exercise the same root notification path on every OS without relying on
+  // the scheduler delivering a native fs.watch event during this assertion.
+  inventory.watchers.get(library).emit("change", "rename", "example");
+  await settle(() => !changes.at(-1).packages.has("example"));
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.deepEqual(watches.map(item => item.file), [library]);
+});
+
+test("temporary network library failures preserve verified package state until recovery", async t => {
+  let unavailable = false, library;
+  const promises = { ...fs.promises, readdir: async (file, ...args) => {
+    if (unavailable && file === library) {
+      throw Object.assign(new Error("network share unavailable"), { code: "EIO" });
+    }
+    return fs.promises.readdir(file, ...args);
+  } };
+  const fixtureData = fixture(t, 0, { promises });
+  ({ libraries: [library] } = fixtureData);
+  const { inventory, changes, logs, install, settle } = fixtureData;
+  install(library);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  unavailable = true;
+  inventory.dirtyLibraries.add(library);
+  await inventory.refresh();
+  const deadline = Date.now() + 5000;
+  while (!changes.at(-1).libraries[0].unavailable) {
+    assert.ok(Date.now() < deadline, "offline status must be reported");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.deepEqual(changes.at(-1).changed, [], "temporary disconnect does not remove installed packages");
+  assert.ok(changes.at(-1).unmonitoredRoots.includes(library));
+  assert.ok(logs.some(line => line.includes("Monitoring temporarily unavailable:") &&
+    line.includes("network share unavailable")));
+
+  unavailable = false;
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "2.0");
+  inventory.dirtyLibraries.add(library);
+  await inventory.refresh();
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.ok(logs.some(line => line.includes("Monitoring restored:")));
+});
+
+test("ordinary package watcher fanout remains bounded without recursive or external watching", async t => {
+  const { libraries: [library], inventory, changes, logs, install, settle, watches } = fixture(t);
+  for (let i = 0; i < 134; i++) install(library, "1.0", "pkg" + i);
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(changes.at(-1).packages.size, 134, "monitoring limits must not hide installed packages");
+  assert.ok(watches.length <= 129, "one library watch plus at most 128 shallow package watches");
+  assert.ok(watches.every(({ file, options }) =>
+    (file === library || path.dirname(file) === library) && options.recursive === false));
+  assert.ok(logs.some(line => line.includes("Limited package monitoring:") &&
+    line.includes("package watcher budget")));
+});
+
+test("an unpinnable configured root fails closed until explicitly reconfigured", async t => {
+  let library, resolutions = 0;
+  const realpathSync = Object.assign((...args) => fs.realpathSync(...args), {
+    native: (file, ...args) => {
+      if (file === library) {
+        resolutions++;
+        throw Object.assign(new Error("untrusted root unavailable"), { code: "EACCES" });
+      }
+      return fs.realpathSync.native(file, ...args);
+    },
+  });
+  const context = fixture(t, 0, { realpathSync });
+  ({ libraries: [library] } = context);
+  const { inventory, changes, logs, settle, watches } = context;
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(changes.at(-1).libraries[0].suspended);
+  assert.equal(resolutions, 1);
+  assert.deepEqual(watches, [], "an unpinnable root must never be watched");
+  assert.ok(logs.some(line => line.includes("unable to pin the configured root")));
+  await inventory.refresh();
+  assert.equal(resolutions, 1, "refresh cannot re-resolve an untrusted configured alias");
+
+  inventory.setLibraryPaths([]);
+  await settle(() => changes.at(-1).libraries.length === 0);
+  inventory.setLibraryPaths([library]);
+  await settle(() => changes.at(-1).libraries[0].suspended);
+  assert.equal(resolutions, 2, "only explicit reconfiguration permits a new pin attempt");
+});
+
+test("oversized configured libraries are suspended without recurrent network scans", async t => {
+  let library, listings = 0;
+  const oversized = Array.from({ length: 4097 }, (_, i) => ({
+    name: "pkg" + i, isDirectory: () => true, isSymbolicLink: () => false,
+  }));
+  const promises = { ...fs.promises, readdir: async (file, ...args) => {
+    if (file === library) { listings++; return oversized; }
+    return fs.promises.readdir(file, ...args);
+  } };
+  const f = fixture(t, 0, { promises });
+  ({ libraries: [library] } = f);
+  const { inventory, changes, logs, settle } = f;
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(changes.at(-1).libraries[0].suspended);
+  assert.equal(inventory.watchers.size, 0, "all watchers close on a too-broad root");
+  assert.equal(inventory.retryTimer, undefined, "do not repeatedly enumerate large network roots");
+  assert.ok(logs.some(line => line.includes("exceeds 4096 entries")));
+  await inventory.refresh();
+  assert.equal(listings, 1, "suspended roots are not rescanned before reconfiguration");
 });

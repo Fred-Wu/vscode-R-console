@@ -1092,7 +1092,7 @@ test("real embedded R completion inspects nested storage without running user co
 });
 
 
-test("static routing preserves search-path identity, opaque callables and stored factory signatures", { timeout: 60000 }, async (t) => {
+test("static routing preserves search-path identity, opaque callables and stored factory signatures", { timeout: 120000 }, async (t) => {
   const root = path.resolve(__dirname, "..");
   const vscode = { Position: class {
     constructor(line, character) {
@@ -1190,7 +1190,8 @@ test("static routing preserves search-path identity, opaque callables and stored
   // completion request's 10-second budget on slower macOS runners.
   await client.start();
   const expectPackageMember = async (input, expected) => {
-    const deadline = Date.now() + 20_000;
+    // Allow a fresh request after the full 20-second provider deadline.
+    const deadline = Date.now() + 55_000;
     while (true) {
       const entries = await complete(input);
       if (entries.some(entry => entry.insert === expected)) return;
