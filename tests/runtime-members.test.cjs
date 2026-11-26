@@ -1185,13 +1185,28 @@ test("static routing preserves search-path identity, opaque callables and stored
     } });
     return entries.filter((x) => "insertText" in x).map((x) => ({ label: x.label, insert: x.insertText }));
   };
+  // Routing is under test here, not the separate R language server's cold
+  // start. Startup and native package indexing can exceed a single static
+  // completion request's 10-second budget on slower macOS runners.
+  await client.start();
+  const expectPackageMember = async (input, expected) => {
+    const deadline = Date.now() + 20_000;
+    while (true) {
+      const entries = await complete(input);
+      if (entries.some(entry => entry.insert === expected)) return;
+      if (failure) throw failure;
+      assert.ok(Date.now() < deadline,
+        `Expected package member ${expected} for ${input}; got ${JSON.stringify(entries)}`);
+      await delay(100, undefined, { signal: t.signal });
+    }
+  };
   await submit("review_hits <- 0L");
   assert.equal(backend.hasCapability(session, 'member-inspection-search-path'), true);
   assert.deepEqual(await inspect('iris', '$'), { status: 'package' }, 'lazy package datasets remain unforced');
   assert.deepEqual(await inspect('data.frame', 'source'), { status: 'package' });
-  assert.ok((await complete('iris$')).some(x => x.insert === 'Sepal.Length'));
+  await expectPackageMember('iris$', 'Sepal.Length');
   assert.deepEqual(await inspect('iris', 'binding'), { status: 'package' });
-  assert.ok((await complete('iris[1,,drop=FALSE]$')).some(x => x.insert === 'Sepal.Length'));
+  await expectPackageMember('iris[1,,drop=FALSE]$', 'Sepal.Length');
   assert.deepEqual((await complete('data.frame(fake=1)$')).map(x => x.insert), ['fake']);
   for (const name of ['review_attached', 'package:datasets']) {
     // Even a spoofed package name cannot authorize a namespace's different object.

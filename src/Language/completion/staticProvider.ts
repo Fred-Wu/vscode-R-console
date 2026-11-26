@@ -2,6 +2,9 @@ import type { CompletionProvider, StaticBindingQuery, StaticBindingResult, Stati
 import { isTransientCompletionFailure } from "./diagnostics";
 
 /** Keep hung providers and obsolete requests out of presentation and follow-up lookups. */
+// Shared across macOS, Linux and Windows. Covers cold provider startup as well
+// as the completion request; aborted requests still settle immediately.
+export const STATIC_COMPLETION_REQUEST_TIMEOUT_MS = 20_000;
 export async function requestStaticCompletion(
   provider: CompletionProvider, request: StaticCompletionRequest
 ): Promise<StaticCompletionResult> {
@@ -34,7 +37,7 @@ export async function requestStaticCompletion(
         ? { ...result, status: "pending" } : result);
     };
     const cancel = () => finish(pending);
-    const timer = setTimeout(() => finish({ status: "pending", reason: "analysis-limit" }), 10000);
+    const timer = setTimeout(() => finish({ status: "pending", reason: "analysis-limit" }), STATIC_COMPLETION_REQUEST_TIMEOUT_MS);
     request.bindings.signal?.addEventListener("abort", cancel, { once: true });
     if (!current()) return finish(pending);
     void Promise.resolve().then(() => finished || !current() ? pending : provider.provideStaticCompletion
