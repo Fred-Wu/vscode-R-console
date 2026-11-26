@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as net from "net";
 import { randomBytes } from "crypto";
 import { authenticateLspSocket } from "./lspSocketAuth";
-import { decodeStartupState, readStartupAcknowledgement, writeStartupState, type LspStartupStateStore } from "./lspStartupState";
+import { readPrivateStartupState, readStartupAcknowledgement, writeStartupState, type LspStartupStateStore } from "./lspStartupState";
 import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 import * as os from "os";
 import * as path from "path";
@@ -930,12 +930,17 @@ export class ConsoleLspClient implements CompletionProvider {
       },
     };
 
+    // The first server sends its startup state through its own stdout pipe.
+    // Neither the JSON-RPC TCP connection nor the persistent backend TCP
+    // connection ever carries credential-bearing startup state.
+    const captureToken = this.startupState ? undefined : randomBytes(16).toString("hex");
+    if (captureToken) env.VSCR_LSP_CAPTURE_TOKEN = captureToken;
     const client = new ConsoleLanguageClient(
       `r-console-${this.options.consoleId}`,
       "R Console",
       useStdio
-        ? () => this.createStdioTransport(args, env)
-        : () => this.createSocketTransport(args, env),
+        ? () => this.createStdioTransport(args, env, captureToken)
+        : () => this.createSocketTransport(args, env, captureToken),
       clientOptions
     );
     this.client = client;
@@ -943,12 +948,7 @@ export class ConsoleLspClient implements CompletionProvider {
     this.sessionStateSyncPromise = undefined;
     await client.start();
     if (!this.startupState) {
-      const state = decodeStartupState(await client.sendRequest<unknown>("rConsole/takeStartupState", {}));
-      if (this.disposed || this.client !== client) {
-        state.fill(0);
-        throw new Error("Language server changed during startup state transfer");
-      }
-      this.startupState = state;
+      throw new Error("Language server did not deliver its startup state through the private child pipe");
     }
     if (this.startupStore && !this.startupStateSaved) {
       await this.startupStore.save(this.startupState);
@@ -966,7 +966,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  private createStdioTransport(args: string[], env: NodeJS.ProcessEnv): Promise<StreamInfo> {
+  private createStdioTransport(args: string[], env: NodeJS.ProcessEnv, captureToken?: string): Promise<StreamInfo> {
     return new Promise<StreamInfo>((resolve, reject) => {
       let settled = false;
       let child: ChildProcess;
@@ -1013,6 +1013,20 @@ export class ConsoleLspClient implements CompletionProvider {
           }
           return;
         }
+        if (captureToken) {
+          void readPrivateStartupState(child.stdout, captureToken).then(state => {
+            if (settled || this.disposed || this.spawnedServer !== child) {
+              state.fill(0);
+              return;
+            }
+            this.startupState = state;
+            settled = true;
+            resolve({ reader: child.stdout!, writer: child.stdin! });
+          }, error => {
+            if (!settled) { settled = true; reject(error); }
+          });
+          return;
+        }
         settled = true;
         resolve({ reader: child.stdout, writer: child.stdin });
       });
@@ -1047,12 +1061,13 @@ export class ConsoleLspClient implements CompletionProvider {
     });
   }
 
-  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<MessageTransports> {
+  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv, captureToken?: string): Promise<MessageTransports> {
     return new Promise<MessageTransports>((resolve, reject) => {
       let settled = false;
       const authToken = randomBytes(32).toString("hex");
       const clientNonce = randomBytes(32).toString("hex");
       let pendingAuth = 0;
+      let captured: Promise<void> = Promise.resolve();
       const server = net.createServer((socket) => {
         if (settled || pendingAuth >= 8) {
           socket.destroy();
@@ -1065,21 +1080,24 @@ export class ConsoleLspClient implements CompletionProvider {
             socket.destroy();
             return;
           }
-          settled = true;
-          if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
           const child = this.spawnedServer;
-          socket.on("error", (error) => this.logServerError(error, child));
-          server.close();
-          // Authentication leaves the socket paused, possibly with early LSP
-          // bytes buffered. Resume only after JSON-RPC installs its reader.
-          const reader = new class extends StreamMessageReader {
-            override listen(callback: DataCallback): vscode.Disposable {
-              const subscription = super.listen(callback);
-              socket.resume();
-              return subscription;
-            }
-          }(socket);
-          resolve({ reader, writer: new StreamMessageWriter(socket) });
+          // Do not create a usable TCP LSP client until its initial state was
+          // read from the child pipe. Authentication alone is not encryption.
+          void captured.then(() => {
+            if (settled) { socket.destroy(); return; }
+            settled = true;
+            if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
+            socket.on("error", (error) => this.logServerError(error, child));
+            server.close();
+            const reader = new class extends StreamMessageReader {
+              override listen(callback: DataCallback): vscode.Disposable {
+                const subscription = super.listen(callback);
+                socket.resume();
+                return subscription;
+              }
+            }(socket);
+            resolve({ reader, writer: new StreamMessageWriter(socket) });
+          }, error => { socket.destroy(); rejectOnce(error); });
         });
       });
       const rejectOnce = (error: Error): void => {
@@ -1127,7 +1145,7 @@ export class ConsoleLspClient implements CompletionProvider {
           child = spawn(this.options.rPath, args, {
             cwd: this.options.cwd ?? this.workingDirectory,
             env,
-            stdio: [this.startupState ? "pipe" : "ignore", "ignore", "pipe"],
+            stdio: [this.startupState ? "pipe" : "ignore", captureToken ? "pipe" : "ignore", "pipe"],
             shell: false,
           });
         } catch (error) {
@@ -1136,9 +1154,22 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         this.spawnedServer = child;
         this.forwardServerStderr(child);
+        // Drain and validate the private stdout capture before resolving TCP
+        // transport creation; the socket is reserved for ordinary LSP only.
+        captured = captureToken && child.stdout
+          ? readPrivateStartupState(child.stdout, captureToken).then(state => {
+            if (settled || this.disposed || this.spawnedServer !== child) {
+              state.fill(0);
+              throw new Error("Language server changed during private startup capture");
+            }
+            this.startupState = state;
+          })
+          : Promise.resolve();
+        // Observe failures immediately; server setup may still be in progress.
+        void captured.catch(error => rejectOnce(error));
         child.once("spawn", () => {
           this.logServerStarted();
-          if (this.startupState) {
+          if (this.startupState && !captureToken) {
             try {
               writeStartupState(child, this.startupState, rejectOnce);
               child.stdin!.end();

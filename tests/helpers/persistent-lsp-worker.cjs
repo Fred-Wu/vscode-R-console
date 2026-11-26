@@ -8,12 +8,13 @@ process.once("message", async ({ runtime, cwd, profile, sidecar }) => {
   const backend = new RustSidecarRuntimeBackend(sidecar);
   const session = backend.reconnect(runtime);
   const controls = [];
+  let captures = 0;
   backend.attach(session, { onControl: event => controls.push(event.type) });
   const { client, complete, instances, logs } = createConsoleLsp({ after() {} }, {
     cwd, args: [], env: { ...process.env, R_PROFILE_USER: profile },
     getStartupStateStore: async () => ({
       load: () => backend.loadLspStartupState(session),
-      save: state => backend.saveLspStartupState(session, state),
+      save: state => { captures++; return backend.saveLspStartupState(session, state); },
     }),
   });
   const stop = async () => {
@@ -28,7 +29,7 @@ process.once("message", async ({ runtime, cwd, profile, sidecar }) => {
       runtimePid: backend.getPid(session), count: items.length,
       captured: client.startupState.includes(Buffer.from("synthetic-persistent-profile-secret")),
       libraries: await client.client.sendRequest("rConsole/libraryPaths", {}),
-      captures: instances[0].requests.filter(item => item.method === "rConsole/takeStartupState").length,
+      captures,
       leaked: controls.some(type => type.startsWith("lsp-startup-")) || logs.some(line => line.includes("synthetic-persistent-profile-secret")),
     });
     process.once("message", async () => { await stop(); process.exit(0); });

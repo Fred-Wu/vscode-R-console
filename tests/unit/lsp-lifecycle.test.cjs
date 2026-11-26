@@ -10,6 +10,7 @@ class Position {
 function createClient(t, { reply, completion, packageChanges, librarySync, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, getStartupStateStore } = {}) {
   const instances = [];
   const logs = [];
+  let owningClient, captures = 0;
   class LanguageClient {
     constructor() {
       this.running = false;
@@ -26,7 +27,15 @@ function createClient(t, { reply, completion, packageChanges, librarySync, start
       instances.push(this);
     }
     isRunning() { return this.running; }
-    async start() { await start?.(this); this.running = true; }
+    async start() {
+      await start?.(this);
+      this.running = true;
+      // Mock the native first-child stdout capture, not an LSP request.
+      if (!owningClient.startupState) {
+        owningClient.startupState = Buffer.from("opaque R state");
+        captures++;
+      }
+    }
     async stop() { this.running = false; await stop?.(this); }
     async dispose() { this.running = false; }
     async sendNotification(method, params) {
@@ -37,7 +46,7 @@ function createClient(t, { reply, completion, packageChanges, librarySync, start
     async sendRequest(method, params, token) {
       if (!this.running) throw new Error("Client is not running");
       this.requests.push({ method, params });
-      if (method === "rConsole/takeStartupState") return Buffer.from("opaque R state").toString("base64");
+      assert.notEqual(method, "rConsole/takeStartupState", "startup credentials never travel over LSP");
       if (method === "rConsole/syncSessionState") return await reply?.(this, params) ?? { libraryPaths: libraries };
       if (method === "rConsole/libraryPaths") return libraries;
       if (method === "rConsole/syncLibraryPaths") return await librarySync?.(this, params) ?? { changed: false };
@@ -76,9 +85,10 @@ function createClient(t, { reply, completion, packageChanges, librarySync, start
     requestRuntimeFunctionArguments,
     getStartupStateStore,
   });
+  owningClient = client;
   client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
-  return { client, instances, logs };
+  return { client, instances, logs, captures: () => captures };
 }
 
 function change() {
@@ -103,7 +113,7 @@ test("persistent state is retrieved before launching R and never recaptured on r
 
 test("initial startup waits for storage acknowledgement and retries failed saves without rereading profiles", async t => {
   let saves = 0;
-  const { client, instances } = createClient(t, { getStartupStateStore: async () => ({
+  const { client, captures } = createClient(t, { getStartupStateStore: async () => ({
     load: async () => undefined,
     save: async () => { if (++saves === 1) throw new Error("storage interrupted"); },
   }) });
@@ -112,8 +122,7 @@ test("initial startup waits for storage acknowledgement and retries failed saves
   await client.start();
   assert.equal(client.startupStateSaved, true);
   assert.equal(saves, 2);
-  assert.equal(instances.flatMap(instance => instance.requests)
-    .filter(request => request.method === "rConsole/takeStartupState").length, 1);
+  assert.equal(captures(), 1, "private child stdout is captured only once");
 });
 
 test("failed persistent-state retrieval cannot fall back to running profiles", async t => {
@@ -1012,14 +1021,13 @@ test("failed library synchronization retries automatically and disposal cancels 
 });
 
 test("startup state is retained across replacement and cleared on disposal", async t => {
-  const { client, instances } = createClient(t);
+  const { client, instances, captures } = createClient(t);
   await client.start();
   const state = client.startupState;
   assert.ok(Buffer.isBuffer(state));
   await client.restartClient(instances[0], "test restart");
   assert.equal(client.startupState, state);
-  assert.equal(instances.flatMap(item => item.requests)
-    .filter(item => item.method === "rConsole/takeStartupState").length, 1);
+  assert.equal(captures(), 1, "replacement never recaptures startup state");
   await client.dispose();
   assert.equal(client.startupState, undefined);
   assert.ok(state.every(byte => byte === 0), "release the retained sensitive buffer");

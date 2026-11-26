@@ -58,10 +58,6 @@ const FRAME_SESSION_STATE: u16 = 20;
 const FRAME_LIBRARY_PATHS: u16 = 21;
 const FRAME_MEMBER_NAMES_REQUEST: u16 = 25;
 const FRAME_MEMBER_NAMES_RESULT: u16 = 26;
-const FRAME_LSP_STARTUP_GET: u16 = 27;
-const FRAME_LSP_STARTUP_PUT: u16 = 28;
-const FRAME_LSP_STARTUP_STATE: u16 = 29;
-const FRAME_LSP_STARTUP_STORED: u16 = 30;
 const MAX_BUFFERED_FRAMES: usize = 4096;
 const MAX_BUFFERED_BYTES: usize = 1_000_000;
 // Use the same streaming granularity for R callbacks and captured native IO.
@@ -89,8 +85,6 @@ pub(crate) enum IncomingCommand {
     DialogResult(DialogResult),
     ParseStatus { request_id: u32, code: String },
     MemberNames { request_id: u32, query: crate::member_inspection::MemberQuery },
-    LspStartupGet { request_id: u32 },
-    LspStartupPut { request_id: u32, state: StartupState },
     Interrupt,
     SetWidth { columns: u16 },
     Shutdown,
@@ -98,6 +92,12 @@ pub(crate) enum IncomingCommand {
 
 // Opaque R serialization. Only the owning language server interprets these bytes.
 pub(crate) struct StartupState(Vec<u8>);
+
+impl StartupState {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self { Self(bytes) }
+    pub(crate) fn as_bytes(&self) -> &[u8] { &self.0 }
+}
+
 
 impl std::fmt::Debug for StartupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -354,31 +354,22 @@ impl OutputSink {
         if let Ok(mut state) = self.output_state.lock() { state.startup_state = None; }
     }
 
-    /// Replies stay on the requesting authenticated attachment and never enter
-    /// the output backlog. Both admission and writing share the attachment lock.
-    pub(crate) fn handle_startup_state(&self, client_id: usize, command: IncomingCommand) -> io::Result<()> {
-        let mut state = self.output_state.lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "startup state lock poisoned"))?;
-        if state.client_id != client_id || state.writer.is_none() { return Ok(()); }
-        let OutputChannelState { writer, startup_state, .. } = &mut *state;
-        let writer = writer.as_mut().expect("attached writer");
-        let result = match command {
-            IncomingCommand::LspStartupGet { request_id } => {
-                write_private_frame(writer, FRAME_LSP_STARTUP_STATE, request_id,
-                    startup_state.as_ref().map_or(&[], |value| value.0.as_slice()))
-            }
-            IncomingCommand::LspStartupPut { request_id, state: incoming } => {
-                let accepted = match startup_state {
-                    Some(existing) => existing.0 == incoming.0,
-                    None => { *startup_state = Some(incoming); true }
-                };
-                write_private_frame(writer, FRAME_LSP_STARTUP_STORED, request_id,
-                    &[if accepted { 0 } else { 1 }])
-            }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid startup state operation")),
-        };
-        if result.is_err() { state.writer = None; }
-        result
+    // Only the OS-protected local key-broker endpoint may access this state.
+    // No startup bytes or acknowledgements are sent through the TCP protocol.
+    pub(crate) fn private_startup_get(&self) -> Option<StartupState> {
+        self.output_state.lock().ok().and_then(|state|
+            state.startup_state.as_ref().map(|value| StartupState::new(value.as_bytes().to_vec())))
+    }
+
+    pub(crate) fn private_startup_put(&self, incoming: StartupState) -> bool {
+        let Ok(mut state) = self.output_state.lock() else { return false };
+        if incoming.as_bytes().is_empty() || incoming.as_bytes().len() > MAX_INPUT_FRAME_BYTES - 32 {
+            return false;
+        }
+        match state.startup_state.as_ref() {
+            Some(existing) => existing.as_bytes() == incoming.as_bytes(),
+            None => { state.startup_state = Some(incoming); true }
+        }
     }
 
     pub(crate) fn detach_client(&self) {
@@ -442,16 +433,6 @@ impl OutputSink {
         queue_backlog_frame(&mut output_state, frame);
         Ok(())
     }
-}
-
-fn write_private_frame(writer: &mut dyn Write, kind: u16, request_id: u32, payload: &[u8]) -> io::Result<()> {
-    let mut header = [0_u8; FRAME_HEADER_LEN];
-    header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    header[4..6].copy_from_slice(&kind.to_le_bytes());
-    header[8..12].copy_from_slice(&request_id.to_le_bytes());
-    writer.write_all(&header)?;
-    writer.write_all(payload)?;
-    writer.flush()
 }
 
 fn queue_backlog_frame(output_state: &mut OutputChannelState, frame: Vec<u8>) {
@@ -857,10 +838,6 @@ pub(crate) fn read_next_command<R: Read>(reader: &mut R) -> io::Result<Option<In
     }
 
     let command = match kind {
-        FRAME_LSP_STARTUP_GET if payload == 1_u32.to_le_bytes() =>
-            IncomingCommand::LspStartupGet { request_id },
-        FRAME_LSP_STARTUP_PUT if !payload.is_empty() =>
-            IncomingCommand::LspStartupPut { request_id, state: StartupState(payload) },
         FRAME_SUBMIT => IncomingCommand::Submit(String::from_utf8_lossy(&payload).into_owned()),
         FRAME_REPLY_INPUT => {
             IncomingCommand::ReplyInput(String::from_utf8_lossy(&payload).into_owned())
@@ -1013,77 +990,33 @@ mod tests {
     }
 
     #[test]
-    fn startup_snapshot_is_write_once_private_and_retained_across_attachments() {
+    fn startup_snapshot_is_write_once_in_private_ipc_and_never_enters_replay() {
         let sink = OutputSink::new_with_capabilities("test", &[]);
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        sink.attach_client(CapturedOutput(Arc::clone(&captured)), 1);
-        sink.handle_startup_state(1, IncomingCommand::LspStartupGet { request_id: 1 }).unwrap();
-        assert_eq!(captured.lock().unwrap().len(), FRAME_HEADER_LEN);
         let secret = b"synthetic-sensitive-state";
-        for value in [secret.as_slice(), secret.as_slice(), b"conflicting-state"] {
-            captured.lock().unwrap().clear();
-            sink.handle_startup_state(1, IncomingCommand::LspStartupPut {
-                request_id: 2, state: StartupState(value.to_vec()),
-            }).unwrap();
-            assert_eq!(captured.lock().unwrap()[FRAME_HEADER_LEN], if value == secret { 0 } else { 1 });
-        }
-        sink.detach_client();
-        captured.lock().unwrap().clear();
-        sink.handle_startup_state(1, IncomingCommand::LspStartupGet { request_id: 3 }).unwrap();
+        assert!(sink.private_startup_get().is_none());
+        assert!(sink.private_startup_put(StartupState::new(secret.to_vec())));
+        assert!(sink.private_startup_put(StartupState::new(secret.to_vec())));
+        assert!(!sink.private_startup_put(StartupState::new(b"conflicting-state".to_vec())));
+        assert_eq!(sink.private_startup_get().unwrap().as_bytes(), secret);
         assert!(sink.output_state.lock().unwrap().backlog.is_empty());
-        sink.attach_client(CapturedOutput(Arc::clone(&captured)), 2);
-        sink.handle_startup_state(1, IncomingCommand::LspStartupPut {
-            request_id: 4, state: StartupState(b"stale attachment".to_vec()),
-        }).unwrap();
-        assert!(captured.lock().unwrap().is_empty());
-        sink.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 5 }).unwrap();
-        assert_eq!(&captured.lock().unwrap()[FRAME_HEADER_LEN..], secret);
-        // A second runtime has its own store even with the same attachment ID.
         let other = OutputSink::new_with_capabilities("test", &[]);
-        let other_output = Arc::new(Mutex::new(Vec::new()));
-        other.attach_client(CapturedOutput(Arc::clone(&other_output)), 2);
-        other.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 5 }).unwrap();
-        assert_eq!(other_output.lock().unwrap().len(), FRAME_HEADER_LEN);
+        assert!(other.private_startup_get().is_none());
         sink.clear_startup_state();
-        captured.lock().unwrap().clear();
-        sink.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 6 }).unwrap();
-        assert_eq!(captured.lock().unwrap().len(), FRAME_HEADER_LEN);
+        assert!(sink.private_startup_get().is_none());
+        assert!(!format!("{:?}", StartupState::new(secret.to_vec())).contains("secret"));
     }
 
     #[test]
-    fn failed_snapshot_ack_is_retryable_and_never_enters_terminal_replay() {
-        struct Disconnected;
-        impl Write for Disconnected {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::ErrorKind::BrokenPipe.into()) }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
-        }
-        let sink = OutputSink::new_with_capabilities("test", &[]);
-        sink.attach_client(Disconnected, 1);
-        assert!(sink.handle_startup_state(1, IncomingCommand::LspStartupPut {
-            request_id: 1, state: StartupState(vec![42; MAX_INPUT_FRAME_BYTES]),
-        }).is_err());
-        assert!(sink.output_state.lock().unwrap().backlog.is_empty());
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        sink.attach_client(CapturedOutput(Arc::clone(&captured)), 2);
-        sink.handle_startup_state(2, IncomingCommand::LspStartupGet { request_id: 2 }).unwrap();
-        assert_eq!(captured.lock().unwrap().len(), FRAME_HEADER_LEN + MAX_INPUT_FRAME_BYTES);
-        assert!(captured.lock().unwrap()[FRAME_HEADER_LEN..].iter().all(|byte| *byte == 42));
-    }
-
-    #[test]
-    fn startup_protocol_checks_format_empty_state_and_frame_limits() {
-        let mut frame = Vec::new();
-        write_private_frame(&mut frame, FRAME_LSP_STARTUP_GET, 7, &1_u32.to_le_bytes()).unwrap();
-        assert!(matches!(read_next_command(&mut frame.as_slice()).unwrap(),
-            Some(IncomingCommand::LspStartupGet { request_id: 7 })));
-        for (kind, payload) in [(FRAME_LSP_STARTUP_GET, vec![2, 0, 0, 0]), (FRAME_LSP_STARTUP_PUT, vec![])] {
-            frame.clear();
-            write_private_frame(&mut frame, kind, 1, &payload).unwrap();
+    fn old_tcp_startup_frames_are_rejected_even_when_authenticated() {
+        for kind in [27_u16, 28_u16] {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&4_u32.to_le_bytes());
+            frame.extend_from_slice(&kind.to_le_bytes());
+            frame.extend_from_slice(&0_u16.to_le_bytes());
+            frame.extend_from_slice(&1_u32.to_le_bytes());
+            frame.extend_from_slice(&1_u32.to_le_bytes());
             assert!(read_next_command(&mut frame.as_slice()).is_err());
         }
-        frame[0..4].copy_from_slice(&((MAX_INPUT_FRAME_BYTES + 1) as u32).to_le_bytes());
-        assert!(read_next_command(&mut frame.as_slice()).is_err());
-        assert!(!format!("{:?}", StartupState(b"secret".to_vec())).contains("secret"));
     }
 
     #[test]

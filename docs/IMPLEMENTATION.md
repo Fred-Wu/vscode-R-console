@@ -1318,27 +1318,27 @@ package scans and change checks run in response to folder events, not typing.
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
 latest snapshot. The initial server captures its effective environment, base and
-site library roots, ordered library paths, all startup options and attached package
-names in an opaque serialized envelope in memory. `rConsole/takeStartupState` transfers that envelope
-once over the mutually authenticated loopback LSP connection, or the inherited
-private stdio transport when configured. The R process releases its envelope after
-transfer. The persistent Rust runtime retains the envelope in session-scoped memory,
-and each attached console client holds a bounded local copy. The
-launcher clears inherited LSP transport settings and assigns fresh connection
-credentials to each socket child. The 16 MiB limit is checked before sending and
-accepting a snapshot. Invalid or oversized transfers fail startup with a
-payload-free error.
+site library roots, ordered library paths, all startup options and attached
+package names in an opaque serialized envelope in memory. It delivers this
+envelope once through its own inherited stdout pipe, using a fresh random
+per-child `RCS2` marker and bounded Base64 framing. The extension consumes
+the marker before exposing the stdout stream to the stdio LSP reader; TCP
+mode captures stdout separately. Project profile output cannot be mistaken for
+the envelope. No LSP JSON-RPC request or authenticated loopback TCP connection
+carries these credential-bearing bytes.
 
-Before launching an LSP process, the console retrieves its session's envelope
-over the authenticated persistent-runtime connection. Capability
-`lsp-startup-state-v1` adds request-ID-correlated frames 27–30 for retrieval,
-storage, the opaque result and acknowledgement. Retrieval requests carry format
-version 1; an empty result confirms that the session has no snapshot. Initial
-startup captures the LSP's own configuration and awaits storage acknowledgement
-before exposing completion. Storage accepts the first snapshot and identical
-retries, and rejects conflicting replacements. Replies go directly to the
-requesting attachment under the output lock. Snapshot payloads never enter
-terminal output, replay buffers, session registry files or lifecycle logs.
+The persistent Rust runtime retains the envelope in session-scoped memory and
+each attached console client holds a bounded local copy. The extension transfers
+the snapshot only through the existing OS-protected local key-broker endpoint
+(a private Unix socket or Windows user-only named pipe). The
+`lsp-startup-ipc-v1` capability indicates support for private startup GET/PUT.
+Commands `RCSG` and `RCSP` are strictly sized, PID-checked and limited to one
+snapshot; identical retries succeed, conflicting updates are refused. Old
+backend TCP startup-state frame types 27–30 are rejected. Snapshot payloads
+never enter terminal output, replay buffers, session registry files or
+lifecycle logs. The 16 MiB transport limit reserves room for framing.
+Malformed, oversized, or unavailable private transports fail startup without
+falling back to plaintext TCP.
 
 VS Code reload and console detach release the client's local copy. Reattachment
 retrieves the same snapshot while the persistent R runtime lives. The interactive

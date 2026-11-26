@@ -4,8 +4,8 @@
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
 restore_startup <- identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
 # Keep this limit in sync with lspStartupState.ts. The envelope travels only
-# through the authenticated LSP transport and the spawned child's private stdin.
-startup_state_limit <- 16L * 1024L * 1024L
+# over the spawned child's private pipes, never the LSP TCP connection.
+startup_state_limit <- 16L * 1024L * 1024L - 32L
 startup_payload <- NULL
 startup_environment <- function() {
     values <- Sys.getenv()
@@ -109,6 +109,20 @@ if (restore_startup) {
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
     q(save = "no", status = 10)
+}
+# The parent captures the original startup state from this specific child's
+# stdout pipe before passing the stream to the stdio LSP reader (or discarding
+# later stdout in TCP mode). Its random marker survives profile stdout output.
+# Do not answer any LSP request with this credential-bearing snapshot.
+if (!is.null(startup_payload)) {
+    capture_nonce <- Sys.getenv("VSCR_LSP_CAPTURE_TOKEN")
+    if (grepl("^[0-9a-f]{32}$", capture_nonce)) {
+        cat("RCS2", capture_nonce, ":",
+            gsub("\n", "", jsonlite::base64_enc(startup_payload), fixed = TRUE),
+            "\n", sep = "")
+        flush(stdout())
+    }
+    startup_payload <- NULL
 }
 
 debug <- Sys.getenv("VSCR_LSP_DEBUG")
@@ -249,14 +263,6 @@ for (resource in c("completion-runtime.R", "completion-static.R", "completion-ar
     source(file.path(console_resource_dir, resource), local = TRUE)
 }
 
-# The client takes ownership once, after mutual socket authentication (or over
-# inherited stdio). Never include this payload in lifecycle or completion logs.
-server$request_handlers[["rConsole/takeStartupState"]] <- function(self, id, params) {
-    payload <- startup_payload
-    startup_payload <<- NULL
-    self$deliver(languageserver:::Response$new(id, result =
-        if (is.null(payload)) NULL else gsub("\n", "", jsonlite::base64_enc(payload), fixed = TRUE)))
-}
 server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, params) {
     attached_packages <- normalize_character(params$attachedPackages)
     workspace <- self$get_workspace(self$rootUri)

@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "crypto";
 import { authenticateBackendSocket, BackendAuthenticationError } from "./backendAuthentication";
+import { loadPrivateStartupState, savePrivateStartupState } from "./privateStartupState";
 import { ChildProcess, spawn, SpawnOptions } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
@@ -21,7 +22,6 @@ import {
   encodeInterruptFrame,
   encodeParseStatusRequestFrame,
   encodeMemberNamesRequestFrame,
-  encodeLspStartupStateFrame,
   encodeReplyInputFrame,
   encodeSetWidthFrame,
   encodeShutdownFrame,
@@ -414,23 +414,39 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (!state.hostConnected || state.explicitClose || state.attachGeneration !== generation) {
       throw new Error("Persistent R session disconnected during startup state transfer");
     }
-    if (!state.capabilities.has("lsp-startup-state-v1")) {
+    if (!state.capabilities.has("lsp-startup-ipc-v1")) {
       throw new Error("This R runtime cannot retain language-server startup state. Close the old R session and start a new console.");
     }
     if (state.pendingStartupRequests.size >= 4) throw new Error("Too many startup state transfers");
+    const pid = this.getPid(session);
+    if (pid === undefined) throw new Error("Persistent runtime identity unavailable for private state transfer");
+    const identity = { sessionId: session.sessionId, pid };
     const requestId = ++state.nextRequestId;
-    const frame = encodeLspStartupStateFrame(requestId, snapshot);
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         state.pendingStartupRequests.delete(requestId);
         reject(new Error("Persistent startup state transfer timed out"));
       }, 10_000);
       state.pendingStartupRequests.set(requestId, { store: snapshot !== undefined, resolve, reject, timeout });
-      if (!this.writeFrame(state, frame)) {
-        clearTimeout(timeout);
+      const transfer = snapshot
+        ? savePrivateStartupState(identity, snapshot).then(() => undefined)
+        : loadPrivateStartupState(identity);
+      void transfer.then(value => {
+        const pending = state.pendingStartupRequests.get(requestId);
+        if (!pending || state.attachGeneration !== generation || state.explicitClose) {
+          value?.fill(0);
+          return;
+        }
         state.pendingStartupRequests.delete(requestId);
-        reject(new Error("Persistent startup state transfer failed"));
-      }
+        clearTimeout(timeout);
+        pending.resolve(value);
+      }, error => {
+        const pending = state.pendingStartupRequests.get(requestId);
+        if (!pending) return;
+        state.pendingStartupRequests.delete(requestId);
+        clearTimeout(timeout);
+        pending.reject(error);
+      });
     });
   }
 
@@ -851,25 +867,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     event: BackendControlEvent
   ): void {
     switch (event.type) {
-      case "lsp-startup-state":
-      case "lsp-startup-stored": {
-        const pending = state.pendingStartupRequests.get(event.requestId);
-        if (!pending) {
-          if (event.type === "lsp-startup-state") event.state?.fill(0);
-          return;
-        }
-        state.pendingStartupRequests.delete(event.requestId);
-        clearTimeout(pending.timeout);
-        if (pending.store !== (event.type === "lsp-startup-stored")) {
-          if (event.type === "lsp-startup-state") event.state?.fill(0);
-          pending.reject(new Error("Unexpected startup state response"));
-        } else if (event.type === "lsp-startup-stored" && !event.accepted) {
-          pending.reject(new Error("Persistent session already has a different startup snapshot"));
-        } else {
-          pending.resolve(event.type === "lsp-startup-state" ? event.state : undefined);
-        }
-        return;
-      }
       case "backend-ready":
         state.capabilities = new Set<BackendCapability>(event.capabilities);
         return;

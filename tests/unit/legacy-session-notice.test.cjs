@@ -56,7 +56,7 @@ test("close selects the saved session regardless of editor focus without a secon
   assert.equal(f.calls.filter(([kind]) => kind === "warning").length, 1);
   const items = f.calls.find(([kind]) => kind === "pick")[1];
   assert.equal(items[1].detail, undefined, "shutdown-only records need no startup directory");
-  assert.match(items[1].label, /R Console \\(\\d+\\)/);
+  assert.match(items[1].label, /^R Console \(\d+\)$/);
 });
 
 test("Cancel leaves the process and registry alone without opening a picker", async () => {

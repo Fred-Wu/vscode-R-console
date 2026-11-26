@@ -3,7 +3,7 @@ const { PassThrough } = require("node:stream");
 const { setImmediate: nextTurn } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
-const { decodeStartupState, readStartupAcknowledgement, writeStartupState, MAX_STARTUP_STATE_BYTES } =
+const { decodeStartupState, readPrivateStartupState, readStartupAcknowledgement, writeStartupState, MAX_STARTUP_STATE_BYTES } =
   loadSource("src/Language/lspStartupState.ts");
 
 test("startup envelope decoding rejects malformed and oversized responses without echoing data", () => {
@@ -57,4 +57,30 @@ test("private startup pipe frames opaque bytes ahead of following LSP input", as
   assert.throws(() => writeStartupState({}, state, () => {}), /private input pipe/);
   assert.throws(() => writeStartupState({ stdin }, Buffer.alloc(0), () => {}), /state size/);
   stdin.destroy();
+});
+
+test("private capture survives noisy profile stdout and preserves following LSP bytes", async () => {
+  const output = new PassThrough();
+  const nonce = "a".repeat(32);
+  const payload = Buffer.from("synthetic-private-credential");
+  const captured = readPrivateStartupState(output, nonce, 1000);
+  output.write("profile stdout is not the startup envelope\nRCS2");
+  await nextTurn();
+  output.write(nonce.slice(0, 12));
+  output.write(nonce.slice(12) + ":" + payload.toString("base64") + "\nContent-Length: 2\r\n\r\n{}");
+  const state = await captured;
+  assert.deepEqual(state, payload);
+  assert.equal(output.read().toString(), "Content-Length: 2\r\n\r\n{}");
+  state.fill(0);
+  output.destroy();
+});
+
+test("private capture rejects wrong marker, incomplete content and malformed Base64", async () => {
+  for (const content of ["RCS2" + "b".repeat(32) + ":YQ==\n", "RCS2" + "a".repeat(32) + ":invalid!\n", ""]) {
+    const output = new PassThrough();
+    const pending = readPrivateStartupState(output, "a".repeat(32), 20);
+    output.end(content);
+    await assert.rejects(pending, /private startup pipe/);
+    output.destroy();
+  }
 });

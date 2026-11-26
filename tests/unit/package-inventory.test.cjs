@@ -6,7 +6,10 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 
 function fixture(t, notificationDelay = 0, overrides = {}) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-")));
+  // Use the same canonical representation as PackageInventory.rootFor().
+  // On Windows realpathSync can yield RUNNER~1 while .native returns the
+  // long path; comparing those as strings misidentifies the same directory.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-")));
   const libraries = ["first", "second"].map(name => path.join(root, name));
   libraries.forEach(library => fs.mkdirSync(library));
   const changes = [], logs = [];
@@ -49,6 +52,14 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
   const waitForLog = message => settle(() => logs.some(line => line.includes(message)),
     `inventory must report: ${message}`);
   return { root, libraries, inventory, changes, logs, install, settle, waitForLog, watches };
+}
+
+/** Windows cannot rename a directory while fs.watch holds its handle.
+ * Release only the OS handles; keep the inventory's logical watcher state so
+ * a synthetic rename notification still exercises replacement and re-arming. */
+function releaseWindowsWatcherHandles(watcher) {
+  if (process.platform !== "win32") return;
+  for (const { watcher: nativeWatcher } of watcher.directories.values()) nativeWatcher.close();
 }
 
 test("inventory preserves effective copies across duplicate additions, removals and library order changes", async t => {
@@ -527,6 +538,7 @@ for (const replaceAncestor of [false, true]) {
     await settle();
     const watcher = inventory.watchers.get(library);
     const replaced = replaceAncestor ? parent : library;
+    releaseWindowsWatcherHandles(watcher);
     fs.renameSync(replaced, replaced + "-original");
     fs.symlinkSync(external, replaced, process.platform === "win32" ? "junction" : "dir");
     // Platforms may report a rename differently; deliver the root event too.
@@ -548,9 +560,13 @@ test("replacing an existing library directory re-arms its watcher without an err
   await settle();
   const previous = inventory.watchers.get(library);
   const moved = library + "-old";
+  releaseWindowsWatcherHandles(previous);
   fs.renameSync(library, moved);
   fs.mkdirSync(library);
   install(library, "2.0");
+  // Windows requires closing the old directory watch to permit the rename.
+  // Deliver the event which the old OS watcher would otherwise have raised.
+  if (process.platform === "win32") previous.emit("change", "rename", undefined);
   const deadline = Date.now() + 10000;
   while (changes.at(-1)?.packages.get("example")?.version !== "2.0") {
     assert.ok(Date.now() < deadline, "replacement directory must be detected");

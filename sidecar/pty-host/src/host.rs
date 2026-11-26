@@ -257,11 +257,8 @@ mod unix_host {
         let api = unsafe { RApi::load(&library_path)? };
 
         let session_transport = session_transport_config().is_some();
-        let _registry_key = if session_transport {
-            Some(crate::registry_key::start(&std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
-        } else { None };
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if session_transport { capabilities.push("lsp-startup-state-v1"); }
+        if session_transport { capabilities.push("lsp-startup-ipc-v1"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -271,6 +268,12 @@ mod unix_host {
             capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
+        // Share the startup snapshot only over the same-user OS-protected
+        // Unix socket / Windows named pipe, never the runtime TCP transport.
+        let _registry_key = if session_transport {
+            Some(crate::registry_key::start(
+                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle())?)
+        } else { None };
         if let Err(error) = output.capture_process_stdout() {
             let _ =
                 output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
@@ -472,14 +475,7 @@ mod unix_host {
                                         {
                                             break;
                                         }
-                                        match command {
-                                            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {
-                                                if let Some(runtime) = host_runtime() {
-                                                    if runtime.output.handle_startup_state(client_id, command).is_err() { break; }
-                                                }
-                                            }
-                                            other => handle_command(other),
-                                        }
+                                        handle_command(command);
                                         if is_shutdown_requested() {
                                             break;
                                         }
@@ -637,8 +633,6 @@ mod unix_host {
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
-            // Session state is available only on the authenticated persistent transport.
-            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {},
         }
     }
 
@@ -2289,11 +2283,8 @@ mod windows_host {
         let mut api = unsafe { RApi::load(&layout)? };
 
         let session_transport = session_transport_config().is_some();
-        let _registry_key = if session_transport {
-            Some(crate::registry_key::start(&std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
-        } else { None };
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if session_transport { capabilities.push("lsp-startup-state-v1"); }
+        if session_transport { capabilities.push("lsp-startup-ipc-v1"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -2303,6 +2294,12 @@ mod windows_host {
             capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
+        // Share the startup snapshot only over the same-user OS-protected
+        // Unix socket / Windows named pipe, never the runtime TCP transport.
+        let _registry_key = if session_transport {
+            Some(crate::registry_key::start(
+                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle())?)
+        } else { None };
         if let Err(error) = output.capture_process_stdout() {
             let _ =
                 output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
@@ -2504,14 +2501,7 @@ mod windows_host {
                                         {
                                             break;
                                         }
-                                        match command {
-                                            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {
-                                                if let Some(runtime) = host_runtime() {
-                                                    if runtime.output.handle_startup_state(client_id, command).is_err() { break; }
-                                                }
-                                            }
-                                            other => handle_command(other),
-                                        }
+                                        handle_command(command);
                                         if is_shutdown_requested() {
                                             break;
                                         }
@@ -2669,8 +2659,6 @@ mod windows_host {
             IncomingCommand::Interrupt => request_interrupt(),
             IncomingCommand::SetWidth { columns } => queue_set_width(columns),
             IncomingCommand::Shutdown => request_shutdown(),
-            // Session state is available only on the authenticated persistent transport.
-            IncomingCommand::LspStartupGet { .. } | IncomingCommand::LspStartupPut { .. } => {},
         }
     }
 
