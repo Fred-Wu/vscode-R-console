@@ -19,9 +19,11 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
     ...fs,
     ...overrides,
     watch: (file, options, callback) => {
-      const record = { file, options, trigger: (event, filename) => callback(event, filename) };
-      if (options.encoding === "utf8") entryWatches.push(record);
-      else watches.push(record);
+      if (options.encoding === "utf8") {
+        entryWatches.push({ file, options, trigger: (event, filename) => callback(event, filename) });
+      } else {
+        watches.push({ file, options });
+      }
       return fs.watch(file, options, (...args) => {
         const timer = setTimeout(() => { notifications.delete(timer); callback(...args); }, notificationDelay);
         notifications.add(timer);
