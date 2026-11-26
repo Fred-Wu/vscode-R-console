@@ -258,7 +258,7 @@ mod unix_host {
 
         let session_transport = session_transport_config().is_some();
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if session_transport { capabilities.push("lsp-startup-ipc-v1"); }
+        if session_transport { capabilities.push("lsp-startup-ipc-v2"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -272,7 +272,8 @@ mod unix_host {
         // Unix socket / Windows named pipe, never the runtime TCP transport.
         let _registry_key = if session_transport {
             Some(crate::registry_key::start(
-                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle())?)
+                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle(),
+                std::env::var("VSC_R_BACKEND_AUTH_TOKEN")?)?)
         } else { None };
         if let Err(error) = output.capture_process_stdout() {
             let _ =
@@ -2284,7 +2285,7 @@ mod windows_host {
 
         let session_transport = session_transport_config().is_some();
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if session_transport { capabilities.push("lsp-startup-ipc-v1"); }
+        if session_transport { capabilities.push("lsp-startup-ipc-v2"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -2298,7 +2299,8 @@ mod windows_host {
         // Unix socket / Windows named pipe, never the runtime TCP transport.
         let _registry_key = if session_transport {
             Some(crate::registry_key::start(
-                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle())?)
+                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle(),
+                std::env::var("VSC_R_BACKEND_AUTH_TOKEN")?)?)
         } else { None };
         if let Err(error) = output.capture_process_stdout() {
             let _ =

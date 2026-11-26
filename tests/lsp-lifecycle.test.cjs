@@ -632,8 +632,9 @@ test(`replacement restores in-memory profile state over ${useStdio ? "stdio" : "
   const state = client.startupState;
   assert.ok(state.includes(Buffer.from(env.RCONSOLE_TEST_CREDENTIAL)), "fixture contains sensitive startup data");
   assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "startup data must stay out of the workspace");
-  assert.equal(await client.client.sendRequest("rConsole/takeStartupState", {}), null,
-    "the R process releases the startup envelope after the first transfer");
+  assert.equal(instances.some(instance => instance.requests.some(request =>
+    request.method === "rConsole/takeStartupState")), false,
+    "credential-bearing startup state must never be requested over LSP");
   const snapshotKeys = execFileSync("Rscript", ["--vanilla", "-e",
     `cat(names(unserialize(readBin(file("stdin", "rb"), "raw", n=${client.startupState.length}))$environment), sep="\\n")`],
     { input: client.startupState, encoding: "utf8" }).trim().split(/\r?\n/);

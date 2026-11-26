@@ -1,6 +1,8 @@
 //! A session-lifetime key, disclosed only through an OS-protected local endpoint.
 //! The endpoint name is public; no authentication credential or key is written to disk.
-use std::io;
+use std::io::{self, Read, Write};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -40,6 +42,54 @@ const MAX_STATE: usize = 16 * 1024 * 1024 - 32;
 
 #[derive(Clone, Copy)]
 enum PrivateRequest { Key, Get, Put(usize) }
+
+const CLIENT_CONTEXT: &[u8] = b"rconsole-private-state-client-v1";
+const SERVER_CONTEXT: &[u8] = b"rconsole-private-state-server-v1";
+
+fn state_mac(token: &[u8], context: &[u8], nonce: &[u8; 32],
+             request: &[u8; 37], payload: &[u8]) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(token).expect("HMAC accepts a session token");
+    mac.update(context);
+    mac.update(nonce);
+    mac.update(request);
+    mac.update(payload);
+    mac
+}
+
+fn state_challenge(nonce: &[u8; 32]) -> [u8; 40] {
+    let mut frame = [0u8; 40];
+    frame[..4].copy_from_slice(b"RCSC");
+    frame[4..8].copy_from_slice(&std::process::id().to_le_bytes());
+    frame[8..].copy_from_slice(nonce);
+    frame
+}
+
+fn state_reply(key: &Key, output: &crate::protocol::OutputSink, kind: PrivateRequest,
+               payload: Vec<u8>, token: &[u8], nonce: &[u8; 32],
+               request: &[u8; 37]) -> Vec<u8> {
+    let mut response = reply(key, output, kind, payload);
+    let proof = state_mac(token, SERVER_CONTEXT, nonce, request, &response)
+        .finalize().into_bytes();
+    response.extend_from_slice(&proof);
+    response
+}
+
+fn read_state_proof<R: Read>(reader: &mut R, kind: PrivateRequest, request: &[u8; 37],
+                             nonce: &[u8; 32], token: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let mut proof = [0u8; 32];
+    reader.read_exact(&mut proof)?;
+    let mut payload = if let PrivateRequest::Put(size) = kind {
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes)?;
+        bytes
+    } else { Vec::new() };
+    let authenticated = state_mac(token, CLIENT_CONTEXT, nonce, request, &payload)
+        .verify_slice(&proof).is_ok();
+    proof.fill(0);
+    if !authenticated { payload.fill(0); return Ok(None); }
+    Ok(Some(payload))
+}
+
 
 fn request_kind(request: &[u8; 37]) -> Option<PrivateRequest> {
     let magic = &request[..4];
@@ -87,14 +137,17 @@ fn reply(key: &Key, output: &crate::protocol::OutputSink, kind: PrivateRequest, 
     }
 }
 
-pub(crate) fn start(id: &str, output: crate::protocol::OutputSink) -> io::Result<Broker> {
+pub(crate) fn start(id: &str, output: crate::protocol::OutputSink, token: String) -> io::Result<Broker> {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(io::Error::other("invalid private startup session token"));
+    }
     if !valid_session_id(id) { return Err(io::Error::other("invalid registry key session identifier")); }
     let key = Key { bytes: crate::protocol::secure_server_nonce()? };
-    platform_start(id, key, output)
+    platform_start(id, key, output, token)
 }
 
 #[cfg(unix)]
-fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink) -> io::Result<Broker> {
+fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink, token: String) -> io::Result<Broker> {
     use std::io::{Read, Write};
     use std::time::Instant;
     use std::os::unix::{fs::{DirBuilderExt, MetadataExt, PermissionsExt}, net::UnixListener};
@@ -140,12 +193,21 @@ fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink) -> io
                     if stream.set_nonblocking(false).is_err() { continue; }
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-                    let payload = if let PrivateRequest::Put(len) = kind {
-                        let mut bytes = vec![0; len];
-                        if stream.read_exact(&mut bytes).is_err() { bytes.fill(0); continue; }
-                        bytes
-                    } else { Vec::new() };
-                    let mut response = reply(&key, &output, kind, payload);
+                    let mut response = match kind {
+                        PrivateRequest::Key => reply(&key, &output, kind, Vec::new()),
+                        PrivateRequest::Get | PrivateRequest::Put(_) => {
+                            let nonce = match crate::protocol::secure_server_nonce() {
+                                Ok(nonce) => nonce,
+                                Err(_) => continue,
+                            };
+                            if stream.write_all(&state_challenge(&nonce)).is_err() { continue; }
+                            let payload = match read_state_proof(&mut stream, kind, &request, &nonce, token.as_bytes()) {
+                                Ok(Some(payload)) => payload,
+                                _ => continue,
+                            };
+                            state_reply(&key, &output, kind, payload, token.as_bytes(), &nonce, &request)
+                        }
+                    };
                     let _ = stream.write_all(&response);
                     response.fill(0);
                 },
@@ -158,17 +220,49 @@ fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink) -> io
 }
 
 #[cfg(windows)]
-fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink) -> io::Result<Broker> {
+fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink, token: String) -> io::Result<Broker> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr::null_mut;
     use std::time::Instant;
     use windows_sys::Win32::{
         Foundation::{INVALID_HANDLE_VALUE, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_NO_DATA},
         Security::SECURITY_ATTRIBUTES,
-        Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile},
+        Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, ReadFile},
         System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe,
             PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_NOWAIT, PIPE_REJECT_REMOTE_CLIENTS},
     };
+    fn read_exact_pipe(raw: windows_sys::Win32::Foundation::HANDLE, into: &mut [u8],
+                       stopped: &AtomicBool, limit: Duration) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use std::ptr::null_mut;
+        let deadline = std::time::Instant::now() + limit;
+        let mut read_total = 0;
+        while read_total < into.len() && std::time::Instant::now() < deadline &&
+              !stopped.load(Ordering::SeqCst) {
+            let mut count = 0;
+            unsafe { ReadFile(raw, into[read_total..].as_mut_ptr(),
+                (into.len() - read_total).min(4096) as u32, &mut count, null_mut()); }
+            read_total += count as usize;
+            if count == 0 { thread::sleep(Duration::from_millis(2)); }
+        }
+        read_total == into.len()
+    }
+    fn write_all_pipe(raw: windows_sys::Win32::Foundation::HANDLE, bytes: &[u8],
+                      stopped: &AtomicBool, limit: Duration) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use std::ptr::null_mut;
+        let deadline = std::time::Instant::now() + limit;
+        let mut sent = 0;
+        while sent < bytes.len() && std::time::Instant::now() < deadline &&
+              !stopped.load(Ordering::SeqCst) {
+            let mut written = 0;
+            unsafe { WriteFile(raw, bytes[sent..].as_ptr(),
+                (bytes.len() - sent).min(4096) as u32, &mut written, null_mut()); }
+            sent += written as usize;
+            if written == 0 { thread::sleep(Duration::from_millis(2)); }
+        }
+        sent == bytes.len()
+    }
     let descriptor = crate::windows_pipe_security::private_pipe_descriptor()?;
     let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0, bInheritHandle: 0 };
@@ -205,46 +299,46 @@ fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink) -> io
             }
             let kind = if count == request.len() { request_kind(&request) } else { None };
             let Some(kind) = kind else { unsafe { DisconnectNamedPipe(raw); } continue; };
-            let payload = if let PrivateRequest::Put(len) = kind {
-                let mut bytes = vec![0_u8; len];
-                let deadline = Instant::now() + Duration::from_secs(10);
-                let mut received = 0;
-                while received < len && Instant::now() < deadline && !stopped.load(Ordering::SeqCst) {
-                    let mut count = 0;
-                    let size = (len - received).min(4096) as u32;
-                    let _success = unsafe { ReadFile(raw, bytes[received..].as_mut_ptr(), size,
-                        &mut count, null_mut()) } != 0;
-                    received += count as usize;
-                    if count == 0 { thread::sleep(Duration::from_millis(2)); }
+            let authenticated = !matches!(kind, PrivateRequest::Key);
+            let nonce = if authenticated {
+                let Ok(nonce) = crate::protocol::secure_server_nonce() else {
+                    unsafe { DisconnectNamedPipe(raw); } continue;
+                };
+                if !write_all_pipe(raw, &state_challenge(&nonce), &stopped, Duration::from_secs(3)) {
+                    unsafe { DisconnectNamedPipe(raw); } continue;
                 }
-                if received != len { bytes.fill(0); unsafe { DisconnectNamedPipe(raw); } continue; }
+                Some(nonce)
+            } else { None };
+            let mut proof = [0u8; 32];
+            if authenticated && !read_exact_pipe(raw, &mut proof, &stopped, Duration::from_secs(3)) {
+                unsafe { DisconnectNamedPipe(raw); } continue;
+            }
+            let mut payload = if let PrivateRequest::Put(len) = kind {
+                let mut bytes = vec![0u8; len];
+                if !read_exact_pipe(raw, &mut bytes, &stopped, Duration::from_secs(10)) {
+                    bytes.fill(0);
+                    unsafe { DisconnectNamedPipe(raw); } continue;
+                }
                 bytes
             } else { Vec::new() };
-            let mut bytes = reply(&key, &output, kind, payload);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut sent = 0;
-            while sent < bytes.len() && Instant::now() < deadline && !stopped.load(Ordering::SeqCst) {
-                let mut written = 0;
-                let size = (bytes.len() - sent).min(4096) as u32;
-                let _success = unsafe { WriteFile(raw, bytes[sent..].as_ptr(), size,
-                    &mut written, null_mut()) } != 0;
-                sent += written as usize;
-                if written == 0 { thread::sleep(Duration::from_millis(2)); }
-            }
-            let delivered = sent == bytes.len();
-            bytes.fill(0);
-            // Keep the named-pipe instance until the client confirms all bytes
-            // were received, otherwise DisconnectNamedPipe may discard them.
-            if delivered {
-                let deadline = Instant::now() + Duration::from_millis(1000);
-                let mut ack = [0u8; 4];
-                let mut count = 0;
-                while count < ack.len() && Instant::now() < deadline && !stopped.load(Ordering::SeqCst) {
-                    let mut read = 0;
-                    unsafe { ReadFile(raw, ack[count..].as_mut_ptr(), (ack.len() - count) as u32, &mut read, null_mut()); }
-                    count += read as usize;
-                    if read == 0 { thread::sleep(Duration::from_millis(2)); }
+            if let Some(nonce) = &nonce {
+                let valid = state_mac(token.as_bytes(), CLIENT_CONTEXT, nonce, &request, &payload)
+                    .verify_slice(&proof).is_ok();
+                proof.fill(0);
+                if !valid {
+                    payload.fill(0);
+                    unsafe { DisconnectNamedPipe(raw); } continue;
                 }
+            }
+            let mut bytes = match nonce {
+                Some(nonce) => state_reply(&key, &output, kind, payload, token.as_bytes(), &nonce, &request),
+                None => reply(&key, &output, kind, payload),
+            };
+            let delivered = write_all_pipe(raw, &bytes, &stopped, Duration::from_secs(10));
+            bytes.fill(0);
+            if delivered {
+                let mut ack = [0u8; 4];
+                let _ = read_exact_pipe(raw, &mut ack, &stopped, Duration::from_secs(1));
             }
             unsafe { DisconnectNamedPipe(raw); }
         }
@@ -257,30 +351,57 @@ fn platform_start(id: &str, key: Key, output: crate::protocol::OutputSink) -> io
 mod tests {
     use super::*;
     #[test]
-    fn private_requests_are_bounded_and_do_not_enter_tcp_replay() {
+    fn private_startup_requires_fresh_session_hmac_before_disclosing_or_storing() {
+        use std::io::Cursor;
         let sink = crate::protocol::OutputSink::new_with_capabilities("test", &[]);
         let key = Key { bytes: [42; 32] };
-        let mut request = [0; 37];
-        request[..4].copy_from_slice(b"RCK1");
-        assert!(matches!(request_kind(&request), Some(PrivateRequest::Key)));
-        let response = reply(&key, &sink, PrivateRequest::Key, vec![]);
-        assert_eq!(&response[9..], &[42; 32]);
-        request[..4].copy_from_slice(b"RCSP");
-        request[4..8].copy_from_slice(&4_u32.to_le_bytes());
-        assert!(matches!(request_kind(&request), Some(PrivateRequest::Put(4))));
-        assert_eq!(reply(&key, &sink, PrivateRequest::Put(4), b"test".to_vec())[12], 0);
-        assert_eq!(reply(&key, &sink, PrivateRequest::Put(4), b"fail".to_vec())[12], 1);
-        let response = reply(&key, &sink, PrivateRequest::Get, vec![]);
-        assert_eq!(&response[12..], b"test");
-        assert_eq!(sink.private_startup_get().unwrap().as_bytes(), b"test");
-        request[4..8].copy_from_slice(&((MAX_STATE + 1) as u32).to_le_bytes());
-        assert!(request_kind(&request).is_none());
-        request[..4].copy_from_slice(b"RCK1");
-        assert!(request_kind(&request).is_none());
-        request[4..8].fill(0);
-        request[12] = 1;
-        assert!(request_kind(&request).is_none());
+        let token = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut request = [0u8; 37];
+        request[..4].copy_from_slice(b"RCSG");
+        assert!(matches!(request_kind(&request), Some(PrivateRequest::Get)));
+        let nonce_a = [5u8; 32];
+        let nonce_b = [6u8; 32];
+        let signed = state_mac(token, CLIENT_CONTEXT, &nonce_a, &request, &[])
+            .finalize().into_bytes().to_vec();
+        assert!(read_state_proof(&mut Cursor::new(signed.as_slice()),
+            PrivateRequest::Get, &request, &nonce_a, token).unwrap().is_some());
+        assert!(read_state_proof(&mut Cursor::new(signed.as_slice()),
+            PrivateRequest::Get, &request, &nonce_b, token).unwrap().is_none(),
+            "a replayed proof cannot authorize a fresh request");
+        assert!(read_state_proof(&mut Cursor::new(signed.as_slice()),
+            PrivateRequest::Get, &request, &nonce_a, b"different-token").unwrap().is_none());
+        let mut put = request;
+        put[..4].copy_from_slice(b"RCSP");
+        put[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(request_kind(&put), Some(PrivateRequest::Put(4))));
+        let put_proof = state_mac(token, CLIENT_CONTEXT, &nonce_a, &put, b"test")
+            .finalize().into_bytes();
+        let mut put_frame = put_proof.to_vec();
+        put_frame.extend_from_slice(b"test");
+        assert!(read_state_proof(&mut Cursor::new(put_frame.as_slice()),
+            PrivateRequest::Put(4), &put, &nonce_a, token).unwrap().is_some());
+        *put_frame.last_mut().unwrap() = b'X';
+        assert!(read_state_proof(&mut Cursor::new(put_frame.as_slice()),
+            PrivateRequest::Put(4), &put, &nonce_a, token).unwrap().is_none(),
+            "a modified payload invalidates the request");
+        let response = state_reply(&key, &sink, PrivateRequest::Put(4),
+            b"test".to_vec(), token, &nonce_a, &put);
+        assert_eq!(response[12], 0);
+        assert!(state_mac(token, SERVER_CONTEXT, &nonce_a, &put, &response[..13])
+            .verify_slice(&response[13..]).is_ok());
+        assert!(state_mac(token, SERVER_CONTEXT, &nonce_b, &put, &response[..13])
+            .verify_slice(&response[13..]).is_err());
+        let get = state_reply(&key, &sink, PrivateRequest::Get, Vec::new(), token, &nonce_b, &request);
+        assert_eq!(&get[12..16], b"test");
+        assert!(state_mac(token, SERVER_CONTEXT, &nonce_b, &request, &get[..16])
+            .verify_slice(&get[16..]).is_ok());
+        assert_eq!(reply(&key, &sink, PrivateRequest::Key, vec![])[9..], [42; 32]);
+        put[4..8].copy_from_slice(&((MAX_STATE + 1) as u32).to_le_bytes());
+        assert!(request_kind(&put).is_none());
+        put[..4].copy_from_slice(b"RCK1");
+        assert!(request_kind(&put).is_none());
     }
+
     #[test]
     fn endpoint_ids_cannot_select_paths_or_remote_hosts() {
         assert!(valid_session_id("01234567-89ab-cdef-0123-456789abcdef"));
@@ -296,7 +417,7 @@ mod tests {
         let nonce = crate::protocol::secure_server_nonce().unwrap();
         let hex: String = nonce[..16].iter().map(|b| format!("{b:02x}")).collect();
         let id = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
-        let broker = start(&id, crate::protocol::OutputSink::new_with_capabilities("test", &[])).unwrap();
+        let broker = start(&id, crate::protocol::OutputSink::new_with_capabilities("test", &[]), "a".repeat(64)).unwrap();
         assert_eq!(std::fs::metadata(&broker.endpoint).unwrap().mode() & 0o777, 0o600);
         let read = |endpoint: &std::path::Path| {
             let mut bytes = [0; 41];
@@ -313,7 +434,7 @@ mod tests {
         assert_eq!(first, read(&broker.endpoint));
         let mut other_id = id.clone();
         other_id.replace_range(..1, if id.starts_with('a') { "b" } else { "a" });
-        let other = start(&other_id, crate::protocol::OutputSink::new_with_capabilities("test", &[])).unwrap();
+        let other = start(&other_id, crate::protocol::OutputSink::new_with_capabilities("test", &[]), "b".repeat(64)).unwrap();
         assert_ne!(&first[9..], &read(&other.endpoint)[9..]);
         // A client which sends no request cannot hold the broker indefinitely.
         let _stalled = UnixStream::connect(&broker.endpoint).unwrap();

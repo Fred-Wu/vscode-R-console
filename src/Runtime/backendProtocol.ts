@@ -65,7 +65,7 @@ export type BackendCapability =
   | "function-source"
   | "function-source-value"
   | "function-arguments"
-  | "lsp-startup-ipc-v1";
+  | "lsp-startup-ipc-v2";
 
 export type BackendDialogRequest =
   | {
@@ -224,7 +224,7 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "function-source" ||
     value === "function-source-value" ||
     value === "function-arguments" ||
-    value === "lsp-startup-ipc-v1"
+    value === "lsp-startup-ipc-v2"
   );
 }
 

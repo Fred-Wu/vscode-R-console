@@ -8,42 +8,61 @@ import { isSessionRegistryIdentity, sessionRegistryKeyEndpoint, type SessionRegi
 export const MAX_PRIVATE_STARTUP_STATE_BYTES = 16 * 1024 * 1024 - 32;
 const PRIVATE_TIMEOUT_MS = 10_000;
 
-export async function loadPrivateStartupState(identity: SessionRegistryIdentity): Promise<Buffer | undefined> {
-  const state = await exchange(identity);
-  return state?.length ? state : undefined;
+import { createHmac, timingSafeEqual } from "crypto";
+
+const CLIENT_CONTEXT = "rconsole-private-state-client-v1";
+const SERVER_CONTEXT = "rconsole-private-state-server-v1";
+const CHALLENGE_BYTES = 40;
+const RESPONSE_HEADER_BYTES = 12;
+const MAC_BYTES = 32;
+
+function mac(context: string, token: string, nonce: Buffer, header: Buffer, payload?: Buffer): Buffer {
+  const hash = createHmac("sha256", token);
+  hash.update(context, "ascii");
+  hash.update(nonce);
+  hash.update(header);
+  if (payload) hash.update(payload);
+  return hash.digest();
 }
 
-export async function savePrivateStartupState(identity: SessionRegistryIdentity, state: Buffer): Promise<void> {
+export async function loadPrivateStartupState(
+  identity: SessionRegistryIdentity, authToken: string
+): Promise<Buffer | undefined> {
+  const bytes = await exchange(identity, authToken);
+  return bytes?.length ? bytes : undefined;
+}
+
+export async function savePrivateStartupState(
+  identity: SessionRegistryIdentity, authToken: string, state: Buffer
+): Promise<void> {
   if (!state.length || state.length > MAX_PRIVATE_STARTUP_STATE_BYTES) {
     throw new Error("Invalid private startup state size");
   }
-  const result = await exchange(identity, state);
-  if (!result || result.length !== 1 || result[0] !== 0) {
-    result?.fill(0);
+  const response = await exchange(identity, authToken, state);
+  if (!response || response.length !== 1 || response[0] !== 0) {
+    response?.fill(0);
     throw new Error("Persistent session already has a different startup snapshot");
   }
-  result.fill(0);
+  response.fill(0);
 }
 
-async function exchange(identity: SessionRegistryIdentity, snapshot?: Buffer): Promise<Buffer | undefined> {
-  // The private key broker can serve a registry-key request while the console
-  // attaches. Retry transient busy/not-ready errors without retrying invalid
-  // framing, identity mismatches or permission failures.
+async function exchange(identity: SessionRegistryIdentity, authToken: string, state?: Buffer): Promise<Buffer | undefined> {
+  if (!isSessionRegistryIdentity(identity)) throw new Error("Invalid runtime startup identity");
+  if (!/^[0-9a-f]{64}$/.test(authToken)) throw new Error("Session authentication unavailable");
   const deadline = Date.now() + PRIVATE_TIMEOUT_MS;
   while (true) {
     try {
-      return await exchangeOnce(identity, snapshot);
+      return await exchangeOnce(identity, authToken, state, Math.max(1, deadline - Date.now()));
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (!["ENOENT", "ECONNREFUSED", "EBUSY", "EPIPE"].includes(code ?? "") ||
-          Date.now() >= deadline) throw error;
+      if (!["ENOENT", "ECONNREFUSED", "EBUSY"].includes(code ?? "") || Date.now() >= deadline) throw error;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
   }
 }
 
-function exchangeOnce(identity: SessionRegistryIdentity, snapshot?: Buffer): Promise<Buffer | undefined> {
-  if (!isSessionRegistryIdentity(identity)) return Promise.reject(new Error("Invalid runtime startup identity"));
+function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
+  state: Buffer | undefined, timeoutMs: number): Promise<Buffer | undefined> {
   const endpoint = sessionRegistryKeyEndpoint(identity);
   if (process.platform !== "win32") {
     try {
@@ -58,66 +77,87 @@ function exchangeOnce(identity: SessionRegistryIdentity, snapshot?: Buffer): Pro
   }
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ path: endpoint });
-    const header = Buffer.alloc(37);
-    header.write(snapshot ? "RCSP" : "RCSG", "ascii");
-    if (snapshot) header.writeUInt32LE(snapshot.length, 4);
-    let chunks: Buffer[] = [];
-    let bytes = 0;
-    let expected: number | undefined;
-    let finished = false;
-    const timer = setTimeout(() => finish(new Error("Private startup state transfer timed out")), PRIVATE_TIMEOUT_MS);
-    function finish(error?: Error, data?: Buffer): void {
-      if (finished) { data?.fill(0); return; }
-      finished = true;
+    const request = Buffer.alloc(37);
+    request.write(state ? "RCSP" : "RCSG", "ascii");
+    if (state) request.writeUInt32LE(state.length, 4);
+    let pending = Buffer.alloc(0);
+    let serverNonce: Buffer | undefined;
+    let expectedResponse: number | undefined;
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error("Private startup state transfer timed out")), timeoutMs);
+    function finish(error?: Error, result?: Buffer): void {
+      if (settled) { result?.fill(0); return; }
+      settled = true;
       clearTimeout(timer);
-      for (const chunk of chunks) chunk.fill(0);
-      chunks = [];
+      pending.fill(0);
+      serverNonce?.fill(0);
+      request.fill(0);
       socket.destroy();
-      if (error) reject(error); else resolve(data);
+      if (error) reject(error); else resolve(result);
     }
-    socket.once("connect", () => {
-      socket.write(header);
-      if (snapshot) socket.write(snapshot);
-    });
+    socket.once("connect", () => socket.write(request));
     socket.on("error", error => finish(error));
-    socket.on("close", () => { if (!finished) finish(new Error("Private startup state connection closed")); });
-    socket.on("data", chunk => {
-      if (finished) return;
-      bytes += chunk.length;
-      if (bytes > 12 + MAX_PRIVATE_STARTUP_STATE_BYTES) {
-        chunk.fill(0);
-        finish(new Error("Private startup state response exceeds size limit"));
+    socket.on("close", () => { if (!settled) finish(new Error("Private startup state connection closed")); });
+    socket.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      const bound = serverNonce
+        ? RESPONSE_HEADER_BYTES + MAX_PRIVATE_STARTUP_STATE_BYTES + MAC_BYTES
+        : CHALLENGE_BYTES;
+      if (pending.length + chunk.length > bound) {
+        finish(new Error("Invalid private startup authentication framing"));
         return;
       }
-      chunks.push(Buffer.from(chunk));
-      if (bytes >= 12 && expected === undefined) {
-        const prefix = Buffer.concat(chunks, bytes);
-        if (prefix.subarray(0, 4).toString("ascii") !== "RCSR" ||
-            prefix.readUInt32LE(4) !== identity.pid) {
-          prefix.fill(0);
-          finish(new Error("Private startup state belongs to a different runtime"));
+      const bytes = Buffer.concat([pending, chunk]);
+      pending.fill(0);
+      pending = bytes;
+      if (!serverNonce) {
+        if (pending.length < CHALLENGE_BYTES) return;
+        if (pending.subarray(0, 4).toString("ascii") !== "RCSC" ||
+            pending.readUInt32LE(4) !== identity.pid) {
+          finish(new Error("Private startup challenge belongs to a different runtime"));
           return;
         }
-        expected = prefix.readUInt32LE(8);
-        prefix.fill(0);
-        if (expected > MAX_PRIVATE_STARTUP_STATE_BYTES ||
-            (snapshot !== undefined && expected !== 1)) {
+        serverNonce = Buffer.from(pending.subarray(8));
+        pending.fill(0);
+        pending = Buffer.alloc(0);
+        const clientProof = mac(CLIENT_CONTEXT, authToken, serverNonce, request, state);
+        // Do not erase a buffer before the socket finishes sending it.
+        socket.write(clientProof, () => clientProof.fill(0));
+        if (state) socket.write(state);
+        return;
+      }
+      if (pending.length >= RESPONSE_HEADER_BYTES && expectedResponse === undefined) {
+        if (pending.subarray(0, 4).toString("ascii") !== "RCSR" ||
+            pending.readUInt32LE(4) !== identity.pid) {
+          finish(new Error("Private startup response belongs to a different runtime"));
+          return;
+        }
+        expectedResponse = pending.readUInt32LE(8);
+        if (expectedResponse > MAX_PRIVATE_STARTUP_STATE_BYTES ||
+            (state !== undefined && expectedResponse !== 1)) {
           finish(new Error("Invalid private startup state response length"));
           return;
         }
       }
-      if (expected === undefined || bytes < 12 + expected) return;
-      if (bytes !== 12 + expected) {
-        finish(new Error("Invalid private startup state response framing"));
+      if (expectedResponse === undefined || pending.length < RESPONSE_HEADER_BYTES + expectedResponse + MAC_BYTES) return;
+      if (pending.length !== RESPONSE_HEADER_BYTES + expectedResponse + MAC_BYTES) {
+        finish(new Error("Invalid private startup response framing"));
         return;
       }
-      const result = Buffer.concat(chunks, bytes);
-      const payload = Buffer.from(result.subarray(12));
-      result.fill(0);
+      const proofBytes = pending.subarray(RESPONSE_HEADER_BYTES + expectedResponse);
+      const expected = mac(SERVER_CONTEXT, authToken, serverNonce, request,
+        pending.subarray(0, RESPONSE_HEADER_BYTES + expectedResponse));
+      const valid = timingSafeEqual(proofBytes, expected);
+      expected.fill(0);
+      if (!valid) {
+        finish(new Error("Private startup response authentication failed"));
+        return;
+      }
+      const result = Buffer.from(pending.subarray(RESPONSE_HEADER_BYTES, RESPONSE_HEADER_BYTES + expectedResponse));
       if (process.platform === "win32") {
-        socket.end(Buffer.from("RCK1"), () => finish(undefined, payload));
+        socket.end(Buffer.from("RCK1"), () => finish(undefined, result));
       } else {
-        finish(undefined, payload);
+        finish(undefined, result);
       }
     });
   });

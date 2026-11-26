@@ -414,13 +414,17 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     if (!state.hostConnected || state.explicitClose || state.attachGeneration !== generation) {
       throw new Error("Persistent R session disconnected during startup state transfer");
     }
-    if (!state.capabilities.has("lsp-startup-ipc-v1")) {
+    if (!state.capabilities.has("lsp-startup-ipc-v2")) {
       throw new Error("This R runtime cannot retain language-server startup state. Close the old R session and start a new console.");
     }
     if (state.pendingStartupRequests.size >= 4) throw new Error("Too many startup state transfers");
     const pid = this.getPid(session);
     if (pid === undefined) throw new Error("Persistent runtime identity unavailable for private state transfer");
     const identity = { sessionId: session.sessionId, pid };
+    const token = state.authToken;
+    if (!token || !/^[0-9a-f]{64}$/.test(token)) {
+      throw new Error("Session authentication unavailable for private startup state");
+    }
     const requestId = ++state.nextRequestId;
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -429,8 +433,8 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       }, 10_000);
       state.pendingStartupRequests.set(requestId, { store: snapshot !== undefined, resolve, reject, timeout });
       const transfer = snapshot
-        ? savePrivateStartupState(identity, snapshot).then(() => undefined)
-        : loadPrivateStartupState(identity);
+        ? savePrivateStartupState(identity, token, snapshot).then(() => undefined)
+        : loadPrivateStartupState(identity, token);
       void transfer.then(value => {
         const pending = state.pendingStartupRequests.get(requestId);
         if (!pending || state.attachGeneration !== generation || state.explicitClose) {

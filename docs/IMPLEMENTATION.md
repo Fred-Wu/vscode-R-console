@@ -1331,9 +1331,18 @@ The persistent Rust runtime retains the envelope in session-scoped memory and
 each attached console client holds a bounded local copy. The extension transfers
 the snapshot only through the existing OS-protected local key-broker endpoint
 (a private Unix socket or Windows user-only named pipe). The
-`lsp-startup-ipc-v1` capability indicates support for private startup GET/PUT.
-Commands `RCSG` and `RCSP` are strictly sized, PID-checked and limited to one
-snapshot; identical retries succeed, conflicting updates are refused. Old
+`lsp-startup-ipc-v2` capability indicates support for private startup GET/PUT.
+Commands `RCSG` and `RCSP` are strictly sized, PID-checked and
+authenticated with the session's existing 256-bit authentication token:
+the runtime sends a fresh random challenge on every connection, the client
+proves token possession with a domain-separated HMAC-SHA256 over the
+challenge, complete request header and (for writes) payload, and the
+runtime authenticates its response with a separate HMAC. Invalid or
+replayed proofs are rejected before releasing any startup state. This is
+a per-session authorization boundary, in addition to OS-user endpoint
+permissions. The `lsp-startup-ipc-v2` capability deliberately excludes
+old runtimes that only support unauthenticated IPC. The snapshot remains
+write-once: identical retries succeed, conflicting updates are refused. Old
 backend TCP startup-state frame types 27–30 are rejected. Snapshot payloads
 never enter terminal output, replay buffers, session registry files or
 lifecycle logs. The 16 MiB transport limit reserves room for framing.

@@ -79,8 +79,15 @@ test("persistent R retains the original LSP profile across extension-host death 
     assert.equal(message.runtimePid, runtimePid, "the interactive R process survives");
     assert.equal(message.captured, true);
     assert.equal(message.leaked, false);
-    assert.ok(message.libraries.some(value => fs.realpathSync(value) === fs.realpathSync(library)),
-      "original library order is restored before live library metadata is supplied");
+    // Windows realpathSync may return RUNNER~1 while .native returns the
+    // long canonical path, and path casing is not significant on Windows.
+    const rootName = value => {
+      const canonical = fs.realpathSync.native(value);
+      return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+    };
+    assert.ok(message.libraries.some(value => rootName(value) === rootName(library)),
+      "original library order is restored before live library metadata is supplied: " +
+        JSON.stringify({ expected: library, actual: message.libraries }));
     assert.deepEqual(fs.readdirSync(message.workspace), []);
     return { worker, message };
   };

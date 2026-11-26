@@ -9,12 +9,12 @@ async function connection(t, { supported = true, load, save } = {}) {
   let stored;
   const { RustSidecarRuntimeBackend } = loadSource("src/Runtime/runtimeBackend.ts", {
     "./privateStartupState": {
-      loadPrivateStartupState: async identity => {
-        ipc.push(["get", identity]);
+      loadPrivateStartupState: async (identity, token) => {
+        ipc.push(["get", identity, token]);
         return load ? load(identity) : stored && Buffer.from(stored);
       },
-      savePrivateStartupState: async (identity, bytes) => {
-        ipc.push(["put", identity]);
+      savePrivateStartupState: async (identity, token, bytes) => {
+        ipc.push(["put", identity, token]);
         if (save) return save(identity, bytes);
         if (stored && !stored.equals(bytes)) throw new Error("Persistent session already has a different startup snapshot");
         stored = Buffer.from(bytes);
@@ -35,7 +35,7 @@ async function connection(t, { supported = true, load, save } = {}) {
   await nextTurn();
   const state = backend.getOrCreateState(session);
   state.hostConnected = true;
-  if (supported) state.capabilities.add("lsp-startup-ipc-v1");
+  if (supported) state.capabilities.add("lsp-startup-ipc-v2");
   t.after(() => backend.detach(session));
   return { backend, session, socket, writes, visible, ipc, state };
 }
@@ -48,7 +48,8 @@ test("startup state uses private same-user IPC, never the backend TCP socket", a
   assert.equal(retrieved.toString(), "synthetic-credential");
   retrieved.fill(0);
   assert.deepEqual(ipc.map(([operation]) => operation), ["get", "put", "get"]);
-  assert.ok(ipc.every(([, identity]) => identity.pid === process.pid && identity.sessionId === "test"));
+  assert.ok(ipc.every(([, identity, token]) =>
+    identity.pid === process.pid && identity.sessionId === "test" && token === "a".repeat(64)));
   assert.deepEqual(writes, [], "no credential-bearing startup payload crosses TCP");
   assert.deepEqual(visible, []);
 });
@@ -60,8 +61,11 @@ test("startup state is write-once and rejects unsupported runtime capability", a
   await assert.rejects(backend.saveLspStartupState(session, Buffer.from("second")), /different startup snapshot/);
   assert.deepEqual(writes, []);
   const old = await connection(t, { supported: false });
-  await assert.rejects(old.backend.loadLspStartupState(old.session), /Close the old R session/);
+  old.state.capabilities.add("lsp-startup-ipc-v1");
+  await assert.rejects(old.backend.loadLspStartupState(old.session), /Close the old R session/,
+    "legacy unauthenticated private IPC cannot authorize credential retrieval");
   assert.deepEqual(old.writes, []);
+  assert.equal(old.ipc.length, 0, "no private request is made to an unauthenticated v1 broker");
 });
 
 test("detach rejects pending private reads and clears late sensitive data", async t => {
