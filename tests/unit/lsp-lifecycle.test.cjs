@@ -1102,3 +1102,19 @@ test("a replacement that still requests restart fails refresh without declaring 
   assert.equal(instances.length, 2, "a failed verification must not spin through replacement processes");
   assert.ok(!instances[1].requests.some(request => request.method === "completion"));
 });
+
+test("package refresh sends pinned installations and explicit monitoring exclusions", async t => {
+  const { client, instances } = createClient(t);
+  await client.start();
+  await client.refreshPackages({
+    libraries: [],
+    packages: new Map([["example", { name: "example", version: "1.0",
+      path: "/configured-alias/example", target: "/pinned-library/example", identity: "installed" }]]),
+    changed: [], unmonitored: ["linked"], unmonitoredRoots: ["/suspended-library"],
+    isCurrent: () => true,
+  });
+  const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
+  assert.deepEqual(request.params.installations, { example: "/pinned-library/example" });
+  assert.deepEqual(request.params.unmonitored, ["linked"]);
+  assert.deepEqual(request.params.unmonitoredRoots, ["/suspended-library"]);
+});

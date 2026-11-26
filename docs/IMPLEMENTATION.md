@@ -1238,30 +1238,60 @@ an unchanged directory remains an inventory event. Applying `.libPaths()` and lo
 packages still use R's ordinary filesystem access, including configured network paths.
 
 The package inventory receives the same ordered snapshot for its own monitoring.
-Unchanged libraries retain their filesystem and parent watchers and cached
-package inventories. Reordering avoids directory rescans; added paths are scanned
+Unchanged libraries retain their directory watchers and cached package inventories.
+Reordering avoids directory rescans; added paths are scanned
 and removed paths are unwatched. An in-flight scan from the previous search order
 cannot suppress publication of the newer order.
 
-`PackageInventory` monitors library folders outside the R process. Folder
-events schedule a scan of the changed library after 250 ms. It reads package names,
-versions, resolved paths, and package-directory timestamps, reusing unchanged
-package records. Linked package directories and their target parents are also
-polled for replacement, removal, recreation and installation locks. Polling
-notifications are verified against installed package identities and known
-lock paths before a full scan. Directory timestamp touches reuse cached package
-records and remain quiet in the lifecycle log. Package
-symlink chains are followed hop by hop with cycle detection and a traversal
-limit. Each hop's parent remains monitored, and the final target's lock location
-is resolved even while the package is absent during installation. Named locks
-are checked against both the logical package name and its resolved directory
-name, which may differ for versioned external caches. External cache locks are
-inspected by their individual paths, requiring traversal permission on the cache
-parent. Scans use bounded asynchronous file operations. Named installation locks
-defer their package; a `00LOCK` directory defers the whole library. Deferred paths remain
-tracked while a lock is held, including packages absent from the initial
-inventory. Package identities and deferred paths must be stable across two
-scans before publication. Releasing a lock reconciles loaded namespaces even
+`PackageInventory` monitors the effective configured library directories and their
+immediate ordinary package directories outside the R process. Each directory receives
+a non-recursive `fs.watch()` subscription. The monitor opens no individual-file
+watches and descends no further than the package-directory level. Notifications from
+an immediate package directory trigger a package metadata check. Changes deeper
+inside a package remain outside monitoring scope. Folder
+events schedule a scan of the changed library after 250 ms; a notification-driven
+50 ms timer reconciles added, replaced and removed package-directory watches. Idle
+inventories have no periodic filesystem poller. Delivery of changes on a network
+filesystem depends on its support for filesystem notifications.
+
+Configured paths define the monitoring roots, including network paths and explicitly
+configured directory aliases. Each path is resolved once when it enters the effective
+library list. Watches, scans and published installation locations use that pinned
+root. Retargeting the configured alias leaves the pinned location unchanged. Removing
+and readding the configured path selects its current destination. A pinned root or
+ancestor subsequently replaced by a link suspends that library's monitoring; the
+new destination receives no automatic subscription or scan. Parent directories have
+no watch subscriptions. Root replacement recovery depends on notifications from the
+existing directory watch, with retries for unavailable ordinary roots.
+
+Scans inspect ordinary package directories directly inside each library. They read
+package names, versions, canonical library locations and package-directory timestamps,
+reusing unchanged package records. Installation identities include directory and
+metadata-file timestamps and identities, so direct metadata changes can refresh the
+inventory while repeated notifications for unchanged files reuse cached records.
+Package symlinks and junctions are excluded from metadata
+inspection and watch registration. `lstat` checks package directories and the `Meta`,
+`package.rds` and `DESCRIPTION` components before metadata access; linked components
+are excluded. Metadata must be ordinary files, and `DESCRIPTION` is opened with
+`O_NOFOLLOW` where available. These checks also handle links introduced after
+directory enumeration. External package cache destinations receive no watches or
+polling.
+
+Excluded package names and suspended library roots accompany inventory publications.
+The console's language-server adapter skips their namespace reconciliation before
+resolving package paths. A linked entry that precedes an ordinary copy in the library
+search order excludes that name from automatic reconciliation, because the inventory
+cannot establish the linked installation's validity or identity. R's ordinary package
+loading and completion lookup continue to use its configured library paths. Updating
+a linked package's external target produces no automatic package refresh.
+
+Scans use bounded asynchronous file operations. Ordinary named installation locks
+defer their package; an ordinary `00LOCK` directory defers the whole library. Lock
+backup discovery checks directory components before descending, and linked lock
+entries are excluded. Deferred paths use logical and canonical library roots and
+remain tracked while a lock is held, including packages absent from the initial
+inventory. Package identities, exclusions and deferred paths must be stable across
+two scans before publication. Releasing a lock reconciles loaded namespaces even
 when the inventory contains the same package identities. Failed reconciliation
 keeps the release pending for retry.
 

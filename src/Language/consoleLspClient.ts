@@ -792,7 +792,9 @@ export class ConsoleLspClient implements CompletionProvider {
         this.options.onPackagesChanged?.();
       }
       const params = {
-        installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
+        installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.target])),
+        unmonitored: change.unmonitored ?? [],
+        unmonitoredRoots: change.unmonitoredRoots ?? [],
         deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
         // A recovered server already loaded the current installations.
         changed: client === previousClient ? change.changed : [],

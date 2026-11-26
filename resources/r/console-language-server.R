@@ -294,18 +294,26 @@ server$request_handlers[["rConsole/syncLibraryPaths"]] <- function(self, id, par
 server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, params) {
     changed <- normalize_character(params$changed)
     loaded <- loadedNamespaces()
-    deferred <- normalizePath(normalize_character(params$deferred), winslash = "/", mustWork = FALSE)
+    unmonitored <- normalize_character(params$unmonitored)
+    unmonitored_roots <- chartr("\\", "/", normalize_character(params$unmonitoredRoots))
+    deferred <- chartr("\\", "/", normalize_character(params$deferred))
     switched <- Filter(function(pkgname) {
-        current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
+        # Excluded installations remain outside automatic reconciliation. Check
+        # names before resolving paths, which could traverse a package link.
+        if (pkgname %in% unmonitored) return(FALSE)
         # Initial discovery can encounter a package that was already loaded
         # while its installation is locked. Reconcile it after the lock clears.
+        current <- chartr("\\", "/", getNamespaceInfo(pkgname, "path"))
+        if (dirname(current) %in% unmonitored_roots) return(FALSE)
         if (current %in% deferred) return(FALSE)
         installation <- params$installations[[pkgname]]
         if (is.null(installation)) return(TRUE)
+        current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
         selected <- normalizePath(installation, winslash = "/", mustWork = FALSE)
         !identical(selected, current)
     }, setdiff(loaded, "base"))
-    restart <- union(intersect(normalize_character(params$changedInstallations), loaded), switched)
+    restart <- union(intersect(setdiff(normalize_character(params$changedInstallations),
+        unmonitored), loaded), switched)
     if (length(restart)) {
         # Removing metadata cannot replace functions or DLLs already loaded in R.
         return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))

@@ -289,51 +289,6 @@ test("background package refresh preserves unaffected libraries and switches rem
   assert.ok(instances.every(instance => !instance.requests.some(request => request.method === "rConsole/checkPackageChanges")));
 });
 
-test("real R refreshes linked project libraries when package links are added, replaced or removed", { timeout: 120000 }, async t => {
-  const { session, configured, createClient } = temporaryLibraries(t);
-  const root = path.dirname(session);
-  const cache = path.join(root, "cache");
-  fs.mkdirSync(cache);
-  const pkg = "rconsolelinkedtest";
-  const source = path.join(root, pkg);
-  fs.mkdirSync(path.join(source, "R"), { recursive: true });
-  fs.writeFileSync(path.join(source, "DESCRIPTION"), [
-    "Package: " + pkg, "Version: 1.0", "Title: Completion Test", "Description: A test package.",
-    "Author: Test", "Maintainer: Test <test@example.org>", "License: MIT", "",
-  ].join("\n"));
-  function install(library, exported) {
-    fs.writeFileSync(path.join(source, "R", "f.R"), exported + " <- function() NULL\n");
-    fs.writeFileSync(path.join(source, "NAMESPACE"), "export(" + exported + ")\n");
-    execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["CMD", "INSTALL", "--no-byte-compile",
-      "--no-test-load", "-l", library, source], { stdio: "pipe" });
-  }
-  install(configured, "originalExport");
-  install(cache, "replacementExport");
-  const { client, complete, instances, logs } = createClient({ libraries: [session] });
-  await client.start();
-  await waitFor(() => logs.some(line => line.includes("unique package names")), "initial inventory");
-  const link = path.join(session, pkg);
-  const linkType = process.platform === "win32" ? "junction" : "dir";
-  fs.symlinkSync(path.join(configured, pkg), link, linkType);
-  await waitFor(() => logs.some(line => line.includes("Added: " + pkg)), "linked package installation");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 1);
-
-  logs.length = 0;
-  fs.unlinkSync(link);
-  fs.symlinkSync(path.join(cache, pkg), link, linkType);
-  await waitFor(() => logs.some(line => line.includes("Updated: " + pkg)), "linked package replacement");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "replacementExport"));
-  assert.equal(instances.length, 2);
-
-  logs.length = 0;
-  fs.unlinkSync(link);
-  await waitFor(() => logs.some(line => line.includes("no copies remain")), "linked package removal");
-  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
-  assert.equal(instances.length, 3);
-});
-
-
 test("real console library-path IPC updates completion without filesystem monitoring", { timeout: 120000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-live-libpaths-"));
   const first = path.join(root, "first");
@@ -842,87 +797,39 @@ test("unrelated abandoned locks do not retain removed namespace metadata", { tim
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "installedExport"));
 });
 
-test("linked cache changes refresh namespace exports without touching the library link", { timeout: 90000 }, async t => {
-  const { first, second: cache, pkg, install, createClient } = lifecycleFixture(t);
+test("linked startup packages stay usable without monitoring their external cache", { timeout: 90000 }, async t => {
+  const { first, second: cache, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(cache, "originalExport");
   const target = path.join(cache, pkg);
   fs.symlinkSync(target, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
-  const { client, complete } = createClient({ libraries: [first] });
-  await client.start();
-  await waitFor(() => client.packageInventory.initialized, "initial inventory");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  const originalIdentity = client.packageInventory.packages.get(pkg).identity;
-  install(cache, "replacementExport");
-  await waitFor(() => client.packageInventory.packages.get(pkg)?.identity !== originalIdentity, "external cache replacement");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  fs.rmSync(target, { recursive: true });
-  await waitFor(() => !client.packageInventory.packages.has(pkg), "external cache removal");
-  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
-});
-
-test("a traversable unlistable cache retires removed namespace completions", {
-  skip: process.platform === "win32" || process.getuid?.() === 0,
-  timeout: 90000,
-}, async t => {
-  const { first, second: cache, pkg, install, createClient } = lifecycleFixture(t);
-  install(cache, "originalExport");
-  const target = path.join(cache, pkg);
-  fs.symlinkSync(target, path.join(first, pkg), "dir");
-  fs.chmodSync(cache, 0o311);
-  let client;
-  try {
-    await assert.rejects(fs.promises.readdir(cache), { code: "EACCES" });
-    execFileSync("Rscript", ["--vanilla", "-e", `library(${pkg}, lib.loc=${JSON.stringify(first)})`], { stdio: "pipe" });
-    const result = createClient({ libraries: [first] });
-    client = result.client;
-    await client.start();
-    await waitFor(() => client.packageInventory.initialized, "inventory of a traversable unlistable cache");
-    assert.ok((await result.complete(pkg + "::")).some(item => item.label === "originalExport"));
-    fs.rmSync(target, { recursive: true });
-    await waitFor(() => !client.packageInventory.packages.has(pkg), "unlistable cache removal published");
-    assert.ok(!(await result.complete(pkg + "::")).some(item => item.label === "originalExport"));
-    assert.ok(!result.logs.some(line => line.includes("Could not refresh package inventory")));
-  } finally {
-    fs.chmodSync(cache, 0o700);
-    await client?.dispose();
-  }
-});
-
-test("a chained package link retains its startup namespace until the cache installation unlocks", { timeout: 90000 }, async t => {
-  const { first, second: cache, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  const alias = path.join(root, "alias"), replacement = path.join(root, "replacement");
-  fs.mkdirSync(alias); fs.mkdirSync(replacement);
-  install(cache, "originalExport");
-  install(replacement, "replacementExport");
-  const target = path.join(cache, pkg), intermediate = path.join(alias, pkg);
-  fs.symlinkSync(target, intermediate, process.platform === "win32" ? "junction" : "dir");
-  fs.symlinkSync(intermediate, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
   const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
     R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
   const { client, instances, complete, logs } = createClient({ env, libraries: [first] });
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.ok(!client.packageInventory.packages.has(pkg));
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  const originalIdentity = client.packageInventory.packages.get(pkg).identity;
-  const lock = path.join(cache, "00LOCK-" + pkg);
-  fs.mkdirSync(lock);
-  fs.renameSync(target, path.join(lock, pkg));
-  await waitFor(() => client.packageInventory.libraries.some(library => library.deferred?.has(pkg)),
-    "the cache lock defers the missing final target");
-  assert.equal(client.packageInventory.packages.get(pkg)?.identity, originalIdentity);
-  assert.equal(instances.length, 1, "the locked backup must not restart the language server");
-  fs.renameSync(path.join(replacement, pkg), target);
-  await new Promise(resolve => setTimeout(resolve, 1800));
-  assert.equal(client.packageInventory.packages.get(pkg)?.identity, originalIdentity);
-  assert.equal(instances.length, 1, "the new copy remains deferred until unlock");
-  fs.rmSync(lock, { recursive: true });
-  await waitFor(() => logs.some(line => line.includes("Updated: " + pkg)), "unlocked replacement published");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 2, "unlock replaces the loaded namespace once");
+  assert.equal(instances.length, 1, "excluding a loaded linked package must not restart the server");
+  const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
+  assert.ok(request.params.unmonitored.includes(pkg));
+
+  logs.length = 0;
+  install(cache, "replacementExport");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(instances.length, 1, "external cache changes must not trigger a refresh");
+  assert.ok(!logs.some(line => line.includes("Scanning folder:")));
+
+  const ordinary = "rconsoleordinaryprobe";
+  install(first, "ordinaryExport", "", ordinary);
+  await waitFor(() => client.packageInventory.packages.has(ordinary), "ordinary installation");
+  assert.ok((await complete(ordinary + "::")).some(item => item.label === "ordinaryExport"));
+  assert.equal(instances.length, 1);
+  fs.rmSync(path.join(first, ordinary), { recursive: true });
+  await waitFor(() => !client.packageInventory.packages.has(ordinary) && !client.packageRefreshPromise,
+    "ordinary removal");
+  assert.ok(!(await complete(ordinary + "::")).some(item => item.label === "ordinaryExport"));
+  assert.equal(instances.length, 2, "ordinary loaded-package removal still refreshes the server");
+  assert.ok(!logs.some(line => line.includes("retained stale packages")));
 });
 
 test("initial locked namespaces stay usable and an excluded startup namespace is retired", { timeout: 90000 }, async t => {

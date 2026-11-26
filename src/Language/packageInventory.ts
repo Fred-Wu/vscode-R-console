@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { EventEmitter } from "events";
 
 export type PackageInstallation = {
   name: string;
@@ -12,13 +13,18 @@ export type PackageInstallation = {
 export type LibraryInventory = {
   path: string;
   packages: Map<string, PackageInstallation>;
-  // Keep each locked package's logical and resolved paths until its lock clears.
+  // Keep each locked package's paths until its lock clears.
   deferred?: Map<string, string[]>;
+  // Names excluded from monitoring because their installation contains links.
+  unmonitored?: Set<string>;
+  suspended?: boolean;
 };
 export type PackageInventoryChange = {
   libraries: LibraryInventory[];
   packages: Map<string, PackageInstallation>;
   changed: string[];
+  unmonitored?: string[];
+  unmonitoredRoots?: string[];
   // Selection changes can reuse an installation already observed unchanged.
   // Only content changes require reloading a namespace at the same path.
   changedInstallations?: string[];
@@ -29,18 +35,12 @@ export class PackageInventory {
   private paths: string[] = [];
   private libraries: LibraryInventory[] = [];
   private packages = new Map<string, PackageInstallation>();
-  private readonly watchers = new Map<string, fs.FSWatcher>();
-  // The child watcher follows the old inode after the library is replaced.
-  // Watch its parent as well so an atomic directory/symlink switch re-arms it.
-  private readonly parentWatchers = new Map<string, fs.FSWatcher>();
-  // fs.watch follows the directory inode (or a symlink's target), not its path.
-  private readonly watchedTargets = new Map<string, string | undefined>();
-  // Poll only linked installations and their target parents. stat follows the
-  // link through deletion/recreation and works when its cache is outside the
-  // library's filesystem watcher. Parent changes include installation locks.
-  private readonly linkedWatches = new Map<string, {
-    libraries: Set<string>; listener: (current: fs.Stats, previous: fs.Stats) => void;
-  }>();
+  private readonly watchers = new Map<string, PackageDirectoryWatcher>();
+  // Resolve explicitly configured aliases once. Watch and scan that root for
+  // the lifetime of this configuration; retargeting an alias grants no new root.
+  private readonly roots = new Map<string, string>();
+  private readonly suspended = new Set<string>();
+  private readonly watchedTargets = new Map<string, string>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -70,10 +70,10 @@ export class PackageInventory {
         this.watchedTargets.delete(library);
       }
     }
-    for (const [library, watcher] of this.parentWatchers) {
+    for (const library of this.roots.keys()) {
       if (!active.has(library)) {
-        watcher.close();
-        this.parentWatchers.delete(library);
+        this.roots.delete(library);
+        this.suspended.delete(library);
       }
     }
     for (const library of this.dirtyLibraries) {
@@ -82,86 +82,81 @@ export class PackageInventory {
     for (const library of this.unconfirmedLibraries) {
       if (!active.has(library)) this.unconfirmedLibraries.delete(library);
     }
-    for (const [file, watch] of this.linkedWatches) {
-      for (const library of watch.libraries) if (!active.has(library)) watch.libraries.delete(library);
-      if (!watch.libraries.size) {
-        fs.unwatchFile(file, watch.listener);
-        this.linkedWatches.delete(file);
-      }
-    }
     this.paths = [...paths];
     this.revision++;
     this.candidate = undefined;
     for (const library of paths) {
-      if (!this.parentWatchers.has(library)) this.watchParent(library);
       if (!this.watchers.has(library)) this.watchLibrary(library);
     }
     this.schedule(0);
   }
 
-  private libraryTarget(library: string): string | undefined {
-    try {
-      const stats = fs.statSync(library);
-      // A real path distinguishes symlink / junction retargeting. Device,
-      // inode, and creation time distinguish replacement at the same path,
-      // including on Windows volumes where inode may not be available.
-      return JSON.stringify([
-        fs.realpathSync.native(library), stats.dev,
-        stats.ino || stats.birthtimeMs,
-      ]);
-    } catch {
-      // A temporarily missing target must be re-armed by the parent watcher.
-      return undefined;
+  private rootFor(library: string): string {
+    if (this.disposed || !this.paths.includes(library)) throw new Error("Library monitoring configuration changed");
+    let root = this.roots.get(library);
+    if (root === undefined) {
+      try { root = fs.realpathSync.native(library); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // Pin the location of a temporarily missing library too.
+        root = path.join(fs.realpathSync.native(path.dirname(library)), path.basename(library));
+      }
+      this.roots.set(library, root);
     }
+    return root;
   }
 
-  private watchParent(library: string): void {
-    if (this.disposed || this.parentWatchers.has(library)) return;
-    try {
-      const basename = path.basename(library);
-      const watcher = fs.watch(path.dirname(library), { persistent: false }, (_event, filename) => {
-        if (this.disposed || this.parentWatchers.get(library) !== watcher) return;
-        if (filename && String(filename).toLowerCase() !== basename.toLowerCase()) return;
-        // macOS can omit filenames for unrelated parent changes. Only re-arm
-        // if the watched directory was actually removed or replaced.
-        const previous = this.watchers.get(library);
-        const target = this.libraryTarget(library);
-        if (previous && target !== undefined &&
-            target === this.watchedTargets.get(library)) return;
-        if (previous) previous.close();
+  private libraryTarget(library: string): string | undefined {
+    if (this.suspended.has(library)) return undefined;
+    const root = this.rootFor(library);
+    // A pinned root or one of its ancestors can subsequently become a link.
+    // Check from the filesystem root so no check traverses a known link.
+    let current = path.parse(root).root;
+    let stats: fs.Stats | undefined;
+    for (const part of root.slice(current.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      stats = fs.lstatSync(current);
+      if (stats.isSymbolicLink()) {
+        this.suspended.add(library);
+        this.watchers.get(library)?.close();
         this.watchers.delete(library);
         this.watchedTargets.delete(library);
-        this.watchLibrary(library, true);
         this.dirtyLibraries.add(library);
         this.schedule(250);
-      });
-      watcher.on("error", error => {
-        if (this.disposed || this.parentWatchers.get(library) !== watcher) return;
-        this.parentWatchers.delete(library);
-        watcher.close();
-        this.log(`[Libraries] Could not watch parent of ${library}: ${String(error)}`);
-        this.scheduleRetry();
-      });
-      this.parentWatchers.set(library, watcher);
-    } catch (error) {
-      this.log(`[Libraries] Could not watch parent of ${library}: ${String(error)}`);
-      this.scheduleRetry();
+        this.log(`[Libraries] Monitoring suspended: ${library} - configured root was replaced by a link`);
+        return undefined;
+      }
     }
+    stats ??= fs.lstatSync(root);
+    if (!stats.isDirectory()) throw Object.assign(new Error("Library is not a directory"), { code: "ENOTDIR" });
+    return JSON.stringify([root, stats.dev, stats.ino || stats.birthtimeMs]);
   }
 
   private watchLibrary(library: string, recovering = false): void {
+    if (this.suspended.has(library)) return;
     try {
       const target = this.libraryTarget(library);
-      const watcher = fs.watch(library, { persistent: false }, (event, filename) => {
+      if (target === undefined) return;
+      const root = this.rootFor(library);
+      const watcher = new PackageDirectoryWatcher(root, () => this.libraryTarget(library) !== undefined, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
-        const name = filename ? String(filename) : "";
-        // Parent-unknown events and directory metadata touches need a cheap
-        // content check first. R can update a library directory's timestamp
-        // without changing any installed packages.
-        if (event === "change" || !name || name === path.basename(library)) {
-          this.unconfirmedLibraries.add(library);
-        } else {
+        let current: string | undefined;
+        try { current = this.libraryTarget(library); } catch { /* Recover a removed root below. */ }
+        if (current !== this.watchedTargets.get(library)) {
+          watcher.close();
+          this.watchers.delete(library);
+          this.watchedTargets.delete(library);
+          this.watchLibrary(library, true);
           this.dirtyLibraries.add(library);
+        } else {
+          const name = filename ? String(filename) : "";
+          // Directory notifications trigger a metadata identity check. Delayed
+          // or duplicate events alone do not establish an installation change.
+          if (event === "change" || !name || name === path.basename(root) || name.includes(path.sep)) {
+            this.unconfirmedLibraries.add(library);
+          } else {
+            this.dirtyLibraries.add(library);
+          }
         }
         this.schedule(250);
       });
@@ -183,127 +178,33 @@ export class PackageInventory {
     }
   }
 
-  private async resolvePackageLink(link: string, files: Set<string>): Promise<string> {
-    let target = link;
-    const visited = new Set<string>();
-    for (let hops = 0; hops < 40; hops++) {
-      // Resolve parent aliases independently of the package's existence. Walk
-      // each package link so a missing final target retains its lock location.
-      const parent = await fs.promises.realpath(path.dirname(target)).catch(error => {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        return path.dirname(target);
-      });
-      target = path.join(parent, path.basename(target));
-      files.add(parent);
-      if (visited.has(target)) break;
-      visited.add(target);
-      let destination: string;
-      try {
-        destination = await fs.promises.readlink(target);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "EINVAL") return target;
-        throw error;
-      }
-      // Preserve '..' until realpath resolves any preceding directory aliases.
-      target = path.isAbsolute(destination) ? destination : parent + path.sep + destination;
-      files.add(path.dirname(target));
-    }
-    throw Object.assign(new Error(`Too many symbolic links resolving ${link}`), { code: "ELOOP" });
-  }
-
-  private async watchLinkedPackages(library: string, entries: fs.Dirent[]): Promise<Map<string, string | null>> {
-    const targets = new Map<string, string | null>();
-    const files = new Set<string>();
-    for (const entry of entries) {
-      if (!entry.isSymbolicLink() || !/^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)) continue;
-      const link = path.join(library, entry.name);
-      files.add(link);
-      try {
-        const target = await this.resolvePackageLink(link, files);
-        targets.set(entry.name, target);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ELOOP" || code === "ENOTDIR") {
-          // An invalid installation is not a library-wide failure. Keep the
-          // link and visited parents watched so repair can be discovered.
-          targets.set(entry.name, null);
-        } else if (code !== "ENOENT" && code !== "EINVAL") throw error;
-      }
-    }
-    if (this.disposed || !this.paths.includes(library)) return targets;
-    for (const [file, watch] of this.linkedWatches) {
-      if (!files.has(file)) watch.libraries.delete(library);
-      if (!watch.libraries.size) {
-        fs.unwatchFile(file, watch.listener);
-        this.linkedWatches.delete(file);
-      }
-    }
-    for (const file of files) {
-      const existing = this.linkedWatches.get(file);
-      if (existing) { existing.libraries.add(library); continue; }
-      const libraries = new Set([library]);
-      const listener = (current: fs.Stats, previous: fs.Stats) => {
-        if (this.disposed || this.linkedWatches.get(file)?.listener !== listener) return;
-        if (current.dev === previous.dev && current.ino === previous.ino &&
-            current.mtimeMs === previous.mtimeMs && current.ctimeMs === previous.ctimeMs &&
-            current.size === previous.size && current.nlink === previous.nlink) return;
-        // Parent timestamps also change during ordinary R tasks (for example,
-        // renv sandbox maintenance). Verify package identities and lock paths
-        // before treating a polling notification as a package change.
-        for (const owner of libraries) this.unconfirmedLibraries.add(owner);
-        this.schedule(250);
-      };
-      fs.watchFile(file, { persistent: false, interval: 1000 }, listener);
-      this.linkedWatches.set(file, { libraries, listener });
-    }
-    return targets;
-  }
-
   private async installationLocks(library: string, entries: fs.Dirent[]): Promise<Set<string>> {
     const locked = new Set<string>();
-    const read = async (directory: string) => {
-      try { return await fs.promises.readdir(directory, { withFileTypes: true }); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
-      }
-    };
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const named = /^00LOCK-([A-Za-z][A-Za-z0-9.]*)$/.exec(entry.name);
       if (named) locked.add(named[1]);
       else if (entry.name === "00LOCK") {
-        // R also uses a whole-library lock for binary and multi-package
-        // installs. Its scope includes new packages with no backup yet.
         locked.add("*");
-        for (const folder of [path.join(library, "00LOCK"), path.join(library, "00LOCK", "00new")]) {
-          for (const item of await read(folder)) {
-            if ((item.isDirectory() || item.isSymbolicLink()) && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.name)) {
-              locked.add(item.name);
+        // Inspect ordinary backup directories for packages absent at discovery.
+        // Check each component before descending into the next one.
+        let folder = path.join(library, "00LOCK");
+        for (let depth = 0; depth < 2; depth++) {
+          try {
+            if (!(await fs.promises.lstat(folder)).isDirectory()) break;
+            for (const item of await fs.promises.readdir(folder, { withFileTypes: true })) {
+              if (item.isDirectory() && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.name)) locked.add(item.name);
             }
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+            break;
           }
+          folder = path.join(folder, "00new");
         }
       }
     }
     return locked;
-  }
-
-  private packageLockPaths(target: string, name: string): string[] {
-    // A versioned cache directory can differ from the logical package name.
-    return [...new Set(["00LOCK", `00LOCK-${name}`, `00LOCK-${path.basename(target)}`])]
-      .map(lock => path.join(path.dirname(target), lock));
-  }
-
-  private async isInstallationLock(file: string): Promise<boolean> {
-    // Traversal permission is sufficient to load a linked package. Inspect
-    // known lock paths without requiring a listing of the external cache.
-    try { return (await fs.promises.lstat(file)).isDirectory(); }
-    catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return false;
-      throw error;
-    }
   }
 
   private clearRetry(): void {
@@ -325,7 +226,6 @@ export class PackageInventory {
       this.retryTimer = undefined;
       this.log("[Libraries] Recovery retry started");
       for (const library of this.paths) {
-        if (!this.parentWatchers.has(library)) this.watchParent(library);
         if (!this.watchers.has(library)) this.watchLibrary(library, true);
       }
       void this.refresh();
@@ -344,10 +244,8 @@ export class PackageInventory {
     this.watchers.clear();
     this.watchedTargets.clear();
     this.unconfirmedLibraries.clear();
-    for (const watcher of this.parentWatchers.values()) watcher.close();
-    this.parentWatchers.clear();
-    for (const [file, watch] of this.linkedWatches) fs.unwatchFile(file, watch.listener);
-    this.linkedWatches.clear();
+    this.roots.clear();
+    this.suspended.clear();
   }
 
   refresh(): Promise<void> {
@@ -360,8 +258,7 @@ export class PackageInventory {
     this.unconfirmedLibraries.clear();
     const request = this.scan(revision, dirty, unconfirmed).then(() => {
       if (!this.disposed && revision === this.revision &&
-          this.watchers.size === this.paths.length &&
-          this.parentWatchers.size === this.paths.length &&
+          this.paths.every(library => this.watchers.has(library) || this.suspended.has(library)) &&
           !this.dirtyLibraries.size && !this.unconfirmedLibraries.size) {
         if (this.retryDelay > 1000) this.log("[Libraries] Recovery complete; retries stopped");
         this.clearRetry();
@@ -410,31 +307,25 @@ export class PackageInventory {
 
   private async hasInstalledPackagesChanged(library: string, previous: LibraryInventory): Promise<boolean> {
     try {
-      const entries = await fs.promises.readdir(library, { withFileTypes: true });
-      if (entries.some(entry => entry.name.startsWith("00LOCK"))) return true;
+      if (this.libraryTarget(library) === undefined) return true;
+      const root = this.rootFor(library);
+      const entries = await fs.promises.readdir(root, { withFileTypes: true });
+      if (entries.some(entry => entry.isDirectory() && /^00LOCK(?:-[A-Za-z][A-Za-z0-9.]*)?$/.test(entry.name))) return true;
       if (previous.deferred?.size) return true;
-      const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+      const names = entries.filter(entry => entry.isDirectory() &&
         /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name);
       if (names.length !== previous.packages.size) return true;
-      const linkedNames = new Set(entries.filter(entry => entry.isSymbolicLink()).map(entry => entry.name));
-      // Same-name installations may be replaced, including via symlink targets.
+      const links = entries.filter(entry => entry.isSymbolicLink() &&
+        /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name);
+      if (links.length !== (previous.unmonitored?.size ?? 0) ||
+          links.some(name => !previous.unmonitored?.has(name))) return true;
       // Compare the identities already used by readPackage(), without reading
       // DESCRIPTION or any package metadata on unchanged events.
       for (const name of names) {
         const installed = previous.packages.get(name);
         if (!installed) return true;
-        const directory = path.join(library, name);
-        const target = await fs.promises.realpath(directory);
-        const stat = await fs.promises.stat(directory);
-        const identity = JSON.stringify([target, stat.mtimeMs, stat.ctimeMs, stat.ino]);
-        if (identity !== installed.identity) return true;
-        // An installer creates its lock before moving the package. The target
-        // identity can still match while its parent reports that lock change.
-        if (linkedNames.has(name)) {
-          for (const lock of this.packageLockPaths(target, name)) {
-            if (await this.isInstallationLock(lock)) return true;
-          }
-        }
+        const current = await this.inspectPackage(library, name);
+        if (!current || current.identity !== installed.identity) return true;
       }
       return false;
     } catch {
@@ -446,15 +337,6 @@ export class PackageInventory {
   private async scan(revision: number, dirty: Set<string>,
     unconfirmed: Set<string> = new Set()): Promise<void> {
     const libraries: LibraryInventory[] = [];
-    const lockRequests = new Map<string, Promise<boolean>>();
-    const isLocked = (file: string) => {
-      let pending = lockRequests.get(file);
-      if (!pending) {
-        pending = this.isInstallationLock(file);
-        lockRequests.set(file, pending);
-      }
-      return pending;
-    };
     for (const library of this.paths) {
       if (this.disposed || revision !== this.revision) return;
       const previous = this.libraries.find(item => item.path === library);
@@ -470,27 +352,34 @@ export class PackageInventory {
       let entries: fs.Dirent[];
       try {
         this.log(`[Libraries] Scanning folder: ${library}`);
-        entries = await fs.promises.readdir(library, { withFileTypes: true });
+        if (this.libraryTarget(library) === undefined) {
+          libraries.push({ path: library, packages: new Map(), suspended: true,
+            unmonitored: new Set([...(previous?.packages.keys() ?? []), ...(previous?.unmonitored ?? [])]) });
+          continue;
+        }
+        entries = await fs.promises.readdir(this.rootFor(library), { withFileTypes: true });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         entries = [];
       }
-      const targets = await this.watchLinkedPackages(library, entries);
       if (this.disposed || revision !== this.revision) return;
-      const locked = await this.installationLocks(library, entries);
+      const locked = await this.installationLocks(this.rootFor(library), entries);
+      const unmonitored = new Set(entries.filter(entry => entry.isSymbolicLink() &&
+        /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name));
       if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
       const deferred = new Map<string, string[]>();
-      const defer = (name: string, target?: string) => {
+      const libraryRoot = this.rootFor(library);
+      const defer = (name: string) => {
         const old = previous?.packages.get(name);
         const paths = new Set(previous?.deferred?.get(name));
         paths.add(path.join(library, name));
-        if (target) paths.add(target);
+        paths.add(path.join(libraryRoot, name));
         if (old?.target) paths.add(old.target);
         deferred.set(name, [...paths].sort());
         return old;
       };
       const names = [...new Set([
-        ...entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+        ...entries.filter(entry => entry.isDirectory() &&
           /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name),
         ...[...locked].filter(name => name !== "*"),
         ...(locked.has("*") ? previous?.packages.keys() ?? [] : []),
@@ -501,19 +390,15 @@ export class PackageInventory {
         if (this.disposed || revision !== this.revision) return;
         const batch = await Promise.all(names.slice(offset, offset + 8).map(async name => {
           const old = previous?.packages.get(name);
-          const target = targets.get(name);
-          if (locked.has("*") || locked.has(name)) return defer(name, target ?? undefined);
-          if (target === null) return undefined;
-          if (target) {
-            for (const lock of this.packageLockPaths(target, name)) {
-              if (await isLocked(lock)) return defer(name, target);
-            }
-          }
-          return this.readPackage(library, name, old);
+          if (unmonitored.has(name)) return undefined;
+          if (locked.has("*") || locked.has(name)) return defer(name);
+          const item = await this.readPackage(library, name, old);
+          if (item === null) unmonitored.add(name);
+          return item;
         }));
         for (const item of batch) if (item) packages.set(item.name, item);
       }
-      libraries.push({ path: library, packages,
+      libraries.push({ path: library, packages, unmonitored,
         deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) });
     }
     if (this.disposed || revision !== this.revision) return;
@@ -527,7 +412,7 @@ export class PackageInventory {
     // Lock transitions also need publication: a namespace deferred during
     // discovery may disappear without ever entering the package inventory.
     const signatureOf = (items: LibraryInventory[]) => JSON.stringify(items.map(library => [library.path,
-      [...library.packages.values()].map(item => [item.name, item.identity]), [...(library.deferred ?? [])]]));
+      [...library.packages.values()].map(item => [item.name, item.identity]), [...(library.deferred ?? [])], [...(library.unmonitored ?? [])].sort(), library.suspended ?? false]));
     const signature = signatureOf(libraries);
     const previousSignature = signatureOf(this.libraries);
     if (this.initialized && signature === previousSignature) {
@@ -546,11 +431,15 @@ export class PackageInventory {
     }
 
     const packages = new Map<string, PackageInstallation>();
+    const unmonitored = new Set<string>();
     for (const library of libraries) {
-      for (const [name, item] of library.packages) if (!packages.has(name)) packages.set(name, item);
+      for (const name of library.unmonitored ?? []) if (!packages.has(name)) unmonitored.add(name);
+      for (const [name, item] of library.packages) {
+        if (!packages.has(name) && !unmonitored.has(name)) packages.set(name, item);
+      }
     }
     const changed = [...new Set([...this.packages.keys(), ...packages.keys()])].filter(name =>
-      this.packages.get(name)?.identity !== packages.get(name)?.identity);
+      !unmonitored.has(name) && this.packages.get(name)?.identity !== packages.get(name)?.identity);
     const changedInstallations = changed.filter(name => {
       const selected = packages.get(name);
       if (!selected) return true;
@@ -558,16 +447,22 @@ export class PackageInventory {
         .find(item => item?.path === selected.path);
       return previous?.identity !== selected.identity;
     });
-    await this.onChange({ libraries, packages, changed: this.initialized ? changed : [],
+    const unmonitoredRoots = libraries.filter(library => library.suspended)
+      .flatMap(library => [library.path, this.rootFor(library.path)]);
+    await this.onChange({ libraries, packages, unmonitored: [...unmonitored], unmonitoredRoots, changed: this.initialized ? changed : [],
       changedInstallations: this.initialized ? changedInstallations : [],
       isCurrent: () => !this.disposed && revision === this.revision });
     if (this.disposed || revision !== this.revision) return;
 
     if (this.initialized) {
       for (const library of this.libraries) {
-        const next = libraries.find(item => item.path === library.path)?.packages;
+        const next = libraries.find(item => item.path === library.path);
         for (const [name, item] of library.packages) {
-          if (!next?.has(name)) {
+          if (!next?.packages.has(name)) {
+            if (next?.unmonitored?.has(name)) {
+              this.log(`[Packages] Monitoring skipped: ${name} - installation contains links`);
+              continue;
+            }
             this.log(`[Packages] Removed copy: ${name} ${item.version} - ${item.path}`);
             const active = packages.get(name);
             if (active && active.identity === this.packages.get(name)?.identity) {
@@ -587,6 +482,7 @@ export class PackageInventory {
         }
       }
       for (const [name, old] of this.packages) {
+        if (unmonitored.has(name)) continue;
         const next = packages.get(name);
         if (!next) this.log(`[Packages] Removed: ${name} - no copies remain in active libraries`);
         else if (next.path !== old.path) {
@@ -606,25 +502,135 @@ export class PackageInventory {
     this.candidate = undefined;
   }
 
-  private async readPackage(library: string, name: string, previous?: PackageInstallation): Promise<PackageInstallation | undefined> {
-    const directory = path.join(library, name);
+  private async inspectPackage(library: string, name: string): Promise<{ directory: string; identity: string } | null | undefined> {
+    const directory = path.join(this.rootFor(library), name);
     try {
-      const target = await fs.promises.realpath(directory);
-      const stat = await fs.promises.stat(directory);
-      const identity = JSON.stringify([target, stat.mtimeMs, stat.ctimeMs, stat.ino]);
-      if (previous?.identity === identity) return previous;
-      await fs.promises.access(path.join(directory, "Meta", "package.rds"));
-      const description = await fs.promises.readFile(path.join(directory, "DESCRIPTION"), "utf8");
+      const stat = await fs.promises.lstat(directory);
+      if (stat.isSymbolicLink()) return null;
+      if (!stat.isDirectory()) return undefined;
+      const meta = await fs.promises.lstat(path.join(directory, "Meta"));
+      if (meta.isSymbolicLink()) return null;
+      if (!meta.isDirectory()) return undefined;
+      const metadata = await fs.promises.lstat(path.join(directory, "Meta", "package.rds"));
+      const description = await fs.promises.lstat(path.join(directory, "DESCRIPTION"));
+      if (metadata.isSymbolicLink() || description.isSymbolicLink()) return null;
+      if (!metadata.isFile() || !description.isFile()) return undefined;
+      const identity = JSON.stringify([directory, ...[stat, metadata, description]
+        .map(value => [value.dev, value.ino, value.mtimeMs, value.ctimeMs, value.size])]);
+      return { directory, identity };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") return null;
+      if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+      throw error;
+    }
+  }
+
+  private async readPackage(library: string, name: string, previous?: PackageInstallation): Promise<PackageInstallation | null | undefined> {
+    const current = await this.inspectPackage(library, name);
+    if (!current) return current;
+    const { directory, identity } = current;
+    if (previous?.identity === identity) return previous;
+    try {
+      const descriptionPath = path.join(directory, "DESCRIPTION");
+      // Protect the final component if it changes between lstat and open.
+      const file = await fs.promises.open(descriptionPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      let description: string;
+      try {
+        if (!(await file.stat()).isFile()) return undefined;
+        description = await file.readFile("utf8");
+      } finally { await file.close(); }
       const packageName = /^Package:\s*(\S+)/m.exec(description)?.[1];
       const version = /^Version:\s*(\S+)/m.exec(description)?.[1];
       if (packageName !== name || !version) return undefined;
-      return { name, version, path: directory, target, identity };
+      return { name, version, path: path.join(library, name), target: directory, identity };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      // A package can become invalid between link resolution and metadata
-      // inspection. Do not let a missing or malformed path abort the scan.
-      if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return undefined;
+      if (code === "ELOOP") return null;
+      // An installation can disappear while its directory is being scanned.
+      if (code === "ENOENT" || code === "ENOTDIR") return undefined;
       throw error;
+    }
+  }
+}
+
+/** Watch the library and its immediate ordinary package directories.
+ * Each OS watch is non-recursive; package contents and links are not traversed. */
+class PackageDirectoryWatcher extends EventEmitter {
+  private readonly directories = new Map<string, { watcher: fs.FSWatcher; identity: string }>();
+  private timer: NodeJS.Timeout | undefined;
+  private closed = false;
+
+  constructor(private readonly root: string, private readonly rootIsValid: () => boolean,
+    onChange: (event: string, filename?: string) => void) {
+    super();
+    this.on("change", onChange);
+    try { this.refresh(); }
+    catch (error) { this.close(); throw error; }
+  }
+
+  close(): void {
+    this.closed = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    for (const { watcher } of this.directories.values()) watcher.close();
+    this.directories.clear();
+  }
+
+  private refresh(): void {
+    if (this.closed || !this.rootIsValid()) return;
+    const present = new Set<string>();
+    const visit = (directory: string, library = false) => {
+      if (this.closed) return;
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(directory); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") return;
+        throw error;
+      }
+      if (!stat.isDirectory()) return;
+      present.add(directory);
+      const identity = JSON.stringify([stat.dev, stat.ino || stat.birthtimeMs]);
+      const previous = this.directories.get(directory);
+      if (previous?.identity !== identity) {
+        previous?.watcher.close();
+        const watcher = fs.watch(directory, { persistent: false, recursive: false }, (event, filename) => {
+          if (this.closed || this.directories.get(directory)?.watcher !== watcher) return;
+          const file = filename ? path.join(directory, String(filename)) : directory;
+          const relative = path.relative(this.root, file);
+          if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) return;
+          if (relative.split(path.sep).length > 2) return;
+          this.emit("change", event, relative);
+          if (this.closed || this.timer) return;
+          // Reconcile package directory watches after bursts of install events.
+          // This timer is scheduled only by a filesystem notification.
+          this.timer = setTimeout(() => {
+            this.timer = undefined;
+            try { this.refresh(); } catch (error) { this.emit("error", error); }
+          }, 50);
+          this.timer.unref();
+        });
+        watcher.on("error", error => {
+          if (!this.closed && this.directories.get(directory)?.watcher === watcher) this.emit("error", error);
+        });
+        this.directories.set(directory, { watcher, identity });
+      }
+      if (!library) return;
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") return;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory() && /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)) visit(path.join(directory, entry.name));
+      }
+    };
+    visit(this.root, true);
+    for (const [directory, { watcher }] of this.directories) {
+      if (!present.has(directory)) { watcher.close(); this.directories.delete(directory); }
     }
   }
 }

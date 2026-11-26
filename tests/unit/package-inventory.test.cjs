@@ -4,35 +4,25 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
-const { PackageInventory } = loadSource("src/Language/packageInventory.ts");
 
-function sameExistingDirectory(left, right) {
-  // Windows can refer to a directory by both its 8.3 short alias and long
-  // spelling. Compare the underlying directory, not its textual path.
-  try {
-    const actual = fs.statSync(left), expected = fs.statSync(right);
-    return actual.isDirectory() && expected.isDirectory() &&
-      actual.dev === expected.dev && actual.ino === expected.ino &&
-      actual.birthtimeMs === expected.birthtimeMs;
-  } catch (error) {
-    if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
-    throw error;
-  }
-}
-
-function fixture(t, notificationDelay = 0) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-"));
+function fixture(t, notificationDelay = 0, overrides = {}) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-")));
   const libraries = ["first", "second"].map(name => path.join(root, name));
   libraries.forEach(library => fs.mkdirSync(library));
   const changes = [], logs = [];
   const notifications = new Set();
-  const Inventory = notificationDelay ? loadSource("src/Language/packageInventory.ts", { fs: {
+  const watches = [];
+  const Inventory = loadSource("src/Language/packageInventory.ts", { fs: {
     ...fs,
-    watch: (file, options, callback) => fs.watch(file, options, (...args) => {
-      const timer = setTimeout(() => { notifications.delete(timer); callback(...args); }, notificationDelay);
-      notifications.add(timer);
-    }),
-  } }).PackageInventory : PackageInventory;
+    ...overrides,
+    watch: (file, options, callback) => {
+      watches.push({ file, options });
+      return fs.watch(file, options, (...args) => {
+        const timer = setTimeout(() => { notifications.delete(timer); callback(...args); }, notificationDelay);
+        notifications.add(timer);
+      });
+    },
+  } }).PackageInventory;
   const inventory = new Inventory(async change => changes.push(change), line => logs.push(line));
   t.after(() => {
     inventory.dispose();
@@ -58,7 +48,7 @@ function fixture(t, notificationDelay = 0) {
   // each mutation before checking that its resulting work has settled.
   const waitForLog = message => settle(() => logs.some(line => line.includes(message)),
     `inventory must report: ${message}`);
-  return { root, libraries, inventory, changes, logs, install, settle, waitForLog };
+  return { root, libraries, inventory, changes, logs, install, settle, waitForLog, watches };
 }
 
 test("inventory preserves effective copies across duplicate additions, removals and library order changes", async t => {
@@ -105,18 +95,14 @@ test("library search-order changes preserve retained watches and scan only added
   inventory.setLibraryPaths([first, second]);
   await settle();
   const firstWatcher = inventory.watchers.get(first);
-  const firstParent = inventory.parentWatchers.get(first);
   const secondWatcher = inventory.watchers.get(second);
-  const secondParent = inventory.parentWatchers.get(second);
-  assert.ok(firstWatcher && secondWatcher && firstParent && secondParent);
+  assert.ok(firstWatcher && secondWatcher);
 
   logs.length = 0;
   inventory.setLibraryPaths([second, first]);
   await settle();
   assert.equal(inventory.watchers.get(first), firstWatcher);
   assert.equal(inventory.watchers.get(second), secondWatcher);
-  assert.equal(inventory.parentWatchers.get(first), firstParent);
-  assert.equal(inventory.parentWatchers.get(second), secondParent);
   assert.ok(!logs.some(line => line.includes("Scanning folder:")),
     "changing search precedence must reuse existing package inventories");
   assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
@@ -127,10 +113,7 @@ test("library search-order changes preserve retained watches and scan only added
   inventory.setLibraryPaths([first, third]);
   await settle();
   assert.equal(inventory.watchers.get(first), firstWatcher);
-  assert.equal(inventory.parentWatchers.get(first), firstParent);
   assert.equal(inventory.watchers.has(second), false);
-  assert.equal(inventory.parentWatchers.has(second), false);
-  assert.ok(inventory.watchers.has(third) && inventory.parentWatchers.has(third));
   const scans = logs.filter(line => line.includes("Scanning folder:"));
   assert.ok(scans.length > 0);
   assert.ok(scans.every(line => line.endsWith(third)),
@@ -230,7 +213,7 @@ for (const notificationDelay of [0, 100]) {
     assert.equal(changes.length, count + 1, "publish lock state without publishing a partial installation");
     assert.deepEqual(changes.at(-1).changed, []);
     assert.equal(changes.at(-1).packages.size, 0);
-    assert.deepEqual(changes.at(-1).libraries[0].deferred.get("example"), [path.join(library, "example")]);
+    assert.ok(changes.at(-1).libraries[0].deferred.get("example").includes(path.join(library, "example")));
     assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
     logs.length = 0;
     install(library);
@@ -265,27 +248,22 @@ test("inventory detects same-version package replacement from folder events", as
   assert.ok(logs.some(line => line.includes("Updated: example 1.0 -> 1.0")));
 });
 
-test("inventory detects package link replacement from folder events", async t => {
+test("a normal installation replaced by a link is excluded until a directory returns", async t => {
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
-  const cache = path.join(root, "cache");
-  const directory = install(cache);
-  const link = path.join(library, "example");
-  const type = process.platform === "win32" ? "junction" : "dir";
-  fs.symlinkSync(directory, link, type);
+  const directory = install(library);
+  const target = install(path.join(root, "cache"), "2.0");
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
-  const replacement = install(path.join(root, "replacement"), "2.0");
-  fs.unlinkSync(link);
-  fs.symlinkSync(replacement, link, type);
-  const deadline = Date.now() + 10000;
-  while (changes.at(-1)?.packages.get("example")?.version !== "2.0") {
-    assert.ok(Date.now() < deadline, "package link replacement must publish");
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  await settle();
+  fs.rmSync(directory, { recursive: true });
+  fs.symlinkSync(target, directory, process.platform === "win32" ? "junction" : "dir");
+  await settle(() => changes.at(-1).unmonitored.includes("example"));
+  assert.equal(changes.at(-1).packages.size, 0);
+  assert.deepEqual(changes.at(-1).changed, [], "a skipped link is not a reported package removal");
+  fs.unlinkSync(directory);
+  install(library, "3.0");
+  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
   assert.deepEqual(changes.at(-1).changed, ["example"]);
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  assert.deepEqual(changes.at(-1).unmonitored, []);
 });
 
 test("inventory stops scanning after events settle and coalesces concurrent scans", async t => {
@@ -319,26 +297,19 @@ test("inventory stops scanning after events settle and coalesces concurrent scan
   assert.equal(changes.length, count + 1);
 });
 
-test("two library links to the same installation retain its completion metadata", async t => {
+test("an excluded higher-priority link does not select a lower-priority installation", async t => {
   const { root, libraries: [first, second], inventory, changes, install, settle } = fixture(t);
   const target = install(path.join(root, "cache"));
-  const type = process.platform === "win32" ? "junction" : "dir";
-  fs.symlinkSync(target, path.join(first, "example"), type);
-  fs.symlinkSync(target, path.join(second, "example"), type);
+  const fallback = install(second, "2.0");
+  fs.symlinkSync(target, path.join(first, "example"), process.platform === "win32" ? "junction" : "dir");
   inventory.setLibraryPaths([first, second]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
-  fs.unlinkSync(path.join(first, "example"));
-  // Idle can precede delivery of the filesystem notification. Wait for the
-  // surviving link to be published, then check that metadata was retained.
-  const deadline = Date.now() + 10000;
-  while (changes.at(-1).packages.get("example")?.path !== path.join(second, "example")) {
-    assert.ok(Date.now() < deadline, "remaining package link must be published");
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  await settle();
-  assert.deepEqual(changes.at(-1).changed, []);
-  assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
+  assert.equal(changes.at(-1).packages.size, 0);
+  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  assert.equal(changes.at(-1).libraries[1].packages.get("example").path, fallback);
+  inventory.setLibraryPaths([second, first]);
+  await settle(() => changes.at(-1).packages.get("example")?.path === fallback);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
 });
 
 test("a failed refresh retries only dirty libraries and publishes the latest installation", async t => {
@@ -486,6 +457,8 @@ test("directory timestamp touches do not rescan unchanged installed packages", a
     watcher.emit("change", "change", undefined);
     watcher.emit("change", "rename", undefined);
     watcher.emit("change", "change", path.basename(library));
+    watcher.emit("change", "change", path.join("example", "DESCRIPTION"));
+    watcher.emit("change", "rename", path.join("example", "Meta"));
   }
   await settle();
   assert.equal(inventory.watchers.get(library), watcher,
@@ -509,88 +482,64 @@ test("directory timestamp touches do not rescan unchanged installed packages", a
   assert.equal(changes.at(-1).packages.get("example")?.version, "2.0");
 });
 
-test("unchanged parent events do not repeatedly restore renv-style library watchers", async t => {
-  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
-  install(library);
-  inventory.setLibraryPaths([library]);
-  await settle();
-  const childWatcher = inventory.watchers.get(library);
-  const parentWatcher = inventory.parentWatchers.get(library);
-  const count = changes.length;
-  assert.ok(childWatcher && parentWatcher);
-
-  logs.length = 0;
-  // macOS may not supply a filename; Windows and Linux commonly do.
-  for (let n = 0; n < 8; n++) {
-    parentWatcher.emit("change", "rename", undefined);
-    parentWatcher.emit("change", "rename", path.basename(library));
-    parentWatcher.emit("change", "rename", Buffer.from(path.basename(library)));
-    parentWatcher.emit("change", "rename", "unrelated-folder");
-  }
-  await settle();
-  assert.equal(inventory.watchers.get(library), childWatcher);
-  assert.equal(inventory.parentWatchers.get(library), parentWatcher);
-  assert.equal(changes.length, count);
-  assert.ok(!logs.some(line => line.includes("Watcher restored") ||
-    line.includes("Scanning folder:")),
-  "unchanged parent events must not rewatch or rescan the library");
-
-  // Unrelated parent notifications must not suppress real child changes.
-  fs.rmSync(path.join(library, "example"), { recursive: true });
-  install(library, "2.0");
-  const deadline = Date.now() + 10000;
-  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
-    assert.ok(Date.now() < deadline, "package updates remain observable");
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  await settle();
-  assert.equal(inventory.watchers.get(library), childWatcher,
-    "normal package updates do not re-arm the directory watcher");
-});
-
-test("a symlinked library retargets its watcher while ignoring unchanged parent events", async t => {
-  const { root, inventory, changes, install, settle } = fixture(t);
-  const first = path.join(root, "original-target");
-  const second = path.join(root, "replacement-target");
+test("configured library aliases remain pinned when their links are retargeted", async t => {
+  const { root, inventory, changes, install, settle, watches } = fixture(t);
+  const first = path.join(root, "original-target"), second = path.join(root, "replacement-target");
   const library = path.join(root, "active-library");
-  fs.mkdirSync(first);
-  fs.mkdirSync(second);
   install(first);
   install(second, "2.0");
-  const type = process.platform === "win32" ? "junction" : "dir";
-  fs.symlinkSync(first, library, type);
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(first, library, kind);
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example")?.version, "1.0");
-  const previous = inventory.watchers.get(library);
-
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  const watcher = inventory.watchers.get(library), count = changes.length;
+  assert.deepEqual(watches.map(watch => watch.file).sort(), [first, path.join(first, "example")].sort());
+  assert.ok(watches.every(watch => watch.options.recursive === false));
   fs.unlinkSync(library);
-  fs.symlinkSync(second, library, type);
-  const deadline = Date.now() + 10000;
-  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
-    assert.ok(Date.now() < deadline, "symlink target replacement must be detected");
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  await settle();
-  const restored = inventory.watchers.get(library);
-  assert.ok(restored);
-  assert.notEqual(restored, previous);
-
-  // Duplicate / filename-less parent notifications must retain the new watch.
-  const parent = inventory.parentWatchers.get(library);
-  parent.emit("change", "rename", undefined);
-  parent.emit("change", "rename", path.basename(library));
-  await settle();
-  assert.equal(inventory.watchers.get(library), restored);
-
+  fs.symlinkSync(second, library, kind);
   fs.rmSync(path.join(second, "example"), { recursive: true });
   install(second, "3.0");
-  const nextDeadline = Date.now() + 10000;
-  while (changes.at(-1).packages.get("example")?.version !== "3.0") {
-    assert.ok(Date.now() < nextDeadline, "new symlink target must still receive package events");
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(changes.length, count);
+  assert.equal(inventory.watchers.get(library), watcher);
+  // An ambiguous event on the original root must also keep the pinned location.
+  watcher.emit("change", "change", undefined);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example").target, path.join(first, "example"));
+  assert.equal(watches.length, 2);
+  inventory.setLibraryPaths([]);
+  await settle(() => changes.at(-1).libraries.length === 0);
+  inventory.setLibraryPaths([library]);
+  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+  assert.ok(watches.some(watch => watch.file === second), "explicit reconfiguration can select a new root");
 });
+
+for (const replaceAncestor of [false, true]) {
+  test(`a pinned library ${replaceAncestor ? "ancestor" : "root"} replaced by a link suspends monitoring`, async t => {
+    const { root, inventory, changes, install, settle, watches } = fixture(t);
+    const parent = path.join(root, "configured"), library = path.join(parent, "library");
+    const external = path.join(root, "external");
+    install(library);
+    install(replaceAncestor ? path.join(external, "library") : external, "2.0");
+    inventory.setLibraryPaths([library]);
+    await settle();
+    const watcher = inventory.watchers.get(library);
+    const replaced = replaceAncestor ? parent : library;
+    fs.renameSync(replaced, replaced + "-original");
+    fs.symlinkSync(external, replaced, process.platform === "win32" ? "junction" : "dir");
+    // Platforms may report a rename differently; deliver the root event too.
+    watcher.emit("change", "rename", path.basename(library));
+    await settle(() => changes.at(-1).unmonitoredRoots.includes(library));
+    assert.equal(changes.at(-1).packages.size, 0);
+    assert.deepEqual(changes.at(-1).changed, []);
+    assert.ok(changes.at(-1).unmonitored.includes("example"));
+    assert.equal(inventory.watchers.size, 0);
+    assert.equal(inventory.retryTimer, undefined, "a changed link is not retried automatically");
+    assert.equal(watches.length, 2, "no watch is opened on the replacement target");
+  });
+}
 
 test("replacing an existing library directory re-arms its watcher without an error event", async t => {
   const { libraries: [library], inventory, changes, install, settle } = fixture(t);
@@ -678,7 +627,6 @@ test("removing and readding an entire runtime library closes and restores its wa
   inventory.setLibraryPaths([second]);
   await settle();
   assert.equal(inventory.watchers.has(first), false, "removed libraries must stop being watched");
-  assert.equal(inventory.parentWatchers.has(first), false);
   assert.equal(changes.at(-1).packages.get("example").version, "2.0");
   assert.ok(logs.some(line => line.includes("Selected copy changed") ||
     line.includes("Using remaining copy")));
@@ -712,202 +660,116 @@ test("package locks preserve only their own installation, including on initial d
   await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
 });
 
-test("linked targets refresh across cache removal, replacement, locks and recreation", async t => {
-  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
-  const cache = path.join(root, "external-cache");
-  fs.mkdirSync(cache);
-  const target = install(cache);
-  fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
+test("linked packages are neither resolved, read, watched nor polled", async t => {
+  const accesses = [];
+  let library;
+  const promises = { ...fs.promises };
+  for (const method of ["realpath", "readlink", "stat", "access", "readFile", "open", "readdir"]) {
+    promises[method] = async (file, ...args) => {
+      accesses.push([method, String(file)]);
+      return fs.promises[method](file, ...args);
+    };
+  }
+  const context = fixture(t, 0, {
+    promises,
+    watchFile() { assert.fail("package monitoring must not create stat pollers"); },
+  });
+  ({ libraries: [library] } = context);
+  const { root, inventory, changes, install, settle, watches } = context;
+  const cache = path.join(root, "cache"), target = install(cache);
+  const link = path.join(library, "example");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(target, link, kind);
+  fs.symlinkSync(path.join(cache, "missing"), path.join(library, "missing"), kind);
+  fs.symlinkSync(path.join(library, "cycle"), path.join(library, "cycle"), kind);
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.size, 0);
+  assert.deepEqual([...changes.at(-1).unmonitored].sort(), ["cycle", "example", "missing"]);
+  const count = changes.length;
   fs.rmSync(target, { recursive: true });
-  await settle(() => !changes.at(-1).packages.has("example"), "a dangling package link must remove stale metadata");
   install(cache, "2.0");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
   fs.mkdirSync(path.join(cache, "00LOCK-example"));
-  fs.rmSync(target, { recursive: true });
-  install(cache, "3.0");
-  await new Promise(resolve => setTimeout(resolve, 1800));
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0", "cache installations remain protected by their own lock");
-  fs.rmdirSync(path.join(cache, "00LOCK-example"));
-  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
-  inventory.setLibraryPaths([]);
-  await settle(() => changes.at(-1).libraries.length === 0);
-  assert.equal(inventory.linkedWatches.size, 0, "removed libraries release linked target subscriptions");
-  inventory.setLibraryPaths([library]);
-  await settle(() => changes.at(-1).packages.has("example"));
-  inventory.dispose();
-  assert.equal(inventory.linkedWatches.size, 0, "disposal releases all linked target subscriptions");
+  await new Promise(resolve => setTimeout(resolve, 1400));
+  await settle();
+  assert.equal(changes.length, count, "external cache mutations are not inventory events");
+  assert.ok(accesses.length > 0);
+  assert.ok(accesses.every(([method, file]) => method === "readdir" && file === library),
+    JSON.stringify(accesses));
+  assert.deepEqual([...inventory.watchers.keys()], [library]);
+  assert.deepEqual(watches, [{ file: library, options: { persistent: false, recursive: false } }]);
+  assert.equal(inventory.timer, undefined);
+  assert.equal(inventory.retryTimer, undefined);
+  install(library, "1.0", "ordinary");
+  await settle(() => changes.at(-1).packages.has("ordinary"));
+  assert.deepEqual(changes.at(-1).changed, ["ordinary"]);
 });
 
-test("linked library and cache timestamp touches do not rescan package metadata", async t => {
-  const { root, libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
-  const cache = path.join(root, "external-cache");
-  fs.mkdirSync(cache);
-  const target = install(cache);
-  fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
-  inventory.setLibraryPaths([library]);
-  await settle();
-  const published = changes.length;
-  const readPackage = t.mock.method(inventory, "readPackage");
-  logs.length = 0;
-
-  for (const directory of [library, cache]) {
-    const before = fs.statSync(directory);
-    const touch = new Date(Date.now() - 5000);
-    fs.utimesSync(directory, touch, touch);
-    const after = fs.statSync(directory);
-    // renv touches its sandbox after R tasks. Deliver the polling event as
-    // well as the filesystem event, including canonical directory aliases.
-    for (const [file, watch] of inventory.linkedWatches) {
-      if (sameExistingDirectory(file, directory)) watch.listener(after, before);
+for (const component of ["Meta", "Meta/package.rds", "DESCRIPTION"]) {
+  test(`linked ${component} is excluded without reading its destination`, async t => {
+    const opened = [];
+    const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
+      promises: { ...fs.promises, open: async (file, ...args) => {
+        opened.push(file);
+        return fs.promises.open(file, ...args);
+      } },
+    });
+    const directory = install(library);
+    const external = install(path.join(root, "external"));
+    const file = path.join(directory, component);
+    fs.rmSync(file, { recursive: true });
+    if (process.platform === "win32" && component !== "Meta") {
+      // File symlinks need Developer Mode / elevation on Windows.
+      try { fs.symlinkSync(path.join(external, component), file, "file"); }
+      catch (error) { if (error.code === "EPERM") { t.skip("file symlink permission unavailable"); return; } throw error; }
+    } else {
+      fs.symlinkSync(path.join(external, component), file,
+        component === "Meta" ? process.platform === "win32" ? "junction" : "dir" : "file");
     }
+    inventory.setLibraryPaths([library]);
     await settle();
-  }
-  // Include the actual poller's delayed delivery before asserting quietness.
-  await new Promise(resolve => setTimeout(resolve, 1500));
-  await settle();
-  assert.equal(readPackage.mock.callCount(), 0, "timestamp-only events must reuse cached package records");
-  assert.equal(changes.length, published);
-  assert.ok(!logs.some(line => line.includes("Scanning folder:") || line.includes("Package inventory unchanged")),
-    "timestamp-only events must not produce package lifecycle logs");
-});
-
-test("external lock transitions remain observable when linked package identities are unchanged", async t => {
-  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
-  const cache = path.join(root, "external-cache");
-  fs.mkdirSync(cache);
-  const target = path.join(cache, "release-1");
-  fs.renameSync(install(cache), target);
-  fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
-  inventory.setLibraryPaths([library]);
-  await settle();
-  const identity = changes.at(-1).packages.get("example").identity;
-
-  for (const lockName of ["00LOCK", "00LOCK-example", "00LOCK-release-1"]) {
-    const lock = path.join(cache, lockName);
-    fs.mkdirSync(lock);
-    await settle(() => changes.at(-1).libraries[0].deferred?.has("example"),
-      "the cache parent poll must discover locks before the package is moved");
-    assert.equal(changes.at(-1).packages.get("example").identity, identity);
-    fs.rmdirSync(lock);
-    await settle(() => changes.at(-1).libraries[0].deferred?.size === 0,
-      "unlock must publish even when no package files changed");
-  }
-});
-
-for (const lockName of ["00LOCK-example", "00LOCK"]) {
-  for (const initiallyMissing of [false, true]) {
-    test(`chained links retain ${lockName} protection with an ${initiallyMissing ? "initially absent" : "existing"} target`, async t => {
-      const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
-      const alias = path.join(root, "alias"), cache = path.join(root, "cache");
-      fs.mkdirSync(alias); fs.mkdirSync(cache);
-      const target = install(cache), intermediate = path.join(alias, "example");
-      const link = (destination, file) => fs.symlinkSync(process.platform === "win32"
-        ? destination : path.relative(path.dirname(file), destination), file,
-      process.platform === "win32" ? "junction" : "dir");
-      link(target, intermediate);
-      link(intermediate, path.join(library, "example"));
-      const lock = path.join(cache, lockName);
-      const holdInstallation = () => {
-        fs.mkdirSync(lock);
-        fs.renameSync(target, path.join(lock, "example"));
-      };
-      if (initiallyMissing) holdInstallation();
-      inventory.setLibraryPaths([library]);
-      await settle();
-      if (!initiallyMissing) {
-        holdInstallation();
-        inventory.dirtyLibraries.add(library);
-        await inventory.refresh();
-        await settle();
-      }
-      const current = changes.at(-1);
-      assert.equal(current.packages.has("example"), !initiallyMissing);
-      const deferredPaths = current.libraries[0].deferred.get("example") ?? [];
-      assert.ok(deferredPaths.some(file =>
-        path.basename(file) === path.basename(target) &&
-        sameExistingDirectory(path.join(path.dirname(file), lockName), lock)),
-        `the missing final target must keep its cache lock and watch location: ${JSON.stringify(deferredPaths)}`);
-      const count = changes.length;
-      install(cache, "2.0");
-      await new Promise(resolve => setTimeout(resolve, 1800));
-      assert.equal(changes.length, count, "a replacement remains deferred while the external lock is held");
-      fs.rmSync(lock, { recursive: true });
-      await settle(() => changes.at(-1).packages.get("example")?.version === "2.0",
-        "the cache parent watch must detect unlock without touching either link");
-      assert.equal(changes.at(-1).libraries[0].deferred.size, 0);
-    });
-  }
-}
-
-for (const lockName of ["00LOCK-example", "00LOCK-release-1", "00LOCK"]) {
-  test(`unlistable external caches refresh packages and preserve ${lockName}`, async t => {
-    const { root, libraries: [library, other], inventory, changes, logs, install, settle } = fixture(t);
-    const cache = path.join(root, "cache");
-    fs.mkdirSync(cache);
-    const target = path.join(cache, "release-1");
-    fs.renameSync(install(cache), target);
-    fs.symlinkSync(target, path.join(library, "example"), process.platform === "win32" ? "junction" : "dir");
-    const readdir = fs.promises.readdir;
-    t.mock.method(fs.promises, "readdir", async function(directory, ...args) {
-      if (sameExistingDirectory(directory, cache)) {
-        throw Object.assign(new Error("Cache allows traversal but not listing"), { code: "EACCES" });
-      }
-      return readdir.call(this, directory, ...args);
-    });
-    inventory.setLibraryPaths([library, other]);
-    await settle(() => changes.at(-1)?.packages.get("example")?.version === "1.0");
-
-    const lock = path.join(cache, lockName);
-    fs.mkdirSync(lock);
-    fs.rmSync(target, { recursive: true });
-    fs.renameSync(install(cache, "2.0"), target);
-    await settle(() => changes.at(-1).libraries[0].deferred?.has("example"));
-    assert.equal(changes.at(-1).packages.get("example").version, "1.0", "the locked replacement stays deferred");
-    const healthy = install(other, "1.0", "healthy");
-    await settle(() => changes.at(-1).packages.has("healthy"), "other libraries continue publishing while the cache is locked");
-    fs.rmSync(healthy, { recursive: true });
-    await settle(() => !changes.at(-1).packages.has("healthy"));
-
-    fs.rmdirSync(lock);
-    await settle(() => changes.at(-1).packages.get("example")?.version === "2.0", "polling discovers unlock without listing the cache");
-    fs.rmSync(target, { recursive: true });
-    await settle(() => !changes.at(-1).packages.has("example"));
-    fs.renameSync(install(cache, "3.0"), target);
-    await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
-    assert.ok(!logs.some(line => line.includes("Could not refresh package inventory")));
+    assert.equal(changes.at(-1).packages.size, 0);
+    assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+    assert.deepEqual(opened, [], "linked metadata is never opened");
   });
 }
 
-test("a versioned cache target honors its package's named installation lock", async t => {
+test("a package changed to a link after directory enumeration is skipped", async t => {
+  let link, target, swapped = false;
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
+    promises: { ...fs.promises, readdir: async (file, ...args) => {
+      const entries = await fs.promises.readdir(file, ...args);
+      if (link && file === path.dirname(link) && !swapped) {
+        swapped = true;
+        fs.rmSync(link, { recursive: true });
+        fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+      }
+      return entries;
+    } },
+  });
+  link = install(library);
+  target = install(path.join(root, "cache"), "2.0");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.equal(changes.at(-1).packages.size, 0);
+  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+});
+
+test("linked installation locks do not defer ordinary package updates", async t => {
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
   const cache = path.join(root, "cache");
   fs.mkdirSync(cache);
-  const original = install(cache);
-  const target = path.join(cache, "release-1");
-  fs.renameSync(original, target);
-  fs.symlinkSync(target, path.join(library, "example"),
-    process.platform === "win32" ? "junction" : "dir");
+  for (const lock of ["00LOCK", "00LOCK-example"]) {
+    fs.symlinkSync(cache, path.join(library, lock), process.platform === "win32" ? "junction" : "dir");
+  }
+  install(library);
   inventory.setLibraryPaths([library]);
   await settle();
-  const before = changes.at(-1).packages.get("example").identity;
-
-  const lock = path.join(cache, "00LOCK-example");
-  fs.mkdirSync(lock);
-  fs.rmSync(target, { recursive: true });
-  fs.renameSync(install(cache, "2.0"), target);
-  inventory.dirtyLibraries.add(library);
-  await inventory.refresh();
-  await settle();
-  assert.equal(changes.at(-1).packages.get("example").identity, before,
-    "the logical package lock must defer an updated versioned target");
-  fs.rmdirSync(lock);
-  inventory.dirtyLibraries.add(library);
-  await inventory.refresh();
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0",
-    "unlocking a named package lock must publish the replacement");
+  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).libraries[0].deferred.size, 0);
+  fs.rmSync(path.join(library, "example"), { recursive: true });
+  install(library, "2.0");
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
 });
 
 // Binary and non-staged installs can copy a new package directly into the
@@ -924,112 +786,7 @@ test("a whole-library lock protects new installations before a backup or staging
   await settle(() => changes.at(-1).packages.has("example"));
 });
 
-test("relative package links resolve parent traversal through directory aliases", {
-  skip: process.platform === "win32" && "junction creation normalizes its destination",
-}, async t => {
-  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
-  const cache = path.join(root, "cache");
-  fs.mkdirSync(path.join(cache, "nested"), { recursive: true });
-  fs.symlinkSync(path.join(cache, "nested"), path.join(library, "alias"), "dir");
-  // The operating system resolves alias before applying '..'.
-  const target = install(cache);
-  fs.symlinkSync("alias/../example", path.join(library, "example"), "dir");
-  const lock = path.join(cache, "00LOCK-example");
-  fs.mkdirSync(lock);
-  fs.renameSync(target, path.join(lock, "example"));
-  inventory.setLibraryPaths([library]);
-  await settle();
-  assert.ok(changes.at(-1).libraries[0].deferred.get("example")?.includes(
-    path.join(fs.realpathSync(cache), "example")));
-});
-
-test("cyclic package links do not block healthy packages and recover when repaired", { timeout: 45000 }, async t => {
-  const { root, libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
-  const alias = path.join(root, "alias"), cache = path.join(root, "cache");
-  fs.mkdirSync(alias); fs.mkdirSync(cache);
-  const link = path.join(first, "example"), intermediate = path.join(alias, "example");
-  const kind = process.platform === "win32" ? "junction" : "dir";
-  const healthy = install(first, "1.0", "healthy");
-  const fallback = install(second);
-  fs.symlinkSync(intermediate, link, kind);
-  fs.symlinkSync(link, intermediate, kind);
-  await assert.rejects(inventory.resolvePackageLink(link, new Set()), { code: "ELOOP" });
-  inventory.setLibraryPaths([first, second]);
-  await settle(() => changes.at(-1)?.packages.get("example")?.path === fallback,
-    "initial discovery must skip the cyclic copy and select the healthy fallback");
-  assert.ok(changes.at(-1).packages.has("healthy"), "healthy packages in the same library must be published");
-  assert.ok(!changes.at(-1).libraries[0].packages.has("example"));
-  fs.rmSync(healthy, { recursive: true });
-  await settle(() => !changes.at(-1).packages.has("healthy"), "same-library changes must publish despite the cycle");
-  fs.rmSync(fallback, { recursive: true });
-  await settle(() => !changes.at(-1).packages.has("example"), "other library changes must publish despite the cycle");
-  install(second, "2.0");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
-
-  // Repair only the external hop, without touching or explicitly rescanning the library.
-  fs.unlinkSync(intermediate);
-  fs.symlinkSync(install(cache, "3.0"), intermediate, kind);
-  await settle(() => changes.at(-1).packages.get("example")?.path === link,
-    "the retained link watches must discover a repaired higher-priority copy");
-  assert.equal(changes.at(-1).packages.get("example").version, "3.0");
-
-  // A malformed link must not override an active installation lock.
-  const lock = path.join(first, "00LOCK-example");
-  fs.mkdirSync(lock);
-  fs.unlinkSync(intermediate);
-  fs.symlinkSync(link, intermediate, kind);
-  await settle(() => changes.at(-1).libraries[0].deferred?.has("example"));
-  assert.equal(changes.at(-1).packages.get("example").path, link);
-  fs.rmdirSync(lock);
-  await settle(() => changes.at(-1).packages.get("example")?.path === fallback,
-    "after unlock, the cyclic copy must be retired in favor of the healthy one");
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
-  assert.ok(!logs.some(line => line.includes("Could not refresh package inventory")),
-    "malformed package links must not trigger global recovery retries");
-});
-
-test("package links through non-directory parents do not prevent inventory updates", {
-  skip: process.platform === "win32" && "junction creation requires directory targets",
-  timeout: 30000,
-}, async t => {
-  const { root, libraries: [first, second], inventory, changes, install, settle } = fixture(t);
-  const parent = path.join(root, "not-a-directory"), link = path.join(first, "example");
-  fs.writeFileSync(parent, "not a directory");
-  fs.symlinkSync(path.join(parent, "example"), link, "dir");
-  const fallback = install(second);
-  inventory.setLibraryPaths([first, second]);
-  await settle(() => changes.at(-1)?.packages.get("example")?.path === fallback);
-  fs.unlinkSync(parent);
-  fs.mkdirSync(parent);
-  install(parent, "2.0");
-  await settle(() => changes.at(-1).packages.get("example")?.path === link,
-    "repair of the malformed target parent must be discovered automatically");
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
-});
-
 for (const lockName of ["00LOCK-example", "00LOCK"]) {
-  test(`${lockName} retains the resolved path of an initially deferred package link while it is absent`, async t => {
-    const { root, libraries: [library], inventory, changes, install, settle } = fixture(t);
-    const cache = path.join(root, "cache");
-    fs.mkdirSync(cache);
-    const target = path.join(cache, "versioned-installation");
-    fs.renameSync(install(cache), target);
-    const link = path.join(library, "example"), lock = path.join(library, lockName);
-    fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
-    fs.mkdirSync(lock);
-    inventory.setLibraryPaths([library]);
-    await settle();
-    assert.equal(changes.length, 1);
-    fs.unlinkSync(link);
-    inventory.dirtyLibraries.add(library);
-    await inventory.refresh();
-    await settle();
-    assert.equal(changes.length, 1, "a missing link must retain the locked namespace's resolved path");
-    fs.rmdirSync(lock);
-    await settle(() => changes.length === 2);
-    assert.deepEqual(changes[1].changed, []);
-  });
-
   test(`releasing ${lockName} republishes initially deferred removals and retries failed reconciliation`, async t => {
     const { libraries: [library], inventory, changes, install, settle } = fixture(t);
     const directory = install(library), lock = path.join(library, lockName);
@@ -1062,3 +819,106 @@ for (const lockName of ["00LOCK-example", "00LOCK"]) {
     assert.equal(changes[1].packages.size, 0);
   });
 }
+
+test("a DESCRIPTION replaced by a symlink before open is not read", {
+  skip: process.platform === "win32" || !fs.constants.O_NOFOLLOW,
+}, async t => {
+  let description, target, swapped = false;
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
+    promises: { ...fs.promises, open: async (file, ...args) => {
+      if (file === description && !swapped) {
+        swapped = true;
+        fs.unlinkSync(file);
+        fs.symlinkSync(target, file, "file");
+      }
+      return fs.promises.open(file, ...args);
+    } },
+  });
+  description = path.join(install(library), "DESCRIPTION");
+  target = path.join(install(path.join(root, "external"), "2.0"), "DESCRIPTION");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(swapped);
+  assert.equal(changes.at(-1).packages.size, 0);
+  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+});
+
+test("whole-library locks inspect ordinary backups and skip linked staging directories", async t => {
+  const reads = [];
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
+    promises: { ...fs.promises, readdir: async (file, ...args) => {
+      reads.push(file);
+      return fs.promises.readdir(file, ...args);
+    } },
+  });
+  const lock = path.join(library, "00LOCK");
+  fs.mkdirSync(lock);
+  install(lock);
+  const external = path.join(root, "external");
+  install(external, "1.0", "outside");
+  const staging = path.join(lock, "00new");
+  fs.symlinkSync(external, staging, process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.ok(changes.at(-1).libraries[0].deferred.has("example"));
+  assert.ok(!changes.at(-1).libraries[0].deferred.has("outside"));
+  assert.ok(!reads.includes(staging) && !reads.includes(external));
+});
+
+
+test("monitoring watches only the library and immediate package directories", async t => {
+  const { root, libraries: [library], inventory, changes, install, settle, watches } = fixture(t);
+  const directory = install(library);
+  const nested = path.join(directory, "R", "nested");
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, "code.R"), "value <- 1");
+  const external = install(path.join(root, "external"));
+  fs.symlinkSync(external, path.join(directory, "linked"), process.platform === "win32" ? "junction" : "dir");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.deepEqual(watches.map(watch => watch.file).sort(), [library, directory].sort());
+  assert.ok(watches.every(watch => watch.options.recursive === false));
+
+  // Immediate package-directory notifications refresh the installation.
+  fs.writeFileSync(path.join(directory, "DESCRIPTION"), "Package: example\nVersion: 2.0\n");
+  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  const count = changes.length;
+  fs.writeFileSync(path.join(nested, "code.R"), "value <- 2");
+  fs.writeFileSync(path.join(external, "DESCRIPTION"), "Package: example\nVersion: 9.0\n");
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(changes.length, count, "deep files and linked targets are outside monitoring scope");
+  assert.deepEqual(watches.map(watch => watch.file).sort(), [library, directory].sort());
+
+  const added = install(library, "1.0", "added");
+  await settle(() => changes.at(-1).packages.has("added"));
+  assert.ok(watches.some(watch => watch.file === added));
+  assert.ok(watches.every(watch => watch.file === library || path.dirname(watch.file) === library));
+});
+
+test("an interrupted scan cannot resolve a removed configured alias again", async t => {
+  const resolutions = [];
+  const realpathSync = Object.assign((...args) => fs.realpathSync(...args), {
+    native: (file, ...args) => { resolutions.push(file); return fs.realpathSync.native(file, ...args); },
+  });
+  const { root, inventory, changes, install, settle } = fixture(t, 0, { realpathSync });
+  const original = path.join(root, "original"), replacement = path.join(root, "replacement");
+  install(original);
+  install(replacement, "2.0");
+  const alias = path.join(root, "configured");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(original, alias, kind);
+  let entered, release;
+  const begun = new Promise(resolve => { entered = resolve; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const locks = inventory.installationLocks.bind(inventory);
+  inventory.installationLocks = async (...args) => { entered(); await blocked; return locks(...args); };
+  inventory.setLibraryPaths([alias]);
+  await begun;
+  fs.unlinkSync(alias);
+  fs.symlinkSync(replacement, alias, kind);
+  inventory.setLibraryPaths([]);
+  release();
+  await settle(() => changes.at(-1)?.libraries.length === 0);
+  assert.deepEqual(resolutions, [alias], "the stale scan cannot follow the retargeted alias");
+});
