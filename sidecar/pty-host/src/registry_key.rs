@@ -5,7 +5,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-struct Key { bytes: [u8; 32], migration: Option<[u8; 32]>, encrypted: bool }
+struct Key { bytes: [u8; 32] }
 impl Drop for Key {
     fn drop(&mut self) {
         for byte in &mut self.bytes { unsafe { std::ptr::write_volatile(byte, 0) }; }
@@ -36,34 +36,24 @@ fn valid_session_id(id: &str) -> bool {
     })
 }
 
-fn reply(key: &mut Key, request: &[u8; 37]) -> Option<[u8; 41]> {
-    if &request[..4] != b"RCK1" || request[4] > 1 { return None; }
+fn reply(key: &Key, request: &[u8; 37]) -> Option<[u8; 41]> {
+    // Reject nonzero reserved bytes; no plaintext migration operation exists.
+    if &request[..4] != b"RCK1" || request[4..].iter().any(|byte| *byte != 0) { return None; }
     let mut bytes = [0; 41];
     bytes[..4].copy_from_slice(b"RCK1");
     bytes[4..8].copy_from_slice(&std::process::id().to_le_bytes());
-    if request[4] == 1 {
-        let digest: [u8; 32] = request[5..].try_into().ok()?;
-        if key.encrypted || key.migration.is_some_and(|previous| previous != digest) {
-            bytes[8] = 1;
-            return Some(bytes);
-        }
-        key.migration = Some(digest);
-    } else {
-        key.encrypted = true;
-        key.migration = None;
-    }
     bytes[9..].copy_from_slice(&key.bytes);
     Some(bytes)
 }
 
 pub(crate) fn start(id: &str) -> io::Result<Broker> {
     if !valid_session_id(id) { return Err(io::Error::other("invalid registry key session identifier")); }
-    let key = Key { bytes: crate::protocol::secure_server_nonce()?, migration: None, encrypted: false };
+    let key = Key { bytes: crate::protocol::secure_server_nonce()? };
     platform_start(id, key)
 }
 
 #[cfg(unix)]
-fn platform_start(id: &str, mut key: Key) -> io::Result<Broker> {
+fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
     use std::io::{Read, Write};
     use std::time::Instant;
     use std::os::unix::{fs::{DirBuilderExt, MetadataExt, PermissionsExt}, net::UnixListener};
@@ -105,7 +95,7 @@ fn platform_start(id: &str, mut key: Key) -> io::Result<Broker> {
                         }
                     }
                     if count != request.len() { continue; }
-                    if let Some(mut bytes) = reply(&mut key, &request) {
+                    if let Some(mut bytes) = reply(&key, &request) {
                         let _ = stream.write_all(&bytes);
                         bytes.fill(0);
                     }
@@ -119,7 +109,7 @@ fn platform_start(id: &str, mut key: Key) -> io::Result<Broker> {
 }
 
 #[cfg(windows)]
-fn platform_start(id: &str, mut key: Key) -> io::Result<Broker> {
+fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr::null_mut;
     use std::time::Instant;
@@ -164,7 +154,7 @@ fn platform_start(id: &str, mut key: Key) -> io::Result<Broker> {
                 count += read as usize;
                 if count < request.len() { thread::sleep(Duration::from_millis(10)); }
             }
-            let response = if count == request.len() { reply(&mut key, &request) } else { None };
+            let response = if count == request.len() { reply(&key, &request) } else { None };
             let Some(mut bytes) = response else { unsafe { DisconnectNamedPipe(raw); } continue; };
             let mut written = 0;
             let sent = unsafe { WriteFile(raw, bytes.as_ptr(), bytes.len() as u32, &mut written, null_mut()) } != 0;
@@ -193,27 +183,19 @@ fn platform_start(id: &str, mut key: Key) -> io::Result<Broker> {
 mod tests {
     use super::*;
     #[test]
-    fn migration_is_pinned_until_encryption_and_cannot_be_reopened() {
-        let mut key = Key { bytes: [42; 32], migration: None, encrypted: false };
+    fn broker_only_accepts_the_key_request() {
+        let key = Key { bytes: [42; 32] };
         let mut request = [0; 37];
         request[..4].copy_from_slice(b"RCK1");
-        request[4] = 1;
-        request[5..].fill(7);
-        let accepted = reply(&mut key, &request).unwrap();
+        let accepted = reply(&key, &request).unwrap();
         assert_eq!(accepted[8], 0);
         assert_eq!(&accepted[9..], &[42; 32]);
-        assert_eq!(reply(&mut key, &request).unwrap(), accepted);
-        request[5] = 9;
-        let rejected = reply(&mut key, &request).unwrap();
-        assert_eq!(rejected[8], 1);
-        assert_eq!(&rejected[9..], &[0; 32]);
-        request[4] = 0;
-        assert_eq!(reply(&mut key, &request).unwrap()[8], 0);
+        assert_eq!(reply(&key, &request).unwrap(), accepted);
         request[4] = 1;
-        request[5] = 7;
-        assert_eq!(reply(&mut key, &request).unwrap()[8], 1);
-        request[4] = 2;
-        assert!(reply(&mut key, &request).is_none());
+        assert!(reply(&key, &request).is_none());
+        request[4] = 0;
+        request[5] = 1;
+        assert!(reply(&key, &request).is_none());
     }
     #[test]
     fn endpoint_ids_cannot_select_paths_or_remote_hosts() {

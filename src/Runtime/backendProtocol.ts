@@ -1,5 +1,5 @@
 const FRAME_HEADER_LEN = 12;
-export const BACKEND_PROTOCOL_VERSION = 3;
+export const BACKEND_PROTOCOL_VERSION = 4;
 export const MAX_BACKEND_FRAME_BYTES = 16 * 1024 * 1024;
 
 export class BackendProtocolVersionError extends Error {

@@ -49,28 +49,26 @@ test("session identities cannot choose arbitrary local or network endpoints", ()
   }
 });
 
-test("private key broker supports fragmented replies and migration requests", { skip: process.platform === "win32" }, async t => {
-  const digest = "ab".repeat(32);
+test("private key broker supports fragmented replies without migration requests", { skip: process.platform === "win32" }, async t => {
   const { identity } = await broker(t, (socket, request) => {
     assert.equal(request.subarray(0, 4).toString(), "RCK1");
-    assert.equal(request[4], 1);
-    assert.equal(request.subarray(5).toString("hex"), digest);
+    assert.deepEqual(request.subarray(4), Buffer.alloc(33));
     socket.write(response().subarray(0, 5));
     setImmediate(() => socket.end(response().subarray(5)));
   });
-  const key = await readSessionRegistryKey(identity, digest);
+  const key = await readSessionRegistryKey(identity);
   assert.deepEqual(key, Buffer.alloc(32, 42));
   key.fill(0);
 });
 
-for (const kind of ["wrong PID", "oversized", "bad magic", "truncated", "rejected migration"]) {
+for (const kind of ["wrong PID", "oversized", "bad magic", "truncated", "nonzero status"]) {
   test(`key reader rejects ${kind}`, { skip: process.platform === "win32" }, async t => {
     const { identity } = await broker(t, socket => {
-      const bytes = response(kind === "wrong PID" ? process.ppid : process.pid, kind === "rejected migration" ? 1 : 0);
+      const bytes = response(kind === "wrong PID" ? process.ppid : process.pid, kind === "nonzero status" ? 1 : 0);
       if (kind === "bad magic") bytes[0] = 0;
       socket.end(kind === "oversized" ? Buffer.concat([bytes, Buffer.alloc(1)]) : kind === "truncated" ? bytes.subarray(0, 15) : bytes);
     });
-    await assert.rejects(readSessionRegistryKey(identity), kind === "rejected migration" ? { code: "PLAINTEXT_REJECTED" } : undefined);
+    await assert.rejects(readSessionRegistryKey(identity));
   });
 }
 

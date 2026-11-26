@@ -14,7 +14,7 @@ function frame(kind, id, payload = Buffer.alloc(0)) {
 
 async function connection(t, supported = true) {
   const backend = new RustSidecarRuntimeBackend("unused");
-  const session = backend.reconnect({ sessionId: "test", port: 12345, protocolVersion: 3, authToken: "a".repeat(64) });
+  const session = backend.reconnect({ sessionId: "test", port: 12345, protocolVersion: 4, authToken: "a".repeat(64) });
   const writes = [], visible = [];
   const socket = Object.assign(new EventEmitter(), {
     destroyed: false, resume() {}, destroy() { this.destroyed = true; },

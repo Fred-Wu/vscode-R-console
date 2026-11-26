@@ -52,38 +52,44 @@ export async function getPersistentSessionRegistryPath(
   return path.join(context.globalStorageUri.fsPath, "folderless", windowId, "persistent-sessions.json");
 }
 
-export type LegacyConsoleRecord = Omit<PersistedConsoleRecord, "terminal"> & {
-  terminal: Omit<PersistedRTerminalState, "runtime"> & {
-    runtime: Omit<PersistedRTerminalState["runtime"], "authToken" | "protocolVersion"> & {
-      protocolVersion?: number;
-      authToken?: string;
-    };
+export type LegacyConsoleRecord = {
+  terminal: {
+    runtime: { sessionId: string; pid?: number; port: number; protocolVersion?: number; authToken?: string };
+    ui?: { backendChildPid?: number };
   };
 };
+type ShutdownRecord = {
+  terminal: {
+    runtime: SessionRegistryIdentity & { port: number; protocolVersion: number; authToken?: string };
+  };
+};
+type ShutdownStorage = Pick<vscode.SecretStorage, "get" | "store" | "delete">;
 
-export function isLegacyConsoleRecord(value: unknown): value is LegacyConsoleRecord {
-  if (!isObjectRecord(value) || !isObjectRecord(value.terminal)) return false;
-  const { options, runtime, ui } = value.terminal;
-  if (!isObjectRecord(runtime)) return false;
-  // Only v0.5.4 omitted both fields. Explicit versions drive all later upgrades.
+function shutdownRecord(value: unknown): ShutdownRecord | undefined {
+  if (!isObjectRecord(value) || !isObjectRecord(value.terminal)) return;
+  const { runtime, ui } = value.terminal;
+  if (!isObjectRecord(runtime)) return;
+  // Only the historical unauthenticated format omitted both fields.
   const version = !Object.hasOwn(runtime, "protocolVersion") && !Object.hasOwn(runtime, "authToken")
     ? 1 : runtime.protocolVersion;
-  if (!isPositiveInteger(version) || version >= BACKEND_PROTOCOL_VERSION) return false;
+  if (!isPositiveInteger(version) || version >= BACKEND_PROTOCOL_VERSION) return;
   const credentialsValid = version === 1
     ? !Object.hasOwn(runtime, "authToken")
     : typeof runtime.authToken === "string" && /^[0-9a-f]{64}$/.test(runtime.authToken);
-  return isPersistedRTerminalOptions(options) && isPersistedUiSnapshot(ui) &&
-    isPersistedTerminalContext(value.location) &&
-    (value.terminalName === undefined || typeof value.terminalName === "string") &&
-    credentialsValid &&
-    typeof runtime.sessionId === "string" && runtime.sessionId.trim().length > 0 &&
-    isPositiveInteger(runtime.port) && runtime.port <= 65535 &&
-    (runtime.pid === undefined || isPositiveInteger(runtime.pid));
+  const identity = { sessionId: runtime.sessionId, pid: runtime.pid ?? ui?.backendChildPid };
+  if (!credentialsValid || !isSessionRegistryIdentity(identity) ||
+      !isPositiveInteger(runtime.port) || runtime.port > 65535) return;
+  return { terminal: { runtime: { ...identity, port: runtime.port, protocolVersion: version,
+    ...(version >= 2 ? { authToken: runtime.authToken } : {}) } } };
+}
+
+export function isLegacyConsoleRecord(value: unknown): value is LegacyConsoleRecord {
+  return shutdownRecord(value) !== undefined;
 }
 
 /** Retain incompatible records without ever passing them to authenticated reconnect. */
 export class PersistentSessionRegistry {
-  private preserved: unknown[] = [];
+  private legacyRecords: ShutdownRecord[] = [];
   private sessions: PersistedConsoleRecord[] = [];
   private metadata: Record<string, unknown> = {};
   private readonly recordMetadata = new Map<string, Record<string, unknown>>();
@@ -95,19 +101,19 @@ export class PersistentSessionRegistry {
   private queue: Promise<unknown> = Promise.resolve();
   private scheduledSave: { records: unknown[]; generation: number; result: Promise<boolean> } | undefined;
   private originalDigest: string | undefined;
-  private migrationDigest: string | undefined;
   private generation = 0;
   private disposed = false;
   private reportedError: string | undefined;
   private readonly scope: string;
 
   constructor(readonly filePath: string, private readonly readKey: SessionRegistryKeyReader = readSessionRegistryKey,
-    private readonly onError: (message: string) => void = () => {}) {
+    private readonly onError: (message: string) => void = () => {},
+    private readonly shutdownStorage?: ShutdownStorage) {
     this.scope = digest(path.resolve(filePath));
   }
 
   get legacySessions(): LegacyConsoleRecord[] {
-    return this.preserved.filter(isLegacyConsoleRecord);
+    return this.legacyRecords.filter(entry => isProcessAlive(entry.terminal.runtime.pid));
   }
 
   load(): Promise<PersistedConsoleRecord[]> {
@@ -124,10 +130,8 @@ export class PersistentSessionRegistry {
     this.clearKeys();
     this.metadata = {};
     this.recordMetadata.clear();
-    this.preserved = [];
     this.sessions = [];
     this.opaque = [];
-    this.migrationDigest = undefined;
     try {
       let original: string | undefined;
       try { original = await fs.promises.readFile(this.filePath, "utf8"); }
@@ -136,7 +140,8 @@ export class PersistentSessionRegistry {
       const parsed: unknown = original === undefined ? { format: REGISTRY_FORMAT, version: 1, sessions: [] } : JSON.parse(original);
       if (!isObjectRecord(parsed) || !Array.isArray(parsed.sessions)) throw new Error("Invalid registry schema");
       let records: unknown[];
-      if (parsed.format === REGISTRY_FORMAT) {
+      const plaintext = parsed.format !== REGISTRY_FORMAT;
+      if (!plaintext) {
         if (parsed.version !== 1) throw new Error("Unsupported registry format");
         const entries = parsed.sessions.map((entry: unknown) => {
           if (!isSessionRegistryIdentity(entry) || !isObjectRecord(entry)) throw new Error("Invalid registry identity");
@@ -158,6 +163,10 @@ export class PersistentSessionRegistry {
               const value = JSON.parse(plaintext.toString("utf8"));
               if (!isObjectRecord(value) || identityKey(identityOf(value.record) ?? { sessionId: "", pid: 0 }) !== identityKey(row) ||
                   !isObjectRecord(value.metadata)) throw new Error("Registry identity mismatch");
+              if (!isPersistedConsoleRecord(value.record) && !isLegacyConsoleRecord(value.record)) {
+                this.opaque.push(row);
+                return;
+              }
               this.recordMetadata.set(identityKey(row), value.metadata);
               return value;
             } finally { partial.fill(0); plaintext?.fill(0); }
@@ -167,33 +176,43 @@ export class PersistentSessionRegistry {
           }
         }));
         records = decoded.filter(value => value !== undefined).map(value => value.record);
-        this.metadata = decoded.find(value => value !== undefined)?.metadata ?? {};
+        this.metadata = decoded.find(value => value && isPersistedConsoleRecord(value.record))?.metadata ?? {};
         if (this.opaque.length) this.reportError("Some saved R Console sessions could not be decrypted. Their encrypted records have been retained for retry.");
       } else {
         if (Object.hasOwn(parsed, "format")) throw new Error("Unsupported registry format");
         records = parsed.sessions;
-        const { sessions: _sessions, ...metadata } = parsed;
-        this.metadata = metadata;
-        this.migrationDigest = this.originalDigest;
       }
-      let migrationReady = true;
-      if (this.migrationDigest) {
-        // Probe every live owner even if another legacy row is malformed. A
-        // damaged row must not bypass the runtime's plaintext downgrade guard.
-        const owners = records.map(identityOf).filter((identity): identity is SessionRegistryIdentity =>
-          identity !== undefined && isProcessAlive(identity.pid));
-        const results = await Promise.allSettled(owners.map(identity => this.keyFor(identity)));
-        if (results.some(result => result.status === "rejected" && result.reason?.code === "PLAINTEXT_REJECTED")) {
-          throw new Error("Plaintext registry replacement rejected");
-        }
-        migrationReady = results.every(result => result.status === "fulfilled");
-        if (!migrationReady) this.reportError("Some R Console runtimes cannot encrypt their saved sessions. Start new R sessions to enable encrypted persistence. The existing file has been retained.");
+      // Keep shutdown credentials separate from restorable records, even if
+      // the user later cancels the upgrade prompt.
+      const legacy = records.some(isLegacyConsoleRecord);
+      try {
+        await this.retainShutdownRecords(records);
+      } catch (error) {
+        if (plaintext || legacy) throw error;
+        this.reportError("R Console could not read its old-session shutdown credentials.");
       }
       if (this.disposed) return [];
-      this.preserved = records.filter(entry => !isPersistedConsoleRecord(entry));
+      if (plaintext) {
+        // A same/newer protocol record cannot be safely classified as an old
+        // shutdown-only runtime. Never discard its last reconnect information.
+        if (records.some(entry => {
+          const record = entry as { terminal?: { runtime?: { protocolVersion?: number } } } | null;
+          const version = record?.terminal?.runtime?.protocolVersion;
+          const id = identityOf(entry);
+          return typeof version === "number" && version >= BACKEND_PROTOCOL_VERSION &&
+            id !== undefined && isProcessAlive(id.pid);
+        })) throw new Error("Live plaintext session cannot be safely replaced before the protocol upgrade");
+        // No plaintext replay is restored or converted. Remove the file only
+        // after securing old-protocol shutdown credentials.
+        this.assertRegistryUnchanged();
+        fs.rmSync(this.filePath, { force: true });
+        this.originalDigest = undefined;
+        this.writable = true;
+        return [];
+      }
       this.sessions = records.filter(isPersistedConsoleRecord).filter(hasLivePersistedRuntime);
       this.writable = true;
-      if (this.migrationDigest && migrationReady) await this.saveInternal([...this.sessions, ...this.preserved]);
+      if (legacy) await this.saveInternal(this.sessions);
       return [...this.sessions];
     } catch {
       this.writable = false;
@@ -205,9 +224,9 @@ export class PersistentSessionRegistry {
 
   save(sessions: PersistedConsoleRecord[]): Promise<boolean> {
     if (!this.writable || this.disposed) return Promise.resolve(false);
-    this.sessions = sessions.filter(hasLivePersistedRuntime);
+    this.sessions = sessions.filter(isPersistedConsoleRecord).filter(hasLivePersistedRuntime);
     let records: unknown[];
-    try { records = JSON.parse(JSON.stringify([...this.sessions, ...this.preserved])); }
+    try { records = JSON.parse(JSON.stringify(this.sessions)); }
     catch { this.reportError("R Console could not encode its saved sessions. The existing file has been preserved."); return Promise.resolve(false); }
     if (this.scheduledSave?.generation === this.generation) {
       this.scheduledSave.records = records;
@@ -225,15 +244,58 @@ export class PersistentSessionRegistry {
     return pending;
   }
 
-  async forgetLegacySession(entry: LegacyConsoleRecord): Promise<boolean> {
-    const previous = this.preserved;
-    this.preserved = previous.filter((item) => !isLegacyConsoleRecord(item) ||
-      item.terminal.runtime.sessionId !== entry.terminal.runtime.sessionId ||
-      item.terminal.runtime.port !== entry.terminal.runtime.port ||
-      getPersistedRuntimePid(item.terminal) !== getPersistedRuntimePid(entry.terminal));
-    if (await this.save(this.sessions)) return true;
-    this.preserved = previous;
-    return false;
+  private get shutdownStorageKey(): string {
+    return "r-console.legacy-shutdown.v1:" + this.scope;
+  }
+
+  private async retainShutdownRecords(records: unknown[]): Promise<void> {
+    const incoming = records.map(shutdownRecord).filter((entry): entry is ShutdownRecord =>
+      entry !== undefined && isProcessAlive(entry.terminal.runtime.pid));
+    if (!this.shutdownStorage) {
+      if (incoming.length) throw new Error("Secure shutdown storage unavailable");
+      return;
+    }
+    const saved = await this.shutdownStorage.get(this.shutdownStorageKey);
+    const decoded: unknown = saved === undefined ? [] : JSON.parse(saved);
+    if (!Array.isArray(decoded)) throw new Error("Invalid shutdown storage");
+    const entries = new Map<string, ShutdownRecord>();
+    for (const value of [...decoded, ...incoming]) {
+      const entry = shutdownRecord(value);
+      if (!entry || !isProcessAlive(entry.terminal.runtime.pid)) continue;
+      const id = identityKey(entry.terminal.runtime);
+      if (!entries.has(id)) entries.set(id, entry);
+    }
+    const next = [...entries.values()];
+    if (this.disposed) return;
+    if (saved !== (next.length ? JSON.stringify(next) : undefined)) await this.writeShutdownRecords(next);
+    this.legacyRecords = next;
+  }
+
+  private async writeShutdownRecords(records: ShutdownRecord[]): Promise<void> {
+    if (!this.shutdownStorage) throw new Error("Secure shutdown storage unavailable");
+    if (records.length) await this.shutdownStorage.store(this.shutdownStorageKey, JSON.stringify(records));
+    else await this.shutdownStorage.delete(this.shutdownStorageKey);
+  }
+
+  forgetLegacySession(entry: LegacyConsoleRecord): Promise<boolean> {
+    const pending = this.queue.then(async () => {
+      if (this.disposed) return false;
+      const selected = shutdownRecord(entry);
+      if (!selected) return false;
+      const id = identityKey(selected.terminal.runtime);
+      const next = this.legacyRecords.filter(item => identityKey(item.terminal.runtime) !== id);
+      if (next.length === this.legacyRecords.length) return true;
+      try {
+        await this.writeShutdownRecords(next);
+        this.legacyRecords = next;
+        return true;
+      } catch {
+        this.reportError("R Console could not remove the old session's saved shutdown credentials.");
+        return false;
+      }
+    });
+    this.queue = pending.catch(() => false);
+    return pending;
   }
 
   dispose(): void {
@@ -259,7 +321,7 @@ export class PersistentSessionRegistry {
     const failed = this.failedKeys.get(id);
     if (failed && Date.now() < failed.retryAfter) throw failed.error;
     const generation = this.generation;
-    const request = this.readKey(identity, this.migrationDigest).then(key => {
+    const request = this.readKey(identity).then(key => {
       if (this.disposed || generation !== this.generation || key.length !== 32) {
         key.fill(0);
         throw new Error("Session key transfer cancelled or invalid");
@@ -286,6 +348,13 @@ export class PersistentSessionRegistry {
     try { this.onError(message); } catch { /* Reporting must not interrupt persistence. */ }
   }
 
+  private assertRegistryUnchanged(): void {
+    let current: string | undefined;
+    try { current = fs.readFileSync(this.filePath, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if ((current === undefined ? undefined : digest(current)) !== this.originalDigest) throw new Error("Registry changed on disk");
+  }
+
   private async saveInternal(records: unknown[]): Promise<boolean> {
     if (this.disposed || !this.writable) return false;
     const temporary = `${this.filePath}.${randomUUID()}.tmp`;
@@ -310,10 +379,7 @@ export class PersistentSessionRegistry {
       if (failure?.status === "rejected") throw failure.reason;
       const rows = encrypted.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
       if (this.disposed) return false;
-      let current: string | undefined;
-      try { current = fs.readFileSync(this.filePath, "utf8"); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if ((current === undefined ? undefined : digest(current)) !== this.originalDigest) throw new Error("Registry changed on disk");
+      this.assertRegistryUnchanged();
       if (rows.length === 0 && opaque.length === 0) {
         fs.rmSync(this.filePath, { force: true });
         this.originalDigest = undefined;
@@ -324,35 +390,26 @@ export class PersistentSessionRegistry {
         fs.renameSync(temporary, this.filePath);
         this.originalDigest = digest(encoded);
       }
-      if (this.migrationDigest) {
-        await Promise.all(alive.map(async ({ identity }) => { const key = await this.readKey(identity!); key.fill(0); }));
-        this.migrationDigest = undefined;
-      }
       const retained = new Set([...rows, ...opaque].map(identityKey));
       for (const [id, key] of this.keys) if (!retained.has(id)) { key.fill(0); this.keys.delete(id); }
       for (const id of this.recordMetadata.keys()) if (!retained.has(id)) this.recordMetadata.delete(id);
       this.opaque = opaque;
       this.reportedError = undefined;
       return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "PLAINTEXT_REJECTED") {
-        this.writable = false;
-        this.sessions = [];
-        this.preserved = [];
-      }
-      this.reportError("R Console could not update its saved sessions. The existing saved data has been retained. Older runtimes require a new R session for encrypted persistence; no plaintext fallback was written.");
+    } catch {
+      this.reportError("R Console could not update its saved sessions. The existing saved data has been retained; no plaintext fallback was written.");
       return false;
     } finally { try { fs.rmSync(temporary, { force: true }); } catch {} }
   }
 }
 
-export function getPersistedRuntimePid(state: Pick<PersistedRTerminalState, "ui"> & { runtime: { pid?: number } }): number | undefined {
+export function getPersistedRuntimePid(state: { ui?: { backendChildPid?: number }; runtime: { pid?: number } }): number | undefined {
   const runtimePid = state.runtime.pid;
   if (isPositiveInteger(runtimePid)) {
     return runtimePid;
   }
 
-  const backendChildPid = state.ui.backendChildPid;
+  const backendChildPid = state.ui?.backendChildPid;
   return isPositiveInteger(backendChildPid) ? backendChildPid : undefined;
 }
 

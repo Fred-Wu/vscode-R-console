@@ -8,10 +8,10 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 
-test("a future protocol upgrade closes a real authenticated protocol 3 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
+test("a future protocol upgrade closes a real authenticated protocol 4 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {
-    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 4 },
+    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 5 },
   });
   const { closeLegacySession } = loadSource("src/Runtime/legacySession.ts", { "./persistentSessionRegistry": registry });
   const { session: savedSession } = require("./helpers/persistent-session.cjs");
@@ -45,7 +45,7 @@ test("a future protocol upgrade closes a real authenticated protocol 3 session",
     await delay(20, undefined, { signal: t.signal });
   }
   const runtime = backend.getReconnectInfo(handle);
-  assert.equal(runtime.protocolVersion, 3);
+  assert.equal(runtime.protocolVersion, 4);
   pid = runtime.pid;
   const entry = savedSession({ ...runtime, cwd: directory });
   assert.equal(registry.isLegacyConsoleRecord(entry), true);

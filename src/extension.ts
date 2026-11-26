@@ -23,7 +23,7 @@ import {
   type PersistedConsoleRecord,
   type TerminalContext,
 } from "./Runtime/persistentSessionRegistry";
-import { showLegacySessionNotice, manageLegacySessions } from "./Terminal/legacySessionNotice";
+import { showLegacySessionNotice, manageLegacySessions, closeLegacyConsoleView } from "./Terminal/legacySessionNotice";
 
 type ConsoleRecord = {
   rTerminal: RTerminal;
@@ -96,7 +96,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   extensionBaseUri = context.extensionUri;
   persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context), undefined,
-    message => { void vscode.window.showErrorMessage(message); });
+    message => { void vscode.window.showErrorMessage(message); }, context.secrets);
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
   context.subscriptions.push(
@@ -206,6 +206,11 @@ async function handleTerminalClose(closedTerminal: vscode.Terminal): Promise<voi
   const record = resolveRecordFromTerminal(closedTerminal);
   if (!record) {
     setRConsoleActiveContext(vscode.window.activeTerminal, closedTerminal);
+    // An incompatible session is never reattached. An identifiable remaining
+    // extension-owned view may still request verified, authenticated shutdown.
+    if (!extensionHostDeactivating && persistentRegistry && "pty" in closedTerminal.creationOptions) {
+      await closeLegacyConsoleView(persistentRegistry, parseConsolePidFromTerminal(closedTerminal));
+    }
     return;
   }
 
@@ -1097,9 +1102,20 @@ function handleTerminalTabChange(event: vscode.TabChangeEvent): void {
 
     const record = editorTabToRecord.get(tab);
     editorTabToRecord.delete(tab);
-    if (!record || extensionHostDeactivating || closeConfirmationInProgress.has(record)) {
+    if (!record) {
+      // The editor tab can close independently of its terminal. Do not
+      // infer an old R session from a tab title alone.
+      const pid = parseConsolePidFromLabel(tab.label);
+      if (!extensionHostDeactivating && persistentRegistry && pid !== undefined &&
+          ![...openTabs].some(open => open.input instanceof vscode.TabInputTerminal &&
+            parseConsolePidFromLabel(open.label) === pid) &&
+          vscode.window.terminals.some(terminal => "pty" in terminal.creationOptions &&
+            parseConsolePidFromTerminal(terminal) === pid && !resolveRecordFromTerminal(terminal))) {
+        void closeLegacyConsoleView(persistentRegistry, pid);
+      }
       continue;
     }
+    if (extensionHostDeactivating || closeConfirmationInProgress.has(record)) continue;
 
     let stillOpenInEditor = false;
     for (const [openTab, mappedRecord] of editorTabToRecord) {

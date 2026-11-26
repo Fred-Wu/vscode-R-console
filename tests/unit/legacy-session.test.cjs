@@ -215,10 +215,13 @@ for (const platform of ["win32", "linux", "darwin"]) {
   });
 }
 
-test("later protocol upgrades use the same authenticated cleanup flow", async t => {
+test("protocol 3 cleanup after upgrade to 4 accepts only minimal shutdown credentials", async t => {
   const f = fixture(t, { protocolVersion: 3, currentVersion: 4 });
   const commands = await authenticatedEndpoint(t, f);
-  await f.closeLegacySession(f.entry);
+  const { sessionId, pid, port, protocolVersion, authToken } = f.entry.terminal.runtime;
+  const minimal = { terminal: { runtime: { sessionId, pid, port, protocolVersion, authToken } } };
+  assert.equal(f.inspectLegacySession !== undefined, true);
+  await f.closeLegacySession(minimal);
   assert.deepEqual(Buffer.concat(commands), frame(17, Buffer.alloc(0)));
 });
 

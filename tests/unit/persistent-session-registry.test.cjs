@@ -8,16 +8,24 @@ const { registryKeys } = require("../helpers/registry-keys.cjs");
 const { session } = require("../helpers/persistent-session.cjs");
 const { PersistentSessionRegistry, getPersistentSessionRegistryPath } = loadSource("src/Runtime/persistentSessionRegistry.ts");
 
-function fixture(t, content) {
+function fixture(t, content, { plaintext = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-upgrade-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const file = path.join(directory, "persistent-sessions.json");
-  fs.writeFileSync(file, typeof content === "string" ? content : JSON.stringify(content));
   const keys = registryKeys();
+  if (typeof content === "string" || plaintext || content.format) {
+    fs.writeFileSync(file, typeof content === "string" ? content : JSON.stringify(content));
+  } else keys.seed(file, content);
+  const values = new Map();
+  const secrets = {
+    get: async key => values.get(key),
+    store: async (key, value) => { values.set(key, value); },
+    delete: async key => { values.delete(key); },
+  };
   const errors = [];
-  const registry = new PersistentSessionRegistry(file, keys.readKey, error => errors.push(error));
+  const registry = new PersistentSessionRegistry(file, keys.readKey, error => errors.push(error), secrets);
   t.after(() => registry.dispose());
-  return { file, registry, read: () => keys.read(file), keys, errors };
+  return { file, registry, read: () => keys.read(file), keys, errors, secrets, values };
 }
 
 test("workspace sessions keep their existing registry path", async () => {
@@ -66,98 +74,113 @@ test("folderless windows preserve separate sessions across saves and reloads", a
   assert.deepEqual(await new PersistentSessionRegistry(fileA, keys.readKey).load(), sessionsA);
 });
 
-test("an upgrade retains old records while authenticated sessions remain reconnectable", async (t) => {
-  const old = session({ legacy: true });
-  const current = session();
-  const { registry, read, file, keys } = fixture(t, { sessions: [old, current], futureMetadata: "retain" });
-  const loaded = await registry.load();
-  assert.deepEqual(loaded, [current]);
-  assert.deepEqual(registry.legacySessions, [old]);
-  assert.equal(await registry.save(loaded), true);
-  const reloaded = new PersistentSessionRegistry(file, keys.readKey);
-  assert.deepEqual(await reloaded.load(), [current]);
-  assert.deepEqual(reloaded.legacySessions, [old]);
-  assert.equal(read().futureMetadata, "retain");
-  assert.equal(read().sessions.length, 2);
-  if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-});
 
-test("legacy-only records survive startup, heartbeat, and deactivation saves", async (t) => {
-  const old = session({ legacy: true });
-  const { registry, read } = fixture(t, { sessions: [old] });
-  assert.deepEqual(await registry.load(), []);
-  for (let i = 0; i < 3; i++) assert.equal(await registry.save([]), true);
-  assert.deepEqual(read().sessions, [old]);
-});
-
-for (const currentVersion of [3, 4]) {
-  test(`protocol ${currentVersion} detects every older session for the same notice and close flow`, async t => {
-    const { PersistentSessionRegistry: UpgradedRegistry } = loadSource("src/Runtime/persistentSessionRegistry.ts", {
-      "./backendProtocol": { BACKEND_PROTOCOL_VERSION: currentVersion },
-    });
-    const old = [session({ legacy: true }), session({ legacy: true, protocolVersion: 1 }),
-      ...Array.from({ length: currentVersion - 2 }, (_, i) => session({ protocolVersion: i + 2 }))];
-    const current = session({ protocolVersion: currentVersion });
-    const damaged = session({ protocolVersion: 2, authToken: "invalid" });
-    const newer = session({ protocolVersion: currentVersion + 1 });
-    const { file, read, keys } = fixture(t, { sessions: [...old, current, damaged, newer] });
-    const registry = new UpgradedRegistry(file, keys.readKey);
-    assert.deepEqual(await registry.load(), [current]);
-    assert.deepEqual(registry.legacySessions, old);
-    assert.equal(await registry.forgetLegacySession(old.at(-1)), true);
-    assert.deepEqual(read().sessions, [current, ...old.slice(0, -1), damaged, newer]);
-  });
+function shutdownRecord(entry) {
+  const { sessionId, pid, port, protocolVersion, authToken } = entry.terminal.runtime;
+  return { terminal: { runtime: { sessionId, pid, port, protocolVersion,
+    ...(authToken ? { authToken } : {}) } } };
 }
 
-test("only protocol 3 reconnects; old records are distinguished from unsupported or damaged records", async (t) => {
-  const old = session({ legacy: true, protocolVersion: 1 });
-  const historical = session({ legacy: true });
-  const oldProtocol2 = session({ protocolVersion: 2 });
-  const current = session();
-  const incompatible = [
-    session({ protocolVersion: 1 }),
-    session({ protocolVersion: 4 }),
-    session({ protocolVersion: undefined }),
-    session({ legacy: true, protocolVersion: 3 }),
-  ];
-  const records = [current, old, historical, oldProtocol2, ...incompatible];
-  const { registry, read } = fixture(t, { sessions: records });
-  assert.deepEqual(await registry.load(), [current]);
-  assert.deepEqual(registry.legacySessions, [old, historical, oldProtocol2]);
-  assert.equal(await registry.save([current]), true);
-  assert.deepEqual(read().sessions, JSON.parse(JSON.stringify(records)));
+test("protocol 4 deletes old plaintext after securing only shutdown credentials", async t => {
+  const old = session({ protocolVersion: 3 });
+  old.terminal.ui.inputText = "OLD_UNSUBMITTED_SECRET";
+  const { registry, file, keys, secrets, values } = fixture(t,
+    { sessions: [old], environment: "OLD_METADATA" }, { plaintext: true });
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(fs.existsSync(file), false);
+  assert.deepEqual(registry.legacySessions, [shutdownRecord(old)]);
+  assert.equal(keys.runtimes.size, 0, "migration never requests the old runtime key");
+  const secured = [...values.values()][0];
+  assert.deepEqual(JSON.parse(secured), [shutdownRecord(old)]);
+  assert.doesNotMatch(secured, /OLD_UNSUBMITTED_SECRET|OLD_METADATA|options|replay|location/);
+  assert.equal(await registry.save([session()]), true);
+  const reloaded = new PersistentSessionRegistry(file, keys.readKey, undefined, secrets);
+  t.after(() => reloaded.dispose());
+  assert.equal((await reloaded.load()).length, 1, "new session reattaches using encrypted replay");
+  assert.deepEqual(reloaded.legacySessions, [shutdownRecord(old)]);
+  assert.equal(await reloaded.forgetLegacySession(reloaded.legacySessions[0]), true);
+  assert.equal(values.size, 0, "shutdown credentials disappear after confirmed close");
 });
 
-test("malformed credentials are preserved but never treated as a legacy authentication fallback", async (t) => {
-  const malformed = session({ authToken: "invalid" });
-  const current = session();
-  const { registry, read } = fixture(t, { sessions: [malformed, null, current] });
+test("dismissal and reload preserve only minimal old shutdown records, not a plaintext file", async t => {
+  const old = session({ protocolVersion: 3 });
+  const { registry, file, secrets, keys } = fixture(t, { sessions: [old] }, { plaintext: true });
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(fs.existsSync(file), false);
+  for (let n = 0; n < 3; n++) assert.equal(await registry.save([]), true);
+  const reload = new PersistentSessionRegistry(file, keys.readKey, undefined, secrets);
+  t.after(() => reload.dispose());
+  assert.deepEqual(await reload.load(), []);
+  assert.deepEqual(reload.legacySessions, [shutdownRecord(old)]);
+  assert.equal(await reload.forgetLegacySession(reload.legacySessions[0]), true);
+  assert.deepEqual(reload.legacySessions, []);
+});
+
+test("an encrypted older-protocol session is removed from replay but retained for shutdown", async t => {
+  const old = session({ protocolVersion: 3 }), current = session();
+  const { registry, file, keys, secrets } = fixture(t, { sessions: [old, current] });
   assert.deepEqual(await registry.load(), [current]);
+  assert.deepEqual(registry.legacySessions, [shutdownRecord(old)]);
+  assert.deepEqual(keys.read(file).sessions, [current]);
+  const reload = new PersistentSessionRegistry(file, keys.readKey, undefined, secrets);
+  t.after(() => reload.dispose());
+  assert.deepEqual(await reload.load(), [current]);
+  assert.deepEqual(reload.legacySessions, [shutdownRecord(old)]);
+});
+
+test("plaintext with live current-protocol reconnect information is never silently deleted", async t => {
+  const live = session();
+  const { registry, file } = fixture(t, { sessions: [live] }, { plaintext: true });
+  const original = fs.readFileSync(file, "utf8");
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.equal(await registry.save([live]), false);
+});
+
+test("unsupported and damaged plaintext rows cannot become shutdown credentials", async t => {
+  const damaged = session({ protocolVersion: 3, authToken: "bad" });
+  const { registry, file, values } = fixture(t, { sessions: [damaged, null] }, { plaintext: true });
+  assert.deepEqual(await registry.load(), []);
   assert.deepEqual(registry.legacySessions, []);
-  assert.equal(await registry.save([current]), false);
-  assert.deepEqual(read().sessions, [malformed, null, current]);
+  assert.equal(values.size, 0);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test("failed secret storage preserves the original plaintext and disables writes", async t => {
+  const old = session({ protocolVersion: 3 });
+  const { registry, file, secrets } = fixture(t, { sessions: [old] }, { plaintext: true });
+  const original = fs.readFileSync(file, "utf8");
+  secrets.store = async () => { throw new Error("SecretStorage unavailable"); };
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.equal(await registry.save([session()]), false);
+});
+
+test("locked plaintext file is left intact until deletion can safely retry", async t => {
+  const old = session({ protocolVersion: 3 });
+  const { registry, file, values } = fixture(t, { sessions: [old] }, { plaintext: true });
+  const original = fs.readFileSync(file, "utf8");
+  const remove = fs.rmSync;
+  fs.rmSync = (target, options) => {
+    if (target === file) throw new Error("File locked");
+    return remove(target, options);
+  };
+  try { assert.deepEqual(await registry.load(), []); }
+  finally { fs.rmSync = remove; }
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.equal(values.size, 1);
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(fs.existsSync(file), false);
 });
 
 for (const content of ['{"sessions":', '{"futureSchema":true}']) {
-  test(`unreadable registry schema is not overwritten: ${content}`, async (t) => {
+  test(`unreadable registry schema is not overwritten: ${content}`, async t => {
     const { registry, file } = fixture(t, content);
     assert.deepEqual(await registry.load(), []);
     assert.equal(await registry.save([session()]), false);
     assert.equal(fs.readFileSync(file, "utf8"), content);
   });
 }
-
-test("closing one old session removes only its record, including across a refresh", async (t) => {
-  const first = session({ legacy: true, cwd: "/first" });
-  const second = session({ legacy: true, cwd: "/second" });
-  const current = session();
-  const { registry, read } = fixture(t, { sessions: [first, second, current] });
-  await registry.load();
-  const selected = registry.legacySessions[0];
-  await registry.load();
-  assert.equal(await registry.forgetLegacySession(selected), true);
-  assert.deepEqual(read().sessions, [current, second]);
-});
 
 test("replay, typed input, reconnect credentials and metadata are encrypted with fresh nonces", async t => {
   const entry = session();
@@ -223,51 +246,18 @@ for (const field of ["ciphertext", "tag", "sessionId", "pid", "path"]) {
   });
 }
 
-test("runtime rejects a plaintext downgrade even if a malformed record accompanies it", async t => {
+test("tampered plaintext never downgrades an already encrypted live session", async t => {
   const entry = session();
   const { registry, file, keys } = fixture(t, { sessions: [entry] });
-  await registry.load();
-  registry.dispose();
-  const replacement = JSON.stringify({ sessions: [entry, null] });
-  fs.writeFileSync(file, replacement);
-  const restored = new PersistentSessionRegistry(file, keys.readKey);
-  t.after(() => restored.dispose());
-  assert.deepEqual(await restored.load(), []);
-  assert.equal(await restored.save([entry]), false);
-  assert.equal(fs.readFileSync(file, "utf8"), replacement);
-});
-
-test("failed atomic replacement can retry the same migration but rejects changed plaintext", async t => {
-  const entry = session();
-  const { registry, file, keys } = fixture(t, { sessions: [entry] });
-  const rename = fs.renameSync;
-  fs.renameSync = () => { throw new Error("write failure"); };
-  try { assert.deepEqual(await registry.load(), [entry]); }
-  finally { fs.renameSync = rename; }
-  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).format, undefined);
-  assert.deepEqual(fs.readdirSync(path.dirname(file)), [path.basename(file)]);
-  assert.equal(await registry.save([entry]), true);
-  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).format, "r-console-session-records");
-
-  const other = fixture(t, { sessions: [session()] });
-  fs.renameSync = () => { throw new Error("write failure"); };
-  try { await other.registry.load(); } finally { fs.renameSync = rename; }
-  const changed = JSON.parse(fs.readFileSync(other.file, "utf8"));
-  changed.sessions[0].terminal.ui.inputText = "changed";
-  fs.writeFileSync(other.file, JSON.stringify(changed));
-  assert.deepEqual(await new PersistentSessionRegistry(other.file, other.keys.readKey).load(), []);
-});
-
-test("older runtimes without a key keep their existing registry and never fall back to plaintext writes", async t => {
-  const entry = session();
-  const { file } = fixture(t, { sessions: [entry] });
-  const before = fs.readFileSync(file, "utf8");
-  const registry = new PersistentSessionRegistry(file, async () => { throw new Error("Old runtime"); });
-  t.after(() => registry.dispose());
   assert.deepEqual(await registry.load(), [entry]);
-  entry.terminal.ui.inputText = "must not be written";
-  assert.equal(await registry.save([entry]), false);
-  assert.equal(fs.readFileSync(file, "utf8"), before);
+  registry.dispose();
+  const tampered = JSON.stringify({ sessions: [entry, null] });
+  fs.writeFileSync(file, tampered);
+  const replacement = new PersistentSessionRegistry(file, keys.readKey);
+  t.after(() => replacement.dispose());
+  assert.deepEqual(await replacement.load(), []);
+  assert.equal(await replacement.save([entry]), false);
+  assert.equal(fs.readFileSync(file, "utf8"), tampered);
 });
 
 test("concurrent saves finish in order and observe snapshots taken at request time", async t => {

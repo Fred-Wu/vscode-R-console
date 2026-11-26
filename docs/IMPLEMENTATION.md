@@ -299,16 +299,16 @@ The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 `127.0.0.1:0`, then writes JSON to the bootstrap file:
 
 ```json
-{"port":12345,"pid":67890,"protocolVersion":3}
+{"port":12345,"pid":67890,"protocolVersion":4}
 ```
 
-The TypeScript side polls that file, requires protocol version 3, reads the port and pid, then connects to
+The TypeScript side polls that file, requires protocol version 4, reads the port and pid, then connects to
 the loopback server. Before exchanging session traffic, both peers prove
 possession of the session secret using HMAC-SHA256 and fresh nonces. The
 authentication implementation is in
 [`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
 
-The current backend uses protocol version 3, including library-path notifications.
+The current backend uses protocol version 4, including library-path notifications and encrypted persistence.
 Protocol 2 introduced authentication; v0.5.4 used version 1 without
 authentication. The extension also checks the live `backend-ready` version.
 This version is independent of vscode-R's `sess` integration protocol.
@@ -1499,17 +1499,19 @@ Activation saves the pruned registry, cleaning up records left after a crash or
 reboot. An empty window keeps its registry absent. Live entries
 whose keys are temporarily unavailable or whose authentication fails retain their
 original ciphertext for retry; other sessions remain usable. Decrypted incompatible
-records remain available for the existing upgrade notice and close flow.
+records are retained for authenticated shutdown only, not for reattachment.
 Unreadable or malformed registry files are preserved and saving is disabled.
 
-Legacy plaintext registries migrate through the runtime key broker. The runtime
-pins the SHA-256 digest of the original plaintext during migration, allowing the
-same migration to retry after a failed write. A successful encrypted save seals
-migration; subsequent plaintext replacements are rejected by that runtime.
-Runtimes predating key support retain their existing records and can still be
-reattached or closed. Starting new R sessions enables encrypted persistence.
-Encryption failures preserve the existing file and report the failure; all new
-registry writes use the encrypted format.
+Plaintext registry files are never migrated or reattached. On protocol upgrade, the
+extension stores only the old session UUID, PID, port, protocol version, and
+authentication token in VS Code SecretStorage, scoped to the original registry
+location. It then deletes the obsolete plaintext registry even if the user
+declines immediate shutdown. If SecretStorage fails, the original plaintext file
+is preserved and new persistence is disabled to avoid losing the only shutdown
+credentials. A live plaintext record claiming the current or a newer protocol
+is likewise preserved rather than silently orphaned. An upgraded session creates
+a fresh encrypted registry; compatible sessions continue to reattach normally.
+The runtime key broker no longer implements plaintext migration or digest pinning.
 
 Records are recognized as older sessions when their protocol version is lower
 than the current version and their structure and credentials are valid. Records
@@ -1518,14 +1520,15 @@ protocol 1. This fallback applies only to those historical records. Activation s
 session, tracked in workspace state. The notice explains that the protocol has
 changed and old sessions must be closed and restarted. It offers only **Close Old
 Session** and **Cancel**. Clicking Close confirms shutdown, with a picker by PID
-and startup directory only when multiple old sessions exist. The picker supports
+only when multiple old sessions exist. The picker supports
 multiple selection with all old sessions preselected, including previously
 dismissed ones. Confirming closes the selected sessions; cancelling or clearing
-every selection closes none. A failure retains that session's record and does
+every selection closes none. A failure retains that session's shutdown credentials and does
 not prevent closing the other selected sessions. There is no details
-page or second confirmation. Cancel leaves the sessions untouched. The session
-manager also provides this close action. It does not depend on editor focus and
-does not create a new console.
+page or second confirmation. Cancel leaves the old R processes untouched, not the
+obsolete plaintext registry. The session manager also provides the authenticated
+close action after reload. Manually closing an identifiable surviving old
+console view offers confirmed shutdown; it cannot reattach the old session.
 
 `Runtime/legacySession.ts` implements this explicit cleanup path. It matches the
 saved PID and port to the session bootstrap file and checks the running backend:

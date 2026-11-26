@@ -3,7 +3,7 @@ import * as net from "net";
 import * as path from "path";
 
 export type SessionRegistryIdentity = { sessionId: string; pid: number };
-export type SessionRegistryKeyReader = (identity: SessionRegistryIdentity, migrationDigest?: string) => Promise<Buffer>;
+export type SessionRegistryKeyReader = (identity: SessionRegistryIdentity) => Promise<Buffer>;
 
 export function isSessionRegistryIdentity(value: unknown): value is SessionRegistryIdentity {
   const item = value as SessionRegistryIdentity | undefined;
@@ -22,15 +22,10 @@ export function sessionRegistryKeyEndpoint(identity: SessionRegistryIdentity): s
 /** The broker uses a private Unix directory/socket or a local-only named pipe
  * with a user-only DACL. Its key is created and retained by the Rust runtime.
  * Endpoints are derived locally; a saved record cannot choose a network path. */
-export const readSessionRegistryKey: SessionRegistryKeyReader = async (identity, migrationDigest) => {
+export const readSessionRegistryKey: SessionRegistryKeyReader = async identity => {
   const endpoint = sessionRegistryKeyEndpoint(identity);
   const request = Buffer.alloc(37);
   request.write("RCK1", "ascii");
-  if (migrationDigest !== undefined) {
-    if (!/^[0-9a-f]{64}$/.test(migrationDigest)) throw new Error("Invalid registry migration digest");
-    request[4] = 1;
-    Buffer.from(migrationDigest, "hex").copy(request, 5);
-  }
   const deadline = Date.now() + 3000;
   while (true) {
     try {
@@ -85,7 +80,7 @@ function receiveKey(endpoint: string, pid: number, request: Buffer, timeout: num
         return;
       }
       if (bytes[8] !== 0) {
-        finish(Object.assign(new Error("The runtime rejected a plaintext registry replacement"), { code: "PLAINTEXT_REJECTED" }));
+        finish(new Error("Invalid session key response"));
         return;
       }
       const key = Buffer.from(bytes.subarray(9));
