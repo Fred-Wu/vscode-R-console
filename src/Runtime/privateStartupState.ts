@@ -84,6 +84,10 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
     let serverNonce: Buffer | undefined;
     let expectedResponse: number | undefined;
     let settled = false;
+    // Windows can report read EPIPE when the broker disconnects after sending
+    // the complete authenticated reply but before Node finishes the final ACK.
+    // Never tolerate pipe errors before the response MAC has been validated.
+    let verifiedResponse: Buffer | undefined;
     const timer = setTimeout(() => finish(new Error("Private startup state transfer timed out")), timeoutMs);
     function finish(error?: Error, result?: Buffer): void {
       if (settled) { result?.fill(0); return; }
@@ -92,12 +96,25 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
       pending.fill(0);
       serverNonce?.fill(0);
       request.fill(0);
+      if (error) verifiedResponse?.fill(0);
+      verifiedResponse = undefined;
       socket.destroy();
       if (error) reject(error); else resolve(result);
     }
     socket.once("connect", () => socket.write(request));
-    socket.on("error", error => finish(error));
-    socket.on("close", () => { if (!settled) finish(new Error("Private startup state connection closed")); });
+    socket.on("error", error => {
+      if (process.platform === "win32" && verifiedResponse &&
+          (error as NodeJS.ErrnoException).code === "EPIPE") {
+        finish(undefined, verifiedResponse);
+      } else {
+        finish(error);
+      }
+    });
+    socket.on("close", () => {
+      if (settled) return;
+      if (process.platform === "win32" && verifiedResponse) finish(undefined, verifiedResponse);
+      else finish(new Error("Private startup state connection closed"));
+    });
     socket.on("data", (chunk: Buffer) => {
       if (settled) return;
       const bound = serverNonce
@@ -155,7 +172,10 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
       }
       const result = Buffer.from(pending.subarray(RESPONSE_HEADER_BYTES, RESPONSE_HEADER_BYTES + expectedResponse));
       if (process.platform === "win32") {
-        socket.end(Buffer.from("RCK1"), () => finish(undefined, result));
+        // The broker's disconnect does not invalidate an already authenticated
+        // response. Still attempt the ACK so the broker can serve the next call.
+        verifiedResponse = result;
+        socket.end(Buffer.from("RCK1"), () => { if (!settled) finish(undefined, result); });
       } else {
         finish(undefined, result);
       }

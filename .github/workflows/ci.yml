@@ -58,7 +58,7 @@ jobs:
       - name: Type-check and bundle
         run: npm run package:extension
       - name: Focused package monitoring and static completion regressions
-        run: node --test tests/unit/package-inventory.test.cjs tests/unit/library-path-entry-monitor.test.cjs tests/unit/static-bindings.test.cjs tests/unit/static-provider-edits.test.cjs tests/unit/static-provider-budget.test.cjs
+        run: node --test tests/unit/package-inventory.test.cjs tests/unit/library-path-entry-monitor.test.cjs tests/unit/private-startup-windows-pipe.test.cjs tests/unit/static-bindings.test.cjs tests/unit/static-provider-edits.test.cjs tests/unit/static-provider-budget.test.cjs
       - name: Unit tests
         run: npm test
       - name: Install Linux system dependency for R fs

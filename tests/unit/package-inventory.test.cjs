@@ -277,7 +277,8 @@ test("an ordinary package replaced by an renv-style link is tracked without watc
   fs.symlinkSync(target, directory, process.platform === "win32" ? "junction" : "dir");
   await settle(() => changes.at(-1).packages.get("example")?.linked === true);
   assert.equal(changes.at(-1).packages.get("example").target, directory);
-  assert.ok(logs.some(line => line.includes("Linked installation observed: example") && line.includes(directory)));
+  assert.ok(!logs.some(line => line.includes("Linked installation observed")),
+    "renv package links must not create per-package location logs");
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.deepEqual(changes.at(-1).unmonitored, []);
   fs.unlinkSync(directory);

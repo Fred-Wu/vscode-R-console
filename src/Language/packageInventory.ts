@@ -615,12 +615,6 @@ export class PackageInventory {
       }
       if (!changed.length) this.log("[Completion] Active package copies unchanged; language server retained");
     }
-    for (const [name, item] of packages) {
-      const old = this.packages.get(name);
-      if (item.linked && (!old?.linked || old.identity !== item.identity)) {
-        this.log(`[Packages] Linked installation observed: ${name} - ${item.path} (external target not watched)`);
-      }
-    }
     this.log("[Libraries] Search order:");
     libraries.forEach((library, index) => this.log(
       `  ${index + 1}. ${library.path} - ${library.packages.size} ${library.packages.size === 1 ? "package" : "packages"}`));
