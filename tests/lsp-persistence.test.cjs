@@ -9,7 +9,7 @@ const { test } = require("node:test");
 const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } =
   require("./helpers/load-source.cjs")("src/Runtime/runtimeBackend.ts");
 
-test("persistent R retains the original LSP profile across extension-host death and detach/reattach", { timeout: 90000 }, async t => {
+test("persistent R supplies live library paths to new LSP processes after crash and reattachment", { timeout: 90000 }, async t => {
   const root = path.resolve(__dirname, "..");
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-persistent-lsp-"));
   const library = path.join(cwd, "original-library");
@@ -59,12 +59,11 @@ test("persistent R retains the original LSP profile across extension-host death 
   await wait(() => ready);
   const runtime = backend.getReconnectInfo(session);
   runtimePid = runtime.pid;
-  assert.equal(await backend.loadLspStartupState(session), undefined);
   backend.sendSessionCommand(session, { type: "submit", code: 'persistent_probe <- 123L; cat(paste0("PROBE", "_READY"), "\\n")' });
   await wait(() => output.includes("PROBE_READY"));
   backend.detach(session);
 
-  const startClient = async () => {
+  const startClient = async (expectedCount = 7) => {
     const worker = fork(path.join(__dirname, "helpers/persistent-lsp-worker.cjs"), [], {
       env: { ...process.env, R_TEST_EXECUTABLE: rPath }, stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
@@ -75,9 +74,9 @@ test("persistent R retains the original LSP profile across extension-host death 
       once(worker, "exit").then(() => { throw new Error("LSP worker exited before becoming ready"); })]);
     assert.ok(!message.error, message.error);
     servers.push(message.lspPid); workspaces.push(message.workspace);
-    assert.equal(message.count, 7, "the original language-server options survive");
+    assert.equal(message.count, expectedCount, "each process uses current normal startup configuration");
     assert.equal(message.runtimePid, runtimePid, "the interactive R process survives");
-    assert.equal(message.captured, true);
+    assert.equal(message.captured, false);
     assert.equal(message.leaked, false);
     // Windows realpathSync may return RUNNER~1 while .native returns the
     // long canonical path, and path casing is not significant on Windows.
@@ -86,13 +85,12 @@ test("persistent R retains the original LSP profile across extension-host death 
       return process.platform === "win32" ? canonical.toLowerCase() : canonical;
     };
     assert.ok(message.libraries.some(value => rootName(value) === rootName(library)),
-      "original library order is restored before live library metadata is supplied: " +
+      "the persistent runtime supplies its library order: " +
         JSON.stringify({ expected: library, actual: message.libraries }));
     assert.deepEqual(fs.readdirSync(message.workspace), []);
     return { worker, message };
   };
   const first = await startClient();
-  assert.equal(first.message.captures, 1);
   const originalRuns = fs.readFileSync(marker, "utf8");
   // languageserver can also start its own metadata workers. Count only the
   // interactive process and the console-owned LSP whose lifetime we manage.
@@ -104,13 +102,12 @@ test("persistent R retains the original LSP profile across extension-host death 
   await crashed;
   try { process.kill(first.message.lspPid, "SIGKILL"); } catch {}
   fs.writeFileSync(profile, [
-    'if (any(basename(commandArgs(TRUE)) == "console-language-server.R")) stop("profile replayed")',
+    `cat(if (any(basename(commandArgs(TRUE)) == "console-language-server.R")) "lsp" else "worker", "\\n", file=${JSON.stringify(marker)}, append=TRUE)`,
     'options(languageserver.max_completions=1L)',
   ].join("\n") + "\n");
   for (let index = 0; index < 2; index++) {
-    const next = await startClient();
-    assert.equal(next.message.captures, 0, "reattach must retrieve the persistent snapshot");
-    assert.equal(fs.readFileSync(marker, "utf8"), originalRuns);
+    const next = await startClient(1);
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split(/\s+/).filter(value => value === "lsp").length, index + 2);
     const stopped = once(next.worker, "exit");
     next.worker.send("detach");
     assert.equal((await stopped)[0], 0);
@@ -119,9 +116,6 @@ test("persistent R retains the original LSP profile across extension-host death 
   ready = false;
   attach();
   await wait(() => ready);
-  const retained = await backend.loadLspStartupState(session);
-  assert.ok(retained.includes(Buffer.from("synthetic-persistent-profile-secret")));
-  retained.fill(0);
   backend.sendSessionCommand(session, { type: "submit", code: 'stopifnot(persistent_probe == 123L); cat(paste0("PERSISTENCE", "_OK"), "\\n")' });
   await wait(() => output.includes("PERSISTENCE_OK"));
 });

@@ -1221,10 +1221,11 @@ completion client gives that snapshot priority over the LSP's own startup paths
 and sends the ordered directory list over the authenticated LSP connection using
 `rConsole/syncLibraryPaths`. The server applies R's `.libPaths()` rules with
 `include.site = FALSE` and reports whether the effective order changed. A change
-refreshes the separate language-server process from its retained in-memory startup
-state, initializing namespace and completion caches with the latest library order.
-The interactive R session retains its loaded packages. Profiles run during the
-initial language-server launch; replacements restore the captured startup state.
+refreshes the separate language-server process, initializing namespace and completion
+caches with the latest library order. The interactive R session retains its loaded
+packages. Each language-server launch performs normal R startup with the configured
+arguments and inherited launch environment. Project and user startup files apply
+to each new process, including changes made since the preceding launch.
 Concurrent changes share a synchronization queue that drains to the latest snapshot
 before completion proceeds. Failed synchronization retries with delays increasing
 from 1 second to 30 seconds, stopping on success or disposal. Synchronization also
@@ -1356,79 +1357,35 @@ package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
-latest snapshot. The initial server captures its effective environment, base and
-site library roots, ordered library paths, all startup options and attached
-package names in an opaque serialized envelope in memory. It delivers this
-envelope once through its own inherited stdout pipe, using a fresh random
-per-child `RCS2` marker and bounded Base64 framing. The extension consumes
-the marker before exposing the stdout stream to the stdio LSP reader; TCP
-mode captures stdout separately, then continuously drains and discards subsequent
-stdout for the lifetime of that child. Package hooks and later output can finish
-without filling the pipe or entering lifecycle logs. Project profile output cannot be mistaken for
-the envelope. No LSP JSON-RPC request or authenticated loopback TCP connection
-carries these credential-bearing bytes.
+latest library-path snapshot. Each child starts with the configured R executable,
+launch environment, arguments, and project working directory. R owns startup-file
+processing and package initialization. The console entry point applies the latest
+ordered library paths with site-library inclusion disabled before loading
+`languageserver`. The client's most recently reported server paths provide a
+fallback while live console library metadata is unavailable.
 
-The persistent Rust runtime retains the envelope in session-scoped memory and
-each attached console client holds a bounded local copy. The extension transfers
-the snapshot only through the existing OS-protected local key-broker endpoint
-(a private Unix socket or Windows user-only named pipe). The
-`lsp-startup-ipc-v2` capability indicates support for private startup GET/PUT.
-Commands `RCG2` and `RCP2` are strictly sized, PID-checked and
-authenticated with the session's existing 256-bit authentication token:
-the client and runtime each generate a fresh random challenge. The runtime
-authenticates both challenges, the request header and its PID before the client
-releases a snapshot. The client proves token possession with a domain-separated
-HMAC-SHA256 over both challenges, the complete request header and (for writes)
-payload. The runtime authenticates its response with a separate HMAC. Invalid or
-replayed proofs are rejected before releasing any startup state. This is
-a per-session authorization boundary, in addition to OS-user endpoint
-permissions. The `lsp-startup-ipc-v2` capability deliberately excludes
-old runtimes that only support unauthenticated IPC. The snapshot remains
-write-once: identical retries succeed, conflicting updates are refused. Old
-backend TCP startup-state frame types 27–30 are rejected. Snapshot payloads
-never enter terminal output, replay buffers, session registry files or
-lifecycle logs. The 16 MiB transport limit reserves room for framing.
-Malformed, oversized, or unavailable private transports fail startup without
-falling back to plaintext TCP.
+The child uses its own R temporary directory and fresh LSP authentication settings.
+In TCP mode its stdin and stdout use the OS null device; stderr carries lifecycle
+messages, and the authenticated socket carries LSP traffic. In stdio mode stdin
+and stdout carry the LSP protocol. The isolated temporary LSP workspace remains
+available for native workspace initialization. R and `languageserver` own their
+package metadata caches and supported configuration.
 
-VS Code reload and console detach release the client's local copy. Reattachment
-retrieves the same snapshot while the persistent R runtime lives. The interactive
-R evaluator does not inspect the envelope. Runtime shutdown clears the retained
-bytes; a new runtime starts with an empty store. Connection failures and timeouts
-fail LSP startup explicitly. Runtimes without the capability require a new R
-session to enable console language-server completion. A crash before the first
-successful store leaves initialization incomplete, so the next attachment performs
-initial startup again. The snapshot format and exact R version are checked by the
-replacement R process before restoring configuration.
-The restore contract covers the fields listed above. Namespace load and attach
-hooks run during reconstruction; languageserver manages its own workers and caches.
+Reattachment launches a new language server and receives the persistent runtime's
+last completed library-path snapshot through the normal session protocol. The
+registry key broker serves only its session-lifetime encryption key. Its fixed
+request format and OS-protected endpoint enforce the registry-key protocol.
 
-The client supplies replacement state through the spawned child's inherited stdin
-pipe, prefixed by a four-byte big-endian byte length. Pipe endpoints are assigned
-by the OS at process creation. R reads the bounded frame before loading package
-dependencies. For stdio, R acknowledges the consumed frame with `RCS1` before
-the client begins LSP writes, preserving the boundary across buffered readers;
-TCP mode closes the bootstrap pipe after sending the frame. No startup state is
-written to the filesystem or lifecycle logs. Client disposal clears its local buffer.
-The isolated temporary LSP workspace remains available for native workspace
-initialization. R and languageserver continue to own their package metadata caches.
-
-Options are serialized into a raw payload inside the envelope, so reading the
-environment and package names cannot deserialize namespace references. Options
-containing only atomic values and lists with reference-free attributes are also
-included as ordinary values for use by namespace load hooks. A replacement
-starts with profiles, environment files and automatic default-package loading
-disabled. It restores environment values and unsets, then the effective `.Library`
-and `.Library.site` values before applying the latest console library order, or
-the saved startup order while live metadata is unavailable, with site-library
-inclusion disabled. It restores those ordinary options,
-then deserializes and restores all startup options and loads the startup packages.
-Transport credentials and R's process-specific temporary
-directory remain fresh. The client verifies namespace installations before publishing
-the inventory. A completion interrupted by replacement reopens its document
-and retries once on the replacement client. `languageserver` owns its completion
-metadata and rebuilds it after a restart. The console does not export or restore
-that metadata. The replacement receives a silent completion request to prepare
+The client verifies namespace installations before publishing the package
+inventory. A replacement whose startup configuration preloads a conflicting
+installation records a diagnostic and suspends its completion responses. Retrying
+an unchanged inventory verifies that process without repeatedly launching it.
+A changed installation or library order permits a new replacement; successful
+verification resumes completion. Correcting startup files and reopening the
+console also performs a fresh launch. A completion interrupted by replacement reopens its document and
+retries once on the replacement client. `languageserver` rebuilds its completion
+metadata after a restart.
+The replacement receives a silent completion request to prepare
 suggestions for the current input. Package changes invalidate stale displayed
 suggestions. Disposal closes library watchers and timers and stops the child
 process before removing its working directory. The `R Console Language Server`

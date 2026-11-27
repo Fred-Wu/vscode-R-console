@@ -17,7 +17,7 @@ const uri = (value) => ({ toString: () => value });
 // Existing static-inference integration fixtures request it explicitly via
 // this helper's default. The extension setting and production default are off.
 function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--vanilla"], env = process.env,
-  staticAnalysis = true, requestRuntimeFunctionArguments, useStdio = false, getStartupStateStore } = {}) {
+  staticAnalysis = true, requestRuntimeFunctionArguments, useStdio = false } = {}) {
   const instances = [];
   const logs = [];
   const runtimeSignatures = new Map();
@@ -128,7 +128,6 @@ function createConsoleLsp(t, { libraries = [], afterResponse, cwd, args = ["--va
       [...runtimeSignatures].map(([name, str]) => [name, { type: "closure", str }])) }),
     getStaticAnalysisEnabled: () => staticMode,
     requestRuntimeFunctionArguments,
-    getStartupStateStore,
   });
   // Model the full .libPaths() result from an interactive session, not just
   // its added libraries. R's ordinary libraries must remain available to the

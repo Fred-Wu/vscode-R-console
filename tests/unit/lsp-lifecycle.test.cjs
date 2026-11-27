@@ -7,10 +7,9 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, librarySync, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, getStartupStateStore, showWarningMessage } = {}) {
+function createClient(t, { reply, completion, packageChanges, librarySync, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, showWarningMessage } = {}) {
   const instances = [];
   const logs = [];
-  let owningClient, captures = 0;
   class LanguageClient {
     constructor() {
       this.running = false;
@@ -30,11 +29,7 @@ function createClient(t, { reply, completion, packageChanges, librarySync, start
     async start() {
       await start?.(this);
       this.running = true;
-      // Mock the native first-child stdout capture, not an LSP request.
-      if (!owningClient.startupState) {
-        owningClient.startupState = Buffer.from("opaque R state");
-        captures++;
-      }
+
     }
     async stop() { this.running = false; await stop?.(this); }
     async dispose() { this.running = false; }
@@ -83,12 +78,10 @@ function createClient(t, { reply, completion, packageChanges, librarySync, start
     rPath: "R", env: {}, getCachedWorkspaceData,
     getStaticAnalysisEnabled: () => staticAnalysis,
     requestRuntimeFunctionArguments,
-    getStartupStateStore,
   });
-  owningClient = client;
   client.packageInventory.setLibraryPaths = () => {};
   t.after(() => client.dispose());
-  return { client, instances, logs, captures: () => captures };
+  return { client, instances, logs };
 }
 
 function change() {
@@ -120,84 +113,6 @@ test("library monitoring warnings are wired to the VS Code host with explicit mo
   assert.match(calls[1][1].detail, /Previously pinned: \/old\nNew location: \/new/);
   assert.deepEqual(calls[1].slice(2), ["Reject", "Trust and Resume"]);
   assert.equal(client.client, undefined, "warning does not launch a language server");
-});
-
-test("persistent state is retrieved before launching R and never recaptured on reattach", async t => {
-  let release;
-  const loading = new Promise(resolve => { release = resolve; });
-  const { client, instances } = createClient(t, { getStartupStateStore: async () => ({
-    load: () => loading, save: async () => assert.fail("reattach must not overwrite startup state"),
-  }) });
-  const starting = client.start();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(instances.length, 0);
-  release(Buffer.from("retained configuration"));
-  await starting;
-  assert.ok(!instances[0].requests.some(request => request.method === "rConsole/takeStartupState"));
-  assert.ok(client.buildServerArgs({ get: () => undefined }, "entry.R").includes("--no-init-file"));
-});
-
-test("initial startup waits for storage acknowledgement and retries failed saves without rereading profiles", async t => {
-  let saves = 0;
-  const { client, captures } = createClient(t, { getStartupStateStore: async () => ({
-    load: async () => undefined,
-    save: async () => { if (++saves === 1) throw new Error("storage interrupted"); },
-  }) });
-  await assert.rejects(client.start(), /storage interrupted/);
-  assert.equal(client.startupStateSaved, false);
-  await client.start();
-  assert.equal(client.startupStateSaved, true);
-  assert.equal(saves, 2);
-  assert.equal(captures(), 1, "private child stdout is captured only once");
-});
-
-test("failed persistent-state retrieval cannot fall back to running profiles", async t => {
-  const { client, instances } = createClient(t, { getStartupStateStore: async () => ({
-    load: async () => { throw new Error("state unavailable"); }, save: async () => {},
-  }) });
-  await assert.rejects(client.start(), /state unavailable/);
-  assert.equal(instances.length, 0);
-});
-
-test("concurrent startup and completion wait for the durable-in-session acknowledgement", async t => {
-  let release, entered;
-  const storing = new Promise(resolve => { entered = resolve; });
-  const acknowledgement = new Promise(resolve => { release = resolve; });
-  t.after(release);
-  const { client, instances } = createClient(t, { getStartupStateStore: async () => ({
-    load: async () => undefined,
-    save: async () => { entered(); await acknowledgement; },
-  }) });
-  const initial = client.start();
-  await storing;
-  let started = false, completed = false;
-  const second = client.start().then(() => { started = true; });
-  const completion = client.provideCompletionItems({ getText: () => "stats::" }, new Position(0, 7))
-    .then(() => { completed = true; });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(started, false);
-  assert.equal(completed, false);
-  assert.ok(!instances[0].requests.some(request => request.method === "completion"));
-  release();
-  await Promise.all([initial, second, completion]);
-  assert.equal(completed, true);
-});
-
-test("disposal during retrieval clears the received snapshot without launching R", async t => {
-  let release, entered;
-  const loading = new Promise(resolve => { entered = resolve; });
-  const response = new Promise(resolve => { release = resolve; });
-  const { client, instances } = createClient(t, { getStartupStateStore: async () => ({
-    load: () => { entered(); return response; }, save: async () => assert.fail("disposed client saved state"),
-  }) });
-  const rejected = assert.rejects(client.start(), /disposed/);
-  await loading;
-  const disposed = client.dispose();
-  const state = Buffer.from("synthetic-secret");
-  release(state);
-  await Promise.all([rejected, disposed]);
-  assert.deepEqual(state, Buffer.alloc(state.length));
-  assert.equal(instances.length, 0);
 });
 
 // Each outcome bundles both TypeScript adapters. Give each an independent
@@ -994,11 +909,9 @@ test("a library change refreshes cached namespaces independently of package disc
   });
   await client.start();
   await client.syncSessionState({ attachedPackages: ["stats"] });
-  const startupState = client.startupState;
   client.updateRuntimeLibraryPaths(["/new", "/base"]);
   await client.libraryPathsSyncPromise;
   assert.equal(instances.length, 2);
-  assert.equal(client.startupState, startupState);
   await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8));
   assert.ok(instances[1].requests.some(request => request.method === "rConsole/syncSessionState"));
   assert.ok(!instances.flatMap(instance => instance.requests)
@@ -1046,17 +959,15 @@ test("failed library synchronization retries automatically and disposal cancels 
   assert.equal(client.libraryPathsRetry._destroyed, true);
 });
 
-test("startup state is retained across replacement and cleared on disposal", async t => {
-  const { client, instances, captures } = createClient(t);
+test("every launch uses ordinary R startup and preserves configured arguments", async t => {
+  const { client, instances } = createClient(t);
+  const config = { get: key => key === "lsp.args" ? ["--quiet"] : undefined };
+  const original = client.buildServerArgs(config, "/console-language-server.R");
   await client.start();
-  const state = client.startupState;
-  assert.ok(Buffer.isBuffer(state));
   await client.restartClient(instances[0], "test restart");
-  assert.equal(client.startupState, state);
-  assert.equal(captures(), 1, "replacement never recaptures startup state");
-  await client.dispose();
-  assert.equal(client.startupState, undefined);
-  assert.ok(state.every(byte => byte === 0), "release the retained sensitive buffer");
+  assert.deepEqual(client.buildServerArgs(config, "/console-language-server.R"), original);
+  assert.ok(original.includes("--quiet"));
+  for (const flag of ["--no-environ", "--no-site-file", "--no-init-file"]) assert.ok(!original.includes(flag));
 });
 
 test("launch discards inherited LSP transport settings while preserving user configuration", t => {
@@ -1071,7 +982,7 @@ test("launch discards inherited LSP transport settings while preserving user con
   for (const name of ["VSCR_LSP_HOST", "VSCR_LSP_PORT", "VSCR_LSP_AUTH_TOKEN", "vscr_lsp_client_nonce"]) {
     assert.ok(!Object.hasOwn(env, name));
   }
-  assert.equal(env.VSCR_LSP_RESTORE_STARTUP, "FALSE");
+  assert.equal(env.VSCR_LSP_RESTORE_STARTUP, undefined);
   assert.equal(env.R_LIBS_USER, inherited.R_LIBS_USER);
   assert.equal(env.USER_SETTING, "preserved");
   assert.equal(inherited.VSCR_LSP_AUTH_TOKEN, "old-token", "launch must not mutate the caller's environment");
@@ -1130,11 +1041,23 @@ test('static provider cancellation reaches the LSP and rejects late results', as
 });
 
 test("a replacement that still requests restart fails refresh without declaring success", async t => {
-  const { client, instances } = createClient(t, { packageChanges: () => ["stats"] });
+  let conflict = true;
+  const { client, instances } = createClient(t, { packageChanges: () => conflict ? ["stats"] : [] });
   await client.start();
   await assert.rejects(client.refreshPackages(change()), /retained stale packages: stats/);
+  await assert.rejects(client.refreshPackages(change()), /retained stale packages: stats/);
   assert.equal(instances.length, 2, "a failed verification must not spin through replacement processes");
+  assert.equal(await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8)), undefined);
   assert.ok(!instances[1].requests.some(request => request.method === "completion"));
+  const updated = change();
+  updated.packages.set("stats", { name: "stats", path: "/base/library/stats", target: "/base/library/stats", identity: "new" });
+  await assert.rejects(client.refreshPackages(updated), /retained stale packages: stats/);
+  assert.equal(instances.length, 3, "a different installation can try a fresh process");
+  conflict = false;
+  await client.refreshPackages(updated);
+  assert.equal(client.failedPackageRefresh, undefined);
+  assert.equal(instances.length, 3, "verification can recover without another restart");
+  assert.deepEqual(await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8)), [{ label: "lm" }]);
 });
 
 test("package refresh sends pinned installations and explicit monitoring exclusions", async t => {

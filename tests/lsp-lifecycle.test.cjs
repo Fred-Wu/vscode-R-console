@@ -480,93 +480,33 @@ function lifecycleFixture(t) {
   return { first, second, root, pkg, install, defaults, createClient };
 }
 
-test("replacement restores startup options with the new package copy before loading namespaces", { timeout: 90000 }, async t => {
+test("normal startup options and large application state survive a server replacement", { timeout: 90000 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  const startupHook = '.onLoad <- function(...) stopifnot(identical(getOption("rconsole.lifecycle.option"), "ready"))';
-  install(first, "originalExport", startupHook); install(second, "replacementExport", startupHook);
+  install(first, "originalExport"); install(second, "replacementExport");
+  const profile = path.join(root, ".Rprofile");
   const marker = path.join(root, "profile-runs");
-  fs.writeFileSync(path.join(root, ".Renviron"), `R_DEFAULT_PACKAGES=datasets,utils,grDevices,graphics,stats,methods,${pkg}\nR_LIBS_USER="${first.replaceAll("\\", "/")}"\n`);
-  fs.writeFileSync(path.join(root, ".Rprofile"), [
-    `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
-    'options(defaultPackages = character(), languageserver.max_completions = 7L, rconsole.lifecycle.option = "ready")',
-    `library(${pkg})`,
-    'library(utils)',
+  fs.writeFileSync(profile, [
+    'options(languageserver.max_completions = 7L, myapp.cache = raw(9L * 1024L * 1024L))',
+    // A closure with captured state is ordinary profile configuration, not a transport payload.
+    'options(myapp.callback = local({ value <- new.env(); function() value }))',
     recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
-  const env = { ...process.env }; delete env.R_PROFILE_USER; delete env.R_ENVIRON_USER;
-  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
-  client.updateRuntimeLibraryPaths([first, second, ...defaults]);
-  await client.start();
-  await waitFor(() => client.packageInventory.initialized, "initial inventory");
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
-    "the initial server must execute the complete profile");
-  if (process.platform !== "win32") {
-    assert.equal(fs.statSync(client.workingDirectory).mode & 0o077, 0,
-      "the language-server working directory must be private");
-  }
-  assert.ok(Buffer.isBuffer(client.startupState), "startup state stays in the client memory");
-  assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "startup must not persist a snapshot");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
-  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 2);
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
-    "replacement must not re-execute profiles that preload stale namespaces");
-  assert.equal((await complete("stats::")).length, 7, "profile completion options survive a clean restart");
-});
-
-test("namespace-valued startup options deserialize after the environment and library order are restored", { timeout: 90000 }, async t => {
-  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  const marker = path.join(root, "namespace-loads");
-  const events = () => fs.readFileSync(marker, "utf8").trim().split(/\r?\n/);
-  const startup = label => `.onLoad <- function(...) {
-    ${recordServerEvent(marker, label)}
-    stopifnot(Sys.getenv("RCONSOLE_OPTION_ENV") == "ready",
-      identical(getOption("rconsole.lifecycle.option"), list(value = "ready")))
-  }
-  .onAttach <- function(...) {
-    callback <- getOption("rconsole.callback")
-    stopifnot(is.function(callback), isNamespace(environment(callback)),
-      identical(environment(attr(getOption("rconsole.attributed"), "callback")), environment(callback)),
-      identical(normalizePath(getNamespaceInfo(environment(callback), "path")),
-        normalizePath(file.path(.libPaths()[[1L]], "${pkg}"))))
-    ${recordServerEvent(marker, "callback-restored")}
-  }`;
-  install(first, "originalExport", startup("original"));
-  install(second, "replacementExport", startup("replacement"));
-  const profile = path.join(root, ".Rprofile");
-  fs.writeFileSync(profile, [
-    'Sys.setenv(RCONSOLE_OPTION_ENV = "ready")',
-    `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
-    'options(rconsole.lifecycle.option = list(value = "ready"))',
-    `options(rconsole.attributed = structure("value", callback = ${pkg}::originalExport))`,
-    `options(rconsole.callback = ${pkg}::originalExport, languageserver.max_completions = 7L)`,
-    `library(${pkg})`,
-  ].join("\n") + "\n");
-  // Inherited paths still select the old copy when the replacement begins.
-  const env = { ...process.env, R_PROFILE_USER: profile,
-    R_LIBS_USER: [first, ...defaults].join(path.delimiter), RCONSOLE_OPTION_ENV: "inherited" };
-  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
+  const { client, instances, complete } = createClient({ cwd: root, args: [],
+    env: { ...process.env, R_PROFILE_USER: profile } });
   client.updateRuntimeLibraryPaths([first, second, ...defaults]);
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  assert.equal((await complete("stats::")).length, 7, "the initial server must apply the profile options");
-  assert.deepEqual(events(), ["original", "callback-restored"]);
-  fs.writeFileSync(marker, "");
-  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
-  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)),
-    "namespace-valued options must not retain the old installation");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 2, "the library switch requires exactly one replacement");
-  assert.deepEqual(events(), ["replacement", "callback-restored"],
-    "deserialization loads only the selected namespace with its restored environment");
   assert.equal((await complete("stats::")).length, 7);
+  assert.equal(Object.hasOwn(client, "startupState"), false);
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), []);
+  if (process.platform !== "win32") assert.equal(fs.statSync(client.workingDirectory).mode & 0o077, 0);
+  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
+  await client.start();
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "replacementExport"));
+  assert.equal((await complete("stats::")).length, 7);
+  assert.equal(instances.length, 2);
+  assert.deepEqual(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/), ["profile", "profile"]);
 });
 
 test("site libraries excluded by a live snapshot stay excluded on startup and refresh", { timeout: 90000 }, async t => {
@@ -590,7 +530,7 @@ test("site libraries excluded by a live snapshot stay excluded on startup and re
 });
 
 for (const useStdio of [false, true]) {
-test(`replacement restores in-memory profile state over ${useStdio ? "stdio" : "authenticated TCP"}`, {
+test(`replacement uses normal profile and environment startup over ${useStdio ? "stdio" : "authenticated TCP"}`, {
   timeout: 90000, skip: useStdio && process.platform === "win32",
 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
@@ -615,7 +555,6 @@ test(`replacement restores in-memory profile state over ${useStdio ? "stdio" : "
     'options(rconsole.test.credential = Sys.getenv("RCONSOLE_TEST_CREDENTIAL"))',
     'options(rconsole.test.raw = as.raw(rep(0:255, 1024L)))',
     `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
-    `library(${pkg})`,
     recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
   const env = { ...process.env, R_PROFILE_USER: profile, R_ENVIRON_USER: environ,
@@ -629,17 +568,8 @@ test(`replacement restores in-memory profile state over ${useStdio ? "stdio" : "
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
     "the initial server must execute the complete profile");
-  const state = client.startupState;
-  assert.ok(state.includes(Buffer.from(env.RCONSOLE_TEST_CREDENTIAL)), "fixture contains sensitive startup data");
-  assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "startup data must stay out of the workspace");
-  assert.equal(instances.some(instance => instance.requests.some(request =>
-    request.method === "rConsole/takeStartupState")), false,
-    "credential-bearing startup state must never be requested over LSP");
-  const snapshotKeys = execFileSync("Rscript", ["--vanilla", "-e",
-    `cat(names(unserialize(readBin(file("stdin", "rb"), "raw", n=${client.startupState.length}))$environment), sep="\\n")`],
-    { input: client.startupState, encoding: "utf8" }).trim().split(/\r?\n/);
-  assert.ok(!snapshotKeys.some(key => key.startsWith("VSCR_") || key === "R_SESSION_TMPDIR"),
-    "the startup snapshot must exclude transport secrets and the old temporary directory");
+  assert.equal(Object.hasOwn(client, "startupState"), false);
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), []);
   for (const [libraries, exported] of [[[second, first, ...defaults], "replacementExport"],
     [[first, second, ...defaults], "originalExport"]]) {
     logs.length = 0;
@@ -647,16 +577,13 @@ test(`replacement restores in-memory profile state over ${useStdio ? "stdio" : "
     await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
     assert.ok((await complete(pkg + "::")).some(item => item.label === exported),
       "profile-dependent packages must load in every replacement server");
-    assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
-      "replacement restores state without replaying the profile");
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length, instances.length,
+      "each replacement performs normal R startup");
   }
   assert.equal(instances.length, 3, "both replacements authenticate with fresh transport state");
-  assert.ok(client.startupState === state, "replacements reuse the original in-memory configuration");
   assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "restarts must not create state files");
-  assert.ok(!logs.join("\n").includes(env.RCONSOLE_TEST_CREDENTIAL), "the state transfer must not log its payload");
+  assert.ok(!logs.join("\n").includes(env.RCONSOLE_TEST_CREDENTIAL), "configuration values must not enter lifecycle logs");
   await client.dispose();
-  assert.equal(client.startupState, undefined);
-  assert.ok(state.every(byte => byte === 0));
 });
 }
 
@@ -695,14 +622,6 @@ test("replacement preserves profile-defined base and site library roots across r
         identical(Sys.getenv("RCONSOLE_LIBRARY_ROOT_TEST"), "ready"),
         identical(getOption("rconsole.lifecycle.option"), "ready"))
     }
-  }
-  .onAttach <- function(...) {
-    if (any(basename(commandArgs(TRUE)) == "console-language-server.R")) {
-      callback <- getOption("rconsole.lifecycle.callback")
-      stopifnot(is.function(callback), isNamespace(environment(callback)),
-        identical(normalizePath(getNamespaceInfo(environment(callback), "path")),
-          normalizePath(file.path(.libPaths()[[1L]], "${pkg}"))))
-    }
   }`;
   install(first, "originalExport", startup);
   install(second, "replacementExport", startup);
@@ -720,8 +639,6 @@ test("replacement preserves profile-defined base and site library roots across r
     `.libPaths(c(${originalOrder.map(value => JSON.stringify(value)).join(", ")}), include.site = FALSE)`,
     'Sys.setenv(RCONSOLE_LIBRARY_ROOT_TEST = "ready")',
     'options(rconsole.lifecycle.option = "ready", languageserver.max_completions = 7L)',
-    `options(rconsole.lifecycle.callback = ${pkg}::originalExport)`,
-    `library(${pkg})`,
     recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
   const env = { ...process.env, R_PROFILE_USER: profile, RCONSOLE_LIBRARY_ROOT_TEST: "inherited" };
@@ -744,7 +661,8 @@ test("replacement preserves profile-defined base and site library roots across r
         "excluded package is not offered for completion: " + name);
     }
     assert.ok(!(await complete(excludedSite + "::")).some(item => item.label === "excludedExport"));
-    assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile", "the initial profile must run only once");
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length, instanceCount,
+      "each process applies the profile-defined library roots");
     // Include the first retry interval, so a successful completion cannot hide
     // a reconciliation failure waiting to restart the server again.
     await new Promise(resolve => setTimeout(resolve, 1200));
@@ -837,7 +755,7 @@ test("linked startup packages remain tracked and usable without monitoring their
   assert.ok(!logs.some(line => line.includes("retained stale packages")));
 });
 
-test("initial locked namespaces stay usable and an excluded startup namespace is retired", { timeout: 90000 }, async t => {
+test("initial locked namespaces stay usable and conflicting startup libraries stop restart loops", { timeout: 90000 }, async t => {
   const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "startupExport");
   const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
@@ -852,11 +770,18 @@ test("initial locked namespaces stay usable and an excluded startup namespace is
   fs.rmdirSync(lock);
   await waitFor(() => client.packageInventory.packages.has(pkg), "unlocked installation");
   await client.dispose();
-  // A fresh console snapshot can already exclude a default package loaded by R startup.
+  // Normal R startup can explicitly preload a package excluded by the live console.
   const next = createClient({ env });
   next.client.updateRuntimeLibraryPaths(defaults);
   await next.client.start();
-  await waitFor(() => next.client.packageInventory.initialized, "excluded startup namespace reconciled");
+  await waitFor(() => next.client.failedPackageRefresh, "conflicting startup namespace diagnosed");
   assert.equal(next.instances.length, 2);
-  assert.ok(!(await next.complete(pkg + "::")).some(item => item.label === "startupExport"));
+  assert.equal(await next.complete(pkg + "::"), undefined, "conflicting namespace cannot supply completions");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(next.instances.length, 2, "retrying inventory must not repeatedly execute the same startup");
+  next.client.updateRuntimeLibraryPaths([first, ...defaults]);
+  await next.client.start();
+  await waitFor(() => next.client.packageInventory.initialized && !next.client.failedPackageRefresh,
+    "a compatible library order restores completion");
+  assert.ok((await next.complete(pkg + "::")).some(item => item.label === "startupExport"));
 });

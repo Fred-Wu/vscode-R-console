@@ -90,31 +90,6 @@ pub(crate) enum IncomingCommand {
     Shutdown,
 }
 
-// Opaque R serialization. Only the owning language server interprets these bytes.
-pub(crate) struct StartupState(Vec<u8>);
-
-impl StartupState {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self { Self(bytes) }
-    pub(crate) fn as_bytes(&self) -> &[u8] { &self.0 }
-}
-
-
-impl std::fmt::Debug for StartupState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StartupState({} bytes)", self.0.len())
-    }
-}
-
-impl Drop for StartupState {
-    fn drop(&mut self) {
-        for byte in &mut self.0 {
-            // Retained configuration can contain credentials.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutputStream {
     Stdout,
@@ -129,7 +104,6 @@ pub(crate) struct OutputSink {
 
 struct OutputChannelState {
     writer: Option<Box<dyn Write + Send>>,
-    startup_state: Option<StartupState>,
     backlog: VecDeque<Vec<u8>>,
     backlog_bytes: usize,
 }
@@ -144,7 +118,6 @@ impl OutputSink {
     pub(crate) fn new_with_capabilities(host_name: &str, capabilities: &[&str]) -> Self {
         Self {
             output_state: Arc::new(Mutex::new(OutputChannelState {
-                startup_state: None,
                 writer: if session_transport_enabled() {
                     None
                 } else {
@@ -344,28 +317,6 @@ impl OutputSink {
     pub(crate) fn attach_client<W: Write + Send + 'static>(&self, writer: W) {
         if let Ok(mut output_state) = self.output_state.lock() {
             output_state.writer = Some(Box::new(writer));
-        }
-    }
-
-    pub(crate) fn clear_startup_state(&self) {
-        if let Ok(mut state) = self.output_state.lock() { state.startup_state = None; }
-    }
-
-    // Only the OS-protected local key-broker endpoint may access this state.
-    // No startup bytes or acknowledgements are sent through the TCP protocol.
-    pub(crate) fn private_startup_get(&self) -> Option<StartupState> {
-        self.output_state.lock().ok().and_then(|state|
-            state.startup_state.as_ref().map(|value| StartupState::new(value.as_bytes().to_vec())))
-    }
-
-    pub(crate) fn private_startup_put(&self, incoming: StartupState) -> bool {
-        let Ok(mut state) = self.output_state.lock() else { return false };
-        if incoming.as_bytes().is_empty() || incoming.as_bytes().len() > MAX_INPUT_FRAME_BYTES - 32 {
-            return false;
-        }
-        match state.startup_state.as_ref() {
-            Some(existing) => existing.as_bytes() == incoming.as_bytes(),
-            None => { state.startup_state = Some(incoming); true }
         }
     }
 
@@ -987,23 +938,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_snapshot_is_write_once_in_private_ipc_and_never_enters_replay() {
-        let sink = OutputSink::new_with_capabilities("test", &[]);
-        let secret = b"synthetic-sensitive-state";
-        assert!(sink.private_startup_get().is_none());
-        assert!(sink.private_startup_put(StartupState::new(secret.to_vec())));
-        assert!(sink.private_startup_put(StartupState::new(secret.to_vec())));
-        assert!(!sink.private_startup_put(StartupState::new(b"conflicting-state".to_vec())));
-        assert_eq!(sink.private_startup_get().unwrap().as_bytes(), secret);
-        assert!(sink.output_state.lock().unwrap().backlog.is_empty());
-        let other = OutputSink::new_with_capabilities("test", &[]);
-        assert!(other.private_startup_get().is_none());
-        sink.clear_startup_state();
-        assert!(sink.private_startup_get().is_none());
-        assert!(!format!("{:?}", StartupState::new(secret.to_vec())).contains("secret"));
-    }
-
-    #[test]
     fn old_tcp_startup_frames_are_rejected_even_when_authenticated() {
         for kind in [27_u16, 28_u16] {
             let mut frame = Vec::new();
@@ -1022,7 +956,6 @@ mod tests {
         let sink = OutputSink {
             output_state: Arc::new(Mutex::new(OutputChannelState {
                 writer: Some(Box::new(CapturedOutput(Arc::clone(&captured)))),
-                startup_state: None,
                 backlog: VecDeque::new(), backlog_bytes: 0,
             })),
             host_name: Arc::new(String::new()), capabilities: Arc::new(Vec::new()),

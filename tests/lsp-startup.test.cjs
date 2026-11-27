@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { spawn, spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const { once } = require("node:events");
 const fs = require("node:fs");
@@ -12,11 +12,11 @@ const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 const entryPoint = path.resolve(__dirname, "../resources/r/console-language-server.R");
 
-test("TCP LSP drains stdout after private capture throughout startup and requests", { timeout: 60000 }, async () => {
+test("TCP LSP discards stdout throughout startup and requests", { timeout: 60000 }, async () => {
   const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-lsp-stdout-"));
-  // Instrument console-owned entry points so output occurs after the capture
-  // marker and during later requests, independently of package load order.
+  // Instrument console-owned entry points during startup and later requests,
+  // independently of package load order.
   fs.cpSync(path.dirname(entryPoint), directory, { recursive: true });
   const script = path.join(directory, path.basename(entryPoint));
   const noise = 'cat(strrep("RCONSOLE_STDOUT_NOISE", 65536L)); flush(stdout())';
@@ -35,7 +35,8 @@ test("TCP LSP drains stdout after private capture throughout startup and request
     await Promise.race([
       (async () => {
         await client.start();
-        assert.ok(client.startupState?.length, "the private snapshot remains available");
+        assert.equal(client.spawnedServer.stdin, null);
+        assert.equal(client.spawnedServer.stdout, null);
         for (let i = 0; i < 2; i++) {
           const paths = await instances[0].sendRequest("rConsole/libraryPaths", {});
           assert.ok(paths.length, "LSP remains responsive after further stdout bursts");
@@ -44,7 +45,7 @@ test("TCP LSP drains stdout after private capture throughout startup and request
           "discarded child stdout must not enter lifecycle logs");
       })(),
       new Promise((_, reject) => { timer = setTimeout(() =>
-        reject(new Error("TCP LSP blocked on child stdout after snapshot capture")), 45000); }),
+        reject(new Error("TCP LSP blocked on child stdout")), 45000); }),
     ]);
   } catch (error) {
     client.spawnedServer?.kill("SIGKILL");
@@ -63,7 +64,7 @@ test("an extension-host crash leaves no startup snapshot on disk", { timeout: 30
     const { client } = createConsoleLsp({ after() {} });
     client.start().then(() => process.send({ workspace: client.workingDirectory,
       rPid: client.spawnedServer.pid,
-      captured: client.startupState.includes(Buffer.from(process.env.RCONSOLE_TEST_CREDENTIAL))
+      captured: Object.hasOwn(client, "startupState")
     })).catch(() => process.exit(1));
   `], {
     cwd: path.resolve(__dirname, ".."), env: { ...process.env, RCONSOLE_TEST_CREDENTIAL: secret },
@@ -80,50 +81,14 @@ test("an extension-host crash leaves no startup snapshot on disk", { timeout: 30
     once(worker, "exit").then(() => { throw new Error("Startup fixture exited before transferring state"); }),
   ]);
   ({ workspace, rPid } = message);
-  assert.equal(message.captured, true, "the snapshot contains a synthetic credential in memory");
+  assert.equal(message.captured, false, "no startup snapshot is retained in the client");
   const exited = once(worker, "exit");
   worker.kill("SIGKILL");
   await exited;
   assert.deepEqual(fs.readdirSync(workspace), [], "a hard crash must leave no startup data to recover");
 });
 
-test("R rejects incomplete and oversized private startup frames before restoring state", () => {
-  for (const [size, body] of [[0, Buffer.alloc(0)], [16 * 1024 * 1024 + 1, Buffer.alloc(0)],
-    [100, Buffer.from("synthetic-private-payload")]]) {
-    const header = Buffer.alloc(4);
-    header.writeUInt32BE(size);
-    const result = spawnSync("Rscript", ["--vanilla", entryPoint], {
-      env: { ...process.env, VSCR_LSP_RESTORE_STARTUP: "TRUE", R_DEFAULT_PACKAGES: "NULL" },
-      input: Buffer.concat([header, body]), encoding: "utf8", timeout: 15000,
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /(?:Invalid|Incomplete) language server startup state/);
-    assert.ok(!result.stderr.includes("synthetic-private-payload"));
-  }
-});
-
-test("R rejects incompatible startup snapshot formats and R versions before applying state", () => {
-  for (const fields of ['format_version=2L, r_version=as.character(getRversion())',
-    'format_version=1L, r_version="0.0.0"']) {
-    const encoded = spawnSync("Rscript", ["--vanilla", "-e",
-      `cat(jsonlite::base64_enc(serialize(list(${fields}, environment=c(TEST="synthetic-private-payload")), NULL)))`],
-    { timeout: 15000 });
-    assert.equal(encoded.status, 0, encoded.stderr.toString());
-    const snapshot = Buffer.from(encoded.stdout.toString(), "base64");
-    const header = Buffer.alloc(4);
-    header.writeUInt32BE(snapshot.length);
-    const result = spawnSync("Rscript", ["--vanilla", entryPoint], {
-      env: { ...process.env, VSCR_LSP_RESTORE_STARTUP: "TRUE", R_DEFAULT_PACKAGES: "NULL" },
-      input: Buffer.concat([header, snapshot]), encoding: "utf8", timeout: 15000,
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Incompatible language server startup state/);
-    assert.ok(!result.stderr.includes("synthetic-private-payload"));
-    assert.ok(!result.stdout.includes("RCS1"));
-  }
-});
-
-test("R sends no startup payload to a socket peer with an invalid server proof", { timeout: 30000 }, async t => {
+test("R sends only a public nonce to a socket peer with an invalid server proof", { timeout: 30000 }, async t => {
   const received = [];
   const sockets = new Set();
   const server = net.createServer(socket => {
@@ -141,7 +106,7 @@ test("R sends no startup payload to a socket peer with an invalid server proof",
   const child = spawn("Rscript", ["--vanilla", entryPoint], {
     env: { ...process.env, VSCR_LSP_HOST: "127.0.0.1", VSCR_LSP_PORT: String(server.address().port),
       VSCR_LSP_AUTH_TOKEN: randomBytes(32).toString("hex"), VSCR_LSP_CLIENT_NONCE: nonce,
-      VSCR_LSP_AUTH_TIMEOUT_SECONDS: "3", VSCR_LSP_RESTORE_STARTUP: "FALSE",
+      VSCR_LSP_AUTH_TIMEOUT_SECONDS: "3",
       RCONSOLE_TEST_CREDENTIAL: "synthetic-private-payload" },
     stdio: ["ignore", "ignore", "pipe"],
   });

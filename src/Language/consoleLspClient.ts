@@ -3,7 +3,6 @@ import * as fs from "fs";
 import * as net from "net";
 import { randomBytes } from "crypto";
 import { authenticateLspSocket } from "./lspSocketAuth";
-import { readPrivateStartupState, readStartupAcknowledgement, writeStartupState, type LspStartupStateStore } from "./lspStartupState";
 import { BACKEND_AUTH_TIMEOUT_MS } from "../Runtime/backendAuthentication";
 import * as os from "os";
 import * as path from "path";
@@ -64,7 +63,6 @@ type ConsoleLspClientOptions = {
   getCachedWorkspaceData?: () => WorkspaceData | undefined;
   getStaticAnalysisEnabled?: () => boolean;
   requestRuntimeFunctionArguments?: RuntimeFunctionArgumentsRequester;
-  getStartupStateStore?: () => Promise<LspStartupStateStore>;
 };
 
 type ConsoleLspSessionState = {
@@ -139,13 +137,10 @@ export class ConsoleLspClient implements CompletionProvider {
   private libraryPathsRetry: NodeJS.Timeout | undefined;
   private libraryPathsRetryDelay = 1000;
   private packageRefreshPromise: Promise<void> | undefined;
+  private failedPackageRefresh: { client: ConsoleLanguageClient; key: string; error: Error } | undefined;
   private packageRevision = 0;
   private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
-  private startupState: Buffer | undefined;
-  private startupStore: LspStartupStateStore | undefined;
-  private startupStateLoaded = false;
-  private startupStateSaved = false;
   private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
@@ -297,9 +292,8 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.disposed = true;
+    this.failedPackageRefresh = undefined;
     clearTimeout(this.libraryPathsRetry);
-    this.startupState?.fill(0);
-    this.startupState = undefined;
     this.packageInventory.dispose();
     this.disposePromise = (async () => {
       while (!(await this.stop())) {
@@ -355,7 +349,7 @@ export class ConsoleLspClient implements CompletionProvider {
       if (signal?.aborted) return undefined;
       const revision = this.packageRevision;
       const client = await this.ensureClient();
-      if (!client || signal?.aborted) {
+      if (!client || signal?.aborted || this.failedPackageRefresh?.client === client) {
         return undefined;
       }
       try {
@@ -806,10 +800,25 @@ export class ConsoleLspClient implements CompletionProvider {
         changed: client === previousClient ? change.changed : [],
         changedInstallations: client === previousClient ? change.changedInstallations ?? change.changed : [],
       };
+      // A profile can preload a package from a library the console has since
+      // excluded. Retrying unchanged inventory must not relaunch that profile
+      // indefinitely or publish completions from the conflicting process.
+      const refreshKey = JSON.stringify([
+        change.libraries.map(library => library.path),
+        [...change.packages].map(([name, item]) => [name, item.target, item.identity]),
+        params.unmonitored, params.unmonitoredRoots, params.deferred,
+      ]);
+      const previousFailure = this.failedPackageRefresh;
+      const retryingConflict = previousFailure?.client === client && previousFailure.key === refreshKey;
+      if (retryingConflict) {
+        params.changed = [];
+        params.changedInstallations = [];
+      }
       const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
       if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
       if (!change.isCurrent()) return;
       if (result.restart.length) {
+        if (retryingConflict) throw previousFailure.error;
         if (!change.changed.length) {
           this.packageRevision++;
           this.options.onPackagesChanged?.();
@@ -828,12 +837,16 @@ export class ConsoleLspClient implements CompletionProvider {
         if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
         if (!change.isCurrent()) return;
         if (verified.restart.length) {
-          // Keep this inventory unpublished so recovery can retry the change.
-          throw new Error(`Replacement language server retained stale packages: ${verified.restart.join(", ")}`);
+          const error = new Error(`Replacement language server retained stale packages: ${verified.restart.join(", ")}. ` +
+            "Check packages loaded by R startup files and reopen the console after correcting the configuration.");
+          this.failedPackageRefresh = { client, key: refreshKey, error };
+          lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] ${error.message}`);
+          throw error;
         }
       } else if (change.changed.length) {
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
       }
+      this.failedPackageRefresh = undefined;
       if (result.restart.length) {
         try {
           const projection = this.inputDocument.project(this.inputDocument.getText(),
@@ -870,9 +883,7 @@ export class ConsoleLspClient implements CompletionProvider {
       return undefined;
     }
     // Session metadata may arrive while the initial library query is in flight.
-    // It can use the running client once the snapshot's storage is acknowledged.
-    const snapshotReady = this.startupState && (!this.startupStore || this.startupStateSaved);
-    if (this.client?.isRunning() && (!this.startPromise || snapshotReady)) {
+    if (this.client?.isRunning()) {
       return this.client;
     }
     try {
@@ -887,17 +898,6 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private async startInternal(): Promise<void> {
-    if (this.options.getStartupStateStore && !this.startupStateLoaded) {
-      this.startupStore ??= await this.options.getStartupStateStore();
-      const state = await this.startupStore.load();
-      if (this.disposed) {
-        state?.fill(0);
-        throw new Error("Console disposed during startup state retrieval");
-      }
-      this.startupState = state;
-      this.startupStateSaved = state !== undefined;
-      this.startupStateLoaded = true;
-    }
     const config = vscode.workspace.getConfiguration("r");
     const scriptPath = this.resolveLanguageServerScriptPath();
     const args = this.buildServerArgs(config, scriptPath);
@@ -936,31 +936,18 @@ export class ConsoleLspClient implements CompletionProvider {
       },
     };
 
-    // The first server sends its startup state through its own stdout pipe.
-    // Neither the JSON-RPC TCP connection nor the persistent backend TCP
-    // connection ever carries credential-bearing startup state.
-    const captureToken = this.startupState ? undefined : randomBytes(16).toString("hex");
-    if (captureToken) env.VSCR_LSP_CAPTURE_TOKEN = captureToken;
     const client = new ConsoleLanguageClient(
       `r-console-${this.options.consoleId}`,
       "R Console",
       useStdio
-        ? () => this.createStdioTransport(args, env, captureToken)
-        : () => this.createSocketTransport(args, env, captureToken),
+        ? () => this.createStdioTransport(args, env)
+        : () => this.createSocketTransport(args, env),
       clientOptions
     );
     this.client = client;
     this.syncedSessionStateKey = undefined;
     this.sessionStateSyncPromise = undefined;
     await client.start();
-    if (!this.startupState) {
-      throw new Error("Language server did not deliver its startup state through the private child pipe");
-    }
-    if (this.startupStore && !this.startupStateSaved) {
-      await this.startupStore.save(this.startupState);
-      if (this.disposed || this.client !== client) throw new Error("Console changed during startup state storage");
-      this.startupStateSaved = true;
-    }
     await this.disableConsoleDiagnostics(client);
     const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});
     if (this.client === client && !this.disposed) {
@@ -972,7 +959,7 @@ export class ConsoleLspClient implements CompletionProvider {
     }
   }
 
-  private createStdioTransport(args: string[], env: NodeJS.ProcessEnv, captureToken?: string): Promise<StreamInfo> {
+  private createStdioTransport(args: string[], env: NodeJS.ProcessEnv): Promise<StreamInfo> {
     return new Promise<StreamInfo>((resolve, reject) => {
       let settled = false;
       let child: ChildProcess;
@@ -998,39 +985,6 @@ export class ConsoleLspClient implements CompletionProvider {
         if (!child.stdout || !child.stdin) {
           settled = true;
           reject(new Error("Console language server started without stdio streams."));
-          return;
-        }
-        if (this.startupState) {
-          const ready = readStartupAcknowledgement(child.stdout);
-          void ready.then(() => {
-            if (settled) return;
-            settled = true;
-            resolve({ reader: child.stdout!, writer: child.stdin! });
-          }, error => {
-            if (!settled) { settled = true; reject(error); }
-          });
-          try {
-            writeStartupState(child, this.startupState, error => {
-              if (!settled) { settled = true; reject(error); }
-            });
-          } catch (error) {
-            settled = true;
-            reject(error);
-          }
-          return;
-        }
-        if (captureToken) {
-          void readPrivateStartupState(child.stdout, captureToken).then(state => {
-            if (settled || this.disposed || this.spawnedServer !== child) {
-              state.fill(0);
-              return;
-            }
-            this.startupState = state;
-            settled = true;
-            resolve({ reader: child.stdout!, writer: child.stdin! });
-          }, error => {
-            if (!settled) { settled = true; reject(error); }
-          });
           return;
         }
         settled = true;
@@ -1067,13 +1021,12 @@ export class ConsoleLspClient implements CompletionProvider {
     });
   }
 
-  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv, captureToken?: string): Promise<MessageTransports> {
+  private createSocketTransport(args: string[], baseEnv: NodeJS.ProcessEnv): Promise<MessageTransports> {
     return new Promise<MessageTransports>((resolve, reject) => {
       let settled = false;
       const authToken = randomBytes(32).toString("hex");
       const clientNonce = randomBytes(32).toString("hex");
       let pendingAuth = 0;
-      let captured: Promise<void> = Promise.resolve();
       const server = net.createServer((socket) => {
         if (settled || pendingAuth >= 8) {
           socket.destroy();
@@ -1087,23 +1040,18 @@ export class ConsoleLspClient implements CompletionProvider {
             return;
           }
           const child = this.spawnedServer;
-          // Do not create a usable TCP LSP client until its initial state was
-          // read from the child pipe. Authentication alone is not encryption.
-          void captured.then(() => {
-            if (settled) { socket.destroy(); return; }
-            settled = true;
-            if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
-            socket.on("error", (error) => this.logServerError(error, child));
-            server.close();
-            const reader = new class extends StreamMessageReader {
-              override listen(callback: DataCallback): vscode.Disposable {
-                const subscription = super.listen(callback);
-                socket.resume();
-                return subscription;
-              }
-            }(socket);
-            resolve({ reader, writer: new StreamMessageWriter(socket) });
-          }, error => { socket.destroy(); rejectOnce(error); });
+          settled = true;
+          if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
+          socket.on("error", (error) => this.logServerError(error, child));
+          server.close();
+          const reader = new class extends StreamMessageReader {
+            override listen(callback: DataCallback): vscode.Disposable {
+              const subscription = super.listen(callback);
+              socket.resume();
+              return subscription;
+            }
+          }(socket);
+          resolve({ reader, writer: new StreamMessageWriter(socket) });
         });
       });
       const rejectOnce = (error: Error): void => {
@@ -1151,7 +1099,7 @@ export class ConsoleLspClient implements CompletionProvider {
           child = spawn(this.options.rPath, args, {
             cwd: this.options.cwd ?? this.workingDirectory,
             env,
-            stdio: [this.startupState ? "pipe" : "ignore", captureToken ? "pipe" : "ignore", "pipe"],
+            stdio: ["ignore", "ignore", "pipe"],
             shell: false,
           });
         } catch (error) {
@@ -1160,33 +1108,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         this.spawnedServer = child;
         this.forwardServerStderr(child);
-        // Drain and validate the private stdout capture before resolving TCP
-        // transport creation; the socket is reserved for ordinary LSP only.
-        captured = captureToken && child.stdout
-          ? readPrivateStartupState(child.stdout, captureToken).then(state => {
-            if (settled || this.disposed || this.spawnedServer !== child) {
-              state.fill(0);
-              throw new Error("Language server changed during private startup capture");
-            }
-            this.startupState = state;
-            // TCP carries LSP traffic after capture. Keep discarding stdout
-            // so package hooks and later output cannot fill the child pipe.
-            child.stdout!.resume();
-          })
-          : Promise.resolve();
-        // Observe failures immediately; server setup may still be in progress.
-        void captured.catch(error => rejectOnce(error));
-        child.once("spawn", () => {
-          this.logServerStarted();
-          if (this.startupState && !captureToken) {
-            try {
-              writeStartupState(child, this.startupState, rejectOnce);
-              child.stdin!.end();
-            } catch (error) {
-              rejectOnce(error instanceof Error ? error : new Error("Startup state transfer failed"));
-            }
-          }
-        });
+        child.once("spawn", () => this.logServerStarted());
         child.once("error", (error) => {
           if (settled) {
             this.logServerError(error);
@@ -1217,7 +1139,6 @@ export class ConsoleLspClient implements CompletionProvider {
     const userArgs = config.get<string[]>("lsp.args") ?? [];
     return [
       ...userArgs,
-      ...(this.startupState ? ["--no-environ", "--no-site-file", "--no-init-file"] : []),
       "--silent",
       "--no-echo",
       "--no-save",
@@ -1281,13 +1202,8 @@ export class ConsoleLspClient implements CompletionProvider {
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
-    // On a replacement server, apply the last console snapshot before loading namespaces.
-    env.VSCR_RUNTIME_LIB_PATHS = (this.runtimeLibraryPaths ??
-      (this.startupState ? this.serverLibraryPaths : undefined))?.join("\n") ?? "";
-    env.VSCR_LSP_RESTORE_STARTUP = this.startupState ? "TRUE" : "FALSE";
-    // The entry point restores the effective startup environment after R has
-    // started without profiles or automatic default-package loading.
-    if (this.startupState) env.R_DEFAULT_PACKAGES = "NULL";
+    // Apply the latest console order before loading the language server.
+    env.VSCR_RUNTIME_LIB_PATHS = (this.runtimeLibraryPaths ?? this.serverLibraryPaths)?.join("\n") ?? "";
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {

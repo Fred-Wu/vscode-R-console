@@ -1,128 +1,11 @@
-# The first process discovers project configuration through normal R startup.
-# Replacements restore the startup environment and completion options with the
-# console's library order. Profiles and automatic package loading are disabled.
+# Each process uses normal R startup and the active console library order.
 runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
-restore_startup <- identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
-# Keep this limit in sync with lspStartupState.ts. The envelope travels only
-# over the spawned child's private pipes, never the LSP TCP connection.
-startup_state_limit <- 16L * 1024L * 1024L - 32L
-startup_payload <- NULL
-startup_environment <- function() {
-    values <- Sys.getenv()
-    # Transport credentials and R's temporary directory belong to this process.
-    keys <- toupper(names(values))
-    values[!startsWith(keys, "VSCR_") & keys != "R_SESSION_TMPDIR"]
-}
-if (restore_startup) {
-    # Options remain serialized inside this namespace-free envelope: reading a
-    # function's namespace reference can load its package during deserialization.
-    startup <- local({
-        input <- file("stdin", open = "rb")
-        on.exit(close(input))
-        read_exact <- function(size) {
-            value <- raw(size)
-            offset <- 0L
-            while (offset < size) {
-                part <- readBin(input, "raw", n = min(65536L, size - offset))
-                if (!length(part)) stop("Incomplete language server startup state")
-                value[seq.int(offset + 1L, offset + length(part))] <- part
-                offset <- offset + length(part)
-            }
-            value
-        }
-        size <- readBin(read_exact(4L), "integer", n = 1L, size = 4L, endian = "big")
-        if (is.na(size) || size <= 0L || size > startup_state_limit) {
-            stop("Invalid language server startup state size")
-        }
-        # The parent supplies this pipe at process creation; no pathname or
-        # network peer can substitute the serialized configuration.
-        unserialize(read_exact(size))
-    })
-    if (!identical(startup$format_version, 1L) ||
-        !identical(startup$r_version, as.character(getRversion()))) {
-        stop("Incompatible language server startup state; start a new R console")
-    }
-    if (!nzchar(Sys.getenv("VSCR_LSP_PORT"))) {
-        # Let the parent send stdio LSP bytes only after closing the bootstrap
-        # reader, whose C buffer could otherwise read ahead into those messages.
-        cat("RCS1")
-        flush(stdout())
-    }
-    # Include profile-created values, empty values and explicit unsets before
-    # loading any packages that depend on the startup configuration.
-    Sys.unsetenv(setdiff(names(startup_environment()), names(startup$environment)))
-    do.call(Sys.setenv, as.list(startup$environment))
-    # .libPaths() always appends .Library, even with include.site = FALSE.
-    # Restore the effective profile-defined roots before selecting libraries or
-    # deserializing options. Preserve the base bindings' original lock state.
-    local({
-        roots <- startup$library_roots
-        for (name in c(".Library", ".Library.site")) {
-            if (!name %in% names(roots)) stop("Missing startup library root: ", name)
-            locked <- bindingIsLocked(name, baseenv())
-            if (locked) unlockBinding(name, baseenv())
-            tryCatch(assign(name, roots[[name]], envir = baseenv()),
-                finally = if (locked) lockBinding(name, baseenv()))
-        }
-    })
-}
 if (nzchar(runtime_lib_paths)) {
     .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
-} else if (restore_startup) {
-    .libPaths(startup$library_paths, include.site = FALSE)
-}
-
-if (restore_startup) {
-    # Namespace load hooks may need ordinary profile settings while the
-    # remaining option values are being deserialized.
-    options(startup$plain_options)
-    options(unserialize(startup$options))
-    for (package in rev(setdiff(startup$packages, "base"))) {
-        require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
-    }
-    rm(startup)
-} else {
-    # Profile-defined options may be required by packages before they load.
-    # Capture before loading the language server and keep the bytes in memory.
-    startup_payload <- local({
-        # Only reference-free values can be read before library selection.
-        # Inspect attributes too: even an atomic option can carry a closure.
-        plain_option <- function(value) {
-            if (isS4(value)) return(FALSE)
-            type <- typeof(value)
-            if (!type %in% c("NULL", "logical", "integer", "double", "complex",
-                "character", "raw", "list")) return(FALSE)
-            if (type == "list" && !all(vapply(unclass(value), plain_option, logical(1)))) return(FALSE)
-            all(vapply(attributes(value), plain_option, logical(1)))
-        }
-        startup_options <- options()
-        payload <- serialize(list(format_version = 1L, r_version = as.character(getRversion()),
-            library_paths = .libPaths(), options = serialize(startup_options, NULL),
-            plain_options = Filter(plain_option, startup_options), packages = .packages(),
-            environment = startup_environment(),
-            library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),
-                inherits = FALSE)), NULL)
-        if (length(payload) > startup_state_limit) stop("Language server startup state exceeds 16 MiB")
-        payload
-    })
 }
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
     q(save = "no", status = 10)
-}
-# The parent captures the original startup state from this specific child's
-# stdout pipe before passing the stream to the stdio LSP reader (or discarding
-# later stdout in TCP mode). Its random marker survives profile stdout output.
-# Do not answer any LSP request with this credential-bearing snapshot.
-if (!is.null(startup_payload)) {
-    capture_nonce <- Sys.getenv("VSCR_LSP_CAPTURE_TOKEN")
-    if (grepl("^[0-9a-f]{32}$", capture_nonce)) {
-        cat("RCS2", capture_nonce, ":",
-            gsub("\n", "", jsonlite::base64_enc(startup_payload), fixed = TRUE),
-            "\n", sep = "")
-        flush(stdout())
-    }
-    startup_payload <- NULL
 }
 
 debug <- Sys.getenv("VSCR_LSP_DEBUG")
@@ -290,8 +173,8 @@ library_paths_changed <- FALSE
 server$request_handlers[["rConsole/syncLibraryPaths"]] <- function(self, id, params) {
     previous <- .libPaths()
     .libPaths(normalize_character(params$libraryPaths), include.site = FALSE)
-    # The client replaces this process when the effective order changes. Its
-    # retained startup state and latest paths initialize fresh namespace caches.
+    # The client replaces this process when the effective order changes. The
+    # latest paths initialize fresh namespace caches.
     # Keep the replacement requirement across retries if a reply is lost.
     library_paths_changed <<- library_paths_changed || !identical(previous, .libPaths())
     self$deliver(languageserver:::Response$new(id,

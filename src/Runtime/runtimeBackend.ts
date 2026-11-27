@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID } from "crypto";
 import { authenticateBackendSocket, BackendAuthenticationError } from "./backendAuthentication";
-import { loadPrivateStartupState, savePrivateStartupState } from "./privateStartupState";
 import { ChildProcess, spawn, SpawnOptions } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
@@ -77,11 +76,6 @@ type BackendSessionState = {
   hostConnected: boolean;
   nextRequestId: number;
   pendingMemberRequests: Map<number, { resolve: (result: MemberInspectionResult) => void; timeout: NodeJS.Timeout }>;
-  pendingStartupRequests: Map<number, {
-    resolve: (state: Buffer | undefined) => void;
-    reject: (error: Error) => void;
-    timeout: NodeJS.Timeout;
-  }>;
   pendingParseRequests: Map<
     number,
     {
@@ -126,8 +120,6 @@ export interface RuntimeBackend {
   sendSessionCommand(session: RuntimeSessionHandle | null, command: RuntimeSessionCommand): boolean;
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined;
   inspectMemberNames(session: RuntimeSessionHandle | null, query: MemberInspectionQuery): Promise<MemberInspectionResult> | undefined;
-  loadLspStartupState(session: RuntimeSessionHandle): Promise<Buffer | undefined>;
-  saveLspStartupState(session: RuntimeSessionHandle, state: Buffer): Promise<void>;
   close(session: RuntimeSessionHandle): void;
   isAlive(session: RuntimeSessionHandle | null): boolean;
   getPid(session: RuntimeSessionHandle | null): number | undefined;
@@ -175,7 +167,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       nextRequestId: 0,
       pendingParseRequests: new Map(),
       pendingMemberRequests: new Map(),
-      pendingStartupRequests: new Map(),
       child,
       childListenersAttached: false,
       sessionFilePath,
@@ -202,7 +193,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       nextRequestId: 0,
       pendingParseRequests: new Map(),
       pendingMemberRequests: new Map(),
-      pendingStartupRequests: new Map(),
       childListenersAttached: false,
       sessionFilePath: getSessionBootstrapFilePath(info.sessionId),
       authToken: info.authToken,
@@ -221,7 +211,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     state.handlers = handlers;
     state.attachGeneration += 1;
     const generation = state.attachGeneration;
-    this.rejectPendingStartupRequests(state);
 
     if (state.socket && !state.socket.destroyed) {
       state.socket.destroy();
@@ -252,7 +241,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
-        this.rejectPendingStartupRequests(state);
         this.cleanupSessionBootstrapFile(state);
         state.handlers?.onExit?.(code ?? 0);
       });
@@ -265,7 +253,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
-        this.rejectPendingStartupRequests(state);
         this.cleanupSessionBootstrapFile(state);
         state.handlers?.onError?.(error instanceof Error ? error : new Error(String(error)));
       });
@@ -286,7 +273,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
     state.socketCarry = Buffer.alloc(0);
     this.resolvePendingParseRequests(state, 1);
     this.resolvePendingMemberRequests(state);
-    this.rejectPendingStartupRequests(state);
     state.socket?.destroy();
     state.socket = undefined;
   }
@@ -392,67 +378,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       ? { status: "unavailable" } : result);
   }
 
-  loadLspStartupState(session: RuntimeSessionHandle): Promise<Buffer | undefined> {
-    return this.requestLspStartupState(session);
-  }
-
-  async saveLspStartupState(session: RuntimeSessionHandle, snapshot: Buffer): Promise<void> {
-    await this.requestLspStartupState(session, snapshot);
-  }
-
-  private async requestLspStartupState(session: RuntimeSessionHandle, snapshot?: Buffer): Promise<Buffer | undefined> {
-    const state = this.sessionStates.get(session);
-    if (!state) throw new Error("Persistent R session is unavailable");
-    const generation = state.attachGeneration;
-    const deadline = Date.now() + 10_000;
-    // Retrieval can join initial attachment. A save must use the connection
-    // already established by retrieval, before its caller can release the bytes.
-    while (snapshot === undefined && !state.hostConnected && !state.explicitClose && state.attachGeneration === generation && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    if (!state.hostConnected || state.explicitClose || state.attachGeneration !== generation) {
-      throw new Error("Persistent R session disconnected during startup state transfer");
-    }
-    if (!state.capabilities.has("lsp-startup-ipc-v2")) {
-      throw new Error("This R runtime cannot retain language-server startup state. Close the old R session and start a new console.");
-    }
-    if (state.pendingStartupRequests.size >= 4) throw new Error("Too many startup state transfers");
-    const pid = this.getPid(session);
-    if (pid === undefined) throw new Error("Persistent runtime identity unavailable for private state transfer");
-    const identity = { sessionId: session.sessionId, pid };
-    const token = state.authToken;
-    if (!token || !/^[0-9a-f]{64}$/.test(token)) {
-      throw new Error("Session authentication unavailable for private startup state");
-    }
-    const requestId = ++state.nextRequestId;
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        state.pendingStartupRequests.delete(requestId);
-        reject(new Error("Persistent startup state transfer timed out"));
-      }, 10_000);
-      state.pendingStartupRequests.set(requestId, { resolve, reject, timeout });
-      const transfer = snapshot
-        ? savePrivateStartupState(identity, token, snapshot).then(() => undefined)
-        : loadPrivateStartupState(identity, token);
-      void transfer.then(value => {
-        const pending = state.pendingStartupRequests.get(requestId);
-        if (!pending || state.attachGeneration !== generation || state.explicitClose) {
-          value?.fill(0);
-          return;
-        }
-        state.pendingStartupRequests.delete(requestId);
-        clearTimeout(timeout);
-        pending.resolve(value);
-      }, error => {
-        const pending = state.pendingStartupRequests.get(requestId);
-        if (!pending) return;
-        state.pendingStartupRequests.delete(requestId);
-        clearTimeout(timeout);
-        pending.reject(error);
-      });
-    });
-  }
-
   requestParseStatus(session: RuntimeSessionHandle | null, code: string): Promise<number> | undefined {
     if (!session) {
       return undefined;
@@ -519,7 +444,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return;
     }
     state.explicitClose = true;
-    this.rejectPendingStartupRequests(state);
     const shutdownSent = this.writeFrame(state, encodeShutdownFrame(), true);
     if (shutdownSent) {
       return;
@@ -639,7 +563,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.socketCarry = parsed.carry;
 
         if (parsed.error) {
-          this.rejectPendingStartupRequests(state);
           socket.destroy();
           state.handlers?.onError?.(new Error(parsed.error));
           return;
@@ -654,7 +577,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
           socket.destroy();
           this.resolvePendingParseRequests(state, 1);
           this.resolvePendingMemberRequests(state);
-          this.rejectPendingStartupRequests(state);
           state.handlers?.onError?.(error as Error);
           return;
         }
@@ -675,8 +597,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
 
         for (const event of parsed.events) {
           this.handleSessionControlEvent(state, event);
-          // Private startup state is now confined to the OS-protected IPC
-          // endpoint. The backend parser rejects the retired TCP frame kinds.
           state.handlers?.onControl?.(event);
         }
       });
@@ -687,7 +607,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         }
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
-        this.rejectPendingStartupRequests(state);
         if (state.hostConnected && isSocketDisconnectError(error)) {
           return;
         }
@@ -707,7 +626,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.hostConnected = false;
         this.resolvePendingParseRequests(state, 1);
         this.resolvePendingMemberRequests(state);
-        this.rejectPendingStartupRequests(state);
         if (!state.explicitClose && wasHostConnected) {
           state.handlers?.onExit?.(0);
         }
@@ -853,7 +771,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       nextRequestId: 0,
       pendingParseRequests: new Map(),
       pendingMemberRequests: new Map(),
-      pendingStartupRequests: new Map(),
       childListenersAttached: false,
       reconnectInfo: { sessionId: session.sessionId },
       socketCarry: Buffer.alloc(0),
@@ -912,14 +829,6 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       pending.resolve({ status: "unavailable" });
     }
     state.pendingMemberRequests.clear();
-  }
-
-  private rejectPendingStartupRequests(state: BackendSessionState): void {
-    for (const pending of state.pendingStartupRequests.values()) {
-      clearTimeout(pending.timeout);
-      pending.reject(new Error("Persistent R session disconnected during startup state transfer"));
-    }
-    state.pendingStartupRequests.clear();
   }
 
   private resolvePendingParseRequests(state: BackendSessionState, status: number): void {

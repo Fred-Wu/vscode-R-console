@@ -258,7 +258,6 @@ mod unix_host {
 
         let session_transport = session_transport_config().is_some();
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if session_transport { capabilities.push("lsp-startup-ipc-v2"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -268,12 +267,10 @@ mod unix_host {
             capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
-        // Share the startup snapshot only over the same-user OS-protected
-        // Unix socket / Windows named pipe, never the runtime TCP transport.
+        // Keep the registry encryption key in the same-user OS-protected broker.
         let _registry_key = if session_transport {
             Some(crate::registry_key::start(
-                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle(),
-                std::env::var("VSC_R_BACKEND_AUTH_TOKEN")?)?)
+                &std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
         } else { None };
         if let Err(error) = output.capture_process_stdout() {
             let _ =
@@ -791,7 +788,6 @@ mod unix_host {
     fn request_shutdown() {
         let mut should_interrupt = false;
         if let Some(runtime) = host_runtime() {
-            runtime.output.clear_startup_state();
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.shutdown_requested = true;
             should_interrupt = state.busy;
@@ -2285,7 +2281,6 @@ mod windows_host {
 
         let session_transport = session_transport_config().is_some();
         let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        if session_transport { capabilities.push("lsp-startup-ipc-v2"); }
         if api.inspector_api.is_some() { capabilities.extend(["member-inspection", "member-inspection-utf8-escapes", "member-inspection-search-path"]); }
         if api.inspector_api.is_some_and(|inspector| inspector.supports_function_arguments()) {
             capabilities.push("function-arguments");
@@ -2295,12 +2290,10 @@ mod windows_host {
             capabilities.push("function-source-value");
         }
         let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
-        // Share the startup snapshot only over the same-user OS-protected
-        // Unix socket / Windows named pipe, never the runtime TCP transport.
+        // Keep the registry encryption key in the same-user OS-protected broker.
         let _registry_key = if session_transport {
             Some(crate::registry_key::start(
-                &std::env::var("VSC_R_BACKEND_SESSION_ID")?, output.clone_handle(),
-                std::env::var("VSC_R_BACKEND_AUTH_TOKEN")?)?)
+                &std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
         } else { None };
         if let Err(error) = output.capture_process_stdout() {
             let _ =
@@ -2815,7 +2808,6 @@ mod windows_host {
     fn request_shutdown() {
         let mut should_interrupt = false;
         if let Some(runtime) = host_runtime() {
-            runtime.output.clear_startup_state();
             let mut state = runtime.state.lock().expect("host state lock poisoned");
             state.shutdown_requested = true;
             should_interrupt = state.busy;

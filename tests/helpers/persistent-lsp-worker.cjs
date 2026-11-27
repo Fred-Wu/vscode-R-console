@@ -8,28 +8,28 @@ process.once("message", async ({ runtime, cwd, profile, sidecar }) => {
   const backend = new RustSidecarRuntimeBackend(sidecar);
   const session = backend.reconnect(runtime);
   const controls = [];
-  let captures = 0;
-  backend.attach(session, { onControl: event => controls.push(event.type) });
-  const { client, complete, instances, logs } = createConsoleLsp({ after() {} }, {
+  const { client, complete, logs } = createConsoleLsp({ after() {} }, {
     cwd, args: [], env: { ...process.env, R_PROFILE_USER: profile },
-    getStartupStateStore: async () => ({
-      load: () => backend.loadLspStartupState(session),
-      save: state => { captures++; return backend.saveLspStartupState(session, state); },
-    }),
+  });
+  const metadata = new Promise((resolve, reject) => {
+    backend.attach(session, { onError: reject, onControl: event => {
+      controls.push(event.type);
+      if (event.type === "library-paths") { client.updateRuntimeLibraryPaths(event.paths); resolve(); }
+    } });
   });
   const stop = async () => {
     await client.dispose();
     backend.detach(session);
   };
   try {
+    await metadata;
     await client.start();
     const items = await complete("stats::");
     process.send({
       ready: true, lspPid: client.spawnedServer.pid, workspace: client.workingDirectory,
       runtimePid: backend.getPid(session), count: items.length,
-      captured: client.startupState.includes(Buffer.from("synthetic-persistent-profile-secret")),
+      captured: Object.hasOwn(client, "startupState"),
       libraries: await client.client.sendRequest("rConsole/libraryPaths", {}),
-      captures,
       leaked: controls.some(type => type.startsWith("lsp-startup-")) || logs.some(line => line.includes("synthetic-persistent-profile-secret")),
     });
     process.once("message", async () => { await stop(); process.exit(0); });

@@ -20,7 +20,6 @@ import {
   toCompletionQuickPickItems,
 } from "../../Language/completion";
 import { ConsoleLspClient } from "../../Language/consoleLspClient";
-import type { LspStartupStateStore } from "../../Language/lspStartupState";
 import { createGuardedBindingResolver } from "../../Language/completion/bindings";
 import { clearCompletionDiagnosticsScope, logConsoleCompletionDecision, noteConsoleCompletionContext } from "../../Language/completion/outputChannel";
 import { completionDecisionContext, type CompletionSuppressionReason } from "../../Language/completion/diagnostics";
@@ -48,7 +47,6 @@ type LangOptions = {
   requestRuntimeMemberCompletions?: RuntimeMemberCompletionRequester;
   requestRuntimeFunctionSource?: RuntimeFunctionSourceRequester;
   requestRuntimeFunctionArguments?: RuntimeFunctionArgumentsRequester;
-  getStartupStateStore?: () => Promise<LspStartupStateStore>;
 };
 
 type AutocompleteRequest = {
@@ -669,7 +667,6 @@ export class RTermLang {
         getCachedWorkspaceData: () => this.cachedSessionData,
         getStaticAnalysisEnabled: this.options.getStaticAnalysisEnabled,
         requestRuntimeFunctionArguments: this.options.requestRuntimeFunctionArguments,
-        getStartupStateStore: this.options.getStartupStateStore,
         onPackagesChanged: () => {
           this.cancelCompletion();
           this.options.onPackagesChanged?.();

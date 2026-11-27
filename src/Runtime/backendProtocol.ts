@@ -64,8 +64,7 @@ export type BackendCapability =
   | "member-inspection-search-path"
   | "function-source"
   | "function-source-value"
-  | "function-arguments"
-  | "lsp-startup-ipc-v2";
+  | "function-arguments";
 
 export type BackendDialogRequest =
   | {
@@ -223,8 +222,7 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "member-inspection-search-path" ||
     value === "function-source" ||
     value === "function-source-value" ||
-    value === "function-arguments" ||
-    value === "lsp-startup-ipc-v2"
+    value === "function-arguments"
   );
 }
 

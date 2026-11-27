@@ -291,25 +291,6 @@ export class RTerminal implements vscode.Pseudoterminal {
         this.requestStoredMemberCompletions(expression, operator),
       requestRuntimeFunctionSource: (name, target) => this.requestStoredFunctionSource(name, target),
       requestRuntimeFunctionArguments: expression => this.requestStoredFunctionArguments(expression),
-      getStartupStateStore: async () => {
-        // Runtime preparation is asynchronous; LSP startup joins its session
-        // once available, then retains that exact authenticated session handle.
-        const deadline = Date.now() + 10_000;
-        while (!this.rProcess && this.mode !== "closed" && !this.extensionResourcesDisposePromise && Date.now() < deadline) {
-          await new Promise(resolve => setTimeout(resolve, 20));
-        }
-        const backend = this.runtimeBackend, session = this.rProcess;
-        const current = () => {
-          if (!backend || !session || this.runtimeBackend !== backend || this.rProcess !== session || this.extensionResourcesDisposePromise) {
-            throw new Error("Persistent R session is unavailable for language-server startup");
-          }
-        };
-        current();
-        return {
-          load: () => { current(); return backend!.loadLspStartupState(session!); },
-          save: state => { current(); return backend!.saveLspStartupState(session!, state); },
-        };
-      },
       getStaticAnalysisEnabled: () =>
         vscode.workspace.getConfiguration("r.console").get<boolean>("completion.staticAnalysis", false),
     });
