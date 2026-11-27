@@ -51,6 +51,56 @@ function fixture(t, overrides = {}) {
   return { base, watches, resolutions, scans, changes, reviews, logs, inventory, mkdir, install, notify, settle };
 }
 
+test("directory metadata changes preserve the pin and allow parent watcher recovery", async t => {
+  const touched = new Set();
+  let replaced;
+  const f = fixture(t, { lstatSync: (file, options) => {
+    const stat = fs.lstatSync(file, options);
+    if (options?.bigint && touched.has(file)) {
+      // macOS can backdate birthtime when mtime is set earlier than creation.
+      // Simulate this on every CI platform without changing the file identity.
+      stat.birthtimeNs -= 5000000000n;
+      stat.mtimeNs -= 5000000000n;
+      stat.ctimeNs += 5000000000n;
+    }
+    if (options?.bigint && file === replaced) stat.ino += 1n;
+    return stat;
+  } });
+  const library = f.mkdir("parent/library"), parent = path.dirname(library);
+  f.install(library); f.inventory.setLibraryPaths([library]); await f.settle();
+  const pin = f.inventory.pins.get(library), watcher = f.inventory.watchers.get(library);
+  const published = f.changes.length, oldParent = f.inventory.entryMonitor.watches.get(parent).watcher;
+  f.logs.length = 0;
+  touched.add(parent); touched.add(library);
+  f.notify(f.base, "parent");
+  assert.equal(f.reviews.length, 0, "a changed creation timestamp is not a changed physical directory");
+  f.notify(parent, "library"); f.notify(library, undefined, false);
+  await f.settle();
+  assert.equal(f.inventory.pins.get(library), pin);
+  assert.equal(f.inventory.watchers.get(library), watcher);
+  assert.equal(f.inventory.entryMonitor.watches.get(parent).watcher, oldParent);
+  assert.equal(f.changes.length, published);
+  assert.ok(!f.logs.some(line => line.includes("Scanning folder:")));
+  assert.equal(f.reviews.length, 0);
+
+  oldParent.emit("error", new Error("lost notifications"));
+  await f.settle(() => f.inventory.entryMonitor.watches.has(parent));
+  assert.notEqual(f.inventory.entryMonitor.watches.get(parent).watcher, oldParent);
+  assert.equal(f.inventory.pins.get(library), pin, "recovery must not replace the pin");
+  assert.equal(f.reviews.length, 0);
+
+  // A changed file identifier must still suspend monitoring even if all of
+  // its timestamps match those observed just before the change.
+  replaced = parent;
+  f.notify(f.base, "parent");
+  assert.equal(f.inventory.watchers.has(library), false);
+  assert.equal(f.reviews.length, 1);
+  assert.equal(f.reviews[0].reason, "Pinned library ancestor replaced");
+  assert.equal(f.reviews[0].entry, parent);
+  assert.equal(f.inventory.pins.get(library), pin);
+  await f.settle(() => f.changes.at(-1).libraries[0].suspended);
+});
+
 test("an ordinary replacement suspends before warning and resumes only after a reviewed pin is accepted", async t => {
   const f = fixture(t), library = f.mkdir("library"); f.install(library);
   f.inventory.setLibraryPaths([library]); await f.settle();

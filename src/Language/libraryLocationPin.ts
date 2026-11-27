@@ -29,10 +29,15 @@ function components(target: string): string[] {
 
 /** Stable directory/link identity, shared with parent watcher registration. */
 export function pinEntryIdentity(stat: fs.BigIntStats): string {
-  // Directory contents change mtime/ctime, not this pin. Include birth time
-  // to distinguish reused file identifiers where available.
-  return [stat.dev, stat.ino, stat.birthtimeNs,
-    ...(stat.isSymbolicLink() ? [stat.size, stat.mtimeNs, stat.ctimeNs] : [])].join(":");
+  // Ordinary directories are identified by their device and file identifier.
+  // Birth time is mutable on some filesystems (macOS can backdate it on
+  // utimes), so it must not invalidate an otherwise unchanged directory pin.
+  // Preserve the existing timestamp fallback for missing file identifiers
+  // and the extra metadata used to recognise changes to link entries.
+  const linked = stat.isSymbolicLink();
+  return [stat.dev, stat.ino,
+    ...(linked || stat.ino === 0n ? [stat.birthtimeNs] : []),
+    ...(linked ? [stat.size, stat.mtimeNs, stat.ctimeNs] : [])].join(":");
 }
 
 function entryAt(entry: string): { state: EntryState; identity: string } {
