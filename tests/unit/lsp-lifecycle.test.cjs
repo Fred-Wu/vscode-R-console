@@ -7,7 +7,7 @@ class Position {
   constructor(line, character) { Object.assign(this, { line, character }); }
 }
 
-function createClient(t, { reply, completion, packageChanges, librarySync, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, getStartupStateStore } = {}) {
+function createClient(t, { reply, completion, packageChanges, librarySync, start, stop, libraries = [], getCachedWorkspaceData, staticAnalysis = false, requestRuntimeFunctionArguments, getStartupStateStore, showWarningMessage } = {}) {
   const instances = [];
   const logs = [];
   let owningClient, captures = 0;
@@ -59,7 +59,7 @@ function createClient(t, { reply, completion, packageChanges, librarySync, start
     vscode: {
       Position, Range: class Range { constructor(start, end) { this.start = start; this.end = end; } },
       Uri: { parse: (value) => ({ toString: () => value }), file: () => ({}) },
-      window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }) },
+      window: { createOutputChannel: () => ({ appendLine: line => logs.push(line), dispose() {} }), showWarningMessage },
       workspace: { getConfiguration: () => ({ get: (key) => {
         if (key === "libPaths" || key === "useRenvLibPath") {
           throw new Error("Console language server must not read vscode-R library settings");
@@ -95,6 +95,32 @@ function change() {
   return { libraries: [{ path: "/base/library", packages: new Map() }],
     packages: new Map(), changed: ["stats"], isCurrent: () => true };
 }
+
+test("library monitoring warnings are wired to the VS Code host with explicit modal confirmation", async t => {
+  const calls = [], proposal = { root: "/new", physical: [], configured: [] };
+  const { client } = createClient(t, { showWarningMessage: async (...args) => {
+    calls.push(args);
+    return calls.length === 1 ? "Review New Location" : "Trust and Resume";
+  } });
+  let accepted = false;
+  client.packageInventory.onLocationChange({
+    library: "/old", previousRoot: "/old", entry: "/old",
+    reason: "Pinned library replaced by a symlink",
+    isCurrent: () => !accepted,
+    review: () => proposal,
+    approve: value => { assert.equal(value, proposal); accepted = true; return true; },
+    reject: () => assert.fail("review was accepted"),
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(accepted, true);
+  assert.match(calls[0][0], /Pinned library replaced by a symlink: \/old/);
+  assert.deepEqual(calls[0].slice(1), ["Review New Location", "Stop Monitoring"]);
+  assert.equal(calls[1][0], "R Console: Trust new library location?");
+  assert.equal(calls[1][1].modal, true);
+  assert.match(calls[1][1].detail, /Previously pinned: \/old\nNew location: \/new/);
+  assert.deepEqual(calls[1].slice(2), ["Reject", "Trust and Resume"]);
+  assert.equal(client.client, undefined, "warning does not launch a language server");
+});
 
 test("persistent state is retrieved before launching R and never recaptured on reattach", async t => {
   let release;

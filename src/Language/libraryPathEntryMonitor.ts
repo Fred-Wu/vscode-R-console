@@ -1,17 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
+import { pinEntryIdentity, type LibraryPin } from "./libraryLocationPin";
 
-export type LibraryPathEntryChange = {
-  library: string;
-  pinnedRoot: string;
-  entry: string;
-  kind: "physical" | "alias";
-  state: "directory" | "link" | "missing" | "other";
-};
-
-type Entry = LibraryPathEntryChange & { parent: string; name: string; key: string };
-type ParentWatch = { watcher: fs.FSWatcher; entries: Map<string, Entry> };
-type Failure = { entries: Map<string, Entry>; attempts: number; lastAttemptAt: number; nextAttemptAt?: number };
+type Entry = { library: string; name: string; parentIdentity: string };
+type Entries = Map<string, Entry>;
+type ParentWatch = { watcher: fs.FSWatcher; entries: Entries; identity: string };
+type Failure = { entries: Entries; attempts: number; lastAttemptAt: number; nextAttemptAt?: number };
 export type EntryRetryClock = {
   now(): number;
   after(callback: () => void, delay: number): NodeJS.Timeout;
@@ -27,55 +21,33 @@ const systemClock: EntryRetryClock = {
   cancel: timer => clearTimeout(timer),
 };
 
-/**
- * Watches directory entries on pinned physical paths and configured aliases,
- * never following newly discovered destinations or package-cache links.
- * Parent watch failures get five automatic retries, then recover only on
- * relevant events, with no idle polling.
- */
+/** Watch entries from the authorised pin only. A notification or failed
+ * registration revalidates that pin; it cannot discover a replacement root. */
 export class LibraryPathEntryMonitor {
-  private readonly roots = new Map<string, string>();
+  private readonly roots = new Map<string, LibraryPin>();
   private readonly watches = new Map<string, ParentWatch>();
-  private readonly identities = new Map<string, string>();
   private readonly failures = new Map<string, Failure>();
   private recoveryTimer: NodeJS.Timeout | undefined;
   private disposed = false;
+  private reconciling = false;
+  private reconcileAgain = false;
+  private readonly queuedRetries = new Set<string>();
 
   constructor(
-    private readonly onChange: (change: LibraryPathEntryChange) => void,
+    private readonly validateLibrary: (library: string) => boolean,
     private readonly log: (message: string) => void,
     private readonly filesystem: Pick<typeof fs, "lstatSync" | "watch"> = fs,
-    private readonly validateLibrary: (library: string) => boolean = () => true,
     private readonly clock: EntryRetryClock = systemClock,
   ) {}
 
-  add(library: string, pinnedRoot: string): void {
-    if (this.disposed || this.roots.get(library) === pinnedRoot) return;
-    this.roots.set(library, pinnedRoot);
+  add(library: string, pin: LibraryPin): void {
+    if (this.disposed) return;
+    this.roots.set(library, pin);
     this.reconcile();
   }
 
-  /** A library's missing entry is covered by its immediate existing parent,
-   * not by just any watcher somewhere higher in the path. */
-  hasPhysicalEntryWatch(library: string): boolean {
-    const parent = this.requiredPhysicalParent(library);
-    const watched = parent && this.watches.get(parent);
-    return !!watched && [...watched.entries.values()].some(entry =>
-      entry.kind === "physical" && entry.library === library);
-  }
-
-  /** A failed watcher owns recovery for this missing entry; don't start an
-   * additional, unbounded package-inventory retry loop. */
-  hasPhysicalEntryRecovery(library: string): boolean {
-    const parent = this.requiredPhysicalParent(library);
-    const failed = parent && this.failures.get(parent);
-    return !!failed && [...failed.entries.values()].some(entry =>
-      entry.kind === "physical" && entry.library === library);
-  }
-
-  /** Called from an active package watcher or a relevant ancestor-entry event.
-   * Each event validates the pinned path; after five scheduled retries,
-   * it can also retry a failed registration at most once per ten seconds. */
+  /** Active package and relevant ancestor events can recover a failed parent
+   * registration after its five scheduled attempts, at most once per 10s. */
   onLibraryEvent(library: string): void {
     if (this.disposed || !this.roots.has(library)) return;
     const affected = [...this.failures].filter(([, failure]) =>
@@ -93,11 +65,7 @@ export class LibraryPathEntryMonitor {
   }
 
   remove(library: string): void {
-    if (!this.roots.delete(library)) return;
-    for (const key of this.identities.keys()) {
-      if (key.startsWith(JSON.stringify(library) + "|")) this.identities.delete(key);
-    }
-    this.reconcile();
+    if (this.roots.delete(library)) this.reconcile();
   }
 
   dispose(): void {
@@ -105,76 +73,28 @@ export class LibraryPathEntryMonitor {
     this.disposed = true;
     this.cancelTimer();
     this.roots.clear();
-    this.identities.clear();
     this.failures.clear();
+    this.queuedRetries.clear();
     for (const item of this.watches.values()) item.watcher.close();
     this.watches.clear();
   }
 
-  private identity(entry: string): { value: string; state: LibraryPathEntryChange["state"] } {
-    try {
-      const s = this.filesystem.lstatSync(entry);
-      const state = s.isSymbolicLink() ? "link" : s.isDirectory() ? "directory" : "other";
-      // Package updates change directory mtime/ctime, not entry identity.
-      return { state, value: JSON.stringify([state, s.dev, s.ino || 0, s.birthtimeMs]) };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return { state: "missing", value: "missing" };
-      return { state: "other", value: `unavailable:${String(code ?? error)}` };
-    }
-  }
-
-  private requiredPhysicalParent(library: string): string | undefined {
-    const root = this.roots.get(library);
-    if (!root) return undefined;
-    let parent = path.parse(root).root;
-    for (const part of root.slice(parent.length).split(path.sep).filter(Boolean)) {
-      const child = path.join(parent, part);
-      if (this.identity(child).state !== "directory") return parent;
-      parent = child;
-    }
-    return path.dirname(root);
-  }
-
-  private gather(library: string, pinnedRoot: string, kind: "physical" | "alias",
-    wanted: Map<string, Map<string, Entry>>): void {
-    const target = path.resolve(kind === "physical" ? pinnedRoot : library);
-    let parent = path.parse(target).root;
-    const parts = target.slice(parent.length).split(path.sep).filter(Boolean);
-    if (parts.length > MAX_PATH_COMPONENTS) {
-      this.log(`[Libraries] Limited root-entry monitoring: ${library} - path depth exceeds ${MAX_PATH_COMPONENTS}`);
-      return;
-    }
-    for (const name of parts) {
-      // Never subscribe through a known link in the pinned physical path.
-      if (this.identity(parent).state !== "directory") break;
-      const entry = path.join(parent, name);
-      const key = `${JSON.stringify(library)}|${kind}|${entry}`;
-      const entries = wanted.get(parent) ?? new Map<string, Entry>();
-      entries.set(key, { library, pinnedRoot, kind, parent, name, entry, key, state: "missing" });
-      wanted.set(parent, entries);
-      parent = entry;
-    }
-  }
-
   private validate(library: string): boolean {
-    if (!this.roots.has(library)) return false;
-    try { return this.validateLibrary(library); }
+    const pin = this.roots.get(library);
+    if (!pin || this.disposed) return false;
+    try { return this.validateLibrary(library) && this.roots.get(library) === pin; }
     catch { return false; }
   }
 
-  private validateEntries(entries: Map<string, Entry>): void {
-    for (const library of new Set([...entries.values()].map(entry => entry.library))) {
-      this.validate(library);
-    }
+  private validateEntries(entries: Entries): void {
+    for (const library of new Set([...entries.values()].map(entry => entry.library))) this.validate(library);
   }
 
-  private fail(parent: string, entries: Map<string, Entry>, error: unknown): void {
+  private fail(parent: string, entries: Entries, error: unknown): void {
     if (this.disposed) return;
     const previous = this.failures.get(parent);
-    if (previous) {
-      previous.entries = entries;
-    } else {
+    if (previous) previous.entries = entries;
+    else {
       this.failures.set(parent, {
         entries, attempts: 0, lastAttemptAt: -Infinity,
         nextAttemptAt: this.clock.now() + RETRY_DELAYS_MS[0],
@@ -212,110 +132,119 @@ export class LibraryPathEntryMonitor {
         ? now + RETRY_DELAYS_MS[failure.attempts] : undefined;
       allowed.add(parent);
     }
-    // lstat the pinned path before any attempt at registration.
-    for (const parent of allowed) {
-      const failure = this.failures.get(parent);
-      if (failure) this.validateEntries(failure.entries);
-    }
     if (allowed.size) this.reconcile(allowed);
     else this.armTimer();
   }
 
   private reconcile(allowedRetries: Set<string> = new Set()): void {
     if (this.disposed) return;
-    const wanted = new Map<string, Map<string, Entry>>();
-    for (const [library, root] of this.roots) {
-      this.gather(library, root, "physical", wanted);
-      if (path.resolve(library) !== path.resolve(root)) this.gather(library, root, "alias", wanted);
-    }
-    for (const [parent, existing] of this.watches) {
-      if (!wanted.has(parent)) {
-        existing.watcher.close();
-        this.watches.delete(parent);
+    for (const parent of allowedRetries) this.queuedRetries.add(parent);
+    // Validation may synchronously suspend and remove a library. Build a fresh
+    // wanted set after removals instead of re-entering with obsolete entries.
+    if (this.reconciling) { this.reconcileAgain = true; return; }
+    this.reconciling = true;
+    try {
+      do {
+        this.reconcileAgain = false;
+        const retries = new Set(this.queuedRetries);
+        this.queuedRetries.clear();
+        this.reconcileOnce(retries);
+      } while (!this.disposed && this.reconcileAgain);
+    } finally { this.reconciling = false; }
+  }
+
+  private reconcileOnce(allowedRetries: Set<string>): void {
+    const verified = new Set([...this.roots.keys()].filter(library => this.validate(library)));
+    const wanted = new Map<string, Entries>();
+    for (const [library, pin] of this.roots) {
+      for (const chain of [pin.physical, pin.configured]) {
+        // The pin already ends at the first configured link and contains only
+        // ordinary physical ancestors. Never walk a newly discovered path.
+        if (chain.length - 1 > MAX_PATH_COMPONENTS) {
+          this.log(`[Libraries] Limited root-entry monitoring: ${library} - path depth exceeds ${MAX_PATH_COMPONENTS}`);
+          continue;
+        }
+        for (let i = 1; i < chain.length; i++) {
+          const parent = chain[i - 1];
+          const name = path.basename(chain[i].path);
+          const entries = wanted.get(parent.path) ?? new Map<string, Entry>();
+          entries.set(JSON.stringify([library, name]), { library, name, parentIdentity: parent.identity });
+          wanted.set(parent.path, entries);
+        }
       }
+    }
+    for (const [parent, current] of this.watches) {
+      if (!wanted.has(parent)) { current.watcher.close(); this.watches.delete(parent); }
     }
     for (const parent of this.failures.keys()) {
       if (!wanted.has(parent)) this.failures.delete(parent);
     }
-    const activeKeys = new Set<string>();
-    const newlyFailed: Map<string, Entry>[] = [];
-    const missed: LibraryPathEntryChange[] = [];
     for (const [parent, entries] of wanted) {
-      for (const entry of entries.values()) {
-        activeKeys.add(entry.key);
-        if (!this.identities.has(entry.key)) this.identities.set(entry.key, this.identity(entry.entry).value);
-      }
+      // Retain failure budgets/old watches during temporary I/O failures, but
+      // register new watches only for libraries whose pin is still verified.
+      const trusted = [...entries.values()].find(entry => verified.has(entry.library) && this.roots.has(entry.library));
       const current = this.watches.get(parent);
       if (current) {
         current.entries = entries;
-        continue;
+        if (!trusted || current.identity === trusted.parentIdentity) continue;
+        current.watcher.close();
+        this.watches.delete(parent);
       }
       const failure = this.failures.get(parent);
-      if (failure && !allowedRetries.has(parent)) {
+      if (failure) {
         failure.entries = entries;
-        continue;
+        if (!allowedRetries.has(parent)) continue;
       }
+      if (!trusted) continue;
       try {
-        if (this.identity(parent).state !== "directory") {
-          throw Object.assign(new Error("Parent directory not ordinary"), { code: "ENOTDIR" });
-        }
+        // Recheck the original pin immediately before a new registration,
+        // including ancestors above the parent being watched.
+        if (!this.validate(trusted.library)) continue;
+        const expected = trusted.parentIdentity;
+        const matches = () => {
+          const stat = this.filesystem.lstatSync(parent, { bigint: true });
+          return stat.isDirectory() && pinEntryIdentity(stat) === expected;
+        };
+        if (!matches()) throw new Error("Pinned parent identity changed before watch registration");
         const watcher = this.filesystem.watch(parent,
-          { persistent: false, recursive: false, encoding: "utf8" },
-          (_event, filename) => this.handle(parent, filename));
+          { persistent: false, recursive: false, encoding: "utf8" }, (_event, filename) => {
+            const active = this.watches.get(parent);
+            if (active?.watcher === watcher) this.handle(active.entries, filename);
+          });
+        try {
+          if (!matches() || !this.validate(trusted.library)) {
+            throw new Error("Pinned parent identity changed during watch registration");
+          }
+        } catch (error) { watcher.close(); throw error; }
         watcher.on("error", error => {
-          if (this.watches.get(parent)?.watcher !== watcher) return;
+          const active = this.watches.get(parent);
+          if (active?.watcher !== watcher) return;
           watcher.close();
           this.watches.delete(parent);
-          this.fail(parent, entries, error);
-          this.validateEntries(entries);
+          this.fail(parent, active.entries, error);
+          this.validateEntries(active.entries);
           this.reconcile();
         });
-        this.watches.set(parent, { watcher, entries });
+        this.watches.set(parent, { watcher, entries, identity: expected });
         if (failure) {
           this.failures.delete(parent);
           this.log(`[Libraries] Monitoring restored: ${parent}`);
-          // Recheck identities to detect changes missed during watcher downtime.
-          for (const entry of entries.values()) {
-            const next = this.identity(entry.entry);
-            if (this.identities.get(entry.key) !== next.value) {
-              this.identities.set(entry.key, next.value);
-              missed.push({ library: entry.library, pinnedRoot: entry.pinnedRoot,
-                entry: entry.entry, kind: entry.kind, state: next.state });
-            }
-          }
         }
       } catch (error) {
-        const alreadyFailed = this.failures.has(parent);
         this.fail(parent, entries, error);
-        if (!alreadyFailed) newlyFailed.push(entries);
+        this.validateEntries(entries);
       }
     }
-    for (const key of this.identities.keys()) if (!activeKeys.has(key)) this.identities.delete(key);
     this.armTimer();
-    for (const entries of newlyFailed) this.validateEntries(entries);
-    for (const change of missed) {
-      if (!this.disposed && this.roots.get(change.library) === change.pinnedRoot) this.onChange(change);
-    }
   }
 
-  private handle(parent: string, filename?: string | Buffer | null): void {
-    const watch = this.watches.get(parent);
-    if (!watch || this.disposed) return;
+  private handle(entries: Entries, filename?: string | Buffer | null): void {
+    if (this.disposed) return;
     const name = filename == null ? undefined : String(filename);
-    const affected = new Set<string>();
-    const changes: LibraryPathEntryChange[] = [];
-    for (const entry of watch.entries.values()) {
-      if (name && (process.platform === "win32"
-        ? name.toLowerCase() !== entry.name.toLowerCase() : name !== entry.name)) continue;
-      affected.add(entry.library);
-      const next = this.identity(entry.entry);
-      if (this.identities.get(entry.key) === next.value) continue;
-      this.identities.set(entry.key, next.value);
-      changes.push({ library: entry.library, pinnedRoot: entry.pinnedRoot,
-        kind: entry.kind, entry: entry.entry, state: next.state });
+    const affected = new Set([...entries.values()].filter(entry => !name || (process.platform === "win32"
+      ? name.toLowerCase() === entry.name.toLowerCase() : name === entry.name)).map(entry => entry.library));
+    for (const library of affected) {
+      if (this.validate(library)) this.onLibraryEvent(library);
     }
-    for (const change of changes) this.onChange(change);
-    for (const library of affected) this.onLibraryEvent(library);
-    if (changes.length) this.reconcile();
   }
 }

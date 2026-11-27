@@ -1,7 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
 import { EventEmitter } from "events";
-import { LibraryPathEntryMonitor, type LibraryPathEntryChange } from "./libraryPathEntryMonitor";
+import { LibraryPathEntryMonitor } from "./libraryPathEntryMonitor";
+import { captureLibraryPin, checkLibraryPin, describeLibraryPinChange, LibraryPinChanged,
+  sameLibraryPin, type LibraryPin, type LibraryPinChange } from "./libraryLocationPin";
+import type { LibraryMonitoringReview } from "./libraryMonitoringNotice";
 
 // A library may be on a slow network drive; bound watcher fanout per root.
 const MAX_PACKAGE_WATCHES_PER_LIBRARY = 128;
@@ -46,16 +49,12 @@ export class PackageInventory {
   private packages = new Map<string, PackageInstallation>();
   private readonly watchers = new Map<string, PackageDirectoryWatcher>();
   private readonly entryMonitor: LibraryPathEntryMonitor;
-  // Resolve explicitly configured aliases once. Watch and scan that root for
-  // the lifetime of this configuration; retargeting an alias grants no new root.
-  private readonly roots = new Map<string, string>();
+  // A configuration authorises one physical directory and its ancestry.
+  // Neither notifications nor watcher recovery may replace this identity.
+  private readonly pins = new Map<string, LibraryPin>();
   private readonly suspended = new Set<string>();
   private readonly unavailable = new Set<string>();
-  private readonly watchedTargets = new Map<string, string>();
-  // Preserve the last successfully watched physical identity across a brief
-  // removal, so a subsequent ordinary replacement is logged as a replacement.
-  private readonly lastWatchedTargets = new Map<string, string>();
-  private readonly configuredAliases = new Set<string>();
+  private readonly reviews = new Map<string, LibraryMonitoringReview>();
   private timer: NodeJS.Timeout | undefined;
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
@@ -71,242 +70,186 @@ export class PackageInventory {
   constructor(
     private readonly onChange: (change: PackageInventoryChange) => Promise<void>,
     private readonly log: (message: string) => void,
+    private readonly onLocationChange: (review: LibraryMonitoringReview) => void = () => {},
   ) {
     this.entryMonitor = new LibraryPathEntryMonitor(
-      change => this.onLibraryPathEntryChange(change), message => this.log(message), fs,
-      library => {
-        // Check the pinned physical path on parent watcher failure and before
-        // every recovery attempt. A missing ordinary directory is recoverable;
-        // a symlinked pinned root suspends monitoring instead.
-        if (this.disposed || !this.paths.includes(library) || this.suspended.has(library)) return false;
-        try { return this.libraryTarget(library) !== undefined; }
-        catch { return !this.suspended.has(library); }
-      });
+      library => this.validateForEvent(library), message => this.log(message), fs);
   }
 
-  private onLibraryPathEntryChange(change: LibraryPathEntryChange): void {
-    const library = change.library;
-    if (this.disposed || !this.paths.includes(library)) return;
-    if (change.kind === "alias") {
-      const wasAlias = this.configuredAliases.has(library);
-      const isAlias = this.configuredPathHasLink(library);
-      if (isAlias) this.configuredAliases.add(library);
-      else this.configuredAliases.delete(library);
-      // An alias's removal is still an alias change. Canonical path spelling
-      // differences alone must not generate misleading alias messages.
-      if (wasAlias || isAlias) {
-        this.log(`[Libraries] Configured library alias changed: ${library}; monitoring remains pinned to ${change.pinnedRoot}`);
-      }
-      return;
+  private validateForEvent(library: string): boolean {
+    if (this.disposed || !this.paths.includes(library) || this.suspended.has(library)) return false;
+    try { return this.libraryTarget(library) !== undefined; }
+    catch {
+      // A transient failure is not a new identity. Keep the pin and recover
+      // through the normal inventory retry path, without registering a watch.
+      if (!this.unavailable.has(library)) {
+        this.dirtyLibraries.add(library);
+        this.schedule(250);
+      } else this.scheduleRetry();
+      return false;
     }
-    let current: string | undefined;
-    try { current = this.libraryTarget(library); }
-    catch { /* A missing ordinary root will be revisited on its parent entry's next event. */ }
-    if (this.suspended.has(library)) {
-      this.entryMonitor.remove(library);
-      this.dirtyLibraries.add(library);
-      this.schedule(250);
-      return;
-    }
-    if (current === this.watchedTargets.get(library)) return;
-    this.watchers.get(library)?.close();
-    this.watchers.delete(library);
-    this.watchedTargets.delete(library);
-    if (current !== undefined) this.watchLibrary(library, true);
-    this.dirtyLibraries.add(library);
-    this.schedule(250);
   }
 
   setLibraryPaths(paths: string[]): void {
     if (this.disposed || JSON.stringify(paths) === JSON.stringify(this.paths)) return;
     const active = new Set(paths);
-    // Preserve existing watchers, cached packages and outstanding dirty scans.
-    // Only paths leaving the R search order lose their watches.
-    for (const [library, watcher] of this.watchers) {
-      if (!active.has(library)) {
-        watcher.close();
-        this.watchers.delete(library);
-        this.watchedTargets.delete(library);
-      }
-    }
-    for (const library of this.roots.keys()) {
-      if (!active.has(library)) {
-        this.entryMonitor.remove(library);
-        this.roots.delete(library);
-        this.lastWatchedTargets.delete(library);
-        this.configuredAliases.delete(library);
-        this.suspended.delete(library);
-        this.unavailable.delete(library);
-      }
-    }
-    for (const library of this.dirtyLibraries) {
-      if (!active.has(library)) this.dirtyLibraries.delete(library);
-    }
-    for (const library of this.unconfirmedLibraries) {
-      if (!active.has(library)) this.unconfirmedLibraries.delete(library);
-    }
+    const previous = new Set(this.paths);
     this.paths = [...paths];
     this.revision++;
     this.candidate = undefined;
+    for (const library of previous) {
+      if (active.has(library)) continue;
+      this.watchers.get(library)?.close();
+      this.watchers.delete(library);
+      this.pins.delete(library);
+      this.reviews.delete(library);
+      this.suspended.delete(library);
+      this.unavailable.delete(library);
+      this.dirtyLibraries.delete(library);
+      this.unconfirmedLibraries.delete(library);
+      this.entryMonitor.remove(library);
+    }
     for (const library of paths) {
-      const root = this.rootFor(library);
-      if (!this.suspended.has(library)) this.entryMonitor.add(library, root);
-      if (!this.watchers.has(library)) this.watchLibrary(library);
+      if (!previous.has(library)) this.pinLibrary(library);
+      if (!this.suspended.has(library) && !this.watchers.has(library)) this.watchLibrary(library);
     }
     this.schedule(0);
   }
 
-  /** Only report a configured alias when an actual path component is linked.
-   * Windows spelling, casing and 8.3-name canonicalization alone are not links. */
-  private configuredPathHasLink(library: string): boolean {
-    const configured = path.resolve(library);
-    let current = path.parse(configured).root;
-    for (const part of configured.slice(current.length).split(path.sep).filter(Boolean)) {
-      current = path.join(current, part);
-      try {
-        if (fs.lstatSync(current).isSymbolicLink()) return true;
-      } catch {
-        // Classification is for logging only; root validation still decides
-        // whether monitoring is safe.
-        return false;
+  private pinLibrary(library: string): void {
+    let pin: LibraryPin;
+    try { pin = captureLibraryPin(library); }
+    catch (error) {
+      if (error instanceof LibraryPinChanged) this.suspendLibrary(library, error.change);
+      else {
+        this.suspended.add(library);
+        this.dirtyLibraries.add(library);
+        this.log(`[Libraries] Monitoring suspended: ${library} - unable to pin the configured root: ${String(error)}; reconfigure to resume`);
       }
+      return;
     }
-    return false;
+    this.installPin(library, pin);
+  }
+
+  private installPin(library: string, pin: LibraryPin): void {
+    this.pins.set(library, pin);
+    this.suspended.delete(library);
+    this.unavailable.delete(library);
+    this.reviews.delete(library);
+    this.revision++;
+    this.candidate = undefined;
+    this.dirtyLibraries.add(library);
+    this.log(pin.configured.some(entry => entry.state === "link")
+      ? `[Libraries] Library alias: ${library} -> ${pin.root}`
+      : `[Libraries] Pinned library: ${pin.root}`);
+    this.entryMonitor.add(library, pin);
+  }
+
+  private suspendLibrary(library: string, change: LibraryPinChange): void {
+    if (this.disposed || !this.paths.includes(library) || this.suspended.has(library)) return;
+    const pin = this.pins.get(library);
+    this.suspended.add(library);
+    this.unavailable.delete(library);
+    this.revision++;
+    this.candidate = undefined;
+    this.watchers.get(library)?.close();
+    this.watchers.delete(library);
+    this.dirtyLibraries.add(library);
+    this.unconfirmedLibraries.delete(library);
+    this.entryMonitor.remove(library);
+    const reason = describeLibraryPinChange(library, pin, change);
+    this.log(`[Libraries] Monitoring suspended: ${library} - ${reason}: ${change.entry}`);
+    const review: LibraryMonitoringReview = {
+      library, previousRoot: pin?.root, entry: change.entry, reason,
+      isCurrent: () => !this.disposed && this.paths.includes(library) && this.reviews.get(library) === review,
+      review: () => review.isCurrent() ? captureLibraryPin(library) : undefined,
+      reject: () => { if (review.isCurrent()) this.reviews.delete(library); },
+      approve: proposal => {
+        if (!review.isCurrent()) return false;
+        let current: LibraryPin;
+        try { current = captureLibraryPin(library); }
+        catch { return false; }
+        if (!sameLibraryPin(proposal, current) || !review.isCurrent()) return false;
+        this.installPin(library, current);
+        this.watchLibrary(library, true);
+        this.schedule(250);
+        return !this.suspended.has(library);
+      },
+    };
+    this.reviews.set(library, review);
+    this.schedule(250);
+    try { this.onLocationChange(review); }
+    catch { /* Notification failure must leave monitoring suspended. */ }
   }
 
   private rootFor(library: string): string {
     if (this.disposed || !this.paths.includes(library)) throw new Error("Library monitoring configuration changed");
-    const pinned = this.roots.get(library);
-    if (pinned !== undefined) return pinned;
-    // Resolve once for this configuration. A missing library can be pinned
-    // relative to the nearest existing canonical ancestor.
-    let candidate = path.resolve(library);
-    let resolved = candidate;
-    const absent: string[] = [];
-    try {
-      for (;;) {
-        try {
-          resolved = path.join(fs.realpathSync.native(candidate), ...absent);
-          break;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          const parent = path.dirname(candidate);
-          if (parent === candidate) throw error;
-          absent.unshift(path.basename(candidate));
-          candidate = parent;
-        }
-      }
-    } catch (error) {
-      // Never retry realpath on an unpinnable or retargeted configured alias.
-      // Keep a lexical root only for exclusion reporting until reconfiguration.
-      this.suspended.add(library);
-      this.log(`[Libraries] Monitoring suspended: ${library} - unable to pin the configured root: ${String(error)}; reconfigure to resume`);
-    }
-    this.roots.set(library, resolved);
-    if (!this.suspended.has(library)) {
-      if (this.configuredPathHasLink(library)) {
-        this.configuredAliases.add(library);
-        this.log(`[Libraries] Library alias: ${library} -> ${resolved}`);
-      } else {
-        this.log(`[Libraries] Pinned library: ${resolved}`);
-      }
-    }
-    return resolved;
+    return this.pins.get(library)?.root ?? path.resolve(library);
   }
 
-  private libraryTarget(library: string): string | undefined {
-    if (this.suspended.has(library)) return undefined;
-    const root = this.rootFor(library);
-    if (this.suspended.has(library)) return undefined;
-    // A pinned root or one of its ancestors can subsequently become a link.
-    // Check from the filesystem root so no check traverses a known link.
-    let current = path.parse(root).root;
-    let stats: fs.Stats | undefined;
-    for (const part of root.slice(current.length).split(path.sep).filter(Boolean)) {
-      current = path.join(current, part);
-      stats = fs.lstatSync(current);
-      if (stats.isSymbolicLink()) {
-        this.suspended.add(library);
-        this.entryMonitor.remove(library);
-        this.watchers.get(library)?.close();
-        this.watchers.delete(library);
-        this.watchedTargets.delete(library);
-        this.dirtyLibraries.add(library);
-        this.schedule(250);
-        this.log(current === root
-          ? `[Libraries] Monitoring suspended: ${root} - pinned library replaced by a symlink`
-          : `[Libraries] Monitoring suspended: ${root} - pinned library ancestor replaced by a symlink: ${current}`);
-        return undefined;
-      }
+  private libraryTarget(library: string): LibraryPin | undefined {
+    if (this.disposed || this.suspended.has(library)) return undefined;
+    const pin = this.pins.get(library);
+    if (!pin) return undefined;
+    const change = checkLibraryPin(pin);
+    if (change) {
+      this.suspendLibrary(library, change);
+      return undefined;
     }
-    stats ??= fs.lstatSync(root);
-    if (!stats.isDirectory()) throw Object.assign(new Error("Library is not a directory"), { code: "ENOTDIR" });
-    return JSON.stringify([root, stats.dev, stats.ino || stats.birthtimeMs]);
+    return pin;
   }
 
   private watchLibrary(library: string, recovering = false): void {
-    if (this.suspended.has(library)) return;
+    if (this.disposed || this.suspended.has(library) || this.watchers.has(library)) return;
+    let watcher: PackageDirectoryWatcher | undefined;
     try {
-      const target = this.libraryTarget(library);
-      if (target === undefined) return;
-      const root = this.rootFor(library);
-      const watcher = new PackageDirectoryWatcher(root, () => this.libraryTarget(library) !== undefined, (event, filename) => {
+      const pin = this.libraryTarget(library);
+      if (!pin) return;
+      const root = pin.root;
+      watcher = new PackageDirectoryWatcher(root, () => this.libraryTarget(library) === pin, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
-        let current: string | undefined;
-        try { current = this.libraryTarget(library); } catch { /* Recover a removed root below. */ }
-        if (this.suspended.has(library)) return;
+        if (!this.validateForEvent(library)) return;
         this.entryMonitor.onLibraryEvent(library);
         if (this.disposed || this.watchers.get(library) !== watcher) return;
-        if (current !== this.watchedTargets.get(library)) {
-          watcher.close();
-          this.watchers.delete(library);
-          this.watchedTargets.delete(library);
-          this.watchLibrary(library, true);
-          this.dirtyLibraries.add(library);
+        const name = filename ? String(filename) : "";
+        // Directory notifications trigger a metadata identity check. Delayed
+        // or duplicate events alone do not establish an installation change.
+        if (event === "change" || !name || name === path.basename(root) || name.includes(path.sep)) {
+          this.unconfirmedLibraries.add(library);
         } else {
-          const name = filename ? String(filename) : "";
-          // Directory notifications trigger a metadata identity check. Delayed
-          // or duplicate events alone do not establish an installation change.
-          if (event === "change" || !name || name === path.basename(root) || name.includes(path.sep)) {
-            this.unconfirmedLibraries.add(library);
-          } else {
-            this.dirtyLibraries.add(library);
-          }
+          this.dirtyLibraries.add(library);
         }
         this.schedule(250);
       }, (reason) => this.log(`[Libraries] Limited package monitoring: ${library} - ${reason}; root events remain active`));
+      if (this.libraryTarget(library) !== pin) { watcher.close(); return; }
       watcher.on("error", error => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         this.watchers.delete(library);
-        this.watchedTargets.delete(library);
-        watcher.close();
+        watcher?.close();
+        if (this.suspended.has(library)) return;
+        this.validateForEvent(library);
+        if (this.suspended.has(library)) return;
         this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
         this.scheduleRetry();
       });
       this.watchers.set(library, watcher);
-      this.watchedTargets.set(library, target);
       this.dirtyLibraries.add(library);
-      const previouslyWatched = this.lastWatchedTargets.get(library);
-      this.lastWatchedTargets.set(library, target);
-      this.log(previouslyWatched && previouslyWatched !== target
-        ? `[Libraries] Pinned library replaced: ${root} - monitoring restored`
-        : `[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
+      if (recovering) this.entryMonitor.add(library, pin);
+      if (!this.suspended.has(library)) this.log(`[Libraries] ${recovering ? "Watcher restored" : "Watching folder"}: ${library}`);
     } catch (error) {
+      watcher?.close();
+      if (this.suspended.has(library)) return;
+      this.validateForEvent(library);
+      if (this.suspended.has(library)) return;
       this.log(`[Libraries] Could not watch ${library}: ${String(error)}`);
-      const code = (error as NodeJS.ErrnoException).code;
-      if ((code === "ENOENT" || code === "ENOTDIR") &&
-          (this.entryMonitor.hasPhysicalEntryWatch(library) ||
-           this.entryMonitor.hasPhysicalEntryRecovery(library))) {
-        this.log(`[Libraries] Waiting for pinned library recreation event: ${this.rootFor(library)}`);
-      } else {
-        this.scheduleRetry();
-      }
+      this.scheduleRetry();
     }
   }
 
-  private async installationLocks(library: string, entries: fs.Dirent[]): Promise<Set<string>> {
+  private async installationLocks(library: string, entries: fs.Dirent[], isCurrent: () => boolean): Promise<Set<string>> {
     const locked = new Set<string>();
     for (const entry of entries) {
+      if (!isCurrent()) break;
       if (!entry.isDirectory()) continue;
       const named = /^00LOCK-([A-Za-z][A-Za-z0-9.]*)$/.exec(entry.name);
       if (named) locked.add(named[1]);
@@ -317,7 +260,7 @@ export class PackageInventory {
         let folder = path.join(library, "00LOCK");
         for (let depth = 0; depth < 2; depth++) {
           try {
-            if (!(await fs.promises.lstat(folder)).isDirectory()) break;
+            if (!isCurrent() || !(await fs.promises.lstat(folder)).isDirectory() || !isCurrent()) break;
             for (const item of await fs.promises.readdir(folder, { withFileTypes: true })) {
               if (item.isDirectory() && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.name)) locked.add(item.name);
             }
@@ -368,12 +311,10 @@ export class PackageInventory {
     this.clearRetry();
     for (const watcher of this.watchers.values()) watcher.close();
     this.watchers.clear();
-    this.watchedTargets.clear();
     this.unconfirmedLibraries.clear();
     this.entryMonitor.dispose();
-    this.roots.clear();
-    this.lastWatchedTargets.clear();
-    this.configuredAliases.clear();
+    this.pins.clear();
+    this.reviews.clear();
     this.suspended.clear();
     this.unavailable.clear();
   }
@@ -435,11 +376,12 @@ export class PackageInventory {
     this.timer.unref();
   }
 
-  private async hasInstalledPackagesChanged(library: string, previous: LibraryInventory): Promise<boolean> {
+  private async hasInstalledPackagesChanged(library: string, previous: LibraryInventory, isCurrent: () => boolean): Promise<boolean> {
     try {
-      if (this.libraryTarget(library) === undefined) return true;
+      if (!isCurrent() || this.libraryTarget(library) === undefined) return true;
       const root = this.rootFor(library);
       const entries = await fs.promises.readdir(root, { withFileTypes: true });
+      if (!isCurrent() || this.libraryTarget(library) === undefined) return true;
       if (entries.some(entry => entry.isDirectory() && /^00LOCK(?:-[A-Za-z][A-Za-z0-9.]*)?$/.test(entry.name))) return true;
       if (previous.deferred?.size) return true;
       const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
@@ -448,15 +390,16 @@ export class PackageInventory {
       // lstat observes a linked package entry without reading its destination.
       // A link replacement changes its own identity and invalidates metadata.
       for (const name of names) {
+        if (!isCurrent()) return true;
         const installed = previous.packages.get(name);
-        const current = await this.inspectPackage(library, name);
+        const current = await this.inspectPackage(library, name, isCurrent);
         if (previous.unmonitored?.has(name)) {
           if (current) return true; // An unsafe installation became ordinary.
         } else if (!installed || !current || current.identity !== installed.identity) {
           return true;
         }
       }
-      return false;
+      return !isCurrent() || this.libraryTarget(library) === undefined;
     } catch {
       // A missing or transient directory must take the normal recovery path.
       return true;
@@ -466,16 +409,17 @@ export class PackageInventory {
   private async scan(revision: number, dirty: Set<string>,
     unconfirmed: Set<string> = new Set()): Promise<void> {
     const libraries: LibraryInventory[] = [];
+    const isCurrent = () => !this.disposed && revision === this.revision;
     for (const library of this.paths) {
-      if (this.disposed || revision !== this.revision) return;
+      if (!isCurrent()) return;
       const previous = this.libraries.find(item => item.path === library);
       if (previous && !dirty.has(library) && !previous.unavailable) {
         if (!unconfirmed.has(library) ||
-            !(await this.hasInstalledPackagesChanged(library, previous))) {
+            !(await this.hasInstalledPackagesChanged(library, previous, isCurrent))) {
           libraries.push(previous);
           continue;
         }
-        if (this.disposed || revision !== this.revision) return;
+        if (!isCurrent()) return;
         dirty.add(library);
       }
       // A pinned root can be temporarily inaccessible on a network share.
@@ -495,64 +439,60 @@ export class PackageInventory {
           libraries.push(retained("suspended"));
           continue;
         }
-        entries = await fs.promises.readdir(this.rootFor(library), { withFileTypes: true });
-        if (this.disposed || revision !== this.revision) return;
+        entries = await fs.promises.readdir(originalTarget.root, { withFileTypes: true });
+        if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
         if (entries.length > MAX_LIBRARY_ENTRIES) {
           throw Object.assign(new Error(`library entry budget exceeded (${MAX_LIBRARY_ENTRIES})`),
             { code: "E2BIG" });
         }
-      if (this.disposed || revision !== this.revision) return;
-      const locked = await this.installationLocks(this.rootFor(library), entries);
-      // The package entry may be a symlink (renv/uvr). Record its lstat
-      // identity, but never traverse, read or watch its target from here.
-      const unmonitored = new Set<string>();
-      if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
-      const deferred = new Map<string, string[]>();
-      const libraryRoot = this.rootFor(library);
-      const defer = (name: string) => {
-        const old = previous?.packages.get(name);
-        const paths = new Set(previous?.deferred?.get(name));
-        paths.add(path.join(library, name));
-        paths.add(path.join(libraryRoot, name));
-        if (old?.target) paths.add(old.target);
-        deferred.set(name, [...paths].sort());
-        return old;
-      };
-      const names = [...new Set([
-        ...entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
-          /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name),
-        ...[...locked].filter(name => name !== "*"),
-        ...(locked.has("*") ? previous?.packages.keys() ?? [] : []),
-        ...(locked.has("*") ? previous?.deferred?.keys() ?? [] : []),
-      ])].sort();
-      const packages = new Map<string, PackageInstallation>();
-      for (let offset = 0; offset < names.length; offset += 8) {
-        if (this.disposed || revision !== this.revision) return;
-        const batch = await Promise.all(names.slice(offset, offset + 8).map(async name => {
+        const locked = await this.installationLocks(originalTarget.root, entries, isCurrent);
+        if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
+        // The package entry may be a symlink (renv/uvr). Record its lstat
+        // identity, but never traverse, read or watch its target from here.
+        const unmonitored = new Set<string>();
+        if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
+        const deferred = new Map<string, string[]>();
+        const libraryRoot = originalTarget.root;
+        const defer = (name: string) => {
           const old = previous?.packages.get(name);
-          if (unmonitored.has(name)) return undefined;
-          if (locked.has("*") || locked.has(name)) return defer(name);
-          const item = await this.readPackage(library, name, old);
-          if (item === null) unmonitored.add(name);
-          return item;
-        }));
-        for (const item of batch) if (item) packages.set(item.name, item);
-      }
-      // Re-validate the pinned identity after asynchronous reads. An
-      // intervening replacement must not publish observations from a new root.
-      if (this.libraryTarget(library) !== originalTarget) {
-        this.dirtyLibraries.add(library);
-        this.schedule(250);
-        libraries.push(retained("unavailable"));
-        continue;
-      }
-      if (this.unavailable.delete(library)) {
-        this.log(`[Libraries] Monitoring restored: ${library}`);
-      }
-      libraries.push({ path: library, packages, unmonitored,
-        deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) });
+          const paths = new Set(previous?.deferred?.get(name));
+          paths.add(path.join(library, name));
+          paths.add(path.join(libraryRoot, name));
+          if (old?.target) paths.add(old.target);
+          deferred.set(name, [...paths].sort());
+          return old;
+        };
+        const names = [...new Set([
+          ...entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+            /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name),
+          ...[...locked].filter(name => name !== "*"),
+          ...(locked.has("*") ? previous?.packages.keys() ?? [] : []),
+          ...(locked.has("*") ? previous?.deferred?.keys() ?? [] : []),
+        ])].sort();
+        const packages = new Map<string, PackageInstallation>();
+        for (let offset = 0; offset < names.length; offset += 8) {
+          if (!isCurrent()) return;
+          const batch = await Promise.all(names.slice(offset, offset + 8).map(async name => {
+            const old = previous?.packages.get(name);
+            if (unmonitored.has(name)) return undefined;
+            if (locked.has("*") || locked.has(name)) return defer(name);
+            const item = await this.readPackage(library, name, old, isCurrent);
+            if (item === null) unmonitored.add(name);
+            return item;
+          }));
+          for (const item of batch) if (item) packages.set(item.name, item);
+        }
+        // Re-validate after asynchronous reads before publishing observations.
+        if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
+        if (this.unavailable.delete(library)) {
+          this.log(`[Libraries] Monitoring restored: ${library}`);
+          this.entryMonitor.add(library, originalTarget);
+          if (!isCurrent()) return;
+        }
+        libraries.push({ path: library, packages, unmonitored,
+          deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) });
       } catch (error) {
-        if (this.disposed || revision !== this.revision) return;
+        if (!isCurrent()) return;
         if ((error as NodeJS.ErrnoException).code === "E2BIG") {
           // Refuse a too-broad root instead of repeatedly enumerating an
           // entire network share or home directory in recovery retries.
@@ -560,7 +500,7 @@ export class PackageInventory {
           this.unavailable.delete(library);
           this.watchers.get(library)?.close();
           this.watchers.delete(library);
-          this.watchedTargets.delete(library);
+          this.entryMonitor.remove(library);
           this.log(`[Libraries] Monitoring suspended: ${library} - library exceeds ${MAX_LIBRARY_ENTRIES} entries; narrow the configured root and reconfigure`);
           libraries.push(retained("suspended"));
           continue;
@@ -569,19 +509,27 @@ export class PackageInventory {
           libraries.push(retained("suspended"));
           continue;
         }
+        // ENOENT from an asynchronous read is not proof of identity change;
+        // validate the pinned ancestry again before deciding how to recover.
+        try { this.libraryTarget(library); } catch { /* Temporarily unavailable. */ }
+        if (!isCurrent()) return;
         if (!this.unavailable.has(library)) {
           const reason = error instanceof Error ? error.message : String(error);
           this.log(`[Libraries] Monitoring temporarily unavailable: ${library} - ${reason}; keeping last verified state`);
         }
         this.unavailable.add(library);
         libraries.push(retained("unavailable"));
-        const code = (error as NodeJS.ErrnoException).code;
-        if ((code !== "ENOENT" && code !== "ENOTDIR") ||
-            !(this.entryMonitor.hasPhysicalEntryWatch(library) ||
-              this.entryMonitor.hasPhysicalEntryRecovery(library))) this.scheduleRetry();
+        this.scheduleRetry();
       }
     }
-    if (this.disposed || revision !== this.revision) return;
+    if (!isCurrent()) return;
+    // Cached inventories also need a valid pin before automatic publication.
+    // An unrelated library event may arrive before the changed ancestor's event.
+    for (const item of libraries) {
+      if (item.suspended || item.unavailable) continue;
+      try { if (!this.libraryTarget(item.path)) return; }
+      catch { this.dirtyLibraries.add(item.path); }
+    }
     if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) {
       for (const library of dirty) this.dirtyLibraries.add(library);
       for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
@@ -616,6 +564,14 @@ export class PackageInventory {
       for (const name of library.unmonitored ?? []) if (!packages.has(name)) unmonitored.add(name);
       for (const [name, item] of library.packages) {
         if (!packages.has(name) && !unmonitored.has(name)) packages.set(name, item);
+      }
+    }
+    // Retain the selected copy for display/precedence, but never ask the LSP
+    // to compare or reload a namespace based on a suspended physical root.
+    for (const library of libraries) {
+      if (!library.suspended && !library.unavailable) continue;
+      for (const [name, item] of library.packages) {
+        if (packages.get(name) === item) unmonitored.add(name);
       }
     }
     const changed = [...new Set([...this.packages.keys(), ...packages.keys()])].filter(name =>
@@ -682,10 +638,12 @@ export class PackageInventory {
     this.candidate = undefined;
   }
 
-  private async inspectPackage(library: string, name: string): Promise<{ directory: string; identity: string; linked?: boolean } | null | undefined> {
+  private async inspectPackage(library: string, name: string, isCurrent: () => boolean): Promise<{ directory: string; identity: string; linked?: boolean } | null | undefined> {
+    if (!isCurrent()) return undefined;
     const directory = path.join(this.rootFor(library), name);
     try {
       const stat = await fs.promises.lstat(directory);
+      if (!isCurrent()) return undefined;
       if (stat.isSymbolicLink()) {
         // Only lstat the entry. Never call realpath/stat/readlink on its
         // destination, and never subscribe to that destination.
@@ -694,10 +652,13 @@ export class PackageInventory {
       }
       if (!stat.isDirectory()) return undefined;
       const meta = await fs.promises.lstat(path.join(directory, "Meta"));
+      if (!isCurrent()) return undefined;
       if (meta.isSymbolicLink()) return null;
       if (!meta.isDirectory()) return undefined;
       const metadata = await fs.promises.lstat(path.join(directory, "Meta", "package.rds"));
+      if (!isCurrent()) return undefined;
       const description = await fs.promises.lstat(path.join(directory, "DESCRIPTION"));
+      if (!isCurrent()) return undefined;
       if (metadata.isSymbolicLink() || description.isSymbolicLink()) return null;
       if (!metadata.isFile() || !description.isFile()) return undefined;
       const identity = JSON.stringify([directory, ...[stat, metadata, description]
@@ -711,8 +672,10 @@ export class PackageInventory {
     }
   }
 
-  private async readPackage(library: string, name: string, previous?: PackageInstallation): Promise<PackageInstallation | null | undefined> {
-    const current = await this.inspectPackage(library, name);
+  private async readPackage(library: string, name: string, previous: PackageInstallation | undefined,
+    isCurrent: () => boolean): Promise<PackageInstallation | null | undefined> {
+    const current = await this.inspectPackage(library, name, isCurrent);
+    if (!isCurrent()) return undefined;
     if (!current) return current;
     const { directory, identity } = current;
     if (previous?.identity === identity) return previous;
@@ -728,7 +691,7 @@ export class PackageInventory {
       const file = await fs.promises.open(descriptionPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
       let description: string;
       try {
-        if (!(await file.stat()).isFile()) return undefined;
+        if (!isCurrent() || !(await file.stat()).isFile() || !isCurrent()) return undefined;
         description = await file.readFile("utf8");
       } finally { await file.close(); }
       const packageName = /^Package:\s*(\S+)/m.exec(description)?.[1];
@@ -824,7 +787,7 @@ class PackageDirectoryWatcher extends EventEmitter {
         });
         this.directories.set(directory, { watcher, identity });
       }
-      if (!library) return;
+      if (!library || !this.rootIsValid()) return;
       let entries: fs.Dirent[];
       try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
       catch (error) {
@@ -832,6 +795,7 @@ class PackageDirectoryWatcher extends EventEmitter {
         if (code === "ENOENT" || code === "ENOTDIR") return;
         throw error;
       }
+      if (!this.rootIsValid()) return;
       if (entries.length > MAX_LIBRARY_ENTRIES) {
         limited = `library entry budget (${MAX_LIBRARY_ENTRIES}) exceeded`;
         return;

@@ -1255,43 +1255,54 @@ inventories have no periodic filesystem poller. Delivery of changes on a network
 filesystem depends on its support for filesystem notifications.
 
 Configured paths define the monitoring roots, including network paths and explicitly
-configured directory aliases. Each path is resolved once when it enters the effective
-library list. Watches, scans and published installation locations use that pinned
-root. Retargeting the configured alias leaves the pinned location unchanged. Removing
-and readding the configured path selects its current destination. A pinned root or
-ancestor subsequently replaced by a link suspends that library's monitoring; the
-new destination receives no automatic subscription or scan. Shared non-recursive
-parent-entry watchers monitor canonical ancestors of the pinned library and
-ordinary ancestors of its configured alias. They detect directory replacement and
-alias retargeting through filesystem notifications without following the new target.
-Console lifecycle output reports a physical library once as
-`[Libraries] Pinned library: <physical-root>`. An actual symlink or junction
-in the configured library path is reported as
-`[Libraries] Library alias: <configured-path> -> <pinned-root>`. Merely different
-canonical spellings are not classified as links. Root/ancestor replacement by a
-symlink logs a monitoring-suspended outcome; a replacement with an ordinary
-directory logs `[Libraries] Pinned library replaced: <pinned-root> - monitoring restored`
-only after the new watcher is successfully registered. No intermediate
-"verifying" entries or per-package symlink locations are logged. R's original
-`.libPaths()` search order remains authoritative and unchanged by pinning.
-Ordinary package-directory events do not rebuild the package watcher set.
-Healthy monitoring uses filesystem notifications only. If an ancestor-entry
-watcher fails, package-directory and other healthy watchers remain active.
-The console checks the pinned physical root and its ancestors with `lstat`
-on initial registration, on relevant watcher events, when a watcher fails,
-before each recovery attempt, and before and after asynchronous inventory scans.
-A linked pinned root or ancestor suspends monitoring without following the link.
+configured directory aliases. When a path enters the effective library list,
+the console resolves it and pins the physical directory and every ordinary
+ancestor using stable filesystem identities. Configured alias entries are
+also recorded without following changes to their targets. Reordering the list
+preserves these pins. Removing a path releases its pin; readding the path
+establishes a new pin. Package installation and directory timestamp changes
+do not change the pin. R's original `.libPaths()` search order remains authoritative
+and is not changed by monitoring.
+
+A different physical identity at the same pathname, a symlink or junction
+replacement, a non-directory replacement, or a missing/renamed pinned library
+or ancestor suspends monitoring. A changed configured alias likewise suspends
+monitoring. An initially missing path has no physical identity to authorise
+and is not watched. Suspension closes the affected subscriptions, invalidates
+in-flight inventory work, and retains the last verified package information
+without automatically reconciling the suspended location. Normal R package
+loading and the interactive R session are unaffected.
+
+A lifecycle log and VS Code warning identify the specific affected component
+and reason. Shared ancestor changes group their warnings. "Stop Monitoring"
+or dismissal leaves monitoring suspended without resolving the replacement.
+"Review New Location" resolves a candidate for review, without registering
+watchers or scanning packages. A compact confirmation displays the previous
+pin, proposed physical location and reason. Only "Trust and Resume" authorises
+a new pin, after revalidating the candidate identities and current library
+configuration. A changed candidate requires another review and confirmation;
+a missing candidate can be checked again only on request. Rejection or
+dismissal leaves monitoring suspended. Removing and readding a library
+through the effective search order also establishes a fresh pin. The
+console does not search for moved directories or modify `.libPaths()`.
+
+Shared non-recursive parent-entry watchers cover the authorised physical
+ancestry and ordinary configured alias ancestors. Before registering or
+recovering a watcher, the console verifies the original pin; recovery never
+adopts a replacement directory. Initial pinning, relevant watcher events,
+watcher errors, scheduled retries and inventory scans validate identities.
+Temporary permission and I/O errors retain the original pin for recovery.
+An unavailable watcher does not authorise resolving the path again.
+
 A failed parent watcher has five automatic registration attempts at 1, 2, 4,
-8 and 16 seconds; one shared timer schedules only pending failures. Each
-successful recovery compares directory-entry identities to detect changes
-missed during the outage. After five failures, the timer stops. Subsequent
-relevant library or ancestor events can retry registration no more often than
-once every 10 seconds. Unrelated notifications do not retry, and no periodic
-package scanning or idle polling is introduced. A missing library's recovery
-relies only on a watcher covering the first missing path entry or an active
-recovery attempt for that watcher, not an unrelated ancestor subscription.
-Failures and restorations are logged once per transition, not per attempt.
-R's search order and legitimate configured library symlinks remain unchanged.
+8 and 16 seconds; one shared timer schedules pending failures. Each recovery
+revalidates the original pin. After five failures the timer stops, and
+subsequent relevant library or ancestor events can retry registration no
+more often than once every 10 seconds. Unrelated notifications do not retry.
+Healthy monitoring is event-driven; no periodic filesystem polling is
+introduced. Shared watcher errors validate all currently associated libraries,
+including those added after registration. Failures and restorations are logged
+once per transition.
 
 Scans inspect ordinary package directories directly inside each library. They read
 package names, versions, canonical library locations and package-directory timestamps,

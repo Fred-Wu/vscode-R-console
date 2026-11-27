@@ -35,6 +35,7 @@ import { createCompletionParams } from "./completion/protocol";
 import { backtickRName } from "./completion/rText";
 import { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
+import { LibraryMonitoringNotices } from "./libraryMonitoringNotice";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
@@ -155,9 +156,14 @@ export class ConsoleLspClient implements CompletionProvider {
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
     // Restrict the isolated workspace to this user.
     if (process.platform !== "win32") fs.chmodSync(this.workingDirectory, 0o700);
+    const libraryNotices = new LibraryMonitoringNotices((message, detail, actions) =>
+      detail === undefined
+        ? vscode.window.showWarningMessage(message, ...actions)
+        : vscode.window.showWarningMessage(message, { modal: true, detail }, ...actions));
     this.packageInventory = new PackageInventory(
       change => this.refreshPackages(change),
       message => lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] ${message}`),
+      review => libraryNotices.enqueue(review),
     );
   }
 
