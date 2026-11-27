@@ -8,6 +8,24 @@ const loadSource = require("../helpers/load-source.cjs");
 const { LibraryMonitoringNotices } = loadSource("src/Language/libraryMonitoringNotice.ts");
 const linkKind = process.platform === "win32" ? "junction" : "dir";
 
+// Compare the observed installation with the fixture's physical metadata.
+// A matching pathname alone would also accept a stale, replaced installation.
+function matchesInstallation(item, directory) {
+  if (!item || item.linked || item.target !== directory) return false;
+  const fingerprint = file => {
+    const stat = fs.lstatSync(file);
+    return [stat.dev, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.size];
+  };
+  try {
+    return item.identity === JSON.stringify([directory, ...[
+      directory, path.join(directory, "Meta", "package.rds"), path.join(directory, "DESCRIPTION"),
+    ].map(fingerprint)]);
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
 function fixture(t, overrides = {}) {
   const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-pin-")));
   const watches = [], resolutions = [], scans = [], changes = [], reviews = [], logs = [];
@@ -30,10 +48,11 @@ function fixture(t, overrides = {}) {
   } });
   const inventory = new PackageInventory(async change => changes.push(change), line => logs.push(line), review => reviews.push(review));
   const mkdir = name => { const dir = path.join(base, name); fs.mkdirSync(dir, { recursive: true }); return dir; };
-  const install = (library, version = "1.0", name = "example") => {
+  const install = (library, revision = 1, name = "example") => {
     const pkg = path.join(library, name); fs.mkdirSync(path.join(pkg, "Meta"), { recursive: true });
-    fs.writeFileSync(path.join(pkg, "DESCRIPTION"), `Package: ${name}\nVersion: ${version}\n`);
-    fs.writeFileSync(path.join(pkg, "Meta", "package.rds"), version);
+    // Vary the metadata size, even on filesystems with coarse timestamps.
+    fs.writeFileSync(path.join(pkg, "DESCRIPTION"), "opaque metadata ".repeat(revision));
+    fs.writeFileSync(path.join(pkg, "Meta", "package.rds"), Buffer.alloc(revision));
   };
   const notify = (parent, name, entry = true) => {
     const record = watches.findLast(w => !w.closed && w.file === parent && (w.options.encoding === "utf8") === entry);
@@ -105,7 +124,9 @@ test("an ordinary replacement suspends before warning and resumes only after a r
   const f = fixture(t), library = f.mkdir("library"); f.install(library);
   f.inventory.setLibraryPaths([library]); await f.settle();
   const old = f.inventory.pins.get(library), previous = f.changes.at(-1);
-  fs.renameSync(library, library + "-old"); f.install(library, "2.0");
+  const oldInstallation = previous.packages.get("example");
+  assert.ok(matchesInstallation(oldInstallation, path.join(library, "example")));
+  fs.renameSync(library, library + "-old"); f.install(library, 2);
   const oldScans = f.scans.length, oldWatches = f.watches.length;
   f.notify(f.base, "library");
   assert.equal(f.inventory.watchers.has(library), false);
@@ -117,7 +138,7 @@ test("an ordinary replacement suspends before warning and resumes only after a r
   await f.settle(() => f.changes.at(-1).libraries[0].suspended);
   assert.deepEqual(f.resolutions, [library]);
   assert.equal(f.scans.length, oldScans); assert.equal(f.watches.length, oldWatches);
-  assert.equal(f.changes.at(-1).packages.get("example").version, "1.0");
+  assert.deepEqual(f.changes.at(-1).packages.get("example"), oldInstallation);
   assert.deepEqual(f.changes.at(-1).unmonitored, ["example"]);
   assert.ok(f.changes.at(-1).unmonitoredRoots.includes(library));
   const proposal = f.reviews[0].review();
@@ -126,7 +147,9 @@ test("an ordinary replacement suspends before warning and resumes only after a r
   assert.equal(f.watches.length, oldWatches, "review alone opens no watches");
   assert.equal(f.scans.length, oldScans, "review alone reads no package inventory");
   assert.equal(f.reviews[0].approve(proposal), true);
-  await f.settle(() => f.changes.at(-1).packages.get("example").version === "2.0");
+  await f.settle(() => matchesInstallation(f.changes.at(-1).packages.get("example"), path.join(library, "example")));
+  assert.notEqual(f.changes.at(-1).packages.get("example").identity, oldInstallation.identity);
+  assert.deepEqual(f.changes.at(-1).changedInstallations, ["example"]);
   assert.equal(f.reviews[0].isCurrent(), false);
   assert.deepEqual(f.changes.at(-1).unmonitored, []);
   assert.equal(f.inventory.watchers.has(library), true);
@@ -134,7 +157,7 @@ test("an ordinary replacement suspends before warning and resumes only after a r
 
 test("a symlink replacement reports the exact path, and an outdated review cannot approve another destination", async t => {
   const f = fixture(t), library = f.mkdir("library"), first = f.mkdir("first"), second = f.mkdir("second");
-  f.install(library); f.install(first, "2.0"); f.install(second, "3.0");
+  f.install(library); f.install(first, 2); f.install(second, 3);
   f.inventory.setLibraryPaths([library]); await f.settle();
   fs.renameSync(library, library + "-old"); fs.symlinkSync(first, library, linkKind);
   f.notify(f.base, "library");
@@ -149,7 +172,8 @@ test("a symlink replacement reports the exact path, and an outdated review canno
   assert.ok(!f.watches.some(w => w.file === first || w.file === second));
   assert.ok(!f.scans.includes(first) && !f.scans.includes(second));
   assert.equal(review.approve(review.review()), true);
-  await f.settle(() => f.changes.at(-1).packages.get("example").version === "3.0");
+  await f.settle(() => matchesInstallation(f.changes.at(-1).packages.get("example"), path.join(second, "example")));
+  assert.equal(f.changes.at(-1).packages.get("example").path, path.join(library, "example"));
   assert.equal(f.inventory.pins.get(library).root, second);
   assert.ok(!f.scans.includes(first));
 });
@@ -157,18 +181,23 @@ test("a symlink replacement reports the exact path, and an outdated review canno
 test("missing or renamed libraries are not accepted on recreation or on search-order changes", async t => {
   const f = fixture(t), library = f.mkdir("library"), healthy = f.mkdir("healthy"); f.install(library);
   f.inventory.setLibraryPaths([library, healthy]); await f.settle();
+  const oldInstallation = f.changes.at(-1).packages.get("example");
+  assert.ok(matchesInstallation(oldInstallation, path.join(library, "example")));
   fs.renameSync(library, library + "-old"); f.notify(f.base, "library");
   const review = f.reviews[0]; assert.equal(review.reason, "Pinned library missing or renamed");
   assert.throws(() => review.review());
   review.reject();
-  f.install(library, "2.0"); f.notify(f.base, "library");
+  f.install(library, 2); f.notify(f.base, "library");
   f.inventory.setLibraryPaths([healthy, library]); await f.settle();
   assert.equal(f.inventory.watchers.has(library), false);
   assert.equal(review.isCurrent(), false);
   assert.deepEqual(f.resolutions, [library, healthy]);
   assert.equal(f.reviews.length, 1);
+  assert.deepEqual(f.changes.at(-1).packages.get("example"), oldInstallation);
+  assert.deepEqual(f.changes.at(-1).unmonitored, ["example"]);
   f.inventory.setLibraryPaths([healthy]); f.inventory.setLibraryPaths([healthy, library]);
-  await f.settle(() => f.changes.at(-1).packages.get("example").version === "2.0");
+  await f.settle(() => matchesInstallation(f.changes.at(-1).packages.get("example"), path.join(library, "example")));
+  assert.notEqual(f.changes.at(-1).packages.get("example").identity, oldInstallation.identity);
   assert.equal(f.inventory.watchers.has(library), true);
   assert.deepEqual(f.resolutions, [library, healthy, library]);
 });
@@ -187,17 +216,22 @@ test("a missing initial path has no authorised identity until a user reviews it"
 
 test("an approved shared ancestor replacement grants no trust to another suspended library", async t => {
   const f = fixture(t), first = f.mkdir("parent/first"), second = f.mkdir("parent/second");
-  f.install(first, "1.0", "one"); f.install(second, "1.0", "two");
+  f.install(first, 1, "one"); f.install(second, 1, "two");
   f.inventory.setLibraryPaths([first, second]); await f.settle();
+  const previousOne = f.changes.at(-1).packages.get("one");
+  const previousTwo = f.changes.at(-1).packages.get("two");
+  assert.ok(matchesInstallation(previousOne, path.join(first, "one")));
+  assert.ok(matchesInstallation(previousTwo, path.join(second, "two")));
   const parent = path.dirname(first);
-  fs.renameSync(parent, parent + "-old"); f.install(first, "2.0", "one"); f.install(second, "2.0", "two");
+  fs.renameSync(parent, parent + "-old"); f.install(first, 2, "one"); f.install(second, 2, "two");
   f.notify(f.base, "parent");
   assert.equal(f.reviews.length, 2); assert.ok(f.reviews.every(r => r.reason === "Pinned library ancestor replaced" && r.entry === parent));
   const review = f.reviews.find(r => r.library === first);
   assert.equal(review.approve(review.review()), true);
-  await f.settle(() => f.changes.at(-1).packages.get("one").version === "2.0");
+  await f.settle(() => matchesInstallation(f.changes.at(-1).packages.get("one"), path.join(first, "one")));
   assert.equal(f.inventory.watchers.has(second), false);
-  assert.equal(f.changes.at(-1).packages.get("two").version, "1.0");
+  assert.notEqual(f.changes.at(-1).packages.get("one").identity, previousOne.identity);
+  assert.deepEqual(f.changes.at(-1).packages.get("two"), previousTwo);
   assert.deepEqual(f.changes.at(-1).unmonitored, ["two"]);
 });
 
@@ -209,11 +243,15 @@ test("a temporary lstat failure preserves the original pin and does not show a s
   } });
   library = f.mkdir("library"); f.install(library); f.inventory.setLibraryPaths([library]); await f.settle();
   const pin = f.inventory.pins.get(library);
+  const oldInstallation = f.changes.at(-1).packages.get("example");
+  assert.ok(matchesInstallation(oldInstallation, path.join(library, "example")));
   unavailable = true; f.notify(f.base, "library");
   const deadline = Date.now() + 5000;
   while (!f.changes.at(-1).libraries[0].unavailable) { assert.ok(Date.now() < deadline); await new Promise(r => setTimeout(r, 10)); }
-  unavailable = false; f.install(library, "2.0");
-  f.notify(library, "example", false); await f.settle(() => f.changes.at(-1).packages.get("example").version === "2.0");
+  assert.deepEqual(f.changes.at(-1).packages.get("example"), oldInstallation);
+  unavailable = false; f.install(library, 2);
+  f.notify(library, "example", false); await f.settle(() => matchesInstallation(f.changes.at(-1).packages.get("example"), path.join(library, "example")));
+  assert.notEqual(f.changes.at(-1).packages.get("example").identity, oldInstallation.identity);
   assert.equal(f.inventory.pins.get(library), pin);
   assert.equal(f.reviews.length, 0);
   assert.deepEqual(f.resolutions, [library]);
@@ -223,9 +261,14 @@ test("a pending inventory scan cannot publish or continue metadata access after 
   let library, block = false, entered, release;
   const begun = new Promise(resolve => { entered = resolve; });
   const blocked = new Promise(resolve => { release = resolve; });
-  const opened = [];
-  const f = fixture(t, { promises: {
+  const opened = [], inspected = [];
+  const observe = file => { if (library && String(file).startsWith(library + path.sep)) inspected.push(file); };
+  const f = fixture(t, { lstatSync: (file, ...args) => {
+    observe(file); return fs.lstatSync(file, ...args);
+  }, promises: {
+    lstat: async (file, ...args) => { observe(file); return fs.promises.lstat(file, ...args); },
     readdir: async (file, ...args) => {
+      observe(file);
       const entries = await fs.promises.readdir(file, ...args);
       if (block && file === library) { entered(); await blocked; }
       return entries;
@@ -234,12 +277,16 @@ test("a pending inventory scan cannot publish or continue metadata access after 
   } });
   t.after(() => release());
   library = f.mkdir("library"); f.install(library); f.inventory.setLibraryPaths([library]); await f.settle();
-  opened.length = 0; block = true; f.inventory.dirtyLibraries.add(library);
+  const oldInstallation = f.changes.at(-1).packages.get("example");
+  assert.ok(matchesInstallation(oldInstallation, path.join(library, "example")));
+  assert.equal(opened.length, 0, "even the initial scan must not open package files");
+  inspected.length = 0; block = true; f.inventory.dirtyLibraries.add(library);
   const pending = f.inventory.refresh(); await begun;
-  fs.renameSync(library, library + "-old"); f.install(library, "2.0"); f.notify(f.base, "library");
+  fs.renameSync(library, library + "-old"); f.install(library, 2); f.notify(f.base, "library");
   block = false; release(); await pending; await f.settle(() => f.changes.at(-1).libraries[0].suspended);
   assert.deepEqual(opened, []);
-  assert.equal(f.changes.at(-1).packages.get("example").version, "1.0");
+  assert.deepEqual(inspected, [], "suspended scans must not even stat replacement package entries");
+  assert.deepEqual(f.changes.at(-1).packages.get("example"), oldInstallation);
 });
 
 test("removal and disposal invalidate pending review decisions", async t => {
@@ -312,14 +359,19 @@ test("simultaneous shared ancestor changes produce one warning with independent 
 
 test("unrelated inventory changes revalidate cached pins before publication", async t => {
   const f = fixture(t), library = f.mkdir("library"), healthy = f.mkdir("healthy");
-  f.install(library); f.install(healthy, "1.0", "other");
+  f.install(library); f.install(healthy, 1, "other");
   f.inventory.setLibraryPaths([library, healthy]); await f.settle();
-  fs.renameSync(library, library + "-old"); f.install(library, "2.0");
+  const oldInstallation = f.changes.at(-1).packages.get("example");
+  const oldHealthy = f.changes.at(-1).packages.get("other");
+  assert.ok(matchesInstallation(oldInstallation, path.join(library, "example")));
+  assert.ok(matchesInstallation(oldHealthy, path.join(healthy, "other")));
+  fs.renameSync(library, library + "-old"); f.install(library, 2);
   // Model a lost/delayed ancestor notification, then a healthy package event.
-  f.install(healthy, "2.0", "other"); f.notify(healthy, "other", false);
+  f.install(healthy, 2, "other"); f.notify(healthy, "other", false);
   await f.settle(() => f.changes.at(-1).libraries[0].suspended &&
-    f.changes.at(-1).packages.get("other").version === "2.0");
+    matchesInstallation(f.changes.at(-1).packages.get("other"), path.join(healthy, "other")));
   assert.equal(f.reviews.length, 1);
-  assert.equal(f.changes.at(-1).packages.get("example").version, "1.0");
+  assert.deepEqual(f.changes.at(-1).packages.get("example"), oldInstallation);
+  assert.notEqual(f.changes.at(-1).packages.get("other").identity, oldHealthy.identity);
   assert.ok(f.changes.at(-1).unmonitored.includes("example"));
 });
