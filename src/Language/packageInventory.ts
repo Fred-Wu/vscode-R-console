@@ -712,7 +712,10 @@ export class PackageInventory {
  * Each OS watch is non-recursive; package contents and links are not traversed. */
 class PackageDirectoryWatcher extends EventEmitter {
   private readonly directories = new Map<string, { watcher: fs.FSWatcher; identity: string }>();
+  private readonly failedPackages = new Map<string, { attempts: number; nextAttemptAt?: number }>();
+  private static readonly retryDelays = [1000, 2000, 4000, 8000, 16000] as const;
   private timer: NodeJS.Timeout | undefined;
+  private packageRetryTimer: NodeJS.Timeout | undefined;
   private closed = false;
   private limitation: string | undefined;
 
@@ -729,97 +732,165 @@ class PackageDirectoryWatcher extends EventEmitter {
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    for (const { watcher } of this.directories.values()) watcher.close();
-    this.directories.clear();
+    if (this.packageRetryTimer) clearTimeout(this.packageRetryTimer);
+    this.packageRetryTimer = undefined;
+    this.failedPackages.clear();
+    for (const directory of this.directories.keys()) this.closeDirectory(directory);
+  }
+
+  private closeDirectory(directory: string): void {
+    const current = this.directories.get(directory);
+    this.directories.delete(directory);
+    current?.watcher.close();
+  }
+
+  private failPackage(directory: string, error: unknown): void {
+    this.closeDirectory(directory);
+    if (this.closed || this.failedPackages.has(directory)) return;
+    this.failedPackages.set(directory, { attempts: 0,
+      nextAttemptAt: Date.now() + PackageDirectoryWatcher.retryDelays[0] });
+    this.onLimited?.(`package watcher unavailable: ${directory} (${String(error)})`);
+  }
+
+  private watchDirectory(directory: string): boolean {
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(directory); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      this.closeDirectory(directory);
+      return false;
+    }
+    if (!stat.isDirectory()) {
+      this.closeDirectory(directory);
+      return false;
+    }
+    const identity = JSON.stringify([stat.dev, stat.ino || stat.birthtimeMs]);
+    if (this.directories.get(directory)?.identity === identity) return true;
+    this.closeDirectory(directory);
+    const watcher = fs.watch(directory, { persistent: false, recursive: false }, (event, filename) => {
+      if (this.closed || this.directories.get(directory)?.watcher !== watcher) return;
+      const file = filename ? path.join(directory, String(filename)) : directory;
+      const relative = path.relative(this.root, file);
+      if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) return;
+      if (relative.split(path.sep).length > 2) return;
+      this.emit("change", event, relative);
+      // Only root notifications can change the set of immediate package
+      // directories. Coalesce bursts before reconciling that set.
+      if (directory !== this.root || this.closed || this.timer) return;
+      this.timer = setTimeout(() => {
+        this.timer = undefined;
+        try { this.refresh(); } catch (error) { if (!this.closed) this.emit("error", error); }
+      }, 50);
+      this.timer.unref();
+    });
+    watcher.on("error", error => {
+      if (this.closed || this.directories.get(directory)?.watcher !== watcher) return;
+      if (directory === this.root) {
+        this.emit("error", error);
+      } else {
+        this.failPackage(directory, error);
+        this.emit("change", "change", path.relative(this.root, directory));
+        this.schedulePackageRetry();
+      }
+    });
+    // Reject a replacement between lstat and fs.watch. Node's path-based
+    // API cannot remove the race entirely, but must not retain a watch on
+    // a new link or directory identity.
+    try {
+      const confirmed = fs.lstatSync(directory);
+      if (!confirmed.isDirectory() ||
+          JSON.stringify([confirmed.dev, confirmed.ino || confirmed.birthtimeMs]) !== identity) {
+        throw new Error("Watched directory identity changed during setup");
+      }
+    } catch (error) { watcher.close(); throw error; }
+    this.directories.set(directory, { watcher, identity });
+    return true;
+  }
+
+  private watchPackage(directory: string): void {
+    try {
+      this.watchDirectory(directory);
+    } catch (error) {
+      this.failPackage(directory, error);
+      return;
+    }
+    // Either the ordinary watch has been restored, or this entry no longer
+    // needs one. Check for changes that may have occurred during the gap.
+    if (this.failedPackages.delete(directory)) {
+      this.emit("change", "rename", path.relative(this.root, directory));
+    }
+  }
+
+  private schedulePackageRetry(): void {
+    if (this.packageRetryTimer) clearTimeout(this.packageRetryTimer);
+    this.packageRetryTimer = undefined;
+    if (this.closed) return;
+    const due = [...this.failedPackages.values()].map(failure => failure.nextAttemptAt)
+      .filter((value): value is number => value !== undefined);
+    if (!due.length) return;
+    this.packageRetryTimer = setTimeout(() => this.retryPackages(), Math.max(0, Math.min(...due) - Date.now()));
+    this.packageRetryTimer.unref();
+  }
+
+  private retryPackages(): void {
+    this.packageRetryTimer = undefined;
+    if (this.closed) return;
+    try {
+      const now = Date.now();
+      for (const [directory, failure] of this.failedPackages) {
+        if (failure.nextAttemptAt === undefined || failure.nextAttemptAt > now) continue;
+        // A retry must not traverse a changed or unverified library root.
+        if (!this.rootIsValid() || this.closed) return;
+        failure.attempts++;
+        failure.nextAttemptAt = failure.attempts < PackageDirectoryWatcher.retryDelays.length
+          ? now + PackageDirectoryWatcher.retryDelays[failure.attempts] : undefined;
+        this.watchPackage(directory);
+      }
+      if (this.rootIsValid() && !this.closed) this.schedulePackageRetry();
+    } catch (error) { if (!this.closed) this.emit("error", error); }
   }
 
   private refresh(): void {
     if (this.closed || !this.rootIsValid()) return;
-    const present = new Set<string>();
-    let packageWatchCount = 0;
+    if (!this.watchDirectory(this.root)) throw new Error("Library directory disappeared during watch setup");
+    if (!this.rootIsValid() || this.closed) return;
+    // Root enumeration errors still use the library-level recovery path.
+    const entries = fs.readdirSync(this.root, { withFileTypes: true });
+    if (!this.rootIsValid() || this.closed) return;
+    const present = new Set<string>([this.root]);
     let limited: string | undefined;
-    const visit = (directory: string, library = false) => {
-      if (this.closed) return;
-      let stat: fs.Stats;
-      try { stat = fs.lstatSync(directory); }
-      catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR") return;
-        throw error;
-      }
-      if (!stat.isDirectory()) return;
-      present.add(directory);
-      const identity = JSON.stringify([stat.dev, stat.ino || stat.birthtimeMs]);
-      const previous = this.directories.get(directory);
-      if (previous?.identity !== identity) {
-        previous?.watcher.close();
-        const watcher = fs.watch(directory, { persistent: false, recursive: false }, (event, filename) => {
-          if (this.closed || this.directories.get(directory)?.watcher !== watcher) return;
-          const file = filename ? path.join(directory, String(filename)) : directory;
-          const relative = path.relative(this.root, file);
-          if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) return;
-          if (relative.split(path.sep).length > 2) return;
-          this.emit("change", event, relative);
-          // Package-directory events cannot change the set of immediate
-          // package watches. Only root directory events re-enumerate entries.
-          if (directory !== this.root || this.closed || this.timer) return;
-          // Reconcile package directory watches after bursts of install events.
-          // This timer is scheduled only by a filesystem notification.
-          this.timer = setTimeout(() => {
-            this.timer = undefined;
-            try { this.refresh(); } catch (error) { this.emit("error", error); }
-          }, 50);
-          this.timer.unref();
-        });
-        // Reject a replacement between lstat and fs.watch. Node's path-based
-        // API cannot remove the race entirely, but must not retain a watch on
-        // a new link or directory identity.
-        let confirmed: fs.Stats;
-        try { confirmed = fs.lstatSync(directory); }
-        catch (error) { watcher.close(); throw error; }
-        if (!confirmed.isDirectory() ||
-            JSON.stringify([confirmed.dev, confirmed.ino || confirmed.birthtimeMs]) !== identity) {
-          watcher.close();
-          throw new Error("Watched directory identity changed during setup");
-        }
-        watcher.on("error", error => {
-          if (!this.closed && this.directories.get(directory)?.watcher === watcher) this.emit("error", error);
-        });
-        this.directories.set(directory, { watcher, identity });
-      }
-      if (!library || !this.rootIsValid()) return;
-      let entries: fs.Dirent[];
-      try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
-      catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR") return;
-        throw error;
-      }
-      if (!this.rootIsValid()) return;
-      if (entries.length > MAX_LIBRARY_ENTRIES) {
-        limited = `library entry budget (${MAX_LIBRARY_ENTRIES}) exceeded`;
-        return;
-      }
-      // Select a stable, bounded subset of ordinary directories. Sorting
-      // prevents watcher churn when directory enumeration order varies.
+    if (entries.length > MAX_LIBRARY_ENTRIES) {
+      limited = `library entry budget (${MAX_LIBRARY_ENTRIES}) exceeded`;
+    } else {
+      // Select a stable, bounded subset of ordinary directories. Failed
+      // candidates still count toward the budget; do not expand the set.
       for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
         if (!entry.isDirectory() || entry.isSymbolicLink() ||
             !/^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)) continue;
-        if (packageWatchCount >= MAX_PACKAGE_WATCHES_PER_LIBRARY) {
+        if (present.size > MAX_PACKAGE_WATCHES_PER_LIBRARY) {
           limited = `package watcher budget (${MAX_PACKAGE_WATCHES_PER_LIBRARY}) reached`;
           break;
         }
-        packageWatchCount++;
-        visit(path.join(directory, entry.name));
+        const directory = path.join(this.root, entry.name);
+        present.add(directory);
+        if (this.closed) return;
+        this.watchPackage(directory);
       }
-    };
-    visit(this.root, true);
+    }
+    if (this.closed || !this.rootIsValid()) return;
     if (limited !== this.limitation) {
       this.limitation = limited;
       if (limited) this.onLimited?.(limited);
     }
-    for (const [directory, { watcher }] of this.directories) {
-      if (!present.has(directory)) { watcher.close(); this.directories.delete(directory); }
+    for (const directory of this.directories.keys()) {
+      if (!present.has(directory)) this.closeDirectory(directory);
     }
+    for (const directory of this.failedPackages.keys()) {
+      if (!present.has(directory)) this.failedPackages.delete(directory);
+    }
+    // Five timed attempts per failed package, then only root notifications
+    // can retry it. No periodic polling when healthy or after exhaustion.
+    this.schedulePackageRetry();
   }
 }

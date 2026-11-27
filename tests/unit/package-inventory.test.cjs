@@ -24,7 +24,7 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
       } else {
         watches.push({ file, options });
       }
-      return fs.watch(file, options, (...args) => {
+      return (overrides.watch ?? fs.watch)(file, options, (...args) => {
         const timer = setTimeout(() => { notifications.delete(timer); callback(...args); }, notificationDelay);
         notifications.add(timer);
       });
@@ -1218,3 +1218,217 @@ test("oversized configured libraries are suspended without recurrent network sca
   await inventory.refresh();
   assert.equal(listings, 1, "suspended roots are not rescanned before reconfiguration");
 });
+
+// Inject deterministic watcher failures without relying on OS limits,
+// permissions, notification ordering or Windows directory handle behaviour.
+function controlledWatches(beforeWatch = () => {}, afterWatch = () => {}) {
+  const { EventEmitter } = require("node:events");
+  const attempts = [], handles = new Map();
+  const watch = (file, options, callback) => {
+    const packageWatch = options.encoding !== "utf8";
+    if (packageWatch) {
+      attempts.push(file);
+      beforeWatch(file);
+    }
+    const handle = new EventEmitter();
+    handle.closed = false;
+    handle.close = () => { handle.closed = true; };
+    handle.trigger = callback;
+    if (packageWatch) {
+      handles.set(file, handle);
+      afterWatch(file, handle);
+    }
+    return handle;
+  };
+  return { watch, attempts, handles };
+}
+
+function forcePackageRetry(group, directory) {
+  // Advance the due time of the real scheduled retry without waiting for
+  // the full 31-second backoff during a unit test.
+  assert.ok(group.packageRetryTimer);
+  clearTimeout(group.packageRetryTimer);
+  group.failedPackages.get(directory).nextAttemptAt = Date.now() - 1;
+  group.retryPackages();
+}
+
+test("a persistent package registration failure leaves the library and sibling watches active", async t => {
+  let broken, fail = true;
+  const control = controlledWatches(file => {
+    if (file === broken && fail) throw Object.assign(new Error("watch limit"), { code: "ENOSPC" });
+  });
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t, 0, { watch: control.watch });
+  broken = install(library, "1.0", "broken");
+  const healthy = install(library, "1.0", "healthy");
+  inventory.setLibraryPaths([library]);
+  const group = inventory.watchers.get(library);
+  assert.ok(group, "a failed package must not prevent library watch registration");
+  const rootWatch = group.directories.get(library).watcher;
+  const healthyWatch = group.directories.get(healthy).watcher;
+  assert.equal(group.directories.has(broken), false);
+  assert.equal(inventory.retryTimer, undefined, "no whole-library recovery for a package failure");
+  for (let i = 1; i <= 5; i++) {
+    forcePackageRetry(group, broken);
+    assert.equal(group.failedPackages.get(broken).attempts, i);
+  }
+  assert.equal(group.packageRetryTimer, undefined, "stop idle retries after five attempts");
+  assert.equal(control.attempts.filter(file => file === broken).length, 6);
+  await settle();
+  assert.deepEqual([...changes.at(-1).packages.keys()], ["broken", "healthy"],
+    "watch failures must not remove readable installations from inventory");
+  assert.equal(logs.filter(line => line.includes("package watcher unavailable:")).length, 1);
+
+  fs.writeFileSync(path.join(healthy, "DESCRIPTION"), "Package: healthy\nVersion: 2.0\n");
+  healthyWatch.trigger("change", "DESCRIPTION");
+  await settle(() => changes.at(-1)?.packages.get("healthy")?.version === "2.0");
+  const added = install(library, "1.0", "added");
+  rootWatch.trigger("rename", "added");
+  await settle(() => changes.at(-1)?.packages.has("added"));
+  assert.ok(group.directories.has(added));
+  assert.equal(group.packageRetryTimer, undefined, "root events do not restart exhausted idle retries");
+
+  fail = false;
+  rootWatch.trigger("rename", "broken");
+  await settle(() => group.directories.has(broken));
+  assert.equal(group.failedPackages.size, 0);
+  assert.equal(inventory.watchers.get(library), group);
+  assert.equal(group.directories.get(library).watcher, rootWatch);
+  assert.equal(group.directories.get(healthy).watcher, healthyWatch);
+  assert.equal(rootWatch.closed || healthyWatch.closed, false);
+  assert.equal(inventory.retryTimer, undefined);
+});
+
+test("a package lstat failure during refresh closes only that package watch and retries it", async t => {
+  let broken, fail = false;
+  const control = controlledWatches();
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    lstatSync: (file, ...args) => {
+      if (file === broken && fail) throw Object.assign(new Error("package unavailable"), { code: "EACCES" });
+      return fs.lstatSync(file, ...args);
+    },
+  });
+  broken = install(library, "1.0", "broken");
+  const healthy = install(library, "1.0", "healthy");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const group = inventory.watchers.get(library);
+  const rootWatch = group.directories.get(library).watcher;
+  const healthyWatch = group.directories.get(healthy).watcher;
+  const brokenWatch = group.directories.get(broken).watcher;
+  fail = true;
+  rootWatch.trigger("rename", "broken");
+  await settle(() => group.failedPackages.has(broken));
+  assert.ok(brokenWatch.closed);
+  assert.equal(group.directories.has(broken), false);
+  assert.equal(inventory.retryTimer, undefined);
+  fail = false;
+  // Exercise an actual scheduled retry, not just a synthetic root event.
+  await settle(() => group.directories.has(broken));
+  assert.equal(group.failedPackages.size, 0);
+  assert.equal(group.packageRetryTimer, undefined);
+  assert.equal(group.directories.get(library).watcher, rootWatch);
+  assert.equal(group.directories.get(healthy).watcher, healthyWatch);
+  assert.equal(rootWatch.closed || healthyWatch.closed, false);
+  assert.deepEqual(changes.at(-1).changed, []);
+});
+
+test("a native package watcher error recovers missed changes without replacing healthy watches", async t => {
+  let broken, fail = false;
+  const control = controlledWatches(file => {
+    if (file === broken && fail) throw new Error("still unavailable");
+  });
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t, 0, { watch: control.watch });
+  broken = install(library, "1.0", "broken");
+  const healthy = install(library, "1.0", "healthy");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const group = inventory.watchers.get(library);
+  const rootWatch = group.directories.get(library).watcher;
+  const healthyWatch = group.directories.get(healthy).watcher;
+  const old = group.directories.get(broken).watcher;
+  fail = true;
+  old.emit("error", new Error("package watch lost"));
+  assert.ok(old.closed);
+  assert.equal(group.directories.has(broken), false);
+  await settle();
+  fs.writeFileSync(path.join(broken, "DESCRIPTION"), "Package: broken\nVersion: 2.0\n");
+  fail = false;
+  forcePackageRetry(group, broken);
+  await settle(() => changes.at(-1)?.packages.get("broken")?.version === "2.0");
+  const replacement = group.directories.get(broken).watcher;
+  assert.notEqual(replacement, old);
+  assert.deepEqual(changes.at(-1).changed, ["broken"]);
+  assert.equal(group.directories.get(library).watcher, rootWatch);
+  assert.equal(group.directories.get(healthy).watcher, healthyWatch);
+  assert.equal(rootWatch.closed || healthyWatch.closed, false);
+  old.emit("error", new Error("stale error"));
+  assert.equal(group.directories.get(broken).watcher, replacement);
+  assert.equal(group.failedPackages.size, 0);
+  assert.equal(inventory.retryTimer, undefined);
+
+  // Root watcher failure must still use the original library-level recovery.
+  rootWatch.emit("error", new Error("root watch lost"));
+  assert.equal(inventory.watchers.has(library), false);
+  assert.ok(healthyWatch.closed && replacement.closed);
+  assert.ok(inventory.retryTimer);
+});
+
+test("a package changed into a link during watch setup is rejected without losing the root watch", async t => {
+  let broken, target;
+  const control = controlledWatches(undefined, file => {
+    if (file !== broken) return;
+    fs.rmSync(broken, { recursive: true });
+    fs.symlinkSync(target, broken, process.platform === "win32" ? "junction" : "dir");
+  });
+  const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, { watch: control.watch });
+  broken = install(library, "1.0", "broken");
+  const healthy = install(library, "1.0", "healthy");
+  target = install(path.join(root, "cache"), "2.0", "broken");
+  inventory.setLibraryPaths([library]);
+  const group = inventory.watchers.get(library);
+  assert.ok(control.handles.get(broken).closed, "close the watch whose identity check failed");
+  assert.equal(group.directories.has(broken), false);
+  assert.ok(group.directories.has(library) && group.directories.has(healthy));
+  forcePackageRetry(group, broken);
+  await settle();
+  assert.equal(changes.at(-1).packages.get("broken").linked, true);
+  assert.equal(control.attempts.filter(file => file === broken).length, 1);
+  assert.ok(!control.attempts.includes(target), "never register a watch on the external target");
+  assert.equal(group.failedPackages.size, 0);
+  assert.equal(group.packageRetryTimer, undefined);
+  assert.equal(inventory.retryTimer, undefined);
+});
+
+for (const replaceRoot of [false, true]) {
+  test(`package watcher retries stop when the library is ${replaceRoot ? "replaced" : "removed from the search path"}`, async t => {
+    let broken;
+    const control = controlledWatches(file => {
+      if (file === broken) throw new Error("package watch unavailable");
+    });
+    const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, { watch: control.watch });
+    broken = install(library, "1.0", "broken");
+    inventory.setLibraryPaths([library]);
+    const group = inventory.watchers.get(library);
+    assert.ok(group.packageRetryTimer);
+    const attempts = control.attempts.length;
+    if (replaceRoot) {
+      fs.renameSync(library, path.join(root, "old-library"));
+      const external = path.join(root, "external");
+      install(external, "2.0", "broken");
+      fs.symlinkSync(external, library, process.platform === "win32" ? "junction" : "dir");
+      // No parent notification: the retry itself must validate the pin.
+      forcePackageRetry(group, broken);
+      await settle(() => changes.at(-1)?.libraries[0]?.suspended === true);
+    } else {
+      inventory.setLibraryPaths([]);
+      await settle(() => changes.at(-1)?.libraries.length === 0);
+    }
+    assert.equal(inventory.watchers.has(library), false);
+    assert.ok(group.closed);
+    assert.equal(group.packageRetryTimer, undefined);
+    assert.equal(group.failedPackages.size, 0);
+    group.retryPackages();
+    assert.equal(control.attempts.length, attempts, "stale retries cannot register new watches");
+  });
+}
