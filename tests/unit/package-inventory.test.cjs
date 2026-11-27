@@ -394,19 +394,23 @@ test("watcher recovery reconciles additions and removals made while watching was
 });
 
 test("a library scan failure keeps its changes pending for retry", async t => {
-  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);
+  let library, failNext = false, failed = false;
+  const f = fixture(t, 0, {
+    promises: { ...fs.promises, readdir: async (file, ...args) => {
+      if (file === library && failNext) {
+        failNext = false;
+        failed = true;
+        throw Object.assign(new Error("Temporary read failure"), { code: "EIO" });
+      }
+      return fs.promises.readdir(file, ...args);
+    } },
+  });
+  ({ libraries: [library] } = f);
+  const { inventory, changes, logs, install, settle } = f;
   inventory.setLibraryPaths([library]);
   await settle();
-  const readPackage = inventory.readPackage.bind(inventory);
-  let failed = false;
-  inventory.readPackage = (...args) => {
-    if (!failed) {
-      failed = true;
-      return Promise.reject(new Error("Temporary read failure"));
-    }
-    return readPackage(...args);
-  };
   install(library);
+  failNext = true;
   // Idle is not proof that an OS watcher event has arrived. This test is
   // about scan failure and recovery; explicitly queue the changed library
   // instead of relying on macOS/Linux/Windows filesystem event timing.
@@ -1432,3 +1436,219 @@ for (const replaceRoot of [false, true]) {
     assert.equal(control.attempts.length, attempts, "stale retries cannot register new watches");
   });
 }
+
+/** A degraded inventory can publish successfully while its independent
+ * recovery timer is still armed. Wait for publication, not for all retries. */
+async function waitForInventoryPublication(inventory, observed = () => true) {
+  const deadline = Date.now() + 10000;
+  do {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (observed() && inventory.initialized && !inventory.pending && !inventory.timer &&
+        !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size) return;
+    assert.ok(Date.now() < deadline, "inventory must publish independently of read recovery");
+  } while (true);
+}
+
+function forceReadRetry(inventory) {
+  assert.ok(inventory.retryTimer);
+  clearTimeout(inventory.retryTimer);
+  inventory.runRecoveryRetry();
+}
+
+test("an initially unreadable higher-priority package blocks fallback but not sibling updates", async t => {
+  let broken, fail = true;
+  const control = controlledWatches();
+  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    promises: { ...fs.promises, lstat: async (file, ...args) => {
+      if (file === broken && fail) throw Object.assign(new Error("package entry inaccessible"), { code: "EACCES" });
+      return fs.promises.lstat(file, ...args);
+    } },
+  });
+  broken = install(first, "1.0", "broken");
+  const healthy = install(first, "1.0", "healthy");
+  install(second, "9.0", "broken");
+  install(second, "1.0", "other");
+  inventory.retryDelay = 10000;
+  inventory.setLibraryPaths([first, second]);
+  await waitForInventoryPublication(inventory);
+  const initial = changes.at(-1);
+  assert.equal(initial.libraries[0].unavailable, undefined);
+  assert.ok(initial.libraries[0].unavailablePackages.has("broken"));
+  assert.deepEqual([...initial.packages.keys()].sort(), ["healthy", "other"]);
+  assert.deepEqual(initial.unmonitored, ["broken"]);
+  assert.deepEqual(initial.unmonitoredRoots, []);
+  assert.ok(initial.libraries[0].deferred.get("broken").includes(broken));
+  assert.ok(logs.some(line => line.includes("Metadata temporarily unavailable: broken") &&
+    line.includes("package entry inaccessible")));
+  const rootWatch = control.handles.get(first);
+  const siblingWatch = control.handles.get(healthy);
+
+  fs.writeFileSync(path.join(healthy, "DESCRIPTION"), "Package: healthy\nVersion: 2.00\n");
+  siblingWatch.trigger("change", "DESCRIPTION");
+  await waitForInventoryPublication(inventory, () => changes.at(-1)?.packages.get("healthy")?.version === "2.00");
+  assert.deepEqual(changes.at(-1).changed, ["healthy"]);
+  assert.equal(changes.at(-1).packages.has("broken"), false);
+  assert.equal(control.handles.get(first), rootWatch);
+  assert.equal(control.handles.get(healthy), siblingWatch);
+  assert.ok(inventory.retryTimer, "healthy publication does not cancel package read recovery");
+
+  for (let remaining = 4; remaining >= 0; remaining--) {
+    forceReadRetry(inventory);
+    await waitForInventoryPublication(inventory);
+    assert.equal(inventory.packageReadRetries.get(first).get("broken"), remaining);
+  }
+  assert.equal(inventory.retryTimer, undefined, "persistent package read failures do not poll indefinitely");
+  assert.equal(logs.filter(line => line.includes("Metadata temporarily unavailable: broken")).length, 1);
+  assert.ok(!logs.some(line => line.includes("Recovery complete")), "exhaustion is not successful recovery");
+
+  fail = false;
+  rootWatch.trigger("rename", "broken");
+  await settle(() => changes.at(-1)?.packages.get("broken")?.path === broken);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
+  assert.equal(changes.at(-1).libraries[0].unavailablePackages.size, 0);
+  assert.equal(inventory.packageReadRetries.size, 0);
+  assert.ok(logs.some(line => line.includes("Metadata restored: broken")));
+});
+
+test("a previously readable package retains its verified metadata while healthy changes publish", async t => {
+  let description, fail = false;
+  const control = controlledWatches();
+  const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    promises: { ...fs.promises, open: async (file, ...args) => {
+      if (file === description && fail) throw Object.assign(new Error("metadata temporarily unreadable"), { code: "EIO" });
+      return fs.promises.open(file, ...args);
+    } },
+  });
+  const broken = install(library, "1.0", "broken");
+  const healthy = install(library, "1.0", "healthy");
+  description = path.join(broken, "DESCRIPTION");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const previous = changes.at(-1).packages.get("broken");
+  fail = true;
+  fs.writeFileSync(description, "Package: broken\nVersion: 2.00\n");
+  fs.writeFileSync(path.join(healthy, "DESCRIPTION"), "Package: healthy\nVersion: 2.00\n");
+  control.handles.get(broken).trigger("change", "DESCRIPTION");
+  control.handles.get(healthy).trigger("change", "DESCRIPTION");
+  await waitForInventoryPublication(inventory, () => changes.at(-1)?.packages.get("healthy")?.version === "2.00");
+  const degraded = changes.at(-1);
+  assert.equal(degraded.packages.get("broken"), previous);
+  assert.ok(degraded.libraries[0].unavailablePackages.has("broken"));
+  assert.deepEqual(degraded.unmonitored, ["broken"]);
+  assert.deepEqual(degraded.unmonitoredRoots, []);
+  assert.deepEqual(degraded.changed, ["healthy"]);
+  assert.deepEqual(degraded.changedInstallations, ["healthy"]);
+  assert.ok(!logs.some(line => line.includes("Removed: broken")));
+
+  fail = false;
+  // Let the real recovery timer fire without any new filesystem event.
+  await settle(() => changes.at(-1)?.packages.get("broken")?.version === "2.00");
+  assert.deepEqual(changes.at(-1).changed, ["broken"]);
+  assert.deepEqual(changes.at(-1).changedInstallations, ["broken"]);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
+  assert.equal(changes.at(-1).libraries[0].deferred.size, 0);
+  assert.equal(inventory.packageReadRetries.size, 0);
+});
+
+test("an unreadable lower-priority installation does not exclude a healthy selected copy", async t => {
+  let metadata;
+  const control = controlledWatches();
+  const { libraries: [first, second], inventory, changes, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    promises: { ...fs.promises, lstat: async (file, ...args) => {
+      if (file === metadata) throw Object.assign(new Error("metadata inaccessible"), { code: "EACCES" });
+      return fs.promises.lstat(file, ...args);
+    } },
+  });
+  const selected = install(first, "1.0");
+  const lower = install(second, "9.0");
+  metadata = path.join(lower, "Meta", "package.rds");
+  inventory.retryDelay = 10000;
+  inventory.setLibraryPaths([first, second]);
+  await waitForInventoryPublication(inventory);
+  assert.equal(changes.at(-1).packages.get("example").path, selected);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
+  assert.ok(changes.at(-1).libraries[1].unavailablePackages.has("example"));
+  assert.ok(changes.at(-1).libraries[1].deferred.get("example").includes(lower));
+
+  fs.writeFileSync(path.join(selected, "DESCRIPTION"), "Package: example\nVersion: 2.00\n");
+  control.handles.get(selected).trigger("change", "DESCRIPTION");
+  await waitForInventoryPublication(inventory, () => changes.at(-1)?.packages.get("example")?.version === "2.00");
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
+
+  inventory.setLibraryPaths([first]);
+  await settle(() => changes.at(-1)?.libraries.length === 1);
+  assert.equal(inventory.packageReadRetries.size, 0);
+  assert.equal(inventory.retryTimer, undefined, "removed library must not retain metadata retries");
+});
+
+test("an unreadable higher-priority package remains excluded through installation locks until removal is confirmed", async t => {
+  let broken;
+  const control = controlledWatches();
+  const { libraries: [first, second], inventory, changes, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    promises: { ...fs.promises, lstat: async (file, ...args) => {
+      if (file === broken) throw Object.assign(new Error("package inaccessible"), { code: "EACCES" });
+      return fs.promises.lstat(file, ...args);
+    } },
+  });
+  broken = install(first, "1.0");
+  const fallback = install(second, "2.0");
+  inventory.retryDelay = 10000;
+  inventory.setLibraryPaths([first, second]);
+  await waitForInventoryPublication(inventory);
+  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  const lock = path.join(first, "00LOCK-example");
+  fs.mkdirSync(lock);
+  fs.rmSync(broken, { recursive: true });
+  control.handles.get(first).trigger("rename", "00LOCK-example");
+  // Deliver and settle the resulting scan even when its inventory is unchanged.
+  await new Promise(resolve => setTimeout(resolve, 400));
+  await waitForInventoryPublication(inventory);
+  assert.equal(changes.at(-1).packages.has("example"), false);
+  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  assert.ok(changes.at(-1).libraries[0].deferred.has("example"));
+
+  fs.rmdirSync(lock);
+  control.handles.get(first).trigger("rename", "00LOCK-example");
+  await settle(() => changes.at(-1)?.packages.get("example")?.path === fallback);
+  assert.deepEqual(changes.at(-1).unmonitored, []);
+  assert.deepEqual(changes.at(-1).changedInstallations, [], "the known lower-priority copy itself did not change");
+  assert.equal(inventory.packageReadRetries.size, 0);
+});
+
+test("metadata recovery cannot traverse a replaced pinned library", async t => {
+  let broken, attempts = 0;
+  const control = controlledWatches();
+  const { root, libraries: [library], inventory, changes, reviews, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    promises: { ...fs.promises, lstat: async (file, ...args) => {
+      if (file === broken) {
+        attempts++;
+        throw Object.assign(new Error("package inaccessible"), { code: "EACCES" });
+      }
+      return fs.promises.lstat(file, ...args);
+    } },
+  });
+  broken = install(library);
+  inventory.retryDelay = 10000;
+  inventory.setLibraryPaths([library]);
+  await waitForInventoryPublication(inventory);
+  const before = attempts;
+  fs.renameSync(library, path.join(root, "old-library"));
+  const external = path.join(root, "external");
+  install(external, "2.0");
+  fs.symlinkSync(external, library, process.platform === "win32" ? "junction" : "dir");
+  // No parent notification: retry must validate the original pin itself.
+  forceReadRetry(inventory);
+  await settle(() => changes.at(-1)?.libraries[0]?.suspended === true);
+  assert.equal(attempts, before, "never inspect packages below the replacement root");
+  assert.equal(reviews.length, 1);
+  assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  assert.equal(inventory.packageReadRetries.size, 0);
+  assert.equal(inventory.retryTimer, undefined);
+  assert.equal(inventory.watchers.has(library), false);
+});
