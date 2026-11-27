@@ -8,9 +8,9 @@ const token = "a".repeat(64);
 const nonce = Buffer.alloc(32, 0x5a);
 const snapshot = Buffer.from("opaque-private-startup-snapshot");
 
-function signature(context, request, payload) {
+function signature(context, request, clientNonce, payload) {
   return createHmac("sha256", token).update(context, "ascii")
-    .update(nonce).update(request).update(payload).digest();
+    .update(nonce).update(request).update(clientNonce).update(payload).digest();
 }
 
 function fixture(mode) {
@@ -20,13 +20,13 @@ function fixture(mode) {
   const net = {
     createConnection() {
       const socket = new EventEmitter();
-      let request, proof, stage = "request", destroyed = false;
+      let request, clientNonce, proof, stage = "request", destroyed = false;
       socket.destroy = () => { destroyed = true; return socket; };
       const rejectPipe = () => socket.emit("error", Object.assign(new Error("read EPIPE"), { code: "EPIPE" }));
       const reply = () => {
-        const put = request.subarray(0, 4).toString() === "RCSP";
+        const put = request.subarray(0, 4).toString() === "RCP2";
         const payload = put ? socket.payload : Buffer.alloc(0);
-        assert.deepEqual(proof, signature("rconsole-private-state-client-v1", request, payload));
+        assert.deepEqual(proof, signature("rconsole-private-state-client-v2", request, clientNonce, payload));
         const value = put ? Buffer.from([0]) : snapshot;
         const header = Buffer.alloc(12);
         header.write("RCSR");
@@ -34,27 +34,32 @@ function fixture(mode) {
         header.writeUInt32LE(value.length, 8);
         const response = Buffer.concat([header, value]);
         const proofBytes = mode === "forged" ? Buffer.alloc(32) :
-          signature("rconsole-private-state-server-v1", request, response);
+          signature("rconsole-private-state-server-v2", request, clientNonce, response);
         queueMicrotask(() => { if (!destroyed) socket.emit("data", Buffer.concat([response, proofBytes])); });
       };
       socket.write = (bytes, callback) => {
         writes++;
         const data = Buffer.from(bytes);
         if (stage === "request") {
-          request = data;
+          request = data.subarray(0, 37);
+          clientNonce = data.subarray(37);
+          assert.equal(clientNonce.length, 32);
           stage = "proof";
           queueMicrotask(() => {
             if (mode === "pre-auth-error") { rejectPipe(); return; }
+            if (mode === "pre-auth-close") { socket.emit("close"); return; }
             const challenge = Buffer.alloc(40);
             challenge.write("RCSC");
             challenge.writeUInt32LE(identity.pid, 4);
             nonce.copy(challenge, 8);
-            socket.emit("data", challenge);
+            const brokerProof = mode === "forged-broker" ? Buffer.alloc(32) :
+              signature("rconsole-private-state-broker-v2", request, clientNonce, challenge);
+            socket.emit("data", Buffer.concat([challenge, brokerProof]));
           });
         } else if (stage === "proof") {
           proof = data;
           stage = "payload";
-          if (request.subarray(0, 4).toString() === "RCSG") reply();
+          if (request.subarray(0, 4).toString() === "RCG2") reply();
         } else {
           socket.payload = data;
           reply();
@@ -112,3 +117,12 @@ test("Windows forged response MAC remains fatal without an acknowledgement", asy
   await assert.rejects(client.loadPrivateStartupState(identity, token), /authentication failed/);
   assert.equal(observations().acknowledgements, 0);
 });
+
+for (const [mode, error] of [["forged-broker", /broker authentication failed/],
+  ["pre-auth-error", /EPIPE/], ["pre-auth-close", /connection closed/]]) {
+  test(`Windows ${mode} releases no startup snapshot`, async () => {
+    const { client, identity, observations } = fixture(mode);
+    await assert.rejects(client.savePrivateStartupState(identity, token, snapshot), error);
+    assert.deepEqual(observations(), { acknowledgements: 0, writes: 1 });
+  });
+}

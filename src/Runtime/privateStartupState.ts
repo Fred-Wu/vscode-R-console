@@ -8,19 +8,22 @@ import { isSessionRegistryIdentity, sessionRegistryKeyEndpoint, type SessionRegi
 export const MAX_PRIVATE_STARTUP_STATE_BYTES = 16 * 1024 * 1024 - 32;
 const PRIVATE_TIMEOUT_MS = 10_000;
 
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
-const CLIENT_CONTEXT = "rconsole-private-state-client-v1";
-const SERVER_CONTEXT = "rconsole-private-state-server-v1";
-const CHALLENGE_BYTES = 40;
+const BROKER_CONTEXT = "rconsole-private-state-broker-v2";
+const CLIENT_CONTEXT = "rconsole-private-state-client-v2";
+const SERVER_CONTEXT = "rconsole-private-state-server-v2";
+const CHALLENGE_BYTES = 72;
 const RESPONSE_HEADER_BYTES = 12;
 const MAC_BYTES = 32;
 
-function mac(context: string, token: string, nonce: Buffer, header: Buffer, payload?: Buffer): Buffer {
+function mac(context: string, token: string, nonce: Buffer, header: Buffer,
+  clientNonce: Buffer, payload?: Buffer): Buffer {
   const hash = createHmac("sha256", token);
   hash.update(context, "ascii");
   hash.update(nonce);
   hash.update(header);
+  hash.update(clientNonce);
   if (payload) hash.update(payload);
   return hash.digest();
 }
@@ -78,8 +81,9 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ path: endpoint });
     const request = Buffer.alloc(37);
-    request.write(state ? "RCSP" : "RCSG", "ascii");
+    request.write(state ? "RCP2" : "RCG2", "ascii");
     if (state) request.writeUInt32LE(state.length, 4);
+    const clientNonce = randomBytes(32);
     let pending = Buffer.alloc(0);
     let serverNonce: Buffer | undefined;
     let expectedResponse: number | undefined;
@@ -96,12 +100,13 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
       pending.fill(0);
       serverNonce?.fill(0);
       request.fill(0);
+      clientNonce.fill(0);
       if (error) verifiedResponse?.fill(0);
       verifiedResponse = undefined;
       socket.destroy();
       if (error) reject(error); else resolve(result);
     }
-    socket.once("connect", () => socket.write(request));
+    socket.once("connect", () => socket.write(Buffer.concat([request, clientNonce])));
     socket.on("error", error => {
       if (process.platform === "win32" && verifiedResponse &&
           (error as NodeJS.ErrnoException).code === "EPIPE") {
@@ -134,10 +139,20 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
           finish(new Error("Private startup challenge belongs to a different runtime"));
           return;
         }
-        serverNonce = Buffer.from(pending.subarray(8));
+        const nonce = pending.subarray(8, 40);
+        const expected = mac(BROKER_CONTEXT, authToken, nonce, request, clientNonce, pending.subarray(0, 40));
+        const valid = timingSafeEqual(pending.subarray(40), expected);
+        expected.fill(0);
+        if (!valid) {
+          finish(new Error("Private startup broker authentication failed"));
+          return;
+        }
+        serverNonce = Buffer.from(nonce);
         pending.fill(0);
         pending = Buffer.alloc(0);
-        const clientProof = mac(CLIENT_CONTEXT, authToken, serverNonce, request, state);
+        // Release the snapshot only after the broker proves knowledge of the
+        // session token for this fresh client challenge and exact request.
+        const clientProof = mac(CLIENT_CONTEXT, authToken, serverNonce, request, clientNonce, state);
         // Do not erase a buffer before the socket finishes sending it.
         socket.write(clientProof, () => clientProof.fill(0));
         if (state) socket.write(state);
@@ -162,7 +177,7 @@ function exchangeOnce(identity: SessionRegistryIdentity, authToken: string,
         return;
       }
       const proofBytes = pending.subarray(RESPONSE_HEADER_BYTES + expectedResponse);
-      const expected = mac(SERVER_CONTEXT, authToken, serverNonce, request,
+      const expected = mac(SERVER_CONTEXT, authToken, serverNonce, request, clientNonce,
         pending.subarray(0, RESPONSE_HEADER_BYTES + expectedResponse));
       const valid = timingSafeEqual(proofBytes, expected);
       expected.fill(0);
