@@ -1142,7 +1142,7 @@ test("package refresh sends pinned installations and explicit monitoring exclusi
   await client.start();
   await client.refreshPackages({
     libraries: [],
-    packages: new Map([["example", { name: "example", version: "1.0",
+    packages: new Map([["example", { name: "example",
       path: "/configured-alias/example", target: "/pinned-library/example", identity: "installed" }]]),
     changed: [], unmonitored: ["linked"], unmonitoredRoots: ["/suspended-library"],
     isCurrent: () => true,

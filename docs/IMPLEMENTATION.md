@@ -1304,26 +1304,25 @@ introduced. Shared watcher errors validate all currently associated libraries,
 including those added after registration. Failures and restorations are logged
 once per transition.
 
-Scans inspect ordinary package directories directly inside each library. They read
-package names, versions, canonical library locations and package-directory timestamps,
-reusing unchanged package records. Installation identities include directory and
-metadata-file timestamps and identities, so direct metadata changes can refresh the
-inventory while repeated notifications for unchanged files reuse cached records.
-Package symlinks and junctions are excluded from metadata
-inspection and watch registration. `lstat` checks package directories and the `Meta`,
-`package.rds` and `DESCRIPTION` components before metadata access; linked components
-are excluded. Metadata must be ordinary files, and `DESCRIPTION` is opened with
-`O_NOFOLLOW` where available. These checks also handle links introduced after
-directory enumeration. External package cache destinations receive no watches or
-polling.
+Scans inspect only filesystem metadata inside each pinned library. Ordinary package
+directories must contain an ordinary `Meta` directory and ordinary
+`Meta/package.rds` and `DESCRIPTION` files. Their names and local filesystem
+identities (including timestamps and sizes) establish an installation fingerprint;
+the monitor never opens, reads, parses or deserializes either file. R and
+languageserver own package validity, version interpretation and namespace loading.
+Installation identity changes, including same-version replacement and in-place
+metadata updates, invalidate completion metadata without version-specific logs.
 
-Excluded package names and suspended library roots accompany inventory publications.
-The console's language-server adapter skips their namespace reconciliation before
-resolving package paths. A linked entry that precedes an ordinary copy in the library
-search order excludes that name from automatic reconciliation, because the inventory
-cannot establish the linked installation's validity or identity. R's ordinary package
-loading and completion lookup continue to use its configured library paths. Updating
-a linked package's external target produces no automatic package refresh.
+Package symlinks and junctions are tracked by the identity of the link entry
+itself. Their destinations are never resolved, inspected or watched by the
+monitor. The link entry changing can invalidate the selected installation;
+changing only its external destination contents is outside monitoring scope.
+Linked metadata components are excluded from inventory reconciliation.
+The pinned root and observed ordinary directory ancestors are revalidated around
+asynchronous metadata and lock inspections; a changed ancestor stops that
+inspection. Node's path-based filesystem operations cannot make validation
+atomic with every concurrent filesystem mutation. No package-file content is
+accessed, and no new physical library location is authorised automatically.
 
 Scans use bounded asynchronous file operations. Ordinary named installation locks
 defer their package; an ordinary `00LOCK` directory defers the whole library. Lock

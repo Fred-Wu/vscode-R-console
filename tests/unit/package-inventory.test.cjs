@@ -5,6 +5,20 @@ const path = require("node:path");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 
+// Assert the observed metadata of the actual installation, not a parsed version.
+// Include its physical path so that precedence/alias regressions cannot pass.
+function matchesDescription(item, directory) {
+  if (!item || item.linked || item.target !== directory) return false;
+  let stat;
+  try { stat = fs.lstatSync(path.join(directory, "DESCRIPTION")); }
+  catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+    throw error;
+  }
+  const expected = [stat.dev, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.size];
+  return JSON.stringify(JSON.parse(item.identity)[3]) === JSON.stringify(expected);
+}
+
 function fixture(t, notificationDelay = 0, overrides = {}) {
   // Use the same canonical representation as PackageInventory.rootFor().
   // On Windows realpathSync can yield RUNNER~1 while .native returns the
@@ -87,7 +101,7 @@ test("inventory preserves effective copies across duplicate additions, removals 
   assert.deepEqual(changes.at(-1).changed, []);
   logs.length = 0;
   install(second);
-  await waitForLog("Added: example 1.0");
+  await waitForLog("Added: example -");
   assert.deepEqual(changes.at(-1).changed, []);
 
   inventory.setLibraryPaths([second, first]);
@@ -95,11 +109,11 @@ test("inventory preserves effective copies across duplicate additions, removals 
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.deepEqual(changes.at(-1).changedInstallations, [],
     "selecting an already observed copy does not replace that installation");
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
   logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await waitForLog("Using remaining copy: example 2.0");
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  await waitForLog("Using remaining copy: example -");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
   logs.length = 0;
   fs.rmSync(path.join(first, "example"), { recursive: true });
   await waitForLog("no copies remain");
@@ -170,15 +184,16 @@ for (const queue of ["dirty", "unconfirmed"]) {
     install(first, "1.0");
     inventory.setLibraryPaths([first, second]);
     await settle();
-    assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+    const before = changes.at(-1).packages.get("example");
+    assert.ok(matchesDescription(before, path.join(first, "example")));
 
     // Model a new installation identity without an extra filesystem event.
     // This proves the pending notification itself survives a search-order edit.
-    const readPackage = inventory.readPackage.bind(inventory);
-    inventory.readPackage = async (library, name, previous, isCurrent) => {
-      const item = await readPackage(library, name, previous, isCurrent);
+    const observePackage = inventory.observePackage.bind(inventory);
+    inventory.observePackage = async (library, name, previous, isCurrent) => {
+      const item = await observePackage(library, name, previous, isCurrent);
       return library === first && item
-        ? { ...item, version: "2.0", identity: item.identity + "-updated" }
+        ? { ...item, identity: before.identity + "-updated" }
         : item;
     };
     if (queue === "dirty") {
@@ -207,13 +222,13 @@ for (const queue of ["dirty", "unconfirmed"]) {
     await pending;
 
     const deadline = Date.now() + 10000;
-    while (inventory.libraries.find(item => item.path === first)?.packages.get("example")?.version !== "2.0") {
+    while (inventory.libraries.find(item => item.path === first)?.packages.get("example")?.identity !== before.identity + "-updated") {
       assert.ok(Date.now() < deadline, `${queue} update must survive library reordering`);
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     await settle();
     assert.deepEqual(changes.at(-1).libraries.map(item => item.path), [second, first]);
-    assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+    assert.equal(changes.at(-1).packages.get("example").identity, before.identity + "-updated");
     assert.deepEqual(changes.at(-1).changed, ["example"]);
   });
 }
@@ -264,7 +279,7 @@ test("inventory detects same-version package replacement from folder events", as
   assert.notEqual(changes.at(-1).packages.get("example").identity, identity);
   assert.deepEqual(changes.at(-1).changedInstallations, ["example"],
     "replacing files at the selected path must still invalidate a loaded namespace");
-  assert.ok(logs.some(line => line.includes("Updated: example 1.0 -> 1.0")));
+  assert.ok(logs.some(line => line.includes("Updated: example -")));
 });
 
 test("an ordinary package replaced by an renv-style link is tracked without watching the target", async t => {
@@ -283,7 +298,7 @@ test("an ordinary package replaced by an renv-style link is tracked without watc
   assert.deepEqual(changes.at(-1).unmonitored, []);
   fs.unlinkSync(directory);
   install(library, "3.0");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), directory));
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.deepEqual(changes.at(-1).unmonitored, []);
 });
@@ -362,7 +377,7 @@ test("a failed refresh retries only dirty libraries and publishes the latest ins
   fs.rmSync(path.join(first, "example"), { recursive: true });
   install(first, "3.0");
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "3.0");
+  assert.ok(matchesDescription(changes.at(-1).packages.get("example"), path.join(first, "example")));
   assert.equal(changes.at(-1).libraries[1], original.libraries[1], "reuse the unaffected library");
   assert.equal(inventory.retryDelay, 1000);
   assert.equal(inventory.retryTimer, undefined);
@@ -508,12 +523,12 @@ test("directory timestamp touches do not rescan unchanged installed packages", a
   install(library, "2.0");
   watcher.emit("change", "change", undefined);
   const deadline = Date.now() + 10000;
-  while (changes.at(-1).packages.get("example")?.version !== "2.0") {
+  while (!matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example"))) {
     assert.ok(Date.now() < deadline, "same-name package replacement must be detected");
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   await settle();
-  assert.equal(changes.at(-1).packages.get("example")?.version, "2.0");
+  assert.ok(matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
 });
 
 test("ordinary physical libraries log one canonical path, with no alias arrow", async t => {
@@ -599,7 +614,8 @@ test("configured library alias retargeting suspends until the new location is tr
   fs.symlinkSync(first, library, kind);
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  const previousInstallation = changes.at(-1).packages.get("example");
+  assert.ok(matchesDescription(previousInstallation, path.join(first, "example")));
   assert.ok(logs.includes(`[Libraries] Library alias: ${library} -> ${first}`));
   assert.deepEqual(watches.map(watch => watch.file).sort(), [first, path.join(first, "example")].sort());
   assert.ok(watches.every(watch => watch.options.recursive === false));
@@ -616,14 +632,14 @@ test("configured library alias retargeting suspends until the new location is tr
   install(second, "3.0");
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(inventory.watchers.has(library), false);
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example"), previousInstallation);
   assert.equal(changes.at(-1).packages.get("example").target, path.join(first, "example"));
   assert.equal(watches.length, 2);
   const proposal = reviews[0].review();
   assert.equal(proposal.root, second);
   assert.equal(watches.length, 2, "review does not watch the destination");
   assert.equal(reviews[0].approve(proposal), true);
-  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), path.join(second, "example")));
   assert.ok(watches.some(watch => watch.file === second));
 });
 
@@ -669,6 +685,7 @@ test("replacing a physical library requires approval before rearming its watcher
   install(library);
   inventory.setLibraryPaths([library]);
   await settle();
+  const previousInstallation = changes.at(-1).packages.get("example");
   const previous = inventory.watchers.get(library);
   const moved = library + "-old";
   releaseWindowsWatcherHandles(previous);
@@ -684,17 +701,17 @@ test("replacing a physical library requires approval before rearming its watcher
   assert.ok(["Pinned library replaced", "Pinned library missing or renamed"].includes(reviews[0].reason),
     "a native notification may see the missing entry or the completed replacement");
   assert.equal(reviews[0].entry, library);
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example"), previousInstallation);
   const proposal = reviews[0].review();
   assert.equal(proposal.root, library);
   assert.equal(reviews[0].approve(proposal), true);
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
   assert.notEqual(inventory.watchers.get(library), previous);
   assert.equal(logs.filter(line => line.includes("Monitoring suspended:")).length, 1);
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   fs.rmSync(path.join(library, "example"), { recursive: true });
   install(library, "3.0");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
 });
 
 test("a renamed library stays suspended when its original path is recreated", async t => {
@@ -702,6 +719,7 @@ test("a renamed library stays suspended when its original path is recreated", as
   install(library);
   inventory.setLibraryPaths([library]);
   await settle();
+  const previousInstallation = changes.at(-1).packages.get("example");
   releaseWindowsWatcherHandles(inventory.watchers.get(library));
   releaseWindowsEntryWatcherHandles(inventory);
   const parentWatch = entryWatches.find(watch => watch.file === path.dirname(library));
@@ -719,10 +737,10 @@ test("a renamed library stays suspended when its original path is recreated", as
   await settle();
   assert.equal(inventory.watchers.has(library), false);
   assert.equal(reviews.length, 1);
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example"), previousInstallation);
   assert.equal(inventory.retryTimer, undefined);
   assert.equal(reviews[0].approve(reviews[0].review()), true);
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
 });
 
 test("healthy library events refresh during a different library's recovery backoff", async t => {
@@ -738,12 +756,12 @@ test("healthy library events refresh during a different library's recovery backo
   fs.rmSync(path.join(second, "example"), { recursive: true });
   install(second, "2.0");
   const deadline = Date.now() + 3000;
-  while (changes.at(-1).libraries[1].packages.get("example")?.version !== "2.0") {
+  while (!matchesDescription(changes.at(-1).libraries[1].packages.get("example"), path.join(second, "example"))) {
     assert.ok(Date.now() < deadline, "healthy library must refresh before recovery retry");
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.ok(inventory.retryTimer, "failed library is still backing off");
-  assert.equal(changes.at(-1).libraries[1].packages.get("example").version, "2.0");
+  assert.ok(matchesDescription(changes.at(-1).libraries[1].packages.get("example"), path.join(second, "example")));
 });
 
 test("a queued healthy scan is not cancelled by another library's watcher failure", async t => {
@@ -763,7 +781,7 @@ test("a queued healthy scan is not cancelled by another library's watcher failur
   inventory.watchers.get(first).emit("error", new Error("Unrelated watcher failure"));
   assert.ok(inventory.timer, "queued healthy scan must survive retry scheduling");
   const deadline = Date.now() + 3000;
-  while (changes.at(-1).libraries[1].packages.get("example")?.version !== "2.0") {
+  while (!matchesDescription(changes.at(-1).libraries[1].packages.get("example"), path.join(second, "example"))) {
     assert.ok(Date.now() < deadline, "healthy library change must publish without retry");
     await new Promise(resolve => setTimeout(resolve, 20));
   }
@@ -776,19 +794,19 @@ test("removing and readding an entire runtime library closes and restores its wa
   install(second, "2.0");
   inventory.setLibraryPaths([first, second]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
 
   inventory.setLibraryPaths([second]);
   await settle();
   assert.equal(inventory.watchers.has(first), false, "removed libraries must stop being watched");
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
   assert.ok(logs.some(line => line.includes("Selected copy changed") ||
     line.includes("Using remaining copy")));
 
   inventory.setLibraryPaths([first, second]);
   await settle();
   assert.equal(inventory.watchers.has(first), true, "readded libraries resume monitoring");
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
 });
 
 test("package locks preserve only their own installation, including on initial discovery", async t => {
@@ -801,17 +819,18 @@ test("package locks preserve only their own installation, including on initial d
   fs.rmSync(example, { recursive: true });
   await settle(() => !changes.at(-1).packages.has("example"));
   install(library, "2.0");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), example));
+  const previousInstallation = changes.at(-1).packages.get("example");
   fs.mkdirSync(path.join(library, "00LOCK"));
   const lock = path.join(library, "00LOCK", "example");
   fs.renameSync(example, lock);
   await new Promise(resolve => setTimeout(resolve, 700));
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0", "generic lock backups retain the previous copy");
+  assert.equal(changes.at(-1).packages.get("example"), previousInstallation, "generic lock backups retain the previous copy");
   install(library, "3.0");
   await new Promise(resolve => setTimeout(resolve, 700));
-  assert.equal(changes.at(-1).packages.get("example").version, "2.0");
+  assert.equal(changes.at(-1).packages.get("example"), previousInstallation);
   fs.rmSync(path.join(library, "00LOCK"), { recursive: true });
-  await settle(() => changes.at(-1).packages.get("example")?.version === "3.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), example));
 });
 
 test("linked package entries are tracked without resolving, reading, watching or polling targets", async t => {
@@ -922,11 +941,11 @@ test("linked installation locks do not defer ordinary package updates", async t 
   install(library);
   inventory.setLibraryPaths([library]);
   await settle();
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.ok(matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
   assert.equal(changes.at(-1).libraries[0].deferred.size, 0);
   fs.rmSync(path.join(library, "example"), { recursive: true });
   install(library, "2.0");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
 });
 
 // Binary and non-staged installs can copy a new package directly into the
@@ -977,18 +996,18 @@ for (const lockName of ["00LOCK-example", "00LOCK"]) {
   });
 }
 
-test("a DESCRIPTION replaced by a symlink before open is not read", {
-  skip: process.platform === "win32" || !fs.constants.O_NOFOLLOW,
+test("a DESCRIPTION replaced by a symlink before metadata inspection is excluded", {
+  skip: process.platform === "win32",
 }, async t => {
   let description, target, swapped = false;
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
-    promises: { ...fs.promises, open: async (file, ...args) => {
+    promises: { ...fs.promises, lstat: async (file, ...args) => {
       if (file === description && !swapped) {
         swapped = true;
         fs.unlinkSync(file);
         fs.symlinkSync(target, file, "file");
       }
-      return fs.promises.open(file, ...args);
+      return fs.promises.lstat(file, ...args);
     } },
   });
   description = path.join(install(library), "DESCRIPTION");
@@ -1038,7 +1057,7 @@ test("monitoring watches only the library and immediate package directories", as
 
   // Immediate package-directory notifications refresh the installation.
   fs.writeFileSync(path.join(directory, "DESCRIPTION"), "Package: example\nVersion: 2.0\n");
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), directory));
   const count = changes.length;
   fs.writeFileSync(path.join(nested, "code.R"), "value <- 2");
   fs.writeFileSync(path.join(external, "DESCRIPTION"), "Package: example\nVersion: 9.0\n");
@@ -1134,6 +1153,7 @@ test("temporary network library failures preserve verified package state until r
   install(library);
   inventory.setLibraryPaths([library]);
   await settle();
+  const previousInstallation = changes.at(-1).packages.get("example");
   unavailable = true;
   inventory.dirtyLibraries.add(library);
   await inventory.refresh();
@@ -1142,7 +1162,7 @@ test("temporary network library failures preserve verified package state until r
     assert.ok(Date.now() < deadline, "offline status must be reported");
     await new Promise(resolve => setTimeout(resolve, 20));
   }
-  assert.equal(changes.at(-1).packages.get("example").version, "1.0");
+  assert.equal(changes.at(-1).packages.get("example"), previousInstallation);
   assert.deepEqual(changes.at(-1).changed, [], "temporary disconnect does not remove installed packages");
   assert.ok(changes.at(-1).unmonitoredRoots.includes(library));
   assert.ok(logs.some(line => line.includes("Monitoring temporarily unavailable:") &&
@@ -1153,7 +1173,7 @@ test("temporary network library failures preserve verified package state until r
   install(library, "2.0");
   inventory.dirtyLibraries.add(library);
   await inventory.refresh();
-  await settle(() => changes.at(-1).packages.get("example")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), path.join(library, "example")));
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.ok(logs.some(line => line.includes("Monitoring restored:")));
 });
@@ -1284,7 +1304,7 @@ test("a persistent package registration failure leaves the library and sibling w
 
   fs.writeFileSync(path.join(healthy, "DESCRIPTION"), "Package: healthy\nVersion: 2.0\n");
   healthyWatch.trigger("change", "DESCRIPTION");
-  await settle(() => changes.at(-1)?.packages.get("healthy")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1)?.packages.get("healthy"), healthy));
   const added = install(library, "1.0", "added");
   rootWatch.trigger("rename", "added");
   await settle(() => changes.at(-1)?.packages.has("added"));
@@ -1303,12 +1323,12 @@ test("a persistent package registration failure leaves the library and sibling w
 });
 
 test("a package lstat failure during refresh closes only that package watch and retries it", async t => {
-  let broken, fail = false;
+  let broken, fail = false, registering = false;
   const control = controlledWatches();
   const { libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
     watch: control.watch,
     lstatSync: (file, ...args) => {
-      if (file === broken && fail) throw Object.assign(new Error("package unavailable"), { code: "EACCES" });
+      if (file === broken && fail && registering) throw Object.assign(new Error("package unavailable"), { code: "EACCES" });
       return fs.lstatSync(file, ...args);
     },
   });
@@ -1320,6 +1340,15 @@ test("a package lstat failure during refresh closes only that package watch and 
   const rootWatch = group.directories.get(library).watcher;
   const healthyWatch = group.directories.get(healthy).watcher;
   const brokenWatch = group.directories.get(broken).watcher;
+  // The metadata-only scanner now also validates directory identities with
+  // lstatSync. Inject a registration-specific failure, not a second unrelated
+  // metadata failure which would legitimately schedule inventory recovery.
+  const watchDirectory = group.watchDirectory.bind(group);
+  group.watchDirectory = directory => {
+    registering = true;
+    try { return watchDirectory(directory); }
+    finally { registering = false; }
+  };
   fail = true;
   rootWatch.trigger("rename", "broken");
   await settle(() => group.failedPackages.has(broken));
@@ -1359,7 +1388,7 @@ test("a native package watcher error recovers missed changes without replacing h
   fs.writeFileSync(path.join(broken, "DESCRIPTION"), "Package: broken\nVersion: 2.0\n");
   fail = false;
   forcePackageRetry(group, broken);
-  await settle(() => changes.at(-1)?.packages.get("broken")?.version === "2.0");
+  await settle(() => matchesDescription(changes.at(-1)?.packages.get("broken"), broken));
   const replacement = group.directories.get(broken).watcher;
   assert.notEqual(replacement, old);
   assert.deepEqual(changes.at(-1).changed, ["broken"]);
@@ -1486,7 +1515,7 @@ test("an initially unreadable higher-priority package blocks fallback but not si
 
   fs.writeFileSync(path.join(healthy, "DESCRIPTION"), "Package: healthy\nVersion: 2.00\n");
   siblingWatch.trigger("change", "DESCRIPTION");
-  await waitForInventoryPublication(inventory, () => changes.at(-1)?.packages.get("healthy")?.version === "2.00");
+  await waitForInventoryPublication(inventory, () => matchesDescription(changes.at(-1)?.packages.get("healthy"), healthy));
   assert.deepEqual(changes.at(-1).changed, ["healthy"]);
   assert.equal(changes.at(-1).packages.has("broken"), false);
   assert.equal(control.handles.get(first), rootWatch);
@@ -1516,9 +1545,9 @@ test("a previously readable package retains its verified metadata while healthy 
   const control = controlledWatches();
   const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t, 0, {
     watch: control.watch,
-    promises: { ...fs.promises, open: async (file, ...args) => {
+    promises: { ...fs.promises, lstat: async (file, ...args) => {
       if (file === description && fail) throw Object.assign(new Error("metadata temporarily unreadable"), { code: "EIO" });
-      return fs.promises.open(file, ...args);
+      return fs.promises.lstat(file, ...args);
     } },
   });
   const broken = install(library, "1.0", "broken");
@@ -1532,7 +1561,7 @@ test("a previously readable package retains its verified metadata while healthy 
   fs.writeFileSync(path.join(healthy, "DESCRIPTION"), "Package: healthy\nVersion: 2.00\n");
   control.handles.get(broken).trigger("change", "DESCRIPTION");
   control.handles.get(healthy).trigger("change", "DESCRIPTION");
-  await waitForInventoryPublication(inventory, () => changes.at(-1)?.packages.get("healthy")?.version === "2.00");
+  await waitForInventoryPublication(inventory, () => matchesDescription(changes.at(-1)?.packages.get("healthy"), healthy));
   const degraded = changes.at(-1);
   assert.equal(degraded.packages.get("broken"), previous);
   assert.ok(degraded.libraries[0].unavailablePackages.has("broken"));
@@ -1544,7 +1573,7 @@ test("a previously readable package retains its verified metadata while healthy 
 
   fail = false;
   // Let the real recovery timer fire without any new filesystem event.
-  await settle(() => changes.at(-1)?.packages.get("broken")?.version === "2.00");
+  await settle(() => matchesDescription(changes.at(-1)?.packages.get("broken"), broken));
   assert.deepEqual(changes.at(-1).changed, ["broken"]);
   assert.deepEqual(changes.at(-1).changedInstallations, ["broken"]);
   assert.deepEqual(changes.at(-1).unmonitored, []);
@@ -1575,7 +1604,7 @@ test("an unreadable lower-priority installation does not exclude a healthy selec
 
   fs.writeFileSync(path.join(selected, "DESCRIPTION"), "Package: example\nVersion: 2.00\n");
   control.handles.get(selected).trigger("change", "DESCRIPTION");
-  await waitForInventoryPublication(inventory, () => changes.at(-1)?.packages.get("example")?.version === "2.00");
+  await waitForInventoryPublication(inventory, () => matchesDescription(changes.at(-1)?.packages.get("example"), selected));
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.deepEqual(changes.at(-1).unmonitored, []);
 
@@ -1673,6 +1702,7 @@ for (const scenario of ["dirty", "unconfirmed", "failed publication"]) {
     inventory.retryDelay = 30000;
     inventory.setLibraryPaths([library]);
     await waitForInventoryPublication(inventory);
+    const previousInstallation = changes.at(-1).packages.get("firstPkg");
     const recovery = inventory.retryTimer;
     assert.ok(recovery);
     assert.equal(inventory.packageReadRetries.get(library).get("unreadable"), 5);
@@ -1727,16 +1757,16 @@ for (const scenario of ["dirty", "unconfirmed", "failed publication"]) {
       assert.equal(inventory.timer, undefined, "a failed publication keeps its recovery backoff");
       assert.equal(publications, 1);
       assert.ok(queue.has(library), "failure must retain the queued work");
-      assert.equal(changes.at(-1).packages.get("firstPkg").version, "1.0");
+      assert.equal(changes.at(-1).packages.get("firstPkg"), previousInstallation);
       assert.equal(inventory.retryTimer, recovery);
       forceReadRetry(inventory);
     } else {
       assert.ok(inventory.timer, "successful publication must re-arm the normal scan despite recovery backoff");
     }
     await waitForInventoryPublication(inventory, () =>
-      changes.at(-1)?.packages.get("firstPkg")?.version === "2.00" &&
+      matchesDescription(changes.at(-1)?.packages.get("firstPkg"), first) &&
       (scenario === "unconfirmed"
-        ? changes.at(-1)?.packages.get("secondPkg")?.version === "2.00"
+        ? matchesDescription(changes.at(-1)?.packages.get("secondPkg"), second)
         : changes.at(-1)?.packages.has("addedPkg")));
     assert.equal(inventory.packageReadRetries.get(library).get("unreadable"),
       scenario === "failed publication" ? 4 : 5);
@@ -1744,3 +1774,34 @@ for (const scenario of ["dirty", "unconfirmed", "failed publication"]) {
       "normal scans do not consume or replace the unrelated recovery retry");
   });
 }
+
+test("inventory publishes metadata-only changes without opening package files", async t => {
+  const forbidden = [];
+  const deny = method => (file, ...args) => {
+    forbidden.push([method, String(file)]);
+    throw new Error("package content access forbidden");
+  };
+  const control = controlledWatches();
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
+    watch: control.watch,
+    openSync: deny("openSync"), readFileSync: deny("readFileSync"),
+    promises: { ...fs.promises, open: deny("open"), readFile: deny("readFile"),
+      access: deny("access"), stat: deny("stat"), realpath: deny("realpath"), readlink: deny("readlink") },
+  });
+  const directory = install(library);
+  const description = path.join(directory, "DESCRIPTION");
+  // The monitor observes metadata, not whether the contents parse as DCF.
+  fs.writeFileSync(description, "opaque");
+  fs.mkdirSync(path.join(library, "notAPackage"));
+  inventory.setLibraryPaths([library]);
+  await settle();
+  assert.deepEqual([...changes.at(-1).packages.keys()], ["example"]);
+  const before = changes.at(-1).packages.get("example");
+  fs.writeFileSync(description, "opaque updated metadata");
+  control.handles.get(directory).trigger("change", "DESCRIPTION");
+  await settle(() => matchesDescription(changes.at(-1).packages.get("example"), directory));
+  assert.notEqual(changes.at(-1).packages.get("example").identity, before.identity);
+  assert.deepEqual(changes.at(-1).changed, ["example"]);
+  assert.deepEqual(changes.at(-1).changedInstallations, ["example"]);
+  assert.deepEqual(forbidden, []);
+});

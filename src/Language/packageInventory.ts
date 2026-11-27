@@ -5,6 +5,7 @@ import { LibraryPathEntryMonitor } from "./libraryPathEntryMonitor";
 import { captureLibraryPin, checkLibraryPin, describeLibraryPinChange, LibraryPinChanged,
   sameLibraryPin, type LibraryPin, type LibraryPinChange } from "./libraryLocationPin";
 import type { LibraryMonitoringReview } from "./libraryMonitoringNotice";
+import { inspectInstallation, verifyDirectory, type InstallationIdentity } from "./packageInstallationIdentity";
 
 // A library may be on a slow network drive; bound watcher fanout per root.
 const MAX_PACKAGE_WATCHES_PER_LIBRARY = 128;
@@ -13,7 +14,6 @@ const MAX_PACKAGE_READ_RETRIES = 5;
 
 export type PackageInstallation = {
   name: string;
-  version: string;
   path: string;
   target: string;
   identity: string;
@@ -265,16 +265,29 @@ export class PackageInventory {
         locked.add("*");
         // Inspect ordinary backup directories for packages absent at discovery.
         // Check each component before descending into the next one.
-        let folder = path.join(library, "00LOCK");
+        const lockPath = path.join(library, "00LOCK");
+        let folder = lockPath;
+        let lockStat: fs.Stats | undefined;
         for (let depth = 0; depth < 2; depth++) {
           try {
-            if (!isCurrent() || !(await fs.promises.lstat(folder)).isDirectory() || !isCurrent()) break;
-            for (const item of await fs.promises.readdir(folder, { withFileTypes: true })) {
+            if (!isCurrent()) break;
+            if (lockStat) verifyDirectory(lockPath, lockStat);
+            const stat = await fs.promises.lstat(folder);
+            if (!isCurrent()) break;
+            if (lockStat) verifyDirectory(lockPath, lockStat);
+            if (!stat.isDirectory()) break;
+            lockStat ??= stat;
+            verifyDirectory(folder, stat);
+            const items = await fs.promises.readdir(folder, { withFileTypes: true });
+            if (!isCurrent()) break;
+            verifyDirectory(lockPath, lockStat);
+            if (folder !== lockPath) verifyDirectory(folder, stat);
+            for (const item of items) {
               if (item.isDirectory() && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.name)) locked.add(item.name);
             }
           } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
-            if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+            if (code !== "ENOENT" && code !== "ENOTDIR" && code !== "ESTALE" && code !== "ELOOP") throw error;
             break;
           }
           folder = path.join(folder, "00new");
@@ -494,7 +507,8 @@ export class PackageInventory {
           throw Object.assign(new Error(`library entry budget exceeded (${MAX_LIBRARY_ENTRIES})`),
             { code: "E2BIG" });
         }
-        const locked = await this.installationLocks(originalTarget.root, entries, isCurrent);
+        const locked = await this.installationLocks(originalTarget.root, entries,
+          () => isCurrent() && this.libraryTarget(library) === originalTarget);
         if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
         // The package entry may be a symlink (renv/uvr). Record its lstat
         // identity, but never traverse, read or watch its target from here.
@@ -532,7 +546,7 @@ export class PackageInventory {
               return defer(name);
             }
             try {
-              const item = await this.readPackage(library, name, old, isCurrent);
+              const item = await this.observePackage(library, name, old, isCurrent);
               if (item === null) unmonitored.add(name);
               return item;
             } catch (error) {
@@ -690,10 +704,10 @@ export class PackageInventory {
               this.log(`[Packages] Monitoring skipped: ${name} - installation contains links`);
               continue;
             }
-            this.log(`[Packages] Removed copy: ${name} ${item.version} - ${item.path}`);
+            this.log(`[Packages] Removed copy: ${name} - ${item.path}`);
             const active = packages.get(name);
             if (active && active.identity === this.packages.get(name)?.identity) {
-              this.log(`[Packages] Active copy unchanged: ${name} ${active.version} - ${active.path}`);
+              this.log(`[Packages] Active copy unchanged: ${name} - ${active.path}`);
             }
           }
         }
@@ -702,9 +716,9 @@ export class PackageInventory {
         const previous = this.libraries.find(item => item.path === library.path)?.packages;
         for (const [name, item] of library.packages) {
           const old = previous?.get(name);
-          if (!old) this.log(`[Packages] Added: ${name} ${item.version} - ${item.path}`);
+          if (!old) this.log(`[Packages] Added: ${name} - ${item.path}`);
           else if (old.identity !== item.identity) {
-            this.log(`[Packages] Updated: ${name} ${old.version} -> ${item.version} - ${item.path}`);
+            this.log(`[Packages] Updated: ${name} - ${item.path}`);
           }
         }
       }
@@ -714,7 +728,7 @@ export class PackageInventory {
         if (!next) this.log(`[Packages] Removed: ${name} - no copies remain in active libraries`);
         else if (next.path !== old.path) {
           const retained = libraries.some(library => library.packages.get(name)?.path === old.path);
-          this.log(`[Packages] ${retained ? "Selected copy changed" : "Using remaining copy"}: ${name} ${next.version} - ${next.path}`);
+          this.log(`[Packages] ${retained ? "Selected copy changed" : "Using remaining copy"}: ${name} - ${next.path}`);
         }
       }
       if (!changed.length) this.log("[Completion] Active package copies unchanged; language server retained");
@@ -729,73 +743,22 @@ export class PackageInventory {
     this.candidate = undefined;
   }
 
-  private async inspectPackage(library: string, name: string, isCurrent: () => boolean): Promise<{ directory: string; identity: string; linked?: boolean } | null | undefined> {
+  private async inspectPackage(library: string, name: string, isCurrent: () => boolean): Promise<InstallationIdentity | null | undefined> {
     if (!isCurrent()) return undefined;
-    const directory = path.join(this.rootFor(library), name);
-    try {
-      const stat = await fs.promises.lstat(directory);
-      if (!isCurrent()) return undefined;
-      if (stat.isSymbolicLink()) {
-        // Only lstat the entry. Never call realpath/stat/readlink on its
-        // destination, and never subscribe to that destination.
-        return { directory, linked: true, identity: JSON.stringify([directory, "linked",
-          stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]) };
-      }
-      if (!stat.isDirectory()) return undefined;
-      const meta = await fs.promises.lstat(path.join(directory, "Meta"));
-      if (!isCurrent()) return undefined;
-      if (meta.isSymbolicLink()) return null;
-      if (!meta.isDirectory()) return undefined;
-      const metadata = await fs.promises.lstat(path.join(directory, "Meta", "package.rds"));
-      if (!isCurrent()) return undefined;
-      const description = await fs.promises.lstat(path.join(directory, "DESCRIPTION"));
-      if (!isCurrent()) return undefined;
-      if (metadata.isSymbolicLink() || description.isSymbolicLink()) return null;
-      if (!metadata.isFile() || !description.isFile()) return undefined;
-      const identity = JSON.stringify([directory, ...[stat, metadata, description]
-        .map(value => [value.dev, value.ino, value.mtimeMs, value.ctimeMs, value.size])]);
-      return { directory, identity };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ELOOP") return null;
-      if (code === "ENOENT" || code === "ENOTDIR") return undefined;
-      throw error;
-    }
+    const pin = this.libraryTarget(library);
+    if (!pin) return undefined;
+    return inspectInstallation(path.join(pin.root, name),
+      () => isCurrent() && this.libraryTarget(library) === pin);
   }
 
-  private async readPackage(library: string, name: string, previous: PackageInstallation | undefined,
+  private async observePackage(library: string, name: string, previous: PackageInstallation | undefined,
     isCurrent: () => boolean): Promise<PackageInstallation | null | undefined> {
     const current = await this.inspectPackage(library, name, isCurrent);
     if (!isCurrent()) return undefined;
     if (!current) return current;
-    const { directory, identity } = current;
-    if (previous?.identity === identity) return previous;
-    if (current.linked) {
-      // A link entry is tracked for lifecycle invalidation, not presented as
-      // a verified package. R/languageserver resolves it normally on demand.
-      return { name, version: "(linked)", path: path.join(library, name),
-        target: directory, identity, linked: true };
-    }
-    try {
-      const descriptionPath = path.join(directory, "DESCRIPTION");
-      // Protect the final component if it changes between lstat and open.
-      const file = await fs.promises.open(descriptionPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-      let description: string;
-      try {
-        if (!isCurrent() || !(await file.stat()).isFile() || !isCurrent()) return undefined;
-        description = await file.readFile("utf8");
-      } finally { await file.close(); }
-      const packageName = /^Package:\s*(\S+)/m.exec(description)?.[1];
-      const version = /^Version:\s*(\S+)/m.exec(description)?.[1];
-      if (packageName !== name || !version) return undefined;
-      return { name, version, path: path.join(library, name), target: directory, identity };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ELOOP") return null;
-      // An installation can disappear while its directory is being scanned.
-      if (code === "ENOENT" || code === "ENOTDIR") return undefined;
-      throw error;
-    }
+    if (previous?.identity === current.identity) return previous;
+    return { name, path: path.join(library, name), target: current.directory, identity: current.identity,
+      ...(current.linked ? { linked: true } : {}) };
   }
 }
 
