@@ -78,7 +78,6 @@ type BackendSessionState = {
   nextRequestId: number;
   pendingMemberRequests: Map<number, { resolve: (result: MemberInspectionResult) => void; timeout: NodeJS.Timeout }>;
   pendingStartupRequests: Map<number, {
-    store: boolean;
     resolve: (state: Buffer | undefined) => void;
     reject: (error: Error) => void;
     timeout: NodeJS.Timeout;
@@ -431,7 +430,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.pendingStartupRequests.delete(requestId);
         reject(new Error("Persistent startup state transfer timed out"));
       }, 10_000);
-      state.pendingStartupRequests.set(requestId, { store: snapshot !== undefined, resolve, reject, timeout });
+      state.pendingStartupRequests.set(requestId, { resolve, reject, timeout });
       const transfer = snapshot
         ? savePrivateStartupState(identity, token, snapshot).then(() => undefined)
         : loadPrivateStartupState(identity, token);

@@ -57,8 +57,6 @@ jobs:
           npm run stage:sidecar
       - name: Type-check and bundle
         run: npm run package:extension
-      - name: Focused package monitoring and static completion regressions
-        run: node --test tests/unit/package-installation-identity.test.cjs tests/unit/package-inventory.test.cjs tests/unit/library-path-entry-monitor.test.cjs tests/unit/library-monitoring-notice.test.cjs tests/unit/private-startup-windows-pipe.test.cjs tests/unit/static-bindings.test.cjs tests/unit/static-provider-edits.test.cjs tests/unit/static-provider-budget.test.cjs
       - name: Unit tests
         run: npm test
       - name: Install Linux system dependency for R fs
@@ -66,8 +64,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - name: Install R completion test dependencies
         run: Rscript -e "packages <- c('digest', 'languageserver', 'magrittr', 'data.table', 'R6', 'S7'); repo <- Sys.getenv('RSPM'); if (!nzchar(repo)) repo <- 'https://cloud.r-project.org'; needed <- setdiff(packages, rownames(installed.packages())); if (length(needed)) install.packages(needed, repos = repo); stopifnot(all(vapply(packages, requireNamespace, logical(1), quietly = TRUE)))"
-      - name: Real R language server startup, completion, and restart tests
-        run: npm run test:lsp
+      - name: Real R private startup IPC and persistent state regressions
+        run: npm run test:lsp:startup
+      - name: Real R language server completion and restart tests
+        run: npm run test:lsp:completion
       - name: Extension host activation and completion tests (Linux)
         if: runner.os == 'Linux'
         run: xvfb-run -a npm run test:extension-host

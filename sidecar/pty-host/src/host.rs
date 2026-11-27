@@ -462,7 +462,7 @@ mod unix_host {
                             break;
                         }
                         if let Some(runtime) = host_runtime() {
-                            runtime.output.attach_client(writer, client_id);
+                            runtime.output.attach_client(writer);
                             emit_attached_client_state(runtime);
                         }
 
@@ -2489,7 +2489,7 @@ mod windows_host {
                             break;
                         }
                         if let Some(runtime) = host_runtime() {
-                            runtime.output.attach_client(writer, client_id);
+                            runtime.output.attach_client(writer);
                             emit_attached_client_state(runtime);
                         }
 

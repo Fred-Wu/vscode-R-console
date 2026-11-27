@@ -129,7 +129,6 @@ pub(crate) struct OutputSink {
 
 struct OutputChannelState {
     writer: Option<Box<dyn Write + Send>>,
-    client_id: usize,
     startup_state: Option<StartupState>,
     backlog: VecDeque<Vec<u8>>,
     backlog_bytes: usize,
@@ -145,7 +144,6 @@ impl OutputSink {
     pub(crate) fn new_with_capabilities(host_name: &str, capabilities: &[&str]) -> Self {
         Self {
             output_state: Arc::new(Mutex::new(OutputChannelState {
-                client_id: 0,
                 startup_state: None,
                 writer: if session_transport_enabled() {
                     None
@@ -343,10 +341,9 @@ impl OutputSink {
         self.emit_frame(FRAME_SESSION_STATE, 0, &payload)
     }
 
-    pub(crate) fn attach_client<W: Write + Send + 'static>(&self, writer: W, client_id: usize) {
+    pub(crate) fn attach_client<W: Write + Send + 'static>(&self, writer: W) {
         if let Ok(mut output_state) = self.output_state.lock() {
             output_state.writer = Some(Box::new(writer));
-            output_state.client_id = client_id;
         }
     }
 
@@ -1025,7 +1022,7 @@ mod tests {
         let sink = OutputSink {
             output_state: Arc::new(Mutex::new(OutputChannelState {
                 writer: Some(Box::new(CapturedOutput(Arc::clone(&captured)))),
-                client_id: 0, startup_state: None,
+                startup_state: None,
                 backlog: VecDeque::new(), backlog_bytes: 0,
             })),
             host_name: Arc::new(String::new()), capabilities: Arc::new(Vec::new()),

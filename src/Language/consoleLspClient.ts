@@ -1169,6 +1169,9 @@ export class ConsoleLspClient implements CompletionProvider {
               throw new Error("Language server changed during private startup capture");
             }
             this.startupState = state;
+            // TCP carries LSP traffic after capture. Keep discarding stdout
+            // so package hooks and later output cannot fill the child pipe.
+            child.stdout!.resume();
           })
           : Promise.resolve();
         // Observe failures immediately; server setup may still be in progress.

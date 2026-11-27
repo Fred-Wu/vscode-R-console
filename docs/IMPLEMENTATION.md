@@ -1362,7 +1362,9 @@ package names in an opaque serialized envelope in memory. It delivers this
 envelope once through its own inherited stdout pipe, using a fresh random
 per-child `RCS2` marker and bounded Base64 framing. The extension consumes
 the marker before exposing the stdout stream to the stdio LSP reader; TCP
-mode captures stdout separately. Project profile output cannot be mistaken for
+mode captures stdout separately, then continuously drains and discards subsequent
+stdout for the lifetime of that child. Package hooks and later output can finish
+without filling the pipe or entering lifecycle logs. Project profile output cannot be mistaken for
 the envelope. No LSP JSON-RPC request or authenticated loopback TCP connection
 carries these credential-bearing bytes.
 
@@ -1371,12 +1373,13 @@ each attached console client holds a bounded local copy. The extension transfers
 the snapshot only through the existing OS-protected local key-broker endpoint
 (a private Unix socket or Windows user-only named pipe). The
 `lsp-startup-ipc-v2` capability indicates support for private startup GET/PUT.
-Commands `RCSG` and `RCSP` are strictly sized, PID-checked and
+Commands `RCG2` and `RCP2` are strictly sized, PID-checked and
 authenticated with the session's existing 256-bit authentication token:
-the runtime sends a fresh random challenge on every connection, the client
-proves token possession with a domain-separated HMAC-SHA256 over the
-challenge, complete request header and (for writes) payload, and the
-runtime authenticates its response with a separate HMAC. Invalid or
+the client and runtime each generate a fresh random challenge. The runtime
+authenticates both challenges, the request header and its PID before the client
+releases a snapshot. The client proves token possession with a domain-separated
+HMAC-SHA256 over both challenges, the complete request header and (for writes)
+payload. The runtime authenticates its response with a separate HMAC. Invalid or
 replayed proofs are rejected before releasing any startup state. This is
 a per-session authorization boundary, in addition to OS-user endpoint
 permissions. The `lsp-startup-ipc-v2` capability deliberately excludes

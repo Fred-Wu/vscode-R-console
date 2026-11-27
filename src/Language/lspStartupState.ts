@@ -2,7 +2,7 @@ import type { ChildProcess } from "child_process";
 import type { Readable } from "stream";
 
 // Matches the R entry point. Startup options can contain large user values.
-// Leave room for the authenticated ciphertext envelope in a 16 MiB backend frame.
+// Shared payload bound for private child pipes and the persistent state broker.
 export const MAX_STARTUP_STATE_BYTES = 16 * 1024 * 1024 - 32;
 
 export interface LspStartupStateStore {

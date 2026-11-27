@@ -12,6 +12,50 @@ const { authenticateLspSocket } = loadSource("src/Language/lspSocketAuth.ts");
 const { BACKEND_AUTH_TIMEOUT_MS } = loadSource("src/Runtime/backendAuthentication.ts");
 const entryPoint = path.resolve(__dirname, "../resources/r/console-language-server.R");
 
+test("TCP LSP drains stdout after private capture throughout startup and requests", { timeout: 60000 }, async () => {
+  const { createConsoleLsp } = require("./helpers/console-lsp.cjs");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-lsp-stdout-"));
+  // Instrument console-owned entry points so output occurs after the capture
+  // marker and during later requests, independently of package load order.
+  fs.cpSync(path.dirname(entryPoint), directory, { recursive: true });
+  const script = path.join(directory, path.basename(entryPoint));
+  const noise = 'cat(strrep("RCONSOLE_STDOUT_NOISE", 65536L)); flush(stdout())';
+  let source = fs.readFileSync(script, "utf8");
+  for (const anchor of ['server <- languageserver:::LanguageServer$new(host, NULL)',
+    'server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params) {']) {
+    assert.ok(source.includes(anchor));
+    source = source.replace(anchor, anchor.startsWith("server <-")
+      ? `${noise}\n${anchor}` : `${anchor}\n    ${noise}`);
+  }
+  fs.writeFileSync(script, source);
+  const { client, instances, logs } = createConsoleLsp({ after() {} });
+  client.resolveLanguageServerScriptPath = () => script;
+  let timer;
+  try {
+    await Promise.race([
+      (async () => {
+        await client.start();
+        assert.ok(client.startupState?.length, "the private snapshot remains available");
+        for (let i = 0; i < 2; i++) {
+          const paths = await instances[0].sendRequest("rConsole/libraryPaths", {});
+          assert.ok(paths.length, "LSP remains responsive after further stdout bursts");
+        }
+        assert.ok(!logs.some(line => line.includes("RCONSOLE_STDOUT_NOISE")),
+          "discarded child stdout must not enter lifecycle logs");
+      })(),
+      new Promise((_, reject) => { timer = setTimeout(() =>
+        reject(new Error("TCP LSP blocked on child stdout after snapshot capture")), 45000); }),
+    ]);
+  } catch (error) {
+    client.spawnedServer?.kill("SIGKILL");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    await client.dispose();
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
 test("an extension-host crash leaves no startup snapshot on disk", { timeout: 30000 }, async t => {
   const secret = "synthetic-startup-crash-secret";
   const worker = spawn(process.execPath, ["-e", `
