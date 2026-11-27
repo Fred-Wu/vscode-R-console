@@ -1652,3 +1652,95 @@ test("metadata recovery cannot traverse a replaced pinned library", async t => {
   assert.equal(inventory.retryTimer, undefined);
   assert.equal(inventory.watchers.has(library), false);
 });
+
+// Exercise real scan timers with deterministic filesystem notifications.
+// The recovery timer stays armed while the first publication is blocked.
+for (const scenario of ["dirty", "unconfirmed", "failed publication"]) {
+  test(`pending ${scenario} work uses the correct scan or recovery timer`, async t => {
+    let unreadable;
+    const control = controlledWatches();
+    const { libraries: [library], inventory, changes, install } = fixture(t, 0, {
+      watch: control.watch,
+      promises: { ...fs.promises, lstat: async (file, ...args) => {
+        if (file === unreadable) throw Object.assign(new Error("metadata inaccessible"), { code: "EACCES" });
+        return fs.promises.lstat(file, ...args);
+      } },
+    });
+    unreadable = install(library, "1.0", "unreadable");
+    const first = install(library, "1.0", "firstPkg");
+    const second = install(library, "1.0", "secondPkg");
+    // Keep the unrelated recovery well beyond normal event-driven scans.
+    inventory.retryDelay = 30000;
+    inventory.setLibraryPaths([library]);
+    await waitForInventoryPublication(inventory);
+    const recovery = inventory.retryTimer;
+    assert.ok(recovery);
+    assert.equal(inventory.packageReadRetries.get(library).get("unreadable"), 5);
+
+    const waitUntil = async (observed, message) => {
+      const deadline = Date.now() + 10000;
+      while (!observed()) {
+        assert.ok(Date.now() < deadline, message);
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    };
+    let release, entered = false, publications = 0;
+    const blocked = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const publish = inventory.onChange;
+    inventory.onChange = async change => {
+      if (++publications === 1) {
+        entered = true;
+        await blocked;
+        if (scenario === "failed publication") throw new Error("Temporary publication failure");
+      }
+      return publish(change);
+    };
+    fs.writeFileSync(path.join(first, "DESCRIPTION"), "Package: firstPkg\nVersion: 2.00\n");
+    control.handles.get(first).trigger("change", "DESCRIPTION");
+    await waitUntil(() => entered, "the first publication must be in flight");
+    const pending = inventory.pending;
+    assert.ok(pending);
+
+    const queue = scenario === "unconfirmed" ? inventory.unconfirmedLibraries : inventory.dirtyLibraries;
+    if (scenario === "unconfirmed") {
+      fs.writeFileSync(path.join(second, "DESCRIPTION"), "Package: secondPkg\nVersion: 2.00\n");
+      control.handles.get(second).trigger("change", "DESCRIPTION");
+    } else {
+      install(library, "1.0", "addedPkg");
+      control.handles.get(library).trigger("rename", "addedPkg");
+    }
+    await waitUntil(() => queue.has(library) && inventory.timer,
+      "the second notification must schedule normal work");
+    if (scenario !== "failed publication") {
+      // The timer fires, but refresh() joins the in-flight publication.
+      // No further filesystem notification will rescue the queued update.
+      await waitUntil(() => !inventory.timer, "the normal timer must fire during publication");
+    }
+    assert.equal(inventory.pending, pending);
+    assert.equal(inventory.retryTimer, recovery);
+    assert.ok(queue.has(library));
+    release();
+    await pending;
+
+    if (scenario === "failed publication") {
+      assert.equal(inventory.timer, undefined, "a failed publication keeps its recovery backoff");
+      assert.equal(publications, 1);
+      assert.ok(queue.has(library), "failure must retain the queued work");
+      assert.equal(changes.at(-1).packages.get("firstPkg").version, "1.0");
+      assert.equal(inventory.retryTimer, recovery);
+      forceReadRetry(inventory);
+    } else {
+      assert.ok(inventory.timer, "successful publication must re-arm the normal scan despite recovery backoff");
+    }
+    await waitForInventoryPublication(inventory, () =>
+      changes.at(-1)?.packages.get("firstPkg")?.version === "2.00" &&
+      (scenario === "unconfirmed"
+        ? changes.at(-1)?.packages.get("secondPkg")?.version === "2.00"
+        : changes.at(-1)?.packages.has("addedPkg")));
+    assert.equal(inventory.packageReadRetries.get(library).get("unreadable"),
+      scenario === "failed publication" ? 4 : 5);
+    if (scenario !== "failed publication") assert.equal(inventory.retryTimer, recovery,
+      "normal scans do not consume or replace the unrelated recovery retry");
+  });
+}

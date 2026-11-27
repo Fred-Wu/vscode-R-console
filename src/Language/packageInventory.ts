@@ -327,13 +327,15 @@ export class PackageInventory {
   }
 
   private scheduleRetry(cancelScheduledScan = false): void {
-    if (this.disposed || this.retryTimer) return;
+    if (this.disposed) return;
     // Keep already queued events from healthy libraries when a different
-    // watcher fails. Only a failed publication should defer its next retry.
+    // watcher fails. A failed publication must defer its next retry even
+    // when another recovery timer is already armed.
     if (cancelScheduledScan) {
       if (this.timer) clearTimeout(this.timer);
       this.timer = undefined;
     }
+    if (this.retryTimer) return;
     this.log(`[Libraries] Recovery retry scheduled in ${this.retryDelay / 1000}s`);
     this.retryTimer = setTimeout(() => this.runRecoveryRetry(), this.retryDelay);
     this.retryDelay = Math.min(this.retryDelay * 2, 30000);
@@ -365,6 +367,7 @@ export class PackageInventory {
     const unconfirmed = new Set(this.unconfirmedLibraries);
     this.dirtyLibraries.clear();
     this.unconfirmedLibraries.clear();
+    let failed = false;
     const request = this.scan(revision, dirty, unconfirmed).then(() => {
       if (this.disposed || revision !== this.revision) return;
       if (this.hasPackageReadRetries()) {
@@ -377,6 +380,7 @@ export class PackageInventory {
         this.clearRetry();
       }
     }).catch(error => {
+      failed = true;
       if (!this.disposed && revision === this.revision) {
         for (const library of dirty) this.dirtyLibraries.add(library);
         for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
@@ -397,8 +401,10 @@ export class PackageInventory {
           if (active.has(library)) this.unconfirmedLibraries.add(library);
         }
         this.schedule(0);
-      } else if (!this.timer && !this.retryTimer &&
+      } else if (!this.disposed && !failed && !this.timer &&
           (this.dirtyLibraries.size || this.unconfirmedLibraries.size)) {
+        // The normal timer may have fired while this scan was still pending.
+        // Re-arm it independently of unrelated watcher or metadata recovery.
         this.schedule(250);
       }
     });
