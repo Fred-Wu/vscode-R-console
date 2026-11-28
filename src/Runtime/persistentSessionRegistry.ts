@@ -95,6 +95,7 @@ export class PersistentSessionRegistry {
   private readonly recordMetadata = new Map<string, Record<string, unknown>>();
   private writable = false;
   private opaque: EncryptedSession[] = [];
+  private encryptedRecords = new Map<string, EncryptedSession>();
   private readonly keys = new Map<string, Buffer>();
   private readonly pendingKeys = new Map<string, Promise<Buffer>>();
   private readonly failedKeys = new Map<string, { error: unknown; retryAfter: number }>();
@@ -132,6 +133,7 @@ export class PersistentSessionRegistry {
     this.recordMetadata.clear();
     this.sessions = [];
     this.opaque = [];
+    this.encryptedRecords.clear();
     try {
       let original: string | undefined;
       try { original = await fs.promises.readFile(this.filePath, "utf8"); }
@@ -149,6 +151,7 @@ export class PersistentSessionRegistry {
           base64(row.iv, 12); base64(row.tag, 16); base64(row.ciphertext);
           return row;
         });
+        this.encryptedRecords = new Map(entries.map(row => [identityKey(row), row]));
         const decoded = await Promise.all(entries.map(async row => {
           if (!isProcessAlive(row.pid)) return;
           try {
@@ -375,9 +378,13 @@ export class PersistentSessionRegistry {
         finally { plaintext.fill(0); }
         return { ...identity!, iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), ciphertext: ciphertext.toString("base64") };
       }));
-      const failure = encrypted.find(result => result.status === "rejected");
-      if (failure?.status === "rejected") throw failure.reason;
-      const rows = encrypted.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
+      let incomplete = false;
+      const rows = encrypted.flatMap((result, index) => {
+        if (result.status === "fulfilled") return [result.value];
+        incomplete = true;
+        const previous = this.encryptedRecords.get(identityKey(alive[index].identity!));
+        return previous ? [previous] : [];
+      });
       if (this.disposed) return false;
       this.assertRegistryUnchanged();
       if (rows.length === 0 && opaque.length === 0) {
@@ -394,8 +401,11 @@ export class PersistentSessionRegistry {
       for (const [id, key] of this.keys) if (!retained.has(id)) { key.fill(0); this.keys.delete(id); }
       for (const id of this.recordMetadata.keys()) if (!retained.has(id)) this.recordMetadata.delete(id);
       this.opaque = opaque;
-      this.reportedError = undefined;
-      return true;
+      this.encryptedRecords = new Map([...rows, ...opaque].map(row => [identityKey(row), row]));
+      if (incomplete) {
+        this.reportError("Some R Console sessions could not be saved. Their previous encrypted records have been retained where available; other sessions were saved successfully.");
+      } else this.reportedError = undefined;
+      return !incomplete;
     } catch {
       this.reportError("R Console could not update its saved sessions. The existing saved data has been retained; no plaintext fallback was written.");
       return false;

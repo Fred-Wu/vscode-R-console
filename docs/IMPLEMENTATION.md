@@ -1247,7 +1247,9 @@ cannot suppress publication of the newer order.
 `PackageInventory` monitors the effective configured library directories and their
 immediate ordinary package directories outside the R process. Each directory receives
 a non-recursive `fs.watch()` subscription. The monitor opens no individual-file
-watches and descends no further than the package-directory level. Notifications from
+watches and descends no further than the package-directory level. The pinned library
+is validated immediately before and after each new watch registration. A changed pin
+stops further registrations and closes the newly created watch. Notifications from
 an immediate package directory trigger a package metadata check. Changes deeper
 inside a package remain outside monitoring scope. Folder
 events schedule a scan of the changed library after 250 ms; a notification-driven
@@ -1479,17 +1481,33 @@ terminal options and reconnect credentials are encrypted together.
 Each persistent Rust runtime creates a random 256-bit key before R starts and
 retains it in memory for that process's lifetime. The extension obtains a copy
 through a local key broker: a user-owned Unix socket in a verified mode-0700
-`/tmp/r-console-keys-<uid>` directory, or a Windows named pipe created with a
+`.r-console` directory, or a Windows named pipe created with a
 protected user-only DACL and remote clients denied. Socket permissions are 0600.
-Endpoint names are derived from validated UUIDs. The broker returns its PID with
+On macOS, the parent is the OS-provided per-user temporary directory obtained through
+`confstr` / `getconf DARWIN_USER_TEMP_DIR`. Other Unix systems use the account database's
+home directory. The parent and its ancestry are checked for ownership and protection
+against replacement by other users. Existing unverified directories retain their
+permissions and contents, and key-broker initialization fails closed. Unix socket
+names use the validated session UUID with its hyphens removed.
+The broker returns its PID with
 the key; requests and replies have fixed lengths and bounded deadlines. The
 Windows client acknowledges receipt before the server disconnects the pipe.
+Windows key reads run through the bundled native helper, which holds the connected
+pipe while verifying `GetNamedPipeServerProcessId` against the expected runtime PID
+and comparing the server's process-token user SID with its own. It requests only
+identification-level pipe impersonation. The verified key reaches the extension
+through an anonymous stdout pipe with bounded output and a process timeout.
 
 The extension caches keys in memory while saving and clears its key buffers on
 disposal. Registry writes use exclusive mode-0600 temporary files followed by
 atomic replacement, check for intervening changes on disk, and serialize saves.
 Queued saves coalesce to the latest UI snapshot; deactivation awaits the final
-save before detaching. VS Code reloads retrieve keys from the surviving runtimes.
+save before detaching. Encryption failures are isolated per session: healthy records
+are committed, and failed sessions retain their last saved ciphertext when available.
+A new session with an unavailable key remains pending for a later save. An incomplete
+save returns failure and reports the affected persistence limitation while preserving
+successful updates. Explicitly removed sessions are pruned; opaque records retained
+during loading remain available for retry. VS Code reloads retrieve keys from the surviving runtimes.
 R exit, crash or reboot ends the key lifetime and makes the associated encrypted
 replay unrecoverable. Session persistence requires a living runtime.
 

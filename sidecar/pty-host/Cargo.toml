@@ -1,6 +1,6 @@
 [package]
 name = "R_CONSOLE_HOST"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 
 [[bin]]

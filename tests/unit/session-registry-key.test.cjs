@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const net = require("node:net");
+const os = require("node:os");
 const { randomUUID } = require("node:crypto");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
@@ -47,6 +48,58 @@ test("session identities cannot choose arbitrary local or network endpoints", ()
   for (const pid of [0, -1, NaN, 2 ** 32, "123"]) {
     assert.throws(() => sessionRegistryKeyEndpoint({ sessionId: randomUUID(), pid }));
   }
+});
+
+test("Unix key discovery uses the protected account location and ignores the public UID directory", { skip: process.platform === "win32" }, t => {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "key-home-")));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const { sessionRegistryKeyEndpoint: endpoint } = loadSource("src/Runtime/sessionRegistryKey.ts", {
+    os: { userInfo: () => ({ homedir: home }) },
+    fs: { ...fs, lstatSync: file => {
+      assert.ok(!String(file).startsWith("/tmp/r-console-keys-"));
+      return fs.lstatSync(file);
+    } },
+  }, { "process.platform": '"linux"' });
+  const identity = { sessionId: randomUUID(), pid: process.pid };
+  assert.equal(endpoint(identity), path.join(home, ".r-console", identity.sessionId.replace(/-/g, "")));
+  fs.chmodSync(home, 0o777);
+  assert.throws(() => endpoint(identity), /not protected/);
+  assert.equal(fs.statSync(home).mode & 0o777, 0o777, "never repair an untrusted parent's permissions");
+});
+
+test("Unix key discovery rejects a foreign-owned account location", { skip: process.platform === "win32" }, () => {
+  const home = fs.realpathSync.native(os.userInfo().homedir);
+  const { sessionRegistryKeyEndpoint: endpoint } = loadSource("src/Runtime/sessionRegistryKey.ts", {
+    os: { userInfo: () => ({ homedir: home }) },
+    fs: { ...fs, lstatSync: file => {
+      const stat = fs.lstatSync(file);
+      return file === home ? Object.assign(Object.create(stat), { uid: process.getuid() + 1, mode: 0o40700 }) : stat;
+    } },
+  }, { "process.platform": '"linux"' });
+  assert.throws(() => endpoint({ sessionId: randomUUID(), pid: process.pid }), /not protected/);
+});
+
+test("Windows key reads require the native verifier and clear rejected output", async () => {
+  const identity = { sessionId: randomUUID(), pid: process.pid };
+  let fail = false, output;
+  const calls = [];
+  const { readSessionRegistryKey: read } = loadSource("src/Runtime/sessionRegistryKey.ts", {
+    child_process: { execFile: (file, args, options, callback) => {
+      calls.push({ file, args, options });
+      output = Buffer.alloc(32, 42);
+      callback(fail ? new Error("wrong server identity") : null, output, Buffer.alloc(0));
+    } },
+    net: { createConnection: () => { throw new Error("must not accept an unverified pipe response"); } },
+  }, { "process.platform": '"win32"' });
+  await assert.rejects(read(identity), /verification is unavailable/);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await read(identity, "/packaged/R_CONSOLE_HOST.exe"), Buffer.alloc(32, 42));
+  assert.deepEqual(calls[0].args, ["--read-session-key", identity.sessionId, String(identity.pid)]);
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.ok(calls[0].options.timeout <= 4000);
+  fail = true;
+  await assert.rejects(read(identity, "/packaged/R_CONSOLE_HOST.exe"), /authenticated/);
+  assert.deepEqual(output, Buffer.alloc(32));
 });
 
 test("private key broker supports fragmented replies without migration requests", { skip: process.platform === "win32" }, async t => {

@@ -811,6 +811,7 @@ class PackageDirectoryWatcher extends EventEmitter {
   }
 
   private watchDirectory(directory: string): boolean {
+    if (this.closed || !this.rootIsValid()) return false;
     let stat: fs.Stats;
     try { stat = fs.lstatSync(directory); }
     catch (error) {
@@ -826,6 +827,7 @@ class PackageDirectoryWatcher extends EventEmitter {
     const identity = JSON.stringify([stat.dev, stat.ino || stat.birthtimeMs]);
     if (this.directories.get(directory)?.identity === identity) return true;
     this.closeDirectory(directory);
+    if (this.closed || !this.rootIsValid()) return false;
     const watcher = fs.watch(directory, { persistent: false, recursive: false }, (event, filename) => {
       if (this.closed || this.directories.get(directory)?.watcher !== watcher) return;
       const file = filename ? path.join(directory, String(filename)) : directory;
@@ -856,6 +858,7 @@ class PackageDirectoryWatcher extends EventEmitter {
     // API cannot remove the race entirely, but must not retain a watch on
     // a new link or directory identity.
     try {
+      if (this.closed || !this.rootIsValid()) { watcher.close(); return false; }
       const confirmed = fs.lstatSync(directory);
       if (!confirmed.isDirectory() ||
           JSON.stringify([confirmed.dev, confirmed.ino || confirmed.birthtimeMs]) !== identity) {
@@ -932,7 +935,7 @@ class PackageDirectoryWatcher extends EventEmitter {
         }
         const directory = path.join(this.root, entry.name);
         present.add(directory);
-        if (this.closed) return;
+        if (this.closed || !this.rootIsValid()) return;
         this.watchPackage(directory);
       }
     }

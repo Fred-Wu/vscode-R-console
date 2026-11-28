@@ -305,7 +305,9 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   const { PersistentSessionRegistry } = loadSource("src/Runtime/persistentSessionRegistry.ts");
   const { session: savedSession } = require("./helpers/persistent-session.cjs");
   const registryFile = path.join(dir, "persistent-sessions.json");
-  const registry = new PersistentSessionRegistry(registryFile);
+  const { readSessionRegistryKey } = loadSource("src/Runtime/sessionRegistryKey.ts");
+  const keyReader = identity => readSessionRegistryKey(identity, binary);
+  const registry = new PersistentSessionRegistry(registryFile, keyReader);
   assert.deepEqual(await registry.load(), []);
   const saved = savedSession({ ...reconnect, cwd: dir });
   saved.terminal.ui.replay.lines = [output];
@@ -318,7 +320,7 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   }
   backend.detach(session);
   assert.equal(alive(), true, "detach must preserve the R process");
-  const restoredRegistry = new PersistentSessionRegistry(registryFile);
+  const restoredRegistry = new PersistentSessionRegistry(registryFile, keyReader);
   t.after(() => restoredRegistry.dispose());
   const restoredRecords = await restoredRegistry.load();
   assert.deepEqual(restoredRecords, [saved], "runtime memory key must recover the complete replay after reload");
@@ -339,7 +341,7 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   backend.close(session);
   await waitFor(() => !alive(), "shutdown must terminate R");
   restoredRegistry.dispose();
-  const endedRegistry = new PersistentSessionRegistry(registryFile);
+  const endedRegistry = new PersistentSessionRegistry(registryFile, keyReader);
   t.after(() => endedRegistry.dispose());
   assert.deepEqual(await endedRegistry.load(), [], "ended R sessions have no replay to reattach");
   assert.equal(await endedRegistry.save([]), true);

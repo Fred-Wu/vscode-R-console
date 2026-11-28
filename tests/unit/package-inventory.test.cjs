@@ -1311,6 +1311,46 @@ function forcePackageRetry(group, directory) {
   group.retryPackages();
 }
 
+for (const phase of ["after enumeration", "during registration"]) {
+  test(`package watches stop immediately when the pinned root changes ${phase}`, async t => {
+    let library, first, root, replaced = false;
+    const replace = () => {
+      if (replaced) return;
+      replaced = true;
+      fs.renameSync(library, path.join(root, "original-library"));
+      fs.mkdirSync(library);
+      for (const name of ["alpha", "beta", "gamma"]) fs.mkdirSync(path.join(library, name));
+    };
+    const control = controlledWatches(undefined, file => {
+      if (phase === "during registration" && file === first) replace();
+    });
+    let enumerations = 0;
+    const f = fixture(t, 0, {
+      watch: control.watch,
+      readdirSync: (file, ...args) => {
+        const result = fs.readdirSync(file, ...args);
+        if (file === library && phase === "after enumeration") {
+          // A Dirent inspection occurs after refresh's post-enumeration guard.
+          const entry = result.find(item => item.name === "alpha");
+          const isDirectory = entry.isDirectory.bind(entry);
+          entry.isDirectory = () => { if (++enumerations === 1) replace(); return isDirectory(); };
+        }
+        return result;
+      },
+    });
+    ({ root, libraries: [library] } = f);
+    first = f.install(library, "1.0", "alpha");
+    f.install(library, "1.0", "beta");
+    f.install(library, "1.0", "gamma");
+    f.inventory.setLibraryPaths([library]);
+    await f.settle(() => f.changes.at(-1)?.libraries[0]?.suspended);
+    assert.equal(replaced, true);
+    assert.deepEqual(control.attempts, phase === "after enumeration" ? [library] : [library, first]);
+    assert.ok([...control.handles.values()].every(handle => handle.closed));
+    assert.equal(f.inventory.watchers.size, 0);
+  });
+}
+
 test("a persistent package registration failure leaves the library and sibling watches active", async t => {
   let broken, fail = true;
   const control = controlledWatches(file => {

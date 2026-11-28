@@ -335,6 +335,41 @@ test("missing runtime keys back off so heartbeat saves do not repeatedly block s
   assert.equal(calls, 1);
 });
 
+test("a new session with an unavailable key does not block healthy saves or replay clearing", async t => {
+  const healthy = session(), missing = session(), another = session();
+  const { registry, file, keys, read, errors } = fixture(t, { sessions: [healthy] });
+  await registry.load();
+  await keys.readKey(missing.terminal.runtime);
+  keys.runtimes.get(`${missing.terminal.runtime.sessionId}:${process.pid}`).unavailable = true;
+  healthy.terminal.ui.replay.lines = [];
+  missing.terminal.ui.inputText = "UNSAVED_SECRET";
+  assert.equal(await registry.save([healthy, missing, another]), false, "report the incomplete save");
+  assert.deepEqual(read().sessions, [healthy, another], "healthy records still commit");
+  assert.doesNotMatch(fs.readFileSync(file, "utf8"), /UNSAVED_SECRET/);
+  assert.ok(errors.length);
+  keys.runtimes.get(`${missing.terminal.runtime.sessionId}:${process.pid}`).unavailable = false;
+  registry.failedKeys.clear();
+  assert.equal(await registry.save([healthy, missing, another]), true);
+  assert.deepEqual(read().sessions, [healthy, missing, another]);
+});
+
+test("a failed re-encryption retains the last ciphertext while other records advance", async t => {
+  const healthy = session(), unavailable = session();
+  const { registry, file, keys, read } = fixture(t, { sessions: [healthy, unavailable] });
+  await registry.load();
+  const original = JSON.parse(fs.readFileSync(file, "utf8")).sessions[1];
+  registry.clearKeys();
+  keys.runtimes.get(`${unavailable.terminal.runtime.sessionId}:${process.pid}`).unavailable = true;
+  healthy.terminal.ui.inputText = "healthy update";
+  const newer = structuredClone(unavailable);
+  newer.terminal.ui.inputText = "unavailable update";
+  assert.equal(await registry.save([healthy, newer]), false);
+  assert.deepEqual(read().sessions, [healthy, unavailable]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).sessions[1], original);
+  assert.equal(await registry.save([healthy]), true, "explicitly removed readable records are pruned");
+  assert.deepEqual(read().sessions, [healthy]);
+});
+
 test("unknown metadata stays with its record during partial recovery", async t => {
   const original = session(), other = session();
   const { registry, file, keys } = fixture(t, { sessions: [original], futureMetadata: "retain" });

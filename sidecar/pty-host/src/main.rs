@@ -6,6 +6,8 @@ mod member_inspection;
 mod protocol;
 mod registry_key;
 #[cfg(windows)]
+mod registry_key_client;
+#[cfg(windows)]
 mod windows_pipe_security;
 
 fn main() {
@@ -34,6 +36,13 @@ fn windows_launch_or_run_real_host() -> Result<(), Box<dyn std::error::Error>> {
     const REAL_HOST_ENV: &str = "VSC_R_CONSOLE_REAL_HOST";
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--read-session-key") {
+        use std::io::Write;
+        if args.len() != 3 { return Err("--read-session-key requires a session UUID and PID".into()); }
+        let key = registry_key_client::read(&args[1], args[2].parse()?)?;
+        std::io::stdout().lock().write_all(&key.bytes)?;
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("--secure-session-pipe") {
         if args.len() != 2 {
             return Err("--secure-session-pipe requires one pipe name".into());

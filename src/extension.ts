@@ -24,6 +24,8 @@ import {
   type TerminalContext,
 } from "./Runtime/persistentSessionRegistry";
 import { showLegacySessionNotice, manageLegacySessions, closeLegacyConsoleView } from "./Terminal/legacySessionNotice";
+import { readSessionRegistryKey } from "./Runtime/sessionRegistryKey";
+import { getBundledRustSidecarPath } from "./Runtime/runtimeBackend";
 
 type ConsoleRecord = {
   rTerminal: RTerminal;
@@ -95,7 +97,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
   extensionBaseUri = context.extensionUri;
-  persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context), undefined,
+  persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context),
+    identity => readSessionRegistryKey(identity, getBundledRustSidecarPath(context.extensionUri.fsPath)),
     message => { void vscode.window.showErrorMessage(message); }, context.secrets);
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);

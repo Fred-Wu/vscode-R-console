@@ -5,7 +5,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-struct Key { bytes: [u8; 32] }
+pub(crate) struct Key { pub(crate) bytes: [u8; 32] }
 impl Drop for Key {
     fn drop(&mut self) {
         for byte in &mut self.bytes { unsafe { std::ptr::write_volatile(byte, 0) }; }
@@ -29,7 +29,7 @@ impl Drop for Broker {
     }
 }
 
-fn valid_session_id(id: &str) -> bool {
+pub(crate) fn valid_session_id(id: &str) -> bool {
     id.len() == 36 && id.bytes().enumerate().all(|(i, b)| {
         if [8, 13, 18, 23].contains(&i) { b == b'-' }
         else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) }
@@ -54,14 +54,53 @@ pub(crate) fn start(id: &str) -> io::Result<Broker> {
     platform_start(id, key)
 }
 
+#[cfg(target_os = "macos")]
+fn account_key_base() -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if size == 0 { return Err(io::Error::last_os_error()); }
+    let mut bytes = vec![0u8; size];
+    let written = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, bytes.as_mut_ptr().cast(), size) };
+    if written == 0 || written > size { return Err(io::Error::other("per-user temporary directory unavailable")); }
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..written - 1])))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn account_key_base() -> io::Result<std::path::PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut capacity = 1024;
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut bytes = vec![0u8; capacity];
+        let mut found = std::ptr::null_mut();
+        let error = unsafe { libc::getpwuid_r(libc::geteuid(), entry.as_mut_ptr(),
+            bytes.as_mut_ptr().cast(), bytes.len(), &mut found) };
+        if error == libc::ERANGE && capacity < 1024 * 1024 { capacity *= 2; continue; }
+        if error != 0 { return Err(io::Error::from_raw_os_error(error)); }
+        if found.is_null() { return Err(io::Error::other("current account has no home directory")); }
+        let entry = unsafe { entry.assume_init() };
+        if entry.pw_dir.is_null() { return Err(io::Error::other("current account has no home directory")); }
+        let home = unsafe { CStr::from_ptr(entry.pw_dir) };
+        return Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())));
+    }
+}
+
 #[cfg(unix)]
-fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
-    use std::io::{Read, Write};
-    use std::time::Instant;
-    use std::os::unix::{fs::{DirBuilderExt, MetadataExt, PermissionsExt}, net::UnixListener};
+fn private_directory(home: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let uid = unsafe { libc::geteuid() };
-    // A short local path also fits macOS's sockaddr_un limit.
-    let directory = std::path::PathBuf::from(format!("/tmp/r-console-keys-{uid}"));
+    let home = std::fs::canonicalize(home)?;
+    for directory in home.ancestors() {
+        let stat = std::fs::symlink_metadata(directory)?;
+        let owner = if directory == home { stat.uid() == uid } else { stat.uid() == uid || stat.uid() == 0 };
+        let protected = stat.mode() & 0o022 == 0 ||
+            (directory != home && stat.uid() == 0 && stat.mode() & 0o1000 != 0);
+        if !stat.is_dir() || !owner || !protected {
+            return Err(io::Error::other("session key home is not protected from other users"));
+        }
+    }
+    let directory = home.join(".r-console");
     match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
         Ok(()) => {},
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
@@ -71,7 +110,16 @@ fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         return Err(io::Error::other("registry key directory is not private to this user"));
     }
-    let endpoint = directory.join(format!("{id}.sock"));
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
+    use std::io::{Read, Write};
+    use std::time::Instant;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let directory = private_directory(&account_key_base()?)?;
+    let endpoint = directory.join(id.replace('-', ""));
     let listener = UnixListener::bind(&endpoint)?;
     if let Err(error) = std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600))
         .and_then(|()| listener.set_nonblocking(true)) {
@@ -235,6 +283,30 @@ mod tests {
             assert!(!valid_session_id(id));
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn key_directory_requires_a_protected_account_location() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = crate::protocol::secure_server_nonce().unwrap();
+        let name: String = nonce[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let home = std::env::temp_dir().join(format!("key-home-{name}"));
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = private_directory(&home).unwrap();
+        assert_eq!(directory.parent().unwrap(), std::fs::canonicalize(&home).unwrap());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_directory(&home).is_err());
+        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o755);
+        std::fs::remove_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(&home, &directory).unwrap();
+        assert!(private_directory(&home).is_err());
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_directory(&home).is_err());
+        assert!(!directory.exists());
+        std::fs::remove_dir(home).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_endpoint_retains_one_key_and_removes_it_on_shutdown() {
