@@ -607,3 +607,33 @@ test("Ctrl+L removes old output from encrypted replay while retaining the live s
   t.after(() => restored.dispose());
   assert.deepEqual(await restored.load(), [saved]);
 });
+
+for (const order of ["valid-first", "invalid-first", "both-valid"]) {
+  test(`duplicate encrypted identities preserve the entire registry (${order})`, async t => {
+    const entry = session();
+    const { registry, file } = fixture(t, { sessions: [entry] });
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    const duplicate = { ...data.sessions[0] };
+    if (order !== "both-valid") duplicate.tag = Buffer.alloc(16).toString("base64");
+    data.sessions = order === "invalid-first" ? [duplicate, ...data.sessions] : [...data.sessions, duplicate];
+    const original = JSON.stringify(data);
+    fs.writeFileSync(file, original);
+    let reads = 0;
+    const read = registry.readKey;
+    registry.readKey = identity => { reads++; return read(identity); };
+    assert.deepEqual(await registry.load(), []);
+    assert.equal(reads, 0, "reject ambiguity before contacting runtime key brokers");
+    assert.equal(await registry.save([entry]), false);
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+  });
+}
+
+test("duplicate outgoing identities cannot create an ambiguous registry", async t => {
+  const entry = session();
+  const { registry, file } = fixture(t, { sessions: [entry] });
+  await registry.load();
+  const original = fs.readFileSync(file, "utf8");
+  assert.equal(await registry.save([entry, entry]), false);
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.equal(await registry.save([entry]), true);
+});

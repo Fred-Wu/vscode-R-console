@@ -179,9 +179,13 @@ export class PersistentSessionRegistry {
       const plaintext = parsed.format !== REGISTRY_FORMAT;
       if (!plaintext) {
         if (parsed.version !== 1) throw new Error("Unsupported registry format");
+        const identities = new Set<string>();
         const entries = parsed.sessions.map((entry: unknown) => {
           if (!isSessionRegistryIdentity(entry) || !isObjectRecord(entry)) throw new Error("Invalid registry identity");
           const row = entry as EncryptedSession;
+          const id = identityKey(row);
+          if (identities.has(id)) throw new Error("Duplicate registry identity");
+          identities.add(id);
           base64(row.iv, 12); base64(row.tag, 16); base64(row.ciphertext);
           return row;
         });
@@ -427,6 +431,8 @@ export class PersistentSessionRegistry {
       const blocked = new Set(opaque.map(identityKey));
       const owned = records.map(record => ({ record, identity: identityOf(record) }));
       if (owned.some(item => !item.identity)) throw new Error("Saved record has no session key owner");
+      const identities = owned.map(item => identityKey(item.identity!));
+      if (new Set(identities).size !== identities.length) throw new Error("Duplicate saved session identity");
       const alive = owned.filter(item => isProcessAlive(item.identity!.pid) && !blocked.has(identityKey(item.identity!)));
       if (alive.length + opaque.length > MAX_REGISTRY_SESSIONS) throw new RegistryLimitError();
       const deadline = Date.now() + KEY_READ_BUDGET_MS;

@@ -970,3 +970,36 @@ test("excluded middle copies preserve R selection behind invalid entries", { tim
   assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
   assert.equal(client.failedPackageRefresh, undefined);
 });
+
+test("unknown roots defer package selection beyond their position while verified earlier copies refresh", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  install(first, "selectedExport"); install(second, "laterExport");
+  const unknown = path.join(root, "unknown"); fs.mkdirSync(unknown);
+  const env = { ...process.env, R_LIBS_USER: [first, unknown, second, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete } = createClient({ env, libraries: [first, second] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized && !client.packageRefreshPromise, "initial inventory published");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "selectedExport"));
+  const server = instances[0];
+  const firstRoot = fs.realpathSync.native(first), secondRoot = fs.realpathSync.native(second);
+  const unknownRoot = fs.realpathSync.native(unknown);
+  // The loaded namespace comes from first. Omitting that unknown root must
+  // neither select the later copy nor treat this loaded package as removed.
+  for (const installations of [{ [pkg]: [path.join(secondRoot, pkg)] }, {}]) {
+    const result = await server.sendRequest("rConsole/refreshPackages", {
+      installations, libraryRoots: [firstRoot, secondRoot, ...defaults], unknownRoots: [firstRoot],
+      changed: [pkg], changedInstallationPaths: [path.join(secondRoot, pkg)],
+    });
+    assert.deepEqual(result.restart, []);
+    assert.ok(!result.changed.includes(pkg));
+  }
+  // A known valid earlier installation can still refresh ahead of the unknown root.
+  const earlier = await server.sendRequest("rConsole/refreshPackages", {
+    installations: { [pkg]: [path.join(firstRoot, pkg), path.join(secondRoot, pkg)] },
+    libraryRoots: [firstRoot, unknownRoot, secondRoot, ...defaults], unknownRoots: [unknownRoot],
+    changed: [pkg], changedInstallationPaths: [path.join(firstRoot, pkg)],
+    unmonitored: defaults.flatMap(directory => fs.readdirSync(directory)),
+  });
+  assert.ok(earlier.restart.includes(pkg));
+});

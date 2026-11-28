@@ -206,6 +206,15 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
             return(get(pkgname, selected_installations, inherits = FALSE))
         }
         candidates <- chartr("\\", "/", normalize_character(params$installations[[pkgname]]))
+        library_roots <- chartr("\\", "/", normalize_character(params$libraryRoots))
+        unknown_roots <- chartr("\\", "/", normalize_character(params$unknownRoots))
+        unknown_position <- match(TRUE, library_roots %in% unknown_roots)
+        # An unobserved root occupies its search-order position for every name,
+        # including namespaces that have no entries in the observed inventory.
+        if (!is.na(unknown_position)) {
+            positions <- match(dirname(candidates), library_roots)
+            candidates <- candidates[!is.na(positions) & positions < unknown_position]
+        }
         barriers <- which(candidates %in% unmonitored_installations |
             dirname(candidates) %in% unmonitored_roots)
         if (length(barriers)) candidates <- head(candidates, barriers[[1]] - 1L)
@@ -221,7 +230,7 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
         }
         # NULL means selection is unknown beyond an excluded copy. Preserve
         # that boundary without opening or resolving its metadata or links.
-        if (!length(selected) && length(barriers)) {
+        if (!length(selected) && (length(barriers) || !is.na(unknown_position))) {
             selected <- NULL
             excluded <<- union(excluded, pkgname)
         }

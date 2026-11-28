@@ -1150,3 +1150,37 @@ test("later-copy changes invalidate displayed completion only when R selects tha
   assert.equal(invalidated, 1, "metadata changes in R's selected copy dismiss stale suggestions");
   assert.equal(instances.length, 1);
 });
+
+for (const phase of ["startup", "session state"]) {
+  test(`package publication is revalidated after ${phase} preparation`, async t => {
+    const { client, instances } = createClient(t);
+    let valid = true, narrowed = 0;
+    const next = { ...change(), changed: ["healthy"] };
+    const snapshot = { ...change(), isCurrent: () => valid,
+      revalidate: () => valid ? snapshot : (++narrowed, next) };
+    const method = phase === "startup" ? "ensureClient" : "applySessionState";
+    const prepare = client[method].bind(client);
+    client[method] = async (...args) => {
+      const result = await prepare(...args);
+      valid = false;
+      return result;
+    };
+    await client.refreshPackages(snapshot);
+    const requests = instances[0].requests.filter(request => request.method === "rConsole/refreshPackages");
+    assert.equal(narrowed, 1);
+    assert.equal(requests.length, 1, "healthy libraries still reach the LSP");
+    assert.deepEqual(requests[0].params.installations, Object.create(null));
+  });
+}
+
+test("unknown library inventories carry ordered root barriers to the LSP", async t => {
+  const { client, instances } = createClient(t);
+  await client.refreshPackages({ ...change(), libraries: [
+    { path: "/first", root: "/physical-first", packages: new Map() },
+    { path: "/unknown", root: "/physical-unknown", packages: new Map(), unavailable: true, initializing: true },
+    { path: "/last", packages: new Map() },
+  ] });
+  const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
+  assert.deepEqual(request.params.libraryRoots, ["/physical-first", "/physical-unknown", "/last"]);
+  assert.deepEqual(request.params.unknownRoots, ["/physical-unknown"]);
+});

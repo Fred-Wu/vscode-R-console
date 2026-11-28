@@ -1305,9 +1305,17 @@ recovery budgets are preserved across the hold.
 One reconciliation publishes the final stable inventory and requests a single
 language-server replacement when loaded namespaces changed. Lock checks and the
 two-snapshot stability check remain part of reconciliation. Stability is confirmed
-independently for each library. Events arriving during a scan invalidate that
-library's candidate and preserve its last published state while healthy libraries
-continue publishing. Unsettled roots are temporarily excluded from reconciliation
+independently for each library. Per-library event revisions cover scanning,
+publication preparation and the language-server request. Preparation revalidates
+the snapshot after client startup and session synchronization, excluding libraries
+that changed while retaining healthy updates. An event during the request prevents
+committing that snapshot and requeues all uncommitted observations.
+Libraries scan independently, with at most one outstanding inventory scan per
+configured path. Each publication waits up to one second for newly started scans;
+pending reads retain their slot until the filesystem operation completes. Healthy
+libraries publish while pending libraries retain their verified state. Completed
+background scans trigger reconciliation and are reused if their configuration and
+event revisions remain current. Unsettled roots are temporarily excluded from reconciliation
 during sibling publication. Changes made outside the console's active evaluation
 use a 250 ms scan deadline; subsequent events preserve the earliest deadline.
 Lock presence
@@ -1414,7 +1422,10 @@ to that later copy still invalidate its metadata and loaded namespace. Excluded
 and suspended installations retain their ordered positions as selection barriers.
 The R adapter validates monitored candidates preceding the first barrier. If none
 is valid, reconciliation of that name is deferred without opening or resolving the
-excluded installation. Valid earlier copies continue to receive updates.
+excluded installation. A library with no verified inventory supplies an ordered
+root barrier for every package name, including loaded namespaces absent from the
+observed inventory. Verified absence becomes available after a successful scan.
+Valid earlier copies continue to receive updates.
 Installation locks defer the affected package. The R adapter retains changed entry
 paths for excluded names until reconciliation resumes or the process is replaced.
 Reusing an unchanged copy after a
@@ -1588,6 +1599,9 @@ R exit, crash or reboot ends the key lifetime and makes the associated encrypted
 replay unrecoverable. Session persistence requires a living runtime.
 
 Registry reads accept regular files up to 64 MiB and at most 256 session records.
+Encrypted session identities must be unique before any key retrieval or decryption.
+An ambiguous registry remains intact with saving disabled. Duplicate identities in
+an outgoing snapshot reject that save while preserving the existing file.
 Reads stop at the byte limit even if a file grows after its initial size check.
 The same limits protect reads before replacement and newly encoded registry writes.
 An oversized or invalid registry remains intact, disables saving for that registry,

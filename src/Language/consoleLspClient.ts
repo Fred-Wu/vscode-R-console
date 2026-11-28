@@ -786,14 +786,17 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private async refreshPackages(change: PackageInventoryChange): Promise<void> {
     const refresh = (async () => {
+      change = change.revalidate?.() ?? change;
       if (!change.isCurrent()) return;
       const previousClient = this.client;
       let client = await this.ensureClient();
       if (!client?.isRunning() || this.disposed) throw new Error("Language server is not running");
+      change = change.revalidate?.() ?? change;
       if (!change.isCurrent()) return;
       await this.applySessionState(client);
       client = this.client;
       if (!client?.isRunning() || this.disposed) throw new Error("Language server changed during package refresh");
+      change = change.revalidate?.() ?? change;
       if (!change.isCurrent()) return;
       const hasChanges = change.changed.length > 0;
       if (hasChanges) {
@@ -818,6 +821,9 @@ export class ConsoleLspClient implements CompletionProvider {
       }
       const params = {
         installations,
+        libraryRoots: change.libraries.map(library => library.root ?? library.path),
+        unknownRoots: change.libraries.filter(library => library.initializing && (library.suspended || library.unavailable))
+          .map(library => library.root ?? library.path),
         unmonitoredInstallationPaths: [...unmonitoredInstallationPaths],
         unmonitored: change.unmonitored ?? [],
         unmonitoredRoots: change.unmonitoredRoots ?? [],
@@ -832,7 +838,7 @@ export class ConsoleLspClient implements CompletionProvider {
       const refreshKey = JSON.stringify([
         change.libraries.map(library => library.path),
         change.libraries.map(library => [...library.packages].map(([name, item]) => [name, item.target, item.identity])),
-        params.installations, params.unmonitoredInstallationPaths, params.unmonitored, params.unmonitoredRoots, params.deferred,
+        params.installations, params.libraryRoots, params.unknownRoots, params.unmonitoredInstallationPaths, params.unmonitored, params.unmonitoredRoots, params.deferred,
       ]);
       const previousFailure = this.failedPackageRefresh;
       const retryingConflict = previousFailure?.client === client && previousFailure.key === refreshKey;

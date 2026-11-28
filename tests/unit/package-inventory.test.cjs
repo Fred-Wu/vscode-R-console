@@ -20,7 +20,7 @@ function matchesDescription(item, directory) {
 }
 
 function fixture(t, notificationDelay = 0, overrides = {}) {
-  // Use the same canonical representation as PackageInventory.rootFor().
+  // Use the same canonical representation as the pinned inventory roots.
   // On Windows realpathSync can yield RUNNER~1 while .native returns the
   // long path; comparing those as strings misidentifies the same directory.
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-inventory-")));
@@ -2340,3 +2340,115 @@ test("whole-library locks retain exclusions for temporarily absent package copie
   assert.equal(f.changes.at(-1).libraries[0].deferred.size, 0);
   assert.deepEqual(f.changes.at(-1).unmonitored, []);
 });
+
+for (const phase of ["preparation", "request"]) {
+  test(`events during LSP ${phase} invalidate publication and preserve healthy libraries`, async t => {
+    const control = controlledWatches();
+    const f = fixture(t, 0, { watch: control.watch });
+    const [changing, healthy] = f.libraries;
+    const first = f.install(changing, "1", "changing");
+    const second = f.install(healthy, "1", "healthy");
+    f.inventory.setLibraryPaths(f.libraries);
+    await f.settle();
+    const verified = f.inventory.packages.get("changing");
+    let entered = false, inject = true;
+    f.inventory.onChange = async change => {
+      if (inject && change.changed.includes("healthy")) {
+        entered = true;
+        await new Promise(resolve => setImmediate(resolve));
+        f.inventory.watchers.get(changing).emit("change", "changing");
+        assert.equal(change.isCurrent(), false, "the confirmed snapshot expires on a later event");
+        if (phase === "preparation") {
+          const current = change.revalidate();
+          assert.equal(current.isCurrent(), true);
+          assert.deepEqual(current.changed, ["healthy"]);
+          assert.equal(current.packages.get("changing"), verified);
+          assert.ok(current.unmonitoredRoots.includes(changing));
+          assert.ok(!current.changedInstallationPaths.includes(first));
+          f.changes.push(current);
+        } else {
+          inject = false;
+          assert.equal(f.inventory.packages.get("healthy").identity === change.packages.get("healthy").identity, false);
+        }
+      } else f.changes.push(change);
+    };
+    fs.appendFileSync(path.join(first, "DESCRIPTION"), "Title: changed\n");
+    fs.appendFileSync(path.join(second, "DESCRIPTION"), "Title: changed\n");
+    for (const library of f.libraries) f.inventory.watchers.get(library).emit("change", "package");
+    await waitForPublication(() => entered && matchesDescription(f.inventory.packages.get("healthy"), second));
+    if (phase === "preparation") assert.equal(f.inventory.packages.get("changing"), verified);
+    inject = false;
+    await f.settle(() => matchesDescription(f.inventory.packages.get("changing"), first));
+  });
+}
+
+test("an unobserved library preserves precedence while verified earlier packages update", async t => {
+  const control = controlledWatches();
+  let unavailable;
+  const f = fixture(t, 0, { watch: control.watch, promises: { ...fs.promises,
+    opendir: async (directory, ...args) => {
+      if (directory === unavailable) throw Object.assign(new Error("offline"), { code: "EIO" });
+      return fs.promises.opendir(directory, ...args);
+    },
+  } });
+  const [earlier, later] = f.libraries;
+  const middle = path.join(f.root, "unknown"); fs.mkdirSync(middle);
+  unavailable = middle;
+  const selected = f.install(earlier, "1", "selected");
+  f.install(middle, "1", "hidden");
+  const laterCopy = f.install(later, "1", "hidden");
+  f.inventory.setLibraryPaths([earlier, middle, later]);
+  await waitForPublication(() => f.inventory.packages.has("selected") && f.changes.at(-1).unmonitored.includes("hidden"));
+  assert.equal(f.inventory.packages.has("hidden"), false);
+  assert.ok(f.changes.at(-1).unmonitored.includes("hidden"));
+  assert.equal(f.inventory.libraries[1].initializing, true);
+  fs.appendFileSync(path.join(selected, "DESCRIPTION"), "Title: updated\n");
+  f.inventory.watchers.get(earlier).emit("change", "selected");
+  await waitForPublication(() => matchesDescription(f.inventory.packages.get("selected"), selected));
+  assert.equal(f.inventory.packages.has("hidden"), false);
+  unavailable = undefined;
+  f.inventory.dirtyLibraries.add(middle);
+  await f.inventory.refresh();
+  await f.settle(() => f.inventory.packages.get("hidden")?.path === path.join(middle, "hidden"));
+  assert.notEqual(f.inventory.packages.get("hidden").path, laterCopy);
+});
+
+for (const initial of [false, true]) {
+  test(`a pending library read stays single-flight while healthy libraries publish (initial=${initial})`, async t => {
+    const control = controlledWatches();
+    const context = new (require("node:async_hooks").AsyncLocalStorage)();
+    let blockedRoot, release, reads = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    const f = fixture(t, 0, { watch: control.watch, promises: { ...fs.promises,
+      opendir: async (directory, ...args) => {
+        if (directory === blockedRoot && context.getStore()) { reads++; await gate; }
+        return fs.promises.opendir(directory, ...args);
+      },
+    } });
+    const [healthy, stalled] = f.libraries;
+    const good = f.install(healthy, "1", "healthy");
+    const slow = f.install(stalled, "1", "slow");
+    const scan = f.inventory.scan.bind(f.inventory);
+    f.inventory.scan = (...args) => context.run(true, () => scan(...args));
+    f.inventory.setLibraryPaths(initial ? f.libraries : [stalled, healthy]);
+    if (!initial) await f.settle();
+    blockedRoot = stalled;
+    t.after(() => { blockedRoot = undefined; release(); });
+    fs.appendFileSync(path.join(good, "DESCRIPTION"), "Title: updated\n");
+    fs.appendFileSync(path.join(slow, "DESCRIPTION"), "Title: updated\n");
+    for (const library of f.libraries) f.inventory.dirtyLibraries.add(library);
+    void f.inventory.refresh();
+    await waitForPublication(() => matchesDescription(f.inventory.packages.get("healthy"), good));
+    assert.equal(reads, 1);
+    assert.equal(f.inventory.scans.get(stalled).complete, false);
+    for (let round = 0; round < 3; round++) {
+      fs.appendFileSync(path.join(good, "DESCRIPTION"), `Title: ${round}\n`);
+      f.inventory.watchers.get(healthy).emit("change", "healthy");
+      await waitForPublication(() => matchesDescription(f.inventory.packages.get("healthy"), good));
+      assert.equal(reads, 1, "pending operations cannot accumulate across refreshes");
+    }
+    blockedRoot = undefined; release();
+    await f.settle(() => matchesDescription(f.inventory.packages.get("slow"), slow));
+    assert.equal(f.inventory.scans.size, 0);
+  });
+}
