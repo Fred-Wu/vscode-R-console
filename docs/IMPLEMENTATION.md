@@ -1257,6 +1257,23 @@ events schedule a scan of the changed library after 250 ms; a notification-drive
 inventories have no periodic filesystem poller. Delivery of changes on a network
 filesystem depends on its support for filesystem notifications.
 
+Directory enumeration uses asynchronous `opendir`/`read` operations with a
+32-entry read-ahead buffer. Library discovery, change detection, watcher
+reconciliation and installation-lock backup discovery each retain at most 4,096
+entries per directory. Observing the 4,097th entry ends that enumeration and
+closes its handle. An oversized library or lock-backup directory suspends the
+library's inventory monitoring until reconfiguration, preserving its last verified
+package state. The lifecycle log identifies the directory that exceeded the limit.
+Pinned paths and cancellation state are validated around asynchronous reads;
+completion, cancellation and failures close the directory handle.
+
+Each library watcher serializes its asynchronous reconciliations. Notifications
+received during enumeration queue one follow-up reconciliation. Pausing evaluation
+invalidates in-flight results and retains that work for the next main prompt.
+Removal and disposal prevent pending enumerations from registering package watches.
+New and replacement package watches trigger a metadata check to include changes
+that occurred before registration completed.
+
 An active console evaluation holds package inventory publication and ordinary
 package-directory watcher reconciliation. Filesystem notifications accumulate
 dirty libraries while pinned-path validation and replacement warnings remain

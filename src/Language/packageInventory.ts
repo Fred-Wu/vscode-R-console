@@ -6,10 +6,10 @@ import { captureLibraryPin, checkLibraryPin, describeLibraryPinChange, LibraryPi
   sameLibraryPin, type LibraryPin, type LibraryPinChange } from "./libraryLocationPin";
 import type { LibraryMonitoringReview } from "./libraryMonitoringNotice";
 import { inspectInstallation, verifyDirectory, type InstallationIdentity } from "./packageInstallationIdentity";
+import { DirectoryEntryLimitError, MAX_DIRECTORY_ENTRIES, readBoundedDirectory } from "./boundedDirectory";
 
 // A library may be on a slow network drive; bound watcher fanout per root.
 const MAX_PACKAGE_WATCHES_PER_LIBRARY = 128;
-const MAX_LIBRARY_ENTRIES = 4096;
 const MAX_PACKAGE_READ_RETRIES = 5;
 
 export type PackageInstallation = {
@@ -302,8 +302,13 @@ export class PackageInventory {
             if (!stat.isDirectory()) break;
             lockStat ??= stat;
             verifyDirectory(folder, stat);
-            const items = await fs.promises.readdir(folder, { withFileTypes: true });
-            if (!isCurrent()) break;
+            const items = await readBoundedDirectory(folder, () => {
+              if (!isCurrent()) return false;
+              verifyDirectory(lockPath, lockStat!);
+              if (folder !== lockPath) verifyDirectory(folder, stat);
+              return true;
+            });
+            if (!items || !isCurrent()) break;
             verifyDirectory(lockPath, lockStat);
             if (folder !== lockPath) verifyDirectory(folder, stat);
             for (const item of items) {
@@ -467,10 +472,12 @@ export class PackageInventory {
 
   private async hasInstalledPackagesChanged(library: string, previous: LibraryInventory, isCurrent: () => boolean): Promise<boolean> {
     try {
-      if (!isCurrent() || this.libraryTarget(library) === undefined) return true;
-      const root = this.rootFor(library);
-      const entries = await fs.promises.readdir(root, { withFileTypes: true });
-      if (!isCurrent() || this.libraryTarget(library) === undefined) return true;
+      if (!isCurrent()) return true;
+      const pin = this.libraryTarget(library);
+      if (!pin) return true;
+      const entries = await readBoundedDirectory(pin.root,
+        () => isCurrent() && this.libraryTarget(library) === pin);
+      if (!entries || !isCurrent() || this.libraryTarget(library) !== pin) return true;
       if (entries.some(entry => entry.isDirectory() && /^00LOCK(?:-[A-Za-z][A-Za-z0-9.]*)?$/.test(entry.name))) return true;
       if (previous.deferred?.size) return true;
       const names = entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
@@ -521,7 +528,6 @@ export class PackageInventory {
         unavailablePackages: new Map(previous?.unavailablePackages),
         [state]: true,
       });
-      let entries: fs.Dirent[];
       try {
         if (!previous) this.log(`[Libraries] Scanning folder: ${library}`);
         const originalTarget = this.libraryTarget(library);
@@ -529,12 +535,9 @@ export class PackageInventory {
           libraries.push(retained("suspended"));
           continue;
         }
-        entries = await fs.promises.readdir(originalTarget.root, { withFileTypes: true });
-        if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
-        if (entries.length > MAX_LIBRARY_ENTRIES) {
-          throw Object.assign(new Error(`library entry budget exceeded (${MAX_LIBRARY_ENTRIES})`),
-            { code: "E2BIG" });
-        }
+        const entries = await readBoundedDirectory(originalTarget.root,
+          () => isCurrent() && this.libraryTarget(library) === originalTarget);
+        if (!entries || !isCurrent() || this.libraryTarget(library) !== originalTarget) return;
         const locked = await this.installationLocks(originalTarget.root, entries,
           () => isCurrent() && this.libraryTarget(library) === originalTarget);
         if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
@@ -602,7 +605,7 @@ export class PackageInventory {
           deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) });
       } catch (error) {
         if (!isCurrent()) return;
-        if ((error as NodeJS.ErrnoException).code === "E2BIG") {
+        if (error instanceof DirectoryEntryLimitError) {
           // Refuse a too-broad root instead of repeatedly enumerating an
           // entire network share or home directory in recovery retries.
           this.suspended.add(library);
@@ -611,7 +614,7 @@ export class PackageInventory {
           this.watchers.get(library)?.close();
           this.watchers.delete(library);
           this.entryMonitor.remove(library);
-          this.log(`[Libraries] Monitoring suspended: ${library} - library exceeds ${MAX_LIBRARY_ENTRIES} entries; narrow the configured root and reconfigure`);
+          this.log(`[Libraries] Monitoring suspended: ${library} - directory exceeds ${MAX_DIRECTORY_ENTRIES} entries: ${error.directory}; narrow the configured root and reconfigure`);
           libraries.push(retained("suspended"));
           continue;
         }
@@ -813,6 +816,8 @@ class PackageDirectoryWatcher extends EventEmitter {
   private closed = false;
   private limitation: string | undefined;
   private refreshPending = false;
+  private refreshPromise: Promise<void> | undefined;
+  private revision = 0;
 
   constructor(private readonly root: string, private readonly rootIsValid: () => boolean,
     onChange: (event: string, filename?: string) => void,
@@ -820,10 +825,8 @@ class PackageDirectoryWatcher extends EventEmitter {
     super();
     this.on("change", onChange);
     try {
-      if (paused) {
-        if (!this.watchDirectory(this.root)) throw new Error("Library directory disappeared during watch setup");
-        this.refreshPending = true;
-      } else this.refresh();
+      if (!this.watchDirectory(this.root)) throw new Error("Library directory disappeared during watch setup");
+      this.scheduleRefresh(0);
     }
     catch (error) { this.close(); throw error; }
   }
@@ -831,26 +834,36 @@ class PackageDirectoryWatcher extends EventEmitter {
   setPaused(paused: boolean): void {
     if (this.closed || this.paused === paused) return;
     this.paused = paused;
+    this.revision++;
     if (paused) {
+      if (this.refreshPromise) this.refreshPending = true;
       if (this.timer) { clearTimeout(this.timer); this.timer = undefined; this.refreshPending = true; }
       if (this.packageRetryTimer) clearTimeout(this.packageRetryTimer);
       this.packageRetryTimer = undefined;
     } else {
       if (this.refreshPending) {
-        this.refreshPending = false;
         this.scheduleRefresh();
       }
       this.schedulePackageRetry();
     }
   }
 
-  private scheduleRefresh(): void {
-    if (this.closed || this.timer) return;
-    if (this.paused) { this.refreshPending = true; return; }
+  private scheduleRefresh(delay = 50): void {
+    if (this.closed) return;
+    this.refreshPending = true;
+    if (this.timer || this.refreshPromise || this.paused) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      try { this.refresh(); } catch (error) { if (!this.closed) this.emit("error", error); }
-    }, 50);
+      this.refreshPending = false;
+      const revision = this.revision;
+      const request = this.refresh(revision).catch(error => {
+        if (!this.closed && revision === this.revision) this.emit("error", error);
+      }).finally(() => {
+        if (this.refreshPromise === request) this.refreshPromise = undefined;
+        if (this.refreshPending) this.scheduleRefresh();
+      });
+      this.refreshPromise = request;
+    }, delay);
     this.timer.unref();
   }
 
@@ -933,6 +946,7 @@ class PackageDirectoryWatcher extends EventEmitter {
   }
 
   private watchPackage(directory: string): void {
+    const previous = this.directories.get(directory);
     try {
       this.watchDirectory(directory);
     } catch (error) {
@@ -943,6 +957,10 @@ class PackageDirectoryWatcher extends EventEmitter {
     // needs one. Check for changes that may have occurred during the gap.
     if (this.failedPackages.delete(directory)) {
       this.emit("change", "rename", path.relative(this.root, directory));
+    } else if (this.directories.get(directory) !== previous) {
+      // Asynchronous setup can finish after inventory publication. Recheck
+      // metadata changed before a new or replacement watch became active.
+      this.emit("change", "change", path.relative(this.root, directory));
     }
   }
 
@@ -975,18 +993,22 @@ class PackageDirectoryWatcher extends EventEmitter {
     } catch (error) { if (!this.closed) this.emit("error", error); }
   }
 
-  private refresh(): void {
-    if (this.closed || !this.rootIsValid()) return;
+  private async refresh(revision: number): Promise<void> {
+    const isCurrent = () => !this.closed && !this.paused && revision === this.revision && this.rootIsValid();
+    if (!isCurrent()) return;
     if (!this.watchDirectory(this.root)) throw new Error("Library directory disappeared during watch setup");
-    if (!this.rootIsValid() || this.closed) return;
-    // Root enumeration errors still use the library-level recovery path.
-    const entries = fs.readdirSync(this.root, { withFileTypes: true });
-    if (!this.rootIsValid() || this.closed) return;
-    const present = new Set<string>([this.root]);
+    let entries: fs.Dirent[] | undefined;
     let limited: string | undefined;
-    if (entries.length > MAX_LIBRARY_ENTRIES) {
-      limited = `library entry budget (${MAX_LIBRARY_ENTRIES}) exceeded`;
-    } else {
+    try { entries = await readBoundedDirectory(this.root, isCurrent); }
+    catch (error) {
+      // Inventory publication suspends over-limit roots. Keep only the root
+      // watch until that scan completes; I/O failures use watcher recovery.
+      if (!(error instanceof DirectoryEntryLimitError)) throw error;
+      limited = `library entry budget (${MAX_DIRECTORY_ENTRIES}) exceeded`;
+    }
+    if (!isCurrent()) return;
+    const present = new Set<string>([this.root]);
+    if (entries) {
       // Select a stable, bounded subset of ordinary directories. Failed
       // candidates still count toward the budget; do not expand the set.
       for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -998,11 +1020,11 @@ class PackageDirectoryWatcher extends EventEmitter {
         }
         const directory = path.join(this.root, entry.name);
         present.add(directory);
-        if (this.closed || !this.rootIsValid()) return;
+        if (!isCurrent()) return;
         this.watchPackage(directory);
       }
     }
-    if (this.closed || !this.rootIsValid()) return;
+    if (!isCurrent()) return;
     if (limited !== this.limitation) {
       this.limitation = limited;
       if (limited) this.onLimited?.(limited);

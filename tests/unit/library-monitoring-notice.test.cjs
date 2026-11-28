@@ -34,8 +34,8 @@ function fixture(t, overrides = {}) {
   });
   const { PackageInventory } = loadSource("src/Language/packageInventory.ts", { fs: {
     ...fs, realpathSync,
-    promises: { ...fs.promises, readdir: async (file, ...args) => {
-      scans.push(file); return fs.promises.readdir(file, ...args);
+    promises: { ...fs.promises, opendir: async (file, ...args) => {
+      scans.push(file); return fs.promises.opendir(file, ...args);
     }, ...overrides.promises },
     ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== "promises")),
     watch(file, options, callback) {
@@ -62,7 +62,7 @@ function fixture(t, overrides = {}) {
     const deadline = Date.now() + 10000;
     do {
       await new Promise(resolve => setTimeout(resolve, 10));
-      if (observed() && inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size) return;
+      if (observed() && inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && [...inventory.watchers.values()].every(w => !w.timer && !w.refreshPromise && !w.refreshPending) && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size) return;
       assert.ok(Date.now() < deadline, "inventory settles: " + logs.join("\n"));
     } while (true);
   };
@@ -267,9 +267,9 @@ test("a pending inventory scan cannot publish or continue metadata access after 
     observe(file); return fs.lstatSync(file, ...args);
   }, promises: {
     lstat: async (file, ...args) => { observe(file); return fs.promises.lstat(file, ...args); },
-    readdir: async (file, ...args) => {
+    opendir: async (file, ...args) => {
       observe(file);
-      const entries = await fs.promises.readdir(file, ...args);
+      const entries = await fs.promises.opendir(file, ...args);
       if (block && file === library) { entered(); await blocked; }
       return entries;
     },

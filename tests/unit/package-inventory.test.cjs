@@ -31,6 +31,7 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
   const watches = [], entryWatches = [];
   const Inventory = loadSource("src/Language/packageInventory.ts", { fs: {
     ...fs,
+    readdirSync: () => { throw new Error("Monitoring must not enumerate synchronously"); },
     ...overrides,
     watch: (file, options, callback) => {
       if (options.encoding === "utf8") {
@@ -61,7 +62,7 @@ function fixture(t, notificationDelay = 0, overrides = {}) {
     const deadline = Date.now() + 10000;
     do {
       await new Promise(resolve => setTimeout(resolve, 20));
-      if (observed() && (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size))) return;
+      if (observed() && (inventory.disposed || (inventory.initialized && !inventory.timer && !inventory.retryTimer && !inventory.pending && [...inventory.watchers.values()].every(w => !w.timer && !w.refreshPromise && !w.refreshPending) && !inventory.dirtyLibraries.size && !inventory.unconfirmedLibraries.size))) return;
       assert.ok(Date.now() < deadline, description);
     } while (true);
   };
@@ -269,8 +270,7 @@ for (const notificationDelay of [0, 100]) {
 test("one R evaluation consolidates sequential package changes and watcher reconciliation", async t => {
   let reads = 0;
   const f = fixture(t, 0, {
-    readdirSync: (...args) => { reads++; return fs.readdirSync(...args); },
-    promises: { ...fs.promises, readdir: (...args) => { reads++; return fs.promises.readdir(...args); } },
+    promises: { ...fs.promises, opendir: (...args) => { reads++; return fs.promises.opendir(...args); } },
   });
   const [first, second] = f.libraries;
   f.install(first, "1", "alpha");
@@ -557,13 +557,13 @@ test("watcher recovery reconciles additions and removals made while watching was
 test("a library scan failure keeps its changes pending for retry", async t => {
   let library, failNext = false, failed = false;
   const f = fixture(t, 0, {
-    promises: { ...fs.promises, readdir: async (file, ...args) => {
+    promises: { ...fs.promises, opendir: async (file, ...args) => {
       if (file === library && failNext) {
         failNext = false;
         failed = true;
         throw Object.assign(new Error("Temporary read failure"), { code: "EIO" });
       }
-      return fs.promises.readdir(file, ...args);
+      return fs.promises.opendir(file, ...args);
     } },
   });
   ({ libraries: [library] } = f);
@@ -987,7 +987,7 @@ test("linked package entries are tracked without resolving, reading, watching or
   const accesses = [];
   let library;
   const promises = { ...fs.promises };
-  for (const method of ["realpath", "readlink", "stat", "access", "readFile", "open", "readdir"]) {
+  for (const method of ["realpath", "readlink", "stat", "access", "readFile", "open", "opendir"]) {
     promises[method] = async (file, ...args) => {
       accesses.push([method, String(file)]);
       return fs.promises[method](file, ...args);
@@ -1019,7 +1019,7 @@ test("linked package entries are tracked without resolving, reading, watching or
   await settle();
   assert.equal(changes.length, count, "external cache mutations are not inventory events");
   assert.ok(accesses.length > 0);
-  assert.ok(accesses.every(([method, file]) => method === "readdir" && file === library),
+  assert.ok(accesses.every(([method, file]) => method === "opendir" && file === library),
     JSON.stringify(accesses));
   assert.deepEqual([...inventory.watchers.keys()], [library]);
   assert.deepEqual(watches, [{ file: library, options: { persistent: false, recursive: false } }]);
@@ -1062,14 +1062,19 @@ for (const component of ["Meta", "Meta/package.rds", "DESCRIPTION"]) {
 test("a package changed to a link after enumeration is recorded without following it", async t => {
   let link, target, swapped = false;
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
-    promises: { ...fs.promises, readdir: async (file, ...args) => {
-      const entries = await fs.promises.readdir(file, ...args);
-      if (link && file === path.dirname(link) && !swapped) {
-        swapped = true;
-        fs.rmSync(link, { recursive: true });
-        fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
-      }
-      return entries;
+    promises: { ...fs.promises, opendir: async (file, ...args) => {
+      const handle = await fs.promises.opendir(file, ...args);
+      return {
+        read: () => handle.read(),
+        close: async () => {
+          await handle.close();
+          if (link && file === path.dirname(link) && !swapped) {
+            swapped = true;
+            fs.rmSync(link, { recursive: true });
+            fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+          }
+        },
+      };
     } },
   });
   link = install(library);
@@ -1172,9 +1177,9 @@ test("a DESCRIPTION replaced by a symlink before metadata inspection is excluded
 test("whole-library locks inspect ordinary backups and skip linked staging directories", async t => {
   const reads = [];
   const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, {
-    promises: { ...fs.promises, readdir: async (file, ...args) => {
+    promises: { ...fs.promises, opendir: async (file, ...args) => {
       reads.push(file);
-      return fs.promises.readdir(file, ...args);
+      return fs.promises.opendir(file, ...args);
     } },
   });
   const lock = path.join(library, "00LOCK");
@@ -1291,11 +1296,11 @@ test("renv-style link creation, retargeting and removal update only the pinned l
 
 test("temporary network library failures preserve verified package state until recovery", async t => {
   let unavailable = false, library;
-  const promises = { ...fs.promises, readdir: async (file, ...args) => {
+  const promises = { ...fs.promises, opendir: async (file, ...args) => {
     if (unavailable && file === library) {
       throw Object.assign(new Error("network share unavailable"), { code: "EIO" });
     }
-    return fs.promises.readdir(file, ...args);
+    return fs.promises.opendir(file, ...args);
   } };
   const fixtureData = fixture(t, 0, { promises });
   ({ libraries: [library] } = fixtureData);
@@ -1371,14 +1376,22 @@ test("an unpinnable configured root fails closed until explicitly reconfigured",
   assert.equal(resolutions, 2, "only explicit reconfiguration permits a new pin attempt");
 });
 
-test("oversized configured libraries are suspended without recurrent network scans", async t => {
-  let library, listings = 0;
-  const oversized = Array.from({ length: 4097 }, (_, i) => ({
-    name: "pkg" + i, isDirectory: () => true, isSymbolicLink: () => false,
-  }));
-  const promises = { ...fs.promises, readdir: async (file, ...args) => {
-    if (file === library) { listings++; return oversized; }
-    return fs.promises.readdir(file, ...args);
+test("oversized configured libraries stop enumeration and suspend without recurrent network scans", async t => {
+  let library;
+  const listings = [];
+  const promises = { ...fs.promises, opendir: async (file, ...args) => {
+    if (file === library) {
+      const listing = { reads: 0, closed: false };
+      listings.push(listing);
+      return {
+        read: async () => {
+          assert.ok(++listing.reads <= 4097, "stop as soon as the entry budget is exceeded");
+          return { name: "pkg" + listing.reads, isDirectory: () => true, isSymbolicLink: () => false };
+        },
+        close: async () => { listing.closed = true; },
+      };
+    }
+    return fs.promises.opendir(file, ...args);
   } };
   const f = fixture(t, 0, { promises });
   ({ libraries: [library] } = f);
@@ -1389,8 +1402,11 @@ test("oversized configured libraries are suspended without recurrent network sca
   assert.equal(inventory.watchers.size, 0, "all watchers close on a too-broad root");
   assert.equal(inventory.retryTimer, undefined, "do not repeatedly enumerate large network roots");
   assert.ok(logs.some(line => line.includes("exceeds 4096 entries")));
+  assert.ok(listings.some(listing => listing.reads === 4097));
+  assert.ok(listings.every(listing => listing.closed), "overflow and cancelled handles close");
+  const count = listings.length;
   await inventory.refresh();
-  assert.equal(listings, 1, "suspended roots are not rescanned before reconfiguration");
+  assert.equal(listings.length, count, "suspended roots are not rescanned before reconfiguration");
 });
 
 // Inject deterministic watcher failures without relying on OS limits,
@@ -1442,16 +1458,22 @@ for (const phase of ["after enumeration", "during registration"]) {
     let enumerations = 0;
     const f = fixture(t, 0, {
       watch: control.watch,
-      readdirSync: (file, ...args) => {
-        const result = fs.readdirSync(file, ...args);
-        if (file === library && phase === "after enumeration") {
-          // A Dirent inspection occurs after refresh's post-enumeration guard.
-          const entry = result.find(item => item.name === "alpha");
-          const isDirectory = entry.isDirectory.bind(entry);
-          entry.isDirectory = () => { if (++enumerations === 1) replace(); return isDirectory(); };
-        }
-        return result;
-      },
+      promises: { ...fs.promises, opendir: async (file, ...args) => {
+        const handle = await fs.promises.opendir(file, ...args);
+        return {
+          read: async () => {
+            const entry = await handle.read();
+            if (entry?.name === "alpha" && file === library && phase === "after enumeration") {
+              // Inspecting a returned Dirent must still revalidate the pin
+              // before registering a package watch or reading its metadata.
+              const isDirectory = entry.isDirectory.bind(entry);
+              entry.isDirectory = () => { if (++enumerations === 1) replace(); return isDirectory(); };
+            }
+            return entry;
+          },
+          close: () => handle.close(),
+        };
+      } },
     });
     ({ root, libraries: [library] } = f);
     first = f.install(library, "1.0", "alpha");
@@ -1475,6 +1497,7 @@ test("a persistent package registration failure leaves the library and sibling w
   broken = install(library, "1.0", "broken");
   const healthy = install(library, "1.0", "healthy");
   inventory.setLibraryPaths([library]);
+  await settle();
   const group = inventory.watchers.get(library);
   assert.ok(group, "a failed package must not prevent library watch registration");
   const rootWatch = group.directories.get(library).watcher;
@@ -1609,6 +1632,7 @@ test("a package changed into a link during watch setup is rejected without losin
   const healthy = install(library, "1.0", "healthy");
   target = install(path.join(root, "cache"), "2.0", "broken");
   inventory.setLibraryPaths([library]);
+  await settle();
   const group = inventory.watchers.get(library);
   assert.ok(control.handles.get(broken).closed, "close the watch whose identity check failed");
   assert.equal(group.directories.has(broken), false);
@@ -1632,6 +1656,7 @@ for (const replaceRoot of [false, true]) {
     const { root, libraries: [library], inventory, changes, install, settle } = fixture(t, 0, { watch: control.watch });
     broken = install(library, "1.0", "broken");
     inventory.setLibraryPaths([library]);
+    await settle();
     const group = inventory.watchers.get(library);
     assert.ok(group.packageRetryTimer);
     const attempts = control.attempts.length;
@@ -2001,3 +2026,134 @@ test("inventory publishes metadata-only changes without opening package files", 
   assert.deepEqual(changes.at(-1).changedInstallationPaths, [directory]);
   assert.deepEqual(forbidden, []);
 });
+
+test("delayed initial package watches recheck metadata changed after inventory publication", async t => {
+  const control = controlledWatches();
+  const { libraries: [library], inventory, changes, install, settle } = fixture(t, 0, { watch: control.watch });
+  const directory = install(library);
+  inventory.setLibraryPaths([library]);
+  const group = inventory.watchers.get(library);
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const refresh = group.refresh.bind(group);
+  group.refresh = async revision => { await blocked; return refresh(revision); };
+  await waitForInventoryPublication(inventory, () => changes.length > 0);
+  assert.equal(group.directories.has(directory), false);
+  fs.writeFileSync(path.join(directory, "DESCRIPTION"), "Package: example\nVersion: changed during setup\n");
+  release();
+  await settle(() => matchesDescription(changes.at(-1)?.packages.get("example"), directory),
+    "new package watches must catch metadata changes during asynchronous setup");
+  assert.equal(group.directories.has(directory), true);
+});
+
+for (const operation of ["watcher", "change detection", "00LOCK", "00LOCK/00new"]) {
+  test(`${operation} stops oversized enumeration and closes its directory`, async t => {
+    let oversizedPath;
+    const listings = [];
+    const control = controlledWatches();
+    const f = fixture(t, 0, { watch: control.watch, promises: { ...fs.promises,
+      opendir: async (file, ...args) => {
+        if (file !== oversizedPath) return fs.promises.opendir(file, ...args);
+        const listing = { reads: 0, closed: false };
+        listings.push(listing);
+        return {
+          read: async () => {
+            assert.ok(++listing.reads <= 4097, 'do not enumerate beyond the overflow sentinel');
+            return { name: 'entry' + listing.reads, isDirectory: () => false, isSymbolicLink: () => false };
+          },
+          close: async () => { listing.closed = true; },
+        };
+      },
+    } });
+    const [library] = f.libraries;
+    const target = operation.startsWith('00LOCK') ? path.join(library, operation) : library;
+    fs.mkdirSync(target, { recursive: true });
+    f.inventory.setLibraryPaths([library]);
+    await f.settle();
+    oversizedPath = target;
+    if (operation === 'watcher') {
+      f.inventory.watchers.get(library).scheduleRefresh();
+      await f.settle(() => f.logs.some(line => line.includes('library entry budget')));
+      assert.equal(f.inventory.watchers.get(library).directories.size, 1);
+    } else {
+      if (operation === 'change detection') f.inventory.unconfirmedLibraries.add(library);
+      else f.inventory.dirtyLibraries.add(library);
+      await f.inventory.refresh();
+      await f.settle(() => f.changes.at(-1).libraries[0].suspended);
+      assert.equal(f.inventory.watchers.size, 0);
+      assert.equal(f.inventory.retryTimer, undefined);
+    }
+    assert.ok(listings.length > 0);
+    assert.ok(listings.every(listing => listing.reads === 4097 && listing.closed));
+    const count = listings.length;
+    await f.inventory.refresh();
+    assert.equal(listings.length, count, 'overflow does not leave a recurring enumeration');
+  });
+}
+
+for (const action of ['dispose', 'remove', 'pause', 'coalesce events']) {
+  test(`in-flight watcher enumeration handles ${action} without overlapping or stale registrations`, async t => {
+    const watcherReads = new (require("node:async_hooks").AsyncLocalStorage)();
+    let library, block = false, entered, release;
+    const begun = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    let opens = 0, active = 0, peak = 0, closes = 0;
+    const control = controlledWatches();
+    const f = fixture(t, 0, { watch: control.watch, promises: { ...fs.promises,
+      opendir: async (file, ...args) => {
+        const handle = await fs.promises.opendir(file, ...args);
+        if (!block || file !== library || !watcherReads.getStore()) return handle;
+        opens++;
+        peak = Math.max(peak, ++active);
+        let first = true;
+        return {
+          read: async () => {
+            const entry = await handle.read();
+            if (first) { first = false; entered(); await blocked; }
+            return entry;
+          },
+          close: async () => { await handle.close(); active--; closes++; },
+        };
+      },
+    } });
+    t.after(() => release());
+    [library] = f.libraries;
+    f.inventory.setLibraryPaths([library]);
+    await f.settle();
+    const group = f.inventory.watchers.get(library);
+    const refresh = group.refresh.bind(group);
+    group.refresh = revision => watcherReads.run(true, () => refresh(revision));
+    // Registration requests an inventory check. Count only the watcher's
+    // reads when asserting that watcher reconciliations cannot overlap.
+    const scan = f.inventory.scan.bind(f.inventory);
+    f.inventory.scan = (...args) => watcherReads.run(false, () => scan(...args));
+    const added = f.install(library, '1', 'added');
+    block = true;
+    group.scheduleRefresh();
+    await begun;
+    // The pending filesystem operation must leave the event loop responsive.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(group.directories.has(added), false);
+    if (action === 'dispose') f.inventory.dispose();
+    else if (action === 'remove') f.inventory.setLibraryPaths([]);
+    else if (action === 'pause') f.inventory.setRuntimeBusy(true);
+    else for (let i = 0; i < 20; i++) group.scheduleRefresh();
+    release();
+    await group.refreshPromise;
+    assert.equal(closes, 1);
+    if (action !== 'coalesce events') assert.equal(group.directories.has(added), false);
+    if (action === 'pause') f.inventory.setRuntimeBusy(false);
+    if (action === 'pause' || action === 'coalesce events') {
+      await f.settle(() => group.directories.has(added));
+      assert.equal(opens, 2, 'one queued reconciliation observes the latest directory');
+      assert.equal(closes, 2);
+    } else {
+      assert.equal(group.closed, true);
+      assert.equal(group.timer, undefined);
+      assert.equal(opens, 1);
+    }
+    assert.equal(peak, 1, 'a watcher has at most one directory enumeration in flight');
+    assert.equal(active, 0);
+  });
+}
