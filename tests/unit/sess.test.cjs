@@ -7,6 +7,7 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
+const { runPowerShell } = require("../helpers/run-powershell.cjs");
 const runtimeHostPath = path.resolve(__dirname, "../../bundled/bin/R_CONSOLE_HOST.exe");
 
 const workspace = { search: [".GlobalEnv"], loaded_namespaces: ["base"], globalenv: {} };
@@ -966,10 +967,8 @@ test("sess admission preserves fragmented Unicode attach and coalesced following
 });
 
 test("Windows read-only named-pipe client cannot evict R or read session requests", {
-  skip: process.platform !== "win32", timeout: 45000,
+  skip: process.platform !== "win32", timeout: 90000,
 }, async (t) => {
-  const { execFile } = require("node:child_process");
-  const { promisify } = require("node:util");
   const server = await upstream(t);
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
   const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
@@ -980,10 +979,9 @@ test("Windows read-only named-pipe client cannot evict R or read session request
   await waitFor(() => proxy.getWorkspaceData());
   const original = proxy.rSocket;
   // Use a real read-only Windows handle; Node's net clients request duplex access.
-  // Bound the read separately from PowerShell startup so a slow CI launch cannot
-  // consume the admission-test budget, and a stalled read identifies its phase.
-  const result = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `
-    $ErrorActionPreference = 'Stop'
+  // The helper bounds PowerShell startup separately; the admission deadline
+  // below stays short even if the runner takes a long time to launch it.
+  const result = await runPowerShell(`
     [Console]::Error.WriteLine('Connecting read-only pipe client')
     $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:VRC_TEST_PIPE, [System.IO.Pipes.PipeDirection]::In, [System.IO.Pipes.PipeOptions]::Asynchronous)
     try {
@@ -994,7 +992,7 @@ test("Windows read-only named-pipe client cannot evict R or read session request
       if (!$read.Wait(7000)) { throw 'Read-only pipe client did not receive EOF after the admission deadline' }
       if ($read.Result -eq 0) { [Console]::WriteLine(-1) } else { [Console]::WriteLine($buffer[0]) }
     } finally { $pipe.Dispose() }
-  `], { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, timeout: 30000, windowsHide: true });
+  `, { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, signal: t.signal });
   assert.equal(result.stdout.trim(), "-1", "the read-only client must receive EOF without session bytes");
   assert.equal(proxy.rSocket, original);
   assert.equal(proxy.getSessionId(), attach.params.session_id);
@@ -1002,18 +1000,15 @@ test("Windows read-only named-pipe client cannot evict R or read session request
 });
 
 test("Windows sess pipe grants access only to its local owner across instances", {
-  skip: process.platform !== "win32", timeout: 15000,
+  skip: process.platform !== "win32", timeout: 90000,
 }, async (t) => {
-  const { execFile } = require("node:child_process");
-  const { promisify } = require("node:util");
   const server = await upstream(t);
   const { SessProxy } = loadSource("src/Runtime/VSCR/sess/sessProxy.ts");
   const proxy = new SessProxy({ runtimeHostPath, upstreamPipePath: server.endpoint });
   t.after(() => proxy.dispose());
   const endpoint = await proxy.start();
   // Inspect several fresh instances, including ones Node creates after start.
-  const result = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `
-    $ErrorActionPreference = 'Stop'
+  const result = await runPowerShell(`
     $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     for ($i = 0; $i -lt 6; $i++) {
       $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:VRC_TEST_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
@@ -1029,7 +1024,7 @@ test("Windows sess pipe grants access only to its local owner across instances",
       } finally { $pipe.Dispose() }
     }
     [Console]::WriteLine('owner-only')
-  `], { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, timeout: 10000 });
+  `, { env: { ...process.env, VRC_TEST_PIPE: endpoint.slice("\\\\.\\pipe\\".length) }, signal: t.signal, timeout: 10000 });
   assert.equal(result.stdout.trim(), "owner-only");
   assert.equal(server.sockets.length, 0, "permission inspection must not attach a session");
   const r = await connectR(t, endpoint);

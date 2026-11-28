@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 const { randomBytes } = require("node:crypto");
 const { once } = require("node:events");
 const fs = require("node:fs");
@@ -71,10 +72,24 @@ test("an extension-host crash leaves no startup snapshot on disk", { timeout: 30
     stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
   let workspace, rPid;
-  t.after(() => {
+  t.after(async () => {
     worker.kill("SIGKILL");
-    if (rPid) { try { process.kill(rPid, "SIGKILL"); } catch {} }
-    if (workspace) fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    if (rPid) {
+      // On Windows R.exe can own an Rterm process and metadata workers.
+      // Killing only the launcher leaves their working directory locked.
+      if (process.platform === "win32") {
+        await promisify(execFile)("taskkill", ["/pid", String(rPid), "/T", "/F"],
+          { windowsHide: true, timeout: 10000 }).catch(error => {
+          try { process.kill(rPid, 0); }
+          catch (missing) { if (missing.code === "ESRCH") return; }
+          throw error;
+        });
+      } else {
+        try { process.kill(rPid, "SIGKILL"); } catch {}
+      }
+    }
+    // Allow process/socket close callbacks to run while Windows releases handles.
+    if (workspace) await fs.promises.rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   const [message] = await Promise.race([
     once(worker, "message"),
