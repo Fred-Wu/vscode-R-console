@@ -23,7 +23,7 @@ function librarySignature(library: LibraryInventory): string {
   return JSON.stringify([library.path, library.root,
     [...library.packages.values()].map(item => [item.name, item.identity]), [...(library.deferred ?? [])],
     [...(library.unmonitored ?? [])].sort(), [...(library.unavailablePackages?.keys() ?? [])].sort(),
-    library.suspended ?? false, library.unavailable ?? false, library.initializing ?? false]);
+    library.suspended ?? false, library.unavailable ?? false, library.initializing ?? false, library.locked ?? false]);
 }
 
 export type PackageInstallation = {
@@ -51,6 +51,10 @@ export type LibraryInventory = {
   unavailable?: boolean;
   // No verified inventory has been published for this root yet.
   initializing?: boolean;
+  // A whole-library lock covers names not yet observed by the monitor.
+  locked?: boolean;
+  // An unfinished scan supplies no stability observation.
+  pending?: boolean;
 };
 export type PackageInventoryChange = {
   libraries: LibraryInventory[];
@@ -62,7 +66,7 @@ export type PackageInventoryChange = {
   changedInstallationPaths?: string[];
   isCurrent: () => boolean;
   // Rebuild a pending publication with changed libraries excluded.
-  revalidate?: () => PackageInventoryChange;
+  revalidate?: (validatePins?: boolean) => PackageInventoryChange | Promise<PackageInventoryChange>;
 };
 
 export class PackageInventory {
@@ -89,6 +93,9 @@ export class PackageInventory {
   private readonly scans = new Map<string, {
     revision: number; eventRevision: number; promise: Promise<LibraryInventory | undefined>;
     complete: boolean; result?: LibraryInventory;
+  }>();
+  private readonly publicationChecks = new Map<string, {
+    promise: Promise<boolean>; current: () => boolean; complete: boolean; result?: boolean;
   }>();
   private readonly candidates = new Map<string, string>();
   private timerDue = 0;
@@ -167,6 +174,7 @@ export class PackageInventory {
       this.lockedLibraries.delete(library);
       this.libraryRevisions.delete(library);
       if (this.scans.get(library)?.complete) this.scans.delete(library);
+      if (this.publicationChecks.get(library)?.complete) this.publicationChecks.delete(library);
       this.entryMonitor.remove(library);
     }
     for (const library of paths) {
@@ -212,8 +220,8 @@ export class PackageInventory {
     this.suspended.add(library);
     this.unavailable.delete(library);
     this.packageReadRetries.delete(library);
-    this.revision++;
-    this.candidates.clear();
+    this.libraryRevisions.set(library, (this.libraryRevisions.get(library) ?? 0) + 1);
+    this.candidates.delete(library);
     this.watchers.get(library)?.close();
     this.watchers.delete(library);
     this.dirtyLibraries.add(library);
@@ -277,6 +285,7 @@ export class PackageInventory {
         async current => await this.libraryTargetAsync(library, current) === pin, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         this.libraryRevisions.set(library, (this.libraryRevisions.get(library) ?? 0) + 1);
+        this.candidates.delete(library);
         if (!this.validateForEvent(library)) return;
         this.entryMonitor.onLibraryEvent(library);
         if (this.disposed || this.watchers.get(library) !== watcher) return;
@@ -443,6 +452,7 @@ export class PackageInventory {
     this.candidates.clear();
     this.libraryRevisions.clear();
     this.scans.clear();
+    this.publicationChecks.clear();
   }
 
   refresh(): Promise<void> {
@@ -553,7 +563,7 @@ export class PackageInventory {
     return { path: library, root: this.pins.get(library)?.root,
       packages: new Map(previous?.packages), deferred: new Map(previous?.deferred),
       unmonitored: new Set(previous?.unmonitored), unavailablePackages: new Map(previous?.unavailablePackages),
-      initializing: previous?.initializing ?? !previous, [state]: true };
+      initializing: previous?.initializing ?? !previous, locked: previous?.locked, [state]: true };
   }
 
   private async scanLibrary(library: string, dirty: Set<string>, unconfirmed: Set<string>,
@@ -652,7 +662,7 @@ export class PackageInventory {
         this.entryMonitor.add(library, originalTarget);
         if (!isCurrent()) return;
       }
-      return { path: library, root: libraryRoot, packages, unmonitored, unavailablePackages,
+      return { path: library, root: libraryRoot, packages, unmonitored, unavailablePackages, locked: locked.has("*"),
         deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) };
     } catch (error) {
       if (!isCurrent()) return;
@@ -701,7 +711,7 @@ export class PackageInventory {
       task = undefined;
     }
     // An outstanding read keeps its slot until the OS operation actually ends.
-    if (task) return retained();
+    if (task) return { ...retained(), pending: true };
     let detached = false;
     task = { revision, eventRevision, complete: false,
       promise: this.scanLibrary(library, dirty, unconfirmed, current) };
@@ -726,7 +736,7 @@ export class PackageInventory {
       })]);
       if (active.complete) this.scans.delete(library);
       else detached = true;
-      return result ?? retained();
+      return result ?? { ...retained(), pending: !active.complete };
     } finally { if (timer) clearTimeout(timer); }
   }
 
@@ -740,10 +750,20 @@ export class PackageInventory {
     if (!isCurrent()) return;
     // Cached inventories also need a valid pin before automatic publication.
     // An unrelated library event may arrive before the changed ancestor's event.
-    for (const item of libraries) {
+    for (let index = 0; index < libraries.length; index++) {
+      const item = libraries[index];
       if (item.suspended || item.unavailable) continue;
-      try { if (!this.libraryTarget(item.path)) return; }
-      catch { this.dirtyLibraries.add(item.path); }
+      try {
+        if (!this.libraryTarget(item.path)) {
+          libraries[index] = this.retainedLibrary(item.path,
+            this.libraries.find(previous => previous.path === item.path), "suspended");
+        }
+      } catch {
+        libraries[index] = this.retainedLibrary(item.path,
+          this.libraries.find(previous => previous.path === item.path), "unavailable");
+        this.dirtyLibraries.add(item.path);
+        this.scheduleRetry();
+      }
     }
     // Confirm each library independently. New events invalidate only that
     // library's observation; healthy siblings can complete their two scans.
@@ -752,6 +772,11 @@ export class PackageInventory {
     for (let index = 0; index < libraries.length; index++) {
       const observed = libraries[index];
       const previous = this.libraries.find(item => item.path === observed.path);
+      if (observed.pending) {
+        unsettled.add(observed.path);
+        libraries[index] = previous ?? this.retainedLibrary(observed.path, undefined, "unavailable");
+        continue;
+      }
       const signature = librarySignature(observed);
       const interrupted = this.dirtyLibraries.has(observed.path) || this.unconfirmedLibraries.has(observed.path);
       if (interrupted) this.candidates.delete(observed.path);
@@ -779,14 +804,20 @@ export class PackageInventory {
       if (unsettled.has(libraries[index].path)) libraries[index] = { ...libraries[index], unavailable: true };
     }
 
-    const revalidate = (): PackageInventoryChange => {
-      libraries = libraries.map(library => {
-        if (library.suspended || library.unavailable ||
-            (this.libraryRevisions.get(library.path) ?? 0) === eventRevisions.get(library.path)) return library;
+    const revalidate = async (validatePins = true): Promise<PackageInventoryChange> => {
+      libraries = await Promise.all(libraries.map(async library => {
+        if (library.suspended || library.unavailable) return library;
+        const current = () => isCurrent() &&
+          (this.libraryRevisions.get(library.path) ?? 0) === eventRevisions.get(library.path);
+        if (current() && (!validatePins || await this.checkPublicationPin(library.path, current)) && current()) return library;
         this.candidates.delete(library.path);
-        this.dirtyLibraries.add(library.path);
-        return this.retainedLibrary(library.path, this.libraries.find(item => item.path === library.path), "unavailable");
-      });
+        if (!this.disposed && this.paths.includes(library.path)) {
+          this.dirtyLibraries.add(library.path);
+          this.scheduleRetry();
+        }
+        return this.retainedLibrary(library.path, this.libraries.find(item => item.path === library.path),
+          this.suspended.has(library.path) ? "suspended" : "unavailable");
+      }));
       const snapshot = libraries;
       publication = this.publication(snapshot, () => isCurrent() && snapshot.every(library =>
         library.suspended || library.unavailable ||
@@ -794,7 +825,7 @@ export class PackageInventory {
       return publication;
     };
     let publication: PackageInventoryChange;
-    await this.onChange(revalidate());
+    await this.onChange(await revalidate(false));
     if (!publication!.isCurrent()) {
       // A request may have been cancelled after consuming several libraries'
       // events. Replay every uncommitted observation, including quiet siblings.
@@ -878,8 +909,51 @@ export class PackageInventory {
     this.initialized = true;
   }
 
+  private async checkPublicationPin(library: string, isCurrent: () => boolean): Promise<boolean> {
+    // Completed background checks are consumed once while their pin and event
+    // revisions remain current. Slow checks can finish without blocking siblings.
+    const previous = this.publicationChecks.get(library);
+    if (previous) {
+      if (!previous.complete) return false;
+      this.publicationChecks.delete(library);
+      if (previous.current() && previous.result) {
+        // Preparation may have replaced a root without delivering an event
+        // since the background check finished. Reuse needs a fresh identity
+        // guard, just like the cached inventory path before publication.
+        try { return !!this.libraryTarget(library) && isCurrent(); }
+        catch { return false; }
+      }
+    }
+    const pin = this.pins.get(library);
+    const current = () => isCurrent() && this.pins.get(library) === pin;
+    let detached = false;
+    const task = { current, complete: false, result: false, promise: Promise.resolve(false) };
+    task.promise = this.libraryTargetAsync(library, current).then(result => !!result, () => false).then(result => {
+      task.complete = true;
+      task.result = result;
+      if (detached) {
+        if (!this.disposed && this.paths.includes(library)) {
+          this.dirtyLibraries.add(library);
+          this.schedule(0);
+        } else this.publicationChecks.delete(library);
+      }
+      return result;
+    });
+    this.publicationChecks.set(library, task);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([task.promise, new Promise<boolean>(resolve => {
+        timer = setTimeout(() => { detached = true; resolve(false); }, LIBRARY_SCAN_WAIT_MS);
+        timer.unref();
+      })]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (!detached && this.publicationChecks.get(library) === task) this.publicationChecks.delete(library);
+    }
+  }
+
   private publication(libraries: LibraryInventory[], isCurrent: () => boolean,
-    revalidate: () => PackageInventoryChange): PackageInventoryChange {
+    revalidate: (validatePins?: boolean) => Promise<PackageInventoryChange>): PackageInventoryChange {
     const packages = new Map<string, PackageInstallation>();
     const unmonitored = new Set<string>();
     let unknown = false;

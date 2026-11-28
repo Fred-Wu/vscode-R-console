@@ -1308,14 +1308,23 @@ two-snapshot stability check remain part of reconciliation. Stability is confirm
 independently for each library. Per-library event revisions cover scanning,
 publication preparation and the language-server request. Preparation revalidates
 the snapshot after client startup and session synchronization, excluding libraries
-that changed while retaining healthy updates. An event during the request prevents
+that changed while retaining healthy updates. Immediately before initial and
+replacement-verification requests, the adapter asynchronously revalidates physical
+library pins. A changed root or ancestor suspends only that library. Each library
+has at most one pending publication pin check; completed background checks are
+consumed once while their pin, configuration and event revisions remain current.
+Reuse also checks the physical pin synchronously to detect silent replacement
+after the background check finished. An event during the request prevents
 committing that snapshot and requeues all uncommitted observations.
 Libraries scan independently, with at most one outstanding inventory scan per
 configured path. Each publication waits up to one second for newly started scans;
 pending reads retain their slot until the filesystem operation completes. Healthy
 libraries publish while pending libraries retain their verified state. Completed
 background scans trigger reconciliation and are reused if their configuration and
-event revisions remain current. Unsettled roots are temporarily excluded from reconciliation
+event revisions remain current. Only completed observations participate in the
+two-scan stability confirmation. Pending scans preserve the previous candidate;
+filesystem events invalidate it immediately. Unsettled roots are temporarily
+excluded from reconciliation
 during sibling publication. Changes made outside the console's active evaluation
 use a 250 ms scan deadline; subsequent events preserve the earliest deadline.
 Lock presence
@@ -1426,8 +1435,13 @@ excluded installation. A library with no verified inventory supplies an ordered
 root barrier for every package name, including loaded namespaces absent from the
 observed inventory. Verified absence becomes available after a successful scan.
 Valid earlier copies continue to receive updates.
-Installation locks defer the affected package. The R adapter retains changed entry
-paths for excluded names until reconciliation resumes or the process is replaced.
+Installation locks defer the affected package. Whole-library `00LOCK` state is
+published explicitly and participates in inventory signatures. Its root is a
+selection barrier for every package name, including a loaded namespace whose
+installation and backup directories were absent at initial discovery. Lock release
+publishes a new inventory even when no observed package identities changed.
+The R adapter retains changed entry paths for excluded names until reconciliation
+resumes or the process is replaced.
 Reusing an unchanged copy after a
 library-order refresh preserves the new server; replacing files in that copy
 still invalidates loaded namespaces. Inventory requests update package metadata;
@@ -1602,6 +1616,15 @@ Registry reads accept regular files up to 64 MiB and at most 256 session records
 Encrypted session identities must be unique before any key retrieval or decryption.
 An ambiguous registry remains intact with saving disabled. Duplicate identities in
 an outgoing snapshot reject that save while preserving the existing file.
+Registry verification and replacement/deletion run under an exclusive OS file lock
+held by the bundled native helper. The helper acknowledges acquisition over stdout
+and holds the lock until its parent closes stdin. Acquisition fails promptly when
+another writer owns the lock. Conflicting snapshots retain the existing file;
+reloading the registry permits a subsequent save of the combined current records.
+The OS releases locks on process exit, including crashes. A stable empty `.lock`
+file remains beside a previously persisted registry; it contains no session data
+and is never unlinked during normal operation. A window that has never persisted
+sessions creates no storage or lock file.
 Reads stop at the byte limit even if a file grows after its initial size check.
 The same limits protect reads before replacement and newly encoded registry writes.
 An oversized or invalid registry remains intact, disables saving for that registry,

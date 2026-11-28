@@ -1184,3 +1184,23 @@ test("unknown library inventories carry ordered root barriers to the LSP", async
   assert.deepEqual(request.params.libraryRoots, ["/physical-first", "/physical-unknown", "/last"]);
   assert.deepEqual(request.params.unknownRoots, ["/physical-unknown"]);
 });
+
+test("replacement verification revalidates pins and rebuilds exclusions", async t => {
+  const { client, instances } = createClient(t, {
+    packageChanges: server => server === instances[0] ? ["stats"] : [],
+  });
+  let validations = 0;
+  const snapshot = { ...change(), revalidate: async () => {
+    validations++;
+    return instances.length > 1
+      ? { ...snapshot, unmonitoredRoots: ["/base/library"], libraries: [
+        { path: "/base/library", packages: new Map(), suspended: true },
+      ] }
+      : snapshot;
+  } };
+  await client.refreshPackages(snapshot);
+  assert.equal(instances.length, 2);
+  const verification = instances[1].requests.find(request => request.method === "rConsole/refreshPackages");
+  assert.ok(validations >= 4);
+  assert.deepEqual(verification.params.unmonitoredRoots, ["/base/library"]);
+});

@@ -191,6 +191,8 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
     loaded <- loadedNamespaces()
     unmonitored <- normalize_character(params$unmonitored)
     unmonitored_roots <- chartr("\\", "/", normalize_character(params$unmonitoredRoots))
+    locked_roots <- chartr("\\", "/", normalize_character(params$lockedRoots))
+    unmonitored_roots <- union(unmonitored_roots, locked_roots)
     unmonitored_installations <- chartr("\\", "/", normalize_character(params$unmonitoredInstallationPaths))
     deferred <- chartr("\\", "/", normalize_character(params$deferred))
     pending_package_changes <<- union(pending_package_changes,
@@ -207,7 +209,7 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
         }
         candidates <- chartr("\\", "/", normalize_character(params$installations[[pkgname]]))
         library_roots <- chartr("\\", "/", normalize_character(params$libraryRoots))
-        unknown_roots <- chartr("\\", "/", normalize_character(params$unknownRoots))
+        unknown_roots <- union(chartr("\\", "/", normalize_character(params$unknownRoots)), locked_roots)
         unknown_position <- match(TRUE, library_roots %in% unknown_roots)
         # An unobserved root occupies its search-order position for every name,
         # including namespaces that have no entries in the observed inventory.

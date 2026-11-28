@@ -398,7 +398,8 @@ test("external registry changes are preserved and failed saves do not leave temp
   fs.writeFileSync(file, external);
   assert.equal(await registry.save([session()]), false);
   assert.equal(fs.readFileSync(file, "utf8"), external);
-  assert.deepEqual(fs.readdirSync(path.dirname(file)), [path.basename(file)]);
+  assert.deepEqual(fs.readdirSync(path.dirname(file)), [path.basename(file), path.basename(file) + ".lock"]);
+  assert.equal(fs.statSync(file + ".lock").size, 0, "the stable lock file contains no session data");
 });
 
 test("disposing a registry cancels pending key retrieval and clears the received key", async t => {

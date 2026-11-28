@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "crypto";
 import * as fs from "fs";
+import { spawn } from "child_process";
 import * as path from "path";
 import type * as vscode from "vscode";
 import type { PersistedRTerminalState, PersistedRTerminalOptions } from "../Terminal/rTerminal";
@@ -145,7 +146,9 @@ export class PersistentSessionRegistry {
 
   constructor(readonly filePath: string, private readonly readKey: SessionRegistryKeyReader = readSessionRegistryKey,
     private readonly onError: (message: string) => void = () => {},
-    private readonly shutdownStorage?: ShutdownStorage) {
+    private readonly shutdownStorage?: ShutdownStorage,
+    private readonly nativeHelper = path.resolve(__dirname, "../../bundled/bin",
+      process.platform === "win32" ? "R_CONSOLE_HOST.exe" : "R_CONSOLE_HOST")) {
     this.scope = digest(path.resolve(filePath));
   }
 
@@ -248,9 +251,11 @@ export class PersistentSessionRegistry {
         })) throw new Error("Live plaintext session cannot be safely replaced before the protocol upgrade");
         // No plaintext replay is restored or converted. Remove the file only
         // after securing old-protocol shutdown credentials.
-        this.assertRegistryUnchanged();
-        fs.rmSync(this.filePath, { force: true });
-        this.originalDigest = undefined;
+        await this.withFileLock(() => {
+          this.assertRegistryUnchanged();
+          fs.rmSync(this.filePath, { force: true });
+          this.originalDigest = undefined;
+        });
         this.writable = true;
         return [];
       }
@@ -399,6 +404,40 @@ export class PersistentSessionRegistry {
     try { this.onError(message); } catch { /* Reporting must not interrupt persistence. */ }
   }
 
+  private withFileLock(action: () => void): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.nativeHelper, ["--lock-session-registry", this.filePath + ".lock"],
+        { stdio: ["pipe", "pipe", "ignore"], shell: false, windowsHide: true });
+      let ready = "", ran = false, failure: unknown;
+      const timer = setTimeout(() => {
+        failure = new Error("Registry lock helper timed out");
+        child.kill();
+      }, 3000);
+      child.stdin.on("error", () => { /* Exit reports failure; no credentials travel here. */ });
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (ran || failure) return;
+        ready += chunk.toString("ascii");
+        if (!"locked\n".startsWith(ready)) {
+          failure = new Error("Invalid registry lock acknowledgement");
+          child.kill();
+        } else if (ready === "locked\n") {
+          ran = true;
+          try {
+            if (this.disposed) throw new Error("Registry disposed before saving");
+            action();
+          } catch (error) { failure = error; }
+          child.stdin.end();
+        }
+      });
+      child.once("error", error => { clearTimeout(timer); reject(error); });
+      child.once("exit", code => {
+        clearTimeout(timer);
+        if (failure || !ran || code !== 0) reject(failure ?? new Error("Session registry is owned by another writer or unavailable"));
+        else resolve();
+      });
+    });
+  }
+
   private assertRegistryUnchanged(): void {
     let fd: number | undefined;
     try { fd = fs.openSync(this.filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK); }
@@ -458,18 +497,23 @@ export class PersistentSessionRegistry {
         return previous ? [previous] : [];
       });
       if (this.disposed) return false;
-      this.assertRegistryUnchanged();
-      if (rows.length === 0 && opaque.length === 0) {
-        fs.rmSync(this.filePath, { force: true });
-        this.originalDigest = undefined;
-      } else {
-        const encoded = JSON.stringify({ format: REGISTRY_FORMAT, version: 1, sessions: [...rows, ...opaque] });
-        if (Buffer.byteLength(encoded) > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
+      // An empty, never-persisted window needs no storage or lock artifact.
+      if (rows.length || opaque.length || this.originalDigest !== undefined) {
         fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-        fs.writeFileSync(temporary, encoded, { encoding: "utf8", mode: 0o600, flag: "wx" });
-        fs.renameSync(temporary, this.filePath);
-        this.originalDigest = digest(encoded);
-      }
+        await this.withFileLock(() => {
+          this.assertRegistryUnchanged();
+          if (rows.length === 0 && opaque.length === 0) {
+            fs.rmSync(this.filePath, { force: true });
+            this.originalDigest = undefined;
+          } else {
+            const encoded = JSON.stringify({ format: REGISTRY_FORMAT, version: 1, sessions: [...rows, ...opaque] });
+            if (Buffer.byteLength(encoded) > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
+            fs.writeFileSync(temporary, encoded, { encoding: "utf8", mode: 0o600, flag: "wx" });
+            fs.renameSync(temporary, this.filePath);
+            this.originalDigest = digest(encoded);
+          }
+        });
+      } else this.assertRegistryUnchanged();
       const retained = new Set([...rows, ...opaque].map(identityKey));
       for (const [id, key] of this.keys) if (!retained.has(id)) { key.fill(0); this.keys.delete(id); }
       for (const id of this.recordMetadata.keys()) if (!retained.has(id)) this.recordMetadata.delete(id);

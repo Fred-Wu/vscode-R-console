@@ -786,60 +786,65 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private async refreshPackages(change: PackageInventoryChange): Promise<void> {
     const refresh = (async () => {
-      change = change.revalidate?.() ?? change;
+      change = await change.revalidate?.(false) ?? change;
       if (!change.isCurrent()) return;
       const previousClient = this.client;
       let client = await this.ensureClient();
       if (!client?.isRunning() || this.disposed) throw new Error("Language server is not running");
-      change = change.revalidate?.() ?? change;
+      change = await change.revalidate?.(false) ?? change;
       if (!change.isCurrent()) return;
       await this.applySessionState(client);
       client = this.client;
       if (!client?.isRunning() || this.disposed) throw new Error("Language server changed during package refresh");
-      change = change.revalidate?.() ?? change;
+      change = await change.revalidate?.() ?? change;
       if (!change.isCurrent()) return;
       const hasChanges = change.changed.length > 0;
       if (hasChanges) {
         this.packageRevision++;
         this.options.onPackagesChanged?.();
       }
-      const installations: Record<string, string[]> = Object.create(null);
-      const unmonitoredInstallationPaths = new Set<string>();
-      for (const library of change.libraries) {
-        const names = new Set([...library.packages.keys(), ...(library.unmonitored ?? []),
-          ...(library.unavailablePackages?.keys() ?? [])]);
-        for (const name of names) {
-          const item = library.packages.get(name);
-          const target = item?.target ?? path.join(library.root ?? library.path, name);
-          const copies = installations[name] ??= [];
-          if (!copies.includes(target)) copies.push(target);
-          // Keep excluded copies in search order as barriers. R may validate
-          // earlier monitored copies, but must not select beyond a barrier.
-          if (library.suspended || library.unavailable || library.unmonitored?.has(name) ||
-              library.unavailablePackages?.has(name)) unmonitoredInstallationPaths.add(target);
+      const parameters = () => {
+        const installations: Record<string, string[]> = Object.create(null);
+        const unmonitoredInstallationPaths = new Set<string>();
+        for (const library of change.libraries) {
+          const names = new Set([...library.packages.keys(), ...(library.unmonitored ?? []),
+            ...(library.unavailablePackages?.keys() ?? [])]);
+          for (const name of names) {
+            const item = library.packages.get(name);
+            const target = item?.target ?? path.join(library.root ?? library.path, name);
+            const copies = installations[name] ??= [];
+            if (!copies.includes(target)) copies.push(target);
+            // Keep excluded copies in search order as barriers. R may validate
+            // earlier monitored copies, but must not select beyond a barrier.
+            if (library.suspended || library.unavailable || library.unmonitored?.has(name) ||
+                library.unavailablePackages?.has(name)) unmonitoredInstallationPaths.add(target);
+          }
         }
-      }
-      const params = {
-        installations,
-        libraryRoots: change.libraries.map(library => library.root ?? library.path),
-        unknownRoots: change.libraries.filter(library => library.initializing && (library.suspended || library.unavailable))
-          .map(library => library.root ?? library.path),
-        unmonitoredInstallationPaths: [...unmonitoredInstallationPaths],
-        unmonitored: change.unmonitored ?? [],
-        unmonitoredRoots: change.unmonitoredRoots ?? [],
-        deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
-        // A recovered server already loaded the current installations.
-        changed: client === previousClient ? change.changed : [],
-        changedInstallationPaths: client === previousClient ? change.changedInstallationPaths ?? [] : [],
+        return {
+          installations,
+          libraryRoots: change.libraries.map(library => library.root ?? library.path),
+          lockedRoots: change.libraries.filter(library => library.locked).map(library => library.root ?? library.path),
+          unknownRoots: change.libraries.filter(library => library.initializing && (library.suspended || library.unavailable))
+            .map(library => library.root ?? library.path),
+          unmonitoredInstallationPaths: [...unmonitoredInstallationPaths],
+          unmonitored: change.unmonitored ?? [],
+          unmonitoredRoots: change.unmonitoredRoots ?? [],
+          deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
+          // A recovered server already loaded the current installations.
+          changed: client === previousClient ? change.changed : [],
+          changedInstallationPaths: client === previousClient ? change.changedInstallationPaths ?? [] : [],
+        };
       };
+      let params = parameters();
       // A profile can preload a package from a library the console has since
       // excluded. Retrying unchanged inventory must not relaunch that profile
       // indefinitely or publish completions from the conflicting process.
-      const refreshKey = JSON.stringify([
+      const key = () => JSON.stringify([
         change.libraries.map(library => library.path),
         change.libraries.map(library => [...library.packages].map(([name, item]) => [name, item.target, item.identity])),
-        params.installations, params.libraryRoots, params.unknownRoots, params.unmonitoredInstallationPaths, params.unmonitored, params.unmonitoredRoots, params.deferred,
+        params.installations, params.libraryRoots, params.unknownRoots, params.lockedRoots, params.unmonitoredInstallationPaths, params.unmonitored, params.unmonitoredRoots, params.deferred,
       ]);
+      let refreshKey = key();
       const previousFailure = this.failedPackageRefresh;
       const retryingConflict = previousFailure?.client === client && previousFailure.key === refreshKey;
       if (retryingConflict) {
@@ -863,7 +868,10 @@ export class ConsoleLspClient implements CompletionProvider {
         if (this.disposed) return;
         if (!client?.isRunning()) throw new Error("Replacement language server is not running");
         await this.applySessionState(client);
+        change = await change.revalidate?.() ?? change;
         if (!change.isCurrent()) return;
+        params = parameters();
+        refreshKey = key();
         const verified = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages",
           { ...params, changed: [], changedInstallationPaths: [] });
         if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");

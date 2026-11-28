@@ -1003,3 +1003,24 @@ test("unknown roots defer package selection beyond their position while verified
   });
   assert.ok(earlier.restart.includes(pkg));
 });
+
+test("whole-library lock covers initially absent loaded packages", { timeout: 90000 }, async t => {
+  const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  install(first, "startupExport");
+  const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances } = createClient({ env, libraries: [first] });
+  const inventory = client.packageInventory;
+  const setPaths = inventory.setLibraryPaths.bind(inventory);
+  inventory.setLibraryPaths = () => {};
+  await client.start();
+  const lock = path.join(first, "00LOCK");
+  fs.mkdirSync(lock);
+  fs.rmSync(path.join(first, pkg), { recursive: true });
+  inventory.setLibraryPaths = setPaths;
+  setPaths([first, ...defaults]);
+  await waitFor(() => inventory.initialized && !client.packageRefreshPromise, "initial publication");
+  assert.equal(instances.length, 1, "an unobserved loaded package stays deferred under a whole-library lock");
+  fs.rmdirSync(lock);
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "lock release reconciles the absent package");
+});

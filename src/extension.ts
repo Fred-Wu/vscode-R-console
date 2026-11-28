@@ -99,7 +99,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   extensionBaseUri = context.extensionUri;
   persistentRegistry = new PersistentSessionRegistry(await getPersistentSessionRegistryPath(context),
     identity => readSessionRegistryKey(identity, getBundledRustSidecarPath(context.extensionUri.fsPath)),
-    message => { void vscode.window.showErrorMessage(message); }, context.secrets);
+    message => { void vscode.window.showErrorMessage(message); }, context.secrets,
+    getBundledRustSidecarPath(context.extensionUri.fsPath));
   await initializePersistentSessionRegistry();
   startPersistentSessionRegistry(context);
   context.subscriptions.push(

@@ -2361,7 +2361,7 @@ for (const phase of ["preparation", "request"]) {
         f.inventory.watchers.get(changing).emit("change", "changing");
         assert.equal(change.isCurrent(), false, "the confirmed snapshot expires on a later event");
         if (phase === "preparation") {
-          const current = change.revalidate();
+          const current = await change.revalidate();
           assert.equal(current.isCurrent(), true);
           assert.deepEqual(current.changed, ["healthy"]);
           assert.equal(current.packages.get("changing"), verified);
@@ -2454,3 +2454,125 @@ for (const initial of [false, true]) {
     assert.equal(f.inventory.scans.size, 0);
   });
 }
+
+test("consistently slow successful scans converge without discarding stability observations", async t => {
+  const f = fixture(t, 0, { watch: controlledWatches().watch });
+  const [library] = f.libraries;
+  const directory = f.install(library);
+  f.inventory.setLibraryPaths([library]);
+  await f.settle();
+  const scan = f.inventory.scanLibrary.bind(f.inventory);
+  let count = 0;
+  f.inventory.scanLibrary = async (...args) => {
+    if (args[0] === library) {
+      count++;
+      await new Promise(resolve => setTimeout(resolve, 1100));
+    }
+    return scan(...args);
+  };
+  fs.appendFileSync(path.join(directory, "DESCRIPTION"), "Title: updated\n");
+  f.inventory.watchers.get(library).emit("change", "example");
+  await f.settle(() => matchesDescription(f.inventory.packages.get("example"), directory));
+  assert.ok(count >= 2, "successful completed scans supply both stability observations");
+});
+
+for (const replaced of ["root", "ancestor"]) {
+  test(`publication rechecks the physical ${replaced} without watcher notifications`, async t => {
+    const f = fixture(t, 0, { watch: controlledWatches().watch });
+    const parent = path.join(f.root, "guarded"), library = path.join(parent, "library");
+    fs.mkdirSync(library, { recursive: true });
+    const healthy = f.libraries[1];
+    f.install(library); f.install(healthy, "1", "healthy");
+    f.inventory.setLibraryPaths([library, healthy]);
+    await f.settle();
+    let checked;
+    f.inventory.onChange = async change => {
+      if (checked) return;
+      const moved = replaced === "root" ? library : parent;
+      fs.renameSync(moved, moved + "-old");
+      fs.mkdirSync(library, { recursive: true });
+      f.install(library, "replacement");
+      checked = await change.revalidate();
+    };
+    f.install(library, "updated"); f.install(healthy, "2", "healthy");
+    for (const directory of [library, healthy]) f.inventory.dirtyLibraries.add(directory);
+    await f.inventory.refresh();
+    await waitForPublication(() => checked !== undefined);
+    assert.ok(f.inventory.suspended.has(library), "physical replacement suspends monitoring");
+    assert.ok(checked.unmonitoredRoots.includes(library));
+    assert.ok(checked.changed.includes("healthy"), "verified siblings still reconcile");
+    assert.ok(!checked.changed.includes("example"));
+  });
+}
+
+test("whole-library lock transitions publish even when no package names are known", async t => {
+  const f = fixture(t, 0, { watch: controlledWatches().watch });
+  const [library] = f.libraries;
+  f.inventory.setLibraryPaths([library]); await f.settle();
+  fs.mkdirSync(path.join(library, "00LOCK"));
+  f.inventory.watchers.get(library).emit("change", "rename", "00LOCK");
+  await f.settle(() => f.inventory.libraries[0].locked === true);
+  assert.equal(f.inventory.libraries[0].packages.size, 0);
+  fs.rmdirSync(path.join(library, "00LOCK"));
+  f.inventory.watchers.get(library).emit("change", "rename", "00LOCK");
+  await f.settle(() => f.inventory.libraries[0].locked === false);
+});
+
+test("slow publication pin checks finish without starving healthy libraries", async t => {
+  const context = new (require("node:async_hooks").AsyncLocalStorage)();
+  const f = fixture(t, 0, { watch: controlledWatches().watch });
+  const [slow, healthy] = f.libraries;
+  const first = f.install(slow, "1", "slow"), second = f.install(healthy, "1", "healthy");
+  f.inventory.setLibraryPaths(f.libraries); await f.settle();
+  const validate = f.inventory.libraryTargetAsync.bind(f.inventory);
+  const check = f.inventory.checkPublicationPin.bind(f.inventory);
+  let active = 0, peak = 0;
+  f.inventory.checkPublicationPin = (...args) => {
+    const scope = { active: true };
+    return context.run(scope, async () => {
+      try { return await check(...args); }
+      finally { scope.active = false; }
+    });
+  };
+  f.inventory.libraryTargetAsync = async (...args) => {
+    if (args[0] !== slow || !context.getStore()?.active) return validate(...args);
+    peak = Math.max(peak, ++active);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      return await validate(...args);
+    } finally { active--; }
+  };
+  f.inventory.onChange = async change => {
+    const verified = await change.revalidate();
+    if (verified.isCurrent()) f.changes.push(verified);
+  };
+  fs.appendFileSync(path.join(first, "DESCRIPTION"), "Title: changed\n");
+  fs.appendFileSync(path.join(second, "DESCRIPTION"), "Title: changed\n");
+  for (const library of f.libraries) f.inventory.watchers.get(library).emit("change", "package");
+  await waitForPublication(() => matchesDescription(f.inventory.packages.get("healthy"), second));
+  assert.ok(!matchesDescription(f.inventory.packages.get("slow"), first), "the pending check leaves its library excluded");
+  await f.settle(() => matchesDescription(f.inventory.packages.get("slow"), first));
+  assert.equal(peak, 1, "there is at most one pin validation per library");
+});
+
+test("a completed background pin check detects silent replacement before reuse", async t => {
+  const f = fixture(t, 0, { watch: controlledWatches().watch });
+  const [library] = f.libraries;
+  f.install(library);
+  f.inventory.setLibraryPaths(f.libraries); await f.settle();
+  const validate = f.inventory.libraryTargetAsync.bind(f.inventory);
+  let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  f.inventory.libraryTargetAsync = async (...args) => { await waiting; return validate(...args); };
+  // Hold the scheduled retry so the completed check can be inspected before
+  // client preparation silently changes the physical location.
+  f.inventory.schedule = () => {};
+  assert.equal(await f.inventory.checkPublicationPin(library, () => true), false);
+  release();
+  await waitForPublication(() => f.inventory.publicationChecks.get(library)?.complete);
+  assert.equal(f.inventory.publicationChecks.get(library).result, true);
+  fs.renameSync(library, library + "-old");
+  fs.mkdirSync(library);
+  assert.equal(await f.inventory.checkPublicationPin(library, () => true), false);
+  assert.ok(f.inventory.suspended.has(library));
+});
