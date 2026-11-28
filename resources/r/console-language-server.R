@@ -191,6 +191,7 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
     loaded <- loadedNamespaces()
     unmonitored <- normalize_character(params$unmonitored)
     unmonitored_roots <- chartr("\\", "/", normalize_character(params$unmonitoredRoots))
+    unmonitored_installations <- chartr("\\", "/", normalize_character(params$unmonitoredInstallationPaths))
     deferred <- chartr("\\", "/", normalize_character(params$deferred))
     pending_package_changes <<- union(pending_package_changes,
         chartr("\\", "/", normalize_character(params$changedInstallationPaths)))
@@ -205,7 +206,9 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
             return(get(pkgname, selected_installations, inherits = FALSE))
         }
         candidates <- chartr("\\", "/", normalize_character(params$installations[[pkgname]]))
-        candidates <- candidates[!dirname(candidates) %in% unmonitored_roots]
+        barriers <- which(candidates %in% unmonitored_installations |
+            dirname(candidates) %in% unmonitored_roots)
+        if (length(barriers)) candidates <- head(candidates, barriers[[1]] - 1L)
         # The monitor observes entries only. R validates package metadata and
         # chooses among the observed copies, including links to missing folders.
         selected <- if (length(candidates)) {
@@ -215,6 +218,12 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
             # R can return .Library using an alias. Canonicalize its parent
             # while retaining a package link's own entry for change matching.
             selected <- file.path(normalizePath(dirname(selected), winslash = "/", mustWork = FALSE), basename(selected))
+        }
+        # NULL means selection is unknown beyond an excluded copy. Preserve
+        # that boundary without opening or resolving its metadata or links.
+        if (!length(selected) && length(barriers)) {
+            selected <- NULL
+            excluded <<- union(excluded, pkgname)
         }
         assign(pkgname, selected, selected_installations)
         selected
@@ -229,6 +238,7 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
         current <- chartr("\\", "/", getNamespaceInfo(pkgname, "path"))
         if (current %in% deferred) return(FALSE)
         installation <- selected_installation(pkgname)
+        if (is.null(installation)) return(FALSE)
         if (!length(installation)) return(TRUE)
         if (installation %in% changed_paths) changed_loaded <<- union(changed_loaded, pkgname)
         current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
@@ -244,9 +254,11 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
     changed <- union(changed, Filter(function(pkgname) {
         if (pkgname %in% excluded) return(FALSE)
         selected <- selected_installation(pkgname)
+        if (is.null(selected)) return(FALSE)
         !length(selected) || selected %in% changed_paths
     }, unique(basename(changed_paths))))
     changed <- setdiff(changed, excluded)
+    changed <- Filter(function(pkgname) !is.null(selected_installation(pkgname)), changed)
     for (workspace in self$workspaces$values()) {
         affected <- changed
         if (length(changed) && is.function(workspace$s3_metadata$keys)) {

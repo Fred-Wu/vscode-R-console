@@ -12,6 +12,19 @@ import { DirectoryEntryLimitError, MAX_DIRECTORY_ENTRIES, readBoundedDirectory }
 const MAX_PACKAGE_WATCHES_PER_LIBRARY = 128;
 const MAX_PACKAGE_READ_RETRIES = 5;
 
+class PackageRecordLimitError extends Error {
+  constructor(directory: string) {
+    super(`Retained package records exceed ${MAX_DIRECTORY_ENTRIES} entries: ${directory}`);
+  }
+}
+
+function librarySignature(library: LibraryInventory): string {
+  return JSON.stringify([library.path, library.root,
+    [...library.packages.values()].map(item => [item.name, item.identity]), [...(library.deferred ?? [])],
+    [...(library.unmonitored ?? [])].sort(), [...(library.unavailablePackages?.keys() ?? [])].sort(),
+    library.suspended ?? false, library.unavailable ?? false]);
+}
+
 export type PackageInstallation = {
   name: string;
   path: string;
@@ -23,6 +36,8 @@ export type PackageInstallation = {
 
 export type LibraryInventory = {
   path: string;
+  // Canonical root captured by the approved location pin.
+  root?: string;
   packages: Map<string, PackageInstallation>;
   // Paths deferred by installation locks or unreadable package metadata.
   deferred?: Map<string, string[]>;
@@ -33,6 +48,8 @@ export type LibraryInventory = {
   suspended?: boolean;
   // Keep verified state when a configured library is temporarily inaccessible.
   unavailable?: boolean;
+  // No verified inventory has been published for this root yet.
+  initializing?: boolean;
 };
 export type PackageInventoryChange = {
   libraries: LibraryInventory[];
@@ -63,7 +80,8 @@ export class PackageInventory {
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelay = 1000;
   private pending: Promise<void> | undefined;
-  private candidate: string | undefined;
+  private readonly candidates = new Map<string, string>();
+  private timerDue = 0;
   private initialized = false;
   private disposed = false;
   private revision = 0;
@@ -87,9 +105,9 @@ export class PackageInventory {
   setRuntimeBusy(busy: boolean): void {
     if (this.disposed || this.runtimeBusy === busy) return;
     this.runtimeBusy = busy;
-    if (busy && (this.timer || this.retryTimer || this.pending || this.candidate)) this.scanAfterEvaluation = true;
+    if (busy && (this.timer || this.retryTimer || this.pending || this.candidates.size)) this.scanAfterEvaluation = true;
     this.revision++;
-    this.candidate = undefined;
+    this.candidates.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     if (this.retryTimer) clearTimeout(this.retryTimer);
@@ -124,7 +142,7 @@ export class PackageInventory {
     const previous = new Set(this.paths);
     this.paths = [...paths];
     this.revision++;
-    this.candidate = undefined;
+    this.candidates.clear();
     for (const library of previous) {
       if (active.has(library)) continue;
       this.watchers.get(library)?.close();
@@ -168,7 +186,7 @@ export class PackageInventory {
     this.packageReadRetries.delete(library);
     this.reviews.delete(library);
     this.revision++;
-    this.candidate = undefined;
+    this.candidates.clear();
     this.dirtyLibraries.add(library);
     this.log(pin.configured.length
       ? `[Libraries] Library alias: ${library} -> ${pin.root}`
@@ -183,7 +201,7 @@ export class PackageInventory {
     this.unavailable.delete(library);
     this.packageReadRetries.delete(library);
     this.revision++;
-    this.candidate = undefined;
+    this.candidates.clear();
     this.watchers.get(library)?.close();
     this.watchers.delete(library);
     this.dirtyLibraries.add(library);
@@ -414,6 +432,7 @@ export class PackageInventory {
     this.unavailable.clear();
     this.packageReadRetries.clear();
     this.lockedLibraries.clear();
+    this.candidates.clear();
   }
 
   refresh(): Promise<void> {
@@ -475,7 +494,11 @@ export class PackageInventory {
     // library watcher or failed publish to exhaust its recovery backoff.
     if (this.disposed) return;
     if (this.runtimeBusy) { this.scanAfterEvaluation = true; return; }
+    // Keep the earliest deadline so continuing notifications cannot starve a scan.
+    const due = Date.now() + delay;
+    if (this.timer && this.timerDue <= due) return;
     if (this.timer) clearTimeout(this.timer);
+    this.timerDue = due;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       void this.refresh();
@@ -535,10 +558,12 @@ export class PackageInventory {
       // Do not turn read failures into package removals or force LSP restarts.
       const retained = (state: "suspended" | "unavailable"): LibraryInventory => ({
         path: library,
+        root: this.pins.get(library)?.root,
         packages: new Map(previous?.packages),
         deferred: new Map(previous?.deferred),
         unmonitored: new Set(previous?.unmonitored),
         unavailablePackages: new Map(previous?.unavailablePackages),
+        initializing: previous?.initializing ?? !previous,
         [state]: true,
       });
       try {
@@ -572,21 +597,32 @@ export class PackageInventory {
           deferred.set(name, [...paths].sort());
           return old;
         };
-        const names = [...new Set([
-          ...entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
-            /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name),
-          ...[...locked].filter(name => name !== "*"),
-          ...(locked.has("*") ? previous?.packages.keys() ?? [] : []),
-          ...(locked.has("*") ? previous?.deferred?.keys() ?? [] : []),
-          ...(locked.has("*") ? previous?.unavailablePackages?.keys() ?? [] : []),
-        ])].sort();
+        // Bound retained lock/read-failure state across scans as well as each
+        // directory listing. Stop before building an oversized reconciliation.
+        const names = new Set<string>();
+        const addNames = (values: Iterable<string>) => {
+          for (const name of values) {
+            names.add(name);
+            if (names.size > MAX_DIRECTORY_ENTRIES) throw new PackageRecordLimitError(libraryRoot);
+          }
+        };
+        addNames(entries.filter(entry => (entry.isDirectory() || entry.isSymbolicLink()) &&
+          /^[A-Za-z][A-Za-z0-9.]*$/.test(entry.name)).map(entry => entry.name));
+        addNames([...locked].filter(name => name !== "*"));
+        if (locked.has("*")) {
+          addNames(previous?.packages.keys() ?? []);
+          addNames(previous?.deferred?.keys() ?? []);
+          addNames(previous?.unavailablePackages?.keys() ?? []);
+          addNames(previous?.unmonitored ?? []);
+        }
+        const orderedNames = [...names].sort();
         const packages = new Map<string, PackageInstallation>();
-        for (let offset = 0; offset < names.length; offset += 8) {
+        for (let offset = 0; offset < orderedNames.length; offset += 8) {
           if (!isCurrent()) return;
-          const batch = await Promise.all(names.slice(offset, offset + 8).map(async name => {
+          const batch = await Promise.all(orderedNames.slice(offset, offset + 8).map(async name => {
             const old = previous?.packages.get(name);
-            if (unmonitored.has(name)) return undefined;
             if (locked.has("*") || locked.has(name)) {
+              if (previous?.unmonitored?.has(name)) unmonitored.add(name);
               const failure = previous?.unavailablePackages?.get(name);
               if (failure !== undefined) unavailablePackages.set(name, failure);
               return defer(name);
@@ -613,11 +649,11 @@ export class PackageInventory {
           this.entryMonitor.add(library, originalTarget);
           if (!isCurrent()) return;
         }
-        libraries.push({ path: library, packages, unmonitored, unavailablePackages,
+        libraries.push({ path: library, root: libraryRoot, packages, unmonitored, unavailablePackages,
           deferred: new Map([...deferred].sort(([a], [b]) => a.localeCompare(b))) });
       } catch (error) {
         if (!isCurrent()) return;
-        if (error instanceof DirectoryEntryLimitError) {
+        if (error instanceof DirectoryEntryLimitError || error instanceof PackageRecordLimitError) {
           // Refuse a too-broad root instead of repeatedly enumerating an
           // entire network share or home directory in recovery retries.
           this.suspended.add(library);
@@ -626,7 +662,9 @@ export class PackageInventory {
           this.watchers.get(library)?.close();
           this.watchers.delete(library);
           this.entryMonitor.remove(library);
-          this.log(`[Libraries] Monitoring suspended: ${library} - directory exceeds ${MAX_DIRECTORY_ENTRIES} entries: ${error.directory}; narrow the configured root and reconfigure`);
+          const reason = error instanceof PackageRecordLimitError ? error.message
+            : `directory exceeds ${MAX_DIRECTORY_ENTRIES} entries: ${error.directory}`;
+          this.log(`[Libraries] Monitoring suspended: ${library} - ${reason}; narrow the configured root and reconfigure`);
           libraries.push(retained("suspended"));
           continue;
         }
@@ -655,32 +693,38 @@ export class PackageInventory {
       try { if (!this.libraryTarget(item.path)) return; }
       catch { this.dirtyLibraries.add(item.path); }
     }
-    if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) {
-      for (const library of dirty) this.dirtyLibraries.add(library);
-      for (const library of unconfirmed) this.unconfirmedLibraries.add(library);
-      this.schedule(250);
-      return;
+    // Confirm each library independently. New events invalidate only that
+    // library's observation; healthy siblings can complete their two scans.
+    let verified = 0;
+    const unsettled = new Set<string>();
+    for (let index = 0; index < libraries.length; index++) {
+      const observed = libraries[index];
+      const previous = this.libraries.find(item => item.path === observed.path);
+      const signature = librarySignature(observed);
+      const interrupted = this.dirtyLibraries.has(observed.path) || this.unconfirmedLibraries.has(observed.path);
+      if (interrupted) this.candidates.delete(observed.path);
+      else if (!this.initialized || (previous && signature === librarySignature(previous)) ||
+          this.candidates.get(observed.path) === signature) {
+        this.candidates.delete(observed.path);
+        verified++;
+        continue;
+      } else this.candidates.set(observed.path, signature);
+      this.dirtyLibraries.add(observed.path);
+      unsettled.add(observed.path);
+      // Until a new root settles, exclude its loaded namespaces from refresh.
+      libraries[index] = previous ?? { path: observed.path, root: observed.root, packages: new Map(), unavailable: true, initializing: true };
     }
+    if (this.dirtyLibraries.size || this.unconfirmedLibraries.size) this.schedule(250);
 
-    // Lock transitions also need publication: a namespace deferred during
-    // discovery may disappear without ever entering the package inventory.
-    const signatureOf = (items: LibraryInventory[]) => JSON.stringify(items.map(library => [library.path,
-      [...library.packages.values()].map(item => [item.name, item.identity]), [...(library.deferred ?? [])],
-      [...(library.unmonitored ?? [])].sort(), [...(library.unavailablePackages?.keys() ?? [])].sort(),
-      library.suspended ?? false, library.unavailable ?? false]));
-    const signature = signatureOf(libraries);
-    const previousSignature = signatureOf(this.libraries);
-    if (this.initialized && signature === previousSignature) {
-      this.candidate = undefined;
-      // A content check without a package change is routine, not a lifecycle
-      // event. Avoid flooding the output channel on normal console input.
-      return;
-    }
-    if (this.initialized && this.candidate !== signature) {
-      this.candidate = signature;
-      for (const library of dirty) this.dirtyLibraries.add(library);
-      this.schedule(250);
-      return;
+    if (!this.initialized && libraries.length && !verified) return;
+
+    // Lock transitions also need publication even when no package was observed.
+    if (this.initialized && JSON.stringify(libraries.map(librarySignature)) ===
+        JSON.stringify(this.libraries.map(librarySignature))) return;
+    // A sibling's publication must not reconcile a changing/locked root using
+    // its older observations. Keep its verified entries and defer its namespaces.
+    for (let index = 0; index < libraries.length; index++) {
+      if (unsettled.has(libraries[index].path)) libraries[index] = { ...libraries[index], unavailable: true };
     }
 
     const packages = new Map<string, PackageInstallation>();
@@ -713,9 +757,10 @@ export class PackageInventory {
     for (const library of libraries) {
       if (library.suspended || library.unavailable) continue;
       const previous = this.libraries.find(item => item.path === library.path);
-      for (const name of new Set([...previous?.packages.keys() ?? [], ...library.packages.keys()])) {
+      if (!previous || previous.initializing) continue;
+      for (const name of new Set([...previous.packages.keys(), ...library.packages.keys()])) {
         if (library.deferred?.has(name) || library.unmonitored?.has(name)) continue;
-        const before = previous?.packages.get(name), after = library.packages.get(name);
+        const before = previous.packages.get(name), after = library.packages.get(name);
         if (before?.identity === after?.identity) continue;
         if (before) changedInstallationPaths.add(before.target);
         if (after) changedInstallationPaths.add(after.target);
@@ -795,7 +840,6 @@ export class PackageInventory {
     this.libraries = libraries;
     this.packages = packages;
     this.initialized = true;
-    this.candidate = undefined;
   }
 
   private async inspectPackage(library: string, name: string, isCurrent: () => boolean): Promise<InstallationIdentity | null | undefined> {

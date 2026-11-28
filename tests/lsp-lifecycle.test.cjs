@@ -842,12 +842,14 @@ test("links to missing package folders preserve R's valid package selection", { 
     process.platform === "win32" ? "junction" : "dir");
   const { client, instances, complete, logs } = createClient({ libraries: [first] });
   await client.start();
-  await waitFor(() => client.packageInventory.initialized, "inventory accepts R's system package selection");
+  await waitFor(() => client.packageInventory.libraries.filter(row => row.packages.has("stats") &&
+    !row.unavailable).length === 2 && !client.packageRefreshPromise,
+    "inventory accepts R's system package selection");
   assert.equal(instances.length, 1);
   assert.equal(client.failedPackageRefresh, undefined);
   assert.ok((await complete("utils::he")).some(item => item.label === "head"));
   assert.ok(!logs.some(line => line.includes("retained stale packages")));
-  const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
+  const request = instances[0].requests.filter(request => request.method === "rConsole/refreshPackages").at(-1);
   const copies = request.params.installations.stats;
   assert.equal(copies.length, 2);
   const ignored = await instances[0].sendRequest("rConsole/refreshPackages", {
@@ -874,7 +876,9 @@ test("R selects valid later copies and tracks their updates behind an unusable p
     R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
   const { client, instances, complete } = createClient({ env, libraries: [first, second] });
   await client.start();
-  await waitFor(() => client.packageInventory.initialized, "initial fallback inventory");
+  await waitFor(() => client.packageInventory.libraries.some(row => row.packages.has(pkg) &&
+    !row.packages.get(pkg).linked && !row.unavailable) && !client.packageRefreshPromise,
+    "initial fallback inventory");
   assert.equal(instances.length, 1);
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   install(second, "updatedExport");
@@ -932,4 +936,37 @@ test("initial locked namespaces stay usable and conflicting startup libraries st
   await waitFor(() => next.client.packageInventory.initialized && !next.client.failedPackageRefresh,
     "a compatible library order restores completion");
   assert.ok((await next.complete(pkg + "::")).some(item => item.label === "startupExport"));
+});
+
+test("excluded middle copies preserve R selection behind invalid entries", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  const third = path.join(root, "third"); fs.mkdirSync(third);
+  install(second, "selectedExport"); install(third, "laterExport");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  const firstEntry = path.join(first, pkg);
+  fs.symlinkSync(path.join(root, "missing"), firstEntry, kind);
+  const meta = path.join(second, pkg, "Meta"), target = path.join(root, "excluded-meta");
+  fs.renameSync(meta, target); fs.symlinkSync(target, meta, kind);
+  const env = { ...process.env, R_LIBS_USER: [first, second, third, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete } = createClient({ env, libraries: [first, second, third] });
+  await client.start();
+  await waitFor(() => new Set(client.packageInventory.libraries
+    .filter(row => row.packages.has(pkg) && !row.unavailable).map(row => row.packages.get(pkg).target)).size === 2 &&
+    client.packageInventory.libraries.some(row => row.unmonitored?.has(pkg) && !row.unavailable) && !client.packageRefreshPromise,
+    "excluded copy reconciled");
+  assert.equal(instances.length, 1, "the excluded selected copy cannot cause a false restart");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "selectedExport"));
+  const request = instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").at(-1);
+  assert.equal(request.params.installations[pkg].length, 3, "preserve the excluded copy's position");
+  assert.ok(request.params.unmonitoredInstallationPaths.includes(request.params.installations[pkg][1]));
+
+  // A valid monitored copy ahead of the barrier still participates normally.
+  fs.unlinkSync(firstEntry); install(first, "preferredExport");
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "valid earlier copy selected");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "preferredExport"));
+  install(first, "updatedExport");
+  await waitFor(() => instances.length === 3 && !client.packageRefreshPromise, "earlier copy update reconciled");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+  assert.equal(client.failedPackageRefresh, undefined);
 });

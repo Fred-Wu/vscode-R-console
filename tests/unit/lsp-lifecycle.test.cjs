@@ -1118,14 +1118,18 @@ test("package refresh sends pinned installations and explicit monitoring exclusi
     libraries: [{ path: "/configured-alias", packages }, { path: "/duplicate-alias", packages },
       { path: "/suspended-library", packages: later, suspended: true },
       { path: "/unavailable-library", packages: later, unavailable: true },
-      { path: "/excluded-entry", packages: later, unmonitored: new Set(["example"]) },
+      { path: "/excluded-entry", root: "/pinned-excluded", packages: new Map(), unmonitored: new Set(["example"]) },
       { path: "/unreadable-entry", packages: later, unavailablePackages: new Map([["example", "EACCES"]]) },
       { path: "/later", packages: later }], packages,
     changed: [], unmonitored: ["linked"], unmonitoredRoots: ["/suspended-library"],
     isCurrent: () => true,
   });
   const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
-  assert.deepEqual({ ...request.params.installations }, { example: ["/pinned-library/example", "/later/example"] });
+  assert.deepEqual({ ...request.params.installations }, {
+    example: ["/pinned-library/example", "/later/example", path.join("/pinned-excluded", "example")],
+  });
+  assert.deepEqual(request.params.unmonitoredInstallationPaths,
+    ["/later/example", path.join("/pinned-excluded", "example")]);
   assert.deepEqual(request.params.unmonitored, ["linked"]);
   assert.deepEqual(request.params.unmonitoredRoots, ["/suspended-library"]);
 });

@@ -1272,7 +1272,11 @@ reconciliation and installation-lock backup discovery each retain at most 4,096
 entries per directory. Observing the 4,097th entry ends that enumeration and
 closes its handle. An oversized library or lock-backup directory suspends the
 library's inventory monitoring until reconfiguration, preserving its last verified
-package state. The lifecycle log identifies the directory that exceeded the limit.
+package state. Each library also retains at most 4,096 distinct package names
+across current entries, lock backups and deferred records from earlier scans.
+Exceeding this combined budget suspends that library and preserves its last
+verified inventory. The lifecycle log identifies the directory or retained-record
+budget that exceeded the limit. Other libraries continue reconciliation.
 Pinned paths are validated with asynchronous, ordered `lstat` calls before and
 after opening and after batches of at most 32 entries. Each check stops at the
 first changed ancestor, without resolving its replacement. Enumeration reads only
@@ -1300,8 +1304,13 @@ recovery budgets are preserved across the hold.
 
 One reconciliation publishes the final stable inventory and requests a single
 language-server replacement when loaded namespaces changed. Lock checks and the
-two-snapshot stability check remain part of reconciliation. Changes made outside
-the console's active evaluation use the filesystem-event debounce. Lock presence
+two-snapshot stability check remain part of reconciliation. Stability is confirmed
+independently for each library. Events arriving during a scan invalidate that
+library's candidate and preserve its last published state while healthy libraries
+continue publishing. Unsettled roots are temporarily excluded from reconciliation
+during sibling publication. Changes made outside the console's active evaluation
+use a 250 ms scan deadline; subsequent events preserve the earliest deadline.
+Lock presence
 is logged once per library until the lock clears. Initial library discovery logs
 its scan; confirmed package changes report their outcomes and updated counts.
 The search-order listing is emitted when library order changes.
@@ -1402,9 +1411,12 @@ adapter uses `find.package()` with the observed candidate libraries to validate
 metadata and select the effective installation. A link to a missing folder or
 an invalid earlier installation can leave a later valid copy selected. Updates
 to that later copy still invalidate its metadata and loaded namespace. Excluded
-and suspended installations remain outside reconciliation, and installation
-locks defer the affected package. The R adapter retains changed entry paths for
-excluded names until reconciliation resumes or the process is replaced.
+and suspended installations retain their ordered positions as selection barriers.
+The R adapter validates monitored candidates preceding the first barrier. If none
+is valid, reconciliation of that name is deferred without opening or resolving the
+excluded installation. Valid earlier copies continue to receive updates.
+Installation locks defer the affected package. The R adapter retains changed entry
+paths for excluded names until reconciliation resumes or the process is replaced.
 Reusing an unchanged copy after a
 library-order refresh preserves the new server; replacing files in that copy
 still invalidates loaded namespaces. Inventory requests update package metadata;

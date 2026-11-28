@@ -2228,3 +2228,115 @@ for (const action of ['dispose', 'remove', 'pause', 'coalesce events']) {
     assert.equal(active, 0);
   });
 }
+
+test("whole-library locks bound retained package names across directory churn", async t => {
+  const control = controlledWatches();
+  const f = fixture(t, 0, { watch: control.watch });
+  const [library, healthy] = f.libraries;
+  const original = f.install(library);
+  const sibling = f.install(healthy, "1", "sibling");
+  f.inventory.setLibraryPaths(f.libraries);
+  await f.settle();
+  const verified = f.changes.at(-1).packages.get("example");
+  fs.mkdirSync(path.join(library, "00LOCK"));
+  let prior = [];
+  for (const [round, count] of [2047, 2048, 1].entries()) {
+    for (const name of prior) fs.rmdirSync(path.join(library, name));
+    prior = Array.from({ length: count }, (_, i) => `pkg${round}.${i}`);
+    for (const name of prior) fs.mkdirSync(path.join(library, name));
+    assert.ok(fs.readdirSync(library).length < 4096);
+    f.inventory.dirtyLibraries.add(library);
+    await f.inventory.refresh();
+    await f.settle();
+    const state = f.changes.at(-1).libraries[0];
+    assert.equal(state.packages.get("example"), verified);
+    assert.equal(state.deferred.size, [2048, 4096, 4096][round]);
+    assert.equal(!!state.suspended, round === 2);
+  }
+  assert.ok(f.logs.some(line => line.includes("Retained package records exceed 4096")));
+  assert.equal(f.inventory.watchers.has(library), false);
+  assert.equal(f.inventory.retryTimer, undefined);
+  assert.ok(matchesDescription(verified, original));
+  fs.appendFileSync(path.join(sibling, "DESCRIPTION"), "Title: updated\n");
+  f.inventory.watchers.get(healthy).emit("change", path.join("sibling", "DESCRIPTION"));
+  await f.settle(() => matchesDescription(f.changes.at(-1).packages.get("sibling"), sibling));
+  assert.ok(f.changes.at(-1).libraries[0].suspended, "only the overflowing library is suspended");
+});
+
+async function waitForPublication(predicate) {
+  const deadline = Date.now() + 10000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, "healthy library publishes while its sibling remains noisy");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+test("continuous events cannot postpone another library's publication deadline", async t => {
+  const control = controlledWatches();
+  const f = fixture(t, 0, { watch: control.watch });
+  const [noisy, healthy] = f.libraries;
+  f.install(noisy, "1", "noisy");
+  const sibling = f.install(healthy, "1", "sibling");
+  f.inventory.setLibraryPaths(f.libraries);
+  await f.settle();
+  fs.appendFileSync(path.join(sibling, "DESCRIPTION"), "Title: updated\n");
+  f.inventory.watchers.get(healthy).emit("change", path.join("sibling", "DESCRIPTION"));
+  const timer = setInterval(() => f.inventory.watchers.get(noisy).emit("change", "noisy"), 25);
+  try {
+    await waitForPublication(() => matchesDescription(f.changes.at(-1).packages.get("sibling"), sibling));
+  } finally { clearInterval(timer); }
+  await f.settle();
+});
+
+test("events during every scan invalidate only the affected library's candidate", async t => {
+  const control = controlledWatches();
+  const f = fixture(t, 0, { watch: control.watch });
+  const [noisy, healthy] = f.libraries;
+  const noisyPackage = f.install(noisy, "1", "noisy");
+  const sibling = f.install(healthy, "1", "sibling");
+  f.inventory.setLibraryPaths(f.libraries);
+  await f.settle();
+  const previous = f.changes.at(-1).packages.get("noisy");
+  fs.appendFileSync(path.join(noisyPackage, "DESCRIPTION"), "Title: changing\n");
+  fs.appendFileSync(path.join(sibling, "DESCRIPTION"), "Title: updated\n");
+  const observe = f.inventory.observePackage.bind(f.inventory);
+  let inject = true, interrupted = 0;
+  f.inventory.observePackage = async (...args) => {
+    const result = await observe(...args);
+    if (inject && args[0] === noisy) {
+      interrupted++;
+      f.inventory.watchers.get(noisy).emit("change", "noisy");
+    }
+    return result;
+  };
+  for (const library of f.libraries) f.inventory.dirtyLibraries.add(library);
+  await f.inventory.refresh();
+  await waitForPublication(() => matchesDescription(f.changes.at(-1).packages.get("sibling"), sibling));
+  assert.ok(interrupted >= 2);
+  assert.equal(f.changes.at(-1).packages.get("noisy"), previous, "interrupted observations stay unpublished");
+  assert.ok(f.changes.at(-1).unmonitoredRoots.includes(noisy), "a sibling update cannot reconcile the unsettled root");
+  inject = false;
+  await f.settle(() => matchesDescription(f.changes.at(-1).packages.get("noisy"), noisyPackage));
+});
+
+test("whole-library locks retain exclusions for temporarily absent package copies", async t => {
+  const control = controlledWatches();
+  const f = fixture(t, 0, { watch: control.watch });
+  const [library] = f.libraries;
+  const directory = f.install(library), meta = path.join(directory, "Meta");
+  const target = path.join(f.root, "excluded-meta");
+  fs.renameSync(meta, target);
+  fs.symlinkSync(target, meta, process.platform === "win32" ? "junction" : "dir");
+  f.inventory.setLibraryPaths([library]);
+  await f.settle();
+  assert.ok(f.changes.at(-1).unmonitored.includes("example"));
+  fs.mkdirSync(path.join(library, "00LOCK"));
+  fs.rmSync(directory, { recursive: true });
+  f.inventory.dirtyLibraries.add(library); await f.inventory.refresh(); await f.settle();
+  assert.ok(f.changes.at(-1).libraries[0].deferred.has("example"));
+  assert.ok(f.changes.at(-1).unmonitored.includes("example"));
+  fs.rmdirSync(path.join(library, "00LOCK"));
+  f.inventory.dirtyLibraries.add(library); await f.inventory.refresh(); await f.settle();
+  assert.equal(f.changes.at(-1).libraries[0].deferred.size, 0);
+  assert.deepEqual(f.changes.at(-1).unmonitored, []);
+});

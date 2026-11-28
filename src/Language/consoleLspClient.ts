@@ -801,16 +801,24 @@ export class ConsoleLspClient implements CompletionProvider {
         this.options.onPackagesChanged?.();
       }
       const installations: Record<string, string[]> = Object.create(null);
+      const unmonitoredInstallationPaths = new Set<string>();
       for (const library of change.libraries) {
-        if (library.suspended || library.unavailable) continue;
-        for (const [name, item] of library.packages) {
-          if (library.unmonitored?.has(name) || library.unavailablePackages?.has(name)) continue;
+        const names = new Set([...library.packages.keys(), ...(library.unmonitored ?? []),
+          ...(library.unavailablePackages?.keys() ?? [])]);
+        for (const name of names) {
+          const item = library.packages.get(name);
+          const target = item?.target ?? path.join(library.root ?? library.path, name);
           const copies = installations[name] ??= [];
-          if (!copies.includes(item.target)) copies.push(item.target);
+          if (!copies.includes(target)) copies.push(target);
+          // Keep excluded copies in search order as barriers. R may validate
+          // earlier monitored copies, but must not select beyond a barrier.
+          if (library.suspended || library.unavailable || library.unmonitored?.has(name) ||
+              library.unavailablePackages?.has(name)) unmonitoredInstallationPaths.add(target);
         }
       }
       const params = {
         installations,
+        unmonitoredInstallationPaths: [...unmonitoredInstallationPaths],
         unmonitored: change.unmonitored ?? [],
         unmonitoredRoots: change.unmonitoredRoots ?? [],
         deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
@@ -824,7 +832,7 @@ export class ConsoleLspClient implements CompletionProvider {
       const refreshKey = JSON.stringify([
         change.libraries.map(library => library.path),
         change.libraries.map(library => [...library.packages].map(([name, item]) => [name, item.target, item.identity])),
-        params.unmonitored, params.unmonitoredRoots, params.deferred,
+        params.installations, params.unmonitoredInstallationPaths, params.unmonitored, params.unmonitoredRoots, params.deferred,
       ]);
       const previousFailure = this.failedPackageRefresh;
       const retryingConflict = previousFailure?.client === client && previousFailure.key === refreshKey;
