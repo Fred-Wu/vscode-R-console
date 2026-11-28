@@ -70,6 +70,9 @@ export class PackageInventory {
   private readonly dirtyLibraries = new Set<string>();
   // Ambiguous events can be directory metadata touches with no package change.
   private readonly unconfirmedLibraries = new Set<string>();
+  private runtimeBusy = false;
+  private scanAfterEvaluation = false;
+  private readonly lockedLibraries = new Set<string>();
 
   constructor(
     private readonly onChange: (change: PackageInventoryChange) => Promise<void>,
@@ -78,6 +81,27 @@ export class PackageInventory {
   ) {
     this.entryMonitor = new LibraryPathEntryMonitor(
       library => this.validateForEvent(library), message => this.log(message), fs);
+  }
+
+  /** Accumulate one console evaluation's filesystem changes until its main prompt. */
+  setRuntimeBusy(busy: boolean): void {
+    if (this.disposed || this.runtimeBusy === busy) return;
+    this.runtimeBusy = busy;
+    if (busy && (this.timer || this.retryTimer || this.pending || this.candidate)) this.scanAfterEvaluation = true;
+    this.revision++;
+    this.candidate = undefined;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    for (const watcher of this.watchers.values()) watcher.setPaused(busy);
+    if (!busy) {
+      // Preserve recovery work as well as events collected during evaluation.
+      if (this.paths.some(library => !this.watchers.has(library) && !this.suspended.has(library)) ||
+          this.hasPackageReadRetries() || this.unavailable.size) this.scheduleRetry();
+      if (this.scanAfterEvaluation || !this.initialized || this.pending || this.dirtyLibraries.size || this.unconfirmedLibraries.size) this.schedule(250);
+      this.scanAfterEvaluation = false;
+    }
   }
 
   private validateForEvent(library: string): boolean {
@@ -112,6 +136,7 @@ export class PackageInventory {
       this.packageReadRetries.delete(library);
       this.dirtyLibraries.delete(library);
       this.unconfirmedLibraries.delete(library);
+      this.lockedLibraries.delete(library);
       this.entryMonitor.remove(library);
     }
     for (const library of paths) {
@@ -227,7 +252,7 @@ export class PackageInventory {
           this.dirtyLibraries.add(library);
         }
         this.schedule(250);
-      }, (reason) => this.log(`[Libraries] Limited package monitoring: ${library} - ${reason}; root events remain active`));
+      }, (reason) => this.log(`[Libraries] Limited package monitoring: ${library} - ${reason}; root events remain active`), this.runtimeBusy);
       if (this.libraryTarget(library) !== pin) { watcher.close(); return; }
       watcher.on("error", error => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
@@ -316,7 +341,7 @@ export class PackageInventory {
 
   private runRecoveryRetry(): void {
     this.retryTimer = undefined;
-    if (this.disposed) return;
+    if (this.disposed || this.runtimeBusy) return;
     this.log("[Libraries] Recovery retry started");
     for (const library of this.paths) {
       if (!this.watchers.has(library)) this.watchLibrary(library, true);
@@ -340,6 +365,7 @@ export class PackageInventory {
 
   private scheduleRetry(cancelScheduledScan = false): void {
     if (this.disposed) return;
+    if (this.runtimeBusy) { this.scanAfterEvaluation = true; return; }
     // Keep already queued events from healthy libraries when a different
     // watcher fails. A failed publication must defer its next retry even
     // when another recovery timer is already armed.
@@ -369,10 +395,12 @@ export class PackageInventory {
     this.suspended.clear();
     this.unavailable.clear();
     this.packageReadRetries.clear();
+    this.lockedLibraries.clear();
   }
 
   refresh(): Promise<void> {
     if (this.disposed) return Promise.resolve();
+    if (this.runtimeBusy) { this.scanAfterEvaluation = true; return Promise.resolve(); }
     if (this.pending) return this.pending;
     const revision = this.revision;
     const dirty = new Set(this.dirtyLibraries);
@@ -428,6 +456,7 @@ export class PackageInventory {
     // Event-driven scans for healthy libraries must not wait for an unrelated
     // library watcher or failed publish to exhaust its recovery backoff.
     if (this.disposed) return;
+    if (this.runtimeBusy) { this.scanAfterEvaluation = true; return; }
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = undefined;
@@ -494,7 +523,7 @@ export class PackageInventory {
       });
       let entries: fs.Dirent[];
       try {
-        this.log(`[Libraries] Scanning folder: ${library}`);
+        if (!previous) this.log(`[Libraries] Scanning folder: ${library}`);
         const originalTarget = this.libraryTarget(library);
         if (originalTarget === undefined) {
           libraries.push(retained("suspended"));
@@ -513,7 +542,10 @@ export class PackageInventory {
         // identity, but never traverse, read or watch its target from here.
         const unmonitored = new Set<string>();
         const unavailablePackages = new Map<string, string>();
-        if (locked.size) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
+        if (locked.size) {
+          if (!this.lockedLibraries.has(library)) this.log(`[Libraries] Scan deferred: installation lock present - ${library}`);
+          this.lockedLibraries.add(library);
+        } else this.lockedLibraries.delete(library);
         const deferred = new Map<string, string[]>();
         const libraryRoot = originalTarget.root;
         const defer = (name: string) => {
@@ -627,12 +659,10 @@ export class PackageInventory {
       this.candidate = undefined;
       // A content check without a package change is routine, not a lifecycle
       // event. Avoid flooding the output channel on normal console input.
-      if (dirty.size) this.log("[Libraries] Package inventory unchanged");
       return;
     }
     if (this.initialized && this.candidate !== signature) {
       this.candidate = signature;
-      this.log("[Libraries] Package inventory changed; checking again to confirm");
       for (const library of dirty) this.dirtyLibraries.add(library);
       this.schedule(250);
       return;
@@ -735,12 +765,18 @@ export class PackageInventory {
           this.log(`[Packages] ${retained ? "First library copy changed" : "Remaining library copy"}: ${name} - ${next.path}`);
         }
       }
-      if (!changed.length) this.log("[Libraries] First library copies unchanged");
+      if (!changed.length && changedInstallationPaths.size) this.log("[Libraries] First library copies unchanged");
     }
-    this.log("[Libraries] Search order:");
-    libraries.forEach((library, index) => this.log(
-      `  ${index + 1}. ${library.path} - ${library.packages.size} ${library.packages.size === 1 ? "package" : "packages"}`));
-    this.log(`[Libraries] ${libraries.reduce((sum, library) => sum + library.packages.size, 0)} installations; ${packages.size} unique package names`);
+    const orderChanged = !this.initialized || JSON.stringify(libraries.map(library => library.path)) !==
+      JSON.stringify(this.libraries.map(library => library.path));
+    if (orderChanged) {
+      this.log("[Libraries] Search order:");
+      libraries.forEach((library, index) => this.log(
+        `  ${index + 1}. ${library.path} - ${library.packages.size} ${library.packages.size === 1 ? "package" : "packages"}`));
+    }
+    if (orderChanged || changedInstallationPaths.size) {
+      this.log(`[Libraries] ${libraries.reduce((sum, library) => sum + library.packages.size, 0)} installations; ${packages.size} unique package names`);
+    }
     this.libraries = libraries;
     this.packages = packages;
     this.initialized = true;
@@ -776,14 +812,46 @@ class PackageDirectoryWatcher extends EventEmitter {
   private packageRetryTimer: NodeJS.Timeout | undefined;
   private closed = false;
   private limitation: string | undefined;
+  private refreshPending = false;
 
   constructor(private readonly root: string, private readonly rootIsValid: () => boolean,
     onChange: (event: string, filename?: string) => void,
-    private readonly onLimited?: (message: string) => void) {
+    private readonly onLimited?: (message: string) => void, private paused = false) {
     super();
     this.on("change", onChange);
-    try { this.refresh(); }
+    try {
+      if (paused) {
+        if (!this.watchDirectory(this.root)) throw new Error("Library directory disappeared during watch setup");
+        this.refreshPending = true;
+      } else this.refresh();
+    }
     catch (error) { this.close(); throw error; }
+  }
+
+  setPaused(paused: boolean): void {
+    if (this.closed || this.paused === paused) return;
+    this.paused = paused;
+    if (paused) {
+      if (this.timer) { clearTimeout(this.timer); this.timer = undefined; this.refreshPending = true; }
+      if (this.packageRetryTimer) clearTimeout(this.packageRetryTimer);
+      this.packageRetryTimer = undefined;
+    } else {
+      if (this.refreshPending) {
+        this.refreshPending = false;
+        this.scheduleRefresh();
+      }
+      this.schedulePackageRetry();
+    }
+  }
+
+  private scheduleRefresh(): void {
+    if (this.closed || this.timer) return;
+    if (this.paused) { this.refreshPending = true; return; }
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      try { this.refresh(); } catch (error) { if (!this.closed) this.emit("error", error); }
+    }, 50);
+    this.timer.unref();
   }
 
   close(): void {
@@ -837,12 +905,7 @@ class PackageDirectoryWatcher extends EventEmitter {
       this.emit("change", event, relative);
       // Only root notifications can change the set of immediate package
       // directories. Coalesce bursts before reconciling that set.
-      if (directory !== this.root || this.closed || this.timer) return;
-      this.timer = setTimeout(() => {
-        this.timer = undefined;
-        try { this.refresh(); } catch (error) { if (!this.closed) this.emit("error", error); }
-      }, 50);
-      this.timer.unref();
+      if (directory === this.root) this.scheduleRefresh();
     });
     watcher.on("error", error => {
       if (this.closed || this.directories.get(directory)?.watcher !== watcher) return;
@@ -886,7 +949,7 @@ class PackageDirectoryWatcher extends EventEmitter {
   private schedulePackageRetry(): void {
     if (this.packageRetryTimer) clearTimeout(this.packageRetryTimer);
     this.packageRetryTimer = undefined;
-    if (this.closed) return;
+    if (this.closed || this.paused) return;
     const due = [...this.failedPackages.values()].map(failure => failure.nextAttemptAt)
       .filter((value): value is number => value !== undefined);
     if (!due.length) return;
@@ -896,7 +959,7 @@ class PackageDirectoryWatcher extends EventEmitter {
 
   private retryPackages(): void {
     this.packageRetryTimer = undefined;
-    if (this.closed) return;
+    if (this.closed || this.paused) return;
     try {
       const now = Date.now();
       for (const [directory, failure] of this.failedPackages) {

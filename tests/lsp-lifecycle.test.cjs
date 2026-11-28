@@ -480,6 +480,41 @@ function lifecycleFixture(t) {
   return { first, second, root, pkg, install, defaults, createClient };
 }
 
+test("one console evaluation updates multiple loaded packages with one LSP restart", { timeout: 120000 }, async t => {
+  const { first, pkg, install, createClient } = lifecycleFixture(t);
+  const alpha = pkg + "alpha", beta = pkg + "beta", removed = pkg + "removed", added = pkg + "added";
+  install(first, "originalAlpha", "", alpha);
+  install(first, "originalBeta", "", beta);
+  install(first, "removedExport", "", removed);
+  const { client, complete, instances, logs } = createClient({ libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial package inventory");
+  for (const [name, exported] of [[alpha, "originalAlpha"], [beta, "originalBeta"], [removed, "removedExport"]]) {
+    assert.ok((await complete(name + "::")).some(item => item.label === exported));
+  }
+  const requests = instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").length;
+  logs.length = 0;
+  client.setRuntimeBusy(true);
+  for (const [name, exported] of [[alpha, "updatedAlpha"], [beta, "updatedBeta"], [added, "addedExport"]]) {
+    install(first, exported, "", name);
+    await new Promise(resolve => setTimeout(resolve, 650));
+  }
+  fs.rmSync(path.join(first, removed), { recursive: true });
+  await new Promise(resolve => setTimeout(resolve, 650));
+  assert.equal(instances.length, 1, "no intermediate server restart during installation");
+  assert.equal(instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").length, requests);
+  assert.ok(!logs.some(line => /Scanning folder|Scan deferred|inventory changed/.test(line)));
+  client.setRuntimeBusy(false);
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise &&
+    client.packageInventory.packages.has(added) && !client.packageInventory.packages.has(removed), "one consolidated reconciliation");
+  assert.equal(instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").length, requests + 1);
+  for (const [name, exported] of [[alpha, "updatedAlpha"], [beta, "updatedBeta"], [added, "addedExport"]]) {
+    assert.ok((await complete(name + "::")).some(item => item.label === exported));
+  }
+  assert.ok(!(await complete(alpha + "::")).some(item => item.label === "originalAlpha"));
+  assert.equal(instances.length, 2);
+});
+
 test("normal startup options and large application state survive a server replacement", { timeout: 90000 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "originalExport"); install(second, "replacementExport");

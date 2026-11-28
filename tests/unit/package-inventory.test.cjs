@@ -239,6 +239,9 @@ for (const notificationDelay of [0, 100]) {
   test(`inventory defers locked installations with ${notificationDelay}ms watcher delivery delay`, async t => {
     // Delayed delivery leaves the inventory idle across several settle polls.
     const { libraries: [library], inventory, changes, logs, install, settle, waitForLog } = fixture(t, notificationDelay);
+    let lockChecks = 0;
+    const checkLocks = inventory.installationLocks.bind(inventory);
+    inventory.installationLocks = (...args) => { lockChecks++; return checkLocks(...args); };
     inventory.setLibraryPaths([library]);
     await settle();
     const count = changes.length;
@@ -252,14 +255,126 @@ for (const notificationDelay of [0, 100]) {
     assert.ok(changes.at(-1).libraries[0].deferred.get("example").includes(path.join(library, "example")));
     assert.ok(logs.includes(`[Libraries] Scan deferred: installation lock present - ${library}`));
     logs.length = 0;
+    const before = lockChecks;
     install(library);
-    await waitForLog(`[Libraries] Scan deferred: installation lock present - ${library}`);
+    await settle(() => lockChecks > before, "the locked installation is checked after its filesystem event");
+    assert.ok(!logs.some(line => line.includes("Scan deferred:")), "the same lock is logged once");
     assert.equal(changes.length, count + 1);
     fs.rmdirSync(lock);
     await settle(() => changes.at(-1).packages.has("example"), "unlocking must publish the installed package");
     assert.deepEqual(changes.at(-1).changed, ["example"]);
   });
 }
+
+test("one R evaluation consolidates sequential package changes and watcher reconciliation", async t => {
+  let reads = 0;
+  const f = fixture(t, 0, {
+    readdirSync: (...args) => { reads++; return fs.readdirSync(...args); },
+    promises: { ...fs.promises, readdir: (...args) => { reads++; return fs.promises.readdir(...args); } },
+  });
+  const [first, second] = f.libraries;
+  f.install(first, "1", "alpha");
+  f.install(second, "1", "beta");
+  f.install(second, "1", "removed");
+  f.inventory.setLibraryPaths(f.libraries);
+  await f.settle();
+  const before = f.changes.length, watched = f.watches.length;
+  f.logs.length = 0;
+  f.inventory.setRuntimeBusy(true);
+  reads = 0;
+  for (const [library, name] of [[first, "alpha"], [second, "beta"], [first, "added"]]) {
+    const lock = path.join(library, "00LOCK-" + name);
+    fs.mkdirSync(lock);
+    f.install(library, "2", name);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    fs.rmdirSync(lock);
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+  fs.rmSync(path.join(second, "removed"), { recursive: true });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(reads, 0, "evaluation queues changes without inventory scans or watch-set enumeration");
+  assert.equal(f.watches.length, watched);
+  assert.equal(f.changes.length, before);
+  assert.deepEqual(f.logs, [], "intermediate lock/scan states stay out of the lifecycle log");
+  f.inventory.setRuntimeBusy(false);
+  await f.settle(() => f.changes.at(-1).packages.has("added"));
+  assert.equal(f.changes.length, before + 1, "one final inventory reaches the language server");
+  assert.deepEqual(f.changes.at(-1).changed.sort(), ["added", "alpha", "beta", "removed"]);
+  assert.ok(matchesDescription(f.changes.at(-1).packages.get("alpha"), path.join(first, "alpha")));
+  assert.ok(matchesDescription(f.changes.at(-1).packages.get("beta"), path.join(second, "beta")));
+  assert.equal(f.inventory.watchers.get(first).directories.has(path.join(first, "added")), true);
+  assert.ok(!f.logs.some(line => /Scanning folder|inventory changed|inventory unchanged|Search order:/.test(line)));
+  assert.equal(f.logs.filter(line => line.includes("unique package names")).length, 1);
+});
+
+test("evaluation invalidates an in-flight scan and resumes its uncommitted changes", async t => {
+  const f = fixture(t);
+  const [library] = f.libraries;
+  f.install(library);
+  f.inventory.setLibraryPaths([library]);
+  await f.settle();
+  const before = f.changes.length;
+  let entered, release, once = true;
+  const begun = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(release);
+  const inspect = f.inventory.observePackage.bind(f.inventory);
+  f.inventory.observePackage = async (...args) => {
+    if (once) { once = false; entered(); await gate; }
+    return inspect(...args);
+  };
+  f.inventory.dirtyLibraries.add(library);
+  const pending = f.inventory.refresh();
+  await begun;
+  f.inventory.setRuntimeBusy(true);
+  f.install(library, "2");
+  release();
+  await pending;
+  assert.equal(f.changes.length, before);
+  assert.equal(f.inventory.timer, undefined);
+  f.inventory.setRuntimeBusy(false);
+  await f.settle(() => f.changes.length > before);
+  assert.equal(f.changes.length, before + 1);
+  assert.ok(matchesDescription(f.changes.at(-1).packages.get("example"), path.join(library, "example")));
+});
+
+test("evaluation batching preserves immediate pinned-library security checks", async t => {
+  const f = fixture(t);
+  const [library] = f.libraries;
+  f.install(library);
+  f.inventory.setLibraryPaths([library]);
+  await f.settle();
+  f.inventory.setRuntimeBusy(true);
+  releaseWindowsWatcherHandles(f.inventory.watchers.get(library));
+  releaseWindowsEntryWatcherHandles(f.inventory);
+  fs.renameSync(library, library + "-old");
+  fs.mkdirSync(library);
+  assert.equal(f.inventory.validateForEvent(library), false);
+  assert.equal(f.inventory.suspended.has(library), true);
+  assert.equal(f.inventory.watchers.has(library), false);
+  assert.equal(f.reviews.length, 1, "replacement is reported before the evaluation completes");
+  f.inventory.setRuntimeBusy(false);
+  await f.settle(() => f.changes.at(-1).libraries[0].suspended);
+  assert.ok(f.changes.at(-1).unmonitored.includes("example"));
+});
+
+test("evaluation preserves both queued and newly requested library-order changes", async t => {
+  const f = fixture(t);
+  const [first, second] = f.libraries;
+  f.install(first, "1");
+  f.install(second, "2");
+  f.inventory.setLibraryPaths([first, second]);
+  await f.settle();
+  for (const requestedWhileBusy of [true, false]) {
+    const paths = requestedWhileBusy ? [second, first] : [first, second];
+    if (requestedWhileBusy) f.inventory.setRuntimeBusy(true);
+    f.inventory.setLibraryPaths(paths);
+    if (!requestedWhileBusy) f.inventory.setRuntimeBusy(true);
+    f.inventory.setRuntimeBusy(false);
+    await f.settle(() => f.changes.at(-1).libraries[0].path === paths[0], "queued library order survives the evaluation hold");
+    assert.equal(f.changes.at(-1).packages.get("example").path, path.join(paths[0], "example"));
+  }
+});
 
 test("inventory detects same-version package replacement from folder events", async t => {
   const { libraries: [library], inventory, changes, logs, install, settle } = fixture(t);

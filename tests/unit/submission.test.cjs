@@ -6,6 +6,25 @@ const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, runtime 
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+test("package batching follows main prompts and busy reconnects, including nested input", () => {
+  const { terminal } = createTerminal();
+  const control = event => runtime.handleRuntimeControl(terminal.runtimeHostAdapter, event);
+  control({ type: "busy", value: true });
+  assert.equal(terminal.lang.runtimeBusy, true);
+  control({ type: "busy", value: false });
+  assert.equal(terminal.lang.runtimeBusy, true, "intermediate busy(false) is not evaluation completion");
+  control({ type: "session-state", busy: false, wait: { kind: "nested", prompt: "Proceed?" } });
+  assert.equal(terminal.lang.runtimeBusy, true);
+  control({ type: "prompt", kind: "cont" });
+  assert.equal(terminal.lang.runtimeBusy, true);
+  control({ type: "prompt", kind: "main" });
+  assert.equal(terminal.lang.runtimeBusy, false);
+  control({ type: "session-state", busy: true, wait: { kind: "none" } });
+  assert.equal(terminal.lang.runtimeBusy, true, "reattaching during installation restores the batch hold");
+  control({ type: "session-state", busy: false, wait: { kind: "top-level", prompt: "main" } });
+  assert.equal(terminal.lang.runtimeBusy, false);
+});
+
 for (const source of ["# comment", "# first\n# second"]) {
   test(`comment-only console Enter restores the visible prompt: ${source}`, async t => {
     const { terminal, commands, history, screenLines } = createTerminalWithScreen(t);

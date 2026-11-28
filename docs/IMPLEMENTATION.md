@@ -1257,6 +1257,24 @@ events schedule a scan of the changed library after 250 ms; a notification-drive
 inventories have no periodic filesystem poller. Delivery of changes on a network
 filesystem depends on its support for filesystem notifications.
 
+An active console evaluation holds package inventory publication and ordinary
+package-directory watcher reconciliation. Filesystem notifications accumulate
+dirty libraries while pinned-path validation and replacement warnings remain
+active. The next main prompt releases the hold and schedules one reconciliation
+of the accumulated installs, updates and removals. Busy reconnect snapshots and
+nested input retain the hold; intermediate `busy(false)` events retain it until
+the main prompt. Runtime exit releases the hold. In-flight scans are invalidated
+and their pending changes are replayed after evaluation. Failed-watch and metadata
+recovery budgets are preserved across the hold.
+
+One reconciliation publishes the final stable inventory and requests a single
+language-server replacement when loaded namespaces changed. Lock checks and the
+two-snapshot stability check remain part of reconciliation. Changes made outside
+the console's active evaluation use the filesystem-event debounce. Lock presence
+is logged once per library until the lock clears. Initial library discovery logs
+its scan; confirmed package changes report their outcomes and updated counts.
+The search-order listing is emitted when library order changes.
+
 Configured paths define the monitoring roots, including network paths and explicitly
 configured directory aliases. When a path enters the effective library list,
 the console resolves it and pins the physical directory and every ordinary

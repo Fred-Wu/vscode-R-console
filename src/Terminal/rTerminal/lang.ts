@@ -73,6 +73,7 @@ export class RTermLang {
   private consoleLsp: ConsoleLspClient | undefined;
   private sessionState: ConsoleSessionState | undefined;
   private runtimeLibraryPaths: string[] | undefined;
+  private runtimeBusy = false;
   private workspaceRevision: number | undefined;
   private cachedSessionData: WorkspaceData | undefined;
   private silentCompletionRequest: Promise<void> | undefined;
@@ -532,6 +533,7 @@ export class RTermLang {
 
   clearSessionState(): void {
     this.cancelCompletion();
+    this.updateRuntimeBusy(false);
     this.sessionState = { attachedPackages: [] };
     this.runtimeLibraryPaths = undefined;
     this.consoleLsp?.resetRuntimeLibraryPaths?.();
@@ -552,6 +554,12 @@ export class RTermLang {
     this.inlineCache = undefined;
     this.cancelCompletion();
     this.consoleLsp?.updateRuntimeLibraryPaths(paths);
+  }
+
+  updateRuntimeBusy(busy: boolean): void {
+    if (this.disposed || this.runtimeBusy === busy) return;
+    this.runtimeBusy = busy;
+    this.consoleLsp?.setRuntimeBusy(busy);
   }
 
   recordCompletion(input: string, start: number, selection: CompletionPickItem): void {
@@ -673,6 +681,7 @@ export class RTermLang {
         },
       });
       this.consoleLsp = lsp;
+      if (this.runtimeBusy) lsp.setRuntimeBusy(true);
       if (this.runtimeLibraryPaths) lsp.updateRuntimeLibraryPaths(this.runtimeLibraryPaths);
     }
 

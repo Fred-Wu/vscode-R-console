@@ -36,6 +36,7 @@ function createTerminal() {
     inputState: new InputState(), keyProcessor: new KeyProcessor(),
     dimensions: { columns: 80, rows: 24 }, lastWriteEndedWithNewline: true,
     lang: { refreshCompletionContextDocument: async () => {}, updateInput() {}, clearSessionState() {},
+      updateRuntimeBusy(busy) { this.runtimeBusy = busy; },
       updateLibraryPaths(paths) { this.libraryPaths = [...paths]; } },
     rHistory: { resetIndex() {}, push(code) { history.push(code); } },
     renderer: new Renderer(() => {}),

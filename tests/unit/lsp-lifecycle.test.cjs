@@ -756,6 +756,7 @@ test("a superseded session update applies the latest attached packages", async (
 test("cached session state reaches the LSP before its first launch", async () => {
   const calls = [];
   class ConsoleLspClient {
+    setRuntimeBusy() {}
     async start() { calls.push("start"); }
     async syncSessionState(state) { calls.push(state); }
     updateInput() {}
@@ -989,8 +990,9 @@ test("launch discards inherited LSP transport settings while preserving user con
 });
 
 test("runtime library snapshots are retained before completion client construction", async () => {
-  const paths = [], calls = [];
+  const paths = [], calls = [], busy = [];
   class ConsoleLspClient {
+    setRuntimeBusy(value) { busy.push(value); }
     updateRuntimeLibraryPaths(value) { paths.push([...value]); }
     resetRuntimeLibraryPaths() { calls.push("reset"); }
     async syncSessionState(value) { calls.push(value); }
@@ -1003,12 +1005,15 @@ test("runtime library snapshots are retained before completion client constructi
     "../../Language/consoleLspClient": { ConsoleLspClient },
   });
   const lang = new RTermLang({ extensionPath: "", rPath: "R", env: {} });
+  lang.updateRuntimeBusy(true);
   lang.updateLibraryPaths(["/active", "/base"]);
   await lang.getCompletionProvider();
+  assert.deepEqual(busy, [true], "a client constructed during evaluation starts with inventory held");
   assert.deepEqual(paths, [["/active", "/base"]]);
   lang.updateLibraryPaths(["/base"]);
   assert.deepEqual(paths.at(-1), ["/base"]);
   lang.clearSessionState();
+  assert.deepEqual(busy, [true, false], "runtime exit releases held inventory work");
   assert.equal(calls.includes("reset"), true);
   await lang.dispose();
 });

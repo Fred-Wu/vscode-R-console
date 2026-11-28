@@ -385,6 +385,7 @@ export function handleRuntimeControl(
       return;
     case "busy":
       if (event.value) {
+        host.lang.updateRuntimeBusy(true);
         host.promptReady = false;
         if (host.awaitingExecutionStart && host.activeSubmission) {
           host.awaitingExecutionStart = false;
@@ -456,6 +457,7 @@ function applyRuntimeSessionState(
   }
 
   host.sessionHostConnected = true;
+  host.lang.updateRuntimeBusy(event.busy || event.wait.kind !== "top-level" || event.wait.prompt !== "main");
 
   if (event.busy || event.wait.kind === "none") {
     host.clearPromptRenderTimer();
@@ -539,6 +541,8 @@ export function handleBackendPrompt(
   host.promptReady = true;
   host.promptKind = kind;
   host.replyPromptText = "";
+
+  if (kind === "main") host.lang.updateRuntimeBusy(false);
 
   if (host.mode === "reply") {
     host.inputState.reset();

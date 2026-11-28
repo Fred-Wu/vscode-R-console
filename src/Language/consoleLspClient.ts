@@ -625,6 +625,10 @@ export class ConsoleLspClient implements CompletionProvider {
     this.inputDocument.selectFunction(start, selection.insertText, selection.packageName);
   }
 
+  setRuntimeBusy(busy: boolean): void {
+    this.packageInventory.setRuntimeBusy(busy);
+  }
+
   async syncSessionState(state: ConsoleLspSessionState): Promise<void> {
     this.sessionState = state;
     const client = await this.ensureClient();
