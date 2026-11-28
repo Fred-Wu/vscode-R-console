@@ -556,7 +556,9 @@ test("watcher recovery reconciles additions and removals made while watching was
 
 test("a library scan failure keeps its changes pending for retry", async t => {
   let library, failNext = false, failed = false;
+  const control = controlledWatches();
   const f = fixture(t, 0, {
+    watch: control.watch,
     promises: { ...fs.promises, opendir: async (file, ...args) => {
       if (file === library && failNext) {
         failNext = false;
@@ -572,9 +574,9 @@ test("a library scan failure keeps its changes pending for retry", async t => {
   await settle();
   install(library);
   failNext = true;
-  // Idle is not proof that an OS watcher event has arrived. This test is
-  // about scan failure and recovery; explicitly queue the changed library
-  // instead of relying on macOS/Linux/Windows filesystem event timing.
+  // Keep watcher delivery controlled so package-watch discovery cannot cancel
+  // this fault-injection scan before its opendir. Queue the changed library
+  // explicitly to exercise read failure and recovery on every platform.
   inventory.dirtyLibraries.add(library);
   await inventory.refresh();
   assert.ok(failed, "the first scan must exercise the injected read failure");
