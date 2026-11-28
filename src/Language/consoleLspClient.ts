@@ -567,10 +567,12 @@ export class ConsoleLspClient implements CompletionProvider {
   private syncLibraryPaths(): Promise<void> {
     if (this.libraryPathsSyncPromise) return this.libraryPathsSyncPromise;
     if (this.disposed || !(this.runtimeLibraryPaths ?? this.serverLibraryPaths)) return Promise.resolve();
+    if (this.libraryPathsRetry) return Promise.reject(new Error("Library synchronization is waiting for retry"));
     const sync = (async () => {
       await this.startPromise;
       await this.restartPromise;
       if (!this.disposed && !this.client?.isRunning()) await this.startClient();
+      let replaced = false;
       while (!this.disposed && this.client?.isRunning()) {
         const client = this.client;
         const paths = this.runtimeLibraryPaths ?? this.serverLibraryPaths;
@@ -584,6 +586,8 @@ export class ConsoleLspClient implements CompletionProvider {
         if (this.client !== client) continue;
         if (typeof reply?.changed !== "boolean") throw new Error("Invalid library synchronization response");
         if (reply.changed) {
+          if (replaced) throw new Error("Library search order still differs after server replacement");
+          replaced = true;
           // All namespace and metadata caches belong to the old library order.
           // A fresh process also drops namespaces loaded by completion workers.
           this.packageRevision++;
@@ -1210,14 +1214,18 @@ export class ConsoleLspClient implements CompletionProvider {
     // Each child gets fresh transport settings. Inherited settings must never
     // redirect a stdio child to another process's socket or state transport.
     for (const key of Object.keys(env)) {
-      if (key.toUpperCase().startsWith("VSCR_LSP_")) delete env[key];
+      if (key.toUpperCase().startsWith("VSCR_LSP_") || key.toUpperCase() === "VSCR_RUNTIME_LIB_PATHS") delete env[key];
     }
     const lang = config.get<string>("lsp.lang") ?? "";
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
     // Apply the latest console order before loading the language server.
-    env.VSCR_RUNTIME_LIB_PATHS = (this.runtimeLibraryPaths ?? this.serverLibraryPaths)?.join("\n") ?? "";
+    const libraries = this.runtimeLibraryPaths ?? this.serverLibraryPaths;
+    if (libraries !== undefined) {
+      env.VSCR_LSP_LIBRARY_COUNT = String(libraries.length);
+      libraries.forEach((library, index) => { env[`VSCR_LSP_LIBRARY_${index}`] = library; });
+    }
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {

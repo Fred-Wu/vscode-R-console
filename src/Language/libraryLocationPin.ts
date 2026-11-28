@@ -132,6 +132,32 @@ export function checkLibraryPin(pin: LibraryPin): LibraryPinChange | undefined {
   return undefined;
 }
 
+/** Check pinned ancestors in order without blocking the extension host.
+ * Stop on cancellation or the first mismatch before inspecting descendants. */
+export async function checkLibraryPinAsync(pin: LibraryPin, isCurrent: () => boolean): Promise<LibraryPinChange | undefined> {
+  for (const [kind, chains] of [["physical", [pin.physical]], ["configured", pin.configured]] as const) {
+    for (const chain of chains) {
+      for (const entry of chain) {
+        if (!isCurrent()) return;
+        let state: EntryState, identity = "";
+        try {
+          const stat = await fs.promises.lstat(entry.path, { bigint: true });
+          state = stat.isSymbolicLink() ? "link" : stat.isDirectory() ? "directory" : "other";
+          identity = pinEntryIdentity(stat);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+          state = "missing";
+        }
+        if (!isCurrent()) return;
+        if (state !== entry.state || identity !== entry.identity) {
+          return { entry: entry.path, kind, state, previous: entry.state };
+        }
+      }
+    }
+  }
+}
+
 export function sameLibraryPin(a: LibraryPin, b: LibraryPin): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }

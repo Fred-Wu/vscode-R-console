@@ -1226,10 +1226,19 @@ caches with the latest library order. The interactive R session retains its load
 packages. Each language-server launch performs normal R startup with the configured
 arguments and inherited launch environment. Project and user startup files apply
 to each new process, including changes made since the preceding launch.
+The ordered library snapshot is transferred in `VSCR_LSP_LIBRARY_COUNT` and
+numbered `VSCR_LSP_LIBRARY_0`, `VSCR_LSP_LIBRARY_1`, etc. environment variables.
+Each variable contains one complete path, preserving newlines, quotes and Unicode.
+Base R reads these variables before loading language-server packages. An absent
+count retains normal startup libraries; a zero count applies an empty supplied
+list through R's ordinary `.libPaths()` rules. Invalid or incomplete snapshots
+fail startup. Every launch discards inherited library transport variables.
 Concurrent changes share a synchronization queue that drains to the latest snapshot
 before completion proceeds. Failed synchronization retries with delays increasing
 from 1 second to 30 seconds, stopping on success or disposal. Synchronization also
 runs after startup, and unchanged snapshots reuse the existing server.
+Each synchronization attempt permits one server replacement. A further mismatch
+uses the same retry backoff, and completion requests cannot bypass that delay.
 
 A reconnect receives the last completed prompt snapshot without evaluating R on the socket
 thread. No library-path requests go through sess or the legacy session integration.
@@ -1264,8 +1273,13 @@ entries per directory. Observing the 4,097th entry ends that enumeration and
 closes its handle. An oversized library or lock-backup directory suspends the
 library's inventory monitoring until reconfiguration, preserving its last verified
 package state. The lifecycle log identifies the directory that exceeded the limit.
-Pinned paths and cancellation state are validated around asynchronous reads;
-completion, cancellation and failures close the directory handle.
+Pinned paths are validated with asynchronous, ordered `lstat` calls before and
+after opening and after batches of at most 32 entries. Each check stops at the
+first changed ancestor, without resolving its replacement. Enumeration reads only
+from its held directory handle and never follows child paths. Results are used
+only after the final validation succeeds. Cancellation is checked before and after
+each entry read and each ancestor lookup. Completion, cancellation and failures
+close the directory handle. A full 4,096-entry listing needs 131 path validations.
 
 Each library watcher serializes its asynchronous reconciliations. Notifications
 received during enumeration queue one follow-up reconciliation. Pausing evaluation

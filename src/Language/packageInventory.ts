@@ -2,10 +2,10 @@ import * as fs from "fs";
 import * as path from "path";
 import { EventEmitter } from "events";
 import { LibraryPathEntryMonitor } from "./libraryPathEntryMonitor";
-import { captureLibraryPin, checkLibraryPin, describeLibraryPinChange, LibraryPinChanged,
+import { captureLibraryPin, checkLibraryPin, checkLibraryPinAsync, describeLibraryPinChange, LibraryPinChanged,
   sameLibraryPin, type LibraryPin, type LibraryPinChange } from "./libraryLocationPin";
 import type { LibraryMonitoringReview } from "./libraryMonitoringNotice";
-import { inspectInstallation, verifyDirectory, type InstallationIdentity } from "./packageInstallationIdentity";
+import { inspectInstallation, verifyDirectoryAsync, type InstallationIdentity } from "./packageInstallationIdentity";
 import { DirectoryEntryLimitError, MAX_DIRECTORY_ENTRIES, readBoundedDirectory } from "./boundedDirectory";
 
 // A library may be on a slow network drive; bound watcher fanout per root.
@@ -231,6 +231,16 @@ export class PackageInventory {
     return pin;
   }
 
+  private async libraryTargetAsync(library: string, isCurrent: () => boolean): Promise<LibraryPin | undefined> {
+    const pin = this.pins.get(library);
+    const current = () => isCurrent() && !this.disposed && !this.suspended.has(library) && this.pins.get(library) === pin;
+    if (!pin || !current()) return;
+    const change = await checkLibraryPinAsync(pin, current);
+    if (!current()) return;
+    if (change) { this.suspendLibrary(library, change); return; }
+    return pin;
+  }
+
   private watchLibrary(library: string, recovering = false): void {
     if (this.disposed || this.suspended.has(library) || this.watchers.has(library)) return;
     let watcher: PackageDirectoryWatcher | undefined;
@@ -238,7 +248,8 @@ export class PackageInventory {
       const pin = this.libraryTarget(library);
       if (!pin) return;
       const root = pin.root;
-      watcher = new PackageDirectoryWatcher(root, () => this.libraryTarget(library) === pin, (event, filename) => {
+      watcher = new PackageDirectoryWatcher(root, () => this.libraryTarget(library) === pin,
+        async current => await this.libraryTargetAsync(library, current) === pin, (event, filename) => {
         if (this.disposed || this.watchers.get(library) !== watcher) return;
         if (!this.validateForEvent(library)) return;
         this.entryMonitor.onLibraryEvent(library);
@@ -278,7 +289,8 @@ export class PackageInventory {
     }
   }
 
-  private async installationLocks(library: string, entries: fs.Dirent[], isCurrent: () => boolean): Promise<Set<string>> {
+  private async installationLocks(library: string, entries: fs.Dirent[], isCurrent: () => boolean,
+    validate: () => Promise<boolean>): Promise<Set<string>> {
     const locked = new Set<string>();
     for (const entry of entries) {
       if (!isCurrent()) break;
@@ -294,23 +306,24 @@ export class PackageInventory {
         let lockStat: fs.Stats | undefined;
         for (let depth = 0; depth < 2; depth++) {
           try {
+            if (!await validate() || !isCurrent()) break;
+            if (lockStat) await verifyDirectoryAsync(lockPath, lockStat);
             if (!isCurrent()) break;
-            if (lockStat) verifyDirectory(lockPath, lockStat);
             const stat = await fs.promises.lstat(folder);
+            if (!await validate() || !isCurrent()) break;
+            if (lockStat) await verifyDirectoryAsync(lockPath, lockStat);
             if (!isCurrent()) break;
-            if (lockStat) verifyDirectory(lockPath, lockStat);
             if (!stat.isDirectory()) break;
             lockStat ??= stat;
-            verifyDirectory(folder, stat);
-            const items = await readBoundedDirectory(folder, () => {
+            const validateFolder = async () => {
+              if (!await validate() || !isCurrent()) return false;
+              await verifyDirectoryAsync(lockPath, lockStat!);
               if (!isCurrent()) return false;
-              verifyDirectory(lockPath, lockStat!);
-              if (folder !== lockPath) verifyDirectory(folder, stat);
-              return true;
-            });
-            if (!items || !isCurrent()) break;
-            verifyDirectory(lockPath, lockStat);
-            if (folder !== lockPath) verifyDirectory(folder, stat);
+              if (folder !== lockPath) await verifyDirectoryAsync(folder, stat);
+              return isCurrent();
+            };
+            const items = await readBoundedDirectory(folder, isCurrent, validateFolder);
+            if (!items || !await validateFolder()) break;
             for (const item of items) {
               if (item.isDirectory() && /^[A-Za-z][A-Za-z0-9.]*$/.test(item.name)) locked.add(item.name);
             }
@@ -475,8 +488,8 @@ export class PackageInventory {
       if (!isCurrent()) return true;
       const pin = this.libraryTarget(library);
       if (!pin) return true;
-      const entries = await readBoundedDirectory(pin.root,
-        () => isCurrent() && this.libraryTarget(library) === pin);
+      const entries = await readBoundedDirectory(pin.root, isCurrent,
+        async () => await this.libraryTargetAsync(library, isCurrent) === pin);
       if (!entries || !isCurrent() || this.libraryTarget(library) !== pin) return true;
       if (entries.some(entry => entry.isDirectory() && /^00LOCK(?:-[A-Za-z][A-Za-z0-9.]*)?$/.test(entry.name))) return true;
       if (previous.deferred?.size) return true;
@@ -535,11 +548,10 @@ export class PackageInventory {
           libraries.push(retained("suspended"));
           continue;
         }
-        const entries = await readBoundedDirectory(originalTarget.root,
-          () => isCurrent() && this.libraryTarget(library) === originalTarget);
+        const validate = async () => await this.libraryTargetAsync(library, isCurrent) === originalTarget;
+        const entries = await readBoundedDirectory(originalTarget.root, isCurrent, validate);
         if (!entries || !isCurrent() || this.libraryTarget(library) !== originalTarget) return;
-        const locked = await this.installationLocks(originalTarget.root, entries,
-          () => isCurrent() && this.libraryTarget(library) === originalTarget);
+        const locked = await this.installationLocks(originalTarget.root, entries, isCurrent, validate);
         if (!isCurrent() || this.libraryTarget(library) !== originalTarget) return;
         // The package entry may be a symlink (renv/uvr). Record its lstat
         // identity, but never traverse, read or watch its target from here.
@@ -820,6 +832,7 @@ class PackageDirectoryWatcher extends EventEmitter {
   private revision = 0;
 
   constructor(private readonly root: string, private readonly rootIsValid: () => boolean,
+    private readonly validateRoot: (isCurrent: () => boolean) => Promise<boolean>,
     onChange: (event: string, filename?: string) => void,
     private readonly onLimited?: (message: string) => void, private paused = false) {
     super();
@@ -994,12 +1007,13 @@ class PackageDirectoryWatcher extends EventEmitter {
   }
 
   private async refresh(revision: number): Promise<void> {
-    const isCurrent = () => !this.closed && !this.paused && revision === this.revision && this.rootIsValid();
+    const current = () => !this.closed && !this.paused && revision === this.revision;
+    const isCurrent = () => current() && this.rootIsValid();
     if (!isCurrent()) return;
     if (!this.watchDirectory(this.root)) throw new Error("Library directory disappeared during watch setup");
     let entries: fs.Dirent[] | undefined;
     let limited: string | undefined;
-    try { entries = await readBoundedDirectory(this.root, isCurrent); }
+    try { entries = await readBoundedDirectory(this.root, current, () => this.validateRoot(current)); }
     catch (error) {
       // Inventory publication suspends over-limit roots. Keep only the root
       // watch until that scan completes; I/O failures use watcher recovery.

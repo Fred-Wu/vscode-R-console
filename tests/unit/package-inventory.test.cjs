@@ -2047,6 +2047,77 @@ test("delayed initial package watches recheck metadata changed after inventory p
   assert.equal(group.directories.has(directory), true);
 });
 
+for (const operation of ["inventory", "change detection", "watcher", "00LOCK", "00LOCK/00new"]) {
+  test(`${operation} enumerates with asynchronous, batched identity checks`, async t => {
+    let target, active = 0, checks = 0;
+    const control = controlledWatches();
+    const f = fixture(t, 0, { watch: control.watch,
+      lstatSync: (...args) => {
+        assert.equal(active, 0, "enumeration cannot block on synchronous identity checks");
+        return fs.lstatSync(...args);
+      },
+      promises: { ...fs.promises,
+        lstat: async (...args) => { if (active) checks++; return fs.promises.lstat(...args); },
+        opendir: async (file, ...args) => {
+          if (file !== target) return fs.promises.opendir(file, ...args);
+          active++;
+          let count = 0;
+          return {
+            read: async () => ++count <= 4096
+              ? { name: "file" + count, isDirectory: () => false, isSymbolicLink: () => false } : null,
+            close: async () => { active--; },
+          };
+        },
+      },
+    });
+    const [library] = f.libraries;
+    if (operation.startsWith("00LOCK")) fs.mkdirSync(path.join(library, operation), { recursive: true });
+    f.inventory.setLibraryPaths([library]); await f.settle();
+    target = operation.startsWith("00LOCK") ? path.join(library, operation) : library;
+    if (operation === "watcher") f.inventory.watchers.get(library).scheduleRefresh();
+    else {
+      if (operation === "change detection") f.inventory.unconfirmedLibraries.add(library);
+      else f.inventory.dirtyLibraries.add(library);
+      await f.inventory.refresh();
+    }
+    await f.settle(() => checks > 0);
+    assert.equal(active, 0);
+    const depth = f.inventory.pins.get(library).physical.length + 2;
+    assert.ok(checks < 150 * depth, `${checks} metadata calls must scale with batches, not entries`);
+  });
+}
+
+test("a lock directory replaced while closing its listing cannot publish stale backup names", async t => {
+  let staging, outside, swapped = false;
+  const control = controlledWatches();
+  const f = fixture(t, 0, { watch: control.watch, promises: { ...fs.promises,
+    opendir: async (file, ...args) => {
+      const handle = await fs.promises.opendir(file, ...args);
+      return {
+        read: () => handle.read(),
+        close: async () => {
+          await handle.close();
+          if (file === staging && !swapped) {
+            swapped = true;
+            fs.renameSync(staging, staging + "-old");
+            fs.symlinkSync(outside, staging, process.platform === "win32" ? "junction" : "dir");
+          }
+        },
+      };
+    },
+  } });
+  const [library] = f.libraries;
+  f.install(library);
+  f.inventory.setLibraryPaths([library]); await f.settle();
+  staging = path.join(library, "00LOCK", "00new");
+  outside = path.join(f.root, "outside"); fs.mkdirSync(outside);
+  fs.mkdirSync(path.join(staging, "phantom"), { recursive: true });
+  f.inventory.dirtyLibraries.add(library);
+  await f.inventory.refresh(); await f.settle();
+  assert.equal(swapped, true);
+  assert.equal(f.changes.at(-1).libraries[0].deferred.has("phantom"), false);
+});
+
 for (const operation of ["watcher", "change detection", "00LOCK", "00LOCK/00new"]) {
   test(`${operation} stops oversized enumeration and closes its directory`, async t => {
     let oversizedPath;

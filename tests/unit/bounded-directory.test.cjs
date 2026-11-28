@@ -83,6 +83,51 @@ test("a failed directory open propagates its error", async () => {
   assert.deepEqual(f.counts(), { opens: 1, reads: 0, closes: 0 });
 });
 
+test("asynchronous validation bounds filesystem checks to batches and validates the final EOF", async () => {
+  const f = fixture({ count: 4096 });
+  let validations = 0;
+  const entries = await f.readBoundedDirectory("library", () => true, async () => { validations++; return true; });
+  assert.equal(entries.length, 4096);
+  assert.equal(validations, 131, "before/after open, 128 batches, and the EOF batch");
+  assert.equal(f.counts().closes, 1);
+});
+
+for (const stage of ["before open", "after open", "after batch"]) {
+  test(`cancellation during asynchronous validation ${stage} prevents further reads`, async () => {
+    let current = true, entered, release, calls = 0;
+    const begun = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const target = { "before open": 1, "after open": 2, "after batch": 3 }[stage];
+    const f = fixture({ count: 100 });
+    const pending = f.readBoundedDirectory("library", () => current, async () => {
+      if (++calls === target) { entered(); await gate; }
+      return true;
+    });
+    await begun;
+    current = false;
+    release();
+    assert.equal(await pending, undefined);
+    assert.deepEqual(f.counts(), { opens: target === 1 ? 0 : 1, reads: target === 3 ? 32 : 0, closes: target === 1 ? 0 : 1 });
+  });
+}
+
+test("a changed pin during a batch discards every entry and stops before the next batch", async () => {
+  let valid = true;
+  const f = fixture({ count: 100, reading: async count => { if (count === 3) valid = false; } });
+  assert.equal(await f.readBoundedDirectory("library", () => true, async () => valid), undefined);
+  assert.deepEqual(f.counts(), { opens: 1, reads: 32, closes: 1 });
+});
+
+test("asynchronous validation failure closes an open handle", async () => {
+  const f = fixture({ count: 100 });
+  let calls = 0;
+  await assert.rejects(f.readBoundedDirectory("library", () => true, async () => {
+    if (++calls === 3) throw new Error("validation I/O failure");
+    return true;
+  }), /validation I\/O failure/);
+  assert.deepEqual(f.counts(), { opens: 1, reads: 32, closes: 1 });
+});
+
 test("real directory iteration lists immediate entries without descending", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-bounded-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

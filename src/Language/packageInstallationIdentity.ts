@@ -25,6 +25,17 @@ export function verifyDirectory(directory: string, expected: fs.Stats): void {
   if (!sameDirectory(actual, expected)) throw changedDirectory(directory);
 }
 
+export async function verifyDirectoryAsync(directory: string, expected: fs.Stats): Promise<void> {
+  let actual: fs.Stats;
+  try { actual = await fs.promises.lstat(directory); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") throw changedDirectory(directory);
+    throw error;
+  }
+  if (!sameDirectory(actual, expected)) throw changedDirectory(directory);
+}
+
 const metadataIdentity = (value: fs.Stats) => [value.dev, value.ino, value.mtimeMs, value.ctimeMs, value.size];
 
 /** Observe local installation metadata only. The caller supplies a guard for

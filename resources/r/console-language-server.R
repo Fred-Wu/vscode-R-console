@@ -1,7 +1,12 @@
 # Each process uses normal R startup and the active console library order.
-runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
-if (nzchar(runtime_lib_paths)) {
-    .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
+runtime_lib_count <- Sys.getenv("VSCR_LSP_LIBRARY_COUNT")
+if (nzchar(runtime_lib_count)) {
+    if (!grepl("^(0|[1-9][0-9]*)$", runtime_lib_count)) stop("Invalid library path count")
+    count <- suppressWarnings(as.integer(runtime_lib_count))
+    if (is.na(count)) stop("Invalid library path count")
+    runtime_lib_paths <- if (count) Sys.getenv(paste0("VSCR_LSP_LIBRARY_", seq_len(count) - 1L), unset = NA_character_) else character()
+    if (anyNA(runtime_lib_paths)) stop("Missing library path")
+    .libPaths(runtime_lib_paths, include.site = FALSE)
 }
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {

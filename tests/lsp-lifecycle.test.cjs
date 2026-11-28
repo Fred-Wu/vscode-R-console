@@ -56,6 +56,52 @@ async function waitFor(predicate, label) {
   }
 }
 
+for (const useStdio of [false, true]) {
+  test(`startup and replacement preserve unusual library paths over ${useStdio ? "stdio" : "TCP"}`,
+    { timeout: 60000 }, async t => {
+      const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-paths-")));
+      let client;
+      t.after(async () => { await client?.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+      const names = process.platform === "win32" ? ["space library", "日本語"]
+        : ["library\nsuffix", "quote\"tab\t", "日本語"];
+      const libraries = names.map(name => path.join(root, name));
+      libraries.forEach(library => fs.mkdirSync(library));
+      // A split newline must not accidentally select this existing prefix.
+      const wrong = path.join(root, "library"); fs.mkdirSync(wrong);
+      const fixture = createConsoleLsp(t, { libraries, useStdio });
+      client = fixture.client;
+      await client.start();
+      assert.equal(fixture.instances.length, 1, "startup already has the exact ordered snapshot");
+      const first = await fixture.instances[0].sendRequest("rConsole/libraryPaths", {});
+      const normalized = libraries.map(library => process.platform === "win32" ? library.replace(/\\/g, "/") : library);
+      assert.deepEqual(first.slice(0, libraries.length), normalized);
+      assert.ok(!first.includes(wrong));
+      await client.restartClient(fixture.instances[0], "path transfer regression");
+      await client.syncLibraryPaths();
+      assert.equal(fixture.instances.length, 2, "a replacement must not cause a synchronization restart loop");
+      assert.deepEqual(await fixture.instances[1].sendRequest("rConsole/libraryPaths", {}), first);
+    });
+}
+
+test("R startup distinguishes absent, empty and incomplete library snapshots", t => {
+  const { client } = createConsoleLsp(t);
+  const config = { get: () => undefined };
+  const startup = 'code <- parse("resources/r/console-language-server.R"); eval(code[[1]]); eval(code[[2]]); ';
+  const run = (env, assertion) => execFileSync("Rscript", ["--vanilla", "-"],
+    { env, input: startup + assertion + "\n", encoding: "utf8", timeout: 15000, stdio: "pipe" });
+  run(client.buildServerEnv(config), 'stopifnot(!exists("runtime_lib_paths"))');
+  const paths = ["/lib\nnewline", "/lib\rreturn", '/lib"quote', "/lib\\slash", "/lib/日本語", "/lib\t tab"];
+  client.runtimeLibraryPaths = paths;
+  run(client.buildServerEnv(config), `stopifnot(identical(unname(runtime_lib_paths), c(${paths.map(value => JSON.stringify(value)).join(",")})))`);
+  client.runtimeLibraryPaths = [];
+  run(client.buildServerEnv(config), 'stopifnot(identical(runtime_lib_paths, character()))');
+  const env = client.buildServerEnv(config);
+  env.VSCR_LSP_LIBRARY_COUNT = "1";
+  assert.throws(() => run(env, ""), /Missing library path/);
+  env.VSCR_LSP_LIBRARY_COUNT = "invalid";
+  assert.throws(() => run(env, ""), /Invalid library path count/);
+});
+
 test("installed package chain signatures also supply arguments without running the chain", { timeout: 90000 }, async t => {
   const { session, createClient } = temporaryLibraries(t);
   const pkg = 'rconsolechaintest';

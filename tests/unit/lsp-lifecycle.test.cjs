@@ -837,10 +837,11 @@ test("a late session-sync reply cannot replace newer R Console paths", async t =
   releaseReply({ libraryPaths: ["/stale"] });
   await synchronizing;
   assert.deepEqual(watched.at(-1), ["/new", "/startup"]);
-  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS,
-    "/new\n/startup");
+  const env = client.buildServerEnv({ get: () => undefined });
+  assert.equal(env.VSCR_LSP_LIBRARY_COUNT, "2");
+  assert.deepEqual([env.VSCR_LSP_LIBRARY_0, env.VSCR_LSP_LIBRARY_1], ["/new", "/startup"]);
   client.resetRuntimeLibraryPaths();
-  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_RUNTIME_LIB_PATHS, "/startup",
+  assert.equal(client.buildServerEnv({ get: () => undefined }).VSCR_LSP_LIBRARY_0, "/startup",
     "replacement falls back to the captured server libraries after a runtime reset");
 });
 
@@ -958,6 +959,47 @@ test("failed library synchronization retries automatically and disposal cancels 
   assert.ok(client.libraryPathsRetry);
   await client.dispose();
   assert.equal(client.libraryPathsRetry._destroyed, true);
+});
+
+test("persistent library mismatches allow one replacement per retry and gate completion", async t => {
+  let mismatch = true;
+  const { client, instances } = createClient(t, { libraries: ["/base"], librarySync: () => ({ changed: mismatch }) });
+  client.runtimeLibraryPaths = ["/requested"];
+  await assert.rejects(client.start(), /still differs/);
+  assert.equal(instances.length, 2);
+  assert.notEqual(client.syncedLibraryPaths?.key, JSON.stringify(["/requested"]));
+  const retry = client.libraryPathsRetry;
+  assert.ok(retry);
+  await assert.rejects(client.syncLibraryPaths(), /waiting for retry/);
+  assert.equal(await client.provideCompletionItems({ getText: () => "stats::l" }, new Position(0, 8)), undefined);
+  assert.equal(instances.length, 2, "requests during backoff cannot launch more processes");
+  assert.equal(client.libraryPathsRetry, retry);
+  // Run the queued retry without waiting on a real second-long timer.
+  const runRetry = retry._onTimeout;
+  clearTimeout(retry);
+  mismatch = false;
+  runRetry();
+  await client.libraryPathsSyncPromise;
+  assert.equal(client.libraryPathsRetry, undefined);
+  assert.equal(client.syncedLibraryPaths.key, JSON.stringify(["/requested"]));
+  assert.equal(instances.length, 2);
+});
+
+test("startup library variables preserve arbitrary path characters, order and explicit emptiness", t => {
+  const { client } = createClient(t);
+  client.options.env = { VSCR_LSP_LIBRARY_COUNT: "20", VSCR_LSP_LIBRARY_19: "stale", VSCR_RUNTIME_LIB_PATHS: "legacy" };
+  const config = { get: () => undefined };
+  assert.equal(client.buildServerEnv(config).VSCR_LSP_LIBRARY_COUNT, undefined);
+  const paths = ["/lib\nnewline", "/lib\rreturn", '/lib"quote', "/lib\\slash", "/lib/日本語", "/lib\t tab"];
+  client.runtimeLibraryPaths = paths;
+  const env = client.buildServerEnv(config);
+  assert.equal(env.VSCR_LSP_LIBRARY_COUNT, String(paths.length));
+  assert.deepEqual(paths.map((_, i) => env[`VSCR_LSP_LIBRARY_${i}`]), paths);
+  assert.equal(env.VSCR_LSP_LIBRARY_19, undefined);
+  assert.equal(env.VSCR_RUNTIME_LIB_PATHS, undefined);
+  client.runtimeLibraryPaths = [];
+  assert.equal(client.buildServerEnv(config).VSCR_LSP_LIBRARY_COUNT, "0");
+  assert.equal(client.buildServerEnv(config).VSCR_LSP_LIBRARY_0, undefined);
 });
 
 test("every launch uses ordinary R startup and preserves configured arguments", async t => {
