@@ -79,6 +79,86 @@ test("Unix key discovery rejects a foreign-owned account location", { skip: proc
   assert.throws(() => endpoint({ sessionId: randomUUID(), pid: process.pid }), /not protected/);
 });
 
+for (const homeName of ["x".repeat(90), "界".repeat(30)]) {
+  test(`Linux long-home key reads retain and close their directory descriptor (${homeName[0]})`,
+    { skip: process.platform === "win32" }, async t => {
+      const parent = fs.mkdtempSync("/tmp/rck-");
+      t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+      const home = path.join(fs.realpathSync.native(parent), homeName);
+      const directory = path.join(home, ".r-console");
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      let rejectReply = false;
+      const actual = await broker(t, socket => socket.end(response(rejectReply ? process.ppid : process.pid)));
+      const endpoint = path.join(directory, actual.identity.sessionId.replace(/-/g, ""));
+      assert.ok(Buffer.byteLength(endpoint) >= 108);
+      if (homeName[0] === "界") assert.ok(endpoint.length < 108, "the limit counts bytes, not characters");
+      let heldFd, changedDirectory = false, connections = 0;
+      const { readSessionRegistryKey: read } = loadSource("src/Runtime/sessionRegistryKey.ts", {
+        os: { userInfo: () => ({ homedir: home }) },
+        fs: { ...fs,
+          lstatSync: file => fs.lstatSync(file === endpoint ? actual.endpoint : file),
+          openSync: (...args) => { heldFd = fs.openSync(...args); return heldFd; },
+          fstatSync: fd => {
+            const stat = fs.fstatSync(fd);
+            return changedDirectory ? Object.assign(Object.create(stat), { ino: stat.ino + 1 }) : stat;
+          },
+        },
+        net: { createConnection: options => {
+          connections++;
+          const match = /^\/proc\/self\/fd\/(\d+)\/([0-9a-f]{32})$/.exec(options.path);
+          assert.ok(match, "long paths use a descriptor alias instead of a truncated sockaddr");
+          heldFd = Number(match[1]);
+          assert.equal(match[2], actual.identity.sessionId.replace(/-/g, ""));
+          assert.equal(fs.fstatSync(heldFd).ino, fs.statSync(directory).ino);
+          // Exercise the real socket transport on every Unix test host.
+          // The Linux-only test below also exercises actual procfs resolution.
+          return net.createConnection({ path: actual.endpoint });
+        } },
+      }, { "process.platform": '"linux"' });
+      assert.deepEqual(await read(actual.identity), Buffer.alloc(32, 42));
+      assert.throws(() => fs.fstatSync(heldFd), { code: "EBADF" });
+      rejectReply = true;
+      await assert.rejects(read(actual.identity), /different runtime/);
+      assert.throws(() => fs.fstatSync(heldFd), { code: "EBADF" });
+      changedDirectory = true;
+      await assert.rejects(read(actual.identity), /directory changed/);
+      assert.equal(connections, 2, "a changed directory must be rejected before connecting");
+      assert.throws(() => fs.fstatSync(heldFd), { code: "EBADF" });
+    });
+}
+
+for (const endpointBytes of [107, 108, "multibyte"]) {
+  test(`Linux reads a real private broker at the pathname boundary (${endpointBytes})`, { skip: process.platform !== "linux" }, async t => {
+    const parent = fs.realpathSync.native(fs.mkdtempSync("/tmp/rck-"));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const home = path.join(parent, endpointBytes === "multibyte" ? "界".repeat(40)
+      : "x".repeat(endpointBytes - Buffer.byteLength(parent) - 45));
+    const directory = path.join(home, ".r-console");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const api = loadSource("src/Runtime/sessionRegistryKey.ts", {
+      os: { userInfo: () => ({ homedir: home }) },
+    });
+    const identity = { sessionId: randomUUID(), pid: process.pid };
+    const endpoint = api.sessionRegistryKeyEndpoint(identity);
+    if (typeof endpointBytes === "number") assert.equal(Buffer.byteLength(endpoint), endpointBytes);
+    const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    const server = net.createServer(socket => {
+      socket.once("data", () => socket.end(response()));
+      socket.on("error", () => {});
+    });
+    const listenPath = `/proc/self/fd/${fd}/${path.basename(endpoint)}`;
+    try {
+      await new Promise((resolve, reject) => { server.once("error", reject); server.listen(listenPath, resolve); });
+      fs.chmodSync(endpoint, 0o600);
+      assert.ok(fs.lstatSync(endpoint).isSocket(), "the socket resides inside the account directory");
+      assert.deepEqual(await api.readSessionRegistryKey(identity), Buffer.alloc(32, 42));
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+      fs.closeSync(fd);
+    }
+  });
+}
+
 test("Windows key reads require the native verifier and clear rejected output", async () => {
   const identity = { sessionId: randomUUID(), pid: process.pid };
   let fail = false, output;

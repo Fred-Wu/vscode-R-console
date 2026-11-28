@@ -1489,6 +1489,11 @@ home directory. The parent and its ancestry are checked for ownership and protec
 against replacement by other users. Existing unverified directories retain their
 permissions and contents, and key-broker initialization fails closed. Unix socket
 names use the validated session UUID with its hyphens removed.
+On Linux, socket paths of 108 bytes or more use a short `/proc/self/fd/<fd>/<name>`
+alias while binding and connecting. Each operation holds an open descriptor to
+the verified private directory through completion. The socket remains inside
+the account's `.r-console` directory, and its canonical path supplies discovery
+and cleanup. Path lengths are measured in bytes, including multibyte home names.
 The broker returns its PID with
 the key; requests and replies have fixed lengths and bounded deadlines. The
 Windows client acknowledges receipt before the server disconnects the pipe.

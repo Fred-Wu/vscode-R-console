@@ -114,18 +114,51 @@ fn private_directory(home: &std::path::Path) -> io::Result<std::path::PathBuf> {
 }
 
 #[cfg(unix)]
+fn bind_private_listener(endpoint: &std::path::Path) -> io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    #[cfg(target_os = "linux")]
+    let directory_handle = {
+        use std::os::unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}};
+        // Linux pathname sockets reserve one of their 108 bytes for NUL.
+        // A held descriptor gives long account paths a short, private alias.
+        if endpoint.as_os_str().as_bytes().len() >= 108 {
+            let directory = std::fs::OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(endpoint.parent().ok_or_else(|| io::Error::other("missing socket directory"))?)?;
+            let metadata = directory.metadata()?;
+            if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(io::Error::other("registry key directory is not private to this user"));
+            }
+            Some(directory)
+        } else { None }
+    };
+    #[cfg(target_os = "linux")]
+    let bind_path = {
+        use std::os::fd::AsRawFd;
+        match &directory_handle {
+            Some(directory) => std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                .join(endpoint.file_name().ok_or_else(|| io::Error::other("missing socket name"))?),
+            None => endpoint.to_path_buf(),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let bind_path = endpoint.to_path_buf();
+    let listener = UnixListener::bind(&bind_path)?;
+    if let Err(error) = std::fs::set_permissions(&bind_path, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| listener.set_nonblocking(true)) {
+        let _ = std::fs::remove_file(&bind_path);
+        return Err(error);
+    }
+    Ok(listener)
+}
+
+#[cfg(unix)]
 fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
     use std::io::{Read, Write};
     use std::time::Instant;
-    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
     let directory = private_directory(&account_key_base()?)?;
     let endpoint = directory.join(id.replace('-', ""));
-    let listener = UnixListener::bind(&endpoint)?;
-    if let Err(error) = std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| listener.set_nonblocking(true)) {
-        let _ = std::fs::remove_file(&endpoint);
-        return Err(error);
-    }
+    let listener = bind_private_listener(&endpoint)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::clone(&stop);
     let thread = thread::spawn(move || {
@@ -305,6 +338,50 @@ mod tests {
         assert!(private_directory(&home).is_err());
         assert!(!directory.exists());
         std::fs::remove_dir(home).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn long_account_paths_bind_private_sockets_without_changing_cwd() {
+        use std::io::{Read, Write};
+        use std::os::{fd::AsRawFd, unix::{fs::{MetadataExt, PermissionsExt}, net::UnixStream}};
+        let nonce = crate::protocol::secure_server_nonce().unwrap();
+        let name: String = nonce[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let parent = std::path::Path::new("/tmp").join(format!("rck-{name}"));
+        std::fs::create_dir(&parent).unwrap();
+        let parent = std::fs::canonicalize(parent).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let fixed_bytes = parent.as_os_str().len() + 45;
+        for name in ["x".repeat(107 - fixed_bytes), "x".repeat(108 - fixed_bytes), "界".repeat(40)] {
+            let home = parent.join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let directory = private_directory(&home).unwrap();
+            let endpoint = directory.join("0123456789abcdef0123456789abcdef");
+            assert!(endpoint.as_os_str().len() >= 107);
+            let listener = bind_private_listener(&endpoint).unwrap();
+            assert_eq!(std::env::current_dir().unwrap(), cwd);
+            assert_eq!(std::fs::metadata(&endpoint).unwrap().mode() & 0o777, 0o600);
+            let handle = std::fs::File::open(&directory).unwrap();
+            let alias = format!("/proc/self/fd/{}/0123456789abcdef0123456789abcdef", handle.as_raw_fd());
+            let mut client = UnixStream::connect(alias).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.write_all(b"private key transport").unwrap();
+            let mut bytes = [0; 21];
+            client.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"private key transport");
+            drop(listener);
+            std::fs::remove_file(endpoint).unwrap();
+            if directory.as_os_str().len() + 33 >= 108 {
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(bind_private_listener(&directory.join("0123456789abcdef0123456789abcdef")).is_err());
+                std::fs::remove_dir(&directory).unwrap();
+                std::os::unix::fs::symlink(&home, &directory).unwrap();
+                assert!(bind_private_listener(&directory.join("0123456789abcdef0123456789abcdef")).is_err());
+                std::fs::remove_file(directory).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(unix)]

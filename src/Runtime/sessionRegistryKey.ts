@@ -68,7 +68,26 @@ export async function readSessionRegistryKey(identity: SessionRegistryIdentity, 
           !socket.isSocket() || socket.uid !== uid || (socket.mode & 0o077) !== 0) {
         throw new Error("Session key endpoint is not private to this user");
       }
-      return await receiveKey(endpoint, identity.pid, request, Math.max(1, deadline - Date.now()));
+      // Linux sockaddr_un has 108 bytes including its terminating NUL. Keep
+      // the socket in the protected account directory and address long paths
+      // through a held directory descriptor. HOME/TMPDIR never select a peer.
+      let directoryFd: number | undefined;
+      try {
+        let connectPath = endpoint;
+        if (process.platform === "linux" && Buffer.byteLength(endpoint) >= 108) {
+          directoryFd = fs.openSync(path.dirname(endpoint), fs.constants.O_RDONLY |
+            fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+          const opened = fs.fstatSync(directoryFd);
+          if (!opened.isDirectory() || opened.uid !== uid || (opened.mode & 0o077) !== 0 ||
+              opened.dev !== directory.dev || opened.ino !== directory.ino) {
+            throw new Error("Session key directory changed before connection");
+          }
+          connectPath = `/proc/self/fd/${directoryFd}/${path.basename(endpoint)}`;
+        }
+        return await receiveKey(connectPath, identity.pid, request, Math.max(1, deadline - Date.now()));
+      } finally {
+        if (directoryFd !== undefined) fs.closeSync(directoryFd);
+      }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EBUSY", "EPIPE"].includes(code ?? "")) throw error;
