@@ -25,7 +25,7 @@ use windows_sys::Win32::{
 };
 
 pub(crate) const FRAME_HEADER_LEN: usize = 12;
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 const MAX_INPUT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_SERVER_CHALLENGE: u16 = 22;
 const FRAME_CLIENT_PROOF: u16 = 23;
@@ -612,7 +612,7 @@ pub(crate) enum PromptKind {
     Cont,
 }
 
-fn secure_server_nonce() -> io::Result<[u8; AUTH_NONCE_BYTES]> {
+pub(crate) fn secure_server_nonce() -> io::Result<[u8; AUTH_NONCE_BYTES]> {
     let mut nonce = [0_u8; AUTH_NONCE_BYTES];
     #[cfg(unix)]
     {
@@ -935,6 +935,19 @@ mod tests {
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn old_tcp_startup_frames_are_rejected_even_when_authenticated() {
+        for kind in [27_u16, 28_u16] {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&4_u32.to_le_bytes());
+            frame.extend_from_slice(&kind.to_le_bytes());
+            frame.extend_from_slice(&0_u16.to_le_bytes());
+            frame.extend_from_slice(&1_u32.to_le_bytes());
+            frame.extend_from_slice(&1_u32.to_le_bytes());
+            assert!(read_next_command(&mut frame.as_slice()).is_err());
+        }
     }
 
     #[test]

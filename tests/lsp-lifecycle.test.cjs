@@ -56,6 +56,52 @@ async function waitFor(predicate, label) {
   }
 }
 
+for (const useStdio of [false, true]) {
+  test(`startup and replacement preserve unusual library paths over ${useStdio ? "stdio" : "TCP"}`,
+    { timeout: 60000 }, async t => {
+      const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-paths-")));
+      let client;
+      t.after(async () => { await client?.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+      const names = process.platform === "win32" ? ["space library", "日本語"]
+        : ["library\nsuffix", "quote\"tab\t", "日本語"];
+      const libraries = names.map(name => path.join(root, name));
+      libraries.forEach(library => fs.mkdirSync(library));
+      // A split newline must not accidentally select this existing prefix.
+      const wrong = path.join(root, "library"); fs.mkdirSync(wrong);
+      const fixture = createConsoleLsp(t, { libraries, useStdio });
+      client = fixture.client;
+      await client.start();
+      assert.equal(fixture.instances.length, 1, "startup already has the exact ordered snapshot");
+      const first = await fixture.instances[0].sendRequest("rConsole/libraryPaths", {});
+      const normalized = libraries.map(library => process.platform === "win32" ? library.replace(/\\/g, "/") : library);
+      assert.deepEqual(first.slice(0, libraries.length), normalized);
+      assert.ok(!first.includes(wrong));
+      await client.restartClient(fixture.instances[0], "path transfer regression");
+      await client.syncLibraryPaths();
+      assert.equal(fixture.instances.length, 2, "a replacement must not cause a synchronization restart loop");
+      assert.deepEqual(await fixture.instances[1].sendRequest("rConsole/libraryPaths", {}), first);
+    });
+}
+
+test("R startup distinguishes absent, empty and incomplete library snapshots", t => {
+  const { client } = createConsoleLsp(t);
+  const config = { get: () => undefined };
+  const startup = 'code <- parse("resources/r/console-language-server.R"); eval(code[[1]]); eval(code[[2]]); ';
+  const run = (env, assertion) => execFileSync("Rscript", ["--vanilla", "-"],
+    { env, input: startup + assertion + "\n", encoding: "utf8", timeout: 15000, stdio: "pipe" });
+  run(client.buildServerEnv(config), 'stopifnot(!exists("runtime_lib_paths"))');
+  const paths = ["/lib\nnewline", "/lib\rreturn", '/lib"quote', "/lib\\slash", "/lib/日本語", "/lib\t tab"];
+  client.runtimeLibraryPaths = paths;
+  run(client.buildServerEnv(config), `stopifnot(identical(unname(runtime_lib_paths), c(${paths.map(value => JSON.stringify(value)).join(",")})))`);
+  client.runtimeLibraryPaths = [];
+  run(client.buildServerEnv(config), 'stopifnot(identical(runtime_lib_paths, character()))');
+  const env = client.buildServerEnv(config);
+  env.VSCR_LSP_LIBRARY_COUNT = "1";
+  assert.throws(() => run(env, ""), /Missing library path/);
+  env.VSCR_LSP_LIBRARY_COUNT = "invalid";
+  assert.throws(() => run(env, ""), /Invalid library path count/);
+});
+
 test("installed package chain signatures also supply arguments without running the chain", { timeout: 90000 }, async t => {
   const { session, createClient } = temporaryLibraries(t);
   const pkg = 'rconsolechaintest';
@@ -248,7 +294,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 
   logs.length = 0;
   install(session, "probeReplacement");
-  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "higher-priority copy refresh");
+  await waitFor(() => logs.some(line => line.includes("First library copy changed: " + pkg)), "higher-priority copy refresh");
   const items = await complete(pkg + "::probe");
   assert.ok(items.some(item => item.label === "probeReplacement"));
   assert.ok(!items.some(item => item.label === "probeOriginal"));
@@ -259,7 +305,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 
   logs.length = 0;
   fs.rmSync(path.join(configured, pkg), { recursive: true });
-  await waitFor(() => logs.some(line => line.includes("Active package copies unchanged")), "inactive-copy removal");
+  await waitFor(() => logs.some(line => line.includes("First library copies unchanged")), "inactive-copy removal");
   assert.equal(instances.length, 2);
   install(configured, "probeFallback");
   logs.length = 0;
@@ -274,7 +320,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 
   logs.length = 0;
   fs.rmSync(path.join(session, pkg), { recursive: true });
-  await waitFor(() => logs.some(line => line.includes("Using remaining copy: " + pkg)), "remaining library copy");
+  await waitFor(() => logs.some(line => line.includes("Remaining library copy: " + pkg)), "remaining library copy");
   const fallback = await complete(pkg + "::");
   assert.ok(fallback.some(item => item.label === "probeFallback"));
   assert.ok(!fallback.some(item => item.label === "probeUpdated"));
@@ -289,52 +335,7 @@ test("background package refresh preserves unaffected libraries and switches rem
   assert.ok(instances.every(instance => !instance.requests.some(request => request.method === "rConsole/checkPackageChanges")));
 });
 
-test("real R refreshes linked project libraries when package links are added, replaced or removed", { timeout: 120000 }, async t => {
-  const { session, configured, createClient } = temporaryLibraries(t);
-  const root = path.dirname(session);
-  const cache = path.join(root, "cache");
-  fs.mkdirSync(cache);
-  const pkg = "rconsolelinkedtest";
-  const source = path.join(root, pkg);
-  fs.mkdirSync(path.join(source, "R"), { recursive: true });
-  fs.writeFileSync(path.join(source, "DESCRIPTION"), [
-    "Package: " + pkg, "Version: 1.0", "Title: Completion Test", "Description: A test package.",
-    "Author: Test", "Maintainer: Test <test@example.org>", "License: MIT", "",
-  ].join("\n"));
-  function install(library, exported) {
-    fs.writeFileSync(path.join(source, "R", "f.R"), exported + " <- function() NULL\n");
-    fs.writeFileSync(path.join(source, "NAMESPACE"), "export(" + exported + ")\n");
-    execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["CMD", "INSTALL", "--no-byte-compile",
-      "--no-test-load", "-l", library, source], { stdio: "pipe" });
-  }
-  install(configured, "originalExport");
-  install(cache, "replacementExport");
-  const { client, complete, instances, logs } = createClient({ libraries: [session] });
-  await client.start();
-  await waitFor(() => logs.some(line => line.includes("unique package names")), "initial inventory");
-  const link = path.join(session, pkg);
-  const linkType = process.platform === "win32" ? "junction" : "dir";
-  fs.symlinkSync(path.join(configured, pkg), link, linkType);
-  await waitFor(() => logs.some(line => line.includes("Added: " + pkg)), "linked package installation");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 1);
-
-  logs.length = 0;
-  fs.unlinkSync(link);
-  fs.symlinkSync(path.join(cache, pkg), link, linkType);
-  await waitFor(() => logs.some(line => line.includes("Updated: " + pkg)), "linked package replacement");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "replacementExport"));
-  assert.equal(instances.length, 2);
-
-  logs.length = 0;
-  fs.unlinkSync(link);
-  await waitFor(() => logs.some(line => line.includes("no copies remain")), "linked package removal");
-  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
-  assert.equal(instances.length, 3);
-});
-
-
-test("real console library-path IPC updates package completion, precedence and removal", { timeout: 120000 }, async t => {
+test("real console library-path IPC updates completion without filesystem monitoring", { timeout: 120000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-live-libpaths-"));
   const first = path.join(root, "first");
   const second = path.join(root, "second");
@@ -360,7 +361,17 @@ test("real console library-path IPC updates package completion, precedence and r
 
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } =
     loadSource("src/Runtime/runtimeBackend.ts");
-  const { client, complete, logs } = createConsoleLsp(t, { cwd: root });
+  let loseSyncReply = true;
+  const { client, instances, complete, logs } = createConsoleLsp(t, { cwd: root,
+    afterResponse: method => {
+      if (method === "rConsole/syncLibraryPaths" && loseSyncReply) {
+        loseSyncReply = false;
+        throw new Error("Simulated lost library synchronization reply");
+      }
+    },
+  });
+  client.packageInventory.dispose();
+  client.packageInventory.setLibraryPaths = () => {};
   const { RTermLang } = loadSource("src/Terminal/rTerminal/lang.ts", {
     vscode: {},
     "../../Language/consoleLspClient": { ConsoleLspClient: class { constructor() { return client; } } },
@@ -400,10 +411,7 @@ test("real console library-path IPC updates package completion, precedence and r
       await new Promise(resolve => setTimeout(resolve, 50));
     }
   };
-  const samePath = (a, b) => fs.realpathSync.native(a).replaceAll("\\", "/").toLowerCase() ===
-    fs.realpathSync.native(b).replaceAll("\\", "/").toLowerCase();
   await client.start();
-  await check(() => client.packageInventory.initialized, "initial language-server inventory");
   session = backend.start([rPath, "--vanilla", "--quiet"], {
     cwd: root, env: { ...process.env, R_HOME: rHome },
   });
@@ -442,28 +450,31 @@ test("real console library-path IPC updates package completion, precedence and r
     assert.ok(backend.canUseSessionCommands(session), "library changes must not disconnect R");
   };
   await submitPaths([first], "FIRST_LIBRARY_ACTIVE");
-  await check(() => logs.some(line => line.includes("Added: " + packageName)),
-    "first package addition observed");
   await check(async () => (await complete(packageName + "::"))?.some(item => item.label === "fromFirstLibrary"),
     "first library completion");
   await submitPaths([first, second], "SECOND_LIBRARY_ACTIVE");
-  await check(() => client.packageInventory.libraries.some(lib => samePath(lib.path, second)),
-    "second library inventory");
+  await client.libraryPathsSyncPromise;
+  assert.deepEqual(await instances.at(-1).sendRequest("rConsole/libraryPaths", {}), snapshots.at(-1));
   await submitPaths([second, first], "REORDERED_LIBRARIES");
   await check(async () => {
     const items = await complete(packageName + "::");
     return items?.some(item => item.label === "fromSecondLibrary") &&
       !items.some(item => item.label === "fromFirstLibrary");
   }, "reordered library completion precedence");
+  client.setStaticAnalysis(false);
+  assert.ok((await complete(packageName + "::"))?.some(item => item.label === "fromSecondLibrary"),
+    "live-mode namespace completion also uses the synchronized library order");
   await submitPaths([], "REMOVED_LIBRARIES");
-  await check(() => logs.some(line => line.includes("Removed: " + packageName)),
-    "removed package inventory");
   await check(async () => {
     const items = await complete(packageName + "::");
     return !items?.some(item => item.label === "fromFirstLibrary" || item.label === "fromSecondLibrary");
   }, "removed library must not complete");
   assert.deepEqual(snapshots.at(-1), basePaths,
     "removing both libraries restores exactly the original console search order");
+  assert.ok(!instances.flatMap(instance => instance.requests)
+    .some(request => request.method === "rConsole/refreshPackages"),
+    "path synchronization must not depend on an inventory refresh");
+  assert.equal(loseSyncReply, false, "exercise retry after R applies paths but the reply is lost");
 });
 
 test("real R keeps startup completion working while the first session snapshot arrives", { timeout: 90000 }, async (t) => {
@@ -515,94 +526,68 @@ function lifecycleFixture(t) {
   return { first, second, root, pkg, install, defaults, createClient };
 }
 
-test("replacement restores startup options with the new package copy before loading namespaces", { timeout: 90000 }, async t => {
-  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  const startupHook = '.onLoad <- function(...) stopifnot(identical(getOption("rconsole.lifecycle.option"), "ready"))';
-  install(first, "originalExport", startupHook); install(second, "replacementExport", startupHook);
-  const marker = path.join(root, "profile-runs");
-  fs.writeFileSync(path.join(root, ".Renviron"), `R_DEFAULT_PACKAGES=datasets,utils,grDevices,graphics,stats,methods,${pkg}\nR_LIBS_USER="${first.replaceAll("\\", "/")}"\n`);
-  fs.writeFileSync(path.join(root, ".Rprofile"), [
-    `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
-    'options(defaultPackages = character(), languageserver.max_completions = 7L, rconsole.lifecycle.option = "ready")',
-    `library(${pkg})`,
-    'library(utils)',
-    recordServerEvent(marker, "profile"),
-  ].join("\n") + "\n");
-  const env = { ...process.env }; delete env.R_PROFILE_USER; delete env.R_ENVIRON_USER;
-  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
-  client.updateRuntimeLibraryPaths([first, second, ...defaults]);
+test("one console evaluation updates multiple loaded packages with one LSP restart", { timeout: 120000 }, async t => {
+  const { first, pkg, install, createClient } = lifecycleFixture(t);
+  const alpha = pkg + "alpha", beta = pkg + "beta", removed = pkg + "removed", added = pkg + "added";
+  install(first, "originalAlpha", "", alpha);
+  install(first, "originalBeta", "", beta);
+  install(first, "removedExport", "", removed);
+  const { client, complete, instances, logs } = createClient({ libraries: [first] });
   await client.start();
-  await waitFor(() => client.packageInventory.initialized, "initial inventory");
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
-    "the initial server must execute the complete profile");
-  if (process.platform !== "win32") {
-    const snapshot = path.join(client.workingDirectory, "startup.rds");
-    assert.equal(fs.statSync(client.workingDirectory).mode & 0o077, 0,
-      "the language-server working directory must be private");
-    assert.equal(fs.statSync(snapshot).mode & 0o077, 0,
-      "startup options and environment must not be readable by other users");
+  await waitFor(() => client.packageInventory.initialized, "initial package inventory");
+  for (const [name, exported] of [[alpha, "originalAlpha"], [beta, "originalBeta"], [removed, "removedExport"]]) {
+    assert.ok((await complete(name + "::")).some(item => item.label === exported));
   }
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
-  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
+  const requests = instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").length;
+  logs.length = 0;
+  client.setRuntimeBusy(true);
+  for (const [name, exported] of [[alpha, "updatedAlpha"], [beta, "updatedBeta"], [added, "addedExport"]]) {
+    install(first, exported, "", name);
+    await new Promise(resolve => setTimeout(resolve, 650));
+  }
+  fs.rmSync(path.join(first, removed), { recursive: true });
+  await new Promise(resolve => setTimeout(resolve, 650));
+  assert.equal(instances.length, 1, "no intermediate server restart during installation");
+  assert.equal(instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").length, requests);
+  assert.ok(!logs.some(line => /Scanning folder|Scan deferred|inventory changed/.test(line)));
+  client.setRuntimeBusy(false);
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise &&
+    client.packageInventory.packages.has(added) && !client.packageInventory.packages.has(removed), "one consolidated reconciliation");
+  assert.equal(instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").length, requests + 1);
+  for (const [name, exported] of [[alpha, "updatedAlpha"], [beta, "updatedBeta"], [added, "addedExport"]]) {
+    assert.ok((await complete(name + "::")).some(item => item.label === exported));
+  }
+  assert.ok(!(await complete(alpha + "::")).some(item => item.label === "originalAlpha"));
   assert.equal(instances.length, 2);
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
-    "replacement must not re-execute profiles that preload stale namespaces");
-  assert.equal((await complete("stats::")).length, 7, "profile completion options survive a clean restart");
 });
 
-test("namespace-valued startup options deserialize after the environment and library order are restored", { timeout: 90000 }, async t => {
+test("normal startup options and large application state survive a server replacement", { timeout: 90000 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  const marker = path.join(root, "namespace-loads");
-  const events = () => fs.readFileSync(marker, "utf8").trim().split(/\r?\n/);
-  const startup = label => `.onLoad <- function(...) {
-    ${recordServerEvent(marker, label)}
-    stopifnot(Sys.getenv("RCONSOLE_OPTION_ENV") == "ready",
-      identical(getOption("rconsole.lifecycle.option"), list(value = "ready")))
-  }
-  .onAttach <- function(...) {
-    callback <- getOption("rconsole.callback")
-    stopifnot(is.function(callback), isNamespace(environment(callback)),
-      identical(environment(attr(getOption("rconsole.attributed"), "callback")), environment(callback)),
-      identical(normalizePath(getNamespaceInfo(environment(callback), "path")),
-        normalizePath(file.path(.libPaths()[[1L]], "${pkg}"))))
-    ${recordServerEvent(marker, "callback-restored")}
-  }`;
-  install(first, "originalExport", startup("original"));
-  install(second, "replacementExport", startup("replacement"));
+  install(first, "originalExport"); install(second, "replacementExport");
   const profile = path.join(root, ".Rprofile");
+  const marker = path.join(root, "profile-runs");
   fs.writeFileSync(profile, [
-    'Sys.setenv(RCONSOLE_OPTION_ENV = "ready")',
-    `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
-    'options(rconsole.lifecycle.option = list(value = "ready"))',
-    `options(rconsole.attributed = structure("value", callback = ${pkg}::originalExport))`,
-    `options(rconsole.callback = ${pkg}::originalExport, languageserver.max_completions = 7L)`,
-    `library(${pkg})`,
+    'options(languageserver.max_completions = 7L, myapp.cache = raw(9L * 1024L * 1024L))',
+    // A closure with captured state is ordinary profile configuration, not a transport payload.
+    'options(myapp.callback = local({ value <- new.env(); function() value }))',
+    recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
-  // Inherited paths still select the old copy when the replacement begins.
-  const env = { ...process.env, R_PROFILE_USER: profile,
-    R_LIBS_USER: [first, ...defaults].join(path.delimiter), RCONSOLE_OPTION_ENV: "inherited" };
-  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
+  const { client, instances, complete } = createClient({ cwd: root, args: [],
+    env: { ...process.env, R_PROFILE_USER: profile } });
   client.updateRuntimeLibraryPaths([first, second, ...defaults]);
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  assert.equal((await complete("stats::")).length, 7, "the initial server must apply the profile options");
-  assert.deepEqual(events(), ["original", "callback-restored"]);
-  fs.writeFileSync(marker, "");
-  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
-  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)),
-    "namespace-valued options must not retain the old installation");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 2, "the library switch requires exactly one replacement");
-  assert.deepEqual(events(), ["replacement", "callback-restored"],
-    "deserialization loads only the selected namespace with its restored environment");
   assert.equal((await complete("stats::")).length, 7);
+  assert.equal(Object.hasOwn(client, "startupState"), false);
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), []);
+  if (process.platform !== "win32") assert.equal(fs.statSync(client.workingDirectory).mode & 0o077, 0);
+  client.updateRuntimeLibraryPaths([second, first, ...defaults]);
+  await client.start();
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "replacementExport"));
+  assert.equal((await complete("stats::")).length, 7);
+  assert.equal(instances.length, 2);
+  assert.deepEqual(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/), ["profile", "profile"]);
 });
 
 test("site libraries excluded by a live snapshot stay excluded on startup and refresh", { timeout: 90000 }, async t => {
@@ -625,7 +610,10 @@ test("site libraries excluded by a live snapshot stay excluded on startup and re
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "siteExport"));
 });
 
-test("replacement restores profile environment changes before package loading and keeps fresh process state", { timeout: 90000 }, async t => {
+for (const useStdio of [false, true]) {
+test(`replacement uses normal profile and environment startup over ${useStdio ? "stdio" : "authenticated TCP"}`, {
+  timeout: 90000, skip: useStdio && process.platform === "win32",
+}, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
   const marker = path.join(root, "profile-runs");
   const startup = `.onLoad <- function(...) {
@@ -633,6 +621,8 @@ test("replacement restores profile environment changes before package loading an
       Sys.getenv("RCONSOLE_TEST_ENVIRON_VALUE") == "environ value",
       is.na(Sys.getenv("RCONSOLE_TEST_UNSET", unset = NA_character_)),
       Sys.getenv("RCONSOLE_TEST_EMPTY") == "", dir.exists(tempdir()))
+    stopifnot(identical(getOption("rconsole.test.raw"), as.raw(rep(0:255, 1024L))),
+      identical(getOption("rconsole.test.credential"), Sys.getenv("RCONSOLE_TEST_CREDENTIAL")))
     session_tmp <- Sys.getenv("R_SESSION_TMPDIR")
     if (nzchar(session_tmp)) stopifnot(normalizePath(session_tmp) == normalizePath(tempdir()))
   }`;
@@ -643,36 +633,40 @@ test("replacement restores profile environment changes before package loading an
   fs.writeFileSync(profile, [
     'Sys.setenv(RCONSOLE_TEST_PROFILE_VALUE = "profile value", RCONSOLE_TEST_EMPTY = "")',
     'Sys.unsetenv("RCONSOLE_TEST_UNSET")',
+    'options(rconsole.test.credential = Sys.getenv("RCONSOLE_TEST_CREDENTIAL"))',
+    'options(rconsole.test.raw = as.raw(rep(0:255, 1024L)))',
     `.libPaths(c(${JSON.stringify(first)}, .libPaths()))`,
-    `library(${pkg})`,
     recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
   const env = { ...process.env, R_PROFILE_USER: profile, R_ENVIRON_USER: environ,
+    VSCR_LSP_HOST: "127.0.0.1", VSCR_LSP_PORT: "1", VSCR_LSP_AUTH_TOKEN: "stale-token",
+    RCONSOLE_TEST_CREDENTIAL: "synthetic-startup-secret-do-not-persist",
     RCONSOLE_TEST_PROFILE_VALUE: "inherited", RCONSOLE_TEST_UNSET: "inherited", RCONSOLE_TEST_EMPTY: "inherited" };
-  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env });
+  const { client, instances, complete, logs } = createClient({ cwd: root, args: [], env, useStdio });
   client.updateRuntimeLibraryPaths([first, second, ...defaults]);
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
     "the initial server must execute the complete profile");
-  const snapshotKeys = execFileSync("Rscript", ["--vanilla", "-e",
-    `cat(names(readRDS(${JSON.stringify(path.join(client.workingDirectory, "startup.rds"))})$environment), sep="\\n")`],
-    { encoding: "utf8" }).trim().split(/\r?\n/);
-  assert.ok(!snapshotKeys.some(key => key.startsWith("VSCR_") || key === "R_SESSION_TMPDIR"),
-    "the startup snapshot must exclude transport secrets and the old temporary directory");
+  assert.equal(Object.hasOwn(client, "startupState"), false);
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), []);
   for (const [libraries, exported] of [[[second, first, ...defaults], "replacementExport"],
     [[first, second, ...defaults], "originalExport"]]) {
     logs.length = 0;
     client.updateRuntimeLibraryPaths(libraries);
-    await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
+    await waitFor(() => logs.some(line => line.includes("First library copy changed: " + pkg)), "confirmed switch");
     assert.ok((await complete(pkg + "::")).some(item => item.label === exported),
       "profile-dependent packages must load in every replacement server");
-    assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile",
-      "replacement restores state without replaying the profile");
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length, instances.length,
+      "each replacement performs normal R startup");
   }
   assert.equal(instances.length, 3, "both replacements authenticate with fresh transport state");
+  assert.deepEqual(fs.readdirSync(client.workingDirectory), [], "restarts must not create state files");
+  assert.ok(!logs.join("\n").includes(env.RCONSOLE_TEST_CREDENTIAL), "configuration values must not enter lifecycle logs");
+  await client.dispose();
 });
+}
 
 test("replacement preserves profile-defined base and site library roots across repeated restarts", { timeout: 120000 }, async t => {
   const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
@@ -709,14 +703,6 @@ test("replacement preserves profile-defined base and site library roots across r
         identical(Sys.getenv("RCONSOLE_LIBRARY_ROOT_TEST"), "ready"),
         identical(getOption("rconsole.lifecycle.option"), "ready"))
     }
-  }
-  .onAttach <- function(...) {
-    if (any(basename(commandArgs(TRUE)) == "console-language-server.R")) {
-      callback <- getOption("rconsole.lifecycle.callback")
-      stopifnot(is.function(callback), isNamespace(environment(callback)),
-        identical(normalizePath(getNamespaceInfo(environment(callback), "path")),
-          normalizePath(file.path(.libPaths()[[1L]], "${pkg}"))))
-    }
   }`;
   install(first, "originalExport", startup);
   install(second, "replacementExport", startup);
@@ -734,8 +720,6 @@ test("replacement preserves profile-defined base and site library roots across r
     `.libPaths(c(${originalOrder.map(value => JSON.stringify(value)).join(", ")}), include.site = FALSE)`,
     'Sys.setenv(RCONSOLE_LIBRARY_ROOT_TEST = "ready")',
     'options(rconsole.lifecycle.option = "ready", languageserver.max_completions = 7L)',
-    `options(rconsole.lifecycle.callback = ${pkg}::originalExport)`,
-    `library(${pkg})`,
     recordServerEvent(marker, "profile"),
   ].join("\n") + "\n");
   const env = { ...process.env, R_PROFILE_USER: profile, RCONSOLE_LIBRARY_ROOT_TEST: "inherited" };
@@ -758,7 +742,8 @@ test("replacement preserves profile-defined base and site library roots across r
         "excluded package is not offered for completion: " + name);
     }
     assert.ok(!(await complete(excludedSite + "::")).some(item => item.label === "excludedExport"));
-    assert.equal(fs.readFileSync(marker, "utf8").trim(), "profile", "the initial profile must run only once");
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length, instanceCount,
+      "each process applies the profile-defined library roots");
     // Include the first retry interval, so a successful completion cannot hide
     // a reconciliation failure waiting to restart the server again.
     await new Promise(resolve => setTimeout(resolve, 1200));
@@ -812,90 +797,117 @@ test("unrelated abandoned locks do not retain removed namespace metadata", { tim
   assert.ok(!(await complete(pkg + "::")).some(item => item.label === "installedExport"));
 });
 
-test("linked cache changes refresh namespace exports without touching the library link", { timeout: 90000 }, async t => {
-  const { first, second: cache, pkg, install, createClient } = lifecycleFixture(t);
+test("linked startup packages remain tracked and usable without monitoring their external cache", { timeout: 90000 }, async t => {
+  const { first, second: cache, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(cache, "originalExport");
   const target = path.join(cache, pkg);
   fs.symlinkSync(target, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
-  const { client, complete } = createClient({ libraries: [first] });
-  await client.start();
-  await waitFor(() => client.packageInventory.initialized, "initial inventory");
-  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  const originalIdentity = client.packageInventory.packages.get(pkg).identity;
-  install(cache, "replacementExport");
-  await waitFor(() => client.packageInventory.packages.get(pkg)?.identity !== originalIdentity, "external cache replacement");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  fs.rmSync(target, { recursive: true });
-  await waitFor(() => !client.packageInventory.packages.has(pkg), "external cache removal");
-  assert.ok(!(await complete(pkg + "::")).some(item => item.label === "replacementExport"));
-});
-
-test("a traversable unlistable cache retires removed namespace completions", {
-  skip: process.platform === "win32" || process.getuid?.() === 0,
-  timeout: 90000,
-}, async t => {
-  const { first, second: cache, pkg, install, createClient } = lifecycleFixture(t);
-  install(cache, "originalExport");
-  const target = path.join(cache, pkg);
-  fs.symlinkSync(target, path.join(first, pkg), "dir");
-  fs.chmodSync(cache, 0o311);
-  let client;
-  try {
-    await assert.rejects(fs.promises.readdir(cache), { code: "EACCES" });
-    execFileSync("Rscript", ["--vanilla", "-e", `library(${pkg}, lib.loc=${JSON.stringify(first)})`], { stdio: "pipe" });
-    const result = createClient({ libraries: [first] });
-    client = result.client;
-    await client.start();
-    await waitFor(() => client.packageInventory.initialized, "inventory of a traversable unlistable cache");
-    assert.ok((await result.complete(pkg + "::")).some(item => item.label === "originalExport"));
-    fs.rmSync(target, { recursive: true });
-    await waitFor(() => !client.packageInventory.packages.has(pkg), "unlistable cache removal published");
-    assert.ok(!(await result.complete(pkg + "::")).some(item => item.label === "originalExport"));
-    assert.ok(!result.logs.some(line => line.includes("Could not refresh package inventory")));
-  } finally {
-    fs.chmodSync(cache, 0o700);
-    await client?.dispose();
-  }
-});
-
-test("a chained package link retains its startup namespace until the cache installation unlocks", { timeout: 90000 }, async t => {
-  const { first, second: cache, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
-  const alias = path.join(root, "alias"), replacement = path.join(root, "replacement");
-  fs.mkdirSync(alias); fs.mkdirSync(replacement);
-  install(cache, "originalExport");
-  install(replacement, "replacementExport");
-  const target = path.join(cache, pkg), intermediate = path.join(alias, pkg);
-  fs.symlinkSync(target, intermediate, process.platform === "win32" ? "junction" : "dir");
-  fs.symlinkSync(intermediate, path.join(first, pkg), process.platform === "win32" ? "junction" : "dir");
   const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
     R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
   const { client, instances, complete, logs } = createClient({ env, libraries: [first] });
   await client.start();
   await waitFor(() => client.packageInventory.initialized, "initial inventory");
+  assert.equal(client.packageInventory.packages.get(pkg)?.linked, true,
+    "linked package entries remain visible to lifecycle reconciliation");
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
-  const originalIdentity = client.packageInventory.packages.get(pkg).identity;
-  const lock = path.join(cache, "00LOCK-" + pkg);
-  fs.mkdirSync(lock);
-  fs.renameSync(target, path.join(lock, pkg));
-  await waitFor(() => client.packageInventory.libraries.some(library => library.deferred?.has(pkg)),
-    "the cache lock defers the missing final target");
-  assert.equal(client.packageInventory.packages.get(pkg)?.identity, originalIdentity);
-  assert.equal(instances.length, 1, "the locked backup must not restart the language server");
-  fs.renameSync(path.join(replacement, pkg), target);
-  await new Promise(resolve => setTimeout(resolve, 1800));
-  assert.equal(client.packageInventory.packages.get(pkg)?.identity, originalIdentity);
-  assert.equal(instances.length, 1, "the new copy remains deferred until unlock");
-  fs.rmSync(lock, { recursive: true });
-  await waitFor(() => logs.some(line => line.includes("Updated: " + pkg)), "unlocked replacement published");
-  const items = await complete(pkg + "::");
-  assert.ok(items.some(item => item.label === "replacementExport"));
-  assert.ok(!items.some(item => item.label === "originalExport"));
-  assert.equal(instances.length, 2, "unlock replaces the loaded namespace once");
+  assert.equal(instances.length, 1, "an unchanged loaded linked package must not restart the server");
+  const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
+  assert.deepEqual(request.params.installations[pkg], [path.join(fs.realpathSync.native(first), pkg)],
+    "the linked entry is anchored to the configured library's pinned real path");
+  assert.ok(!request.params.unmonitored.includes(pkg),
+    "a trusted project-library link entry is monitored without watching its target");
+
+  logs.length = 0;
+  install(cache, "replacementExport");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(instances.length, 1, "external cache changes must not trigger a refresh");
+  assert.ok(!logs.some(line => line.includes("Scanning folder:")));
+
+  const ordinary = "rconsoleordinaryprobe";
+  install(first, "ordinaryExport", "", ordinary);
+  await waitFor(() => client.packageInventory.packages.has(ordinary), "ordinary installation");
+  assert.ok((await complete(ordinary + "::")).some(item => item.label === "ordinaryExport"));
+  assert.equal(instances.length, 1);
+  fs.rmSync(path.join(first, ordinary), { recursive: true });
+  await waitFor(() => !client.packageInventory.packages.has(ordinary) && !client.packageRefreshPromise,
+    "ordinary removal");
+  assert.ok(!(await complete(ordinary + "::")).some(item => item.label === "ordinaryExport"));
+  assert.equal(instances.length, 2, "ordinary loaded-package removal still refreshes the server");
+  assert.ok(!logs.some(line => line.includes("retained stale packages")));
 });
 
-test("initial locked namespaces stay usable and an excluded startup namespace is retired", { timeout: 90000 }, async t => {
+test("links to missing package folders preserve R's valid package selection", { timeout: 90000 }, async t => {
+  const { first, root, createClient } = lifecycleFixture(t);
+  fs.symlinkSync(path.join(root, "missing-cache"), path.join(first, "stats"),
+    process.platform === "win32" ? "junction" : "dir");
+  const { client, instances, complete, logs } = createClient({ libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.libraries.filter(row => row.packages.has("stats") &&
+    !row.unavailable).length === 2 && !client.packageRefreshPromise,
+    "inventory accepts R's system package selection");
+  assert.equal(instances.length, 1);
+  assert.equal(client.failedPackageRefresh, undefined);
+  assert.ok((await complete("utils::he")).some(item => item.label === "head"));
+  assert.ok(!logs.some(line => line.includes("retained stale packages")));
+  const request = instances[0].requests.filter(request => request.method === "rConsole/refreshPackages").at(-1);
+  const copies = request.params.installations.stats;
+  assert.equal(copies.length, 2);
+  const ignored = await instances[0].sendRequest("rConsole/refreshPackages", {
+    ...request.params, changedInstallationPaths: [copies[0]],
+  });
+  assert.deepEqual(ignored.restart, [], "a change to the unusable link cannot reload the system copy");
+  const excluded = await instances[0].sendRequest("rConsole/refreshPackages", {
+    ...request.params, unmonitored: ["stats"], changedInstallationPaths: [copies[1]],
+  });
+  assert.deepEqual(excluded.restart, [], "excluded names defer reconciliation");
+  const selected = await instances[0].sendRequest("rConsole/refreshPackages", {
+    ...request.params, changedInstallationPaths: [],
+  });
+  assert.ok(selected.restart.includes("stats"),
+    "resuming preserves deferred selected-copy updates, including an aliased .Library spelling");
+});
+
+test("R selects valid later copies and tracks their updates behind an unusable package entry", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  install(second, "originalExport");
+  const link = path.join(first, pkg), kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(path.join(root, "missing-cache"), link, kind);
+  const env = { ...process.env, R_LIBS_USER: [first, second, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete } = createClient({ env, libraries: [first, second] });
+  await client.start();
+  await waitFor(() => client.packageInventory.libraries.some(row => row.packages.has(pkg) &&
+    !row.packages.get(pkg).linked && !row.unavailable) && !client.packageRefreshPromise,
+    "initial fallback inventory");
+  assert.equal(instances.length, 1);
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
+  install(second, "updatedExport");
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "later-copy update restarts its loaded namespace");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+
+  // Package validity belongs to R even when an ordinary directory has both
+  // metadata filenames. The filesystem monitor never opens their contents.
+  fs.unlinkSync(link);
+  fs.mkdirSync(path.join(link, "Meta"), { recursive: true });
+  fs.writeFileSync(path.join(link, "DESCRIPTION"), "invalid package metadata");
+  fs.writeFileSync(path.join(link, "Meta", "package.rds"), "invalid R metadata");
+  await waitFor(() => client.packageInventory.packages.get(pkg)?.linked !== true && !client.packageRefreshPromise,
+    "invalid ordinary entry reconciled");
+  assert.equal(instances.length, 2, "an unusable earlier copy cannot reload the unchanged selected copy");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+
+  const cache = path.join(root, "cache"); fs.mkdirSync(cache);
+  install(cache, "preferredExport");
+  fs.rmSync(link, { recursive: true }); fs.symlinkSync(path.join(cache, pkg), link, kind);
+  await waitFor(() => instances.length === 3 && !client.packageRefreshPromise, "valid earlier link becomes selected");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "preferredExport"));
+  fs.unlinkSync(link); fs.symlinkSync(path.join(root, "missing-again"), link, kind);
+  await waitFor(() => instances.length === 4 && !client.packageRefreshPromise, "missing earlier target returns selection to later copy");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+  assert.equal(client.failedPackageRefresh, undefined);
+});
+
+test("initial locked namespaces stay usable and conflicting startup libraries stop restart loops", { timeout: 90000 }, async t => {
   const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
   install(first, "startupExport");
   const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
@@ -910,11 +922,105 @@ test("initial locked namespaces stay usable and an excluded startup namespace is
   fs.rmdirSync(lock);
   await waitFor(() => client.packageInventory.packages.has(pkg), "unlocked installation");
   await client.dispose();
-  // A fresh console snapshot can already exclude a default package loaded by R startup.
+  // Normal R startup can explicitly preload a package excluded by the live console.
   const next = createClient({ env });
   next.client.updateRuntimeLibraryPaths(defaults);
   await next.client.start();
-  await waitFor(() => next.client.packageInventory.initialized, "excluded startup namespace reconciled");
+  await waitFor(() => next.client.failedPackageRefresh, "conflicting startup namespace diagnosed");
   assert.equal(next.instances.length, 2);
-  assert.ok(!(await next.complete(pkg + "::")).some(item => item.label === "startupExport"));
+  assert.equal(await next.complete(pkg + "::"), undefined, "conflicting namespace cannot supply completions");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(next.instances.length, 2, "retrying inventory must not repeatedly execute the same startup");
+  next.client.updateRuntimeLibraryPaths([first, ...defaults]);
+  await next.client.start();
+  await waitFor(() => next.client.packageInventory.initialized && !next.client.failedPackageRefresh,
+    "a compatible library order restores completion");
+  assert.ok((await next.complete(pkg + "::")).some(item => item.label === "startupExport"));
+});
+
+test("excluded middle copies preserve R selection behind invalid entries", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  const third = path.join(root, "third"); fs.mkdirSync(third);
+  install(second, "selectedExport"); install(third, "laterExport");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  const firstEntry = path.join(first, pkg);
+  fs.symlinkSync(path.join(root, "missing"), firstEntry, kind);
+  const meta = path.join(second, pkg, "Meta"), target = path.join(root, "excluded-meta");
+  fs.renameSync(meta, target); fs.symlinkSync(target, meta, kind);
+  const env = { ...process.env, R_LIBS_USER: [first, second, third, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete } = createClient({ env, libraries: [first, second, third] });
+  await client.start();
+  await waitFor(() => new Set(client.packageInventory.libraries
+    .filter(row => row.packages.has(pkg) && !row.unavailable).map(row => row.packages.get(pkg).target)).size === 2 &&
+    client.packageInventory.libraries.some(row => row.unmonitored?.has(pkg) && !row.unavailable) && !client.packageRefreshPromise,
+    "excluded copy reconciled");
+  assert.equal(instances.length, 1, "the excluded selected copy cannot cause a false restart");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "selectedExport"));
+  const request = instances[0].requests.filter(item => item.method === "rConsole/refreshPackages").at(-1);
+  assert.equal(request.params.installations[pkg].length, 3, "preserve the excluded copy's position");
+  assert.ok(request.params.unmonitoredInstallationPaths.includes(request.params.installations[pkg][1]));
+
+  // A valid monitored copy ahead of the barrier still participates normally.
+  fs.unlinkSync(firstEntry); install(first, "preferredExport");
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "valid earlier copy selected");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "preferredExport"));
+  install(first, "updatedExport");
+  await waitFor(() => instances.length === 3 && !client.packageRefreshPromise, "earlier copy update reconciled");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+  assert.equal(client.failedPackageRefresh, undefined);
+});
+
+test("unknown roots defer package selection beyond their position while verified earlier copies refresh", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  install(first, "selectedExport"); install(second, "laterExport");
+  const unknown = path.join(root, "unknown"); fs.mkdirSync(unknown);
+  const env = { ...process.env, R_LIBS_USER: [first, unknown, second, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete } = createClient({ env, libraries: [first, second] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized && !client.packageRefreshPromise, "initial inventory published");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "selectedExport"));
+  const server = instances[0];
+  const firstRoot = fs.realpathSync.native(first), secondRoot = fs.realpathSync.native(second);
+  const unknownRoot = fs.realpathSync.native(unknown);
+  // The loaded namespace comes from first. Omitting that unknown root must
+  // neither select the later copy nor treat this loaded package as removed.
+  for (const installations of [{ [pkg]: [path.join(secondRoot, pkg)] }, {}]) {
+    const result = await server.sendRequest("rConsole/refreshPackages", {
+      installations, libraryRoots: [firstRoot, secondRoot, ...defaults], unknownRoots: [firstRoot],
+      changed: [pkg], changedInstallationPaths: [path.join(secondRoot, pkg)],
+    });
+    assert.deepEqual(result.restart, []);
+    assert.ok(!result.changed.includes(pkg));
+  }
+  // A known valid earlier installation can still refresh ahead of the unknown root.
+  const earlier = await server.sendRequest("rConsole/refreshPackages", {
+    installations: { [pkg]: [path.join(firstRoot, pkg), path.join(secondRoot, pkg)] },
+    libraryRoots: [firstRoot, unknownRoot, secondRoot, ...defaults], unknownRoots: [unknownRoot],
+    changed: [pkg], changedInstallationPaths: [path.join(firstRoot, pkg)],
+    unmonitored: defaults.flatMap(directory => fs.readdirSync(directory)),
+  });
+  assert.ok(earlier.restart.includes(pkg));
+});
+
+test("whole-library lock covers initially absent loaded packages", { timeout: 90000 }, async t => {
+  const { first, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  install(first, "startupExport");
+  const env = { ...process.env, R_LIBS_USER: [first, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances } = createClient({ env, libraries: [first] });
+  const inventory = client.packageInventory;
+  const setPaths = inventory.setLibraryPaths.bind(inventory);
+  inventory.setLibraryPaths = () => {};
+  await client.start();
+  const lock = path.join(first, "00LOCK");
+  fs.mkdirSync(lock);
+  fs.rmSync(path.join(first, pkg), { recursive: true });
+  inventory.setLibraryPaths = setPaths;
+  setPaths([first, ...defaults]);
+  await waitFor(() => inventory.initialized && !client.packageRefreshPromise, "initial publication");
+  assert.equal(instances.length, 1, "an unobserved loaded package stays deferred under a whole-library lock");
+  fs.rmdirSync(lock);
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "lock release reconciles the absent package");
 });

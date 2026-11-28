@@ -145,6 +145,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       env: {
         ...options.env,
         VSC_R_BACKEND_SESSION_FILE: sessionFilePath,
+        VSC_R_BACKEND_SESSION_ID: sessionId,
         VSC_R_BACKEND_AUTH_TOKEN: authToken,
         VSC_R_BACKEND_INITIAL_CONNECT_GRACE_MS: String(INITIAL_CONNECT_GRACE_MS),
         VSC_R_BACKEND_RECONNECT_GRACE_MS: String(PERSISTENT_RECONNECT_GRACE_MS),
@@ -509,7 +510,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return undefined;
     }
     const state = this.sessionStates.get(session);
-    if (!state) {
+    if (!state || !state.hostConnected || state.capabilities.has("ephemeral-session")) {
       return undefined;
     }
     this.refreshReconnectInfo(state);
@@ -562,6 +563,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
         state.socketCarry = parsed.carry;
 
         if (parsed.error) {
+          socket.destroy();
           state.handlers?.onError?.(new Error(parsed.error));
           return;
         }

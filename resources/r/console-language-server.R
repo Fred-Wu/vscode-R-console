@@ -1,77 +1,12 @@
-# The first process discovers project configuration through normal R startup.
-# Replacements restore the startup environment and completion options with the
-# console's library order. Profiles and automatic package loading are disabled.
-runtime_lib_paths <- Sys.getenv("VSCR_RUNTIME_LIB_PATHS")
-startup_state <- Sys.getenv("VSCR_LSP_STARTUP_STATE")
-restore_startup <- nzchar(startup_state) && identical(Sys.getenv("VSCR_LSP_RESTORE_STARTUP"), "TRUE")
-startup_environment <- function() {
-    values <- Sys.getenv()
-    # Transport credentials and R's temporary directory belong to this process.
-    keys <- toupper(names(values))
-    values[!startsWith(keys, "VSCR_") & keys != "R_SESSION_TMPDIR"]
-}
-if (restore_startup) {
-    # Options remain serialized inside this namespace-free envelope: reading a
-    # function's namespace reference can load its package during deserialization.
-    startup <- readRDS(startup_state)
-    # Include profile-created values, empty values and explicit unsets before
-    # loading any packages that depend on the startup configuration.
-    Sys.unsetenv(setdiff(names(startup_environment()), names(startup$environment)))
-    do.call(Sys.setenv, as.list(startup$environment))
-    # .libPaths() always appends .Library, even with include.site = FALSE.
-    # Restore the effective profile-defined roots before selecting libraries or
-    # deserializing options. Preserve the base bindings' original lock state.
-    local({
-        roots <- startup$library_roots
-        for (name in c(".Library", ".Library.site")) {
-            if (!name %in% names(roots)) stop("Missing startup library root: ", name)
-            locked <- bindingIsLocked(name, baseenv())
-            if (locked) unlockBinding(name, baseenv())
-            tryCatch(assign(name, roots[[name]], envir = baseenv()),
-                finally = if (locked) lockBinding(name, baseenv()))
-        }
-    })
-}
-if (nzchar(runtime_lib_paths)) {
-    .libPaths(strsplit(runtime_lib_paths, "\n", fixed = TRUE)[[1L]], include.site = FALSE)
-}
-
-if (nzchar(startup_state)) {
-    if (restore_startup) {
-        # Namespace load hooks may need ordinary profile settings while the
-        # remaining option values are being deserialized.
-        options(startup$plain_options)
-        options(unserialize(startup$options))
-        for (package in rev(setdiff(startup$packages, "base"))) {
-            require(package, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
-        }
-    } else {
-        # Profile-defined options may be required by packages before they load.
-        # The snapshot can include sensitive values, so create it owner-only.
-        local({
-            # Only reference-free values can be read before library selection.
-            # Inspect attributes too: even an atomic option can carry a closure.
-            plain_option <- function(value) {
-                if (isS4(value)) return(FALSE)
-                type <- typeof(value)
-                if (!type %in% c("NULL", "logical", "integer", "double", "complex",
-                    "character", "raw", "list")) return(FALSE)
-                if (type == "list" && !all(vapply(unclass(value), plain_option, logical(1)))) return(FALSE)
-                all(vapply(attributes(value), plain_option, logical(1)))
-            }
-            startup_options <- options()
-            if (.Platform$OS.type == "unix") {
-                original_umask <- Sys.umask("077")
-                on.exit(Sys.umask(original_umask))
-            }
-            saveRDS(list(options = serialize(startup_options, NULL),
-                plain_options = Filter(plain_option, startup_options), packages = .packages(),
-                environment = startup_environment(),
-                library_roots = mget(c(".Library", ".Library.site"), envir = baseenv(),
-                    inherits = FALSE)), startup_state)
-            if (.Platform$OS.type == "unix") Sys.chmod(startup_state, mode = "0600")
-        })
-    }
+# Each process uses normal R startup and the active console library order.
+runtime_lib_count <- Sys.getenv("VSCR_LSP_LIBRARY_COUNT")
+if (nzchar(runtime_lib_count)) {
+    if (!grepl("^(0|[1-9][0-9]*)$", runtime_lib_count)) stop("Invalid library path count")
+    count <- suppressWarnings(as.integer(runtime_lib_count))
+    if (is.na(count)) stop("Invalid library path count")
+    runtime_lib_paths <- if (count) Sys.getenv(paste0("VSCR_LSP_LIBRARY_", seq_len(count) - 1L), unset = NA_character_) else character()
+    if (anyNA(runtime_lib_paths)) stop("Missing library path")
+    .libPaths(runtime_lib_paths, include.site = FALSE)
 }
 
 if (!requireNamespace("languageserver", quietly = TRUE)) {
@@ -239,26 +174,102 @@ server$request_handlers[["rConsole/syncSessionState"]] <- function(self, id, par
 server$request_handlers[["rConsole/libraryPaths"]] <- function(self, id, params) {
     self$deliver(languageserver:::Response$new(id, result = as.list(.libPaths())))
 }
+library_paths_changed <- FALSE
+server$request_handlers[["rConsole/syncLibraryPaths"]] <- function(self, id, params) {
+    previous <- .libPaths()
+    .libPaths(normalize_character(params$libraryPaths), include.site = FALSE)
+    # The client replaces this process when the effective order changes. The
+    # latest paths initialize fresh namespace caches.
+    # Keep the replacement requirement across retries if a reply is lost.
+    library_paths_changed <<- library_paths_changed || !identical(previous, .libPaths())
+    self$deliver(languageserver:::Response$new(id,
+        result = list(changed = library_paths_changed)))
+}
+pending_package_changes <- character()
 server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, params) {
     changed <- normalize_character(params$changed)
     loaded <- loadedNamespaces()
-    deferred <- normalizePath(normalize_character(params$deferred), winslash = "/", mustWork = FALSE)
+    unmonitored <- normalize_character(params$unmonitored)
+    unmonitored_roots <- chartr("\\", "/", normalize_character(params$unmonitoredRoots))
+    locked_roots <- chartr("\\", "/", normalize_character(params$lockedRoots))
+    unmonitored_roots <- union(unmonitored_roots, locked_roots)
+    unmonitored_installations <- chartr("\\", "/", normalize_character(params$unmonitoredInstallationPaths))
+    deferred <- chartr("\\", "/", normalize_character(params$deferred))
+    pending_package_changes <<- union(pending_package_changes,
+        chartr("\\", "/", normalize_character(params$changedInstallationPaths)))
+    changed_paths <- pending_package_changes
+    excluded <- union(unmonitored, basename(deferred))
+    excluded <- union(excluded, Filter(function(pkgname) {
+        dirname(chartr("\\", "/", getNamespaceInfo(pkgname, "path"))) %in% unmonitored_roots
+    }, setdiff(loaded, "base")))
+    selected_installations <- new.env(parent = emptyenv())
+    selected_installation <- function(pkgname) {
+        if (exists(pkgname, selected_installations, inherits = FALSE)) {
+            return(get(pkgname, selected_installations, inherits = FALSE))
+        }
+        candidates <- chartr("\\", "/", normalize_character(params$installations[[pkgname]]))
+        library_roots <- chartr("\\", "/", normalize_character(params$libraryRoots))
+        unknown_roots <- union(chartr("\\", "/", normalize_character(params$unknownRoots)), locked_roots)
+        unknown_position <- match(TRUE, library_roots %in% unknown_roots)
+        # An unobserved root occupies its search-order position for every name,
+        # including namespaces that have no entries in the observed inventory.
+        if (!is.na(unknown_position)) {
+            positions <- match(dirname(candidates), library_roots)
+            candidates <- candidates[!is.na(positions) & positions < unknown_position]
+        }
+        barriers <- which(candidates %in% unmonitored_installations |
+            dirname(candidates) %in% unmonitored_roots)
+        if (length(barriers)) candidates <- head(candidates, barriers[[1]] - 1L)
+        # The monitor observes entries only. R validates package metadata and
+        # chooses among the observed copies, including links to missing folders.
+        selected <- if (length(candidates)) {
+            find.package(pkgname, lib.loc = unique(dirname(candidates)), quiet = TRUE, verbose = FALSE)
+        } else character()
+        if (length(selected)) {
+            # R can return .Library using an alias. Canonicalize its parent
+            # while retaining a package link's own entry for change matching.
+            selected <- file.path(normalizePath(dirname(selected), winslash = "/", mustWork = FALSE), basename(selected))
+        }
+        # NULL means selection is unknown beyond an excluded copy. Preserve
+        # that boundary without opening or resolving its metadata or links.
+        if (!length(selected) && (length(barriers) || !is.na(unknown_position))) {
+            selected <- NULL
+            excluded <<- union(excluded, pkgname)
+        }
+        assign(pkgname, selected, selected_installations)
+        selected
+    }
+    changed_loaded <- character()
     switched <- Filter(function(pkgname) {
-        current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
+        # Excluded installations remain outside automatic reconciliation. Check
+        # names before resolving paths, which could traverse a package link.
+        if (pkgname %in% excluded) return(FALSE)
         # Initial discovery can encounter a package that was already loaded
         # while its installation is locked. Reconcile it after the lock clears.
+        current <- chartr("\\", "/", getNamespaceInfo(pkgname, "path"))
         if (current %in% deferred) return(FALSE)
-        installation <- params$installations[[pkgname]]
-        if (is.null(installation)) return(TRUE)
+        installation <- selected_installation(pkgname)
+        if (is.null(installation)) return(FALSE)
+        if (!length(installation)) return(TRUE)
+        if (installation %in% changed_paths) changed_loaded <<- union(changed_loaded, pkgname)
+        current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
         selected <- normalizePath(installation, winslash = "/", mustWork = FALSE)
         !identical(selected, current)
     }, setdiff(loaded, "base"))
-    restart <- union(intersect(changed, loaded), switched)
+    restart <- union(changed_loaded, switched)
     if (length(restart)) {
         # Removing metadata cannot replace functions or DLLs already loaded in R.
         return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))
     }
-    .libPaths(normalize_character(params$libraryPaths), include.site = FALSE)
+    # A valid later copy can change while the first observed link stays fixed.
+    changed <- union(changed, Filter(function(pkgname) {
+        if (pkgname %in% excluded) return(FALSE)
+        selected <- selected_installation(pkgname)
+        if (is.null(selected)) return(FALSE)
+        !length(selected) || selected %in% changed_paths
+    }, unique(basename(changed_paths))))
+    changed <- setdiff(changed, excluded)
+    changed <- Filter(function(pkgname) !is.null(selected_installation(pkgname)), changed)
     for (workspace in self$workspaces$values()) {
         affected <- changed
         if (length(changed) && is.function(workspace$s3_metadata$keys)) {
@@ -298,7 +309,10 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
             }
         }
     }
-    self$deliver(languageserver:::Response$new(id, result = list(restart = list())))
+    # Keep changes to excluded names until reconciliation resumes. A healthy
+    # later copy can change while an earlier library is suspended or unreadable.
+    pending_package_changes <<- changed_paths[basename(changed_paths) %in% excluded]
+    self$deliver(languageserver:::Response$new(id, result = list(restart = list(), changed = as.list(changed))))
 }
 server$notification_handlers[["textDocument/didClose"]] <- console_text_document_did_close
 

@@ -7,7 +7,7 @@ const CLOSE = "Close Old Session";
 const MESSAGE = "The R Console connection protocol has changed. Sessions started with an older version cannot reconnect. Close the old session and start a new R Console.";
 
 function label(entry: LegacyConsoleRecord): string {
-  return entry.terminalName || `R Console (${getPersistedRuntimePid(entry.terminal) ?? "unknown PID"})`;
+  return `R Console (${getPersistedRuntimePid(entry.terminal) ?? "unknown PID"})`;
 }
 
 function processDescription(entry: LegacyConsoleRecord): string {
@@ -37,21 +37,50 @@ export async function manageLegacySessions(
   const selected = entries.length === 1 ? entries : (await vscode.window.showQuickPick(
     entries.map((entry) => ({
       label: label(entry), description: processDescription(entry),
-      detail: `Saved startup directory: ${entry.terminal.options.cwd || "not recorded"}`,
       picked: true,
       entry,
     })), { placeHolder: "Select the old R Console sessions to close", canPickMany: true, ignoreFocusOut: true }
   ))?.map((item) => item.entry);
   if (!selected?.length) return;
 
-  for (const entry of selected) {
+  for (const entry of selected) await closeSelectedLegacySession(registry, entry);
+}
+
+const closing = new Map<string, Promise<void>>();
+const confirming = new Set<string>();
+
+async function closeSelectedLegacySession(registry: PersistentSessionRegistry, entry: LegacyConsoleRecord): Promise<void> {
+  const id = entry.terminal.runtime.sessionId;
+  const pending = closing.get(id);
+  if (pending) return pending;
+  const operation = (async () => {
     try {
       await closeLegacySession(entry);
-      if (!registry.forgetLegacySession(entry)) {
-        throw new Error("The process has stopped, but its saved record could not be removed.");
+      if (!await registry.forgetLegacySession(entry)) {
+        throw new Error("The process has stopped, but its saved shutdown credentials could not be removed.");
       }
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not close ${label(entry)}: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }
+  })();
+  closing.set(id, operation);
+  try { await operation; }
+  finally { closing.delete(id); }
+}
+
+/** A surviving old console view can request shutdown, never reattachment. */
+export async function closeLegacyConsoleView(registry: PersistentSessionRegistry, pid: number | undefined): Promise<void> {
+  if (pid === undefined) return;
+  const matches = registry.legacySessions.filter(entry => getPersistedRuntimePid(entry.terminal) === pid);
+  if (matches.length !== 1) return;
+  const entry = matches[0];
+  const id = entry.terminal.runtime.sessionId;
+  if (closing.has(id) || confirming.has(id)) return;
+  confirming.add(id);
+  try {
+    const action = await vscode.window.showWarningMessage(
+      `Close old ${label(entry)} permanently? This session cannot be reattached under the current protocol.`,
+      { modal: true }, CLOSE);
+    if (action === CLOSE) await closeSelectedLegacySession(registry, entry);
+  } finally { confirming.delete(id); }
 }

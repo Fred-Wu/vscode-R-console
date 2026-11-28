@@ -55,8 +55,8 @@ test("close selects the saved session regardless of editor focus without a secon
   assert.deepEqual(f.calls.filter(([kind]) => kind === "close" || kind === "forget"), [["close", f.old[1]], ["forget", f.old[1]]]);
   assert.equal(f.calls.filter(([kind]) => kind === "warning").length, 1);
   const items = f.calls.find(([kind]) => kind === "pick")[1];
-  assert.match(items[1].detail, /\/project-b/);
-  assert.doesNotMatch(items[1].detail, /unrelated-project/);
+  assert.equal(items[1].detail, undefined, "shutdown-only records need no startup directory");
+  assert.match(items[1].label, /^R Console \(\d+\)$/);
 });
 
 test("Cancel leaves the process and registry alone without opening a picker", async () => {
@@ -135,4 +135,41 @@ test("an authenticated older session gets the same one-time popup and close acti
   assert.equal(f.calls.filter(([kind]) => kind === "warning").length, 1);
   assert.deepEqual(f.calls.find(([kind]) => kind === "warning").slice(2), ["Close Old Session", "Cancel"]);
   assert.deepEqual(f.calls.filter(([kind]) => kind === "close" || kind === "forget"), [["close", old], ["forget", old]]);
+});
+
+test("declining upgrade then closing the old console view runs verified shutdown", async () => {
+  let close = false;
+  const f = fixture({ answer: () => close ? "Close Old Session" : "Cancel" });
+  f.registry.legacySessions = [f.old[0]];
+  await f.showLegacySessionNotice(f.state, f.registry);
+  assert.equal(f.calls.some(([kind]) => kind === "close"), false);
+  close = true;
+  await f.closeLegacyConsoleView(f.registry, f.old[0].terminal.runtime.pid);
+  assert.deepEqual(f.calls.filter(([kind]) => kind === "close" || kind === "forget"),
+    [["close", f.old[0]], ["forget", f.old[0]]]);
+  assert.match(f.calls.filter(([kind]) => kind === "warning").at(-1)[1], /cannot be reattached/);
+});
+
+test("closing an unknown or ambiguous old PID never sends shutdown", async () => {
+  const f = fixture({ answer: () => "Close Old Session" });
+  await f.closeLegacyConsoleView(f.registry, undefined);
+  await f.closeLegacyConsoleView(f.registry, f.old[0].terminal.runtime.pid + 1);
+  await f.closeLegacyConsoleView(f.registry, f.old[0].terminal.runtime.pid);
+  assert.equal(f.calls.some(([kind]) => kind === "close" || kind === "forget"), false);
+});
+
+test("cancelled manual close leaves old shutdown credentials intact", async () => {
+  const f = fixture({ answer: () => "Cancel" });
+  f.registry.legacySessions = [f.old[0]];
+  await f.closeLegacyConsoleView(f.registry, f.old[0].terminal.runtime.pid);
+  assert.equal(f.calls.some(([kind]) => kind === "close" || kind === "forget"), false);
+});
+
+test("failed manual shutdown retains credentials and reports error", async () => {
+  const f = fixture({ answer: () => "Close Old Session", failClose: true });
+  f.registry.legacySessions = [f.old[0]];
+  await f.closeLegacyConsoleView(f.registry, f.old[0].terminal.runtime.pid);
+  assert.equal(f.calls.filter(([kind]) => kind === "close").length, 1);
+  assert.equal(f.calls.some(([kind]) => kind === "forget"), false);
+  assert.ok(f.calls.some(([kind]) => kind === "error"));
 });

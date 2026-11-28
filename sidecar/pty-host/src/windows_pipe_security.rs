@@ -15,7 +15,7 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
-struct LocalAllocation(*mut c_void);
+pub(crate) struct LocalAllocation(pub(crate) *mut c_void);
 
 impl Drop for LocalAllocation {
     fn drop(&mut self) {
@@ -31,6 +31,19 @@ pub(crate) fn secure_session_pipe(name: &str) -> io::Result<()> {
     if suffix.len() != 12 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid R Console pipe name"));
     }
+    let descriptor = private_pipe_descriptor()?;
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        if SetFileSecurityW(name.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, descriptor.0) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Apply this descriptor at creation so no broadly accessible pipe instance exists.
+pub(crate) fn private_pipe_descriptor() -> io::Result<LocalAllocation> {
     unsafe {
         let mut token = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -63,12 +76,6 @@ pub(crate) fn secure_session_pipe(name: &str) -> io::Result<()> {
         ) == 0 {
             return Err(io::Error::last_os_error());
         }
-        let _descriptor = LocalAllocation(descriptor);
-        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        if SetFileSecurityW(name.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, descriptor) == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        Ok(LocalAllocation(descriptor))
     }
-    Ok(())
 }

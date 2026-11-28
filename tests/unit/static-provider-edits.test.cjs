@@ -11,6 +11,7 @@ const vscode = {
 const { InputState } = loadSource('src/Terminal/inputState.ts');
 const { RTerminal } = loadSource('src/Terminal/rTerminal.ts', { vscode, './rTerminal/lang': {} });
 const { provideNativeStaticCompletion } = loadSource('src/Language/completion/nativeStaticProvider.ts');
+const { STATIC_COMPLETION_REQUEST_TIMEOUT_MS } = loadSource('src/Language/completion/staticProvider.ts');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const pending = () => ({ status: 'pending', reason: 'analysis-pending' });
 const resolved = items => ({ status: 'resolved', completion: { items } });
@@ -98,7 +99,7 @@ test('symbol and argument pickers retry timed-out providers when search grows', 
     const h = await openStaticPicker(t, marked, async () => ++calls === 1
       ? new Promise(() => {})
       : resolved([{ label: 'column', insertText: 'column', role: 'symbol', kind: 5 }]));
-    t.mock.timers.tick(10000);
+    t.mock.timers.tick(STATIC_COMPLETION_REQUEST_TIMEOUT_MS);
     await tick();
     assert.ok(h.pick, marked);
     await h.type('colu');

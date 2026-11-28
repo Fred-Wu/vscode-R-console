@@ -28,8 +28,8 @@ test("console language server uses R startup and only the active console library
     path.join(__dirname, "../../resources/r/console-language-server.R"), "utf8"
   );
   assert.doesNotMatch(script, /VSCR_LIB_PATHS|VSCR_USE_RENV_LIB_PATH|renv::paths\$cache/);
-  assert.match(script, /VSCR_RUNTIME_LIB_PATHS/);
-  assert.match(script, /\.libPaths\(strsplit\(runtime_lib_paths/);
+  assert.match(script, /VSCR_LSP_LIBRARY_COUNT/);
+  assert.match(script, /\.libPaths\(runtime_lib_paths, include.site = FALSE\)/);
 });
 
 test("console R language server authenticates before entering the LSP event loop", () => {

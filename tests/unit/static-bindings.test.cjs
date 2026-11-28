@@ -4,17 +4,19 @@ const loadSource = require('../helpers/load-source.cjs');
 const { createGuardedBindingResolver } = loadSource('src/Language/completion/bindings.ts');
 const query = (name, lookup = 'function', extra = {}) => ({ name, lookup, ...extra });
 
-test('provider deadlines retain retryability and reject late candidates', async t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { requestStaticCompletion } = loadSource('src/Language/completion/staticProvider.ts');
+test('provider deadlines retain retryability and reject late candidates', async () => {
+  const { requestStaticCompletion, STATIC_COMPLETION_REQUEST_TIMEOUT_MS } =
+    loadSource('src/Language/completion/staticProvider.ts');
+  assert.equal(STATIC_COMPLETION_REQUEST_TIMEOUT_MS, 20_000);
   let finish, capability;
   const result = requestStaticCompletion({ provideStaticCompletion: request => {
     capability = request.bindings;
     return new Promise(resolve => { finish = resolve; });
   } }, { document: { version: 1, getText: () => 'co' }, input: 'co',
-    bindings: createGuardedBindingResolver() });
+    bindings: createGuardedBindingResolver() }, 15);
   await Promise.resolve();
-  t.mock.timers.tick(10000);
+  // Use a bounded real deadline; do not mock global timers or block the
+  // Node test runner if the production timeout changes again.
   const expired = await result;
   assert.equal(expired.staticStatus, 'pending');
   assert.equal(expired.isIncomplete, true);

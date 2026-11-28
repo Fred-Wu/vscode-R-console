@@ -299,16 +299,16 @@ The Rust host reads `VSC_R_BACKEND_SESSION_FILE`, binds a TCP listener on
 `127.0.0.1:0`, then writes JSON to the bootstrap file:
 
 ```json
-{"port":12345,"pid":67890,"protocolVersion":3}
+{"port":12345,"pid":67890,"protocolVersion":4}
 ```
 
-The TypeScript side polls that file, requires protocol version 3, reads the port and pid, then connects to
+The TypeScript side polls that file, requires protocol version 4, reads the port and pid, then connects to
 the loopback server. Before exchanging session traffic, both peers prove
 possession of the session secret using HMAC-SHA256 and fresh nonces. The
 authentication implementation is in
 [`src/Runtime/backendAuthentication.ts`](../src/Runtime/backendAuthentication.ts).
 
-The current backend uses protocol version 3, including library-path notifications.
+The current backend uses protocol version 4, including library-path notifications and encrypted persistence.
 Protocol 2 introduced authentication; v0.5.4 used version 1 without
 authentication. The extension also checks the live `backend-ready` version.
 This version is independent of vscode-R's `sess` integration protocol.
@@ -749,7 +749,7 @@ with the first read and bounds new and pending inspection. Settled snapshots rem
 available to prefix retries while the request is current. Cancellation, input
 changes, session changes and setting
 changes invalidate outstanding access and prevent late results from presentation.
-Provider completion has a 10-second deadline covering startup, dependency reads
+Provider completion has a 20-second deadline covering startup, dependency reads
 and the native completion response; capabilities expire when that invocation
 finishes. An expired deadline returns pending analysis with the `analysis-limit`
 reason. The request boundary also classifies provider exceptions, unavailable
@@ -1218,34 +1218,201 @@ r.useRenvLibPath settings. The embedded R host reads the fixed base `.libPaths()
 call at a completed main prompt, publishing a bounded,
 ordered snapshot only when the effective search order changes. The console's
 completion client gives that snapshot priority over the LSP's own startup paths
-and updates the package inventory and language-server library paths. A reconnect
-receives the last completed prompt snapshot without evaluating R on the socket
+and sends the ordered directory list over the authenticated LSP connection using
+`rConsole/syncLibraryPaths`. The server applies R's `.libPaths()` rules with
+`include.site = FALSE` and reports whether the effective order changed. A change
+refreshes the separate language-server process, initializing namespace and completion
+caches with the latest library order. The interactive R session retains its loaded
+packages. Each language-server launch performs normal R startup with the configured
+arguments and inherited launch environment. Project and user startup files apply
+to each new process, including changes made since the preceding launch.
+The ordered library snapshot is transferred in `VSCR_LSP_LIBRARY_COUNT` and
+numbered `VSCR_LSP_LIBRARY_0`, `VSCR_LSP_LIBRARY_1`, etc. environment variables.
+Each variable contains one complete path, preserving newlines, quotes and Unicode.
+Base R reads these variables before loading language-server packages. An absent
+count retains normal startup libraries; a zero count applies an empty supplied
+list through R's ordinary `.libPaths()` rules. Invalid or incomplete snapshots
+fail startup. Every launch discards inherited library transport variables.
+Concurrent changes share a synchronization queue that drains to the latest snapshot
+before completion proceeds. Failed synchronization retries with delays increasing
+from 1 second to 30 seconds, stopping on success or disposal. Synchronization also
+runs after startup, and unchanged snapshots reuse the existing server.
+Each synchronization attempt permits one server replacement. A further mismatch
+uses the same retry backoff, and completion requests cannot bypass that delay.
+
+A reconnect receives the last completed prompt snapshot without evaluating R on the socket
 thread. No library-path requests go through sess or the legacy session integration.
-Library removal, reordering, and restoration use the same package-inventory lifecycle.
-Unchanged libraries retain their filesystem and parent watchers and cached
-package inventories. Reordering avoids directory rescans; added paths are scanned
+Directory additions, removal and reordering reach the language server independently
+of filesystem inventory publication. Package installation, removal or update inside
+an unchanged directory remains an inventory event. Applying `.libPaths()` and loading
+packages still use R's ordinary filesystem access, including configured network paths.
+
+The package inventory receives the same ordered snapshot for its own monitoring.
+Unchanged libraries retain their directory watchers and cached package inventories.
+Reordering avoids directory rescans; added paths are scanned
 and removed paths are unwatched. An in-flight scan from the previous search order
 cannot suppress publication of the newer order.
 
-`PackageInventory` monitors library folders outside the R process. Folder
-events schedule a scan of the changed library after 250 ms. It reads package names,
-versions, resolved paths, and package-directory timestamps, reusing unchanged
-package records. Linked package directories and their target parents are also
-polled for replacement, removal, recreation and installation locks. Polling
-notifications are verified against installed package identities and known
-lock paths before a full scan. Directory timestamp touches reuse cached package
-records and remain quiet in the lifecycle log. Package
-symlink chains are followed hop by hop with cycle detection and a traversal
-limit. Each hop's parent remains monitored, and the final target's lock location
-is resolved even while the package is absent during installation. Named locks
-are checked against both the logical package name and its resolved directory
-name, which may differ for versioned external caches. External cache locks are
-inspected by their individual paths, requiring traversal permission on the cache
-parent. Scans use bounded asynchronous file operations. Named installation locks
-defer their package; a `00LOCK` directory defers the whole library. Deferred paths remain
-tracked while a lock is held, including packages absent from the initial
-inventory. Package identities and deferred paths must be stable across two
-scans before publication. Releasing a lock reconciles loaded namespaces even
+`PackageInventory` monitors the effective configured library directories and their
+immediate ordinary package directories outside the R process. Each directory receives
+a non-recursive `fs.watch()` subscription. The monitor opens no individual-file
+watches and descends no further than the package-directory level. The pinned library
+is validated immediately before and after each new watch registration. A changed pin
+stops further registrations and closes the newly created watch. Notifications from
+an immediate package directory trigger a package metadata check. Changes deeper
+inside a package remain outside monitoring scope. Folder
+events schedule a scan of the changed library after 250 ms; a notification-driven
+50 ms timer reconciles added, replaced and removed package-directory watches. Idle
+inventories have no periodic filesystem poller. Delivery of changes on a network
+filesystem depends on its support for filesystem notifications.
+
+Directory enumeration uses asynchronous `opendir`/`read` operations with a
+32-entry read-ahead buffer. Library discovery, change detection, watcher
+reconciliation and installation-lock backup discovery each retain at most 4,096
+entries per directory. Observing the 4,097th entry ends that enumeration and
+closes its handle. An oversized library or lock-backup directory suspends the
+library's inventory monitoring until reconfiguration, preserving its last verified
+package state. Each library also retains at most 4,096 distinct package names
+across current entries, lock backups and deferred records from earlier scans.
+Exceeding this combined budget suspends that library and preserves its last
+verified inventory. The lifecycle log identifies the directory or retained-record
+budget that exceeded the limit. Other libraries continue reconciliation.
+Pinned paths are validated with asynchronous, ordered `lstat` calls before and
+after opening and after batches of at most 32 entries. Each check stops at the
+first changed ancestor, without resolving its replacement. Enumeration reads only
+from its held directory handle and never follows child paths. Results are used
+only after the final validation succeeds. Cancellation is checked before and after
+each entry read and each ancestor lookup. Completion, cancellation and failures
+close the directory handle. A full 4,096-entry listing needs 131 path validations.
+
+Each library watcher serializes its asynchronous reconciliations. Notifications
+received during enumeration queue one follow-up reconciliation. Pausing evaluation
+invalidates in-flight results and retains that work for the next main prompt.
+Removal and disposal prevent pending enumerations from registering package watches.
+New and replacement package watches trigger a metadata check to include changes
+that occurred before registration completed.
+
+An active console evaluation holds package inventory publication and ordinary
+package-directory watcher reconciliation. Filesystem notifications accumulate
+dirty libraries while pinned-path validation and replacement warnings remain
+active. The next main prompt releases the hold and schedules one reconciliation
+of the accumulated installs, updates and removals. Busy reconnect snapshots and
+nested input retain the hold; intermediate `busy(false)` events retain it until
+the main prompt. Runtime exit releases the hold. In-flight scans are invalidated
+and their pending changes are replayed after evaluation. Failed-watch and metadata
+recovery budgets are preserved across the hold.
+
+One reconciliation publishes the final stable inventory and requests a single
+language-server replacement when loaded namespaces changed. Lock checks and the
+two-snapshot stability check remain part of reconciliation. Stability is confirmed
+independently for each library. Per-library event revisions cover scanning,
+publication preparation and the language-server request. Preparation revalidates
+the snapshot after client startup and session synchronization, excluding libraries
+that changed while retaining healthy updates. Immediately before initial and
+replacement-verification requests, the adapter asynchronously revalidates physical
+library pins. A changed root or ancestor suspends only that library. Each library
+has at most one pending publication pin check; completed background checks are
+consumed once while their pin, configuration and event revisions remain current.
+Reuse also checks the physical pin synchronously to detect silent replacement
+after the background check finished. An event during the request prevents
+committing that snapshot and requeues all uncommitted observations.
+Libraries scan independently, with at most one outstanding inventory scan per
+configured path. Each publication waits up to one second for newly started scans;
+pending reads retain their slot until the filesystem operation completes. Healthy
+libraries publish while pending libraries retain their verified state. Completed
+background scans trigger reconciliation and are reused if their configuration and
+event revisions remain current. Only completed observations participate in the
+two-scan stability confirmation. Pending scans preserve the previous candidate;
+filesystem events invalidate it immediately. Unsettled roots are temporarily
+excluded from reconciliation
+during sibling publication. Changes made outside the console's active evaluation
+use a 250 ms scan deadline; subsequent events preserve the earliest deadline.
+Lock presence
+is logged once per library until the lock clears. Initial library discovery logs
+its scan; confirmed package changes report their outcomes and updated counts.
+The search-order listing is emitted when library order changes.
+
+Configured paths define the monitoring roots, including network paths and explicitly
+configured directory aliases. When a path enters the effective library list,
+the console resolves it and pins the physical directory and every ordinary
+ancestor using stable filesystem identities. Initial resolution records each
+alias and its ordinary parent chain, including links reached through other
+links and links below an aliased directory. Capture follows at most 40 links.
+Targets are resolved component by component, retaining directories traversed
+before `..` as dependencies of the pin.
+Routine validation checks these recorded identities without resolving targets.
+Reordering the list preserves these pins. Removing a path releases its pin; readding the path
+establishes a new pin. Package installation and directory timestamp changes
+do not change the pin. R's original `.libPaths()` search order remains authoritative
+and is not changed by monitoring.
+
+A different physical identity at the same pathname, a symlink or junction
+replacement, a non-directory replacement, or a missing/renamed pinned library
+or ancestor suspends monitoring. A changed configured alias likewise suspends
+monitoring. An initially missing path has no physical identity to authorise
+and is not watched. Suspension closes the affected subscriptions, invalidates
+in-flight inventory work, and retains the last verified package information
+without automatically reconciling the suspended location. Normal R package
+loading and the interactive R session are unaffected.
+
+A lifecycle log and VS Code warning identify the specific affected component
+and reason. Shared ancestor changes group their warnings. "Stop Monitoring"
+or dismissal leaves monitoring suspended without resolving the replacement.
+"Review New Location" resolves a candidate for review, without registering
+watchers or scanning packages. A compact confirmation displays the previous
+pin, proposed physical location and reason. Only "Trust and Resume" authorises
+a new pin, after revalidating the candidate identities and current library
+configuration. A changed candidate requires another review and confirmation;
+a missing candidate can be checked again only on request. Rejection or
+dismissal leaves monitoring suspended. Removing and readding a library
+through the effective search order also establishes a fresh pin. The
+console does not search for moved directories or modify `.libPaths()`.
+
+Shared non-recursive parent-entry watchers cover the authorised physical
+ancestry and every recorded alias parent chain. Before registering or
+recovering a watcher, the console verifies the original pin; recovery never
+adopts a replacement directory. Initial pinning, relevant watcher events,
+watcher errors, scheduled retries and inventory scans validate identities.
+Temporary permission and I/O errors retain the original pin for recovery.
+An unavailable watcher does not authorise resolving the path again.
+
+A failed parent watcher has five automatic registration attempts at 1, 2, 4,
+8 and 16 seconds; one shared timer schedules pending failures. Each recovery
+revalidates the original pin. After five failures the timer stops, and
+subsequent relevant library or ancestor events can retry registration no
+more often than once every 10 seconds. Unrelated notifications do not retry.
+Healthy monitoring is event-driven; no periodic filesystem polling is
+introduced. Shared watcher errors validate all currently associated libraries,
+including those added after registration. Failures and restorations are logged
+once per transition.
+
+Scans inspect only filesystem metadata inside each pinned library. Ordinary package
+directories must contain an ordinary `Meta` directory and ordinary
+`Meta/package.rds` and `DESCRIPTION` files. Their names and local filesystem
+identities (including timestamps and sizes) establish an installation fingerprint;
+the monitor never opens, reads, parses or deserializes either file. R and
+languageserver own package validity, version interpretation and namespace loading.
+Installation identity changes, including same-version replacement and in-place
+metadata updates, invalidate completion metadata without version-specific logs.
+
+Package symlinks and junctions are tracked by the identity of the link entry
+itself. Their destinations are never resolved, inspected or watched by the
+monitor. The link entry changing can invalidate the selected installation;
+changing only its external destination contents is outside monitoring scope.
+Linked metadata components are excluded from inventory reconciliation.
+The pinned root and observed ordinary directory ancestors are revalidated around
+asynchronous metadata and lock inspections; a changed ancestor stops that
+inspection. Node's path-based filesystem operations cannot make validation
+atomic with every concurrent filesystem mutation. No package-file content is
+accessed, and no new physical library location is authorised automatically.
+
+Scans use bounded asynchronous file operations. Ordinary named installation locks
+defer their package; an ordinary `00LOCK` directory defers the whole library. Lock
+backup discovery checks directory components before descending, and linked lock
+entries are excluded. Deferred paths use logical and canonical library roots and
+remain tracked while a lock is held, including packages absent from the initial
+inventory. Package identities, exclusions and deferred paths must be stable across
+two scans before publication. Releasing a lock reconciles loaded namespaces even
 when the inventory contains the same package identities. Failed reconciliation
 keeps the release pending for retry.
 
@@ -1255,10 +1422,33 @@ monitoring is also retried; restoring it triggers a scan to catch changes missed
 while monitoring was unavailable. Recovery stops once successful or when the
 console closes. Healthy libraries continue to use the existing inventory.
 
-The first library containing a package selects its effective installation.
-Adding or removing a lower-priority copy updates the inventory and counts but
-preserves completion data. A new effective package updates the package-name
-list without restarting. A changed effective copy invalidates that package's
+The inventory records observed package entries in library order and reports
+changed physical entry paths for every monitored copy. The console-owned R
+adapter uses `find.package()` with the observed candidate libraries to validate
+metadata and select the effective installation. A link to a missing folder or
+an invalid earlier installation can leave a later valid copy selected. Updates
+to that later copy still invalidate its metadata and loaded namespace. Excluded
+and suspended installations retain their ordered positions as selection barriers.
+The R adapter validates monitored candidates preceding the first barrier. If none
+is valid, reconciliation of that name is deferred without opening or resolving the
+excluded installation. A library with no verified inventory supplies an ordered
+root barrier for every package name, including loaded namespaces absent from the
+observed inventory. Verified absence becomes available after a successful scan.
+Valid earlier copies continue to receive updates.
+Installation locks defer the affected package. Whole-library `00LOCK` state is
+published explicitly and participates in inventory signatures. Its root is a
+selection barrier for every package name, including a loaded namespace whose
+installation and backup directories were absent at initial discovery. Lock release
+publishes a new inventory even when no observed package identities changed.
+The R adapter retains changed entry paths for excluded names until reconciliation
+resumes or the process is replaced.
+Reusing an unchanged copy after a
+library-order refresh preserves the new server; replacing files in that copy
+still invalidates loaded namespaces. Inventory requests update package metadata;
+the dedicated library synchronization request owns the search order.
+With an unchanged library order, adding or removing a lower-priority copy updates
+the inventory and counts while preserving completion data. A newly installed
+package updates the package-name list without restarting. A changed effective copy invalidates that package's
 completion metadata and affected requests. `rConsole/refreshPackages` requests
 a restart only when a changed package is already loaded in the LSP process,
 or the loaded namespace comes from a different installation. Console-side
@@ -1266,28 +1456,35 @@ package scans and change checks run in response to folder events, not typing.
 
 Package and library changes share one restart promise. Startup and completion
 callers await the replacement process, and session synchronization applies the
-latest snapshot. The initial server saves its effective environment, base and site
-library roots, all startup options and attached package names in its private
-temporary directory. The
-options are serialized into a raw payload inside the snapshot, so reading the
-environment and package names cannot deserialize namespace references. Options
-containing only atomic values and lists with reference-free attributes are also
-saved as ordinary values for use by namespace load hooks. The
-snapshot can contain values set by user profiles, including credentials, so the
-temporary directory and snapshot have owner-only permissions on Unix; Windows
-uses the current user's temporary-directory access controls. Normal disposal
-removes the snapshot. A replacement
-starts with profiles, environment files and automatic default-package loading
-disabled. It restores environment values and unsets, then the effective `.Library`
-and `.Library.site` values before applying the console's library order with
-site-library inclusion disabled. It restores those ordinary options,
-then deserializes and restores all startup options and loads the startup packages.
-Transport credentials and R's process-specific temporary
-directory remain fresh. The client verifies namespace installations before publishing
-the inventory. A completion interrupted by replacement reopens its document
-and retries once on the replacement client. `languageserver` owns its completion
-metadata and rebuilds it after a restart. The console does not export or restore
-that metadata. The replacement receives a silent completion request to prepare
+latest library-path snapshot. Each child starts with the configured R executable,
+launch environment, arguments, and project working directory. R owns startup-file
+processing and package initialization. The console entry point applies the latest
+ordered library paths with site-library inclusion disabled before loading
+`languageserver`. The client's most recently reported server paths provide a
+fallback while live console library metadata is unavailable.
+
+The child uses its own R temporary directory and fresh LSP authentication settings.
+In TCP mode its stdin and stdout use the OS null device; stderr carries lifecycle
+messages, and the authenticated socket carries LSP traffic. In stdio mode stdin
+and stdout carry the LSP protocol. The isolated temporary LSP workspace remains
+available for native workspace initialization. R and `languageserver` own their
+package metadata caches and supported configuration.
+
+Reattachment launches a new language server and receives the persistent runtime's
+last completed library-path snapshot through the normal session protocol. The
+registry key broker serves only its session-lifetime encryption key. Its fixed
+request format and OS-protected endpoint enforce the registry-key protocol.
+
+The client verifies namespace installations before publishing the package
+inventory. A replacement whose startup configuration preloads a conflicting
+installation records a diagnostic and suspends its completion responses. Retrying
+an unchanged inventory verifies that process without repeatedly launching it.
+A changed installation or library order permits a new replacement; successful
+verification resumes completion. Correcting startup files and reopening the
+console also performs a fresh launch. A completion interrupted by replacement reopens its document and
+retries once on the replacement client. `languageserver` rebuilds its completion
+metadata after a restart.
+The replacement receives a silent completion request to prepare
 suggestions for the current input. Package changes invalidate stale displayed
 suggestions. Disposal closes library watchers and timers and stops the child
 process before removing its working directory. The `R Console Language Server`
@@ -1360,7 +1557,89 @@ Each record contains:
 - terminal location: panel or editor column
 
 The session manager uses these records to reconnect the backend and reconstruct
-its console UI.
+its console UI. Each record is encrypted separately with AES-256-GCM, a fresh
+96-bit nonce and a 128-bit authentication tag. The registry path, format version,
+session UUID and runtime PID form authenticated associated data. The cleartext
+JSON envelope contains only the format version, UUID, PID and encryption framing.
+Root metadata is included in each encrypted record. Replay, pending input, paths,
+terminal options and reconnect credentials are encrypted together.
+
+Each persistent Rust runtime creates a random 256-bit key before R starts and
+retains it in memory for that process's lifetime. The extension obtains a copy
+through a local key broker: a user-owned Unix socket in a verified mode-0700
+`.r-console` directory, or a Windows named pipe created with a
+protected user-only DACL and remote clients denied. Socket permissions are 0600.
+On macOS, the parent is the OS-provided per-user temporary directory obtained through
+`confstr` / `getconf DARWIN_USER_TEMP_DIR`. Linux first tries `/run/user/<uid>` and
+then the account database's home directory; other Unix systems use the account home.
+Each candidate and its ancestry are checked for ownership and protection against
+replacement by other users. Creation or socket-binding failures advance to the next
+candidate. The key reader checks the same protected locations, including the home
+location used by surviving runtimes. Existing unverified directories retain their
+permissions and contents. Unix socket
+names use the validated session UUID with its hyphens removed.
+On Linux, socket paths of 108 bytes or more use a short `/proc/self/fd/<fd>/<name>`
+alias while binding and connecting. Each operation holds an open descriptor to
+the verified private directory through completion. The socket remains inside
+the selected `.r-console` directory, and its canonical path supplies discovery
+and cleanup. Path lengths are measured in bytes, including multibyte home names.
+If the broker cannot start, the runtime advertises `ephemeral-session` and displays
+a persistence warning. R evaluation and authenticated console communication remain
+available. The frontend waits for capability negotiation before exporting reconnect
+credentials and excludes ephemeral sessions from persistence and detachment. Disposing
+their console closes the runtime; loss of the authenticated client starts a one-second
+shutdown grace period. Encryption keys and plaintext session records remain absent
+from disk.
+The broker returns its PID with
+the key; requests and replies have fixed lengths and bounded deadlines. The
+Windows client acknowledges receipt before the server disconnects the pipe.
+Windows key reads run through the bundled native helper, which holds the connected
+pipe while verifying `GetNamedPipeServerProcessId` against the expected runtime PID
+and comparing the server's process-token user SID with its own. It requests only
+identification-level pipe impersonation. The verified key reaches the extension
+through an anonymous stdout pipe with bounded output and a process timeout.
+
+The extension caches keys in memory while saving and clears its key buffers on
+disposal. Registry writes use exclusive mode-0600 temporary files followed by
+atomic replacement, check for intervening changes on disk, and serialize saves.
+Queued saves coalesce to the latest UI snapshot; deactivation awaits the final
+save before detaching. Encryption failures are isolated per session: healthy records
+are committed, and failed sessions retain their last saved ciphertext when available.
+A new session with an unavailable key remains pending for a later save. An incomplete
+save returns failure and reports the affected persistence limitation while preserving
+successful updates. Explicitly removed sessions are pruned; opaque records retained
+during loading remain available for retry. VS Code reloads retrieve keys from the surviving runtimes.
+R exit, crash or reboot ends the key lifetime and makes the associated encrypted
+replay unrecoverable. Session persistence requires a living runtime.
+
+Registry reads accept regular files up to 64 MiB and at most 256 session records.
+Encrypted session identities must be unique before any key retrieval or decryption.
+An ambiguous registry remains intact with saving disabled. Duplicate identities in
+an outgoing snapshot reject that save while preserving the existing file.
+Registry verification and replacement/deletion run under an exclusive OS file lock
+held by the bundled native helper. The helper acknowledges acquisition over stdout
+and holds the lock until its parent closes stdin. Acquisition fails promptly when
+another writer owns the lock. Conflicting snapshots retain the existing file;
+reloading the registry permits a subsequent save of the combined current records.
+The OS releases locks on process exit, including crashes. A stable empty `.lock`
+file remains beside a previously persisted registry; it contains no session data
+and is never unlinked during normal operation. A window that has never persisted
+sessions creates no storage or lock file.
+Reads stop at the byte limit even if a file grows after its initial size check.
+The same limits protect reads before replacement and newly encoded registry writes.
+An oversized or invalid registry remains intact, disables saving for that registry,
+and reports the problem while ordinary console creation remains available.
+Loading and saving process at most four records concurrently. Each operation admits
+new key requests for five seconds; already-started requests retain their transport
+timeouts (three seconds on Unix and 3.5 seconds for the Windows helper). Unread records
+retain their ciphertext, failed saves retain previous ciphertext where available,
+and disposal stops queued key requests. These limits apply before ciphertext authentication.
+
+Ctrl+L clears captured console output from the in-memory replay. The next
+successful registry save records that cleared replay, normally within the
+five-second heartbeat or during detach/deactivation. The current draft input
+and reconnect record remain available. Command history has its own storage
+and deletion command.
 
 ### 4.3 Registry Loading And Pruning
 
@@ -1374,9 +1653,26 @@ Records are validated individually before reconnecting. A record can reconnect o
 - its UI replay state is structurally valid
 - its recorded backend pid is either absent or still alive
 
-Dead authenticated records are pruned when the registry is saved. Incompatible
-records are retained alongside valid records; one invalid entry does not discard
-the whole registry. Unreadable or malformed registry files are not overwritten.
+Entries with dead runtime PIDs are pruned when the registry is saved. Each file
+holds the sessions for its workspace or folderless window. Removing one session
+preserves the remaining records; removing the last record deletes the file.
+Activation saves the pruned registry, cleaning up records left after a crash or
+reboot. An empty window keeps its registry absent. Live entries
+whose keys are temporarily unavailable or whose authentication fails retain their
+original ciphertext for retry; other sessions remain usable. Decrypted incompatible
+records are retained for authenticated shutdown only, not for reattachment.
+Unreadable or malformed registry files are preserved and saving is disabled.
+
+Plaintext registry files are never migrated or reattached. On protocol upgrade, the
+extension stores only the old session UUID, PID, port, protocol version, and
+authentication token in VS Code SecretStorage, scoped to the original registry
+location. It then deletes the obsolete plaintext registry even if the user
+declines immediate shutdown. If SecretStorage fails, the original plaintext file
+is preserved and new persistence is disabled to avoid losing the only shutdown
+credentials. A live plaintext record claiming the current or a newer protocol
+is likewise preserved rather than silently orphaned. An upgraded session creates
+a fresh encrypted registry; compatible sessions continue to reattach normally.
+The runtime key broker no longer implements plaintext migration or digest pinning.
 
 Records are recognized as older sessions when their protocol version is lower
 than the current version and their structure and credentials are valid. Records
@@ -1385,14 +1681,15 @@ protocol 1. This fallback applies only to those historical records. Activation s
 session, tracked in workspace state. The notice explains that the protocol has
 changed and old sessions must be closed and restarted. It offers only **Close Old
 Session** and **Cancel**. Clicking Close confirms shutdown, with a picker by PID
-and startup directory only when multiple old sessions exist. The picker supports
+only when multiple old sessions exist. The picker supports
 multiple selection with all old sessions preselected, including previously
 dismissed ones. Confirming closes the selected sessions; cancelling or clearing
-every selection closes none. A failure retains that session's record and does
+every selection closes none. A failure retains that session's shutdown credentials and does
 not prevent closing the other selected sessions. There is no details
-page or second confirmation. Cancel leaves the sessions untouched. The session
-manager also provides this close action. It does not depend on editor focus and
-does not create a new console.
+page or second confirmation. Cancel leaves the old R processes untouched, not the
+obsolete plaintext registry. The session manager also provides the authenticated
+close action after reload. Manually closing an identifiable surviving old
+console view offers confirmed shutdown; it cannot reattach the old session.
 
 `Runtime/legacySession.ts` implements this explicit cleanup path. It matches the
 saved PID and port to the session bootstrap file and checks the running backend:

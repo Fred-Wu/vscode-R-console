@@ -6,7 +6,7 @@ const { EventEmitter } = require("node:events");
 const { test } = require("node:test");
 const { RustSidecarRuntimeBackend } = require("../helpers/load-source.cjs")("src/Runtime/runtimeBackend.ts");
 
-for (const protocolVersion of [undefined, 1, 2, 4]) {
+for (const protocolVersion of [undefined, 1, 2, 3, 5]) {
   test(`rejects incompatible saved protocol ${protocolVersion} before connecting`, () => {
     const backend = new RustSidecarRuntimeBackend("unused");
     assert.throws(() => backend.reconnect({
@@ -34,11 +34,30 @@ function frame(kind, payload) {
   return Buffer.concat([header, payload]);
 }
 
-for (const protocolVersion of [1, 2, 3, 4]) {
+test("ephemeral sessions accept commands but never export reconnect credentials", async () => {
+  const backend = new RustSidecarRuntimeBackend("unused");
+  const session = backend.reconnect({ sessionId: "ephemeral", port: 12345,
+    pid: process.pid, protocolVersion: 4, authToken: "a".repeat(64) });
+  const socket = Object.assign(new EventEmitter(), {
+    destroyed: false, resume() {}, destroy() { this.destroyed = true; },
+  });
+  backend.connectSocketWithRetry = async () => socket;
+  backend.attach(session, {});
+  assert.equal(backend.getReconnectInfo(session), undefined, "wait for capability negotiation");
+  await new Promise(resolve => setImmediate(resolve));
+  const info = Buffer.concat([string("embedded-r-host"), u32(2), string("session-control"), string("ephemeral-session")]);
+  socket.emit("data", Buffer.concat([frame(1, Buffer.concat([u32(4), info])), frame(2, info)]));
+  assert.equal(backend.hasCapability(session, "ephemeral-session"), true);
+  assert.equal(backend.canUseSessionCommands(session), true);
+  assert.equal(backend.getReconnectInfo(session), undefined);
+  backend.detach(session);
+});
+
+for (const protocolVersion of [1, 2, 3, 4, 5]) {
   test(`validates live protocol ${protocolVersion} before enabling session commands`, async () => {
     const backend = new RustSidecarRuntimeBackend("unused");
     const session = backend.reconnect({
-      sessionId: "version-check", port: 12345, protocolVersion: 3, authToken: "a".repeat(64),
+      sessionId: "version-check", port: 12345, protocolVersion: 4, authToken: "a".repeat(64),
     });
     const socket = Object.assign(new EventEmitter(), {
       destroyed: false, resume() {}, destroy() { this.destroyed = true; },
@@ -54,10 +73,10 @@ for (const protocolVersion of [1, 2, 3, 4]) {
     socket.emit("data", greeting.subarray(0, 15));
     assert.equal(backend.canUseSessionCommands(session), false);
     socket.emit("data", greeting.subarray(15));
-    assert.equal(backend.canUseSessionCommands(session), protocolVersion === 3);
-    assert.equal(socket.destroyed, protocolVersion !== 3);
-    assert.equal(errors.length, protocolVersion === 3 ? 0 : 1);
-    assert.equal(controls.length, protocolVersion === 3 ? 2 : 0);
+    assert.equal(backend.canUseSessionCommands(session), protocolVersion === 4);
+    assert.equal(socket.destroyed, protocolVersion !== 4);
+    assert.equal(errors.length, protocolVersion === 4 ? 0 : 1);
+    assert.equal(controls.length, protocolVersion === 4 ? 2 : 0);
     backend.detach(session);
   });
 }

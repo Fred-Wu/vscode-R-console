@@ -4,10 +4,10 @@ const path = require("node:path");
 const { test } = require("node:test");
 const root = path.resolve(__dirname, "../..");
 
-test("Rust and TypeScript agree on authenticated protocol version 3", () => {
+test("Rust and TypeScript agree on authenticated protocol version 4", () => {
   const source = fs.readFileSync(path.join(root, "sidecar/pty-host/src/protocol.rs"), "utf8");
   const { BACKEND_PROTOCOL_VERSION } = require("../helpers/load-source.cjs")("src/Runtime/backendProtocol.ts");
-  assert.equal(BACKEND_PROTOCOL_VERSION, 3);
+  assert.equal(BACKEND_PROTOCOL_VERSION, 4);
   assert.equal(Number(/const PROTOCOL_VERSION: u32 = (\d+);/.exec(source)?.[1]), BACKEND_PROTOCOL_VERSION);
 });
 

@@ -7,11 +7,67 @@ const net = require("node:net");
 const { setTimeout: delay } = require("node:timers/promises");
 const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
+const { BACKEND_PROTOCOL_VERSION } = loadSource("src/Runtime/backendProtocol.ts");
 
-test("a future protocol upgrade closes a real authenticated protocol 3 session", { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
+test("a denied key broker leaves R usable, disables persistence, and exits on disconnect", {
+  skip: process.platform !== "darwin", timeout: 30000,
+}, async t => {
+  const childProcess = require("node:child_process");
+  const { sessionRegistryKeyEndpoints } = loadSource("src/Runtime/sessionRegistryKey.ts");
+  const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts", {
+    child_process: { ...childProcess, spawn: (file, args, options) => {
+      const [endpoint] = sessionRegistryKeyEndpoints({ sessionId: options.env.VSC_R_BACKEND_SESSION_ID, pid: process.pid });
+      // Deny only this session's socket creation; all R and authenticated IPC operations remain available.
+      const profile = `(version 1)(allow default)(deny file-write-create (literal ${JSON.stringify(endpoint)}))`;
+      return childProcess.spawn("/usr/bin/sandbox-exec", ["-p", profile, file, ...args], options);
+    } },
+  });
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-ephemeral-"));
+  const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"], { encoding: "utf8" }).trim();
+  const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(path.resolve(__dirname, "..")));
+  const handle = backend.start([path.join(rHome, "bin", "R"), "--vanilla", "--quiet"],
+    { cwd: directory, env: { ...process.env, R_HOME: rHome } });
+  let pid, ready = false, output = "", failure;
+  const notices = [];
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  t.after(async () => {
+    backend.close(handle);
+    backend.detach(handle);
+    if (pid && alive()) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  });
+  backend.attach(handle, {
+    onStdout: text => { output += text; },
+    onControl: event => {
+      if (event.type === "host-error") notices.push(event.message);
+      if (event.type === "prompt" || (event.type === "session-state" && event.wait.kind === "top-level")) ready = true;
+    },
+    onError: error => { failure = error; },
+  });
+  async function waitFor(check) {
+    const deadline = Date.now() + 10000;
+    while (!check()) {
+      if (failure) throw failure;
+      assert.ok(Date.now() < deadline, "ephemeral runtime must make progress");
+      await delay(20, undefined, { signal: t.signal });
+    }
+  }
+  await waitFor(() => ready);
+  pid = backend.getPid(handle);
+  assert.ok(pid);
+  assert.equal(backend.hasCapability(handle, "ephemeral-session"), true);
+  assert.equal(backend.getReconnectInfo(handle), undefined);
+  assert.match(notices.join("\n"), /Encrypted session persistence is unavailable/);
+  assert.equal(backend.sendSessionCommand(handle, { type: "submit", code: 'cat("EPHEMERAL_OK\\n")' }), true);
+  await waitFor(() => output.includes("EPHEMERAL_OK"));
+  backend.detach(handle);
+  await waitFor(() => !alive());
+});
+
+test(`a future protocol upgrade closes a real authenticated protocol ${BACKEND_PROTOCOL_VERSION} session`, { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {
-    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: 4 },
+    "./backendProtocol": { BACKEND_PROTOCOL_VERSION: BACKEND_PROTOCOL_VERSION + 1 },
   });
   const { closeLegacySession } = loadSource("src/Runtime/legacySession.ts", { "./persistentSessionRegistry": registry });
   const { session: savedSession } = require("./helpers/persistent-session.cjs");
@@ -45,7 +101,7 @@ test("a future protocol upgrade closes a real authenticated protocol 3 session",
     await delay(20, undefined, { signal: t.signal });
   }
   const runtime = backend.getReconnectInfo(handle);
-  assert.equal(runtime.protocolVersion, 3);
+  assert.equal(runtime.protocolVersion, BACKEND_PROTOCOL_VERSION);
   pid = runtime.pid;
   const entry = savedSession({ ...runtime, cwd: directory });
   assert.equal(registry.isLegacyConsoleRecord(entry), true);
@@ -161,9 +217,9 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   const bootstrap = path.join(os.tmpdir(), `r-console-session-${session.sessionId}.json`);
   const sessionData = JSON.parse(fs.readFileSync(bootstrap, "utf8"));
   assert.equal(sessionData.authToken, undefined, "bootstrap must never disclose backend credentials");
-  assert.equal(sessionData.protocolVersion, 3);
-  assert.equal(backend.getReconnectInfo(session).protocolVersion, 3);
-  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, 3);
+  assert.equal(sessionData.protocolVersion, BACKEND_PROTOCOL_VERSION);
+  assert.equal(backend.getReconnectInfo(session).protocolVersion, BACKEND_PROTOCOL_VERSION);
+  assert.equal(events.find(event => event.type === "backend-ready")?.protocolVersion, BACKEND_PROTOCOL_VERSION);
   assert.match(backend.getReconnectInfo(session).authToken, /^[0-9a-f]{64}$/);
   if (process.platform !== "win32") assert.equal(fs.statSync(bootstrap).mode & 0o777, 0o600);
   // Wrong and missing credentials must not replace the authenticated console.
@@ -301,11 +357,31 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   stage = "reconnect";
   const reconnect = backend.getReconnectInfo(session);
   assert.ok(reconnect);
+  const { PersistentSessionRegistry } = loadSource("src/Runtime/persistentSessionRegistry.ts");
+  const { session: savedSession } = require("./helpers/persistent-session.cjs");
+  const registryFile = path.join(dir, "persistent-sessions.json");
+  const { readSessionRegistryKey } = loadSource("src/Runtime/sessionRegistryKey.ts");
+  const keyReader = identity => readSessionRegistryKey(identity, binary);
+  const registry = new PersistentSessionRegistry(registryFile, keyReader);
+  assert.deepEqual(await registry.load(), []);
+  const saved = savedSession({ ...reconnect, cwd: dir });
+  saved.terminal.ui.replay.lines = [output];
+  saved.terminal.ui.inputText = "SENSITIVE_UNSUBMITTED_INPUT";
+  assert.equal(await registry.save([saved]), true);
+  registry.dispose();
+  const encrypted = fs.readFileSync(registryFile, "utf8");
+  for (const secret of [reconnect.authToken, "SENSITIVE_UNSUBMITTED_INPUT", "REPLY: 中文 café 🙂", dir]) {
+    assert.equal(encrypted.includes(secret), false, "session secrets must be encrypted on disk");
+  }
   backend.detach(session);
   assert.equal(alive(), true, "detach must preserve the R process");
+  const restoredRegistry = new PersistentSessionRegistry(registryFile, keyReader);
+  t.after(() => restoredRegistry.dispose());
+  const restoredRecords = await restoredRegistry.load();
+  assert.deepEqual(restoredRecords, [saved], "runtime memory key must recover the complete replay after reload");
   backend = new RustSidecarRuntimeBackend(binary);
   instrument(backend);
-  session = backend.reconnect(JSON.parse(JSON.stringify(reconnect)));
+  session = backend.reconnect(restoredRecords[0].terminal.runtime);
   events.length = 0;
   backend.attach(session, handlers);
   // The snapshot follows the session-state frame and can arrive in a separate
@@ -319,4 +395,10 @@ test("real R evaluates, handles nested input and interrupts, reconnects, and shu
   stage = "shutdown";
   backend.close(session);
   await waitFor(() => !alive(), "shutdown must terminate R");
+  restoredRegistry.dispose();
+  const endedRegistry = new PersistentSessionRegistry(registryFile, keyReader);
+  t.after(() => endedRegistry.dispose());
+  assert.deepEqual(await endedRegistry.load(), [], "ended R sessions have no replay to reattach");
+  assert.equal(await endedRegistry.save([]), true);
+  assert.equal(fs.existsSync(registryFile), false, "the last ended session must remove the registry file");
 });

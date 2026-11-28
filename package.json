@@ -220,7 +220,9 @@
   "scripts": {
     "audit:dependencies": "node scripts/audit-dependencies.js",
     "test": "node --test tests/unit/*.test.cjs",
-    "test:lsp": "node --test tests/static-delegation.test.cjs tests/static-provider.test.cjs tests/lsp-startup.test.cjs tests/lsp-integration.test.cjs tests/lsp-lifecycle.test.cjs",
+    "test:lsp": "npm run test:lsp:startup && npm run test:lsp:completion",
+    "test:lsp:startup": "node --test tests/lsp-startup.test.cjs tests/lsp-persistence.test.cjs",
+    "test:lsp:completion": "node --test tests/static-delegation.test.cjs tests/static-provider.test.cjs tests/lsp-integration.test.cjs tests/lsp-lifecycle.test.cjs",
     "test:extension-host": "vscode-test",
     "test:runtime": "node --test tests/runtime.test.cjs tests/runtime-members.test.cjs tests/submission-runtime.test.cjs tests/large-input-runtime.test.cjs",
     "test:package": "node --test tests/package.test.cjs",

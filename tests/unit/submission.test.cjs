@@ -6,6 +6,39 @@ const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, runtime 
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+for (const ephemeral of [false, true]) {
+  test(`disposing a ${ephemeral ? "temporary" : "persistent"} console handles its runtime lifetime`, async () => {
+    const { terminal } = createTerminal();
+    let closed = 0;
+    terminal.runtimeBackend.hasCapability = (_session, capability) => ephemeral && capability === "ephemeral-session";
+    terminal.forceClose = () => { closed++; return Promise.resolve(); };
+    terminal.releaseExtensionResources = () => Promise.resolve();
+    terminal.inlineThemeDisposables = [];
+    for (const name of ["writeEmitter", "closeEmitter", "nameEmitter", "pidEmitter"]) terminal[name] = { dispose() {} };
+    await terminal.dispose();
+    assert.equal(closed, ephemeral ? 1 : 0);
+  });
+}
+
+test("package batching follows main prompts and busy reconnects, including nested input", () => {
+  const { terminal } = createTerminal();
+  const control = event => runtime.handleRuntimeControl(terminal.runtimeHostAdapter, event);
+  control({ type: "busy", value: true });
+  assert.equal(terminal.lang.runtimeBusy, true);
+  control({ type: "busy", value: false });
+  assert.equal(terminal.lang.runtimeBusy, true, "intermediate busy(false) is not evaluation completion");
+  control({ type: "session-state", busy: false, wait: { kind: "nested", prompt: "Proceed?" } });
+  assert.equal(terminal.lang.runtimeBusy, true);
+  control({ type: "prompt", kind: "cont" });
+  assert.equal(terminal.lang.runtimeBusy, true);
+  control({ type: "prompt", kind: "main" });
+  assert.equal(terminal.lang.runtimeBusy, false);
+  control({ type: "session-state", busy: true, wait: { kind: "none" } });
+  assert.equal(terminal.lang.runtimeBusy, true, "reattaching during installation restores the batch hold");
+  control({ type: "session-state", busy: false, wait: { kind: "top-level", prompt: "main" } });
+  assert.equal(terminal.lang.runtimeBusy, false);
+});
+
 for (const source of ["# comment", "# first\n# second"]) {
   test(`comment-only console Enter restores the visible prompt: ${source}`, async t => {
     const { terminal, commands, history, screenLines } = createTerminalWithScreen(t);

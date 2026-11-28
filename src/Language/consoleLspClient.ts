@@ -34,6 +34,7 @@ import { createCompletionParams } from "./completion/protocol";
 import { backtickRName } from "./completion/rText";
 import { parseRuntimeMemberQuery } from "./completion/runtimeMembers";
 import { PackageInventory, type PackageInventoryChange } from "./packageInventory";
+import { LibraryMonitoringNotices } from "./libraryMonitoringNotice";
 import type { WorkspaceData } from "../Runtime/VSCR/types";
 import { workspaceStrings } from "../Runtime/VSCR/workspaceMetadata";
 import { lifecycleOutputChannel } from "./completion/outputChannel";
@@ -131,11 +132,15 @@ export class ConsoleLspClient implements CompletionProvider {
   private readonly packageInventory: PackageInventory;
   private runtimeLibraryPaths: string[] | undefined;
   private serverLibraryPaths: string[] | undefined;
+  private syncedLibraryPaths: { client: ConsoleLanguageClient; key: string } | undefined;
+  private libraryPathsSyncPromise: Promise<void> | undefined;
+  private libraryPathsRetry: NodeJS.Timeout | undefined;
+  private libraryPathsRetryDelay = 1000;
   private packageRefreshPromise: Promise<void> | undefined;
+  private failedPackageRefresh: { client: ConsoleLanguageClient; key: string; error: Error } | undefined;
   private packageRevision = 0;
   private runtimeRevision = 0;
   private restartPromise: Promise<void> | undefined;
-  private restoreStartup = false;
   private readonly plannedRestarts = new WeakMap<ChildProcess, string>();
 
   constructor(private readonly options: ConsoleLspClientOptions) {
@@ -144,32 +149,37 @@ export class ConsoleLspClient implements CompletionProvider {
     this.outputChannel = new SilentOutputChannel("R Console");
     // Keep the LSP workspace isolated from project indexing.
     this.workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-lsp-"));
-    // Startup state can contain profile-provided credentials. Restrict the
-    // directory before the language server can write its snapshot.
+    // Restrict the isolated workspace to this user.
     if (process.platform !== "win32") fs.chmodSync(this.workingDirectory, 0o700);
+    const libraryNotices = new LibraryMonitoringNotices((message, detail, actions) =>
+      detail === undefined
+        ? vscode.window.showWarningMessage(message, ...actions)
+        : vscode.window.showWarningMessage(message, { modal: true, detail }, ...actions));
     this.packageInventory = new PackageInventory(
       change => this.refreshPackages(change),
       message => lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] ${message}`),
+      review => libraryNotices.enqueue(review),
     );
   }
 
   async start(): Promise<void> {
     if (this.restartPromise) {
       await this.restartPromise;
-      return;
+    } else {
+      await this.startClient();
     }
-    await this.startClient();
+    await this.syncLibraryPaths();
   }
 
   private async startClient(): Promise<void> {
     if (this.disposed) {
       throw new Error("Cannot start a disposed console language server.");
     }
-    if (this.client?.isRunning()) {
-      return;
-    }
     if (this.startPromise) {
       await this.startPromise;
+      return;
+    }
+    if (this.client?.isRunning()) {
       return;
     }
     this.startPromise = (async () => {
@@ -282,6 +292,8 @@ export class ConsoleLspClient implements CompletionProvider {
     }
 
     this.disposed = true;
+    this.failedPackageRefresh = undefined;
+    clearTimeout(this.libraryPathsRetry);
     this.packageInventory.dispose();
     this.disposePromise = (async () => {
       while (!(await this.stop())) {
@@ -337,7 +349,7 @@ export class ConsoleLspClient implements CompletionProvider {
       if (signal?.aborted) return undefined;
       const revision = this.packageRevision;
       const client = await this.ensureClient();
-      if (!client || signal?.aborted) {
+      if (!client || signal?.aborted || this.failedPackageRefresh?.client === client) {
         return undefined;
       }
       try {
@@ -518,6 +530,7 @@ export class ConsoleLspClient implements CompletionProvider {
   // The R console owns this ordered list. It may change after startup without
   // any change to the language server's working directory or attached packages.
   updateRuntimeLibraryPaths(paths: string[]): void {
+    if (this.disposed) return;
     if (JSON.stringify(this.runtimeLibraryPaths) === JSON.stringify(paths)) return;
     const before = this.runtimeLibraryPaths ?? this.serverLibraryPaths ?? [];
     this.runtimeLibraryPaths = [...paths];
@@ -529,6 +542,7 @@ export class ConsoleLspClient implements CompletionProvider {
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Libraries] Removed from search order: ${library}`);
       }
       this.packageInventory.setLibraryPaths(paths);
+      this.scheduleLibraryPathsSync();
     }
   }
 
@@ -538,7 +552,72 @@ export class ConsoleLspClient implements CompletionProvider {
     this.runtimeRevision++;
     if (this.client?.isRunning() && this.serverLibraryPaths) {
       this.packageInventory.setLibraryPaths(this.serverLibraryPaths);
+      this.scheduleLibraryPathsSync();
     }
+  }
+
+  private scheduleLibraryPathsSync(): void {
+    clearTimeout(this.libraryPathsRetry);
+    this.libraryPathsRetry = undefined;
+    void this.syncLibraryPaths().catch(() => {});
+  }
+
+  // This queue depends only on the R snapshot and the authenticated LSP
+  // connection. Filesystem discovery can be slow, unavailable or disabled.
+  private syncLibraryPaths(): Promise<void> {
+    if (this.libraryPathsSyncPromise) return this.libraryPathsSyncPromise;
+    if (this.disposed || !(this.runtimeLibraryPaths ?? this.serverLibraryPaths)) return Promise.resolve();
+    if (this.libraryPathsRetry) return Promise.reject(new Error("Library synchronization is waiting for retry"));
+    const sync = (async () => {
+      await this.startPromise;
+      await this.restartPromise;
+      if (!this.disposed && !this.client?.isRunning()) await this.startClient();
+      let replaced = false;
+      while (!this.disposed && this.client?.isRunning()) {
+        const client = this.client;
+        const paths = this.runtimeLibraryPaths ?? this.serverLibraryPaths;
+        if (!paths) return;
+        const key = JSON.stringify(paths);
+        if (this.syncedLibraryPaths?.client === client && this.syncedLibraryPaths.key === key) break;
+        await this.closeCompletionDocuments(client);
+        this.preparedPackages = undefined;
+        const reply = await client.sendRequest<{ changed: boolean }>("rConsole/syncLibraryPaths", { libraryPaths: paths });
+        if (this.disposed) return;
+        if (this.client !== client) continue;
+        if (typeof reply?.changed !== "boolean") throw new Error("Invalid library synchronization response");
+        if (reply.changed) {
+          if (replaced) throw new Error("Library search order still differs after server replacement");
+          replaced = true;
+          // All namespace and metadata caches belong to the old library order.
+          // A fresh process also drops namespaces loaded by completion workers.
+          this.packageRevision++;
+          this.options.onPackagesChanged?.();
+          lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Libraries] Library search order synchronized; refreshing language server.`);
+          await this.restartClient(client, "library search order changed");
+        } else {
+          this.syncedLibraryPaths = { client, key };
+        }
+        // A newer snapshot may have arrived during the request or replacement.
+      }
+      clearTimeout(this.libraryPathsRetry);
+      this.libraryPathsRetry = undefined;
+      this.libraryPathsRetryDelay = 1000;
+    })().catch(error => {
+      if (!this.disposed && !this.libraryPathsRetry) {
+        lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Libraries] Library search order synchronization failed; retrying.`);
+        this.libraryPathsRetry = setTimeout(() => {
+          this.libraryPathsRetry = undefined;
+          this.scheduleLibraryPathsSync();
+        }, this.libraryPathsRetryDelay);
+        this.libraryPathsRetry.unref();
+        this.libraryPathsRetryDelay = Math.min(this.libraryPathsRetryDelay * 2, 30000);
+      }
+      throw error;
+    }).finally(() => {
+      if (this.libraryPathsSyncPromise === sync) this.libraryPathsSyncPromise = undefined;
+    });
+    this.libraryPathsSyncPromise = sync;
+    return sync;
   }
 
   updateInput(input: string): void {
@@ -548,6 +627,10 @@ export class ConsoleLspClient implements CompletionProvider {
   recordCompletion(input: string, start: number, selection: CompletionPickItem): void {
     this.inputDocument.update(input);
     this.inputDocument.selectFunction(start, selection.insertText, selection.packageName);
+  }
+
+  setRuntimeBusy(busy: boolean): void {
+    this.packageInventory.setRuntimeBusy(busy);
   }
 
   async syncSessionState(state: ConsoleLspSessionState): Promise<void> {
@@ -561,6 +644,7 @@ export class ConsoleLspClient implements CompletionProvider {
   }
 
   private async applySessionState(client: ConsoleLanguageClient): Promise<void> {
+    await this.syncLibraryPaths();
     if (!this.sessionState) {
       return;
     }
@@ -702,53 +786,107 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private async refreshPackages(change: PackageInventoryChange): Promise<void> {
     const refresh = (async () => {
+      change = await change.revalidate?.(false) ?? change;
       if (!change.isCurrent()) return;
       const previousClient = this.client;
       let client = await this.ensureClient();
       if (!client?.isRunning() || this.disposed) throw new Error("Language server is not running");
+      change = await change.revalidate?.(false) ?? change;
       if (!change.isCurrent()) return;
       await this.applySessionState(client);
-      if (this.client !== client) throw new Error("Language server changed during package refresh");
+      client = this.client;
+      if (!client?.isRunning() || this.disposed) throw new Error("Language server changed during package refresh");
+      change = await change.revalidate?.() ?? change;
       if (!change.isCurrent()) return;
-      if (change.changed.length) {
+      const hasChanges = change.changed.length > 0;
+      if (hasChanges) {
         this.packageRevision++;
         this.options.onPackagesChanged?.();
       }
-      const params = {
-        libraryPaths: change.libraries.map(library => library.path),
-        installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.path])),
-        deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
-        // A recovered server already loaded the current installations.
-        changed: client === previousClient ? change.changed : [],
+      const parameters = () => {
+        const installations: Record<string, string[]> = Object.create(null);
+        const unmonitoredInstallationPaths = new Set<string>();
+        for (const library of change.libraries) {
+          const names = new Set([...library.packages.keys(), ...(library.unmonitored ?? []),
+            ...(library.unavailablePackages?.keys() ?? [])]);
+          for (const name of names) {
+            const item = library.packages.get(name);
+            const target = item?.target ?? path.join(library.root ?? library.path, name);
+            const copies = installations[name] ??= [];
+            if (!copies.includes(target)) copies.push(target);
+            // Keep excluded copies in search order as barriers. R may validate
+            // earlier monitored copies, but must not select beyond a barrier.
+            if (library.suspended || library.unavailable || library.unmonitored?.has(name) ||
+                library.unavailablePackages?.has(name)) unmonitoredInstallationPaths.add(target);
+          }
+        }
+        return {
+          installations,
+          libraryRoots: change.libraries.map(library => library.root ?? library.path),
+          lockedRoots: change.libraries.filter(library => library.locked).map(library => library.root ?? library.path),
+          unknownRoots: change.libraries.filter(library => library.initializing && (library.suspended || library.unavailable))
+            .map(library => library.root ?? library.path),
+          unmonitoredInstallationPaths: [...unmonitoredInstallationPaths],
+          unmonitored: change.unmonitored ?? [],
+          unmonitoredRoots: change.unmonitoredRoots ?? [],
+          deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
+          // A recovered server already loaded the current installations.
+          changed: client === previousClient ? change.changed : [],
+          changedInstallationPaths: client === previousClient ? change.changedInstallationPaths ?? [] : [],
+        };
       };
-      const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
+      let params = parameters();
+      // A profile can preload a package from a library the console has since
+      // excluded. Retrying unchanged inventory must not relaunch that profile
+      // indefinitely or publish completions from the conflicting process.
+      const key = () => JSON.stringify([
+        change.libraries.map(library => library.path),
+        change.libraries.map(library => [...library.packages].map(([name, item]) => [name, item.target, item.identity])),
+        params.installations, params.libraryRoots, params.unknownRoots, params.lockedRoots, params.unmonitoredInstallationPaths, params.unmonitored, params.unmonitoredRoots, params.deferred,
+      ]);
+      let refreshKey = key();
+      const previousFailure = this.failedPackageRefresh;
+      const retryingConflict = previousFailure?.client === client && previousFailure.key === refreshKey;
+      if (retryingConflict) {
+        params.changed = [];
+        params.changedInstallationPaths = [];
+      }
+      const result = await client.sendRequest<{ restart: string[]; changed?: string[] }>("rConsole/refreshPackages", params);
       if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
       if (!change.isCurrent()) return;
+      if (!hasChanges && (result.restart.length || result.changed?.length)) {
+        this.packageRevision++;
+        this.options.onPackagesChanged?.();
+      }
       if (result.restart.length) {
-        if (!change.changed.length) {
-          this.packageRevision++;
-          this.options.onPackagesChanged?.();
-        }
+        if (retryingConflict) throw previousFailure.error;
         const reason = result.restart.map(name =>
           `${name} (${change.packages.has(name) ? "installation changed" : "removed"})`).join(", ");
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restarting language server: ${reason}; clearing packages loaded in the server.`);
-        this.restoreStartup = true;
         await this.restartClient(client, reason);
         client = this.client;
         if (this.disposed) return;
         if (!client?.isRunning()) throw new Error("Replacement language server is not running");
         await this.applySessionState(client);
+        change = await change.revalidate?.() ?? change;
         if (!change.isCurrent()) return;
-        const verified = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", { ...params, changed: [] });
+        params = parameters();
+        refreshKey = key();
+        const verified = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages",
+          { ...params, changed: [], changedInstallationPaths: [] });
         if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
         if (!change.isCurrent()) return;
         if (verified.restart.length) {
-          // Keep this inventory unpublished so recovery can retry the change.
-          throw new Error(`Replacement language server retained stale packages: ${verified.restart.join(", ")}`);
+          const error = new Error(`Replacement language server retained stale packages: ${verified.restart.join(", ")}. ` +
+            "Check packages loaded by R startup files and reopen the console after correcting the configuration.");
+          this.failedPackageRefresh = { client, key: refreshKey, error };
+          lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] ${error.message}`);
+          throw error;
         }
-      } else if (change.changed.length) {
+      } else if (hasChanges || result.changed?.length) {
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
       }
+      this.failedPackageRefresh = undefined;
       if (result.restart.length) {
         try {
           const projection = this.inputDocument.project(this.inputDocument.getText(),
@@ -784,6 +922,7 @@ export class ConsoleLspClient implements CompletionProvider {
     if (this.disposed) {
       return undefined;
     }
+    // Session metadata may arrive while the initial library query is in flight.
     if (this.client?.isRunning()) {
       return this.client;
     }
@@ -853,6 +992,7 @@ export class ConsoleLspClient implements CompletionProvider {
     const libraries = await client.sendRequest<string[]>("rConsole/libraryPaths", {});
     if (this.client === client && !this.disposed) {
       this.serverLibraryPaths = [...libraries];
+      this.syncedLibraryPaths = { client, key: JSON.stringify(libraries) };
       if (!this.syncedSessionStateKey) {
         this.packageInventory.setLibraryPaths(this.runtimeLibraryPaths ?? libraries);
       }
@@ -939,13 +1079,11 @@ export class ConsoleLspClient implements CompletionProvider {
             socket.destroy();
             return;
           }
+          const child = this.spawnedServer;
           settled = true;
           if (this.pendingSocketServer === server) this.pendingSocketServer = undefined;
-          const child = this.spawnedServer;
           socket.on("error", (error) => this.logServerError(error, child));
           server.close();
-          // Authentication leaves the socket paused, possibly with early LSP
-          // bytes buffered. Resume only after JSON-RPC installs its reader.
           const reader = new class extends StreamMessageReader {
             override listen(callback: DataCallback): vscode.Disposable {
               const subscription = super.listen(callback);
@@ -1010,9 +1148,7 @@ export class ConsoleLspClient implements CompletionProvider {
         }
         this.spawnedServer = child;
         this.forwardServerStderr(child);
-        child.once("spawn", () => {
-          this.logServerStarted();
-        });
+        child.once("spawn", () => this.logServerStarted());
         child.once("error", (error) => {
           if (settled) {
             this.logServerError(error);
@@ -1043,7 +1179,6 @@ export class ConsoleLspClient implements CompletionProvider {
     const userArgs = config.get<string[]>("lsp.args") ?? [];
     return [
       ...userArgs,
-      ...(this.restoreStartup ? ["--no-environ", "--no-site-file", "--no-init-file"] : []),
       "--silent",
       "--no-echo",
       "--no-save",
@@ -1098,18 +1233,21 @@ export class ConsoleLspClient implements CompletionProvider {
 
   private buildServerEnv(config: vscode.WorkspaceConfiguration): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...this.options.env };
+    // Each child gets fresh transport settings. Inherited settings must never
+    // redirect a stdio child to another process's socket or state transport.
+    for (const key of Object.keys(env)) {
+      if (key.toUpperCase().startsWith("VSCR_LSP_") || key.toUpperCase() === "VSCR_RUNTIME_LIB_PATHS") delete env[key];
+    }
     const lang = config.get<string>("lsp.lang") ?? "";
 
     // Keep languageserver's verbose tracing out of the lifecycle channel.
     env.VSCR_LSP_DEBUG = "FALSE";
-    // On a replacement server, apply the last console snapshot before loading namespaces.
-    env.VSCR_RUNTIME_LIB_PATHS = (this.runtimeLibraryPaths ??
-      (this.restoreStartup ? this.serverLibraryPaths : undefined))?.join("\n") ?? "";
-    env.VSCR_LSP_STARTUP_STATE = path.join(this.workingDirectory, "startup.rds");
-    env.VSCR_LSP_RESTORE_STARTUP = this.restoreStartup ? "TRUE" : "FALSE";
-    // The entry point restores the effective startup environment after R has
-    // started without profiles or automatic default-package loading.
-    if (this.restoreStartup) env.R_DEFAULT_PACKAGES = "NULL";
+    // Apply the latest console order before loading the language server.
+    const libraries = this.runtimeLibraryPaths ?? this.serverLibraryPaths;
+    if (libraries !== undefined) {
+      env.VSCR_LSP_LIBRARY_COUNT = String(libraries.length);
+      libraries.forEach((library, index) => { env[`VSCR_LSP_LIBRARY_${index}`] = library; });
+    }
     if (lang) {
       env.LANG = lang;
     } else if (!env.LANG) {
