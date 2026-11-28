@@ -97,22 +97,24 @@ test("inventory preserves effective copies across duplicate additions, removals 
   // notification. Wait for each observable publication before asserting state.
   logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await waitForLog("Active package copies unchanged");
+  await waitForLog("First library copies unchanged");
   assert.deepEqual(changes.at(-1).changed, []);
   logs.length = 0;
   install(second);
   await waitForLog("Added: example -");
   assert.deepEqual(changes.at(-1).changed, []);
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [path.join(second, "example")],
+    "R receives later-copy changes even when the first observed entry is unchanged");
 
   inventory.setLibraryPaths([second, first]);
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
-  assert.deepEqual(changes.at(-1).changedInstallations, [],
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [],
     "selecting an already observed copy does not replace that installation");
   assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
   logs.length = 0;
   fs.rmSync(path.join(second, "example"), { recursive: true });
-  await waitForLog("Using remaining copy: example -");
+  await waitForLog("Remaining library copy: example -");
   assert.equal(changes.at(-1).packages.get("example").path, path.join(first, "example"));
   logs.length = 0;
   fs.rmSync(path.join(first, "example"), { recursive: true });
@@ -277,7 +279,7 @@ test("inventory detects same-version package replacement from folder events", as
   await settle();
   assert.deepEqual(changes.at(-1).changed, ["example"]);
   assert.notEqual(changes.at(-1).packages.get("example").identity, identity);
-  assert.deepEqual(changes.at(-1).changedInstallations, ["example"],
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [path.join(library, "example")],
     "replacing files at the selected path must still invalidate a loaded namespace");
   assert.ok(logs.some(line => line.includes("Updated: example -")));
 });
@@ -351,7 +353,10 @@ test("a tracked higher-priority link selects its own entry rather than a lower-p
 });
 
 test("a failed refresh retries only dirty libraries and publishes the latest installation", async t => {
-  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t);
+  // This test owns notification timing. Native macOS events from fixture setup
+  // can otherwise rescan the second library after the initial idle check.
+  const control = controlledWatches();
+  const { libraries: [first, second], inventory, changes, logs, install, settle } = fixture(t, 0, { watch: control.watch });
   install(first);
   install(second);
   inventory.setLibraryPaths([first, second]);
@@ -367,6 +372,7 @@ test("a failed refresh retries only dirty libraries and publishes the latest ins
   };
   fs.rmSync(path.join(first, "example"), { recursive: true });
   install(first, "2.0");
+  control.handles.get(first).trigger("rename", "example");
   await failed;
   await inventory.pending;
   assert.equal(changes.at(-1), original, "retain the last successful inventory");
@@ -376,7 +382,8 @@ test("a failed refresh retries only dirty libraries and publishes the latest ins
   inventory.onChange = publish;
   fs.rmSync(path.join(first, "example"), { recursive: true });
   install(first, "3.0");
-  await settle();
+  control.handles.get(first).trigger("rename", "example");
+  await settle(() => changes.at(-1) !== original);
   assert.ok(matchesDescription(changes.at(-1).packages.get("example"), path.join(first, "example")));
   assert.equal(changes.at(-1).libraries[1], original.libraries[1], "reuse the unaffected library");
   assert.equal(inventory.retryDelay, 1000);
@@ -385,6 +392,30 @@ test("a failed refresh retries only dirty libraries and publishes the latest ins
   // A fresh filesystem event can now recover before the delayed retry fires.
   // Both paths must settle the inventory and cancel the backoff timer.
   assert.equal(logs.filter(line => line.includes("Recovery complete; retries stopped")).length, 1);
+});
+
+test("a later alias change suspends inventory until its full new path is approved", async t => {
+  const { root, libraries: [first, second], inventory, changes, install, reviews, settle } = fixture(t);
+  install(first); install(second, "2.0");
+  const parent = path.join(root, "parent"), alias = path.join(root, "alias");
+  fs.mkdirSync(parent);
+  const middle = path.join(parent, "library"), kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(first, middle, kind); fs.symlinkSync(parent, alias, kind);
+  const library = path.join(alias, "library");
+  inventory.setLibraryPaths([library]);
+  await settle();
+  const previous = changes.at(-1).packages.get("example");
+  fs.unlinkSync(middle); fs.symlinkSync(second, middle, kind);
+  await settle(() => inventory.suspended.has(library) && changes.at(-1).libraries[0].suspended);
+  assert.equal(reviews.length, 1);
+  assert.equal(reviews[0].entry, middle);
+  assert.equal(changes.at(-1).packages.get("example"), previous);
+  assert.equal(inventory.watchers.size, 0);
+  const proposal = reviews[0].review();
+  assert.equal(proposal.root, second);
+  assert.equal(inventory.watchers.size, 0, "review alone cannot start monitoring");
+  assert.equal(reviews[0].approve(proposal), true);
+  await settle(() => changes.at(-1).packages.get("example").target === path.join(second, "example"));
 });
 
 test("watcher recovery reconciles additions and removals made while watching was unavailable", async t => {
@@ -552,7 +583,11 @@ test("canonical spelling differences without a symlink are not logged as aliases
   const realpathSync = Object.assign((...args) => fs.realpathSync(...args), {
     native: (file, ...args) => file === configured ? physical[0] : fs.realpathSync.native(file, ...args),
   });
-  const { root, inventory, changes, logs, reviews, settle, entryWatches } = fixture(t, 0, { realpathSync });
+  const { root, inventory, changes, logs, reviews, settle, entryWatches } = fixture(t, 0, {
+    realpathSync,
+    // Model two spellings of the same directory, including its file identity.
+    lstatSync: (file, ...args) => fs.lstatSync(file === configured ? physical[0] : file, ...args),
+  });
   configured = path.join(root, "displayed-library");
   physical[0] = path.join(root, "canonical-library");
   fs.mkdirSync(configured);
@@ -800,8 +835,8 @@ test("removing and readding an entire runtime library closes and restores its wa
   await settle();
   assert.equal(inventory.watchers.has(first), false, "removed libraries must stop being watched");
   assert.equal(changes.at(-1).packages.get("example").path, path.join(second, "example"));
-  assert.ok(logs.some(line => line.includes("Selected copy changed") ||
-    line.includes("Using remaining copy")));
+  assert.ok(logs.some(line => line.includes("First library copy changed") ||
+    line.includes("Remaining library copy")));
 
   inventory.setLibraryPaths([first, second]);
   await settle();
@@ -1568,14 +1603,14 @@ test("a previously readable package retains its verified metadata while healthy 
   assert.deepEqual(degraded.unmonitored, ["broken"]);
   assert.deepEqual(degraded.unmonitoredRoots, []);
   assert.deepEqual(degraded.changed, ["healthy"]);
-  assert.deepEqual(degraded.changedInstallations, ["healthy"]);
+  assert.deepEqual(degraded.changedInstallationPaths, [healthy]);
   assert.ok(!logs.some(line => line.includes("Removed: broken")));
 
   fail = false;
   // Let the real recovery timer fire without any new filesystem event.
   await settle(() => matchesDescription(changes.at(-1)?.packages.get("broken"), broken));
   assert.deepEqual(changes.at(-1).changed, ["broken"]);
-  assert.deepEqual(changes.at(-1).changedInstallations, ["broken"]);
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [broken]);
   assert.deepEqual(changes.at(-1).unmonitored, []);
   assert.equal(changes.at(-1).libraries[0].deferred.size, 0);
   assert.equal(inventory.packageReadRetries.size, 0);
@@ -1630,6 +1665,12 @@ test("an unreadable higher-priority package remains excluded through installatio
   inventory.setLibraryPaths([first, second]);
   await waitForInventoryPublication(inventory);
   assert.deepEqual(changes.at(-1).unmonitored, ["example"]);
+  install(second, "3.0");
+  control.handles.get(fallback).trigger("change", "DESCRIPTION");
+  await waitForInventoryPublication(inventory, () =>
+    matchesDescription(changes.at(-1).libraries[1].packages.get("example"), fallback));
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [fallback],
+    "retain a healthy copy's update while reconciliation of its name is excluded");
   const lock = path.join(first, "00LOCK-example");
   fs.mkdirSync(lock);
   fs.rmSync(broken, { recursive: true });
@@ -1645,7 +1686,7 @@ test("an unreadable higher-priority package remains excluded through installatio
   control.handles.get(first).trigger("rename", "00LOCK-example");
   await settle(() => changes.at(-1)?.packages.get("example")?.path === fallback);
   assert.deepEqual(changes.at(-1).unmonitored, []);
-  assert.deepEqual(changes.at(-1).changedInstallations, [], "the known lower-priority copy itself did not change");
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [], "the known lower-priority copy itself did not change");
   assert.equal(inventory.packageReadRetries.size, 0);
 });
 
@@ -1802,6 +1843,6 @@ test("inventory publishes metadata-only changes without opening package files", 
   await settle(() => matchesDescription(changes.at(-1).packages.get("example"), directory));
   assert.notEqual(changes.at(-1).packages.get("example").identity, before.identity);
   assert.deepEqual(changes.at(-1).changed, ["example"]);
-  assert.deepEqual(changes.at(-1).changedInstallations, ["example"]);
+  assert.deepEqual(changes.at(-1).changedInstallationPaths, [directory]);
   assert.deepEqual(forbidden, []);
 });

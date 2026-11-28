@@ -3,7 +3,7 @@ import * as path from "path";
 
 type EntryState = "directory" | "link" | "missing" | "other";
 type PinEntry = { path: string; state: "directory" | "link"; identity: string };
-export type LibraryPin = { root: string; physical: PinEntry[]; configured: PinEntry[] };
+export type LibraryPin = { root: string; physical: PinEntry[]; configured: PinEntry[][] };
 export type LibraryPinChange = {
   entry: string;
   kind: "physical" | "configured";
@@ -15,16 +15,6 @@ export class LibraryPinChanged extends Error {
   constructor(readonly change: LibraryPinChange) {
     super(`Library path entry changed: ${change.entry}`);
   }
-}
-
-function components(target: string): string[] {
-  let current = path.parse(target).root;
-  const entries = [current];
-  for (const name of target.slice(current.length).split(path.sep).filter(Boolean)) {
-    current = path.join(current, name);
-    entries.push(current);
-  }
-  return entries;
 }
 
 /** Stable directory/link identity, shared with parent watcher registration. */
@@ -53,18 +43,28 @@ function entryAt(entry: string): { state: EntryState; identity: string } {
   }
 }
 
-function capturePath(target: string, kind: LibraryPinChange["kind"]): PinEntry[] {
+function capturePath(target: string, kind: LibraryPinChange["kind"]):
+  { entries: PinEntry[]; remaining: string[]; parent: boolean } {
   const entries: PinEntry[] = [];
-  for (const entry of components(target)) {
+  const root = path.parse(target).root;
+  const names = [root, ...target.slice(root.length).split(process.platform === "win32" ? /[\\/]/ : /\//).filter(Boolean)];
+  let entry = root;
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    if (index > 0 && name === ".") continue;
+    // Record the directory traversed before '..': replacing it with a link
+    // can change the destination even when the final physical root survives.
+    if (index > 0 && name === "..") return { entries, remaining: names.slice(index + 1), parent: true };
+    if (index > 0) entry = path.join(entry, name);
     const { state, identity } = entryAt(entry);
     if (state !== "directory" && !(kind === "configured" && state === "link")) {
       throw new LibraryPinChanged({ entry, kind, state });
     }
     entries.push({ path: entry, state, identity });
-    // Track the configured alias entry, not the path through a link.
-    if (state === "link") break;
+    // A link's target gets a separate rooted chain.
+    if (state === "link") return { entries, remaining: names.slice(index + 1), parent: false };
   }
-  return entries;
+  return { entries, remaining: [], parent: false };
 }
 
 function checkEntries(entries: PinEntry[], kind: LibraryPinChange["kind"]): LibraryPinChange | undefined {
@@ -79,20 +79,57 @@ function checkEntries(entries: PinEntry[], kind: LibraryPinChange["kind"]): Libr
 
 /** Resolve only on initial configuration or an explicit user review. */
 export function captureLibraryPin(library: string): LibraryPin {
-  const configured = path.resolve(library);
-  const entries = capturePath(configured, "configured");
-  const root = path.resolve(fs.realpathSync.native(configured));
-  const physical = capturePath(root, "physical");
+  const configured: PinEntry[][] = [];
+  const initial = path.resolve(library);
+  let target = initial;
+  let links = 0;
+  let entries: PinEntry[];
+  for (;;) {
+    // Only initial configuration or explicit review may follow these links.
+    for (const chain of configured) {
+      const changed = checkEntries(chain, "configured");
+      if (changed) throw new LibraryPinChanged(changed);
+    }
+    const captured = capturePath(target, "configured");
+    entries = captured.entries;
+    const last = entries[entries.length - 1];
+    if (captured.parent) {
+      configured.push(entries);
+      target = [path.dirname(last.path), ...captured.remaining].join(path.sep);
+      continue;
+    }
+    if (last.state !== "link") break;
+    if (++links > 40) throw new Error("Library alias chain exceeds 40 links");
+    configured.push(entries);
+    const destination = fs.readlinkSync(last.path);
+    // Preserve target components until their links have been resolved. Joining
+    // or resolving the whole string would collapse '..' before following links.
+    const next = path.isAbsolute(destination) ? destination : path.dirname(last.path) + path.sep + destination;
+    target = [next, ...captured.remaining].join(path.sep);
+  }
+  const root = path.resolve(fs.realpathSync.native(initial));
+  const physical = capturePath(root, "physical").entries;
+  // Canonical spelling may differ, but resolution must reach the same object.
+  if (entries[entries.length - 1].identity !== physical[physical.length - 1].identity) {
+    throw new Error("Library alias resolution changed during pinning");
+  }
   // Do not accept a path that changed during the resolution itself.
-  const changed = checkEntries(entries, "configured") ?? checkEntries(physical, "physical");
+  const pin = { root, physical, configured };
+  const changed = checkLibraryPin(pin);
   if (changed) throw new LibraryPinChanged(changed);
-  return { root, physical, configured: configured === root ? [] : entries };
+  return pin;
 }
 
 /** Validate from the filesystem root, stopping at the first mismatch. Never
  * resolve a changed path or inspect anything below a replaced component. */
 export function checkLibraryPin(pin: LibraryPin): LibraryPinChange | undefined {
-  return checkEntries(pin.physical, "physical") ?? checkEntries(pin.configured, "configured");
+  const physical = checkEntries(pin.physical, "physical");
+  if (physical) return physical;
+  for (const chain of pin.configured) {
+    const changed = checkEntries(chain, "configured");
+    if (changed) return changed;
+  }
+  return undefined;
 }
 
 export function sameLibraryPin(a: LibraryPin, b: LibraryPin): boolean {

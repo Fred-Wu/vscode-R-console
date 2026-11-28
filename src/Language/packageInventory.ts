@@ -40,9 +40,8 @@ export type PackageInventoryChange = {
   changed: string[];
   unmonitored?: string[];
   unmonitoredRoots?: string[];
-  // Selection changes can reuse an installation already observed unchanged.
-  // Only content changes require reloading a namespace at the same path.
-  changedInstallations?: string[];
+  // Include every observed copy: R can skip an invalid higher-priority entry.
+  changedInstallationPaths?: string[];
   isCurrent: () => boolean;
 };
 
@@ -146,7 +145,7 @@ export class PackageInventory {
     this.revision++;
     this.candidate = undefined;
     this.dirtyLibraries.add(library);
-    this.log(pin.configured.some(entry => entry.state === "link")
+    this.log(pin.configured.length
       ? `[Libraries] Library alias: ${library} -> ${pin.root}`
       : `[Libraries] Pinned library: ${pin.root}`);
     this.entryMonitor.add(library, pin);
@@ -665,17 +664,22 @@ export class PackageInventory {
     }
     const changed = [...new Set([...this.packages.keys(), ...packages.keys()])].filter(name =>
       !unmonitored.has(name) && this.packages.get(name)?.identity !== packages.get(name)?.identity);
-    const changedInstallations = changed.filter(name => {
-      const selected = packages.get(name);
-      if (!selected) return true;
-      const previous = this.libraries.map(library => library.packages.get(name))
-        .find(item => item?.path === selected.path);
-      return previous?.identity !== selected.identity;
-    });
+    const changedInstallationPaths = new Set<string>();
+    for (const library of libraries) {
+      if (library.suspended || library.unavailable) continue;
+      const previous = this.libraries.find(item => item.path === library.path);
+      for (const name of new Set([...previous?.packages.keys() ?? [], ...library.packages.keys()])) {
+        if (library.deferred?.has(name) || library.unmonitored?.has(name)) continue;
+        const before = previous?.packages.get(name), after = library.packages.get(name);
+        if (before?.identity === after?.identity) continue;
+        if (before) changedInstallationPaths.add(before.target);
+        if (after) changedInstallationPaths.add(after.target);
+      }
+    }
     const unmonitoredRoots = libraries.filter(library => library.suspended || library.unavailable)
       .flatMap(library => [library.path, this.rootFor(library.path)]);
     await this.onChange({ libraries, packages, unmonitored: [...unmonitored], unmonitoredRoots, changed: this.initialized ? changed : [],
-      changedInstallations: this.initialized ? changedInstallations : [],
+      changedInstallationPaths: this.initialized ? [...changedInstallationPaths] : [],
       isCurrent: () => !this.disposed && revision === this.revision });
     if (this.disposed || revision !== this.revision) return;
 
@@ -707,7 +711,7 @@ export class PackageInventory {
             this.log(`[Packages] Removed copy: ${name} - ${item.path}`);
             const active = packages.get(name);
             if (active && active.identity === this.packages.get(name)?.identity) {
-              this.log(`[Packages] Active copy unchanged: ${name} - ${active.path}`);
+              this.log(`[Packages] Earlier library copy unchanged: ${name} - ${active.path}`);
             }
           }
         }
@@ -728,10 +732,10 @@ export class PackageInventory {
         if (!next) this.log(`[Packages] Removed: ${name} - no copies remain in active libraries`);
         else if (next.path !== old.path) {
           const retained = libraries.some(library => library.packages.get(name)?.path === old.path);
-          this.log(`[Packages] ${retained ? "Selected copy changed" : "Using remaining copy"}: ${name} - ${next.path}`);
+          this.log(`[Packages] ${retained ? "First library copy changed" : "Remaining library copy"}: ${name} - ${next.path}`);
         }
       }
-      if (!changed.length) this.log("[Completion] Active package copies unchanged; language server retained");
+      if (!changed.length) this.log("[Libraries] First library copies unchanged");
     }
     this.log("[Libraries] Search order:");
     libraries.forEach((library, index) => this.log(

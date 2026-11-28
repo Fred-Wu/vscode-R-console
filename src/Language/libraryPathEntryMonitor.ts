@@ -157,9 +157,9 @@ export class LibraryPathEntryMonitor {
     const verified = new Set([...this.roots.keys()].filter(library => this.validate(library)));
     const wanted = new Map<string, Entries>();
     for (const [library, pin] of this.roots) {
-      for (const chain of [pin.physical, pin.configured]) {
-        // The pin already ends at the first configured link and contains only
-        // ordinary physical ancestors. Never walk a newly discovered path.
+      for (const chain of [pin.physical, ...pin.configured]) {
+        // Each recorded chain has ordinary parents and can end at an alias.
+        // Never walk a newly discovered path.
         if (chain.length - 1 > MAX_PATH_COMPONENTS) {
           this.log(`[Libraries] Limited root-entry monitoring: ${library} - path depth exceeds ${MAX_PATH_COMPONENTS}`);
           continue;

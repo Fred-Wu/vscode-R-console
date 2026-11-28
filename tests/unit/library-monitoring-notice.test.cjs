@@ -149,7 +149,7 @@ test("an ordinary replacement suspends before warning and resumes only after a r
   assert.equal(f.reviews[0].approve(proposal), true);
   await f.settle(() => matchesInstallation(f.changes.at(-1).packages.get("example"), path.join(library, "example")));
   assert.notEqual(f.changes.at(-1).packages.get("example").identity, oldInstallation.identity);
-  assert.deepEqual(f.changes.at(-1).changedInstallations, ["example"]);
+  assert.deepEqual(f.changes.at(-1).changedInstallationPaths, [path.join(library, "example")]);
   assert.equal(f.reviews[0].isCurrent(), false);
   assert.deepEqual(f.changes.at(-1).unmonitored, []);
   assert.equal(f.inventory.watchers.has(library), true);

@@ -749,7 +749,7 @@ with the first read and bounds new and pending inspection. Settled snapshots rem
 available to prefix retries while the request is current. Cancellation, input
 changes, session changes and setting
 changes invalidate outstanding access and prevent late results from presentation.
-Provider completion has a 10-second deadline covering startup, dependency reads
+Provider completion has a 20-second deadline covering startup, dependency reads
 and the native completion response; capabilities expire when that invocation
 finishes. An expired deadline returns pending analysis with the `analysis-limit`
 reason. The request boundary also classifies provider exceptions, unavailable
@@ -1258,9 +1258,13 @@ filesystem depends on its support for filesystem notifications.
 Configured paths define the monitoring roots, including network paths and explicitly
 configured directory aliases. When a path enters the effective library list,
 the console resolves it and pins the physical directory and every ordinary
-ancestor using stable filesystem identities. Configured alias entries are
-also recorded without following changes to their targets. Reordering the list
-preserves these pins. Removing a path releases its pin; readding the path
+ancestor using stable filesystem identities. Initial resolution records each
+alias and its ordinary parent chain, including links reached through other
+links and links below an aliased directory. Capture follows at most 40 links.
+Targets are resolved component by component, retaining directories traversed
+before `..` as dependencies of the pin.
+Routine validation checks these recorded identities without resolving targets.
+Reordering the list preserves these pins. Removing a path releases its pin; readding the path
 establishes a new pin. Package installation and directory timestamp changes
 do not change the pin. R's original `.libPaths()` search order remains authoritative
 and is not changed by monitoring.
@@ -1288,7 +1292,7 @@ through the effective search order also establishes a fresh pin. The
 console does not search for moved directories or modify `.libPaths()`.
 
 Shared non-recursive parent-entry watchers cover the authorised physical
-ancestry and ordinary configured alias ancestors. Before registering or
+ancestry and every recorded alias parent chain. Before registering or
 recovering a watcher, the console verifies the original pin; recovery never
 adopts a replacement directory. Initial pinning, relevant watcher events,
 watcher errors, scheduled retries and inventory scans validate identities.
@@ -1341,9 +1345,16 @@ monitoring is also retried; restoring it triggers a scan to catch changes missed
 while monitoring was unavailable. Recovery stops once successful or when the
 console closes. Healthy libraries continue to use the existing inventory.
 
-The first library containing a package selects its effective installation.
-Inventory publication distinguishes a selection change from a change to the
-selected installation's recorded identity. Reusing an unchanged copy after a
+The inventory records observed package entries in library order and reports
+changed physical entry paths for every monitored copy. The console-owned R
+adapter uses `find.package()` with the observed candidate libraries to validate
+metadata and select the effective installation. A link to a missing folder or
+an invalid earlier installation can leave a later valid copy selected. Updates
+to that later copy still invalidate its metadata and loaded namespace. Excluded
+and suspended installations remain outside reconciliation, and installation
+locks defer the affected package. The R adapter retains changed entry paths for
+excluded names until reconciliation resumes or the process is replaced.
+Reusing an unchanged copy after a
 library-order refresh preserves the new server; replacing files in that copy
 still invalidates loaded namespaces. Inventory requests update package metadata;
 the dedicated library synchronization request owns the search order.

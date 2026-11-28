@@ -1051,6 +1051,7 @@ test("a replacement that still requests restart fails refresh without declaring 
   assert.ok(!instances[1].requests.some(request => request.method === "completion"));
   const updated = change();
   updated.packages.set("stats", { name: "stats", path: "/base/library/stats", target: "/base/library/stats", identity: "new" });
+  updated.libraries[0].packages = updated.packages;
   await assert.rejects(client.refreshPackages(updated), /retained stale packages: stats/);
   assert.equal(instances.length, 3, "a different installation can try a fresh process");
   conflict = false;
@@ -1063,15 +1064,38 @@ test("a replacement that still requests restart fails refresh without declaring 
 test("package refresh sends pinned installations and explicit monitoring exclusions", async t => {
   const { client, instances } = createClient(t);
   await client.start();
+  const packages = new Map([["example", { name: "example",
+    path: "/configured-alias/example", target: "/pinned-library/example", identity: "installed" }]]);
+  const later = new Map([["example", { name: "example", path: "/later/example", target: "/later/example", identity: "later" }]]);
   await client.refreshPackages({
-    libraries: [],
-    packages: new Map([["example", { name: "example",
-      path: "/configured-alias/example", target: "/pinned-library/example", identity: "installed" }]]),
+    libraries: [{ path: "/configured-alias", packages }, { path: "/duplicate-alias", packages },
+      { path: "/suspended-library", packages: later, suspended: true },
+      { path: "/unavailable-library", packages: later, unavailable: true },
+      { path: "/excluded-entry", packages: later, unmonitored: new Set(["example"]) },
+      { path: "/unreadable-entry", packages: later, unavailablePackages: new Map([["example", "EACCES"]]) },
+      { path: "/later", packages: later }], packages,
     changed: [], unmonitored: ["linked"], unmonitoredRoots: ["/suspended-library"],
     isCurrent: () => true,
   });
   const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
-  assert.deepEqual(request.params.installations, { example: "/pinned-library/example" });
+  assert.deepEqual({ ...request.params.installations }, { example: ["/pinned-library/example", "/later/example"] });
   assert.deepEqual(request.params.unmonitored, ["linked"]);
   assert.deepEqual(request.params.unmonitoredRoots, ["/suspended-library"]);
+});
+
+test("later-copy changes invalidate displayed completion only when R selects that copy", async t => {
+  const { client, instances } = createClient(t);
+  await client.start();
+  const sendRequest = instances[0].sendRequest.bind(instances[0]);
+  let selected = false, invalidated = 0;
+  instances[0].sendRequest = async (method, params) => method === "rConsole/refreshPackages"
+    ? { restart: [], changed: selected ? ["example"] : [] } : sendRequest(method, params);
+  client.options.onPackagesChanged = () => invalidated++;
+  const update = { ...change(), changed: [], changedInstallationPaths: ["/later/example"] };
+  await client.refreshPackages(update);
+  assert.equal(invalidated, 0, "an unused copy does not dismiss valid suggestions");
+  selected = true;
+  await client.refreshPackages(update);
+  assert.equal(invalidated, 1, "metadata changes in R's selected copy dismiss stale suggestions");
+  assert.equal(instances.length, 1);
 });

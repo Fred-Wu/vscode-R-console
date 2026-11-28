@@ -180,33 +180,68 @@ server$request_handlers[["rConsole/syncLibraryPaths"]] <- function(self, id, par
     self$deliver(languageserver:::Response$new(id,
         result = list(changed = library_paths_changed)))
 }
+pending_package_changes <- character()
 server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, params) {
     changed <- normalize_character(params$changed)
     loaded <- loadedNamespaces()
     unmonitored <- normalize_character(params$unmonitored)
     unmonitored_roots <- chartr("\\", "/", normalize_character(params$unmonitoredRoots))
     deferred <- chartr("\\", "/", normalize_character(params$deferred))
+    pending_package_changes <<- union(pending_package_changes,
+        chartr("\\", "/", normalize_character(params$changedInstallationPaths)))
+    changed_paths <- pending_package_changes
+    excluded <- union(unmonitored, basename(deferred))
+    excluded <- union(excluded, Filter(function(pkgname) {
+        dirname(chartr("\\", "/", getNamespaceInfo(pkgname, "path"))) %in% unmonitored_roots
+    }, setdiff(loaded, "base")))
+    selected_installations <- new.env(parent = emptyenv())
+    selected_installation <- function(pkgname) {
+        if (exists(pkgname, selected_installations, inherits = FALSE)) {
+            return(get(pkgname, selected_installations, inherits = FALSE))
+        }
+        candidates <- chartr("\\", "/", normalize_character(params$installations[[pkgname]]))
+        candidates <- candidates[!dirname(candidates) %in% unmonitored_roots]
+        # The monitor observes entries only. R validates package metadata and
+        # chooses among the observed copies, including links to missing folders.
+        selected <- if (length(candidates)) {
+            find.package(pkgname, lib.loc = unique(dirname(candidates)), quiet = TRUE, verbose = FALSE)
+        } else character()
+        if (length(selected)) {
+            # R can return .Library using an alias. Canonicalize its parent
+            # while retaining a package link's own entry for change matching.
+            selected <- file.path(normalizePath(dirname(selected), winslash = "/", mustWork = FALSE), basename(selected))
+        }
+        assign(pkgname, selected, selected_installations)
+        selected
+    }
+    changed_loaded <- character()
     switched <- Filter(function(pkgname) {
         # Excluded installations remain outside automatic reconciliation. Check
         # names before resolving paths, which could traverse a package link.
-        if (pkgname %in% unmonitored) return(FALSE)
+        if (pkgname %in% excluded) return(FALSE)
         # Initial discovery can encounter a package that was already loaded
         # while its installation is locked. Reconcile it after the lock clears.
         current <- chartr("\\", "/", getNamespaceInfo(pkgname, "path"))
-        if (dirname(current) %in% unmonitored_roots) return(FALSE)
         if (current %in% deferred) return(FALSE)
-        installation <- params$installations[[pkgname]]
-        if (is.null(installation)) return(TRUE)
+        installation <- selected_installation(pkgname)
+        if (!length(installation)) return(TRUE)
+        if (installation %in% changed_paths) changed_loaded <<- union(changed_loaded, pkgname)
         current <- normalizePath(getNamespaceInfo(pkgname, "path"), winslash = "/", mustWork = FALSE)
         selected <- normalizePath(installation, winslash = "/", mustWork = FALSE)
         !identical(selected, current)
     }, setdiff(loaded, "base"))
-    restart <- union(intersect(setdiff(normalize_character(params$changedInstallations),
-        unmonitored), loaded), switched)
+    restart <- union(changed_loaded, switched)
     if (length(restart)) {
         # Removing metadata cannot replace functions or DLLs already loaded in R.
         return(self$deliver(languageserver:::Response$new(id, result = list(restart = as.list(restart)))))
     }
+    # A valid later copy can change while the first observed link stays fixed.
+    changed <- union(changed, Filter(function(pkgname) {
+        if (pkgname %in% excluded) return(FALSE)
+        selected <- selected_installation(pkgname)
+        !length(selected) || selected %in% changed_paths
+    }, unique(basename(changed_paths))))
+    changed <- setdiff(changed, excluded)
     for (workspace in self$workspaces$values()) {
         affected <- changed
         if (length(changed) && is.function(workspace$s3_metadata$keys)) {
@@ -246,7 +281,10 @@ server$request_handlers[["rConsole/refreshPackages"]] <- function(self, id, para
             }
         }
     }
-    self$deliver(languageserver:::Response$new(id, result = list(restart = list())))
+    # Keep changes to excluded names until reconciliation resumes. A healthy
+    # later copy can change while an earlier library is suspended or unreadable.
+    pending_package_changes <<- changed_paths[basename(changed_paths) %in% excluded]
+    self$deliver(languageserver:::Response$new(id, result = list(restart = list(), changed = as.list(changed))))
 }
 server$notification_handlers[["textDocument/didClose"]] <- console_text_document_did_close
 

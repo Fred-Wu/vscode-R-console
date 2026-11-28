@@ -787,42 +787,52 @@ export class ConsoleLspClient implements CompletionProvider {
       client = this.client;
       if (!client?.isRunning() || this.disposed) throw new Error("Language server changed during package refresh");
       if (!change.isCurrent()) return;
-      if (change.changed.length) {
+      const hasChanges = change.changed.length > 0;
+      if (hasChanges) {
         this.packageRevision++;
         this.options.onPackagesChanged?.();
       }
+      const installations: Record<string, string[]> = Object.create(null);
+      for (const library of change.libraries) {
+        if (library.suspended || library.unavailable) continue;
+        for (const [name, item] of library.packages) {
+          if (library.unmonitored?.has(name) || library.unavailablePackages?.has(name)) continue;
+          const copies = installations[name] ??= [];
+          if (!copies.includes(item.target)) copies.push(item.target);
+        }
+      }
       const params = {
-        installations: Object.fromEntries([...change.packages].map(([name, item]) => [name, item.target])),
+        installations,
         unmonitored: change.unmonitored ?? [],
         unmonitoredRoots: change.unmonitoredRoots ?? [],
         deferred: change.libraries.flatMap(library => [...(library.deferred?.values() ?? [])].flat()),
         // A recovered server already loaded the current installations.
         changed: client === previousClient ? change.changed : [],
-        changedInstallations: client === previousClient ? change.changedInstallations ?? change.changed : [],
+        changedInstallationPaths: client === previousClient ? change.changedInstallationPaths ?? [] : [],
       };
       // A profile can preload a package from a library the console has since
       // excluded. Retrying unchanged inventory must not relaunch that profile
       // indefinitely or publish completions from the conflicting process.
       const refreshKey = JSON.stringify([
         change.libraries.map(library => library.path),
-        [...change.packages].map(([name, item]) => [name, item.target, item.identity]),
+        change.libraries.map(library => [...library.packages].map(([name, item]) => [name, item.target, item.identity])),
         params.unmonitored, params.unmonitoredRoots, params.deferred,
       ]);
       const previousFailure = this.failedPackageRefresh;
       const retryingConflict = previousFailure?.client === client && previousFailure.key === refreshKey;
       if (retryingConflict) {
         params.changed = [];
-        params.changedInstallations = [];
+        params.changedInstallationPaths = [];
       }
-      const result = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages", params);
+      const result = await client.sendRequest<{ restart: string[]; changed?: string[] }>("rConsole/refreshPackages", params);
       if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
       if (!change.isCurrent()) return;
+      if (!hasChanges && (result.restart.length || result.changed?.length)) {
+        this.packageRevision++;
+        this.options.onPackagesChanged?.();
+      }
       if (result.restart.length) {
         if (retryingConflict) throw previousFailure.error;
-        if (!change.changed.length) {
-          this.packageRevision++;
-          this.options.onPackagesChanged?.();
-        }
         const reason = result.restart.map(name =>
           `${name} (${change.packages.has(name) ? "installation changed" : "removed"})`).join(", ");
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Restarting language server: ${reason}; clearing packages loaded in the server.`);
@@ -833,7 +843,7 @@ export class ConsoleLspClient implements CompletionProvider {
         await this.applySessionState(client);
         if (!change.isCurrent()) return;
         const verified = await client.sendRequest<{ restart: string[] }>("rConsole/refreshPackages",
-          { ...params, changed: [], changedInstallations: [] });
+          { ...params, changed: [], changedInstallationPaths: [] });
         if (this.disposed || this.client !== client) throw new Error("Language server changed during package refresh");
         if (!change.isCurrent()) return;
         if (verified.restart.length) {
@@ -843,7 +853,7 @@ export class ConsoleLspClient implements CompletionProvider {
           lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] ${error.message}`);
           throw error;
         }
-      } else if (change.changed.length) {
+      } else if (hasChanges || result.changed?.length) {
         lifecycleOutputChannel.appendLine(`[${formatLogTimestamp()}] [Completion] Refreshed package metadata; language server retained`);
       }
       this.failedPackageRefresh = undefined;

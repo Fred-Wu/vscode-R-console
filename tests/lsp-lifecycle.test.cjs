@@ -248,7 +248,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 
   logs.length = 0;
   install(session, "probeReplacement");
-  await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "higher-priority copy refresh");
+  await waitFor(() => logs.some(line => line.includes("First library copy changed: " + pkg)), "higher-priority copy refresh");
   const items = await complete(pkg + "::probe");
   assert.ok(items.some(item => item.label === "probeReplacement"));
   assert.ok(!items.some(item => item.label === "probeOriginal"));
@@ -259,7 +259,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 
   logs.length = 0;
   fs.rmSync(path.join(configured, pkg), { recursive: true });
-  await waitFor(() => logs.some(line => line.includes("Active package copies unchanged")), "inactive-copy removal");
+  await waitFor(() => logs.some(line => line.includes("First library copies unchanged")), "inactive-copy removal");
   assert.equal(instances.length, 2);
   install(configured, "probeFallback");
   logs.length = 0;
@@ -274,7 +274,7 @@ test("background package refresh preserves unaffected libraries and switches rem
 
   logs.length = 0;
   fs.rmSync(path.join(session, pkg), { recursive: true });
-  await waitFor(() => logs.some(line => line.includes("Using remaining copy: " + pkg)), "remaining library copy");
+  await waitFor(() => logs.some(line => line.includes("Remaining library copy: " + pkg)), "remaining library copy");
   const fallback = await complete(pkg + "::");
   assert.ok(fallback.some(item => item.label === "probeFallback"));
   assert.ok(!fallback.some(item => item.label === "probeUpdated"));
@@ -574,7 +574,7 @@ test(`replacement uses normal profile and environment startup over ${useStdio ? 
     [[first, second, ...defaults], "originalExport"]]) {
     logs.length = 0;
     client.updateRuntimeLibraryPaths(libraries);
-    await waitFor(() => logs.some(line => line.includes("Selected copy changed: " + pkg)), "confirmed switch");
+    await waitFor(() => logs.some(line => line.includes("First library copy changed: " + pkg)), "confirmed switch");
     assert.ok((await complete(pkg + "::")).some(item => item.label === exported),
       "profile-dependent packages must load in every replacement server");
     assert.equal(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length, instances.length,
@@ -731,7 +731,7 @@ test("linked startup packages remain tracked and usable without monitoring their
   assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
   assert.equal(instances.length, 1, "an unchanged loaded linked package must not restart the server");
   const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
-  assert.equal(request.params.installations[pkg], path.join(fs.realpathSync.native(first), pkg),
+  assert.deepEqual(request.params.installations[pkg], [path.join(fs.realpathSync.native(first), pkg)],
     "the linked entry is anchored to the configured library's pinned real path");
   assert.ok(!request.params.unmonitored.includes(pkg),
     "a trusted project-library link entry is monitored without watching its target");
@@ -753,6 +753,73 @@ test("linked startup packages remain tracked and usable without monitoring their
   assert.ok(!(await complete(ordinary + "::")).some(item => item.label === "ordinaryExport"));
   assert.equal(instances.length, 2, "ordinary loaded-package removal still refreshes the server");
   assert.ok(!logs.some(line => line.includes("retained stale packages")));
+});
+
+test("links to missing package folders preserve R's valid package selection", { timeout: 90000 }, async t => {
+  const { first, root, createClient } = lifecycleFixture(t);
+  fs.symlinkSync(path.join(root, "missing-cache"), path.join(first, "stats"),
+    process.platform === "win32" ? "junction" : "dir");
+  const { client, instances, complete, logs } = createClient({ libraries: [first] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "inventory accepts R's system package selection");
+  assert.equal(instances.length, 1);
+  assert.equal(client.failedPackageRefresh, undefined);
+  assert.ok((await complete("utils::he")).some(item => item.label === "head"));
+  assert.ok(!logs.some(line => line.includes("retained stale packages")));
+  const request = instances[0].requests.find(request => request.method === "rConsole/refreshPackages");
+  const copies = request.params.installations.stats;
+  assert.equal(copies.length, 2);
+  const ignored = await instances[0].sendRequest("rConsole/refreshPackages", {
+    ...request.params, changedInstallationPaths: [copies[0]],
+  });
+  assert.deepEqual(ignored.restart, [], "a change to the unusable link cannot reload the system copy");
+  const excluded = await instances[0].sendRequest("rConsole/refreshPackages", {
+    ...request.params, unmonitored: ["stats"], changedInstallationPaths: [copies[1]],
+  });
+  assert.deepEqual(excluded.restart, [], "excluded names defer reconciliation");
+  const selected = await instances[0].sendRequest("rConsole/refreshPackages", {
+    ...request.params, changedInstallationPaths: [],
+  });
+  assert.ok(selected.restart.includes("stats"),
+    "resuming preserves deferred selected-copy updates, including an aliased .Library spelling");
+});
+
+test("R selects valid later copies and tracks their updates behind an unusable package entry", { timeout: 120000 }, async t => {
+  const { first, second, root, pkg, install, defaults, createClient } = lifecycleFixture(t);
+  install(second, "originalExport");
+  const link = path.join(first, pkg), kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(path.join(root, "missing-cache"), link, kind);
+  const env = { ...process.env, R_LIBS_USER: [first, second, ...defaults].join(path.delimiter),
+    R_DEFAULT_PACKAGES: `datasets,utils,grDevices,graphics,stats,methods,${pkg}` };
+  const { client, instances, complete } = createClient({ env, libraries: [first, second] });
+  await client.start();
+  await waitFor(() => client.packageInventory.initialized, "initial fallback inventory");
+  assert.equal(instances.length, 1);
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "originalExport"));
+  install(second, "updatedExport");
+  await waitFor(() => instances.length === 2 && !client.packageRefreshPromise, "later-copy update restarts its loaded namespace");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+
+  // Package validity belongs to R even when an ordinary directory has both
+  // metadata filenames. The filesystem monitor never opens their contents.
+  fs.unlinkSync(link);
+  fs.mkdirSync(path.join(link, "Meta"), { recursive: true });
+  fs.writeFileSync(path.join(link, "DESCRIPTION"), "invalid package metadata");
+  fs.writeFileSync(path.join(link, "Meta", "package.rds"), "invalid R metadata");
+  await waitFor(() => client.packageInventory.packages.get(pkg)?.linked !== true && !client.packageRefreshPromise,
+    "invalid ordinary entry reconciled");
+  assert.equal(instances.length, 2, "an unusable earlier copy cannot reload the unchanged selected copy");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+
+  const cache = path.join(root, "cache"); fs.mkdirSync(cache);
+  install(cache, "preferredExport");
+  fs.rmSync(link, { recursive: true }); fs.symlinkSync(path.join(cache, pkg), link, kind);
+  await waitFor(() => instances.length === 3 && !client.packageRefreshPromise, "valid earlier link becomes selected");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "preferredExport"));
+  fs.unlinkSync(link); fs.symlinkSync(path.join(root, "missing-again"), link, kind);
+  await waitFor(() => instances.length === 4 && !client.packageRefreshPromise, "missing earlier target returns selection to later copy");
+  assert.ok((await complete(pkg + "::")).some(item => item.label === "updatedExport"));
+  assert.equal(client.failedPackageRefresh, undefined);
 });
 
 test("initial locked namespaces stay usable and conflicting startup libraries stop restart loops", { timeout: 90000 }, async t => {

@@ -97,6 +97,72 @@ test("retargeting a configured directory link never subscribes to its new destin
   assert.equal(f.watchers.size, 0, "suspended library releases all entry subscriptions");
 });
 
+for (const layout of ["linked parent", "linked target", "relative target"]) {
+  test(`pins every alias in a library with a ${layout}`, t => {
+    const f = fixture(t), first = f.make("first"), second = f.make("second"), parent = f.make("parent");
+    const middle = path.join(parent, "library"), alias = path.join(f.base, "alias");
+    fs.symlinkSync(first, middle, linkKind);
+    const target = layout === "linked parent" ? parent : layout === "relative target" ? "parent/library" : middle;
+    // Windows junctions store absolute destinations; directory symlinks support relative ones.
+    const kind = layout === "relative target" ? "dir" : linkKind;
+    try { fs.symlinkSync(target, alias, kind); }
+    catch (error) { if (error.code === "EPERM") { t.skip("directory symlink permission unavailable"); return; } throw error; }
+    const library = layout === "linked parent" ? path.join(alias, "library") : alias;
+    const pin = f.add(library);
+    assert.equal(pin.root, first);
+    assert.ok(f.watchers.has(parent), "the later link's parent is monitored");
+    fs.unlinkSync(middle); fs.symlinkSync(second, middle, linkKind);
+    f.watchers.get(parent).notify("library");
+    assert.deepEqual(f.changes.map(({ entry, kind }) => [entry, kind]), [[middle, "configured"]]);
+    assert.equal(f.watchers.size, 0);
+    assert.equal(f.clock.pending(), 0);
+  });
+}
+
+test("routine validation never resolves aliases, including after a later link changes", t => {
+  const f = fixture(t), first = f.make("first"), second = f.make("second"), parent = f.make("parent");
+  const alias = path.join(f.base, "alias"), middle = path.join(parent, "library");
+  fs.symlinkSync(parent, alias, linkKind); fs.symlinkSync(first, middle, linkKind);
+  let capturing = true;
+  const pinning = loadSource("src/Language/libraryLocationPin.ts", { fs: { ...fs,
+    readlinkSync: (...args) => { assert.ok(capturing); return fs.readlinkSync(...args); },
+    realpathSync: { native: (...args) => { assert.ok(capturing); return fs.realpathSync.native(...args); } },
+  } });
+  const pin = pinning.captureLibraryPin(path.join(alias, "library"));
+  capturing = false;
+  assert.equal(pinning.checkLibraryPin(pin), undefined);
+  fs.unlinkSync(middle); fs.symlinkSync(second, middle, linkKind);
+  assert.equal(pinning.checkLibraryPin(pin).entry, middle);
+});
+
+test("cyclic alias chains have a bounded capture", t => {
+  const f = fixture(t), alias = path.join(f.base, "alias"), middle = path.join(f.base, "middle");
+  fs.symlinkSync(middle, alias, linkKind); fs.symlinkSync(alias, middle, linkKind);
+  assert.throws(() => captureLibraryPin(alias), /exceeds 40 links/);
+});
+
+for (const intermediateLink of [true, false]) {
+  test(`alias targets retain dependencies before '..' (linked=${intermediateLink})`, t => {
+    const f = fixture(t), first = f.make("first/library"), second = f.make("second/library");
+    const firstHop = f.make("first/hop"), secondHop = f.make("second/hop");
+    const alias = path.join(f.base, "alias"), transit = path.join(f.base, "transit");
+    if (intermediateLink) fs.symlinkSync(firstHop, transit, linkKind);
+    // A directory symlink preserves '..' in its stored target on Windows too.
+    try { fs.symlinkSync((intermediateLink ? "transit" : "first/hop") + "/../library", alias, "dir"); }
+    catch (error) { if (error.code === "EPERM") { t.skip("directory symlink permission unavailable"); return; } throw error; }
+    const pin = f.add(alias);
+    assert.equal(pin.root, first);
+    const entry = intermediateLink ? transit : firstHop;
+    if (intermediateLink) fs.unlinkSync(entry);
+    else fs.renameSync(entry, entry + "-old");
+    fs.symlinkSync(secondHop, entry, linkKind);
+    assert.equal(fs.realpathSync.native(alias), second);
+    f.watchers.get(path.dirname(entry)).notify(path.basename(entry));
+    assert.equal(f.changes[0].entry, entry);
+    assert.equal(f.watchers.size, 0);
+  });
+}
+
 for (const level of ["library", "ancestor"]) {
   for (const replacement of ["directory", "link", "missing", "file"]) {
     test(`a pinned ${level} replaced by ${replacement} is never adopted by a watcher`, t => {
