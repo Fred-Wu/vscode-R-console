@@ -8,9 +8,9 @@ const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
 const { readSessionRegistryKey, sessionRegistryKeyEndpoints } = loadSource("src/Runtime/sessionRegistryKey.ts");
 
-async function broker(t, respond) {
-  const identity = { sessionId: randomUUID(), pid: process.pid };
-  const endpoint = sessionRegistryKeyEndpoints(identity)[0];
+async function broker(t, respond, { api = { sessionRegistryKeyEndpoints }, index = 0,
+  identity = { sessionId: randomUUID(), pid: process.pid } } = {}) {
+  const endpoint = api.sessionRegistryKeyEndpoints(identity)[index];
   fs.mkdirSync(path.dirname(endpoint), { recursive: true, mode: 0o700 });
   const sockets = new Set();
   const server = net.createServer(socket => {
@@ -31,6 +31,21 @@ async function broker(t, respond) {
     fs.rmSync(endpoint, { force: true });
   });
   return { identity, endpoint };
+}
+
+// Exercise Linux's two candidates on every Unix CI host without depending on
+// the runner's /run/user directory or leaving fixtures in its account home.
+function linuxKeyLocations(t) {
+  const parent = fs.realpathSync.native(fs.mkdtempSync("/tmp/rck-"));
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+  const home = path.join(parent, "home"), runtime = path.join(parent, "runtime");
+  for (const base of [home, runtime]) fs.mkdirSync(base, { mode: 0o700 });
+  const api = loadSource("src/Runtime/sessionRegistryKey.ts", {
+    os: { userInfo: () => ({ homedir: home }) },
+    fs: { ...fs, realpathSync: { ...fs.realpathSync, native: file =>
+      file === `/run/user/${process.getuid()}` ? runtime : fs.realpathSync.native(file) } },
+  }, { "process.platform": '"linux"' });
+  return { api, home, runtime };
 }
 
 function response(pid = process.pid, status = 0) {
@@ -253,17 +268,45 @@ for (const kind of ["wrong PID", "oversized", "bad magic", "truncated", "nonzero
   });
 }
 
-test("key reader rejects a socket readable by other users before connecting", { skip: process.platform === "win32" }, async t => {
-  let connected = false;
-  const { identity, endpoint } = await broker(t, () => { connected = true; });
-  fs.chmodSync(endpoint, 0o666);
-  await assert.rejects(readSessionRegistryKey(identity), /not private/);
-  assert.equal(connected, false);
+for (const index of [0, 1]) {
+  for (const kind of ["unsafe permissions", "wrong PID", "stalled broker"]) {
+    test(`Linux candidate ${index}: ${kind} survives a missing alternative`,
+      { skip: process.platform === "win32" }, async t => {
+        const { api } = linuxKeyLocations(t);
+        let connected = false;
+        const { identity, endpoint } = await broker(t, socket => {
+          connected = true;
+          if (kind === "wrong PID") socket.end(response(process.ppid));
+        }, { api, index });
+        if (kind === "unsafe permissions") fs.chmodSync(endpoint, 0o666);
+        const start = Date.now();
+        await assert.rejects(api.readSessionRegistryKey(identity), kind === "unsafe permissions"
+          ? /not private/ : kind === "wrong PID" ? /different runtime/ : /timed out/);
+        assert.equal(connected, kind !== "unsafe permissions");
+        assert.ok(Date.now() - start < 5000, "candidate discovery shares one bounded deadline");
+      });
+  }
+}
+
+test("Linux key discovery retains the first rejection when both brokers reject", { skip: process.platform === "win32" }, async t => {
+  const { api } = linuxKeyLocations(t);
+  const { identity } = await broker(t, socket => socket.end(response(process.ppid)), { api });
+  await broker(t, socket => socket.end(response(process.pid, 1)), { api, index: 1, identity });
+  await assert.rejects(api.readSessionRegistryKey(identity), /different runtime/);
 });
 
-test("a stalled broker has a bounded request lifetime", { skip: process.platform === "win32" }, async t => {
-  const { identity } = await broker(t, () => {});
-  const start = Date.now();
-  await assert.rejects(readSessionRegistryKey(identity), /timed out/);
-  assert.ok(Date.now() - start < 5000);
+test("Linux key discovery can use a valid fallback after a rejected broker", { skip: process.platform === "win32" }, async t => {
+  const { api } = linuxKeyLocations(t);
+  const { identity } = await broker(t, socket => socket.end(response(process.ppid)), { api });
+  await broker(t, socket => socket.end(response()), { api, index: 1, identity });
+  assert.deepEqual(await api.readSessionRegistryKey(identity), Buffer.alloc(32, 42));
+});
+
+test("Linux key discovery retries missing endpoints until a broker appears", { skip: process.platform === "win32" }, async t => {
+  const { api } = linuxKeyLocations(t);
+  const identity = { sessionId: randomUUID(), pid: process.pid };
+  const reading = api.readSessionRegistryKey(identity);
+  // The first attempt has already observed both missing directories.
+  await broker(t, socket => socket.end(response()), { api, index: 1, identity });
+  assert.deepEqual(await reading, Buffer.alloc(32, 42));
 });

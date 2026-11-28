@@ -99,7 +99,10 @@ export async function readSessionRegistryKey(identity: SessionRegistryIdentity, 
         }
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        failure = error;
+        // Keep the first non-retryable rejection if later candidates also
+        // fail. A valid fallback may still succeed, but a missing endpoint
+        // must not hide a permission, authentication or timeout failure.
+        if (retryable) failure = error;
         retryable &&= ["ENOENT", "ECONNREFUSED", "EBUSY", "EPIPE"].includes(code ?? "");
       }
     }
