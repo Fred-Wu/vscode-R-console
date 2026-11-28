@@ -145,21 +145,26 @@ for (const intermediateLink of [true, false]) {
   test(`alias targets retain dependencies before '..' (linked=${intermediateLink})`, t => {
     const f = fixture(t), first = f.make("first/library"), second = f.make("second/library");
     const firstHop = f.make("first/hop"), secondHop = f.make("second/hop");
-    const alias = path.join(f.base, "alias"), transit = path.join(f.base, "transit");
+    const alias = path.join(f.base, "alias"), transit = path.join(f.base, "first", "transit");
     if (intermediateLink) fs.symlinkSync(firstHop, transit, linkKind);
-    // A directory symlink preserves '..' in its stored target on Windows too.
-    try { fs.symlinkSync((intermediateLink ? "transit" : "first/hop") + "/../library", alias, "dir"); }
+    // Both native resolution rules initially reach first/library: Windows
+    // normalizes '..' lexically, while Unix follows the intermediate link.
+    try { fs.symlinkSync((intermediateLink ? "first/transit" : "first/hop") + "/../library", alias, "dir"); }
     catch (error) { if (error.code === "EPERM") { t.skip("directory symlink permission unavailable"); return; } throw error; }
     const pin = f.add(alias);
     assert.equal(pin.root, first);
     const entry = intermediateLink ? transit : firstHop;
+    assert.ok(pin.configured.some(chain => chain.some(item => item.path === entry)),
+      "the component before '..' must remain a pinned dependency on every platform");
     if (intermediateLink) fs.unlinkSync(entry);
     else fs.renameSync(entry, entry + "-old");
     fs.symlinkSync(secondHop, entry, linkKind);
-    assert.equal(fs.realpathSync.native(alias), second);
+    assert.equal(fs.realpathSync.native(alias), process.platform === "win32" ? first : second);
     f.watchers.get(path.dirname(entry)).notify(path.basename(entry));
-    assert.equal(f.changes[0].entry, entry);
+    assert.deepEqual(f.changes.map(({ entry, kind, state }) => [entry, kind, state]),
+      [[entry, "configured", "link"]]);
     assert.equal(f.watchers.size, 0);
+    assert.equal(f.clock.pending(), 0);
   });
 }
 
