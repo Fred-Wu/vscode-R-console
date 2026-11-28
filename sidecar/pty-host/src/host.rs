@@ -266,12 +266,19 @@ mod unix_host {
             capabilities.push("function-source");
             capabilities.push("function-source-value");
         }
-        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
-        // Keep the registry encryption key in the same-user OS-protected broker.
-        let _registry_key = if session_transport {
-            Some(crate::registry_key::start(
-                &std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
+        let registry_key = if session_transport {
+            Some(std::env::var("VSC_R_BACKEND_SESSION_ID").map_err(io::Error::other)
+                .and_then(|id| crate::registry_key::start(&id)))
         } else { None };
+        let persistence_error = registry_key.as_ref().and_then(|result| result.as_ref().err());
+        if persistence_error.is_some() { capabilities.push("ephemeral-session"); }
+        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
+        if let Some(error) = persistence_error {
+            let _ = output.emit_host_error(&format!(
+                "Encrypted session persistence is unavailable ({error}). This R Console remains usable and will close when its client disconnects."));
+        }
+        // Hold the encryption key for the lifetime of a persistent runtime.
+        let _registry_key = registry_key.and_then(Result::ok);
         if let Err(error) = output.capture_process_stdout() {
             let _ =
                 output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
@@ -290,7 +297,7 @@ mod unix_host {
                 cv: Condvar::new(),
             })
             .map_err(|_| "host runtime already initialized")?;
-        start_command_reader();
+        start_command_reader(_registry_key.is_some());
 
         unsafe {
             api.initialize(&r_executable, r_args)?;
@@ -330,10 +337,11 @@ mod unix_host {
         Ok(())
     }
 
-    fn start_command_reader() {
+    fn start_command_reader(persistent: bool) {
         if let Some((session_file, initial_connect_grace, reconnect_grace)) =
             session_transport_config()
         {
+            let reconnect_grace = if persistent { reconnect_grace } else { Some(Duration::from_secs(1)) };
             start_session_command_reader(session_file, initial_connect_grace, reconnect_grace);
             return;
         }
@@ -2289,12 +2297,19 @@ mod windows_host {
             capabilities.push("function-source");
             capabilities.push("function-source-value");
         }
-        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
-        // Keep the registry encryption key in the same-user OS-protected broker.
-        let _registry_key = if session_transport {
-            Some(crate::registry_key::start(
-                &std::env::var("VSC_R_BACKEND_SESSION_ID")?)?)
+        let registry_key = if session_transport {
+            Some(std::env::var("VSC_R_BACKEND_SESSION_ID").map_err(io::Error::other)
+                .and_then(|id| crate::registry_key::start(&id)))
         } else { None };
+        let persistence_error = registry_key.as_ref().and_then(|result| result.as_ref().err());
+        if persistence_error.is_some() { capabilities.push("ephemeral-session"); }
+        let output = OutputSink::new_with_capabilities("embedded-r-host", &capabilities);
+        if let Some(error) = persistence_error {
+            let _ = output.emit_host_error(&format!(
+                "Encrypted session persistence is unavailable ({error}). This R Console remains usable and will close when its client disconnects."));
+        }
+        // Hold the encryption key for the lifetime of a persistent runtime.
+        let _registry_key = registry_key.and_then(Result::ok);
         if let Err(error) = output.capture_process_stdout() {
             let _ =
                 output.emit_host_error(&format!("backend stdout capture setup failed: {error}"));
@@ -2313,7 +2328,7 @@ mod windows_host {
                 cv: Condvar::new(),
             })
             .map_err(|_| "host runtime already initialized")?;
-        start_command_reader();
+        start_command_reader(_registry_key.is_some());
 
         unsafe {
             api.initialize(&r_executable, r_args)?;
@@ -2353,10 +2368,11 @@ mod windows_host {
         Ok(())
     }
 
-    fn start_command_reader() {
+    fn start_command_reader(persistent: bool) {
         if let Some((session_file, initial_connect_grace, reconnect_grace)) =
             session_transport_config()
         {
+            let reconnect_grace = if persistent { reconnect_grace } else { Some(Duration::from_secs(1)) };
             start_session_command_reader(session_file, initial_connect_grace, reconnect_grace);
             return;
         }

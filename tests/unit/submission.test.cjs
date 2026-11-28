@@ -6,6 +6,20 @@ const { createTerminal, createTerminalWithScreen, nextPrompt, deferred, runtime 
 // exposed promise. Tests control parser completion explicitly, never by sleeps.
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+for (const ephemeral of [false, true]) {
+  test(`disposing a ${ephemeral ? "temporary" : "persistent"} console handles its runtime lifetime`, async () => {
+    const { terminal } = createTerminal();
+    let closed = 0;
+    terminal.runtimeBackend.hasCapability = (_session, capability) => ephemeral && capability === "ephemeral-session";
+    terminal.forceClose = () => { closed++; return Promise.resolve(); };
+    terminal.releaseExtensionResources = () => Promise.resolve();
+    terminal.inlineThemeDisposables = [];
+    for (const name of ["writeEmitter", "closeEmitter", "nameEmitter", "pidEmitter"]) terminal[name] = { dispose() {} };
+    await terminal.dispose();
+    assert.equal(closed, ephemeral ? 1 : 0);
+  });
+}
+
 test("package batching follows main prompts and busy reconnects, including nested input", () => {
   const { terminal } = createTerminal();
   const control = event => runtime.handleRuntimeControl(terminal.runtimeHostAdapter, event);

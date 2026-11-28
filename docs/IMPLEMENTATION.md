@@ -1502,16 +1502,26 @@ through a local key broker: a user-owned Unix socket in a verified mode-0700
 `.r-console` directory, or a Windows named pipe created with a
 protected user-only DACL and remote clients denied. Socket permissions are 0600.
 On macOS, the parent is the OS-provided per-user temporary directory obtained through
-`confstr` / `getconf DARWIN_USER_TEMP_DIR`. Other Unix systems use the account database's
-home directory. The parent and its ancestry are checked for ownership and protection
-against replacement by other users. Existing unverified directories retain their
-permissions and contents, and key-broker initialization fails closed. Unix socket
+`confstr` / `getconf DARWIN_USER_TEMP_DIR`. Linux first tries `/run/user/<uid>` and
+then the account database's home directory; other Unix systems use the account home.
+Each candidate and its ancestry are checked for ownership and protection against
+replacement by other users. Creation or socket-binding failures advance to the next
+candidate. The key reader checks the same protected locations, including the home
+location used by surviving runtimes. Existing unverified directories retain their
+permissions and contents. Unix socket
 names use the validated session UUID with its hyphens removed.
 On Linux, socket paths of 108 bytes or more use a short `/proc/self/fd/<fd>/<name>`
 alias while binding and connecting. Each operation holds an open descriptor to
 the verified private directory through completion. The socket remains inside
-the account's `.r-console` directory, and its canonical path supplies discovery
+the selected `.r-console` directory, and its canonical path supplies discovery
 and cleanup. Path lengths are measured in bytes, including multibyte home names.
+If the broker cannot start, the runtime advertises `ephemeral-session` and displays
+a persistence warning. R evaluation and authenticated console communication remain
+available. The frontend waits for capability negotiation before exporting reconnect
+credentials and excludes ephemeral sessions from persistence and detachment. Disposing
+their console closes the runtime; loss of the authenticated client starts a one-second
+shutdown grace period. Encryption keys and plaintext session records remain absent
+from disk.
 The broker returns its PID with
 the key; requests and replies have fixed lengths and bounded deadlines. The
 Windows client acknowledges receipt before the server disconnects the pipe.
@@ -1533,6 +1543,17 @@ successful updates. Explicitly removed sessions are pruned; opaque records retai
 during loading remain available for retry. VS Code reloads retrieve keys from the surviving runtimes.
 R exit, crash or reboot ends the key lifetime and makes the associated encrypted
 replay unrecoverable. Session persistence requires a living runtime.
+
+Registry reads accept regular files up to 64 MiB and at most 256 session records.
+Reads stop at the byte limit even if a file grows after its initial size check.
+The same limits protect reads before replacement and newly encoded registry writes.
+An oversized or invalid registry remains intact, disables saving for that registry,
+and reports the problem while ordinary console creation remains available.
+Loading and saving process at most four records concurrently. Each operation admits
+new key requests for five seconds; already-started requests retain their transport
+timeouts (three seconds on Unix and 3.5 seconds for the Windows helper). Unread records
+retain their ciphertext, failed saves retain previous ciphertext where available,
+and disposal stops queued key requests. These limits apply before ciphertext authentication.
 
 Ctrl+L clears captured console output from the in-memory replay. The next
 successful registry save records that cleared replay, normally within the

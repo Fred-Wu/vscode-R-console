@@ -34,6 +34,25 @@ function frame(kind, payload) {
   return Buffer.concat([header, payload]);
 }
 
+test("ephemeral sessions accept commands but never export reconnect credentials", async () => {
+  const backend = new RustSidecarRuntimeBackend("unused");
+  const session = backend.reconnect({ sessionId: "ephemeral", port: 12345,
+    pid: process.pid, protocolVersion: 4, authToken: "a".repeat(64) });
+  const socket = Object.assign(new EventEmitter(), {
+    destroyed: false, resume() {}, destroy() { this.destroyed = true; },
+  });
+  backend.connectSocketWithRetry = async () => socket;
+  backend.attach(session, {});
+  assert.equal(backend.getReconnectInfo(session), undefined, "wait for capability negotiation");
+  await new Promise(resolve => setImmediate(resolve));
+  const info = Buffer.concat([string("embedded-r-host"), u32(2), string("session-control"), string("ephemeral-session")]);
+  socket.emit("data", Buffer.concat([frame(1, Buffer.concat([u32(4), info])), frame(2, info)]));
+  assert.equal(backend.hasCapability(session, "ephemeral-session"), true);
+  assert.equal(backend.canUseSessionCommands(session), true);
+  assert.equal(backend.getReconnectInfo(session), undefined);
+  backend.detach(session);
+});
+
 for (const protocolVersion of [1, 2, 3, 4, 5]) {
   test(`validates live protocol ${protocolVersion} before enabling session commands`, async () => {
     const backend = new RustSidecarRuntimeBackend("unused");

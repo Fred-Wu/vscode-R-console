@@ -7,6 +7,43 @@ import { BACKEND_PROTOCOL_VERSION } from "./backendProtocol";
 import { isSessionRegistryIdentity, readSessionRegistryKey, type SessionRegistryIdentity, type SessionRegistryKeyReader } from "./sessionRegistryKey";
 
 const REGISTRY_FORMAT = "r-console-session-records";
+const MAX_REGISTRY_BYTES = 64 * 1024 * 1024;
+const MAX_REGISTRY_SESSIONS = 256;
+const KEY_READ_CONCURRENCY = 4;
+const KEY_READ_BUDGET_MS = 5000;
+class RegistryLimitError extends Error {}
+
+async function readRegistryFile(file: string): Promise<string | undefined> {
+  let handle: fs.promises.FileHandle;
+  try { handle = await fs.promises.open(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
+    // The inclusive end also bounds a file that grows after stat().
+    const stream = handle.createReadStream({ autoClose: false, end: MAX_REGISTRY_BYTES });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of stream) {
+      size += chunk.length;
+      if (size > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks, size).toString("utf8");
+  } finally { await handle.close(); }
+}
+
+async function mapRegistryEntries<T, U>(entries: readonly T[], visit: (entry: T) => Promise<U>): Promise<U[]> {
+  const results = new Array<U>(entries.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(KEY_READ_CONCURRENCY, entries.length) }, async () => {
+    while (next < entries.length) {
+      const index = next++;
+      results[index] = await visit(entries[index]);
+    }
+  }));
+  return results;
+}
 type EncryptedSession = SessionRegistryIdentity & { iv: string; tag: string; ciphertext: string };
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const identityKey = (identity: SessionRegistryIdentity): string => `${identity.sessionId}:${identity.pid}`;
@@ -90,7 +127,6 @@ export function isLegacyConsoleRecord(value: unknown): value is LegacyConsoleRec
 /** Retain incompatible records without ever passing them to authenticated reconnect. */
 export class PersistentSessionRegistry {
   private legacyRecords: ShutdownRecord[] = [];
-  private sessions: PersistedConsoleRecord[] = [];
   private metadata: Record<string, unknown> = {};
   private readonly recordMetadata = new Map<string, Record<string, unknown>>();
   private writable = false;
@@ -131,16 +167,14 @@ export class PersistentSessionRegistry {
     this.clearKeys();
     this.metadata = {};
     this.recordMetadata.clear();
-    this.sessions = [];
     this.opaque = [];
     this.encryptedRecords.clear();
     try {
-      let original: string | undefined;
-      try { original = await fs.promises.readFile(this.filePath, "utf8"); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      const original = await readRegistryFile(this.filePath);
       this.originalDigest = original === undefined ? undefined : digest(original);
       const parsed: unknown = original === undefined ? { format: REGISTRY_FORMAT, version: 1, sessions: [] } : JSON.parse(original);
       if (!isObjectRecord(parsed) || !Array.isArray(parsed.sessions)) throw new Error("Invalid registry schema");
+      if (parsed.sessions.length > MAX_REGISTRY_SESSIONS) throw new RegistryLimitError();
       let records: unknown[];
       const plaintext = parsed.format !== REGISTRY_FORMAT;
       if (!plaintext) {
@@ -152,9 +186,12 @@ export class PersistentSessionRegistry {
           return row;
         });
         this.encryptedRecords = new Map(entries.map(row => [identityKey(row), row]));
-        const decoded = await Promise.all(entries.map(async row => {
+        const deadline = Date.now() + KEY_READ_BUDGET_MS;
+        const decoded = await mapRegistryEntries(entries, async row => {
+          if (this.disposed) return;
           if (!isProcessAlive(row.pid)) return;
           try {
+            if (Date.now() >= deadline) throw new Error("Registry key retrieval budget exhausted");
             const key = await this.keyFor(row);
             const decipher = createDecipheriv("aes-256-gcm", key, base64(row.iv, 12));
             decipher.setAAD(this.associatedData(row));
@@ -177,7 +214,7 @@ export class PersistentSessionRegistry {
             this.opaque.push(row);
             return;
           }
-        }));
+        });
         records = decoded.filter(value => value !== undefined).map(value => value.record);
         this.metadata = decoded.find(value => value && isPersistedConsoleRecord(value.record))?.metadata ?? {};
         if (this.opaque.length) this.reportError("Some saved R Console sessions could not be decrypted. Their encrypted records have been retained for retry.");
@@ -213,23 +250,30 @@ export class PersistentSessionRegistry {
         this.writable = true;
         return [];
       }
-      this.sessions = records.filter(isPersistedConsoleRecord).filter(hasLivePersistedRuntime);
+      const sessions = records.filter(isPersistedConsoleRecord).filter(hasLivePersistedRuntime);
       this.writable = true;
-      if (legacy) await this.saveInternal(this.sessions);
-      return [...this.sessions];
-    } catch {
+      if (legacy) await this.saveInternal(sessions);
+      return sessions;
+    } catch (error) {
       this.writable = false;
       this.clearKeys();
-      this.reportError("R Console could not read its saved session registry. The existing file has been preserved and saving is disabled.");
+      this.reportError((error instanceof RegistryLimitError
+        ? "R Console requires a regular session registry file of at most 64 MiB and 256 records. "
+        : "R Console could not read its saved session registry. ") +
+        "The existing file has been preserved and saving is disabled.");
       return [];
     }
   }
 
   save(sessions: PersistedConsoleRecord[]): Promise<boolean> {
     if (!this.writable || this.disposed) return Promise.resolve(false);
-    this.sessions = sessions.filter(isPersistedConsoleRecord).filter(hasLivePersistedRuntime);
+    if (sessions.length > MAX_REGISTRY_SESSIONS) {
+      this.reportError("R Console has too many sessions to save. The existing saved data has been retained.");
+      return Promise.resolve(false);
+    }
+    const validSessions = sessions.filter(isPersistedConsoleRecord).filter(hasLivePersistedRuntime);
     let records: unknown[];
-    try { records = JSON.parse(JSON.stringify(this.sessions)); }
+    try { records = JSON.parse(JSON.stringify(validSessions)); }
     catch { this.reportError("R Console could not encode its saved sessions. The existing file has been preserved."); return Promise.resolve(false); }
     if (this.scheduledSave?.generation === this.generation) {
       this.scheduledSave.records = records;
@@ -352,10 +396,27 @@ export class PersistentSessionRegistry {
   }
 
   private assertRegistryUnchanged(): void {
-    let current: string | undefined;
-    try { current = fs.readFileSync(this.filePath, "utf8"); }
+    let fd: number | undefined;
+    try { fd = fs.openSync(this.filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if ((current === undefined ? undefined : digest(current)) !== this.originalDigest) throw new Error("Registry changed on disk");
+    let current: string | undefined;
+    if (fd !== undefined) {
+      try {
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile() || stat.size > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
+        const hash = createHash("sha256"), buffer = Buffer.alloc(64 * 1024);
+        let size = 0;
+        for (;;) {
+          const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, MAX_REGISTRY_BYTES + 1 - size), null);
+          if (!count) break;
+          size += count;
+          if (size > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
+          hash.update(buffer.subarray(0, count));
+        }
+        current = hash.digest("hex");
+      } finally { fs.closeSync(fd); }
+    }
+    if (current !== this.originalDigest) throw new Error("Registry changed on disk");
   }
 
   private async saveInternal(records: unknown[]): Promise<boolean> {
@@ -367,17 +428,22 @@ export class PersistentSessionRegistry {
       const owned = records.map(record => ({ record, identity: identityOf(record) }));
       if (owned.some(item => !item.identity)) throw new Error("Saved record has no session key owner");
       const alive = owned.filter(item => isProcessAlive(item.identity!.pid) && !blocked.has(identityKey(item.identity!)));
-      const encrypted = await Promise.allSettled(alive.map(async ({ record, identity }) => {
-        const key = await this.keyFor(identity!);
-        const iv = randomBytes(12);
-        const cipher = createCipheriv("aes-256-gcm", key, iv);
-        cipher.setAAD(this.associatedData(identity!));
-        const plaintext = Buffer.from(JSON.stringify({ record, metadata: this.recordMetadata.get(identityKey(identity!)) ?? this.metadata }));
-        let ciphertext: Buffer;
-        try { ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]); }
-        finally { plaintext.fill(0); }
-        return { ...identity!, iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), ciphertext: ciphertext.toString("base64") };
-      }));
+      if (alive.length + opaque.length > MAX_REGISTRY_SESSIONS) throw new RegistryLimitError();
+      const deadline = Date.now() + KEY_READ_BUDGET_MS;
+      const encrypted = await mapRegistryEntries(alive, async ({ record, identity }): Promise<PromiseSettledResult<EncryptedSession>> => {
+        try {
+          if (this.disposed || Date.now() >= deadline) throw new Error("Registry key retrieval budget exhausted");
+          const key = await this.keyFor(identity!);
+          const iv = randomBytes(12);
+          const cipher = createCipheriv("aes-256-gcm", key, iv);
+          cipher.setAAD(this.associatedData(identity!));
+          const plaintext = Buffer.from(JSON.stringify({ record, metadata: this.recordMetadata.get(identityKey(identity!)) ?? this.metadata }));
+          let ciphertext: Buffer;
+          try { ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]); }
+          finally { plaintext.fill(0); }
+          return { status: "fulfilled", value: { ...identity!, iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), ciphertext: ciphertext.toString("base64") } };
+        } catch (reason) { return { status: "rejected", reason }; }
+      });
       let incomplete = false;
       const rows = encrypted.flatMap((result, index) => {
         if (result.status === "fulfilled") return [result.value];
@@ -392,6 +458,7 @@ export class PersistentSessionRegistry {
         this.originalDigest = undefined;
       } else {
         const encoded = JSON.stringify({ format: REGISTRY_FORMAT, version: 1, sessions: [...rows, ...opaque] });
+        if (Buffer.byteLength(encoded) > MAX_REGISTRY_BYTES) throw new RegistryLimitError();
         fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
         fs.writeFileSync(temporary, encoded, { encoding: "utf8", mode: 0o600, flag: "wx" });
         fs.renameSync(temporary, this.filePath);
@@ -406,8 +473,11 @@ export class PersistentSessionRegistry {
         this.reportError("Some R Console sessions could not be saved. Their previous encrypted records have been retained where available; other sessions were saved successfully.");
       } else this.reportedError = undefined;
       return !incomplete;
-    } catch {
-      this.reportError("R Console could not update its saved sessions. The existing saved data has been retained; no plaintext fallback was written.");
+    } catch (error) {
+      this.reportError((error instanceof RegistryLimitError
+        ? "R Console saved sessions exceed the regular-file, 64 MiB or 256-record limits. "
+        : "R Console could not update its saved sessions. ") +
+        "The existing saved data has been retained; no plaintext fallback was written.");
       return false;
     } finally { try { fs.rmSync(temporary, { force: true }); } catch {} }
   }

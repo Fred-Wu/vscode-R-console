@@ -3188,6 +3188,9 @@ export class RTerminal implements vscode.Pseudoterminal {
   }
 
   dispose(): Promise<void> {
+    if (this.runtimeBackend?.hasCapability(this.rProcess, "ephemeral-session")) {
+      void this.forceClose();
+    }
     for (const subscription of this.inlineThemeDisposables) subscription.dispose();
     const cleanup = this.releaseExtensionResources();
     this.writeEmitter.dispose();

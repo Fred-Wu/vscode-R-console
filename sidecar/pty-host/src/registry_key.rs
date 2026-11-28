@@ -153,12 +153,33 @@ fn bind_private_listener(endpoint: &std::path::Path) -> io::Result<std::os::unix
 }
 
 #[cfg(unix)]
+fn bind_session_listener(
+    id: &str,
+    bases: impl IntoIterator<Item = io::Result<std::path::PathBuf>>,
+) -> io::Result<(std::path::PathBuf, std::os::unix::net::UnixListener)> {
+    let mut failure = io::Error::other("no secure session key location available");
+    for base in bases {
+        let result = base.and_then(|base| private_directory(&base)).and_then(|directory| {
+            let endpoint = directory.join(id.replace('-', ""));
+            bind_private_listener(&endpoint).map(|listener| (endpoint, listener))
+        });
+        match result {
+            Ok(bound) => return Ok(bound),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+#[cfg(unix)]
 fn platform_start(id: &str, key: Key) -> io::Result<Broker> {
     use std::io::{Read, Write};
     use std::time::Instant;
-    let directory = private_directory(&account_key_base()?)?;
-    let endpoint = directory.join(id.replace('-', ""));
-    let listener = bind_private_listener(&endpoint)?;
+    let bases = std::iter::once_with(account_key_base);
+    #[cfg(target_os = "linux")]
+    let bases = std::iter::once(Ok(std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }))))
+        .chain(bases);
+    let (endpoint, listener) = bind_session_listener(id, bases)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::clone(&stop);
     let thread = thread::spawn(move || {
@@ -381,6 +402,36 @@ mod tests {
                 std::fs::remove_file(directory).unwrap();
             }
         }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_binding_falls_back_without_repairing_rejected_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = crate::protocol::secure_server_nonce().unwrap();
+        let name: String = nonce[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let parent = std::path::Path::new("/tmp").join(format!("rck-fallback-{name}"));
+        let rejected = parent.join("rejected");
+        let usable = parent.join("usable");
+        std::fs::create_dir_all(&rejected).unwrap();
+        std::fs::create_dir_all(&usable).unwrap();
+        std::fs::set_permissions(&rejected, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&usable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        // Simulate a missing OS location followed by an unsafe base and a valid base.
+        let (endpoint, listener) = bind_session_listener(id, [
+            Err(io::Error::from(io::ErrorKind::NotFound)), Ok(rejected.clone()), Ok(usable.clone()),
+        ]).unwrap();
+        assert!(endpoint.starts_with(std::fs::canonicalize(&usable).unwrap()));
+        assert!(!rejected.join(".r-console").exists());
+        assert_eq!(std::fs::metadata(&rejected).unwrap().permissions().mode() & 0o777, 0o777);
+        drop(listener);
+        std::fs::remove_file(&endpoint).unwrap();
+        // A pre-existing socket pathname must also leave the rejected file intact.
+        std::fs::write(&endpoint, b"occupied").unwrap();
+        assert!(bind_session_listener(id, [Ok(rejected), Ok(usable)]).is_err());
+        assert_eq!(std::fs::read(&endpoint).unwrap(), b"occupied");
         std::fs::remove_dir_all(parent).unwrap();
     }
 

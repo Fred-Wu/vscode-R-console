@@ -52,6 +52,7 @@ const FrameKind = {
 } as const;
 
 export type BackendCapability =
+  | "ephemeral-session"
   | "control-channel"
   | "shutdown"
   | "session-control"
@@ -213,6 +214,7 @@ function isBackendCapability(value: string): value is BackendCapability {
     value === "control-channel" ||
     value === "shutdown" ||
     value === "session-control" ||
+    value === "ephemeral-session" ||
     value === "top-level-submit" ||
     value === "nested-input" ||
     value === "parse-status" ||

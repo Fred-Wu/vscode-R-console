@@ -9,6 +9,61 @@ const { test } = require("node:test");
 const loadSource = require("./helpers/load-source.cjs");
 const { BACKEND_PROTOCOL_VERSION } = loadSource("src/Runtime/backendProtocol.ts");
 
+test("a denied key broker leaves R usable, disables persistence, and exits on disconnect", {
+  skip: process.platform !== "darwin", timeout: 30000,
+}, async t => {
+  const childProcess = require("node:child_process");
+  const { sessionRegistryKeyEndpoints } = loadSource("src/Runtime/sessionRegistryKey.ts");
+  const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts", {
+    child_process: { ...childProcess, spawn: (file, args, options) => {
+      const [endpoint] = sessionRegistryKeyEndpoints({ sessionId: options.env.VSC_R_BACKEND_SESSION_ID, pid: process.pid });
+      // Deny only this session's socket creation; all R and authenticated IPC operations remain available.
+      const profile = `(version 1)(allow default)(deny file-write-create (literal ${JSON.stringify(endpoint)}))`;
+      return childProcess.spawn("/usr/bin/sandbox-exec", ["-p", profile, file, ...args], options);
+    } },
+  });
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "r-console-ephemeral-"));
+  const rHome = execFileSync(process.env.R_TEST_EXECUTABLE || "R", ["RHOME"], { encoding: "utf8" }).trim();
+  const backend = new RustSidecarRuntimeBackend(getBundledRustSidecarPath(path.resolve(__dirname, "..")));
+  const handle = backend.start([path.join(rHome, "bin", "R"), "--vanilla", "--quiet"],
+    { cwd: directory, env: { ...process.env, R_HOME: rHome } });
+  let pid, ready = false, output = "", failure;
+  const notices = [];
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  t.after(async () => {
+    backend.close(handle);
+    backend.detach(handle);
+    if (pid && alive()) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  });
+  backend.attach(handle, {
+    onStdout: text => { output += text; },
+    onControl: event => {
+      if (event.type === "host-error") notices.push(event.message);
+      if (event.type === "prompt" || (event.type === "session-state" && event.wait.kind === "top-level")) ready = true;
+    },
+    onError: error => { failure = error; },
+  });
+  async function waitFor(check) {
+    const deadline = Date.now() + 10000;
+    while (!check()) {
+      if (failure) throw failure;
+      assert.ok(Date.now() < deadline, "ephemeral runtime must make progress");
+      await delay(20, undefined, { signal: t.signal });
+    }
+  }
+  await waitFor(() => ready);
+  pid = backend.getPid(handle);
+  assert.ok(pid);
+  assert.equal(backend.hasCapability(handle, "ephemeral-session"), true);
+  assert.equal(backend.getReconnectInfo(handle), undefined);
+  assert.match(notices.join("\n"), /Encrypted session persistence is unavailable/);
+  assert.equal(backend.sendSessionCommand(handle, { type: "submit", code: 'cat("EPHEMERAL_OK\\n")' }), true);
+  await waitFor(() => output.includes("EPHEMERAL_OK"));
+  backend.detach(handle);
+  await waitFor(() => !alive());
+});
+
 test(`a future protocol upgrade closes a real authenticated protocol ${BACKEND_PROTOCOL_VERSION} session`, { timeout: process.platform === "win32" ? 45000 : 30000 }, async t => {
   const { RustSidecarRuntimeBackend, getBundledRustSidecarPath } = loadSource("src/Runtime/runtimeBackend.ts");
   const registry = loadSource("src/Runtime/persistentSessionRegistry.ts", {

@@ -6,11 +6,11 @@ const os = require("node:os");
 const { randomUUID } = require("node:crypto");
 const { test } = require("node:test");
 const loadSource = require("../helpers/load-source.cjs");
-const { readSessionRegistryKey, sessionRegistryKeyEndpoint } = loadSource("src/Runtime/sessionRegistryKey.ts");
+const { readSessionRegistryKey, sessionRegistryKeyEndpoints } = loadSource("src/Runtime/sessionRegistryKey.ts");
 
 async function broker(t, respond) {
   const identity = { sessionId: randomUUID(), pid: process.pid };
-  const endpoint = sessionRegistryKeyEndpoint(identity);
+  const endpoint = sessionRegistryKeyEndpoints(identity)[0];
   fs.mkdirSync(path.dirname(endpoint), { recursive: true, mode: 0o700 });
   const sockets = new Set();
   const server = net.createServer(socket => {
@@ -41,27 +41,68 @@ function response(pid = process.pid, status = 0) {
   return bytes;
 }
 
+for (const scenario of ["runtime with unavailable home", "unsafe runtime", "missing runtime", "legacy home", "unsafe runtime child"]) {
+  test(`Linux key discovery: ${scenario}`, { skip: process.platform === "win32" }, async t => {
+    const parent = fs.realpathSync.native(fs.mkdtempSync("/tmp/rck-"));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const home = path.join(parent, "home"), runtime = path.join(parent, "runtime");
+    for (const base of [home, runtime]) fs.mkdirSync(path.join(base, ".r-console"), { recursive: true, mode: 0o700 });
+    if (scenario === "unsafe runtime") fs.chmodSync(runtime, 0o777);
+    if (scenario === "unsafe runtime child") fs.chmodSync(path.join(runtime, ".r-console"), 0o755);
+    const api = loadSource("src/Runtime/sessionRegistryKey.ts", {
+      os: { userInfo: () => {
+        if (scenario === "runtime with unavailable home") throw new Error("account home unavailable");
+        return { homedir: home };
+      } },
+      fs: { ...fs, realpathSync: { ...fs.realpathSync, native: file => {
+        if (file === `/run/user/${process.getuid()}`) {
+          if (scenario === "missing runtime") throw Object.assign(new Error("missing"), { code: "ENOENT" });
+          return runtime;
+        }
+        return fs.realpathSync.native(file);
+      } } },
+    }, { "process.platform": '"linux"' });
+    const identity = { sessionId: randomUUID(), pid: process.pid };
+    const selected = scenario === "runtime with unavailable home" ? runtime : home;
+    const endpoint = path.join(selected, ".r-console", identity.sessionId.replace(/-/g, ""));
+    const server = net.createServer(socket => {
+      socket.on("error", () => {});
+      socket.once("data", () => socket.end(response()));
+    });
+    await new Promise((resolve, reject) => { server.once("error", reject); server.listen(endpoint, resolve); });
+    fs.chmodSync(endpoint, 0o600);
+    try {
+      assert.deepEqual(await api.readSessionRegistryKey(identity), Buffer.alloc(32, 42));
+      if (scenario === "unsafe runtime") assert.equal(fs.statSync(runtime).mode & 0o777, 0o777);
+      if (scenario === "unsafe runtime child") assert.equal(fs.statSync(path.join(runtime, ".r-console")).mode & 0o777, 0o755);
+    } finally { await new Promise(resolve => server.close(resolve)); }
+  });
+}
+
 test("session identities cannot choose arbitrary local or network endpoints", () => {
   for (const sessionId of ["../outside", "\\\\host\\share", "/tmp/anything", "bad", "", undefined]) {
-    assert.throws(() => sessionRegistryKeyEndpoint({ sessionId, pid: process.pid }));
+    assert.throws(() => sessionRegistryKeyEndpoints({ sessionId, pid: process.pid }));
   }
   for (const pid of [0, -1, NaN, 2 ** 32, "123"]) {
-    assert.throws(() => sessionRegistryKeyEndpoint({ sessionId: randomUUID(), pid }));
+    assert.throws(() => sessionRegistryKeyEndpoints({ sessionId: randomUUID(), pid }));
   }
 });
 
 test("Unix key discovery uses the protected account location and ignores the public UID directory", { skip: process.platform === "win32" }, t => {
   const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "key-home-")));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const { sessionRegistryKeyEndpoint: endpoint } = loadSource("src/Runtime/sessionRegistryKey.ts", {
+  const { sessionRegistryKeyEndpoints: endpoint } = loadSource("src/Runtime/sessionRegistryKey.ts", {
     os: { userInfo: () => ({ homedir: home }) },
-    fs: { ...fs, lstatSync: file => {
+    fs: { ...fs, realpathSync: { ...fs.realpathSync, native: file => {
+      if (String(file).startsWith("/run/user/")) throw Object.assign(new Error("no runtime directory"), { code: "ENOENT" });
+      return fs.realpathSync.native(file);
+    } }, lstatSync: file => {
       assert.ok(!String(file).startsWith("/tmp/r-console-keys-"));
       return fs.lstatSync(file);
     } },
   }, { "process.platform": '"linux"' });
   const identity = { sessionId: randomUUID(), pid: process.pid };
-  assert.equal(endpoint(identity), path.join(home, ".r-console", identity.sessionId.replace(/-/g, "")));
+  assert.deepEqual(endpoint(identity), [path.join(home, ".r-console", identity.sessionId.replace(/-/g, ""))]);
   fs.chmodSync(home, 0o777);
   assert.throws(() => endpoint(identity), /not protected/);
   assert.equal(fs.statSync(home).mode & 0o777, 0o777, "never repair an untrusted parent's permissions");
@@ -69,9 +110,12 @@ test("Unix key discovery uses the protected account location and ignores the pub
 
 test("Unix key discovery rejects a foreign-owned account location", { skip: process.platform === "win32" }, () => {
   const home = fs.realpathSync.native(os.userInfo().homedir);
-  const { sessionRegistryKeyEndpoint: endpoint } = loadSource("src/Runtime/sessionRegistryKey.ts", {
+  const { sessionRegistryKeyEndpoints: endpoint } = loadSource("src/Runtime/sessionRegistryKey.ts", {
     os: { userInfo: () => ({ homedir: home }) },
-    fs: { ...fs, lstatSync: file => {
+    fs: { ...fs, realpathSync: { ...fs.realpathSync, native: file => {
+      if (String(file).startsWith("/run/user/")) throw Object.assign(new Error("no runtime directory"), { code: "ENOENT" });
+      return fs.realpathSync.native(file);
+    } }, lstatSync: file => {
       const stat = fs.lstatSync(file);
       return file === home ? Object.assign(Object.create(stat), { uid: process.getuid() + 1, mode: 0o40700 }) : stat;
     } },
@@ -96,6 +140,10 @@ for (const homeName of ["x".repeat(90), "界".repeat(30)]) {
       const { readSessionRegistryKey: read } = loadSource("src/Runtime/sessionRegistryKey.ts", {
         os: { userInfo: () => ({ homedir: home }) },
         fs: { ...fs,
+          realpathSync: { ...fs.realpathSync, native: file => {
+            if (String(file).startsWith("/run/user/")) throw Object.assign(new Error("no runtime directory"), { code: "ENOENT" });
+            return fs.realpathSync.native(file);
+          } },
           lstatSync: file => fs.lstatSync(file === endpoint ? actual.endpoint : file),
           openSync: (...args) => { heldFd = fs.openSync(...args); return heldFd; },
           fstatSync: fd => {
@@ -139,7 +187,7 @@ for (const endpointBytes of [107, 108, "multibyte"]) {
       os: { userInfo: () => ({ homedir: home }) },
     });
     const identity = { sessionId: randomUUID(), pid: process.pid };
-    const endpoint = api.sessionRegistryKeyEndpoint(identity);
+    const endpoint = api.sessionRegistryKeyEndpoints(identity).find(value => value.startsWith(home + path.sep));
     if (typeof endpointBytes === "number") assert.equal(Buffer.byteLength(endpoint), endpointBytes);
     const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
     const server = net.createServer(socket => {

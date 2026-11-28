@@ -510,7 +510,7 @@ export class RustSidecarRuntimeBackend implements RuntimeBackend {
       return undefined;
     }
     const state = this.sessionStates.get(session);
-    if (!state) {
+    if (!state || !state.hostConnected || state.capabilities.has("ephemeral-session")) {
       return undefined;
     }
     this.refreshReconnectInfo(state);

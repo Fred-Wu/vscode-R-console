@@ -8,6 +8,126 @@ const { registryKeys } = require("../helpers/registry-keys.cjs");
 const { session } = require("../helpers/persistent-session.cjs");
 const { PersistentSessionRegistry, getPersistentSessionRegistryPath } = loadSource("src/Runtime/persistentSessionRegistry.ts");
 
+test("loading and saving bound simultaneous key reads and preserve session order", async t => {
+  const sessions = Array.from({ length: 24 }, () => session());
+  const { file, keys } = fixture(t, { sessions });
+  let active = 0, peak = 0, calls = 0;
+  const registry = new PersistentSessionRegistry(file, async identity => {
+    calls++;
+    peak = Math.max(peak, ++active);
+    await new Promise(resolve => setImmediate(resolve));
+    active--;
+    return keys.readKey(identity);
+  });
+  t.after(() => registry.dispose());
+  assert.deepEqual(await registry.load(), sessions);
+  assert.equal(calls, sessions.length);
+  assert.equal(peak, 4);
+  const added = Array.from({ length: 24 }, () => session());
+  assert.equal(await registry.save([...sessions, ...added]), true);
+  assert.equal(peak, 4);
+  assert.equal(calls, sessions.length + added.length);
+  assert.deepEqual(keys.read(file).sessions, [...sessions, ...added]);
+});
+
+for (const plaintext of [false, true]) {
+  test(`too many ${plaintext ? "plaintext" : "encrypted"} records preserve the original without key reads`, async t => {
+    const { registry, file } = fixture(t, { sessions: Array.from({ length: 257 }, () => session()) }, { plaintext });
+    const original = fs.readFileSync(file, "utf8");
+    let calls = 0;
+    registry.readKey = async () => { calls++; throw new Error("must not retrieve keys"); };
+    assert.deepEqual(await registry.load(), []);
+    assert.equal(calls, 0);
+    assert.equal(await registry.save([session()]), false);
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+  });
+}
+
+test("oversized files are rejected before reading their contents and cannot be overwritten", async t => {
+  const { registry, file, errors } = fixture(t, { sessions: [] });
+  fs.truncateSync(file, 64 * 1024 * 1024 + 1);
+  const before = fs.statSync(file);
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(await registry.save([session()]), false);
+  assert.equal(fs.statSync(file).size, before.size);
+  assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+  assert.equal(errors.length, 1);
+});
+
+test("a growing file is bounded even when its initial stat is below the size limit", async t => {
+  const { file } = fixture(t, { sessions: [] });
+  fs.truncateSync(file, 64 * 1024 * 1024 + 1);
+  let closed = false, readBytes = 0;
+  const { PersistentSessionRegistry: Registry } = loadSource("src/Runtime/persistentSessionRegistry.ts", {
+    fs: { ...fs, promises: { ...fs.promises, open: async (...args) => {
+      const handle = await fs.promises.open(...args);
+      return {
+        stat: async () => ({ isFile: () => true, size: 64 }),
+        createReadStream: options => {
+          const stream = handle.createReadStream(options);
+          stream.on("data", chunk => { readBytes += chunk.length; });
+          return stream;
+        },
+        close: async () => { closed = true; await handle.close(); },
+      };
+    } } },
+  });
+  const registry = new Registry(file, async () => { throw new Error("must not retrieve keys"); });
+  t.after(() => registry.dispose());
+  assert.deepEqual(await registry.load(), []);
+  assert.equal(closed, true);
+  assert.equal(readBytes, 64 * 1024 * 1024 + 1);
+  assert.equal(await registry.save([session()]), false);
+});
+
+test("over-limit saves and externally enlarged files preserve existing records", async t => {
+  const entry = session();
+  const { registry, file } = fixture(t, { sessions: [entry] });
+  await registry.load();
+  const original = fs.readFileSync(file, "utf8");
+  assert.equal(await registry.save(Array.from({ length: 257 }, () => session())), false);
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  fs.truncateSync(file, 64 * 1024 * 1024 + 1);
+  assert.equal(await registry.save([entry]), false);
+  assert.equal(fs.statSync(file).size, 64 * 1024 * 1024 + 1);
+});
+
+for (const stop of ["dispose", "budget"]) {
+  test(`${stop} stops queued key requests and preserves unread sessions`, async t => {
+    const sessions = Array.from({ length: 12 }, () => session());
+    const { file, keys } = fixture(t, { sessions });
+    const original = fs.readFileSync(file, "utf8");
+    let release, started, calls = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    const firstBatch = new Promise(resolve => { started = resolve; });
+    const registry = new PersistentSessionRegistry(file, async identity => {
+      if (++calls === 4) started();
+      await gate;
+      return keys.readKey(identity);
+    });
+    t.after(() => registry.dispose());
+    const realNow = Date.now;
+    let now = realNow();
+    if (stop === "budget") Date.now = () => now;
+    try {
+      const pending = registry.load();
+      await firstBatch;
+      if (stop === "dispose") registry.dispose();
+      else now += 5000;
+      release();
+      const restored = await pending;
+      assert.equal(calls, 4);
+      assert.equal(restored.length, stop === "dispose" ? 0 : 4);
+      assert.equal(fs.readFileSync(file, "utf8"), original);
+      if (stop === "budget") {
+        assert.equal(await registry.save(restored), true);
+        assert.deepEqual(new Set(keys.read(file).sessions.map(value => value.terminal.runtime.sessionId)),
+          new Set(sessions.map(value => value.terminal.runtime.sessionId)));
+      }
+    } finally { Date.now = realNow; release(); }
+  });
+}
+
 function fixture(t, content, { plaintext = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rconsole-upgrade-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
